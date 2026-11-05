@@ -38,6 +38,9 @@ mod m0001_baseline;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0005_drop_continuous_backups;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -135,6 +138,19 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 StoreKind::Catalog,
                 &m0005_drop_continuous_backups::DropContinuousBackups,
                 m0005_drop_continuous_backups::SOURCE,
+            )],
+        },
+        MigrationId::UniqueAccessKeyIds => Migration::Applies {
+            // A unique index is never additive (CONTRIBUTING.md): the
+            // previous release does not expect the index to refuse a write.
+            kind: Kind::Breaking,
+            // Once the index is built no ID has a second copy, so running
+            // the body again deletes nothing and keeps the index.
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_unique_access_key_ids::UniqueAccessKeyIds,
+                m0006_unique_access_key_ids::SOURCE,
             )],
         },
     }

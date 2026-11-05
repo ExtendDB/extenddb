@@ -127,6 +127,9 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
 
@@ -148,7 +151,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         MigrationId::Baseline
         | MigrationId::ResourceTagConditionKeys
         | MigrationId::SortKeyDefinitions
-        | MigrationId::DropContinuousBackups => RunsIn::Transaction,
+        | MigrationId::DropContinuousBackups
+        | MigrationId::UniqueAccessKeyIds => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

@@ -127,6 +127,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
+             EXISTS, so an ID can be stored once",
+        ),
     }
 }
 

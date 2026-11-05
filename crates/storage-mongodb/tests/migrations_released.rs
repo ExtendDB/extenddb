@@ -5,21 +5,24 @@
 //! 0.1.12, 0.1.13 and 0.1.14 images (0.1.12 stands for v0.1.4 to v0.1.11,
 //! whose bootstrapper is the same), and `dotted-ttl`, a 0.1.12 catalog with
 //! the TTL index releases before v0.1.12 created for a dotted attribute.
-//! Each is compared after the upgrade with the definitions migration 1
-//! creates, and its per-table objects with what they were before, and the
+//! Each is compared after the upgrade with the definitions of a fresh
+//! install, and its per-table objects with what they were before, and the
 //! code bodies' output with committed golden files.
 
 mod migrations_support;
 
 use std::collections::BTreeMap;
 
-use bson::{Document, doc};
-use extenddb_storage::migrations::{CatalogStatus, MigrationBackend};
+use bson::oid::ObjectId;
+use bson::spec::BinarySubtype;
+use bson::{Binary, Bson, Document, doc};
+use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, exit};
 use extenddb_storage_mongodb::migrations::{Definitions, MongoMigrations, describe_store};
-use migrations_support::{Deployment, fixture, server};
+use migrations_support::{
+    ACCESS_KEY_ID_INDEX, Deployment, catalog_after_every_migration, fixture, server,
+};
 use serde_json::Value;
 
-const CATALOG_EXPECTED: &str = include_str!("../migrations/catalog/0001_baseline.expected.json");
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
 const STATES: [&str; 4] = ["0.1.12", "0.1.13", "0.1.14", "dotted-ttl"];
 
@@ -136,9 +139,7 @@ fn golden(name: &str, value: &Value) {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install() {
     let Some(uri) = server() else { return };
-    let mut expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).unwrap();
-    // Migration 5 drops continuous_backups, which migration 1 creates.
-    expected_catalog.remove("continuous_backups");
+    let expected_catalog = catalog_after_every_migration();
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).unwrap();
     let fresh = Deployment::new(&uri, "freshkeys").await;
     fresh.create().await;
@@ -164,12 +165,12 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 6, "{state}");
+        assert_eq!(pending.len(), 7, "{state}");
         let report = d.migrate().await.expect("migrate");
-        assert_eq!((report.from, report.to), (None, Some(5)), "{state}");
+        assert_eq!((report.from, report.to), (None, Some(6)), "{state}");
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 5 },
+            CatalogStatus::Current { version: 6 },
             "{state}"
         );
 
@@ -401,10 +402,1149 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
             .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
         "{report:?}"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
     assert_eq!(
         documents(Deployment::documents(&d.catalog(), "iam_policies").await),
         before
     );
     d.drop_databases().await;
+}
+
+/// The access key ID of AWS's documented example pair.
+const EXAMPLE_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+
+/// The released fixture's one access key: its `_id`, ID, account and
+/// creation time.
+async fn fixture_key(d: &Deployment) -> (Bson, String, String, i64) {
+    let key = Deployment::documents(&d.catalog(), "access_keys")
+        .await
+        .pop()
+        .expect("the fixture's access key");
+    (
+        key.get("_id").cloned().unwrap(),
+        key.get_str("access_key_id").unwrap().to_owned(),
+        key.get_str("account_id").unwrap().to_owned(),
+        key.get_datetime("created_at").unwrap().timestamp_millis(),
+    )
+}
+
+/// An access key document as a release before 1.0 stored it, with an `_id`
+/// and a creation time the test chooses, and a secret that tells the copies
+/// apart.
+fn stored_key(n: u8, access_key_id: &str, account: &str, user: &str, created_ms: i64) -> Document {
+    doc! {
+        "_id": oid(n),
+        "access_key_id": access_key_id,
+        "account_id": account,
+        "user_name": user,
+        "secret_key_encrypted": Binary { subtype: BinarySubtype::Generic, bytes: vec![n; 60] },
+        "is_active": true,
+        "created_at": bson::DateTime::from_millis(created_ms),
+    }
+}
+
+/// The `_id` of the document the server's credential lookup reads for
+/// `access_key_id`, by the lookup's own query.
+async fn looked_up(d: &Deployment, access_key_id: &str) -> Bson {
+    d.catalog()
+        .collection::<Document>("access_keys")
+        .find_one(doc! { "access_key_id": access_key_id })
+        .await
+        .unwrap()
+        .expect("a key")
+        .get("_id")
+        .cloned()
+        .unwrap()
+}
+
+async fn access_key_indexes(d: &Deployment) -> Vec<String> {
+    d.catalog()
+        .collection::<Document>("access_keys")
+        .list_index_names()
+        .await
+        .unwrap()
+}
+
+/// Migration 6's body on the oldest released catalog, after the fixture's
+/// user imported its access key ID twice more and the user `ci` imported
+/// the example pair three times: a release before 1.0 stored a document for
+/// each import. Each ID keeps the copy a credential lookup read before the
+/// upgrade: the first in natural order, which for the fixture's key is
+/// neither the oldest copy nor the one with the lowest `_id`. The unique
+/// index then refuses another copy. The committed golden file pins the keys
+/// and the notes.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_keeps_the_copy_each_lookup_read_as_the_golden_file_records() {
+    use futures::TryStreamExt;
+    use mongodb::error::{ErrorKind, WriteFailure};
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "golden6").await;
+    fixture::load(&d, &fixture::read("0.1.12")).await;
+    let (fixture_doc, fixture_id, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    keys.insert_many([
+        stored_key(1, &fixture_id, &account, "cu-tester", created - 60_000),
+        stored_key(2, &fixture_id, &account, "cu-tester", created + 60_000),
+        stored_key(11, EXAMPLE_KEY_ID, &account, "ci", created + 120_000),
+        stored_key(12, EXAMPLE_KEY_ID, &account, "ci", created + 180_000),
+        stored_key(13, EXAMPLE_KEY_ID, &account, "ci", created + 240_000),
+    ])
+    .await
+    .unwrap();
+    let ids = [fixture_id.as_str(), EXAMPLE_KEY_ID];
+    let mut read_before = Vec::new();
+    for id in ids {
+        read_before.push(looked_up(&d, id).await);
+    }
+    assert_eq!(read_before[0], fixture_doc);
+
+    // The profiler records the body's requests on the catalog: with only
+    // migration 1's indexes the lookup is a forward scan, so the body reads
+    // record IDs and sends no lookup query of its own.
+    let catalog = d.catalog();
+    catalog
+        .run_command(doc! { "create": "system.profile", "capped": true, "size": 16 << 20 })
+        .await
+        .unwrap();
+    catalog.run_command(doc! { "profile": 2 }).await.unwrap();
+    d.migrate().await.expect("migrate");
+    catalog.run_command(doc! { "profile": 0 }).await.unwrap();
+    let profiled = catalog.collection::<Document>("system.profile");
+    let count = |filter: Document| {
+        let profiled = profiled.clone();
+        async move { profiled.count_documents(filter).await.unwrap() }
+    };
+    assert_eq!(
+        count(doc! {
+            "command.find": "access_keys",
+            "command.filter._id": { "$exists": false },
+            "command.filter.access_key_id": { "$exists": true },
+        })
+        .await,
+        0,
+        "the body sent a lookup query of its own"
+    );
+    assert_eq!(
+        count(doc! { "command.find": "access_keys", "command.showRecordId": true }).await,
+        ids.len() as u64
+    );
+    assert_eq!(
+        count(doc! { "command.explain.find": "access_keys" }).await,
+        ids.len() as u64
+    );
+    catalog
+        .collection::<Document>("system.profile")
+        .drop()
+        .await
+        .unwrap();
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    for (id, kept) in ids.iter().zip(&read_before) {
+        let copies: Vec<Document> = keys
+            .find(doc! { "access_key_id": *id })
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(copies.len(), 1, "{id}: {copies:?}");
+        assert_eq!(copies[0].get("_id"), Some(kept), "{id}");
+        assert_eq!(&looked_up(&d, id).await, kept, "{id}");
+    }
+    assert!(
+        access_key_indexes(&d)
+            .await
+            .contains(&ACCESS_KEY_ID_INDEX.to_owned())
+    );
+    let refused = keys
+        .insert_one(stored_key(3, &fixture_id, &account, "cu-tester", created))
+        .await
+        .expect_err("the index refuses another copy");
+    assert!(
+        matches!(*refused.kind, ErrorKind::Write(WriteFailure::WriteError(ref e)) if e.code == 11000),
+        "{refused}"
+    );
+
+    let stored: Vec<Value> = Deployment::documents(&d.catalog(), "access_keys")
+        .await
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "_id": k.get_object_id("_id").unwrap().to_hex(),
+                "access_key_id": k.get_str("access_key_id").unwrap(),
+                "account_id": k.get_str("account_id").unwrap(),
+                "user_name": k.get_str("user_name").unwrap(),
+                "created_at": k.get_datetime("created_at").unwrap().try_to_rfc3339_string().unwrap(),
+            })
+        })
+        .collect();
+    let notes: Vec<String> = d
+        .catalog_ledger()
+        .await
+        .iter()
+        .find(|row| row.id == 6)
+        .expect("migration 6's row")
+        .notes
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    golden(
+        "0006_unique_access_key_ids",
+        &serde_json::json!({ "access_keys": stored, "notes": notes }),
+    );
+    d.drop_databases().await;
+}
+
+/// Migration 6's `detect` refuses, before any migration writes, an ID that
+/// another user of the account holds, an ID that users of one name in two
+/// accounts hold, two documents without an ID, and a document whose ID is
+/// an array: the status reads NeedsAttention, `migrate --yes` exits 5 and
+/// names every copy, and every document is kept, the user `ci`'s two copies
+/// of the example pair included, which the body itself would resolve. Once
+/// the documents the refusal names are deleted, `migrate --yes` applies
+/// every migration.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_refuses_copies_it_cannot_resolve_and_writes_nothing() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "refuse6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let (owner, fixture_id, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    let without_id = |n: u8| {
+        let mut key = stored_key(n, "", &account, "broken", created);
+        key.remove("access_key_id");
+        key
+    };
+    let mut array = stored_key(31, "", &account, "listed", created);
+    array.insert("access_key_id", ARRAY_KEY_IDS.map(Bson::from).to_vec());
+    keys.insert_many([
+        stored_key(1, &fixture_id, &account, "importer", created + 60_000),
+        stored_key(2, TWO_ACCOUNTS_KEY_ID, &account, "shared", created + 30_000),
+        stored_key(
+            3,
+            TWO_ACCOUNTS_KEY_ID,
+            OTHER_ACCOUNT,
+            "shared",
+            created + 90_000,
+        ),
+        stored_key(11, EXAMPLE_KEY_ID, &account, "ci", created + 120_000),
+        stored_key(12, EXAMPLE_KEY_ID, &account, "ci", created + 180_000),
+        without_id(21),
+        without_id(22),
+        array,
+    ])
+    .await
+    .unwrap();
+    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
+    let settings = Deployment::documents(&d.catalog(), "settings").await;
+
+    let CatalogStatus::NeedsAttention { items } = d.status().await else {
+        panic!("migration 6 is not refused");
+    };
+    assert_eq!(items.len(), 4, "{items:?}");
+    let error = d.migrate().await.expect_err("refused");
+    assert_eq!(error.exit_code(), exit::ATTENTION);
+    let message = error.to_string();
+    let catalog = &d.target.catalog;
+    let delete =
+        format!("db.getSiblingDB(\"{catalog}\").access_keys.deleteOne({{ _id: <its _id> }})");
+    for part in [
+        format!(
+            "migration 6 unique_access_key_ids: the access key ID {fixture_id} is stored 2 \
+             times in {catalog}.access_keys, for more than one user: _id {owner} (account \
+             {account}, user cu-tester, created "
+        ),
+        format!(
+            "), _id {} (account {account}, user importer, created ",
+            Bson::ObjectId(oid(1))
+        ),
+        format!(
+            "), and a credential lookup reads _id {owner}; delete each copy that is not the key \
+             owner's with {delete} in mongosh"
+        ),
+        format!(
+            "migration 6 unique_access_key_ids: the access key ID {TWO_ACCOUNTS_KEY_ID} is \
+             stored 2 times in {catalog}.access_keys, for more than one user: _id {} (account \
+             {account}, user shared, created ",
+            Bson::ObjectId(oid(2))
+        ),
+        format!(
+            "), _id {} (account {OTHER_ACCOUNT}, user shared, created ",
+            Bson::ObjectId(oid(3))
+        ),
+        format!(
+            "), and a credential lookup reads _id {}; delete each copy",
+            Bson::ObjectId(oid(2))
+        ),
+        format!(
+            "migration 6 unique_access_key_ids: 2 documents in {catalog}.access_keys have no \
+             access key ID"
+        ),
+        format!(
+            "migration 6 unique_access_key_ids: the access key ID of _id {} (account \
+             {account}, user listed, created ",
+            Bson::ObjectId(oid(31))
+        ),
+        format!(
+            ") in {catalog}.access_keys is the array [\"{}\", \"{}\"], and a credential lookup \
+             reads such a document for each ID in the array; delete it with {delete}, or set \
+             its access_key_id to one string, in mongosh",
+            ARRAY_KEY_IDS[0], ARRAY_KEY_IDS[1]
+        ),
+    ] {
+        assert!(message.contains(&part), "{part}\n{message}");
+    }
+    assert!(!message.contains(EXAMPLE_KEY_ID), "{message}");
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "access_keys").await,
+        documents
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "settings").await,
+        settings
+    );
+    assert!(
+        Deployment::documents(&d.catalog(), "extenddb_migrations")
+            .await
+            .is_empty()
+    );
+    assert_eq!(unique_index(&d).await, None);
+
+    // What the refusal asks for: the importer's copy, the copy of the other
+    // account, one of the two documents without an ID, which the index
+    // takes one of, and the array.
+    for n in [1, 3, 22, 31] {
+        keys.delete_one(doc! { "_id": oid(n) }).await.unwrap();
+    }
+    d.migrate().await.expect("migrate");
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(looked_up(&d, &fixture_id).await, owner);
+    for (filter, count) in [
+        (doc! { "access_key_id": &fixture_id }, 1),
+        (doc! { "access_key_id": TWO_ACCOUNTS_KEY_ID }, 1),
+        (doc! { "access_key_id": EXAMPLE_KEY_ID }, 1),
+        (doc! { "access_key_id": Bson::Null }, 1),
+    ] {
+        assert_eq!(
+            keys.count_documents(filter.clone()).await.unwrap(),
+            count,
+            "{filter}"
+        );
+    }
+    assert_eq!(unique_index(&d).await, Some(true));
+    d.drop_databases().await;
+}
+
+/// An index of `access_keys` that would make the build fail is refused
+/// before anything is written: `access_key_id_1` without `unique`, which an
+/// operator may have created for the lookups, and the unique index under
+/// another name. Each refusal prints its `dropIndex` command, and once it
+/// has run `migrate --yes` applies migration 6. A non-unique index on the
+/// ID under another name stays beside the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_refuses_an_index_the_build_would_fail_on() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "index6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let (owner, fixture_id, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    keys.insert_one(stored_key(
+        1,
+        &fixture_id,
+        &account,
+        "cu-tester",
+        created + 60_000,
+    ))
+    .await
+    .unwrap();
+    keys.create_index(id_index(None, false)).await.unwrap();
+    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
+    let catalog = d.target.catalog.clone();
+    let item = refused_index(&d).await;
+    assert!(
+        item.starts_with(&format!(
+            "migration 6 unique_access_key_ids: the index access_key_id_1 on \
+             {catalog}.access_keys ("
+        )) && item.ends_with(&format!(
+            ") is not the unique index on access_key_id that this migration creates under \
+             that name, and the build refuses a second index of the name; drop it with \
+             db.getSiblingDB(\"{catalog}\").access_keys.dropIndex(\"access_key_id_1\") in \
+             mongosh"
+        )),
+        "{item}"
+    );
+    assert_eq!(
+        d.migrate().await.expect_err("refused").exit_code(),
+        exit::ATTENTION
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "access_keys").await,
+        documents
+    );
+    keys.drop_index(ACCESS_KEY_ID_INDEX).await.unwrap();
+    d.migrate().await.expect("migrate");
+    assert_eq!(looked_up(&d, &fixture_id).await, owner);
+    assert_eq!(
+        keys.count_documents(doc! { "access_key_id": &fixture_id })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(unique_index(&d).await, Some(true));
+    d.drop_databases().await;
+
+    let d = Deployment::new(&uri, "renamed6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    keys.create_index(id_index(Some("akid"), true))
+        .await
+        .unwrap();
+    keys.create_index(id_index(Some("akid_plain"), false))
+        .await
+        .unwrap();
+    let catalog = d.target.catalog.clone();
+    let item = refused_index(&d).await;
+    assert!(
+        item.starts_with(&format!(
+            "migration 6 unique_access_key_ids: the unique index akid on {catalog}.access_keys ("
+        )) && item.ends_with(&format!(
+            ") is the index this migration creates under the name access_key_id_1, and the \
+             build refuses a second name for it; drop it with \
+             db.getSiblingDB(\"{catalog}\").access_keys.dropIndex(\"akid\") in mongosh"
+        )),
+        "{item}"
+    );
+    keys.drop_index("akid").await.unwrap();
+    d.migrate().await.expect("migrate");
+    assert_eq!(unique_index(&d).await, Some(true));
+    assert!(
+        access_key_indexes(&d)
+            .await
+            .contains(&"akid_plain".to_owned())
+    );
+    d.drop_databases().await;
+}
+
+/// The body's own `run` refuses what `detect` refuses, which the runner's
+/// `detect` otherwise stops first: copies and an index written after the
+/// runner read the collection. It returns NeedsAttention and writes
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_run_refuses_copies_written_after_detect() {
+    use extenddb_storage::migrations::MigrationId;
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "run6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    d.migrate_through(MigrationId::DropContinuousBackups)
+        .await
+        .expect("migrations 1 to 5");
+    let (_, fixture_id, account, created) = fixture_key(&d).await;
+    d.catalog()
+        .collection::<Document>("access_keys")
+        .insert_one(stored_key(
+            1,
+            &fixture_id,
+            &account,
+            "importer",
+            created + 60_000,
+        ))
+        .await
+        .unwrap();
+    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
+
+    let items = run_body(&d).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        items[0].starts_with(&format!("the access key ID {fixture_id} is stored 2 times")),
+        "{items:?}"
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "access_keys").await,
+        documents
+    );
+    assert_eq!(unique_index(&d).await, None);
+
+    // An index the build would fail on, beside an ID the body itself
+    // resolves: `run` refuses the index and deletes no copy.
+    let keys = d.catalog().collection::<Document>("access_keys");
+    keys.delete_one(doc! { "_id": oid(1) }).await.unwrap();
+    keys.insert_one(stored_key(
+        2,
+        &fixture_id,
+        &account,
+        "cu-tester",
+        created + 60_000,
+    ))
+    .await
+    .unwrap();
+    keys.create_index(id_index(None, false)).await.unwrap();
+    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
+    let items = run_body(&d).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        items[0].starts_with("the index access_key_id_1 on "),
+        "{items:?}"
+    );
+    assert_eq!(
+        Deployment::documents(&d.catalog(), "access_keys").await,
+        documents
+    );
+    assert!(
+        d.catalog_ledger().await.iter().all(|row| row.id != 6),
+        "migration 6 is not recorded"
+    );
+    d.drop_databases().await;
+}
+
+/// Migration 6's body `run`, called directly under the lock; the items it
+/// refuses the migration for.
+async fn run_body(d: &Deployment) -> Vec<String> {
+    use extenddb_storage::migrations::{Body, MigrationError, MigrationId};
+    use extenddb_storage_mongodb::migrations::{MigrationLock, Timing, migration};
+
+    let held = MigrationLock::acquire(
+        &d.target,
+        std::time::Duration::from_secs(10),
+        Timing::PRODUCTION,
+    )
+    .await
+    .expect("lock");
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
+        .await
+        .expect("open");
+    let entry = migration(MigrationId::UniqueAccessKeyIds);
+    let Body::Code { body, .. } = &entry.bodies()[0].body else {
+        panic!("migration 6 is a code body");
+    };
+    let result = body.run(migrations.stores()).await;
+    migrations.close().await;
+    held.release().await;
+    match result {
+        Err(MigrationError::Status(CatalogStatus::NeedsAttention { items })) => items,
+        other => panic!("run did not refuse: {:?}", other.map(|done| done.notes)),
+    }
+}
+
+/// An account other than the fixture's.
+const OTHER_ACCOUNT: &str = "210987654321";
+
+/// An access key ID that users of one name in two accounts hold.
+const TWO_ACCOUNTS_KEY_ID: &str = "AKIATWOACCOUNTS00000";
+
+/// The access key IDs of a document whose `access_key_id` is an array.
+const ARRAY_KEY_IDS: [&str; 2] = ["AKIAARRAYEXAMPLE000A", "AKIAARRAYEXAMPLE000B"];
+
+/// The `_id` [`stored_key`] gives document `n`.
+fn oid(n: u8) -> ObjectId {
+    ObjectId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n])
+}
+
+/// An index on `{ access_key_id: 1 }`, with a name when it is given.
+fn id_index(name: Option<&str>, unique: bool) -> mongodb::IndexModel {
+    let options = match name {
+        Some(name) => mongodb::options::IndexOptions::builder()
+            .name(name.to_owned())
+            .unique(unique)
+            .build(),
+        None => mongodb::options::IndexOptions::builder()
+            .unique(unique)
+            .build(),
+    };
+    mongodb::IndexModel::builder()
+        .keys(doc! { "access_key_id": 1 })
+        .options(options)
+        .build()
+}
+
+/// Whether `access_key_id_1` is unique, or `None` when it does not exist.
+async fn unique_index(d: &Deployment) -> Option<bool> {
+    use futures::TryStreamExt;
+    let indexes: Vec<mongodb::IndexModel> = d
+        .catalog()
+        .collection::<Document>("access_keys")
+        .list_indexes()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    indexes
+        .iter()
+        .filter_map(|m| m.options.as_ref())
+        .find(|o| o.name.as_deref() == Some(ACCESS_KEY_ID_INDEX))
+        .map(|o| o.unique == Some(true))
+}
+
+/// The items for which the status refuses migration 6.
+async fn status_items(d: &Deployment) -> Vec<String> {
+    match d.status().await {
+        CatalogStatus::NeedsAttention { items } => items,
+        status => panic!("migration 6 is not refused: {status}"),
+    }
+}
+
+/// The one item for which the status refuses migration 6.
+async fn refused_index(d: &Deployment) -> String {
+    let mut items = status_items(d).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    items.pop().unwrap()
+}
+
+/// Once its index is built, migration 6 groups only the documents whose ID
+/// is an array, which the unique index takes and a lookup reads for each ID
+/// in it; beside an index named `access_key_id_1` that is not its own, it
+/// groups every document. A catalog at migration 5 holds an ID of two
+/// users, an array ID, a document without an ID and one whose ID is the
+/// number 42. Beside a non-unique `access_key_id_1`, the status refuses the
+/// ID of two users, the array and the index. With the unique index built by
+/// hand and hidden, it refuses the array and the hidden index, with the
+/// command that unhides it, and once the index is shown, the array alone.
+/// After the array is deleted `migrate --yes` applies 6, and
+/// `--reconverge` refuses an array ID written later and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_refuses_array_ids_beside_its_own_index() {
+    use extenddb_storage::migrations::MigrationId;
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "arrays6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    d.migrate_through(MigrationId::DropContinuousBackups)
+        .await
+        .expect("migrations 1 to 5");
+    let (_, fixture_id, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    let mut without_id = stored_key(21, "", &account, "broken", created);
+    without_id.remove("access_key_id");
+    let mut numbered = stored_key(41, "", &account, "numbered", created);
+    numbered.insert("access_key_id", 42);
+    let array = |n: u8| {
+        let mut key = stored_key(n, "", &account, "listed", created);
+        key.insert("access_key_id", ARRAY_KEY_IDS.map(Bson::from).to_vec());
+        key
+    };
+    keys.insert_many([
+        stored_key(1, &fixture_id, &account, "importer", created + 60_000),
+        without_id,
+        numbered,
+        array(31),
+    ])
+    .await
+    .unwrap();
+    keys.create_index(id_index(None, false)).await.unwrap();
+    let catalog = d.target.catalog.clone();
+    let prefix = "migration 6 unique_access_key_ids: ";
+    let refused_array = |n: u8| {
+        format!(
+            "{prefix}the access key ID of _id {} (account {account}, user listed, created ",
+            Bson::ObjectId(oid(n))
+        )
+    };
+    let refused_index = format!("{prefix}the index access_key_id_1 on {catalog}.access_keys (");
+
+    let items = status_items(&d).await;
+    assert_eq!(items.len(), 3, "{items:?}");
+    for start in [
+        format!("{prefix}the access key ID {fixture_id} is stored 2 times"),
+        refused_array(31),
+        refused_index.clone(),
+    ] {
+        assert!(
+            items.iter().any(|item| item.starts_with(&start)),
+            "{start}\n{items:?}"
+        );
+    }
+
+    // The importer's copy and the index go, and the manual's unique index
+    // is built hidden.
+    keys.delete_one(doc! { "_id": oid(1) }).await.unwrap();
+    keys.drop_index(ACCESS_KEY_ID_INDEX).await.unwrap();
+    d.catalog()
+        .run_command(doc! { "createIndexes": "access_keys", "indexes": [
+            { "key": { "access_key_id": 1 }, "name": ACCESS_KEY_ID_INDEX, "unique": true, "hidden": true },
+        ], "commitQuorum": "majority" })
+        .await
+        .unwrap();
+    let items = status_items(&d).await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert!(items[0].starts_with(&refused_array(31)), "{items:?}");
+    assert!(
+        items[1].starts_with(&refused_index)
+            && items[1].ends_with(&format!(
+                ") is the unique index on access_key_id that this migration creates, hidden \
+                 from the query planner, so a credential lookup does not use it; unhide it \
+                 with db.getSiblingDB(\"{catalog}\").access_keys.unhideIndex(\"access_key_id_1\") \
+                 in mongosh"
+            )),
+        "{items:?}"
+    );
+
+    d.catalog()
+        .run_command(doc! { "collMod": "access_keys", "index": {
+            "name": ACCESS_KEY_ID_INDEX, "hidden": false,
+        } })
+        .await
+        .unwrap();
+    let items = status_items(&d).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].starts_with(&refused_array(31)), "{items:?}");
+
+    keys.delete_one(doc! { "_id": oid(31) }).await.unwrap();
+    d.migrate().await.expect("migrate");
+    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    for filter in [doc! { "_id": oid(21) }, doc! { "_id": oid(41) }] {
+        assert_eq!(
+            keys.count_documents(filter.clone()).await.unwrap(),
+            1,
+            "{filter}"
+        );
+    }
+
+    keys.insert_one(array(32)).await.unwrap();
+    let error = d.reconverge().await.expect_err("refused");
+    assert_eq!(error.exit_code(), exit::ATTENTION);
+    let message = error.to_string();
+    assert!(message.contains(&refused_array(32)), "{message}");
+    for absent in ["have no access key ID", "have the access key ID 42"] {
+        assert!(!message.contains(absent), "{absent}\n{message}");
+    }
+    d.drop_databases().await;
+}
+
+/// With an operator's index on `{ access_key_id: 1, created_at: -1 }`, a
+/// lookup reads an ID's newest copy, which is not its first in natural
+/// order. The body keeps the copy the lookup's own query returns and
+/// deletes the others, and the operator's index stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_keeps_the_copy_a_lookup_reads_through_an_operator_index() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "operator6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let (first, fixture_id, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    keys.insert_many([
+        stored_key(1, &fixture_id, &account, "cu-tester", created + 60_000),
+        stored_key(2, &fixture_id, &account, "cu-tester", created - 60_000),
+    ])
+    .await
+    .unwrap();
+    keys.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "access_key_id": 1, "created_at": -1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .name("akid_newest_first".to_owned())
+                    .build(),
+            )
+            .build(),
+    )
+    .await
+    .unwrap();
+    let newest = Bson::ObjectId(oid(1));
+    assert_eq!(looked_up(&d, &fixture_id).await, newest);
+
+    d.migrate().await.expect("migrate");
+    let left: Vec<Bson> = Deployment::documents(&d.catalog(), "access_keys")
+        .await
+        .iter()
+        .filter(|k| k.get_str("access_key_id") == Ok(fixture_id.as_str()))
+        .map(|k| k.get("_id").cloned().unwrap())
+        .collect();
+    assert_eq!(left, std::slice::from_ref(&newest));
+    let notes = d
+        .catalog_ledger()
+        .await
+        .into_iter()
+        .find(|row| row.id == 6)
+        .expect("migration 6's row")
+        .notes;
+    assert_eq!(
+        notes,
+        format!(
+            "access key {fixture_id} of account {account}, user cu-tester was stored 3 times: \
+             kept _id {newest}, the copy credential lookups read, and deleted the other copies \
+             _id {first}, _id {}",
+            Bson::ObjectId(oid(2))
+        )
+    );
+    assert_eq!(unique_index(&d).await, Some(true));
+    assert!(
+        access_key_indexes(&d)
+            .await
+            .contains(&"akid_newest_first".to_owned())
+    );
+    d.drop_databases().await;
+}
+
+/// A partial index on `access_key_id` gives the lookup an index plan for
+/// some IDs and not for others: here `{ access_key_id: 1, created_at: -1 }`
+/// for IDs from AKIAM on. The lookup reads an ID below AKIAM by a forward
+/// scan, its first copy in natural order, and an ID from AKIAM on through
+/// the index, its newest copy. The body keeps, for each ID, the copy its
+/// own lookup reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_keeps_the_copy_each_lookup_reads_beside_a_partial_index() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "partial6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let (_, _, account, created) = fixture_key(&d).await;
+    let keys = d.catalog().collection::<Document>("access_keys");
+    let (scanned, indexed) = ("AKIAAPARTIAL00000001", "AKIAZPARTIAL00000001");
+    keys.insert_many([
+        stored_key(1, scanned, &account, "low", created + 60_000),
+        stored_key(2, indexed, &account, "high", created + 60_000),
+        stored_key(3, scanned, &account, "low", created + 120_000),
+        stored_key(4, indexed, &account, "high", created + 120_000),
+    ])
+    .await
+    .unwrap();
+    keys.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "access_key_id": 1, "created_at": -1 })
+            .options(
+                mongodb::options::IndexOptions::builder()
+                    .name("akid_partial_newest_first".to_owned())
+                    .partial_filter_expression(doc! { "access_key_id": { "$gte": "AKIAM" } })
+                    .build(),
+            )
+            .build(),
+    )
+    .await
+    .unwrap();
+    let expected = [
+        (scanned, Bson::ObjectId(oid(1))),
+        (indexed, Bson::ObjectId(oid(4))),
+    ];
+    for (id, read) in &expected {
+        assert_eq!(&looked_up(&d, id).await, read, "{id}");
+    }
+
+    d.migrate().await.expect("migrate");
+    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
+    for (id, read) in &expected {
+        let left: Vec<&Bson> = documents
+            .iter()
+            .filter(|k| k.get_str("access_key_id") == Ok(*id))
+            .filter_map(|k| k.get("_id"))
+            .collect();
+        assert_eq!(left, [read], "{id}");
+        assert_eq!(&looked_up(&d, id).await, read, "{id}");
+    }
+    assert_eq!(unique_index(&d).await, Some(true));
+    d.drop_databases().await;
+}
+
+/// On MongoDB 8.0 and later, query settings can give the lookup's command
+/// another plan with no index on `access_key_id`: here `allowedIndexes:
+/// [{ $natural: -1 }]` for its shape, so a lookup reads an ID's last copy in
+/// natural order. `explain` reports a backward scan, and the body keeps the
+/// copy the lookup's own query returns. MongoDB 7.0 has no query settings,
+/// and there the test stops after it loads the fixture, before it writes
+/// the second copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_keeps_the_copy_a_lookup_reads_under_query_settings() {
+    use futures::FutureExt;
+
+    /// CommandNotFound.
+    const NO_SUCH_COMMAND: i32 = 59;
+
+    fn no_such_command(e: &mongodb::error::Error) -> bool {
+        matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == NO_SUCH_COMMAND)
+    }
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "settings6").await;
+    let catalog = d.target.catalog.clone();
+    let admin = d.client.database("admin");
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    let (first, fixture_id, account, created) = fixture_key(&d).await;
+    let set = admin
+        .run_command(doc! {
+            "setQuerySettings": {
+                "find": "access_keys",
+                "filter": { "access_key_id": &fixture_id },
+                "limit": 1,
+                "singleBatch": true,
+                "$db": &catalog,
+            },
+            "settings": { "indexHints": {
+                "ns": { "db": &catalog, "coll": "access_keys" },
+                "allowedIndexes": [{ "$natural": -1 }],
+            } },
+        })
+        .await;
+    let hash = match set {
+        Ok(reply) => reply.get_str("queryShapeHash").unwrap().to_owned(),
+        Err(e) if no_such_command(&e) => {
+            eprintln!("query settings need MongoDB 8.0 or later; this server has none");
+            d.drop_databases().await;
+            return;
+        }
+        Err(e) => panic!("setQuerySettings: {e}"),
+    };
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let keys = d.catalog().collection::<Document>("access_keys");
+        keys.insert_one(stored_key(
+            1,
+            &fixture_id,
+            &account,
+            "cu-tester",
+            created + 60_000,
+        ))
+        .await
+        .unwrap();
+        let last = Bson::ObjectId(oid(1));
+        assert_eq!(looked_up(&d, &fixture_id).await, last);
+
+        d.migrate().await.expect("migrate");
+        let left: Vec<Bson> = Deployment::documents(&d.catalog(), "access_keys")
+            .await
+            .iter()
+            .filter(|k| k.get_str("access_key_id") == Ok(fixture_id.as_str()))
+            .map(|k| k.get("_id").cloned().unwrap())
+            .collect();
+        assert_eq!(left, std::slice::from_ref(&last));
+        let notes = d
+            .catalog_ledger()
+            .await
+            .into_iter()
+            .find(|row| row.id == 6)
+            .expect("migration 6's row")
+            .notes;
+        assert_eq!(
+            notes,
+            format!(
+                "access key {fixture_id} of account {account}, user cu-tester was stored 2 times: \
+                 kept _id {last}, the copy credential lookups read, and deleted the other copy \
+                 _id {first}"
+            )
+        );
+    })
+    .catch_unwind()
+    .await;
+    admin
+        .run_command(doc! { "removeQuerySettings": &hash })
+        .await
+        .unwrap_or_else(|e| panic!("removeQuerySettings {hash}: {e}"));
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    d.drop_databases().await;
+}
+
+/// How migration 6 must treat an index an operator may have on
+/// `access_keys`, as measured with `createIndexes` on MongoDB 7.0.45 and
+/// 8.0.34: whether `detect` refuses it, and whether the build of
+/// `access_key_id_1` fails beside it. The unique hidden `access_key_id_1`
+/// is refused, because a lookup does not use a hidden index and MongoDB 8
+/// answers the build with IndexOptionsConflict, although MongoDB 7 answers
+/// that the index exists.
+const INDEX_VARIANTS: &[IndexVariant] = &[
+    ("access_key_id_1, not unique", Refused::BuildFails, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1" }
+    }),
+    ("access_key_id_1, background", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "background": true }
+    }),
+    ("access_key_id_1, sparse: false", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "sparse": false }
+    }),
+    (
+        "access_key_id_1, the key direction a Decimal128",
+        Refused::No,
+        || {
+            doc! { "key": { "access_key_id": decimal_one() }, "name": "access_key_id_1", "unique": true }
+        },
+    ),
+    (
+        "access_key_id_1, the key direction the Decimal128 1.0",
+        Refused::No,
+        || {
+            doc! { "key": { "access_key_id": decimal("1.0") }, "name": "access_key_id_1", "unique": true }
+        },
+    ),
+    (
+        "access_key_id_1, the key direction a Decimal128 just above 1",
+        Refused::BuildFails,
+        || {
+            doc! { "key": { "access_key_id": decimal(JUST_ABOVE_ONE) }, "name": "access_key_id_1", "unique": true }
+        },
+    ),
+    ("access_key_id_1, partial", Refused::BuildFails, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true,
+        "partialFilterExpression": { "access_key_id": { "$exists": true } } }
+    }),
+    ("access_key_id_1, TTL", Refused::BuildFails, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "expireAfterSeconds": 3600 }
+    }),
+    ("access_key_id_1, hidden", Refused::ByVersion, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "hidden": true }
+    }),
+    ("access_key_id_1 on account_id", Refused::BuildFails, || {
+        doc! { "key": { "account_id": 1 }, "name": "access_key_id_1" }
+    }),
+    ("akid", Refused::BuildFails, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true }
+    }),
+    (
+        "akid, the key direction a Double",
+        Refused::BuildFails,
+        || {
+            doc! { "key": { "access_key_id": 1.0 }, "name": "akid", "unique": true }
+        },
+    ),
+    (
+        "akid, the key direction an Int64",
+        Refused::BuildFails,
+        || {
+            doc! { "key": { "access_key_id": 1_i64 }, "name": "akid", "unique": true }
+        },
+    ),
+    (
+        "akid, the key direction a Decimal128",
+        Refused::BuildFails,
+        || {
+            doc! { "key": { "access_key_id": decimal_one() }, "name": "akid", "unique": true }
+        },
+    ),
+    (
+        "akid, the key direction a Decimal128 just above 1",
+        Refused::No,
+        || {
+            doc! { "key": { "access_key_id": decimal(JUST_ABOVE_ONE) }, "name": "akid", "unique": true }
+        },
+    ),
+    ("akid, the key direction the Double 2", Refused::No, || {
+        doc! { "key": { "access_key_id": 2.0 }, "name": "akid", "unique": true }
+    }),
+    ("akid, the key direction the Double -1", Refused::No, || {
+        doc! { "key": { "access_key_id": -1.0 }, "name": "akid", "unique": true }
+    }),
+    ("akid, the key direction the Int64 -1", Refused::No, || {
+        doc! { "key": { "access_key_id": -1_i64 }, "name": "akid", "unique": true }
+    }),
+    ("akid, sparse: false", Refused::BuildFails, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true, "sparse": false }
+    }),
+    ("akid, sparse", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true, "sparse": true }
+    }),
+    ("akid, partial", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true,
+        "partialFilterExpression": { "access_key_id": { "$exists": true } } }
+    }),
+    ("akid, collation", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true,
+        "collation": { "locale": "en", "strength": 2 } }
+    }),
+    ("akid, descending", Refused::No, || {
+        doc! { "key": { "access_key_id": -1 }, "name": "akid", "unique": true }
+    }),
+    ("akid, not unique", Refused::No, || {
+        doc! { "key": { "access_key_id": 1 }, "name": "akid" }
+    }),
+    ("akid, compound", Refused::No, || {
+        doc! { "key": { "access_key_id": 1, "account_id": 1 }, "name": "akid", "unique": true }
+    }),
+];
+
+/// A variant's label, whether `detect` refuses it, and its spec.
+type IndexVariant = (&'static str, Refused, fn() -> Document);
+
+/// Whether `detect` refuses an index, and why.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Refused {
+    /// Accepted: the build succeeds beside it.
+    No,
+    /// Refused: the build fails beside it.
+    BuildFails,
+    /// Refused: the build fails beside it on some versions.
+    ByVersion,
+}
+
+fn decimal_one() -> Bson {
+    decimal("1")
+}
+
+fn decimal(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
+}
+
+/// A Decimal128 that a Double rounds to 1 and the server compares as
+/// another value than 1.
+const JUST_ABOVE_ONE: &str = "1.0000000000000000000000000000001";
+
+/// Each index of [`INDEX_VARIANTS`], alone beside migration 1's indexes on
+/// a catalog at migration 5 that holds one key: `detect` refuses it exactly
+/// when it is marked refused. The body's own `createIndexes`, sent beside a
+/// refused index, fails, and `migrate --yes` applies migration 6 beside an
+/// accepted one.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_refuses_an_index_exactly_when_the_build_fails_on_it() {
+    use extenddb_storage::migrations::MigrationId;
+
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "variants6").await;
+    fixture::load(&d, &fixture::read("0.1.14")).await;
+    d.migrate_through(MigrationId::DropContinuousBackups)
+        .await
+        .expect("migrations 1 to 5");
+    let keys = d.catalog().collection::<Document>("access_keys");
+    for (label, refused, spec) in INDEX_VARIANTS {
+        for name in access_key_indexes(&d).await {
+            if !["_id_", "account_id_1_user_name_1"].contains(&name.as_str()) {
+                keys.drop_index(name).await.unwrap();
+            }
+        }
+        d.catalog()
+            .run_command(doc! { "createIndexes": "access_keys", "indexes": [spec()] })
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let status = d.status().await;
+        match refused {
+            Refused::No => {
+                assert_eq!(status.label(), "Behind", "{label}: {status}");
+                d.migrate().await.unwrap_or_else(|e| panic!("{label}: {e}"));
+                assert_eq!(unique_index(&d).await, Some(true), "{label}");
+                forget_6(&d).await;
+            }
+            Refused::BuildFails | Refused::ByVersion => {
+                let CatalogStatus::NeedsAttention { items } = status else {
+                    panic!("{label}: not refused: {status}");
+                };
+                assert_eq!(items.len(), 1, "{label}: {items:?}");
+                let built = d
+                    .catalog()
+                    .run_command(doc! { "createIndexes": "access_keys", "indexes": [
+                        { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true },
+                    ], "commitQuorum": "majority" })
+                    .await;
+                if *refused == Refused::BuildFails {
+                    assert!(built.is_err(), "{label}: the build succeeds: {built:?}");
+                }
+            }
+        }
+    }
+    d.drop_databases().await;
+}
+
+/// `migrate --forget 6`.
+async fn forget_6(d: &Deployment) {
+    use extenddb_storage::migrations::Runner;
+    use extenddb_storage_mongodb::migrations::{MigrationLock, Timing};
+
+    let held = MigrationLock::acquire(
+        &d.target,
+        std::time::Duration::from_secs(10),
+        Timing::PRODUCTION,
+    )
+    .await
+    .expect("lock");
+    let migrations = MongoMigrations::open(&d.target, Some(&held))
+        .await
+        .expect("open");
+    let forgot = Runner::new(&migrations, "test").forget(6).await;
+    migrations.close().await;
+    held.release().await;
+    forgot.expect("forget 6");
 }

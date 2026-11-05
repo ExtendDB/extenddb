@@ -264,13 +264,27 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
     );
+    // Every id has a row: `applied` for one with a body on SQLite, and
+    // `not_applicable` for one that does not apply here.
+    let applies = MigrationId::ALL
+        .into_iter()
+        .filter(|id| !super::migration(*id).bodies().is_empty())
+        .count();
     assert_eq!(
         count(
             &db,
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
-        i64::from(LATEST)
+        i64::try_from(applies).unwrap()
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'not_applicable'"
+        )
+        .await,
+        i64::try_from(MigrationId::ALL.len() - applies).unwrap()
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(

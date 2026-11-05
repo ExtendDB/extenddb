@@ -106,6 +106,9 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
 
