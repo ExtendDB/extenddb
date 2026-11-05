@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
 use extenddb_storage::migrations::{
-    CatalogStatus, MigrationError, Prepared, Startup, Target, exit, prepare_to_serve,
+    CatalogStatus, MigrationError, MigrationId, Prepared, Startup, Target, exit, prepare_to_serve,
 };
 use extenddb_storage_mongodb::migrations::MongoCatalogMigrations;
 use migrations_support::{Deployment, fixture, server};
@@ -67,8 +67,13 @@ async fn apply_migrates_a_released_catalog_and_refuse_writes_nothing() {
         .await
         .expect("applied");
     let report = prepared.run.expect("a run");
-    assert_eq!(report.applied.len(), 6, "{report:?}");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(report.applied.len(), 7, "{report:?}");
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     d.drop_databases().await;
 }
 
@@ -253,9 +258,14 @@ async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 6],
+        [0, 7],
         "one migrates, and the other takes the lock after it and applies nothing"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     d.drop_databases().await;
 }
