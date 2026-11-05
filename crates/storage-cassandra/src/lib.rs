@@ -32,6 +32,11 @@ pub mod migrations;
 pub mod operations;
 mod password_hash_store;
 pub(crate) mod propagation_hold;
+#[cfg(test)]
+#[path = "../../config/src/sample_toml_support.rs"]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 mod snapshot_engine;
 mod stream_engine;
 pub mod stream_util;

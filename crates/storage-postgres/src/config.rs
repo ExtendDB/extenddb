@@ -6,6 +6,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct PostgresStorageConfig {
     #[serde(default = "default_connection_string")]

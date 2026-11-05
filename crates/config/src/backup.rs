@@ -37,7 +37,7 @@
 //! part of this struct.
 
 use extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The smallest `data_file_target_bytes`: the cap on one line of a data
 /// file, so a file closes at most one line past the knob.
@@ -50,7 +50,7 @@ pub const MIN_STALE_HEARTBEATS: u64 = 3;
 /// The largest `max_concurrent_jobs`.
 pub const MAX_CONCURRENT_JOBS: usize = 1024;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
     /// Uncompressed bytes per data file; a file closes once it reaches this,

@@ -88,72 +88,17 @@ for backend failures.
 
 ### extenddb.toml: Static Configuration
 
-These settings require a server restart to take effect.
+Every key of `extenddb.toml`, its default and what it controls is listed on the [Configuration](../configuration.md) page, which is generated from `extenddb.sample.toml` and checked against the configuration structs by the test suite. These settings take effect at the next server start. Every key can also be set through an environment variable with the `EXTENDDB__` prefix and `__` between levels (`EXTENDDB__SERVER__PORT=9000`); a list key (`import.paths`, `export.paths`, `storage.cassandra.contact_points`) takes one comma-delimited string (`EXTENDDB__IMPORT__PATHS="/data/in,/data/shared"`), with items trimmed and empty items dropped. Precedence, highest first, is environment variables, the configuration file, then the built-in defaults; `extenddb serve --port` overrides `server.port` on top of all three.
 
-#### [server]
+#### PostgreSQL connection budget and restores
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `bind_addr` | `127.0.0.1` | Network interface to bind |
-| `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (under a value outside that class `CreateBackup` is refused with a `ValidationException` naming `server.region`, since no backup ARN can be formed; backups taken before the upgrade under such a region keep an ARN `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup` refuse as "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
+The `pool_size` key of `[storage.postgres]` sizes two pools, one against the catalog database and one against the data database; the Configuration page gives the connection arithmetic. Restores draw on the same pool.
 
-#### [storage]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `backend` | `postgres` | Storage backend: `postgres`, `mongodb`, `sqlite` or `cassandra`. Must match the feature the binary was built with; see [Storage backends](../storage-backends.md) |
-
-#### [storage.postgres]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `connection_string` | `postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog` | Catalog database connection string |
-| `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
-| `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
-
-Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, below), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
+Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, on the [Configuration](../configuration.md) page), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 
 `RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock (the job's claim) for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) the lock lands on a pooled server connection and is not released with the job, so later jobs can be refused as already claimed; do not run backups or restores through one.
 
-#### [storage.sqlite]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
-| `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
-
-#### [backup]
-
-The knobs backup and restore jobs and the reconciler read; every key has a default, and the section may be left out.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `data_file_target_bytes` | `67108864` | Uncompressed bytes per backup data file (minimum 32 MiB); read by the store-backed backup writer |
-| `heartbeat_interval_secs` | `15` | The job heartbeat timer. The in-catalog backup and restore paths of this release heartbeat every 15 s whatever this says |
-| `stale_job_after_secs` | `300` | Heartbeat age after which a job's owner is dead and the reconciler fails the job and removes its restore target. Must be at least three heartbeat periods, where the period is the larger of `heartbeat_interval_secs` and the 15 s the jobs of this release heartbeat at (so 45 at the least, whatever `heartbeat_interval_secs` says); on SQLite a long write transaction delays a heartbeat, so keep a margin above that floor |
-| `failed_row_retention_secs` | `604800` | How long FAILED backup rows are kept for the operator (7 days) |
-| `reconcile_interval_secs` | `60` | The reconciler's cycle; it also runs once at startup |
-| `max_concurrent_jobs` | `4` | Backup and restore jobs this instance runs at once (at most 1024); a request over it waits up to 30 s for a slot, then `LimitExceededException`. On PostgreSQL the pool sizes are raised to `2 * max_concurrent_jobs + 10` when smaller |
-| `spool_path` | (unset) | Restore download area for an S3 store, used by a later release |
-
-#### [auth]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `provider` | `builtin` | Auth provider: `builtin` (SigV4 + IAM). The server refuses to start with `"none"`. |
-
-#### [auth.cache]
-
-In-memory stale-while-revalidate caches eliminate the per-request catalog roundtrip for credentials, IAM policies, principal/resource tags, and table key info. Self-induced changes (admin API and console mutations) propagate instantly via write-through invalidation; off-instance changes take up to `ttl_seconds` to propagate.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | Master kill switch. When `false`, all caches operate in pass-through mode. |
-| `ttl_seconds` | `60` | Hard TTL: entries older than this trigger a fresh, request-blocking load. |
-| `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
-| `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
-| `max_entries` | `10000` | Maximum entries per cache. |
+#### Auth cache statistics and invalidation timing
 
 Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
@@ -162,41 +107,6 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
 - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. The account and role sweeps register a predicate with moka, and moka's `get` applies it, so matching entries are not served once the call returns; moka removes them from its map during later cache operations. The group fanout drops each member's entries in turn. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
-
-#### [server.tls]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | TLS is mandatory. The server refuses to start with `enabled = false`. |
-| `cert_path` | `~/.extenddb/tls/cert.pem` | PEM certificate file |
-| `key_path` | `~/.extenddb/tls/key.pem` | PEM private key file |
-
-`extenddb init` generates a self-signed certificate. Replace with a CA-signed certificate for production.
-
-#### [limits]
-
-All defaults match the DynamoDB service limits. Override only for testing edge cases.
-
-#### [logging]
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `level` | `info` | Initial log level (overridden by runtime setting) |
-| `format` | `pretty` | Log format: `pretty` or `json` |
-
-Logging always goes to syslog (facility: daemon, ident: extenddb).
-
-### Environment Variable Overrides
-
-Any config key can be overridden via environment variables using the `EXTENDDB__` prefix with `__` as separator:
-
-```bash
-EXTENDDB__SERVER__PORT=9000
-EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING="postgresql://..."
-EXTENDDB__AUTH__PROVIDER=builtin
-```
-
-Precedence: CLI flags > environment variables > config file > defaults.
 
 ### Runtime Settings
 

@@ -10,8 +10,10 @@ use serde::Deserialize;
 /// Deliberately does **not** derive `Serialize`: `connection_string` may carry
 /// `user:pass@` credentials, and a `Serialize` impl would let them leave the
 /// process on any serialize path. Matches the postgres backend, which derives
-/// only `Debug, Clone, Deserialize`.
+/// only `Debug, Clone, Deserialize`. The `cfg(test)` derive below exists for
+/// the sample-pinning test and is absent from the library build.
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(deny_unknown_fields)]
 pub struct MongoStorageConfig {
     /// `MongoDB` connection string (mongodb://...)

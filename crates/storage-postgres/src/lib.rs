@@ -26,6 +26,11 @@ pub mod migrations;
 mod operations;
 mod password_hash_store;
 mod pg_util;
+#[cfg(test)]
+#[path = "../../config/src/sample_toml_support.rs"]
+mod sample_toml_support;
+#[cfg(test)]
+mod sample_toml_tests;
 mod snapshot_engine;
 #[doc(hidden)]
 pub use snapshot_engine::map_fetch_error;
