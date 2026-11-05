@@ -124,6 +124,75 @@ fn parse_default_form_with_and_without_space() {
     }
 }
 
+/// Both forms trim the key name, and the default form trims before and after
+/// the comma and before the closing brace; the text inside the quotes keeps
+/// its spaces. Rows W1 to W8 and T4 of `evaluator/tests/variable_spelling.rs`.
+#[test]
+fn parse_trims_spaces_around_the_key_in_both_forms() {
+    let plain = Reference::Key {
+        name: "aws:username",
+        default: None,
+    };
+    for inner in [" aws:username ", "aws:username ", " aws:username"] {
+        assert_eq!(parse_reference(inner), plain, "{inner:?}");
+    }
+    let defaulted = Reference::Key {
+        name: "aws:username",
+        default: Some("anon"),
+    };
+    for inner in [
+        " aws:username , 'anon'",
+        "aws:username ,'anon'",
+        "aws:username,  'anon'",
+        "aws:username, 'anon' ",
+    ] {
+        assert_eq!(parse_reference(inner), defaulted, "{inner:?}");
+    }
+    assert_eq!(
+        parse_reference("aws:username, ' anon '"),
+        Reference::Key {
+            name: "aws:username",
+            default: Some(" anon ")
+        }
+    );
+}
+
+/// The code points up to U+0020 are trimmed and no others (rows T1 to T11
+/// of `evaluator/tests/variable_spelling.rs`).
+#[test]
+fn parse_trims_code_points_up_to_space_and_no_others() {
+    for c in [' ', '\t', '\n', '\u{b}', '\u{c}', '\r', '\u{1}', '\u{1f}'] {
+        let inner = format!("{c}aws:username{c}");
+        assert_eq!(
+            parse_reference(&inner),
+            Reference::Key {
+                name: "aws:username",
+                default: None
+            },
+            "{c:?}"
+        );
+    }
+    for c in ['\u{85}', '\u{a0}', '\u{3000}'] {
+        let inner = format!("{c}aws:username{c}");
+        assert_eq!(
+            parse_reference(&inner),
+            Reference::Key {
+                name: &inner,
+                default: None
+            },
+            "{c:?}"
+        );
+    }
+}
+
+/// `${ * }` and `${ $ }` are the escapes (rows X1 and X2); `${ ? }` follows.
+#[test]
+fn parse_trims_the_escapes() {
+    assert_eq!(parse_reference(" * "), Reference::Escape(b'*'));
+    assert_eq!(parse_reference(" ? "), Reference::Escape(b'?'));
+    assert_eq!(parse_reference("\t$\t"), Reference::Escape(b'$'));
+}
+
 #[test]
 fn parse_comma_without_quotes_is_key_text() {
     assert_eq!(
@@ -298,6 +367,66 @@ fn field_count_rule_holds_after_expansion() {
     ));
 }
 
+// --- `?` and `*` count UTF-16 code units, as `matcher::wildcard_match` does
+// (#581) ---
+
+const TABLE: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/";
+
+/// Whether `table/<pattern>` followed by a variable that expands to nothing
+/// matches `table/<name>`. The variable puts the pattern on the token path;
+/// the answer must be the one `arn_match` gives for `table/<pattern>`.
+fn matches_beside_an_empty_variable(pattern: &str, name: &str) -> bool {
+    let arn = format!("{TABLE}{name}");
+    let with_variable = format!("{TABLE}{pattern}${{aws:PrincipalTag/none, ''}}");
+    let answer = resource_pattern_matches(&with_variable, &arn, true, &Ctx::empty());
+    assert_eq!(
+        answer,
+        arn_match(&format!("{TABLE}{pattern}"), &arn),
+        "{pattern} against {name}"
+    );
+    answer
+}
+
+/// The `Resource` rows of `matcher/utf16_tests.rs`, measured with the IAM
+/// policy simulator: `?` takes the one-unit `\u{e9}` and `\u{65e5}`, and the
+/// two-unit `\u{1f600}` takes `??`. The `?zz` cases follow from them.
+#[test]
+fn question_mark_takes_one_utf16_unit_beside_a_variable() {
+    assert!(matches_beside_an_empty_variable("?", "\u{e9}"));
+    assert!(!matches_beside_an_empty_variable("??", "\u{e9}"));
+    assert!(matches_beside_an_empty_variable("?", "\u{65e5}"));
+    assert!(!matches_beside_an_empty_variable("??", "\u{65e5}"));
+    assert!(!matches_beside_an_empty_variable("?", "\u{1f600}"));
+    assert!(matches_beside_an_empty_variable("??", "\u{1f600}"));
+    assert!(!matches_beside_an_empty_variable("????", "\u{1f600}"));
+    assert!(matches_beside_an_empty_variable("?zz", "\u{e9}zz"));
+    assert!(matches_beside_an_empty_variable("?zz", "\u{65e5}zz"));
+}
+
+/// Measured with the IAM policy simulator: `*??bc` does not match
+/// `\u{65e5}bc` and matches `\u{1f600}bc`, and `*?bc` matches `\u{1f600}bc`.
+#[test]
+fn star_backtracks_by_utf16_units_beside_a_variable() {
+    assert!(!matches_beside_an_empty_variable("*??bc", "\u{65e5}bc"));
+    assert!(matches_beside_an_empty_variable("*??bc", "\u{1f600}bc"));
+    assert!(matches_beside_an_empty_variable("*?bc", "\u{1f600}bc"));
+}
+
+#[test]
+fn a_substituted_value_is_matched_by_utf16_units() {
+    // The value is literal, and a `?` written after it takes one unit.
+    let ctx = Ctx::empty().with(TEAM, &["\u{65e5}"]);
+    let matches = |suffix: &str, name: &str| {
+        let pattern = format!("{TABLE}${{aws:PrincipalTag/team}}{suffix}");
+        resource_pattern_matches(&pattern, &format!("{TABLE}{name}"), true, &ctx)
+    };
+    assert!(matches("?", "\u{65e5}\u{e9}"));
+    assert!(!matches("?", "\u{65e5}\u{1f600}"));
+    assert!(matches("??", "\u{65e5}\u{1f600}"));
+    assert!(!matches("?", "\u{65e5}"));
+    assert!(!matches("?", "\u{65e6}x"));
+}
+
 #[test]
 fn unclosed_brace_is_literal_text() {
     let pattern = "arn:aws:dynamodb:us-east-1:123456789012:table/${aws";
@@ -449,6 +578,31 @@ fn variable_key_names_strip_the_default_and_skip_escapes() {
     let names: Vec<&str> = variable_key_names("${a, b}").collect();
     assert_eq!(names, ["a, b"]);
     assert_eq!(variable_key_names("plain").count(), 0);
+    // The name is trimmed as `parse_reference` trims it.
+    let names: Vec<&str> =
+        variable_key_names("${aws:RequestTag/env , 'x'}${ aws:username }").collect();
+    assert_eq!(names, ["aws:RequestTag/env", "aws:username"]);
+}
+
+/// Without expansion, as in a `2008-10-17` document or under an operator
+/// other than a string or ARN one, the whole value is compared as written:
+/// the default form, a trimmed key and `${key}` itself are all literal text
+/// (rows V1 to V5 of `evaluator/tests/condition_variable_scope.rs`, and the
+/// no-`Version` `${aws:username}` rows of issue #534).
+#[test]
+fn without_expansion_the_whole_value_is_literal_text() {
+    let ctx = Ctx::empty().with("aws:username", &["alice"]);
+    for value in [
+        "${aws:username, 'anon'}",
+        "${aws:PrincipalTag/team, 'none'}",
+        "${ aws:username }",
+        "u-${aws:username}",
+    ] {
+        assert_eq!(
+            expand_condition_value(value, false, &ctx),
+            ConditionValue::Literal(value.to_owned())
+        );
+    }
 }
 
 #[test]

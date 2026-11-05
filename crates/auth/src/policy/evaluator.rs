@@ -234,9 +234,10 @@ fn resource_matches(
     }
 }
 
-/// Outcome of a statement's `Condition` block, three-valued. Policy variables
-/// in condition values are expanded only when `policy` is a `2012-10-17`
-/// document.
+/// Outcome of a statement's `Condition` block, three-valued. `policy` is the
+/// statement's document: its `Version` decides whether the condition values
+/// expand policy variables, which only a `2012-10-17` document does
+/// (`condition::evaluate_condition_with`).
 fn statement_conditions(
     policy: &PolicyDocument,
     statement: &Statement,

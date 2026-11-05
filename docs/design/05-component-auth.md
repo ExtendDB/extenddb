@@ -1587,18 +1587,19 @@ impl AuthLayer {
 
 ## 10. Secret Key Encryption
 
-```rust
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+The implementation is `crates/storage/src/secret_cipher.rs`, on AWS-LC through
+aws-lc-rs ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)). `aad` is the
+access key id.
 
-pub fn encrypt_secret(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    // Generate random 12-byte nonce
-    // Encrypt with AES-256-GCM
+```rust
+pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
+    // Seal with AES-256-GCM under a fresh random 12-byte nonce
     // Return: nonce || ciphertext || tag
 }
 
-pub fn decrypt_secret(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AuthError> {
-    // Extract nonce (first 12 bytes)
-    // Decrypt with AES-256-GCM
+pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
+    // Split off the nonce (first 12 bytes)
+    // Open with the same aad; any mismatch fails
     // Return plaintext
 }
 ```

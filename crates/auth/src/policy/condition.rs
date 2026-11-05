@@ -39,14 +39,17 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
     evaluate_condition_with(condition, true, context)
 }
 
-/// [`evaluate_condition`] with `expand_variables` saying whether the document
-/// expands policy variables in condition values
-/// ([`super::document::PolicyDocument::expands_policy_variables`]). A
+/// [`evaluate_condition`] for a statement of a document whose `Version` is
+/// `2012-10-17` when `version_2012` is true
+/// ([`super::document::PolicyDocument::expands_policy_variables`]).
+///
+/// Only such a document expands policy variables in condition values, and in
+/// it only the string and ARN operators do ([`expands_variables`]). A
 /// `2008-10-17` document, or one with no `Version`, compares each value as
 /// written.
 pub fn evaluate_condition_with(
     condition: &Condition,
-    expand_variables: bool,
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> bool {
     let context_values = context.resolve_key(&condition.key);
@@ -55,7 +58,7 @@ pub fn evaluate_condition_with(
     // numeric value written as a variable is compared as written, and a `Bool`
     // or `Null` value written as one is read as the boolean `false`
     // (`bool_matches`, `null_holds`).
-    let expand_variables = expand_variables && operator_expands_variables(&condition.operator);
+    let expand_variables = expands_variables(&condition.operator, version_2012);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<ConditionValue> = condition
@@ -203,29 +206,27 @@ pub enum ConditionMatch {
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
 /// context reports it as service-populated (case 3), and, when the value is
-/// expanded (`expand_variables` and a string or ARN operator), when a
-/// condition value reads such a key through a `${name}` or `${name, 'default'}`
-/// policy variable, since the variable has no value to expand to and the
-/// service, which has one, would not use the default. A value that also names
-/// a key the request does not carry, with no default, fails closed here
-/// although it matches nothing whatever the other key holds; a `Resource`
-/// pattern of that shape does not. Without `expand_variables`, and under an
-/// operator that does not expand variables ([`operator_expands_variables`]),
-/// the value is not expanded and reads no
-/// key. It also returns `Unresolvable`, whatever `expand_variables` says, when
-/// a value of an `Arn*` operator, with or without a set qualifier or
-/// `IfExists`, contains `${` and has fewer than five `:` written outside its
-/// `${...}` references, such as `${aws:ResourceTag/owner}`. Otherwise returns
-/// `Match` or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are
-/// unchanged.
+/// expanded ([`expands_variables`]: a `2012-10-17` document and a string or
+/// ARN operator), when a condition value reads such a key through a `${name}`
+/// or `${name, 'default'}` policy variable, since the variable has no value to
+/// expand to and the service, which has one, would not use the default. A
+/// value that also names a key the request does not carry, with no default,
+/// fails closed here although it matches nothing whatever the other key
+/// holds; a `Resource` pattern of that shape does not. Where the value is not
+/// expanded it is compared as written and reads no key. It also returns
+/// `Unresolvable`, whatever `version_2012` says, when a value of an `Arn*`
+/// operator, with or without a set qualifier or `IfExists`, contains `${` and
+/// has fewer than five `:` written outside its `${...}` references, such as
+/// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from
+/// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
+/// as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
-    expand_variables: bool,
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     if is_unresolvable(&condition.key, context)
-        || (expand_variables
-            && operator_expands_variables(&condition.operator)
+        || (expands_variables(&condition.operator, version_2012)
             && reads_unresolvable_variable(condition, context))
     {
         return ConditionMatch::Unresolvable;
@@ -234,7 +235,7 @@ pub fn evaluate_condition_match(
     // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
     // IAM gives no decision to match. Failing closed makes a `Deny` apply and
     // keeps an `Allow` from granting. IAM checks the value's fields whatever
-    // the document's `Version`, so the rule does not read `expand_variables`.
+    // the document's `Version`, so the rule does not read `version_2012`.
     if matches!(
         base_operator(&condition.operator),
         ConditionOperator::ArnEquals
@@ -245,7 +246,7 @@ pub fn evaluate_condition_match(
     {
         return ConditionMatch::Unresolvable;
     }
-    if evaluate_condition_with(condition, expand_variables, context) {
+    if evaluate_condition_with(condition, version_2012, context) {
         ConditionMatch::Match
     } else {
         ConditionMatch::NoMatch
@@ -262,12 +263,35 @@ fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
 /// policy variable, a key [`is_unresolvable`] reports.
 ///
 /// The names come from [`super::variables::variable_key_names`], which reads
-/// the default form the way [`expand_policy_variables`] expands it, so a
-/// default written beside such a key does not hide the key from this check.
+/// the text between the braces the way [`expand_policy_variables`] expands
+/// it, so a default written beside such a key does not hide the key from this
+/// check. The caller asks only where the value is expanded
+/// ([`expands_variables`]).
 fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
     condition.values.iter().any(|value| {
         super::variables::variable_key_names(value).any(|name| is_unresolvable(name, context))
     })
+}
+
+/// Whether the values of a condition under `operator`, in a document whose
+/// `Version` is `2012-10-17` when `version_2012` is true, expand policy
+/// variables: only in such a document, and only under the string and ARN
+/// operators ([`operator_expands_variables`]).
+///
+/// IAM reads the `${key, 'default'}` form, and a key name trimmed of the code
+/// points up to U+0020, in the same places (IAM policy simulator, 2026-11-03,
+/// two samples per row): in a `2008-10-17` document and in one with no
+/// `Version`, `${aws:username, 'x'}` is compared as written under
+/// `StringEquals` and `StringNotEquals`, and in a `2012-10-17` document a
+/// default does not take part under `NumericEquals`, `DateGreaterThan`,
+/// `IpAddress`, `Bool` or `Null`, while it does under `StringEquals` and
+/// `ArnLike`. Where this is false the whole value is compared as written:
+/// `${key}` is not expanded either (measured, issue #534: `StringEquals`
+/// `${aws:username}` in a document with no `Version` matches the text and not
+/// the user name, and `NumericEquals` `${aws:PrincipalTag/age}` in a
+/// `2012-10-17` document does not match the tag's value).
+fn expands_variables(operator: &ConditionOperator, version_2012: bool) -> bool {
+    version_2012 && operator_expands_variables(operator)
 }
 
 /// Evaluate a statement's whole condition block (all conditions are ANDed).
@@ -275,18 +299,17 @@ fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionCo
 /// `NoMatch` dominates: if any condition is definitely not satisfied the
 /// statement does not apply, even if another condition is unresolvable. Failing
 /// that, any unresolvable condition makes the block `Unresolvable` (fail
-/// closed). Otherwise every condition matched.
-///
-/// `expand_variables` is the document's
-/// [`super::document::PolicyDocument::expands_policy_variables`].
+/// closed). Otherwise every condition matched. `version_2012` is whether the
+/// statement's document has `Version` `2012-10-17`, as in
+/// [`evaluate_condition_with`].
 pub fn evaluate_statement_conditions(
     conditions: &[Condition],
-    expand_variables: bool,
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     let mut any_unresolvable = false;
     for condition in conditions {
-        match evaluate_condition_match(condition, expand_variables, context) {
+        match evaluate_condition_match(condition, version_2012, context) {
             ConditionMatch::Match => {}
             ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
             ConditionMatch::Unresolvable => any_unresolvable = true,
@@ -350,12 +373,8 @@ fn operator_expands_variables(op: &ConditionOperator) -> bool {
         | ConditionOperator::StringEqualsIgnoreCase
         | ConditionOperator::StringNotEqualsIgnoreCase
         | ConditionOperator::StringLike
-        | ConditionOperator::StringNotLike
-        | ConditionOperator::ArnEquals
-        | ConditionOperator::ArnNotEquals
-        | ConditionOperator::ArnLike
-        | ConditionOperator::ArnNotLike => true,
-        _ => false,
+        | ConditionOperator::StringNotLike => true,
+        other => is_arn_operator(other),
     }
 }
 

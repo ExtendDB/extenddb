@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use super::{trust_decision_for, trust_policy_expands_variables};
+use super::{trust_decision_for, trust_policy_is_version_2012};
 use extenddb_auth::policy::context::AssumeRoleContext;
 
 const CALLER: &str = "arn:aws:iam::123456789012:user/alice";
@@ -59,7 +59,7 @@ fn assumable(doc: &Value) -> bool {
         CALLER,
         &context(),
         false,
-        trust_policy_expands_variables(doc),
+        trust_policy_is_version_2012(doc),
     )
 }
 

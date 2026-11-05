@@ -9,13 +9,16 @@
 //! as the boolean `false`.
 //!
 //! The `Null` cases have the shapes of cells N1f and N1a, measured with the
-//! IAM policy simulator on 2026-10-28 (`condition_variables_operators.rs`).
+//! IAM policy simulator on 2026-10-28 (`condition_variables_operators.rs`),
+//! and of row N5, measured on 2026-11-03 (`condition_variable_scope.rs`).
 //! No other expectation here was measured on its own. Each follows from a
 //! rule the PR #535 body table measured with the IAM policy simulator on
 //! 2026-10-24: text from a value is matched literally (`team=bl*` matches only
 //! `table/bl*`), and a condition value naming `dynamodb:LeadingKeys` is not
 //! expanded under `StringEquals`. The default form in a condition value was
-//! measured under `StringEquals` only (cell E8, `condition_variables.rs`).
+//! measured under `StringEquals` (cell E8, `condition_variables.rs`) and, on
+//! 2026-11-03, under `StringEquals`, `ArnLike` and `Null`
+//! (`condition_variable_scope.rs`).
 
 use super::*;
 
@@ -161,6 +164,20 @@ fn a_null_value_written_with_a_default_reads_as_false() {
     let with_team = Ctx::empty().with("aws:PrincipalTag/team", vec!["blue"]);
     assert_eq!(get(&p, "T", &with_team), AuthzDecision::Allow);
     assert_eq!(get(&p, "T", &Ctx::empty()), AuthzDecision::Deny);
+}
+
+#[test]
+fn the_default_form_is_not_read_in_a_null_condition() {
+    // Row N5 of `condition_variable_scope.rs`: the Deny does not apply to a
+    // caller with neither tag. The text `${aws:PrincipalTag/f, 'true'}` reads
+    // as `false`, so the Deny needs `team`. Read with its default, the value
+    // would be `true` and the Deny would apply.
+    let p = deny_get_if(
+        "Null",
+        "aws:PrincipalTag/team",
+        "${aws:PrincipalTag/f, 'true'}",
+    );
+    assert_eq!(get(&p, "T", &Ctx::empty()), AuthzDecision::Allow);
 }
 
 // --- A multivalued key in a condition value, under every operator form ---
