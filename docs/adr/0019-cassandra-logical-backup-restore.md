@@ -1,4 +1,4 @@
-# ADR-0009: Logical backup and restore for Cassandra
+# ADR-0019: Logical backup and restore for Cassandra
 
 **Status:** Accepted
 **Date:** 2026-08-03

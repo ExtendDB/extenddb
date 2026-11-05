@@ -1,8 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the listener: request timeouts, the first-byte deadline
-//! and `TCP_NODELAY` on both listener modes.
+//! Unit tests for the listener: request timeouts, the first-byte deadline,
+//! `TCP_NODELAY` on both listener modes, and the stop a lost serving
+//! registration asks for.
 
 use super::*;
 use tokio::io::AsyncWriteExt;
@@ -30,7 +31,14 @@ async fn plaintext_listener_closes_a_stalled_header_phase() {
     let timeout = Duration::from_millis(300);
     let (listener, mut client) = bind_and_connect().await;
     let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-    let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        timeout,
+        None,
+        None,
+        Admission::default(),
+    ));
 
     // A request line and one header, no terminating blank line.
     client
@@ -122,7 +130,14 @@ async fn plaintext_listener_closes_a_connection_that_sends_nothing() {
     let timeout = Duration::from_millis(300);
     let (listener, mut client) = bind_and_connect().await;
     let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-    let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        timeout,
+        None,
+        None,
+        Admission::default(),
+    ));
 
     expect_closed_within(&mut client, timeout * 10, "plaintext, zero bytes").await;
     server.abort();
@@ -135,7 +150,14 @@ async fn plaintext_listener_closes_a_partial_h2_preface() {
     let timeout = Duration::from_millis(300);
     let (listener, mut client) = bind_and_connect().await;
     let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-    let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        timeout,
+        None,
+        None,
+        Admission::default(),
+    ));
 
     client
         .write_all(&H2_PREFACE[..16])
@@ -248,7 +270,14 @@ async fn start_tls_listener(
         .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
     let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-    let server = tokio::spawn(serve_app(listener, app, timeout, Some(tls), None));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        timeout,
+        Some(tls),
+        None,
+        Admission::default(),
+    ));
     (addr, cert_der, dir, server)
 }
 
@@ -327,7 +356,14 @@ async fn plaintext_listener_serves_a_request_that_arrives_before_the_deadline() 
     let timeout = Duration::from_millis(600);
     let (listener, mut client) = bind_and_connect().await;
     let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
-    let server = tokio::spawn(serve_app(listener, app, timeout, None, None));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        timeout,
+        None,
+        None,
+        Admission::default(),
+    ));
 
     tokio::time::sleep(timeout / 3).await;
     client
@@ -361,4 +397,35 @@ async fn deadline_tracks_the_version_sniff() {
     let mut adapter = FirstByteDeadline::new(tokio::io::empty(), Duration::from_secs(1));
     assert!(!adapter.sniff_decided(b"PRI"));
     assert!(adapter.sniff_decided(b" + HTTP"));
+}
+
+/// A stop that the registration supervisor asks for ends the plaintext
+/// server through the graceful shutdown a signal starts.
+#[tokio::test]
+async fn a_stop_after_a_lost_registration_ends_the_server_as_a_signal_does() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let admission = Admission::default();
+    let app = Router::new().route("/", axum::routing::get(|| async { "served" }));
+    let server = tokio::spawn(serve_app(
+        listener,
+        app,
+        Duration::from_secs(5),
+        None,
+        None,
+        admission.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!server.is_finished(), "the server stopped by itself");
+    admission.stop("the registration could not be taken again".to_owned());
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("the server stops within 10 s of the stop")
+        .expect("the server task")
+        .expect("the server");
+    assert_eq!(
+        admission.stop_reason(),
+        Some("the registration could not be taken again")
+    );
 }

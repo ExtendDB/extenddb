@@ -38,7 +38,6 @@ bcrypt = { workspace = true }
 unicode-properties = "0.1.4"
 base64 = { workspace = true }
 time = { workspace = true }
-aes-gcm = { workspace = true }
 rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
