@@ -30,12 +30,12 @@ use crate::data::{
     query_with_pk_sk_item_txnid_ts, query_with_pk_sk_txnid, query_with_txnid_ts_pk_sk, select_by_pk,
 };
 
-/// How long a `ClientRequestToken` row lives after the reservation, the
-/// take or the cancellation that last wrote it: the service keeps a
-/// cancelled token used 9 minutes after the cancellation and treats it as
-/// new 11 minutes after (measured 2026-11-05), as the 10 minutes the other
-/// backends read through `created_at`. A send that fails after the
-/// reservation or the take leaves its running row for as long.
+/// How long a `ClientRequestToken` row lives after its last write: the
+/// service keeps a token used 9 minutes after its request, committed or
+/// cancelled, and treats it as new 11 minutes after (measured 2026-11-05),
+/// as the 10 minutes the other backends read through `created_at`. A send
+/// that fails after the reservation or the take leaves its running row for
+/// as long.
 const IDEMPOTENCY_TOKEN_TTL_SECONDS: u32 = 600;
 
 /// What the transaction paths read from one base row.
@@ -1453,7 +1453,9 @@ impl CassandraEngine {
     /// same request then answers as a replay. A failed write is logged: the
     /// row keeps the running fingerprint, so the same request answers
     /// `TransactionInProgress` until the row expires, 10 minutes after the
-    /// reservation or the take.
+    /// reservation or the take. The mark writes the row with
+    /// [`IDEMPOTENCY_TOKEN_TTL_SECONDS`], so the committed token stays used
+    /// for 10 minutes from the commit.
     async fn mark_token_committed(&self, idempotency: Option<(&str, &str, &str)>) {
         let Some((account_id, token, fingerprint)) = idempotency else {
             return;
@@ -1461,6 +1463,7 @@ impl CassandraEngine {
         let keyspace = self.catalog_keyspace();
         let mark_query = format!(
             "UPDATE {keyspace}.idempotency_tokens_by_account \
+             USING TTL {IDEMPOTENCY_TOKEN_TTL_SECONDS} \
              SET fingerprint = ? WHERE account_id = ? AND \"token\" = ? IF fingerprint = ?"
         );
         let marked: Result<bool, StorageError> = crate::cassandra_util::apply_lwt(

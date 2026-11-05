@@ -1099,3 +1099,25 @@ async fn test_a_reserved_token_row_expires_ten_minutes_after_its_reservation() {
         .expect("the reservation has a TTL");
     assert!((590..=600).contains(&ttl), "TTL(created_at) {ttl}");
 }
+
+/// The service keeps the token of a committed request used 9 minutes after
+/// the request and treats it as new 11 minutes after (measured 2026-11-05).
+/// Cassandra keeps that window as the TTL of the commit mark, the write of
+/// the plain fingerprint.
+#[tokio::test]
+async fn test_a_committed_token_row_expires_ten_minutes_after_its_commit() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let table = TestTable::new(&engine, "TxnTokenCommittedTtl", false).await;
+    let key_info = &table.key_info;
+    let token = format!("tok-committed-ttl-{}", uuid::Uuid::new_v4().simple());
+    put_with_token(&engine, key_info, "committed", &token)
+        .await
+        .expect("the Put commits");
+    let (fingerprint, ttl) = token_row(&engine, &key_info.account_id, &token).await;
+    assert_eq!(fingerprint, "fp-put-committed");
+    let ttl = ttl.expect("the committed token row has a TTL");
+    assert!((590..=600).contains(&ttl), "TTL {ttl}");
+}
