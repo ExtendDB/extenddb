@@ -8,11 +8,15 @@
  *
  *   Todo         issue with no assignee and no trusted open linked PR
  *   In Progress  issue assigned or with a trusted open linked PR; any PR that
- *                is a draft, not yet reviewed, or has an outstanding
- *                changes-requested verdict
- *   Review       PR reviewed by a person other than its author (bots ignored),
- *                including one whose changes-requested reviewer has been asked
- *                to review again; an issue whose trusted linked PR is in Review
+ *                is a draft or has an outstanding changes-requested verdict
+ *   Needs review PR that is ready (not a draft) and waits on a reviewer: no
+ *                review from another person yet, or its changes-requested
+ *                reviewers have all been asked to review again
+ *   Review       PR reviewed by a person other than its author (bots ignored)
+ *                with no outstanding changes-requested verdict
+ *
+ * An issue takes the furthest status of its trusted open linked PRs, or
+ * In Progress / Todo from its assignees, whichever is further.
  *
  * A PR whose only human review was dismissed still counts as reviewed: a
  * person did look at it.
@@ -20,7 +24,7 @@
  * It never touches:
  *   - closed or merged items (the board's built-in workflows set Done)
  *   - draft (board-only), inaccessible and archived items
- *   - a card whose Status is not one of the three above (e.g. Done, Blocked)
+ *   - a card whose Status is not one of the four above (e.g. Done, Blocked)
  *   - a card whose "Auto status" field is "Off" (a permanent hold)
  *   - a card a person moved by hand, until the issue, the PR, or the issue's
  *     trusted linked PR changes again. "By hand" is read from the item's
@@ -50,7 +54,7 @@ const HOLD_FIELD = 'Auto status';
 const HOLD_OFF = 'Off';
 const HEARTBEAT_PREFIX = 'Board sweep:';
 // Statuses the sweep manages, lowest to highest.
-const MANAGED = ['Todo', 'In Progress', 'Review'];
+const MANAGED = ['Todo', 'In Progress', 'Needs review', 'Review'];
 const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const REVIEW_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']);
 // Built-in board workflows that also set Status and would fight the sweep.
@@ -203,13 +207,16 @@ function prStatus(pr) {
     (r) => r.state === 'CHANGES_REQUESTED' && !requested.has(r.author.login),
   );
   if (blocking.length > 0) return 'In Progress';
+  // Every changes-requested reviewer was asked to look again: the ball is
+  // back with a reviewer.
+  if (verdicts.some((r) => r.state === 'CHANGES_REQUESTED')) return 'Needs review';
   if (verdicts.length > 0) return 'Review';
 
   // No verdict yet: any submitted human review (comment, dismissed) still counts.
   const reviewed = (pr.reviews?.nodes ?? []).some(
     (r) => r.submittedAt && REVIEW_STATES.has(r.state) && byOtherHuman(r, author),
   );
-  return reviewed ? 'Review' : 'In Progress';
+  return reviewed ? 'Review' : 'Needs review';
 }
 
 /** Open linked PRs an issue may follow. */

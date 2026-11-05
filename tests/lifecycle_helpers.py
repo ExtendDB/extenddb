@@ -201,9 +201,12 @@ def cli_env(tmp_path):
 
     yield env
 
-    # Cleanup: stop server if running, destroy, drop database
+    # Cleanup: stop server if running, destroy, drop database. `--port` keeps
+    # `stop` on this fixture's port: a config that was never patched (or never
+    # written) resolves to the default port, whose PID file belongs to the
+    # shared test server.
     try:
-        _run_extenddb("stop", config=config_path, check=False, timeout=10)
+        _run_extenddb("stop", "--port", str(port), config=config_path, check=False, timeout=10)
     except Exception:
         pass
     try:
