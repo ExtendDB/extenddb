@@ -892,6 +892,244 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 # {"status":"healthy"}
 ```
 
+## Database Backup and Restore
+
+`CreateBackup` stores each table backup in the deployment's own database, in the catalog's `backups` and `backup_items` tables, so losing that database loses those backups as well. To keep a copy of the whole deployment, use the database's own tools as this section describes. The copy holds what ExtendDB keeps in its databases: the accounts, IAM users, roles and policies, access keys, tables, items, stream records and table backups.
+
+The copies taken while the server ran were measured with a client writing to two tables, one of them with a GSI, during the copy. The copies taken with the server stopped were measured after the client's last acknowledged write. A server started on each restored copy returned all writes acknowledged before the copy began. Its GSI queries returned the same items as the base table, and the access keys created before the copy authenticated.
+
+### What a copy holds
+
+The catalog holds the AES-256-GCM key that encrypts the stored secret access keys, in the `encryption_key` row of its `settings` table, next to the encrypted secrets in `access_keys` and `iam_sessions`. Anyone who can read a copy of the catalog can decrypt the secret access keys in it. The catalog also holds the bcrypt hashes of the admin and console passwords. On SQLite the catalog is the database file. On PostgreSQL it is the catalog database, and its `data_database_connection_string` row also holds the application role's password. The PostgreSQL data database holds the items, index entries and stream records. It holds no keys.
+
+Keep copies on encrypted storage, readable by their owner only. Under umask 022, `VACUUM INTO` and the `pg_dump` redirections below create files with mode 0644, which every local user can read. Under `umask 077` they create files with mode 0600.
+
+### Stop the server first
+
+`extenddb stop` finds the server through the PID file the daemon writes. It stops nothing and exits 1 for a server started with `serve --foreground`, which writes no PID file, and when its `--config` path does not name the server's config file. Stop the server through whatever runs it: `sudo systemctl stop extenddb` for the Deployment Guide's systemd unit, the container runtime for a container, otherwise `extenddb stop --config /path/to/extenddb.toml`. Start it again the same way when the procedure is done.
+
+Each procedure below that needs the server stopped is one block that runs in a subshell under `set -e`, so a failed command ends the block and leaves your shell open. Before it touches a file or a database, the block runs `extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'`, which ends the block unless `extenddb status` reports that nothing listens on the configured port. Give the config file as an absolute path: a relative path names another file when the block runs from another directory. `extenddb status` connects to the port on 127.0.0.1, so for a server whose `bind_addr` is another address, also confirm the stop through whatever runs the server.
+
+### SQLite
+
+The database is the file named by `[storage.sqlite] path`, plus the `-wal` and `-shm` files SQLite keeps beside it. `extenddb serve` sets all three to mode 0600 when it opens them, so run the commands below as the user that owns them. The commands keep each copy in a directory of its own under `/path/to/backups`, in a file named `extenddb.sqlite` like the database.
+
+#### Copy while the server runs
+
+```bash
+(
+  set -e
+  umask 077
+  d=/path/to/backups/$(date +%Y%m%d%H%M%S)
+  mkdir -p "$d"
+  sqlite3 -cmd ".timeout 5000" /path/to/extenddb.sqlite "VACUUM INTO '$d/extenddb.sqlite'"
+)
+```
+
+`VACUUM INTO` reads the database in one read transaction and writes a new database file with no `-wal` or `-shm` file. The copy holds the writes committed before its read transaction began, a few milliseconds after the command starts: one copy held 3 writes acknowledged after the command started, the last of them 21 ms after. The server keeps serving reads and writes while it runs. On a 284 MB database the copy took 2.0 s, with a client making about 100 writes a second; 206 of those writes were acknowledged during the copy. `.timeout 5000` sets the shell's busy timeout (its help reads `Try opening locked tables for MS milliseconds`), so the command waits for a lock instead of failing at once.
+
+The commands here were run with sqlite3 3.46.0. SQLite's release history dates `VACUUM INTO` to version 3.27.0. The sqlite3 3.7.17 shell rejects it (`Error: near "INTO": syntax error`) and cannot read the database's schema (`malformed database schema (idx_login_attempts_source_ip_time)`).
+
+Do not use the sqlite3 `.backup` command while the server takes writes. The shell copies 100 pages at a time through SQLite's online backup API, which the SQLite documentation says starts again from the first page when another connection writes to the database between two steps. With the client making about 100 writes a second to the 284 MB database, `.backup` had not finished after 300 s. With no client writing it took 5.0 s.
+
+#### Copy with the server stopped
+
+A non-empty `-wal` file can hold committed writes that are not yet in the database file, and one database file copied without it did not open (`database disk image is malformed`). `extenddb stop` does not always leave the `-wal` file: after seven of eight measured stops the `-wal` and `-shm` files stayed, with up to 4.2 MB in the `-wal` file, and after one they were gone. The block copies each of the three files that exists. Stop the server (see [Stop the server first](#stop-the-server-first)), then run:
+
+```bash
+(
+  set -e
+  umask 077
+  extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+  d=/path/to/backups/$(date +%Y%m%d%H%M%S)
+  mkdir -p "$d"
+  cd /path/to
+  for f in extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm; do
+    if [ -e "$f" ]; then cp -p "$f" "$d/"; fi
+  done
+)
+```
+
+#### Restore a SQLite copy
+
+SQLite applies a `-wal` file to the database file of the same name, so a copy put beside the old `-wal` file gets pages of the old database written over it. With the old `-wal` and `-shm` files left in place, one server answered `ListTables`, returned `InternalServerError` to `Scan` on both tables, and logged `database disk image is malformed`. Another could not open the database and exited 34 s after it started.
+
+The block makes a work directory, `restore-<time>`, beside the database. It copies the saved files into its `new` directory and checks them with `PRAGMA integrity_check`. It then moves the database file and its `-wal` and `-shm` files into its `replaced` directory and moves the saved files into their place. It ends before it moves anything if the server is running or if the check prints anything but `ok`. Stop the server, set `copy` to the directory that holds the copy, and run:
+
+```bash
+(
+  set -e
+  umask 077
+  copy=/path/to/backups/20261101180020
+  extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+  cd /path/to
+  w=restore-$(date +%Y%m%d%H%M%S)
+  mkdir "$w"
+  mkdir "$w/new" "$w/replaced"
+  for f in extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm; do
+    if [ -e "$copy/$f" ]; then cp -p "$copy/$f" "$w/new/"; fi
+  done
+  test "$(sqlite3 "$w/new/extenddb.sqlite" 'PRAGMA integrity_check')" = ok
+  for f in extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm; do
+    if [ -e "$f" ]; then mv "$f" "$w/replaced/"; fi
+  done
+  for f in extenddb.sqlite extenddb.sqlite-wal extenddb.sqlite-shm; do
+    if [ -e "$w/new/$f" ]; then mv "$w/new/$f" .; fi
+  done
+  rmdir "$w/new"
+)
+```
+
+Then start the server and check it as [Check a restored server](#check-a-restored-server) describes. The integrity check writes a copied `-wal` file into the database file and removes it, so a copy taken with the server stopped goes into place as one file. A database file copied without its non-empty `-wal` file failed the check (`database disk image is malformed`), and the block ended with the old files in place. The work directory keeps the replaced files. The server sets a restored file to mode 0600 when it opens it. The `extenddb.sqlite.lock` file can stay where it is.
+
+### PostgreSQL
+
+The catalog database (`<catalog-db>`, `extenddb_catalog` by default) holds the accounts, IAM data, keys, table definitions and table backups. The data database (`<data-db>`, `extenddb` by default) holds a PostgreSQL table for each ExtendDB table and for each index, with their items, and the stream records. A copy needs both databases as of one moment. `<admin>` is the PostgreSQL role `init` connected as (`--pg-user`), and `<owner>` is the application role (`init --extenddb-user`, `extenddb` by default).
+
+#### The two databases must agree
+
+Each `pg_dump` reads one database as of one instant, so two `pg_dump` runs read the catalog and the data database at different instants. Writes to items between the two runs do no harm, because items live only in the data database. A table created or deleted between the runs leaves the two dumps disagreeing. The measurement used a pair with one table deleted and one created between the catalog dump and the data dump.
+
+- The deleted table was back in `ListTables`, and `DescribeTable` reported it `ACTIVE`. `Scan`, `GetItem`, `PutItem` and `DeleteItem` on it returned `ResourceNotFoundException`. `DeleteTable` removed it.
+- The created table was missing. Its items stayed in a table of the data database that the catalog does not name, and a `CreateTable` of the same name made a new, empty table.
+
+`RestoreTableFromBackup` also creates a table, and an `UpdateTable` that adds or removes a GSI creates or drops a table in the data database, so treat them the same way. Two procedures give a copy whose databases agree: dump both databases with the servers stopped, or take a base backup of the PostgreSQL server that holds both.
+
+#### Dump with the servers stopped
+
+Stop every server that uses the catalog (see [Stop the server first](#stop-the-server-first)), then run:
+
+```bash
+(
+  set -e
+  umask 077
+  extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+  test "$(psql -h <host> -U <admin> -d postgres -At -c "SELECT count(*) FROM pg_stat_activity WHERE datname IN ('<catalog-db>', '<data-db>') AND usename = '<owner>'")" = 0
+  pg_dumpall -h <host> -U <admin> --globals-only > globals.sql
+  pg_dump -h <host> -U <admin> -Fc <catalog-db> > catalog.dump
+  pg_dump -h <host> -U <admin> -Fc <data-db> > data.dump
+)
+```
+
+The `pg_stat_activity` query ends the block while any session of the application role is connected to either database, which covers servers on other hosts and servers that `extenddb status` cannot see. A dump holds no roles, so `globals.sql` keeps the application role and its password hash for a restore on another PostgreSQL server. `pg_dumpall --globals-only` reads the password hashes from `pg_authid`, which only a superuser can read: as a role with `CREATEDB` and `CREATEROLE` it failed with `permission denied for table pg_authid`, and with `--no-role-passwords` it wrote the roles without their passwords. Where `<admin>` is not a superuser, as on Amazon RDS and Aurora, add `--no-role-passwords`; [Restore a dump pair](#restore-a-dump-pair) then sets the password. The measured deployment was down for 3.7 s, 3.0 s of it the server's start.
+
+#### Base backup with the server running
+
+`init` creates both databases on one PostgreSQL server. `pg_basebackup` copies that server as of one instant, so the two databases in the copy agree:
+
+```bash
+(
+  set -e
+  umask 077
+  pg_basebackup -h <host> -U <admin> -D - -Ft -X fetch -c fast > base.tar
+)
+```
+
+The archive holds the server's databases and the write-ahead log that makes them consistent. A 147 MB archive took 3.0 s while the client wrote. The PostgreSQL documentation for `pg_basebackup` sets these requirements:
+
+- `<admin>` is a superuser or has the `REPLICATION` attribute. The measured runs used the `postgres` superuser.
+- The server's `wal_level` is `replica` (the default) or `logical`.
+- `pg_hba.conf` allows a replication connection from your host. A line for database `all` does not match a replication connection; it needs `replication` in the database column. The `pgvector/pgvector:pg16` image allows replication connections from the loopback address only. A connection from the container's own non-loopback address failed with `no pg_hba.conf entry for replication connection from host`, and worked once a `host replication all <address>/32 scram-sha-256` line was added and the server reloaded its configuration.
+- With `-X fetch`, the server must still hold all the write-ahead log written during the backup when the backup ends, or the backup fails and is unusable. Set `wal_keep_size` high enough for the log the server writes while the backup runs. The measured server had `wal_keep_size` 0 and a 3.0 s backup.
+
+#### Restore a dump pair
+
+Restore the two dumps of one pair, connected as `<admin>`, into empty databases owned by the application role. In the commands below, `<catalog-db>` and `<data-db>` are the names you restore to, and `/path/to/extenddb.toml` is the config file of the server that will serve them. Stop that server first.
+
+On a new PostgreSQL server, create the roles first. The command reports `role "postgres" already exists`, because a new server has that role. Without the application role, `pg_restore` stops at the first ownership statement (`role "extenddb" does not exist`).
+
+```bash
+psql -h <host> -U <admin> -d postgres -f globals.sql
+```
+
+If `globals.sql` was made with `--no-role-passwords`, the application role has no password, and a server started on the restore failed with `password authentication failed for user "extenddb"`. Set the role's password to the one in the config file's `[storage.postgres] connection_string`, with any `%` escape in it decoded:
+
+```bash
+psql -h <host> -U <admin> -d postgres -c "ALTER ROLE <owner> PASSWORD '<password>'"
+```
+
+On a PostgreSQL server that still holds databases under the names you restore to, rename them first. The restore can then use the names, and the current databases stay until the restored server has passed its check. PostgreSQL refuses the rename while any session is connected to the database (`database "extenddb" is being accessed by other users`).
+
+```bash
+(
+  set -e
+  extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+  psql -h <host> -U <admin> -d postgres -v ON_ERROR_STOP=1 \
+    -c 'ALTER DATABASE <catalog-db> RENAME TO <catalog-db>_before_restore' \
+    -c 'ALTER DATABASE <data-db> RENAME TO <data-db>_before_restore'
+)
+```
+
+Then restore the pair and read where the restored catalog says the data database is:
+
+```bash
+(
+  set -e
+  extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+  createdb -h <host> -U <admin> -O <owner> <catalog-db>
+  createdb -h <host> -U <admin> -O <owner> <data-db>
+  pg_restore -h <host> -U <admin> -d <catalog-db> --exit-on-error < catalog.dump
+  pg_restore -h <host> -U <admin> -d <data-db> --exit-on-error < data.dump
+  psql -h <host> -U <admin> -d <catalog-db> -At -c "SELECT key, value FROM settings WHERE key LIKE 'data_database%' ORDER BY key"
+)
+```
+
+Restored by `<admin>`, the tables are owned by the application role again, as `init` made them. The data dump creates the `vector` extension when the data database had it, and a stock PostgreSQL server lets only a superuser do that. `--exit-on-error` makes `pg_restore` stop at the first error and leaves that database partly restored. If a restore fails after you renamed the old pair, the old pair is as it was: rename the new pair aside and the old pair back, and start the server on them.
+
+```bash
+psql -h <host> -U <admin> -d postgres -v ON_ERROR_STOP=1 \
+  -c 'ALTER DATABASE <catalog-db> RENAME TO <catalog-db>_failed_restore' \
+  -c 'ALTER DATABASE <data-db> RENAME TO <data-db>_failed_restore' \
+  -c 'ALTER DATABASE <catalog-db>_before_restore RENAME TO <catalog-db>' \
+  -c 'ALTER DATABASE <data-db>_before_restore RENAME TO <data-db>'
+```
+
+The restore block ends by printing the two `settings` rows that record the data database, for example `data_database_connection_string|postgresql://extenddb:<password>@127.0.0.1:5432/extenddb` and `data_database_name|extenddb`. `extenddb serve` opens its data connections with `data_database_connection_string` alone, so a server on a catalog whose row names another database, or another PostgreSQL server, reads and writes that one with no error. A server started on a catalog restored as `extenddb_r_catalog`, with the rows unchanged, opened its data connections to the original `extenddb` database and served that database's current items. `extenddb settings set` refuses to change the rows (`Setting 'data_database_name' is read-only and cannot be changed via this command.`).
+
+When the rows name a database other than the one you restored to, or an address other than the one ExtendDB uses to reach it, set both rows to their full new values and read them back. `<host>:<port>` is the address in the config file's connection string. Copy `<owner>:<password>` from the value the restore block printed, because `init` URL-encodes each part.
+
+```bash
+psql -h <host> -U <admin> -d <catalog-db> -v ON_ERROR_STOP=1 \
+  -c "UPDATE settings SET value = '<data-db>' WHERE key = 'data_database_name'" \
+  -c "UPDATE settings SET value = 'postgresql://<owner>:<password>@<host>:<port>/<data-db>' WHERE key = 'data_database_connection_string'" \
+  -c "SELECT key, value FROM settings WHERE key LIKE 'data_database%' ORDER BY key"
+```
+
+Set `[storage.postgres] connection_string` in the config file to the restored catalog database, start the server, and check it as [Check a restored server](#check-a-restored-server) describes. When it has passed the check, remove the renamed databases:
+
+```bash
+psql -h <host> -U <admin> -d postgres -c 'DROP DATABASE <catalog-db>_before_restore' -c 'DROP DATABASE <data-db>_before_restore'
+```
+
+#### Restore a base backup
+
+Extract the archive into an empty data directory for a PostgreSQL server of the same major version, owned by the operating-system user PostgreSQL runs as, with mode 0700:
+
+```bash
+tar -C <data-directory> -xf base.tar
+```
+
+Start PostgreSQL on that directory. It replays the write-ahead log from the archive, logs `consistent recovery state reached`, and then accepts connections. The databases keep their names, roles and owners, so ExtendDB serves them with its config file unchanged when the new server listens at the old address. At another address, change `[storage.postgres] connection_string` in the config file and the `data_database_connection_string` row as for a dump pair. Then check the server as [Check a restored server](#check-a-restored-server) describes.
+
+### Check a restored server
+
+Before clients use a restored server, read every table. A server can answer `ListTables` and `DescribeTable` on a damaged restore and fail only when it reads a table's items. On a SQLite file it could not open, `extenddb serve` printed `extenddb server started`, and the daemon exited 15 to 35 s later. Run the block with an access key of each account in the environment:
+
+```bash
+(
+  set -e
+  export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
+  url=https://127.0.0.1:18443
+  tables=$(aws dynamodb list-tables --endpoint-url "$url" --query 'TableNames[]' --output text)
+  for t in $tables; do
+    n=$(aws dynamodb scan --endpoint-url "$url" --table-name "$t" --select COUNT --query Count --output text)
+    echo "$t $n"
+  done
+)
+```
+
+It prints each table's item count and ends at the first table it cannot read. Compare the counts with the ones you expect, or read items you know with `GetItem`. On a SQLite copy put in place beside the old `-wal` file, `extenddb status` reported the server running 2 s after the start. The block's first request could not connect, so the block ended, and the daemon exited 34 s after the start.
+
 ## Troubleshooting
 
 ### Vector Index Support (PostgreSQL)
@@ -969,17 +1207,7 @@ Increase `pool_size` in `extenddb.toml` or check for connection leaks.
 
 ### Data Recovery
 
-extenddb stores all data in PostgreSQL. Use standard PostgreSQL backup and recovery tools:
-
-```bash
-# Backup
-pg_dump extenddb_catalog > catalog_backup.sql
-pg_dump extenddb_catalog_data > data_backup.sql
-
-# Restore
-psql -f catalog_backup.sql extenddb_catalog
-psql -f data_backup.sql extenddb_catalog_data
-```
+[Database Backup and Restore](#database-backup-and-restore) gives the commands that copy and restore a SQLite or PostgreSQL deployment.
 
 ---
 

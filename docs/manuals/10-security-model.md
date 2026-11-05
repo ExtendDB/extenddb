@@ -328,12 +328,7 @@ Import/export file paths are validated:
 
 ### Backup and Recovery
 
-extenddb stores all state in PostgreSQL. Use standard PostgreSQL tools for backup and recovery:
-
-```bash
-pg_dump extenddb_catalog > catalog_backup.sql
-pg_dump extenddb_catalog_data > data_backup.sql
-```
+See [Database Backup and Restore](05-admin-guide.md#database-backup-and-restore) in the Admin Guide for the copy and restore commands. On SQLite the catalog is the database file, and on PostgreSQL it is the catalog database. Create the copies under `umask 077`, so only their owner can read them.
 
 Encryption keys are stored in the catalog database. A catalog backup includes the encryption key needed to decrypt access key secrets.
 
