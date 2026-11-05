@@ -30,8 +30,8 @@
 #             Docker Hub credentials; the token never coexists with a job
 #             executing a freshly built image. Pushes ONLY commit-addressed
 #             candidate tags (sha-<full-commit>{,-amd64,-arm64}), verifies the
-#             tag ANONYMOUSLY, then signs the index digest (KMS via OIDC,
-#             Rekor, tag-based .sig).
+#             tag ANONYMOUSLY, then signs the index digest (keyless via
+#             OIDC, Rekor, tag-based .sig).
 #
 #   propagate Second approval (ghcr environment): copies image + signature to
 #             GHCR and ECR Public via the copy-artifact composite action —
@@ -390,7 +390,7 @@ jobs:
       sig-digest: ${{ steps.sign.outputs.sig-digest }}
     permissions:
       contents: read
-      id-token: write   # KMS signing role (OIDC)
+      id-token: write   # keyless signing (Sigstore/Fulcio) via OIDC
     steps:
       - name: Check out (composite signing action lives in-repo)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -507,21 +507,13 @@ jobs:
           grep -q '"architecture": *"amd64"' <<< "$RAW" || { echo "::error::amd64 missing from published index"; exit 1; }
           grep -q '"architecture": *"arm64"' <<< "$RAW" || { echo "::error::arm64 missing from published index"; exit 1; }
 
-      - name: Assume the signing role via OIDC
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBContainerSigningCI
-          role-session-name: extenddb-release-sign-${{ github.run_id }}
-          aws-region: us-east-1
-
-      - name: Sign the candidate (composite action; Rekor ON, tag-based .sig)
+      - name: Sign the candidate (composite action; keyless, Rekor ON, tag-based .sig)
         id: sign
         uses: ./.github/actions/sign-image
         with:
           image-repo: ${{ needs.gate.outputs.image_repo }}
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
-          key-arn: arn:aws:kms:us-east-1:975306274793:key/654ab7f4-4a11-45e1-a313-3a6989f3721c
 
       - name: Summarise for the release checklist
         if: always()
