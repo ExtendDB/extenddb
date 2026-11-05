@@ -24,14 +24,22 @@
 //! (`WriteOutcome::Unknown`: the statement may have reached the server);
 //! a server error (a command or write error) is `Err`, as a statement error
 //! is on PostgreSQL.
+//!
+//! The maintenance claim is one document (`_id: "claim"`) in
+//! `backup_maintenance`: a record whose heartbeat is older than the stale
+//! window is taken over by a conditional update, a missing one is inserted by
+//! an upsert whose filter a live record never matches (its insert then trips
+//! the `_id` index and the claim is refused), and heartbeats and the release
+//! are conditioned on the generation. `$expr` is not allowed in an upsert's
+//! filter, which is why the takeover and the insert are two writes.
 
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields, StoreIdentity,
-    StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StaleClock,
+    StatusFields, StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -196,6 +204,31 @@ fn key_filter(key: &BackupKey) -> Document {
     doc! { "account_id": &key.account_id, "backup_id": &key.backup_id }
 }
 
+/// The filter for the rows of `store`.
+fn store_filter(store: &StoreIdentity) -> Document {
+    doc! {
+        "store_kind": store.store_kind.as_str(),
+        "store_root": &store.store_root,
+        "store_id": &store.store_id,
+    }
+}
+
+/// The `$expr` of [`BackupCatalog::list_backup_rows_older_than`]: the
+/// `clock` column older than `age` on the server's clock. `age_is_stale`
+/// reads a missing column as the epoch, which is the rule the dead-job
+/// listing wants and not this one: a row with `completed_at` unset has not
+/// reached its terminal status's clock, so the column must also be present.
+fn older_than_filter(clock: StaleClock, age: Duration) -> Document {
+    let column = match clock {
+        StaleClock::Heartbeat => "heartbeat_at",
+        StaleClock::Completed => "completed_at",
+    };
+    doc! {
+        column: { "$type": "date" },
+        "$expr": age_is_stale(&[column], age),
+    }
+}
+
 /// The sort every listing applies: `(created_at, backup_arn)`.
 fn listing_sort() -> Document {
     doc! { "created_at": 1, "backup_arn": 1 }
@@ -242,6 +275,28 @@ pub(crate) fn dead_restore_job_filter(stale_after: Duration) -> Document {
             },
         ]
     }
+}
+
+/// A restore job record as the two listings read a table document.
+fn restore_job_row(doc: &Document) -> Result<RestoreJobRow, StorageError> {
+    let id = doc
+        .get_document("_id")
+        .map_err(|_| StorageError::Internal("table is missing _id".to_owned()))?;
+    let job = doc.get_document(RESTORE_JOB).map_err(|_| {
+        StorageError::Internal("restore target is missing its job record".to_owned())
+    })?;
+    Ok(RestoreJobRow {
+        target: RestoreTargetKey {
+            account_id: required_str(id, "account_id")?,
+            table_name: required_str(id, "table_name")?,
+            table_id: required_str(doc, "table_id")?,
+        },
+        source_backup_arn: required_str(doc, "restore_source_backup_arn")?,
+        kind: RestoreKind::parse(&required_str(job, "kind")?)?,
+        status: JobStatus::parse(&required_str(job, "status")?)?,
+        owner_generation: generation_from_field(job, "owner_generation"),
+        heartbeat_at: optional_datetime(job, "heartbeat_at").unwrap_or(0.0),
+    })
 }
 
 /// A backup job's handle on its `backup_index` document.
@@ -530,11 +585,7 @@ impl BackupCatalog for MongoEngine {
         store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
         rows_stream(async move {
-            let mut filter = doc! {
-                "store_kind": store.store_kind.as_str(),
-                "store_root": &store.store_root,
-                "store_id": &store.store_id,
-            };
+            let mut filter = store_filter(store);
             if let Some(status) = status {
                 filter.insert("status", status.as_str());
             }
@@ -546,6 +597,24 @@ impl BackupCatalog for MongoEngine {
                 .try_collect()
                 .await
                 .map_err(internal)
+        })
+    }
+
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        store: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        Box::pin(async move {
+            let mut filter = store_filter(store);
+            filter.insert("status", BackupStatus::Available.as_str());
+            self.backup_index()
+                .find_one(filter)
+                .sort(doc! { "created_at": -1, "backup_arn": -1 })
+                .await
+                .map_err(internal)?
+                .as_ref()
+                .map(row_from_doc)
+                .transpose()
         })
     }
 
@@ -648,6 +717,46 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let mut filter = key_filter(key);
+            filter.insert("status", BackupStatus::Creating.as_str());
+            filter.insert("$expr", age_is_stale(&["heartbeat_at"], stale_after));
+            let result = self
+                .backup_index()
+                .delete_one(filter)
+                .await
+                .map_err(internal)?;
+            Ok(result.deleted_count == 1)
+        })
+    }
+
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        status: BackupStatus,
+        store: &'a StoreIdentity,
+        clock: StaleClock,
+        age: Duration,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        rows_stream(async move {
+            let mut filter = store_filter(store);
+            filter.insert("status", status.as_str());
+            filter.extend(older_than_filter(clock, age));
+            self.backup_index()
+                .find(filter)
+                .sort(listing_sort())
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)
+        })
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -729,41 +838,33 @@ impl BackupCatalog for MongoEngine {
             // cannot read, so one such document does not stop the cycle.
             Ok(docs
                 .iter()
-                .filter_map(|doc| {
-                    let read = || -> Result<RestoreJobRow, StorageError> {
-                        let id = doc.get_document("_id").map_err(|_| {
-                            StorageError::Internal("table is missing _id".to_owned())
-                        })?;
-                        let job = doc.get_document(RESTORE_JOB).map_err(|_| {
-                            StorageError::Internal(
-                                "restore target is missing its job record".to_owned(),
-                            )
-                        })?;
-                        Ok(RestoreJobRow {
-                            target: RestoreTargetKey {
-                                account_id: required_str(id, "account_id")?,
-                                table_name: required_str(id, "table_name")?,
-                                table_id: required_str(doc, "table_id")?,
-                            },
-                            source_backup_arn: required_str(doc, "restore_source_backup_arn")?,
-                            kind: RestoreKind::parse(&required_str(job, "kind")?)?,
-                            status: JobStatus::parse(&required_str(job, "status")?)?,
-                            owner_generation: generation_from_field(job, "owner_generation"),
-                            heartbeat_at: optional_datetime(job, "heartbeat_at").unwrap_or(0.0),
-                        })
-                    };
-                    match read() {
-                        Ok(row) => Some(row),
-                        Err(e) => {
-                            tracing::warn!(
-                                "reconciler: restore job record {:?} skipped: {e}",
-                                doc.get("_id")
-                            );
-                            None
-                        }
+                .filter_map(|doc| match restore_job_row(doc) {
+                    Ok(row) => Some(row),
+                    Err(e) => {
+                        tracing::warn!(
+                            "reconciler: restore job record {:?} skipped: {e}",
+                            doc.get("_id")
+                        );
+                        None
                     }
                 })
                 .collect())
+        })
+    }
+
+    fn list_running_restore_jobs(&self) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            // By status alone: a record stamped in this read's instant, or
+            // ahead of the server's clock, is RUNNING too.
+            let docs: Vec<Document> = self
+                .tables()
+                .find(doc! { RESTORE_JOB_STATUS: JobStatus::Running.as_str() })
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)?;
+            docs.iter().map(restore_job_row).collect()
         })
     }
 
@@ -802,15 +903,183 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
+        Box::pin(async move {
+            let ids = self
+                .backup_index()
+                .distinct(
+                    "store_id",
+                    doc! { "store_kind": store_kind.as_str(), "store_root": store_root },
+                )
+                .await
+                .map_err(internal)?;
+            let mut ids: Vec<String> = ids
+                .into_iter()
+                .filter_map(|v| match v {
+                    Bson::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            ids.sort();
+            Ok(ids)
+        })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        Box::pin(async move {
+            // The record is the claim, as a backup row is: one document under
+            // a fixed `_id`. Two writes: the first takes over a record whose
+            // heartbeat is stale (a dead holder's), the second inserts the
+            // record when there is none. A live record matches neither
+            // filter, so the second write's upsert trips the `_id` index and
+            // the claim is refused; two commands racing for a stale record
+            // both run the first write, and the one whose filter no longer
+            // matches falls to the second and is refused the same way.
+            // (`$expr` is not allowed in an upsert's filter, which is why
+            // the two are not one write.)
+            let generation = new_generation();
+            let collection = self.maintenance();
+            let set = doc! { "$set": {
+                "holder": { "$literal": holder },
+                "owner_generation": { "$literal": generation_field(generation) },
+                "claimed_at": "$$NOW",
+                "heartbeat_at": "$$NOW",
+            } };
+            let refused = |current: Option<String>| {
+                StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {}",
+                    current.as_deref().unwrap_or("another maintenance command")
+                ))
+            };
+            let taken_over = collection
+                .update_one(
+                    doc! {
+                        "_id": MAINTENANCE_CLAIM_ID,
+                        "$expr": age_is_stale(&["heartbeat_at"], stale_after),
+                    },
+                    vec![set.clone()],
+                )
+                .await
+                .map_err(internal)?
+                .matched_count
+                == 1;
+            if !taken_over {
+                match collection
+                    .update_one(
+                        doc! {
+                            "_id": MAINTENANCE_CLAIM_ID,
+                            "owner_generation": { "$exists": false },
+                        },
+                        vec![set],
+                    )
+                    .upsert(true)
+                    .await
+                {
+                    // The upsert matched a document with no
+                    // `owner_generation` (an operator's insert, say, not a
+                    // release's) and overwrote it with this call's
+                    // generation: the claim is this call's, and refusing here
+                    // would leave a document nobody heartbeats until it goes
+                    // stale.
+                    Ok(result) if result.upserted_id.is_some() || result.matched_count == 1 => {}
+                    Ok(_) => return Err(refused(None)),
+                    Err(e) if is_duplicate_key(&e) => {
+                        let current = collection
+                            .find_one(doc! { "_id": MAINTENANCE_CLAIM_ID })
+                            .await
+                            .map_err(internal)?
+                            .and_then(|d| d.get_str("holder").ok().map(str::to_owned));
+                        return Err(refused(current));
+                    }
+                    Err(e) => return Err(internal(e)),
+                }
+            }
+            Ok(Box::new(MongoMaintenanceClaim {
+                collection,
+                generation,
+            }) as Box<dyn MaintenanceClaim>)
+        })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
         Box::pin(async move {
             let held = self
-                .catalog_db
-                .collection::<Document>(BACKUP_MAINTENANCE)
-                .find_one(doc! {})
+                .maintenance()
+                .find_one(doc! {
+                    "$nor": [ { "$expr": age_is_stale(&["heartbeat_at"], stale_after) } ],
+                })
                 .await
                 .map_err(internal)?;
             Ok(held.is_some())
+        })
+    }
+}
+
+/// The `_id` of the one maintenance claim document.
+const MAINTENANCE_CLAIM_ID: &str = "claim";
+
+impl MongoEngine {
+    fn maintenance(&self) -> mongodb::Collection<Document> {
+        self.catalog_db.collection::<Document>(BACKUP_MAINTENANCE)
+    }
+}
+
+/// The holder's handle on the maintenance claim document.
+struct MongoMaintenanceClaim {
+    collection: mongodb::Collection<Document>,
+    generation: u64,
+}
+
+impl MongoMaintenanceClaim {
+    fn owned_filter(&self) -> Document {
+        doc! {
+            "_id": MAINTENANCE_CLAIM_ID,
+            "owner_generation": generation_field(self.generation),
+        }
+    }
+}
+
+impl MaintenanceClaim for MongoMaintenanceClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let result = self
+                .collection
+                .update_one(
+                    self.owned_filter(),
+                    vec![doc! { "$set": { "heartbeat_at": "$$NOW" } }],
+                )
+                .await
+                .map_err(|e| StorageError::Internal(format!("maintenance heartbeat: {e}")))?;
+            Ok(if result.matched_count == 1 {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            self.collection
+                .delete_one(self.owned_filter())
+                .await
+                .map_err(internal)?;
+            Ok(())
         })
     }
 }
@@ -904,6 +1173,33 @@ mod tests {
         )
         .into();
         assert!(!outcome_unknown(&command));
+    }
+
+    /// The older-than filter reads the named column alone against the
+    /// server's clock and requires the column to be a date, so a row whose
+    /// `completed_at` was never stamped is not read as old as the epoch.
+    #[test]
+    fn the_older_than_filter_names_one_clock_column_and_requires_it_set() {
+        let heartbeat = older_than_filter(StaleClock::Heartbeat, Duration::from_secs(90));
+        assert_eq!(
+            heartbeat.get_document("heartbeat_at").unwrap(),
+            &doc! { "$type": "date" }
+        );
+        assert!(heartbeat.get("completed_at").is_none());
+        let expr = heartbeat.get_document("$expr").unwrap().to_string();
+        assert!(expr.contains("$heartbeat_at"), "{expr}");
+        assert!(!expr.contains("completed_at"), "{expr}");
+        assert!(expr.contains("$$NOW") && expr.contains("90000"), "{expr}");
+
+        let completed = older_than_filter(StaleClock::Completed, Duration::from_secs(90));
+        assert_eq!(
+            completed.get_document("completed_at").unwrap(),
+            &doc! { "$type": "date" }
+        );
+        assert!(completed.get("heartbeat_at").is_none());
+        let expr = completed.get_document("$expr").unwrap().to_string();
+        assert!(expr.contains("$completed_at"), "{expr}");
+        assert!(!expr.contains("heartbeat_at"), "{expr}");
     }
 
     /// The dead-job filter selects, by the server's clock, RUNNING records

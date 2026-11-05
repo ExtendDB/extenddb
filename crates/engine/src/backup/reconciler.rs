@@ -2,14 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The reconciler: the periodic worker that resolves catalog rows whose
-//! owner is dead.
+//! owner is dead, and keeps the configured store's health current.
 //!
 //! One cycle runs every `interval`. It first checks the catalog-level
 //! maintenance claim; while a maintenance command holds it the reconciler
-//! runs only the duties that resolve the states the command waits on, which
-//! today are every duty it has, so the check is what decides when the other
-//! duties are added. The duties, over the records `list_dead_restore_jobs`
-//! returns:
+//! runs only the duties below, which resolve the states the command waits
+//! on or finishes itself (the dead-owner duties, the store's check and the
+//! DELETING rows); the duties a later release adds that delete or move a
+//! row the command does not wait on (a FAILED row's prefix, tombstone
+//! retention) go in the branch the flag skips.
+//!
+//! The claim is read through `check_maintenance_claim(stale_job_after)`,
+//! except in a cycle a maintenance command runs itself while it holds the
+//! claim (`backup purge` on SQLite, with a zero dead-owner window): that
+//! caller's state says so ([`ReconcilerState::for_maintenance_holder`]) and
+//! the cycle takes the held branch without reading the claim. Read through
+//! the clock, a zero window would see the command's own claim held only
+//! when its heartbeat and the check land in the same instant, so the
+//! branch would be decided by scheduler timing.
+//!
+//! The duties, over the records `list_dead_restore_jobs` returns:
 //!
 //! - A RUNNING restore job record whose `heartbeat_at` is older than
 //!   `stale_job_after` (on the catalog's clock) has a dead owner. One of kind
@@ -34,6 +46,28 @@
 //!   `delete`, which takes its items with it, unless the backend removed it
 //!   in the call that reported it (`AbandonedLegacyBackup::removed`), when
 //!   the reconciler only logs it.
+//! - With a store configured: the store's check runs again
+//!   ([`super::check_configured_store`]: `validate` while it has not passed,
+//!   then the identity check and manifest probe) and sets the store's
+//!   health, so a store whose checks run after the listener is up, or that
+//!   failed at startup or later, is healthy once a check passes, and one
+//!   that fails is refused from the next cycle on. The check runs after the
+//!   duties above and under the store's bound
+//!   ([`super::ConfiguredStore::check_timeout`]: 5 s for a filesystem root,
+//!   30 s for a bucket), so a store that has stopped answering costs each
+//!   cycle that bound and nothing more: the dead-owner duties run every
+//!   `interval` plus the bound, the check is recorded as a transport
+//!   failure, and a filesystem check leaves one blocking thread parked on
+//!   the mount until it answers, after which no check starts until that
+//!   call returns (the runtime module's in-flight rule), so a mount that
+//!   stays stalled parks one thread and not one per cycle. The check is
+//!   also selected against the shutdown token, so a cycle that is checking
+//!   when the server stops returns at once and the drain finishes.
+//!   While the store is healthy, each DELETING row of the configured store
+//!   (a DeleteBackup whose deletion did not finish) is finished
+//!   (`finish_backup_delete` in the engine's backup module): the manifest, then the prefix, then
+//!   the row to DELETED. While it is unhealthy the reconciler acts on no row
+//!   of the store.
 //!
 //! A cycle that fails logs and waits for the next; each cycle records the
 //! worker metrics the other workers record (`WorkerLastSuccess` and
@@ -44,10 +78,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::metrics::{MetricsCollector, QuerySource};
-use extenddb_storage::backup_catalog::{JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey};
+use extenddb_storage::backup_catalog::{
+    BackupStatus, JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupCatalog, CancellationToken, LegacyBackupReader, sleep_or_shutdown};
+use futures::TryStreamExt;
+
+use super::BackupRuntime;
 
 /// The two durations a reconciler reads from `[backup]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,25 +122,65 @@ pub struct CycleReport {
     pub manifest_restores_logged: Vec<String>,
     /// In-catalog CREATING backup rows removed, by ARN.
     pub legacy_backups_removed: Vec<String>,
+    /// The configured store's health after this cycle's check; `None` with
+    /// no store configured.
+    pub store_healthy: Option<bool>,
+    /// DELETING rows of the configured store moved to DELETED, by ARN.
+    pub deletions_finished: Vec<String>,
 }
 
 /// What a reconciler carries from one cycle to the next: the manifest
 /// records it has already logged, so a record it cannot act on is reported
-/// once rather than every cycle. The caller of [`run`] owns it and hands the
+/// once rather than every cycle (the caller of [`run`] owns it and hands the
 /// same state to every worker it starts, so the set outlives a worker
-/// restart (`serve` restarts its workers each time it takes the serving
-/// registration again).
+/// restart: `serve` restarts its workers each time it takes the serving
+/// registration again), the worker's shutdown token, which the
+/// store's check is selected against, and, for a maintenance command's own
+/// cycle, that its caller holds the maintenance claim.
 #[derive(Debug, Default)]
 pub struct ReconcilerState {
     logged_manifest_restores: HashSet<RestoreTargetKey>,
+    shutdown: Option<CancellationToken>,
+    /// `Some(true)` when the caller holds the maintenance claim: the cycle
+    /// takes the held branch and does not read the claim. `None` reads it
+    /// through `check_maintenance_claim`.
+    maintenance_held: Option<bool>,
+}
+
+impl ReconcilerState {
+    /// A state whose cycles stop waiting on the store's check when `shutdown`
+    /// fires (the health is then left as the last check left it). A default
+    /// state, which commands and tests use, waits the check's bound.
+    #[must_use]
+    pub fn with_shutdown(shutdown: CancellationToken) -> Self {
+        Self {
+            shutdown: Some(shutdown),
+            ..Self::default()
+        }
+    }
+
+    /// The state of a cycle that a maintenance command runs while it holds
+    /// the maintenance claim: the cycle takes the held branch without
+    /// reading the claim, whatever window it is given.
+    #[must_use]
+    pub fn for_maintenance_holder() -> Self {
+        Self {
+            maintenance_held: Some(true),
+            ..Self::default()
+        }
+    }
 }
 
 /// Run cycles every `settings.interval` until `shutdown` fires. One cycle
 /// runs at once at startup, so a restart resolves what the stopped process
-/// left without waiting an interval. `state` is locked for each cycle.
+/// left without waiting an interval. `backend` names the storage backend in
+/// an identity file this worker has to rewrite. `state` is locked for each
+/// cycle.
 pub async fn run<S>(
     storage: Arc<S>,
+    runtime: Arc<BackupRuntime>,
     settings: ReconcilerSettings,
+    backend: String,
     metrics: Arc<MetricsCollector>,
     state: Arc<tokio::sync::Mutex<ReconcilerState>>,
     shutdown: CancellationToken,
@@ -111,7 +191,17 @@ pub async fn run<S>(
         let started = std::time::Instant::now();
         let outcome = {
             let mut state = state.lock().await;
-            cycle(&*storage, settings.stale_job_after, &mut state).await
+            // The state outlives this worker (it is `serve`'s); the token is
+            // this worker's, so it is set here, each cycle.
+            state.shutdown = Some(shutdown.clone());
+            cycle(
+                &*storage,
+                &runtime,
+                settings.stale_job_after,
+                &backend,
+                &mut state,
+            )
+            .await
         };
         match outcome {
             Ok(report) => {
@@ -121,12 +211,14 @@ pub async fn run<S>(
                 if !report.legacy_restores_removed.is_empty()
                     || !report.failed_targets_removed.is_empty()
                     || !report.legacy_backups_removed.is_empty()
+                    || !report.deletions_finished.is_empty()
                 {
                     tracing::info!(
                         "backup reconciler: removed {} abandoned restore target(s) and {} \
-                         abandoned in-catalog backup(s)",
+                         abandoned in-catalog backup(s), finished {} deletion(s)",
                         report.legacy_restores_removed.len() + report.failed_targets_removed.len(),
-                        report.legacy_backups_removed.len()
+                        report.legacy_backups_removed.len(),
+                        report.deletions_finished.len()
                     );
                 }
             }
@@ -141,7 +233,10 @@ pub async fn run<S>(
     }
 }
 
-/// One cycle: the maintenance check, then the duties.
+/// One cycle: the maintenance check (or the caller's word that it holds
+/// the claim, from `state`), then the duties. `stale_job_after` is the
+/// dead-owner window; it is also the claim's stale window when the claim is
+/// read.
 ///
 /// # Errors
 ///
@@ -149,20 +244,26 @@ pub async fn run<S>(
 /// logged and the cycle goes on to the next row.
 pub async fn cycle<S>(
     storage: &S,
+    runtime: &BackupRuntime,
     stale_job_after: Duration,
+    backend: &str,
     state: &mut ReconcilerState,
 ) -> Result<CycleReport, StorageError>
 where
     S: BackupCatalog + LegacyBackupReader + ?Sized,
 {
+    let maintenance_held = match state.maintenance_held {
+        Some(held) => held,
+        None => storage.check_maintenance_claim(stale_job_after).await?,
+    };
     let mut report = CycleReport {
-        maintenance_held: storage.check_maintenance_claim().await?,
+        maintenance_held,
         ..CycleReport::default()
     };
     if report.maintenance_held {
         tracing::info!(
             "backup reconciler: a maintenance claim is held; running only the duties that \
-             resolve rows whose owner is dead"
+             resolve rows whose owner is dead, the store's check and the DELETING rows"
         );
     }
 
@@ -246,7 +347,116 @@ where
             ),
         }
     }
+
+    if let Some(store) = runtime.configured_store() {
+        let check = super::check_configured_store(store, storage, backend);
+        let outcome = match &state.shutdown {
+            Some(shutdown) => tokio::select! {
+                outcome = check => Some(outcome),
+                () = shutdown.cancelled() => None,
+            },
+            None => Some(check.await),
+        };
+        match outcome {
+            Some(outcome) => {
+                // The defaulted SQLite root's rule, applied to the first
+                // check when the startup checks did not finish and left the
+                // store checking: a failure with no rows for the root is the
+                // warning the startup check would have given, and the store
+                // is left unconfigured rather than unhealthy.
+                if store.is_defaulted()
+                    && store.health() == super::StoreHealth::Checking
+                    && let Err(problem) = &outcome
+                    && !matches!(problem, super::StoreProblem::Catalog(_))
+                    && storage
+                        .read_store_ids(store.kind, &store.root)
+                        .await
+                        .is_ok_and(|ids| ids.is_empty())
+                {
+                    tracing::warn!(
+                        "backup store: the default root {} failed its first check ({problem}); \
+                         the catalog has no backup rows for it, so the store is unconfigured and \
+                         CreateBackup writes in-catalog backups. Fix the root (owned by this \
+                         user, mode 0700, under directories others cannot write to, its \
+                         extenddb-store.json naming this catalog), configure [backup.store] to \
+                         choose another, or set kind = \"disabled\" to silence this",
+                        store.root
+                    );
+                    store.set_aside();
+                    return Ok(report);
+                }
+                store.record_check(outcome);
+            }
+            None => {
+                tracing::info!(
+                    "backup store ({}) check was stopped by shutdown; its health is left as the \
+                     last check left it",
+                    store.kind
+                );
+                report.store_healthy = Some(store.is_healthy());
+                return Ok(report);
+            }
+        }
+        report.store_healthy = Some(store.is_healthy());
+        if let Some(identity) = store.identity().filter(|_| store.is_healthy()) {
+            report.deletions_finished = finish_deleting_rows(storage, store, &identity).await?;
+        }
+    }
+
+    if !report.maintenance_held {
+        // The duties a maintenance command does not wait on and must not
+        // race: a later release's deletion of a FAILED row's prefix and its
+        // removal of tombstones past their retention run here.
+    }
     Ok(report)
+}
+
+/// The duty for DELETING rows of the configured store: finish each deletion.
+/// Returns the ARNs moved to DELETED; a row whose deletion fails is logged
+/// and left for the next cycle.
+async fn finish_deleting_rows<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    store: &super::ConfiguredStore,
+    identity: &extenddb_storage::backup_catalog::StoreIdentity,
+) -> Result<Vec<String>, StorageError> {
+    let rows: Vec<_> = storage
+        .list_backup_rows(Some(BackupStatus::Deleting), identity)
+        .try_collect()
+        .await?;
+    let mut finished = Vec::new();
+    for row in rows {
+        let arn = match BackupArn::parse(&row.backup_arn) {
+            Ok(arn) => arn,
+            Err(e) => {
+                tracing::error!(
+                    "DELETING row {} carries an ARN this build cannot parse; left as it is: {e}",
+                    row.backup_arn
+                );
+                continue;
+            }
+        };
+        match super::finish_backup_delete(storage, &store.calls("deletion"), &arn).await {
+            Ok(true) => {
+                tracing::info!(
+                    "finished the deletion of backup {} (account {})",
+                    row.backup_arn,
+                    row.account_id
+                );
+                finished.push(row.backup_arn);
+            }
+            Ok(false) => tracing::info!(
+                "backup {} was no longer DELETING when its objects were gone; left to its owner",
+                row.backup_arn
+            ),
+            Err(e) => tracing::error!(
+                "could not finish the deletion of backup {} (account {}); the next cycle \
+                 retries: {e}",
+                row.backup_arn,
+                row.account_id
+            ),
+        }
+    }
+    Ok(finished)
 }
 
 /// Mark a dead legacy restore FAILED and remove its target. The FAILED write

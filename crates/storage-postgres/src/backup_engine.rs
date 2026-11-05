@@ -112,6 +112,14 @@ impl ClaimSession {
         &mut self.conn
     }
 
+    /// End the session, releasing its advisory lock; a close that fails is
+    /// logged (the server reaps the connection either way).
+    pub(crate) async fn close(self) {
+        if let Err(e) = <sqlx::PgConnection as sqlx::Connection>::close(self.conn).await {
+            tracing::warn!("closing a claim session: {e}");
+        }
+    }
+
     /// Run `statement`, bound with the record's key and this generation, on
     /// the claim connection and report whether it refreshed exactly one row.
     pub(crate) async fn confirm(
@@ -193,6 +201,18 @@ pub(crate) async fn try_claim(
     key: &str,
     permit: Option<JobPermit>,
 ) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim_with(pool, key, permit, 1, Duration::ZERO).await
+}
+
+/// [`try_claim`] trying the lock up to `tries` times on the one connection,
+/// `pause` apart, before answering `Ok(None)`.
+pub(crate) async fn try_claim_with(
+    pool: &sqlx::PgPool,
+    key: &str,
+    permit: Option<JobPermit>,
+    tries: u32,
+    pause: Duration,
+) -> Result<Option<ClaimSession>, StorageError> {
     let options = pool.connect_options();
     let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect_with(&options)
         .await
@@ -214,12 +234,19 @@ pub(crate) async fn try_claim(
              the server setting: {e}"
         );
     }
-    let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
-        .bind(key)
-        .bind(RESTORE_LOCK_SEED)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+    let mut taken = false;
+    for attempt in 1..=tries.max(1) {
+        taken = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
+            .bind(key)
+            .bind(RESTORE_LOCK_SEED)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+        if taken || attempt == tries {
+            break;
+        }
+        tokio::time::sleep(pause).await;
+    }
     Ok(taken.then(|| ClaimSession {
         conn,
         generation: new_generation(),

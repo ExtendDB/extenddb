@@ -246,11 +246,33 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # Local S3 endpoint for tests/test_backup_store_config.py's S3 cells
+      # (an S3 store's /health against an endpoint that refuses, stalls and
+      # recovers), which devtools/run-tests runs on a SQLite build after the
+      # main suite. Same moto as the unit-test workflow, pinned in
+      # requirements-moto.txt, installed into a virtualenv of its own: its
+      # boto3 and botocore pins differ from requirements.txt's, and the
+      # suite keeps running on the environment installed above. On port
+      # 9200, clear of the server's.
+      - name: Start S3 mock
+        run: |
+          python -m venv "$RUNNER_TEMP/moto-venv"
+          "$RUNNER_TEMP/moto-venv/bin/pip" install -r requirements-moto.txt
+          nohup "$RUNNER_TEMP/moto-venv/bin/moto_server" -p 9200 > moto.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9200/ > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "moto_server did not start"; cat moto.log; exit 1
+
       - name: Run integration tests
         env:
           EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
           EXTENDDB_ADMIN_USER: admin
           EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          # The backup store wire tests' S3 cells; the file sets the AWS_*
+          # variables for the servers it starts, so none leaks here.
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9200
         run: devtools/run-tests --extenddb --pytest --comprehensive --parallel --filter "not import_export"
 
       # Same rationale as the postgres job: the daemonized server logs to
@@ -258,6 +280,10 @@ jobs:
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+      - name: Print the S3 mock's log
+        if: failure()
+        run: cat moto.log || true
 
   run-integration-dev-mode:
     # dev-mode was shipped with no CI coverage at all, which is how the batch and

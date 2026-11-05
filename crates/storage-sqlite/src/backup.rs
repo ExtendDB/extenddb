@@ -4327,7 +4327,8 @@ mod restore_tests {
         use extenddb_storage::BackupCatalog;
         use extenddb_storage::backup_catalog::{
             BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreTargetKey,
-            StatusFields, StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
+            StaleClock, StatusFields, StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION,
+            WriteOutcome,
         };
         use futures::TryStreamExt;
 
@@ -4388,7 +4389,12 @@ mod restore_tests {
                 uuid::Uuid::parse_str(&engine.catalog_id().await.expect("id")).is_ok(),
                 "the catalog has an id from the migration"
             );
-            assert!(!engine.check_maintenance_claim().await.expect("check"));
+            assert!(
+                !engine
+                    .check_maintenance_claim(std::time::Duration::from_secs(300))
+                    .await
+                    .expect("check")
+            );
             let row = row(ACCOUNT, "Music", "nightly");
             let claim = engine.claim_backup(&row).await.expect("claim");
             assert_ne!(claim.generation(), UNOWNED_GENERATION);
@@ -4993,6 +4999,503 @@ mod restore_tests {
                 .delete(ACCOUNT, &backup.backup_arn)
                 .await
                 .expect("the backup is free");
+        }
+
+        /// `read_store_ids`: the distinct ids of the rows for a root, of
+        /// every status, scoped to the kind and the root.
+        #[tokio::test]
+        async fn read_store_ids_lists_the_distinct_ids_of_a_root() {
+            let engine = engine().await;
+            let root = store().store_root.clone();
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids")
+                    .is_empty()
+            );
+            let first = row(ACCOUNT, "Music", "a");
+            let _c1 = engine.claim_backup(&first).await.expect("claim");
+            let second = row(ACCOUNT, "Music", "b");
+            let c2 = engine.claim_backup(&second).await.expect("claim");
+            c2.set_status(
+                JobStatus::Creating,
+                JobStatus::Failed,
+                &StatusFields::default(),
+            )
+            .await
+            .expect("fail");
+            assert_eq!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids"),
+                ["store-1"],
+                "two rows of one store, of two statuses, are one id"
+            );
+            let mut other = row(ACCOUNT, "Songs", "c");
+            other.store.store_id = "store-2".to_owned();
+            let _c3 = engine.claim_backup(&other).await.expect("claim");
+            assert_eq!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &root)
+                    .await
+                    .expect("ids"),
+                ["store-1", "store-2"]
+            );
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::S3, &root)
+                    .await
+                    .expect("ids")
+                    .is_empty(),
+                "another kind at the same root is another store"
+            );
+            assert!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, "/elsewhere")
+                    .await
+                    .expect("ids")
+                    .is_empty()
+            );
+        }
+
+        /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat
+        /// is older than the window is removed outright; one with a live
+        /// owner, one that is not CREATING, and one that is gone are left,
+        /// answering `false`.
+        #[tokio::test]
+        async fn a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let age = |backup_id: String| {
+                let pool = engine.pool.clone();
+                async move {
+                    sqlx::query(
+                        "UPDATE backup_index SET heartbeat_at = \
+                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes') WHERE backup_id = ?",
+                    )
+                    .bind(backup_id)
+                    .execute(&pool)
+                    .await
+                    .expect("age");
+                }
+            };
+            let creating = row(ACCOUNT, "Music", "a");
+            let key = creating.key();
+            let claim = engine.claim_backup(&creating).await.expect("claim");
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap(),
+                "a live owner keeps its row"
+            );
+            age(creating.backup_id.clone()).await;
+            assert!(
+                engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&creating))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&key, stale)
+                    .await
+                    .unwrap(),
+                "gone"
+            );
+            drop(claim);
+
+            let available = row(ACCOUNT, "Music", "b");
+            let claim = engine.claim_backup(&available).await.expect("claim");
+            claim
+                .set_status(
+                    JobStatus::Creating,
+                    JobStatus::Available,
+                    &StatusFields::default(),
+                )
+                .await
+                .expect("available");
+            age(available.backup_id.clone()).await;
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&available.key(), stale)
+                    .await
+                    .unwrap(),
+                "only a CREATING row"
+            );
+            assert_eq!(
+                engine
+                    .read_backup_row(&arn_of(&available))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                BackupStatus::Available
+            );
+        }
+
+        /// `list_backup_rows_older_than`: the rows of a store with a status
+        /// whose clock column is older than the age on the database's clock.
+        /// The two clocks are told apart by a row heartbeated at the start
+        /// and FAILED after the window passed (as the reconciler fails a dead
+        /// owner's row): listed on the heartbeat clock at once, not on the
+        /// completed clock until its own window passes. A FAILED row without
+        /// `completed_at` is never listed on the completed clock. A CREATING
+        /// row and another store's row are not listed. The window is crossed
+        /// by waiting, not by dating rows.
+        #[tokio::test]
+        async fn rows_older_than_are_listed_on_the_named_clock() {
+            let engine = engine().await;
+            let window = Duration::from_secs(1);
+            // Names in the listing's order; two rows minted in one millisecond
+            // share `created_at` and fall to ARN order, so the sets compare
+            // sorted.
+            let names = |listed: Vec<BackupRow>| -> Vec<String> {
+                let mut names: Vec<String> = listed.into_iter().map(|r| r.backup_name).collect();
+                names.sort();
+                names
+            };
+            let older = |status: BackupStatus, clock: StaleClock| {
+                let engine = engine.clone();
+                async move {
+                    let rows: Vec<BackupRow> = engine
+                        .list_backup_rows_older_than(status, &store(), clock, window)
+                        .try_collect()
+                        .await
+                        .expect("list");
+                    names(rows)
+                }
+            };
+            async fn fail(claim: &dyn extenddb_storage::backup_catalog::JobClaim, completed: bool) {
+                let fields = StatusFields {
+                    failure_reason: Some("test".to_owned()),
+                    completed,
+                    ..StatusFields::default()
+                };
+                assert_eq!(
+                    claim
+                        .set_status(JobStatus::Creating, JobStatus::Failed, &fields)
+                        .await
+                        .unwrap(),
+                    WriteOutcome::Matched
+                );
+            }
+
+            // All heartbeated now. `late` stays CREATING until the window has
+            // passed; `unfinished` is FAILED without `completed_at`;
+            // `creating` stays CREATING; `elsewhere` is another store's;
+            // `gone` is DELETED now.
+            let late = row(ACCOUNT, "Music", "late");
+            let late_claim = engine.claim_backup(&late).await.expect("claim");
+            let unfinished = row(ACCOUNT, "Music", "unfinished");
+            let unfinished_claim = engine.claim_backup(&unfinished).await.expect("claim");
+            fail(unfinished_claim.as_ref(), false).await;
+            let creating = row(ACCOUNT, "Music", "creating");
+            let _creating_claim = engine.claim_backup(&creating).await.expect("claim");
+            let mut elsewhere = row(ACCOUNT, "Music", "elsewhere");
+            elsewhere.store.store_id = "store-2".to_owned();
+            let elsewhere_claim = engine.claim_backup(&elsewhere).await.expect("claim");
+            fail(elsewhere_claim.as_ref(), true).await;
+            let gone = row(ACCOUNT, "Music", "gone");
+            let gone_claim = engine.claim_backup(&gone).await.expect("claim");
+            assert_eq!(
+                gone_claim
+                    .set_status(
+                        JobStatus::Creating,
+                        JobStatus::Available,
+                        &StatusFields::default()
+                    )
+                    .await
+                    .unwrap(),
+                WriteOutcome::Matched
+            );
+            assert_eq!(
+                engine.start_backup_delete(&gone.key()).await.unwrap(),
+                DeleteStart::Deleting
+            );
+            assert!(engine.set_backup_deleted(&gone.key()).await.unwrap());
+
+            // Inside the window on every clock: nothing is older.
+            assert!(
+                older(BackupStatus::Failed, StaleClock::Heartbeat)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                older(BackupStatus::Failed, StaleClock::Completed)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                older(BackupStatus::Deleted, StaleClock::Completed)
+                    .await
+                    .is_empty()
+            );
+
+            tokio::time::sleep(window + Duration::from_millis(300)).await;
+            // The reconciler's shape: the owner's last beat is past the
+            // window, the FAILED write is now.
+            fail(late_claim.as_ref(), true).await;
+            assert_eq!(
+                older(BackupStatus::Failed, StaleClock::Heartbeat).await,
+                ["late", "unfinished"],
+                "both heartbeats are past the window; the just-failed row is listed on the \
+                 heartbeat clock at once"
+            );
+            assert!(
+                older(BackupStatus::Failed, StaleClock::Completed)
+                    .await
+                    .is_empty(),
+                "completed just now, or never"
+            );
+            assert_eq!(
+                older(BackupStatus::Deleted, StaleClock::Completed).await,
+                ["gone"]
+            );
+            let elsewhere_rows: Vec<BackupRow> = engine
+                .list_backup_rows_older_than(
+                    BackupStatus::Failed,
+                    &elsewhere.store,
+                    StaleClock::Heartbeat,
+                    window,
+                )
+                .try_collect()
+                .await
+                .expect("list");
+            assert_eq!(names(elsewhere_rows), ["elsewhere"], "scoped to the store");
+
+            tokio::time::sleep(window + Duration::from_millis(300)).await;
+            assert_eq!(
+                older(BackupStatus::Failed, StaleClock::Completed).await,
+                ["late"],
+                "the completed window crossed on the database's clock; a row without \
+                 completed_at is never listed on this clock"
+            );
+            drop(late_claim);
+            drop(unfinished_claim);
+            drop(elsewhere_claim);
+            drop(gone_claim);
+        }
+
+        /// The maintenance claim: taken once, refused to a second holder
+        /// naming the first, heartbeated, released; a holder whose heartbeat
+        /// is older than the stale window is dead, so its claim is not
+        /// reported held and is taken over, and its handle finds the claim
+        /// lost.
+        #[tokio::test]
+        async fn the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let check = || engine.check_maintenance_claim(stale);
+            assert!(!check().await.expect("check"));
+            let first = engine
+                .maintenance_claim("purge on host-a", stale)
+                .await
+                .expect("claim");
+            assert_ne!(first.generation(), UNOWNED_GENERATION);
+            assert!(check().await.expect("check"), "a live claim is held");
+            match engine.maintenance_claim("purge on host-b", stale).await {
+                Err(StorageError::AlreadyExists(m)) => {
+                    assert!(m.contains("purge on host-a"), "{m}");
+                }
+                Err(other) => panic!("a second holder is refused with AlreadyExists: {other:?}"),
+                Ok(_) => panic!("a second holder is refused"),
+            }
+            assert_eq!(
+                first.heartbeat().await.expect("heartbeat"),
+                Heartbeat::Confirmed
+            );
+            first.release().await.expect("release");
+            assert!(!check().await.expect("check"), "released");
+            first.release().await.expect("a second release is a no-op");
+
+            // A dead holder: its heartbeat aged past the window.
+            let dead = engine
+                .maintenance_claim("purge on host-c", stale)
+                .await
+                .expect("claim");
+            sqlx::query(
+                "UPDATE backup_maintenance SET heartbeat_at = \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes')",
+            )
+            .execute(&engine.pool)
+            .await
+            .expect("age");
+            assert!(!check().await.expect("check"), "a stale claim is not held");
+            let taker = engine
+                .maintenance_claim("purge on host-d", stale)
+                .await
+                .expect("a dead holder's claim is taken over");
+            assert_ne!(taker.generation(), dead.generation());
+            assert!(check().await.expect("check"));
+            assert_eq!(
+                dead.heartbeat().await.expect("heartbeat"),
+                Heartbeat::Lost,
+                "the dead holder's handle finds the claim lost"
+            );
+            dead.release()
+                .await
+                .expect("a release by a lost holder changes nothing");
+            assert!(check().await.expect("check"), "the taker still holds it");
+            let holder: String = sqlx::query_scalar("SELECT holder FROM backup_maintenance")
+                .fetch_one(&engine.pool)
+                .await
+                .expect("holder");
+            assert_eq!(holder, "purge on host-d");
+            taker.release().await.expect("release");
+            assert!(!check().await.expect("check"));
+        }
+
+        /// An engine that holds the serve lock (a command that opened the
+        /// file as `serve` does: `backup purge --confirm`) takes over a
+        /// maintenance claim whose heartbeat is young: under the lock the
+        /// row's holder is dead whatever its heartbeat says. The holder that
+        /// was taken over finds its claim lost. The same take on an engine
+        /// without the lock is refused naming the holder.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn under_the_serve_lock_a_live_looking_claim_is_taken_over() {
+            let stale = Duration::from_secs(300);
+            let unlocked = engine().await;
+            let killed = unlocked
+                .maintenance_claim("extenddb backup purge on host-a (pid 1)", stale)
+                .await
+                .expect("claim");
+            let refused = unlocked
+                .maintenance_claim("extenddb backup purge on host-a (pid 2)", stale)
+                .await
+                .err()
+                .expect("a live claim is refused without the serve lock");
+            assert!(refused.to_string().contains("(pid 1)"), "{refused}");
+
+            let dir = std::env::temp_dir().join(format!(
+                "extenddb-maintenance-serve-lock-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let mut locked = unlocked.clone();
+            locked.serve_lock = Some(std::sync::Arc::new(
+                crate::serve_lock::ServeLock::try_acquire(&dir.join("db.sqlite"))
+                    .unwrap_or_else(|_| panic!("the serve lock")),
+            ));
+            assert!(
+                locked.check_maintenance_claim(stale).await.expect("check"),
+                "the first claim's heartbeat is young"
+            );
+            let taken = locked
+                .maintenance_claim("extenddb backup purge on host-a (pid 2)", stale)
+                .await
+                .expect("taken over under the serve lock");
+            assert_ne!(taken.generation(), killed.generation());
+            assert_eq!(killed.heartbeat().await.expect("beat"), Heartbeat::Lost);
+            assert_eq!(taken.heartbeat().await.expect("beat"), Heartbeat::Confirmed);
+            taken.release().await.expect("release");
+            drop(locked);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A zero window selects by status alone: under the serve lock every
+        /// owner is dead, so a FAILED or CREATING row whose heartbeat is
+        /// stamped ahead of the database's clock (a backward clock step) is
+        /// listed as dead and removed, where the age comparison would read it
+        /// as a live owner and `backup purge` would wait on it and refuse.
+        /// Under a non-zero window the same rows read as live. The RUNNING
+        /// restore listing follows the same rule, and the wait set's listing
+        /// by status sees such a record too.
+        #[tokio::test]
+        async fn a_zero_window_selects_dead_owners_by_status_alone() {
+            let engine = engine().await;
+            let failed = row(ACCOUNT, "Music", "failed-ahead");
+            let failed_claim = engine.claim_backup(&failed).await.expect("claim");
+            let fields = StatusFields {
+                failure_reason: Some("test".to_owned()),
+                completed: true,
+                ..StatusFields::default()
+            };
+            assert_eq!(
+                failed_claim
+                    .set_status(JobStatus::Creating, JobStatus::Failed, &fields)
+                    .await
+                    .unwrap(),
+                WriteOutcome::Matched
+            );
+            let creating = row(ACCOUNT, "Music", "creating-ahead");
+            let _creating_claim = engine.claim_backup(&creating).await.expect("claim");
+            // Both heartbeats a day ahead of the clock.
+            let ahead: i64 = sqlx::query(
+                "UPDATE backup_index SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', \
+                 'now', '+1 day') WHERE backup_id IN (?, ?)",
+            )
+            .bind(&failed.backup_id)
+            .bind(&creating.backup_id)
+            .execute(&engine.pool)
+            .await
+            .expect("stamp ahead")
+            .rows_affected()
+            .try_into()
+            .unwrap();
+            assert_eq!(ahead, 2);
+            let listed = |status: BackupStatus, window: Duration| {
+                let engine = engine.clone();
+                async move {
+                    let rows: Vec<BackupRow> = engine
+                        .list_backup_rows_older_than(
+                            status,
+                            &store(),
+                            StaleClock::Heartbeat,
+                            window,
+                        )
+                        .try_collect()
+                        .await
+                        .expect("list");
+                    rows.into_iter().map(|r| r.backup_name).collect::<Vec<_>>()
+                }
+            };
+            let window = Duration::from_secs(300);
+            assert!(
+                listed(BackupStatus::Failed, window).await.is_empty()
+                    && listed(BackupStatus::Creating, window).await.is_empty(),
+                "under a window a heartbeat ahead of the clock reads as live"
+            );
+            assert_eq!(
+                listed(BackupStatus::Failed, Duration::ZERO).await,
+                ["failed-ahead"]
+            );
+            assert_eq!(
+                listed(BackupStatus::Creating, Duration::ZERO).await,
+                ["creating-ahead"]
+            );
+            assert!(
+                !engine
+                    .remove_dead_creating_backup_row(&creating.key(), window)
+                    .await
+                    .unwrap(),
+                "kept under a window"
+            );
+            assert!(
+                engine
+                    .remove_dead_creating_backup_row(&creating.key(), Duration::ZERO)
+                    .await
+                    .unwrap(),
+                "removed under the zero window whatever the heartbeat says"
+            );
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&creating))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(failed_claim);
         }
     }
 
