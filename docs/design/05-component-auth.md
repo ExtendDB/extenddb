@@ -1,4 +1,8 @@
-# extenddb — Component Design: Authentication & Authorization
+---
+description: "The auth crate: the AuthProvider trait, the SigV4 provider and the IAM policy evaluation engine."
+---
+
+# Component design: Authentication and authorization
 
 **Version:** 2.0
 **Date:** 2026-04-06
@@ -1609,7 +1613,7 @@ pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<Stri
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

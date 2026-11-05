@@ -1,4 +1,8 @@
-# 10 — Dependency Licenses
+---
+description: "Which open source licenses dependencies may carry and how the build checks them."
+---
+
+# Dependency licenses
 
 Generated: 2026-04-23
 
@@ -435,7 +439,7 @@ This file is a human-controlled policy input and must not be modified by agents.
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

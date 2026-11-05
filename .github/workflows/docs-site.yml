@@ -1,0 +1,91 @@
+name: Documentation site
+
+# Builds the Docusaurus site in website/ from docs/. On a pull request the
+# build is the check: a broken link, a missing anchor or a Markdown error
+# fails it. On a push to main the built site is published to GitHub Pages.
+#
+# Hosting is selected by the repository variable DOCS_CUSTOM_DOMAIN. When it
+# is unset the site is served at https://extenddb.github.io/extenddb/ (base
+# path /extenddb/). When it holds a domain such as docs.extenddb.org the site
+# is built for the root path and a CNAME file is written into the artifact.
+
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'website/**'
+      - 'Cargo.toml'
+      - '.github/workflows/docs-site.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'website/**'
+      - 'Cargo.toml'
+      - '.github/workflows/docs-site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    env:
+      DOCS_CUSTOM_DOMAIN: ${{ vars.DOCS_CUSTOM_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install
+        working-directory: website
+        run: npm ci --no-audit --no-fund
+      - name: Select hosting
+        id: hosting
+        run: |
+          if [ -n "$DOCS_CUSTOM_DOMAIN" ]; then
+            echo "url=https://$DOCS_CUSTOM_DOMAIN" >> "$GITHUB_OUTPUT"
+            echo "base=/" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=https://extenddb.github.io" >> "$GITHUB_OUTPUT"
+            echo "base=/extenddb/" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Typecheck
+        working-directory: website
+        run: npm run typecheck
+      - name: Build
+        working-directory: website
+        env:
+          DOCS_URL: ${{ steps.hosting.outputs.url }}
+          DOCS_BASE_URL: ${{ steps.hosting.outputs.base }}
+        run: npm run build
+      - name: Write CNAME
+        if: env.DOCS_CUSTOM_DOMAIN != ''
+        run: echo "$DOCS_CUSTOM_DOMAIN" > website/build/CNAME
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+  deploy:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - id: deployment
+        uses: actions/deploy-pages@v4

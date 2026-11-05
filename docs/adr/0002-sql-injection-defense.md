@@ -1,4 +1,4 @@
-# ADR: SQL Injection Defense
+# ADR-0002: SQL injection defense
 
 ## Status
 
@@ -73,7 +73,7 @@ This is **not** the same as raw string interpolation of user input. The validati
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

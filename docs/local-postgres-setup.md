@@ -1,8 +1,14 @@
-# Local PostgreSQL Setup
+---
+description: "Set up a PostgreSQL instance on a development machine for building and testing ExtendDB."
+---
+
+# Local PostgreSQL setup (development)
+
+These notes set up a PostgreSQL instance on a development machine for building and testing ExtendDB. For a running server with PostgreSQL in containers see [Docker Compose with PostgreSQL](local-dev-docker-compose.md); for production deployments see the [deployment guide](manuals/11-deployment-guide.md).
 
 ## Installation
 
-PostgreSQL 15.17 installed from PGDG repository (EL-7 compatible) on Amazon Linux 2:
+One worked example, PostgreSQL 15 from the PGDG repository on Amazon Linux 2 (any PostgreSQL 14 or newer works):
 
 ```bash
 sudo rpm -ivh --nodeps \
@@ -68,10 +74,11 @@ tail -f ~/pgdata/server.log
 
 ## Config Mapping
 
-The extenddb `config.toml` should use:
+`extenddb init` writes `extenddb.toml` with the catalog database it creates (`extenddb_catalog` by default). To point the server at the role above, edit the generated section:
+
 ```toml
 [storage.postgres]
-connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb"
+connection_string = "postgresql://extenddb:extenddb-local-dev@localhost:5432/extenddb_catalog"
 pool_size = 20
 ```
 
@@ -86,7 +93,7 @@ export EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING=\
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

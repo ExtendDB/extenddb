@@ -1,7 +1,7 @@
 # RFCs
-``
+
 Substantial changes go through the RFC process before implementation.
-ADRs ([`docs/adr/`](../adr/)) record decisions; RFCs solicit input on
+[Decision records](../adr/README.md) record decisions; RFCs solicit input on
 proposals.
 
 ## When an RFC is required
@@ -31,7 +31,7 @@ you whether an RFC, an ADR, or neither is needed.
    maintainer may move the broad design debate to GitHub Discussions and
    reserve the PR for line-level comments.
 2. **Under Review.** A maintainer assigns reviewers from
-   [`.github/CODEOWNERS`](../../.github/CODEOWNERS): at minimum two maintainers,
+   [`.github/CODEOWNERS`](https://github.com/ExtendDB/extenddb/blob/main/.github/CODEOWNERS): at minimum two maintainers,
    including at least one code owner for each surface the RFC affects.
    Discussion happens inline on the PR.
 3. **Final Comment Period (FCP).** When reviewers are aligned, a maintainer
@@ -51,8 +51,9 @@ you whether an RFC, an ADR, or neither is needed.
 
 | RFC      | Title | Status | Release |
 |:---------|:------|:-------|:--------|
-| [0001]() | | Draft  | |
+| [0000](0000-mongodb-backend.md) | MongoDB Backend | Draft | |
 | [0002](0002-backend-plugin-policy.md) | Backend Plugin Policy | Draft | |
 | [0003](0003-backend-acceptance-criteria.md) | Backend Acceptance Criteria | Draft | |
+| [draft](draft-cassandra-backend.md) | Cassandra Backend | Draft | |
 
 

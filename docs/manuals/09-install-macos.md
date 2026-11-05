@@ -1,21 +1,25 @@
-# Installing extenddb on macOS
+---
+description: "Build and run ExtendDB from source on macOS with Homebrew PostgreSQL."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Installing ExtendDB on macOS
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 This guide is the macOS-specific path for the generic instructions in
-`docs/getting-started.md`. See that doc for the full CLI surface and
+the [full walkthrough](../getting-started.md). See that guide for the full CLI surface and
 feature walkthrough.
 
 ## Quick Install (recommended)
 
-The installer script checks dependencies, builds extenddb, sets up a Python
+The installer script checks dependencies, builds ExtendDB, sets up a Python
 venv for documentation, and builds PDF manuals:
 
 ```bash
 scripts/install-macos.sh
 ```
 
-The script does **not** install missing dependencies — it reports what's
+The script does **not** install missing dependencies; it reports what's
 missing so you can install them with Homebrew, then re-run.
 
 After the script completes, skip to [Step 3: Initialize the deployment](#3-initialize-the-deployment).
@@ -33,7 +37,7 @@ If you prefer to run each step yourself, follow the sections below.
 
 ## 1. Start PostgreSQL
 
-Using `brew services` (recommended — survives reboots):
+Using `brew services` (recommended, survives reboots):
 
 ```bash
 brew services start postgresql@17
@@ -56,7 +60,7 @@ pg_isready
 On Homebrew macOS the superuser is your macOS username (`$(whoami)`), not
 `postgres`, and uses trust auth over the local socket.
 
-## 2. Build extenddb
+## 2. Build ExtendDB
 
 ```bash
 cargo build --release
@@ -72,13 +76,13 @@ creates a default account + admin user, and writes `extenddb.toml` for you.
 Do **not** hand-write `extenddb.toml` before running `init`.
 
 On macOS you must tell `init` which PostgreSQL user to connect as for
-the `CREATE ROLE` / `CREATE DATABASE` steps — your macOS username:
+the `CREATE ROLE` / `CREATE DATABASE` steps, your macOS username:
 
 ```bash
 ./target/release/extenddb init --pg-user $(whoami)
 ```
 
-This prints the admin credentials **once**. Save them — they cannot be
+This prints the admin credentials **once**. Save them; they cannot be
 retrieved later.
 
 `init` writes a `extenddb.toml` with `auth.provider = "builtin"` (the default).
@@ -107,7 +111,7 @@ Expected:
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb daemonizes automatically and logs to syslog.
+ExtendDB daemonizes automatically and logs to syslog.
 
 Check status:
 
@@ -188,14 +192,14 @@ No data is lost; only the catalog schema is updated.
 | `role "extenddb" does not exist` during init               | Re-run with `--pg-user $(whoami)`                                   |
 | DROP DATABASE hangs after hard kill                    | Check for lingering backends: `ps -eo pid,command \| grep postgres` |
 
-See `docs/troubleshooting.md` for the full troubleshooting guide.
+See [Troubleshooting](../troubleshooting.md) for the full troubleshooting guide.
 
 ---
 
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is not
 affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark

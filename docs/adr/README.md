@@ -43,8 +43,8 @@ decision, write a new ADR.
 | [0014](0014-cassandra-upsert-semantics.md) | Cassandra: natural UPSERT semantics | Accepted |
 | [0015](0015-cassandra-account-keyspace-provisioning.md) | Cassandra: account keyspace provisioning timing | Accepted |
 | [0016](0016-cassandra-index-table-primary-key-structure.md) | Cassandra: index table primary-key structure | Accepted |
-| [0017](0017-cassandra-transaction-implementation.md) | Cassandra: TransactWriteItems / TransactGetItems implementation | Accepted |
-| [0018](0018-cassandra-stream-implementation.md) | Cassandra: DynamoDB Streams implementation | Accepted |
+| [0017](0017-cassandra-transaction-implementation.md) | Cassandra: TransactWriteItems / TransactGetItems implementation | Draft |
+| [0018](0018-cassandra-stream-implementation.md) | Cassandra: DynamoDB Streams implementation | Draft |
 | [0019](0019-cassandra-logical-backup-restore.md) | Cassandra: logical backup and restore | Accepted |
 | [0020](0020-cassandra-occ-update-item.md) | Cassandra: optimistic concurrency control for UpdateItem and PutItem | Accepted |
 | [0021](0021-cassandra-lwt-delete-atomicity-gap.md) | Cassandra: LWT delete atomicity gap and required worker/saga pattern | Accepted |

@@ -351,7 +351,7 @@ that each backend implements, as follows.
   per-table objects also changes the DDL that creates new ones, in the same
   PR, and is breaking. Released bodies are not edited, and the release PR
   pastes the checksum literals. The procedure is in the
-  [catalog migration section of CONTRIBUTING.md](../../CONTRIBUTING.md#adding-a-catalog-migration).
+  [catalog migration section of CONTRIBUTING.md](https://github.com/ExtendDB/extenddb/blob/main/CONTRIBUTING.md#adding-a-catalog-migration).
 - An operator upgrades by stopping the server, backing up the stores the
   backend uses, running `extenddb migrate` to see what is pending (exit 3
   when something is), running `extenddb migrate --yes`, and starting `serve`.

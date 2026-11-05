@@ -1,11 +1,15 @@
-# Event Ticketing Platform — End-to-End Demo
+---
+description: "A worked application on ExtendDB: accounts and IAM users, tables, sample data, queries, a ticket purchase in a transaction, a streams consumer, TTL and metrics."
+---
+
+# Event ticketing demo
 
 This guide walks you through building a complete event ticketing system on
 ExtendDB (extenddb). You will create tables, load data, purchase tickets
 with transactions, observe TTL-based reservation expiry, consume change events
 via DynamoDB Streams, enforce IAM policies, and verify operational metrics.
 
-**Time to complete:** 20–30 minutes (includes a 2-minute wait for TTL expiry).
+**Time to complete:** 20 to 30 minutes (includes a 2-minute wait for TTL expiry).
 
 **Platform:** macOS (Homebrew). Linux users: substitute your package manager.
 
@@ -34,7 +38,7 @@ brew install awscli
 
 ---
 
-## 1. Build extenddb
+## 1. Build ExtendDB
 
 ```bash
 cd /path/to/ExtendDB
@@ -55,7 +59,7 @@ serves them when `docs_dir` is configured.
 
 ---
 
-## 3. Initialize extenddb
+## 3. Initialize ExtendDB
 
 ```bash
 ./target/release/extenddb init --config extenddb.toml
@@ -74,13 +78,13 @@ export EXTENDDB_ADMIN_PASSWORD="<password-from-init-output>"
 
 ---
 
-## 4. Start extenddb
+## 4. Start ExtendDB
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb daemonizes automatically — no output appears in the terminal. Verify it's running:
+ExtendDB daemonizes automatically, so no output appears in the terminal. Verify it's running:
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
@@ -92,9 +96,9 @@ curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 ## 5. Create accounts and IAM users
 
 We'll create three users with different access levels:
-- **box-office** — full DynamoDB access (the operator)
-- **customer-app** — read Events, manage own Tickets only
-- **auditor** — read-only access to all tables
+- **box-office**: full DynamoDB access (the operator)
+- **customer-app**: read Events, manage own Tickets only
+- **auditor**: read-only access to all tables
 
 ```bash
 EXTENDDB="./target/release/extenddb"
@@ -380,7 +384,7 @@ aws dynamodb scan \
 ## 9. Purchase a ticket (Transaction)
 
 This is the core operation: atomically create a ticket and increment the
-event's sold count. The ticket has a 2-minute TTL — if not confirmed, it
+event's sold count. The ticket has a 2-minute TTL; if not confirmed, it
 expires automatically.
 
 ```bash
@@ -436,7 +440,7 @@ aws dynamodb transact-get-items --transact-items '[
 ## 10. Start the streams consumer
 
 Open a **second terminal** and run the streams consumer script. This will
-print change events as they arrive — including the TTL deletion event.
+print change events as they arrive, including the TTL deletion event.
 
 ```bash
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
@@ -466,7 +470,7 @@ aws dynamodb update-item \
     --expression-attribute-values '{":confirmed": {"S": "confirmed"}}'
 ```
 
-Check the streams terminal — you should see a MODIFY event showing the status
+Check the streams terminal: you should see a MODIFY event showing the status
 change from "reserved" to "confirmed" and the removal of `expires_at`.
 
 ---
@@ -501,13 +505,13 @@ aws dynamodb get-item \
 
 **Now wait approximately 2 minutes.** While waiting, proceed to step 13 to
 check metrics. When the TTL fires, the streams consumer will print a REMOVE
-event with `userIdentity.type: Service` — proving the deletion was automatic.
+event with `userIdentity.type: Service`, which marks the deletion as automatic.
 
 ---
 
 ## 13. Check metrics (while waiting for TTL)
 
-Verify that extenddb is recording operational metrics:
+Verify that ExtendDB is recording operational metrics:
 
 ```bash
 # Request counts and latencies
@@ -537,7 +541,7 @@ aws dynamodb get-item \
 # Should return empty (no Item)
 ```
 
-Check the streams consumer terminal — you should see:
+Check the streams consumer terminal; you should see:
 
 ```
 REMOVE: {'event_id': {'S': 'EVT-002'}, 'ticket_id': {'S': 'TKT-002'}}
@@ -545,7 +549,7 @@ REMOVE: {'event_id': {'S': 'EVT-002'}, 'ticket_id': {'S': 'TKT-002'}}
 ```
 
 This confirms TTL-based deletion generates a streams event with the service
-principal, exactly matching real DynamoDB behavior.
+principal, exactly matching the DynamoDB service behavior.
 
 ---
 
@@ -565,7 +569,7 @@ This returns all tickets for CUST-001 (the confirmed ticket TKT-001).
 
 ## 16. Batch operations
 
-### BatchGetItem — fetch multiple customers at once
+### BatchGetItem: fetch multiple customers at once
 
 ```bash
 aws dynamodb batch-get-item --request-items '{
@@ -631,7 +635,7 @@ aws dynamodb get-item \
 aws dynamodb delete-item \
     --table-name Events \
     --key '{"event_id": {"S": "EVT-001"}}'
-# ✗ AccessDeniedException — customer-app cannot delete events
+# ✗ AccessDeniedException: customer-app cannot delete events
 ```
 
 ### Allowed: create a ticket
@@ -781,9 +785,9 @@ rm -rf /tmp/extenddb-exports
 
 | Table | Partition Key | Sort Key | GSIs | Streams | TTL |
 |-------|--------------|----------|------|---------|-----|
-| Events | `event_id` (S) | — | `VenueDateIndex` (venue_id + event_date) | No | No |
+| Events | `event_id` (S) | none | `VenueDateIndex` (venue_id + event_date) | No | No |
 | Tickets | `event_id` (S) | `ticket_id` (S) | `CustomerTicketsIndex` (customer_id + event_id) | NEW_AND_OLD_IMAGES | `expires_at` |
-| Customers | `customer_id` (S) | — | — | No | No |
+| Customers | `customer_id` (S) | none | none | No | No |
 
 ### Access patterns
 
@@ -812,5 +816,5 @@ rm -rf /tmp/extenddb-exports
 | Setting | Demo | Production |
 |---------|------|-----------|
 | Reservation TTL | 120 seconds | 900 seconds (15 min) |
-| Streams polling interval | 1 second | 1–5 seconds |
+| Streams polling interval | 1 second | 1 to 5 seconds |
 | Export path | `/tmp/extenddb-exports` | `/var/lib/extenddb/exports` |
