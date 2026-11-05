@@ -250,3 +250,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "account_scope_reads_tests.rs"]
+mod reads_tests;

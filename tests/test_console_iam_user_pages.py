@@ -16,8 +16,9 @@ The account holds a user `owner` with an inline policy, an access key and a
 tag; a second user `peer`; a group with `owner` as its member and an inline
 policy; and a role with an inline policy. The IAM user `viewer` is created
 with a console password, so it holds only the self-service policy that every
-such user gets. Each name carries a random suffix, so that no page shows it
-by chance.
+such user gets. It is the member of a second group and has a tag, which its
+own page leaves out. Each name carries a random suffix, so that no page
+shows it by chance.
 
 Prerequisites match tests/test_console_account_scope.py:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -160,16 +161,24 @@ class World:
     viewer_name: str
     viewer_password: str
     viewer_key: str
+    viewer_group: str  # the group the viewer is a member of
+    viewer_tag_key: str
+    viewer_tag_value: str
     missing_user: str  # a name that no user has
 
     def others(self) -> list[str]:
-        """Every name of the account, its other users, its group and its
+        """Every name of the account, its other users, its groups and its
         role, which no page the viewer opens may show."""
         return [
             self.account_name, self.owner, self.peer, self.group, self.role,
             self.user_policy, self.group_policy, self.role_policy,
-            self.owner_key, self.tag_key, self.tag_value,
+            self.owner_key, self.tag_key, self.tag_value, self.viewer_group,
         ]
+
+    def viewer_hidden(self) -> list[str]:
+        """The viewer's group and tag, which the management API does not
+        give the viewer and its own page leaves out."""
+        return [self.viewer_group, self.viewer_tag_key, self.viewer_tag_value]
 
     def viewer_auth(self) -> tuple[str, str]:
         return (f"{self.account_id}/{self.viewer_name}", self.viewer_password)
@@ -201,6 +210,9 @@ def world():
         viewer_name=f"viewer-{suffix}",
         viewer_password=uuid.uuid4().hex,
         viewer_key="",
+        viewer_group=f"viewer-group-{suffix}",
+        viewer_tag_key=f"viewer-tag-key-{suffix}",
+        viewer_tag_value=f"viewer-tag-value-{suffix}",
         missing_user=f"nobody-{suffix}",
     )
     a = w.account_id
@@ -217,6 +229,9 @@ def world():
             lambda: mgmt.put_group_policy(a, w.group, w.group_policy, _POLICY),
             lambda: mgmt.put_role_policy(a, w.role, w.role_policy, _POLICY),
             lambda: mgmt.tag_user(a, w.owner, {w.tag_key: w.tag_value}),
+            lambda: mgmt.create_group(a, w.viewer_group),
+            lambda: mgmt.add_group_member(a, w.viewer_group, w.viewer_name),
+            lambda: mgmt.tag_user(a, w.viewer_name, {w.viewer_tag_key: w.viewer_tag_value}),
         ]
         for step in steps:
             resp = step()
@@ -237,6 +252,8 @@ def world():
         mgmt.delete_role_policy(a, w.role, w.role_policy)
         mgmt.remove_group_member(a, w.group, w.owner)
         mgmt.delete_group(a, w.group)
+        mgmt.remove_group_member(a, w.viewer_group, w.viewer_name)
+        mgmt.delete_group(a, w.viewer_group)
         mgmt.delete_role(a, w.role)
         for user in (w.owner, w.peer, w.viewer_name):
             keys = mgmt.list_access_keys(a, user)
@@ -396,6 +413,8 @@ def test_viewer_reads_its_own_user_page(world: World) -> None:
     # the page leaves out the policies, groups and tags sections.
     for absent in ("<h2>Policies", "<h2>Groups", "<h2>Tags", _SELF_SERVICE_POLICY):
         assert absent not in resp.text, absent
+    for name in world.viewer_hidden():
+        assert name not in resp.text, f"the viewer's own page shows {name}"
 
 
 def test_management_api_gives_the_viewer_the_same_reads(world: World) -> None:
@@ -445,6 +464,50 @@ def test_viewer_manages_its_own_access_keys(world: World) -> None:
     assert deleted.headers.get("location") == f"/console/accounts/{a}/users/{user}"
     assert key_id not in world.mgmt.list_access_keys(a, user).text
     assert world.viewer_key in world.mgmt.list_access_keys(a, user).text
+
+
+def _viewer_key_ids(w: World) -> set[str]:
+    """The viewer's access key IDs, as the management API lists them."""
+    resp = w.mgmt.list_access_keys(w.account_id, w.viewer_name)
+    assert resp.status_code == 200, resp.text
+    return {key["access_key_id"] for key in resp.json()}
+
+
+# A `_csrf` value other than the session's token: an empty one, and one of
+# the same length that differs from the token in its last character.
+WRONG_CSRF: dict[str, Callable[[str], str]] = {
+    "empty": lambda token: "",
+    "altered": lambda token: token[:-1] + ("1" if token.endswith("0") else "0"),
+}
+
+
+@pytest.mark.parametrize("csrf", sorted(WRONG_CSRF))
+@pytest.mark.parametrize("form", ["create-key", "delete-key"])
+def test_key_form_with_a_wrong_csrf_token_gets_403_and_changes_no_key(
+    world: World, form: str, csrf: str
+) -> None:
+    """The two forms an IAM-user session can submit check the session's
+    CSRF token before they change a key."""
+    a, user = world.account_id, world.viewer_name
+    # A key for the delete form to name, so that the viewer's own key stays
+    # in place if the form deletes it.
+    extra = world.mgmt.create_access_key(a, user)
+    assert extra.status_code == 201, extra.text
+    path = {
+        "create-key": f"/accounts/{a}/users/{user}/access-keys/new",
+        "delete-key": (f"/accounts/{a}/users/{user}/access-keys/"
+                       f"{extra.json()['access_key_id']}/delete"),
+    }[form]
+    before = _viewer_key_ids(world)
+    try:
+        resp = world.viewer.post(path, {"_csrf": WRONG_CSRF[csrf](world.viewer.csrf)})
+        after = _viewer_key_ids(world)
+    finally:
+        for key_id in _viewer_key_ids(world) - {world.viewer_key}:
+            world.mgmt.delete_access_key(a, user, key_id)
+
+    assert resp.status_code == 403, f"{form}: {resp.status_code} {resp.text[:300]}"
+    assert after == before, f"{form} changed the keys from {before} to {after}"
 
 
 def _viewer_pages(world: World) -> dict[str, str]:
@@ -521,7 +584,7 @@ SHOWN: dict[str, Callable[[World], tuple[str, list[str]]]] = {
         [w.owner_key, w.user_policy, w.group, w.tag_key, w.tag_value]),
     "viewer": lambda w: (
         f"/accounts/{w.account_id}/users/{w.viewer_name}",
-        [w.viewer_key, _SELF_SERVICE_POLICY]),
+        [w.viewer_key, _SELF_SERVICE_POLICY, *w.viewer_hidden()]),
     "group": lambda w: (
         f"/accounts/{w.account_id}/groups/{w.group}", [w.owner, w.group_policy]),
     "role": lambda w: (f"/accounts/{w.account_id}/roles/{w.role}", [w.role_policy]),
