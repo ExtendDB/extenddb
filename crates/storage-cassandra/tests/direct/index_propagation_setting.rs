@@ -14,136 +14,35 @@
 //! default.
 
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, PathElement};
-use extenddb_core::types::{
-    AttributeDefinition, AttributeValue, CreateTableInput, GsiInput, Item, KeySchemaElement,
-    KeyType, Projection, ProjectionType, ScalarAttributeType, TableKeyInfo,
-};
+use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
+use extenddb_storage::DataEngine as _;
 use extenddb_storage::management_store::SettingsStore;
-use extenddb_storage::{DataEngine as _, TableEngine as _};
 use extenddb_storage_cassandra::{CassandraCatalogStore, CassandraEngine};
 
 const GSI: &str = "GsiIdx";
 const GSI_PK: &str = "gpk";
 
-/// An engine on a keyspace prefix of its own, with a migrated catalog, one
-/// migrated account, and a table with one GSI that sets no delay of its own,
-/// so the GSI follows the system setting.
+/// An engine on a keyspace prefix of its own, with one account and a table
+/// with one GSI that sets no delay of its own, so the GSI follows the system
+/// setting.
 struct Fixture {
     engine: std::sync::Arc<CassandraEngine>,
     settings: CassandraCatalogStore,
     key_info: TableKeyInfo,
     account_keyspace: String,
-    _drop: crate::helpers::DropKeyspacesOnDrop,
+    _isolated: crate::helpers::IsolatedEngine,
 }
 
 async fn fixture(tag: &str) -> Fixture {
-    let mut config = crate::helpers::test_config();
-    config.keyspace_prefix = format!("ips{tag}_{}", &crate::helpers::unique_test_id()[..10]);
-    config.cached_connection_string = None;
-    config.ensure_cached_connection_string();
-    let engine = std::sync::Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
-    let session = engine.session_arc();
-    let account_id = crate::helpers::unique_test_account();
-    let catalog_ks = engine.catalog_keyspace();
-    let account_keyspace = engine.account_keyspace(&account_id);
-    let drop =
-        crate::helpers::DropKeyspacesOnDrop(vec![catalog_ks.clone(), account_keyspace.clone()]);
-    for ks in [&catalog_ks, &account_keyspace] {
-        engine.create_keyspace(ks).await.unwrap();
-        crate::helpers::ensure_keyspace_rf(&engine, ks)
-            .await
-            .unwrap();
-    }
-    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
-        session.clone(),
-        &config.keyspace_prefix,
-        "test",
-        std::time::Duration::from_secs(120),
-    )
-    .await
-    .unwrap();
-    extenddb_storage_cassandra::migrations::migrate_account(
-        session.clone(),
-        &config.keyspace_prefix,
-        &account_keyspace,
-        "test",
-    )
-    .await
-    .unwrap();
-    session
-        .query_with_values(
-            format!(
-                "INSERT INTO {catalog_ks}.accounts (account_id, account_name, created_at) \
-                 VALUES (?, ?, toTimestamp(now()))"
-            ),
-            cdrs_tokio::query_values!(account_id.as_str(), "Propagation Setting Test"),
-        )
-        .await
-        .unwrap();
-
-    let key_schema = vec![KeySchemaElement {
-        attribute_name: "id".to_string(),
-        key_type: KeyType::Hash,
-    }];
-    let attribute_definitions = vec![
-        AttributeDefinition {
-            attribute_name: "id".to_string(),
-            attribute_type: ScalarAttributeType::S,
-        },
-        AttributeDefinition {
-            attribute_name: GSI_PK.to_string(),
-            attribute_type: ScalarAttributeType::S,
-        },
-    ];
-    let input = CreateTableInput {
-        table_name: "PropagationSetting".to_string(),
-        key_schema: key_schema.clone(),
-        attribute_definitions: attribute_definitions.clone(),
-        local_secondary_indexes: None,
-        global_secondary_indexes: Some(vec![GsiInput {
-            index_name: GSI.to_string(),
-            key_schema: vec![KeySchemaElement {
-                attribute_name: GSI_PK.to_string(),
-                key_type: KeyType::Hash,
-            }],
-            projection: Projection {
-                projection_type: ProjectionType::All,
-                non_key_attributes: None,
-            },
-            provisioned_throughput: None,
-        }]),
-        vector_indexes: None,
-        billing_mode: None,
-        table_throughput_mode: None,
-        provisioned_throughput: None,
-        on_demand_throughput: None,
-        stream_specification: None,
-        sse_specification: None,
-        tags: None,
-        table_class: None,
-        deletion_protection_enabled: None,
-    };
-    let table = engine.create_table(&account_id, input).await.unwrap();
-    let key_info = TableKeyInfo {
-        table_name: "PropagationSetting".to_string(),
-        account_id,
-        table_id: table.table_id,
-        key_schema: key_schema.clone(),
-        base_key_schema: key_schema,
-        attribute_definitions,
-        has_lsi: false,
-        global_secondary_indexes: Vec::new(),
-        local_secondary_indexes: Vec::new(),
-        vector_indexes: Vec::new(),
-        stream_specification: None,
-    };
-    let settings = crate::helpers::create_catalog_store(&engine, &config);
+    let isolated = crate::helpers::isolated_engine(&format!("ips{tag}")).await;
+    let account =
+        crate::helpers::isolated_gsi_account(&isolated, "PropagationSetting", GSI, GSI_PK).await;
     Fixture {
-        engine,
-        settings,
-        key_info,
-        account_keyspace,
-        _drop: drop,
+        engine: isolated.engine.clone(),
+        settings: isolated.settings(),
+        key_info: account.key_info,
+        account_keyspace: account.keyspace,
+        _isolated: isolated,
     }
 }
 

@@ -57,6 +57,10 @@ pub struct CassandraEngine {
     /// and by the background poller.
     pub(crate) gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Catalog reads [`Self::index_propagation_delay`] has made, for tests
+    /// that check how often the write paths read the setting.
+    index_delay_reads: Arc<std::sync::atomic::AtomicU64>,
+
     /// Short-lived cache of per-table TTL configuration for the write path.
     ///
     /// Every Put/Update/Delete needs the config, and reading it from the
@@ -152,6 +156,7 @@ impl CassandraEngine {
             gsi_default_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS,
             )),
+            index_delay_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ttl_config_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             ttl_config_cache_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gsi_queue: crate::gsi_queue::GsiQueue::new(),
@@ -294,6 +299,7 @@ impl CassandraEngine {
         use cdrs_tokio::types::IntoRustByName as _;
         use std::sync::atomic::Ordering;
 
+        self.index_delay_reads.fetch_add(1, Ordering::Relaxed);
         let query = format!(
             "SELECT key, value FROM {}.settings \
              WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms')",
@@ -333,21 +339,45 @@ impl CassandraEngine {
         }
     }
 
+    /// How many times this engine has read `index_propagation_delay_ms` from
+    /// the catalog.
+    #[doc(hidden)]
+    pub fn index_delay_reads(&self) -> u64 {
+        self.index_delay_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The system delay a write to a table with `indexes` needs: the live
     /// [`Self::index_propagation_delay`] when some GSI follows the system
     /// setting, else `0` with no catalog read.
     ///
     /// `0` is safe to return in the second case because nothing reads it: an
     /// LSI is always synchronous, and a GSI with a delay of its own uses that
-    /// (see [`crate::data::index::effective_delay`]). Callers on the request
-    /// path call this once per request, and once per transaction, not once
-    /// per index or per item.
+    /// (see [`crate::data::index::effective_delay`]). Write calls read it at
+    /// most once, however often they retry, and a transaction once for all
+    /// its items. BatchWriteItem makes one write call per item, so it reads
+    /// once per item, as SQLite and PostgreSQL do.
     pub(crate) async fn system_index_delay(
         &self,
         indexes: &[crate::data::index::IndexMeta],
     ) -> u64 {
         if indexes.iter().any(follows_system_delay) {
             self.index_propagation_delay().await
+        } else {
+            0
+        }
+    }
+
+    /// [`Self::system_index_delay`] for a write that retries: the setting is
+    /// read at most once into `read`, which the retry loop owns, so every
+    /// attempt of one write call uses the same value.
+    pub(crate) async fn system_index_delay_once(
+        &self,
+        indexes: &[crate::data::index::IndexMeta],
+        read: &tokio::sync::OnceCell<u64>,
+    ) -> u64 {
+        if indexes.iter().any(follows_system_delay) {
+            *read.get_or_init(|| self.index_propagation_delay()).await
         } else {
             0
         }

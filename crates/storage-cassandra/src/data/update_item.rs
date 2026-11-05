@@ -60,8 +60,8 @@ impl CassandraEngine {
             ),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
-        // Read live, once per request (not per OCC attempt), and only when
-        // some GSI follows the system setting.
+        // Read live, once per write call (not per OCC attempt), and only
+        // when some GSI follows the system setting.
         let sys_delay = self.system_index_delay(&indexes).await;
         // Resolve sort key once — used in every iteration of the OCC loop.
         let (sk_opt, sk_col_opt) = if let Some(sk_elem) = key_info

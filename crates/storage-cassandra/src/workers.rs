@@ -302,23 +302,40 @@ async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Canc
 }
 
 /// What one pass of a worker over its partition found.
-struct GsiBatch {
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GsiBatch {
     /// Rows applied (and deleted from the queue).
-    applied: usize,
+    pub applied: usize,
     /// `ready_at` (ms) of the earliest row seen that was not yet due, across
     /// all account keyspaces: when the worker has work again.
-    next_due_ms: Option<i64>,
+    pub next_due_ms: Option<i64>,
+    /// Queued rows fetched with their payload, applied or not.
+    pub payload_rows_read: usize,
+}
+
+/// Run one pass of GSI worker `worker_id` over its partition, for tests that
+/// check what a pass reads and applies without the worker loop's timing.
+#[doc(hidden)]
+pub async fn run_gsi_pass(
+    engine: &CassandraEngine,
+    worker_id: u64,
+) -> Result<GsiBatch, extenddb_storage::error::StorageError> {
+    gsi_process_batch(worker_id, engine).await
 }
 
 /// Apply the due rows of this worker's partition, up to 100 per account
 /// keyspace, and find when the next row is due.
 ///
-/// Each keyspace's partition is read in `(ready_at, id)` order without a
-/// `ready_at` filter. Rows are applied until the first one not yet due; that
-/// row's `ready_at` is the keyspace's next due time. One query per keyspace
-/// gives both, where a separate `MIN(ready_at)` read would double the
-/// worker's reads. "Due" is judged with this server's clock, the one
-/// `enqueue_async_indexes` used to set `ready_at`.
+/// Two reads per keyspace: the due rows (`ready_at <= now`) with their item
+/// images, then the `ready_at` alone of the first row not yet due. Item
+/// images are read only for rows this pass applies. The second read starts
+/// past `now`, so it does not walk the tombstones of applied rows.
+///
+/// "Due" is judged with this server's clock. `ready_at` was set with the
+/// clock of the server that queued the row, which for a row queued by
+/// another server is a different clock: a row can be applied early by as
+/// much as this clock runs ahead of that one.
 async fn gsi_process_batch(
     worker_id: u64,
     engine: &CassandraEngine,
@@ -330,14 +347,16 @@ async fn gsi_process_batch(
     let keyspaces = list_account_keyspaces(engine).await?;
     let mut total = 0usize;
     let mut next_due_ms: Option<i64> = None;
+    let mut payload_rows_read = 0usize;
     #[allow(clippy::cast_possible_truncation)]
     let worker_id_i32 = worker_id as i32;
 
     for keyspace in &keyspaces {
+        let now_ms = crate::cassandra_util::now_millis();
         let query = format!(
             "SELECT worker_partition, ready_at, id, table_id, old_item, new_item, index_context \
              FROM {keyspace}.gsi_pending \
-             WHERE worker_partition = ? \
+             WHERE worker_partition = ? AND ready_at <= ? \
              ORDER BY ready_at ASC, id ASC \
              LIMIT 100"
         );
@@ -345,12 +364,22 @@ async fn gsi_process_batch(
         let rows = match crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
             &engine.session,
             &query,
-            query_values!(worker_id_i32),
+            query_values!(worker_id_i32, now_ms),
             "gsi_worker",
         )
         .await
         {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                // Not the static-only row a drained partition returns.
+                payload_rows_read += rows
+                    .iter()
+                    .filter(|row| {
+                        let ready_at: Option<i64> = row.get_by_name("ready_at").ok().flatten();
+                        ready_at.is_some()
+                    })
+                    .count();
+                rows
+            }
             Err(ref e) if is_table_not_found(e) => {
                 tracing::warn!(
                     "GSI worker {worker_id}: {keyspace}.gsi_pending not found, skipping keyspace"
@@ -360,19 +389,36 @@ async fn gsi_process_batch(
             Err(e) => return Err(e),
         };
 
-        let now_ms = crate::cassandra_util::now_millis();
+        // `ready_at` alone of the first row not yet due: when this keyspace
+        // has work again.
+        let next_query = format!(
+            "SELECT ready_at FROM {keyspace}.gsi_pending \
+             WHERE worker_partition = ? AND ready_at > ? \
+             ORDER BY ready_at ASC \
+             LIMIT 1"
+        );
+        let next_rows = crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+            &engine.session,
+            &next_query,
+            query_values!(worker_id_i32, now_ms),
+            "gsi_worker_next_due",
+        )
+        .await?;
+        let keyspace_next_due: Option<i64> = next_rows
+            .first()
+            .and_then(|row| row.get_by_name("ready_at").ok().flatten());
+        if let Some(due) = keyspace_next_due {
+            next_due_ms = Some(next_due_ms.map_or(due, |earliest| earliest.min(due)));
+        }
+
         for row in rows {
-            // A partition whose queued rows are all deleted still returns its
-            // static `last_ready_at` as a row with no clustering key: no work.
+            // Defensive: a partition whose queued rows are all deleted can
+            // return its static `last_ready_at` as a row with no clustering
+            // key. No work.
             let ready_at: Option<i64> = row.get_by_name("ready_at").ok().flatten();
             let Some(ready_at) = ready_at else {
                 continue;
             };
-            if ready_at > now_ms {
-                // Rows come in ready_at order: none after this one is due.
-                next_due_ms = Some(next_due_ms.map_or(ready_at, |due| due.min(ready_at)));
-                break;
-            }
             let id: uuid::Uuid = crate::cassandra_util::get_column(&row, "id", "gsi_worker")?;
             let table_id: String =
                 crate::cassandra_util::get_column(&row, "table_id", "gsi_worker")?;
@@ -445,6 +491,7 @@ async fn gsi_process_batch(
     Ok(GsiBatch {
         applied: total,
         next_due_ms,
+        payload_rows_read,
     })
 }
 

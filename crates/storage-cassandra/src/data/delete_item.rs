@@ -90,10 +90,20 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
+        // The system delay, read at most once for all attempts.
+        let sys_delay_read = tokio::sync::OnceCell::new();
         for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
             match self
                 .delete_item_impl_inner(
-                    key_info, key, return_old, condition, maps, stream, None, None,
+                    key_info,
+                    key,
+                    return_old,
+                    condition,
+                    maps,
+                    stream,
+                    None,
+                    None,
+                    &sys_delay_read,
                 )
                 .await
             {
@@ -185,6 +195,7 @@ impl CassandraEngine {
         stream: Option<&StreamCapture>,
         allowed_prepared_txn_id: Option<uuid::Uuid>,
         expected_claimed_item: Option<&Item>,
+        sys_delay_read: &tokio::sync::OnceCell<u64>,
     ) -> Result<Option<Item>, StorageError> {
         // Taken before the read: a write whose version is at or above it began
         // after this delete did (`item_present_serial`).
@@ -200,9 +211,9 @@ impl CassandraEngine {
             fetch_indexes_for_table(&key_info.table_id, &self.session, &catalog_keyspace),
             self.ttl_config_for_table(&key_info.account_id, &key_info.table_name),
         )?;
-        // Read live, once per request, and only when some GSI follows the
-        // system setting.
-        let sys_delay = self.system_index_delay(&indexes).await;
+        // Read live, once per write call however often it retries, and only
+        // when some GSI follows the system setting.
+        let sys_delay = self.system_index_delay_once(&indexes, sys_delay_read).await;
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)

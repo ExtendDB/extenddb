@@ -93,6 +93,8 @@ impl CassandraEngine {
     ) -> Result<Option<Item>, StorageError> {
         use super::delete_item::{TTL_CLAIM_MAX_RETRIES, ttl_claim_backoff};
 
+        // The system delay, read at most once for all attempts.
+        let sys_delay_read = tokio::sync::OnceCell::new();
         for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
             match self
                 .put_item_impl_inner(
@@ -103,6 +105,7 @@ impl CassandraEngine {
                     maps,
                     stream,
                     index_writes,
+                    &sys_delay_read,
                 )
                 .await
             {
@@ -136,6 +139,7 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
         index_writes: IndexWrites,
+        sys_delay_read: &tokio::sync::OnceCell<u64>,
     ) -> Result<Option<Item>, StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let catalog_keyspace = self.catalog_keyspace();
@@ -172,10 +176,10 @@ impl CassandraEngine {
                 index.propagation_delay_ms = Some(0);
             }
         }
-        // Read live, once per request, and only when some GSI follows the
-        // system setting. `AllSynchronous` set every index's delay to 0
-        // above, so it reads nothing.
-        let sys_delay = self.system_index_delay(&indexes).await;
+        // Read live, once per write call however often it retries, and only
+        // when some GSI follows the system setting. `AllSynchronous` set
+        // every index's delay to 0 above, so it reads nothing.
+        let sys_delay = self.system_index_delay_once(&indexes, sys_delay_read).await;
 
         // Always use read-then-write path to check prepared_txn_id for transaction safety.
         // This ensures non-transactional writes cannot corrupt in-flight transactions.
