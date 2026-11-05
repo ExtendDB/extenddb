@@ -153,6 +153,95 @@ paths = ["/path/to/imports"]
 paths = ["/path/to/exports"]
 ```
 
+### `Bulk operations are disabled. Configure [bulk] in extenddb.toml to enable.`
+
+**Cause:** A `StartBulkPutItems` request was made, but no `[bulk]` section is configured. Bulk operations are disabled by default for security. The `[import]` and `[export]` sections do not enable them; the bulk store has its own section.
+
+**Fix:** Add a `[bulk]` section to `extenddb.toml`, for the filesystem store:
+```toml
+[bulk]
+store = "filesystem"
+
+[bulk.filesystem]
+path = "/path/to/buckets"
+```
+
+or for the S3 store, which takes its AWS credentials from the standard credential chain (see the Admin Guide):
+```toml
+[bulk]
+store = "s3"
+```
+
+### `[bulk.filesystem] path is required when store = "filesystem", the default; to use the [bulk.s3] section, set store = "s3" in [bulk], or add [bulk.filesystem]`
+
+**Cause:** The configuration has a `[bulk.s3]` section, no `[bulk.filesystem]` section, and no `store` line in `[bulk]`. `store` defaults to `filesystem`, and the filesystem store needs a path.
+
+**Fix:** For the S3 store, set `store = "s3"` in `[bulk]` or `EXTENDDB__BULK__STORE=s3`. For the filesystem store, add `[bulk.filesystem]` with a `path`.
+
+### `[bulk.s3] region must be lowercase letters, digits and hyphens, beginning and ending with a letter or a digit`
+
+**Cause:** `[bulk.s3] region`, or `EXTENDDB__BULK__S3__REGION`, is not one host label, for example `US-EAST-1` or `us-east-1/x`. The section is checked whatever `store` selects, so the refusal also stops a server on the filesystem store. The message does not repeat the value.
+
+**Fix:** Set a region code such as `us-east-1`, or remove the key to use `[server] region`.
+
+### `The specified bucket does not exist` (`FailureCode: S3NoSuchBucket`)
+
+**Cause:** The bucket a `StartBulkPutItems` request named does not exist. The input bucket is checked at start: the operation is inserted already terminal, `FAILED`, `FailureCode` `S3NoSuchBucket`, `EndTime` equal to `StartTime`, zero item counters. On a table with an operation running, the Start answers `ResourceInUseException` instead and nothing is inserted. The report bucket is checked when the operation's first report record is produced, or when the manifest is written if no record was produced; the operation then ends `FAILED` with the same code, and at the manifest, at its check or at the write itself, the message starts `Manifest is not available. `. On the filesystem store the bucket is a directory beneath the caller's account subtree of the bulk store root, and one that is not a directory counts as missing. On the S3 store the message carries S3's request ids after the sentence.
+
+**Fix:** On the filesystem store, create the directory `<[bulk.filesystem] path>/<account id>/<S3Bucket>` on the server and stage the input files beneath it. On the S3 store, create the bucket where the server's credentials reach it, on the configured `endpoint_url` for an S3-compatible service, or correct `S3Bucket`. Then retry. A retry with the same `ClientToken` returns the failed operation; send the retry with a new token or none.
+
+### `is not authorized to perform: s3:...` or `Access Denied` (`FailureCode: S3AccessDenied`)
+
+**Cause:** One of four sources:
+
+- ExtendDB's check of the caller's policies denied `s3:ListBucket`, `s3:GetObject`, or `s3:PutObject`. The message names the caller and the resource, `User: <caller ARN> is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::<bucket>/<key>" because no identity-based policy allows the s3:GetObject action`, and ends without request ids. On the filesystem store, and on the S3 store with `endpoint_url`, the resource can be the key the store writes rather than the key composed from the request, for example a key under `reports/` for an output prefix of `./reports`.
+- On the S3 store, a Deny conditioned on `aws:ResourceAccount`, such as `StringNotEquals` with `${aws:PrincipalAccount}`, applies to every one of ExtendDB's S3 checks, because the key is absent from them there.
+- On the S3 store, S3 refused the server's request. The message is S3's text followed by `(Service: Amazon S3; ...)` or `(Service: S3, ...)` with S3's request ids, and a policy denial names the principal the server signs as.
+- The bucket does not match `S3BucketOwner` (`Access Denied`). On the filesystem store any owner other than the caller's account is refused, and so is a symbolic link or a non-directory component in the caller's tree.
+
+**Fix:** For ExtendDB's denial, grant the caller the named action on the named resource in its ExtendDB policies (see the Security Model, S3 actions of a bulk operation). For a Deny on `aws:ResourceAccount` on the S3 store, add `"Null": {"aws:ResourceAccount": "false"}` to its condition so it applies only where the key is present, and limit the caller's S3 grants to its own buckets. For S3's, grant the server's credentials the S3 and KMS permissions the Admin Guide lists, or allow the server's principal in the bucket policy. If S3's denial names the AWS identity of a key imported into ExtendDB, the server is signing with that key: start it without the clients' variables (see the Admin Guide, AWS credentials for S3). For an owner mismatch, correct `S3BucketOwner` or leave it out.
+
+### `InternalServerError` from `StartBulkPutItems` or a bulk operation on the S3 store
+
+**Cause:** An S3 call failed for a reason on the server's side. The server log has an ERROR line, `S3 <call> failed`, naming the bucket, with S3's code and message when S3 answered. One of four sources:
+
+- S3 refused the server's own credentials, account, or clock: `InvalidAccessKeyId`, `SignatureDoesNotMatch`, `ExpiredToken`, `InvalidToken`, `TokenRefreshRequired`, `RequestTimeTooSkewed`, or another code the Admin Guide lists. The line reads `S3 <call> failed: S3 refused the server's own credentials, account or clock; the caller is answered InternalServerError`.
+- The server's credentials did not resolve. The startup log has the warning `S3 bulk store credentials cannot be resolved`, or `S3 bulk store credentials were not resolved within five seconds`.
+- S3 or the network kept failing: for 10 seconds on a call `StartBulkPutItems` makes, or, for a running operation, through ten resumes in a row that found its checkpoint unmoved, each after 120 seconds of retries (about three minutes when S3 gave no answer at all). The failures are 5xx or 429 answers, `SlowDown`, `RequestTimeout`, timeouts, or connection failures. Each retry before that is logged at WARN with its wait, and each such resume logs a WARN line.
+- S3 answered a 4xx code ExtendDB does not map to a `FailureCode`. S3's message in the ERROR line names the cause.
+
+**Fix:** Correct the server's credentials or its clock. A server started from a shell that exports the ExtendDB access key as `AWS_ACCESS_KEY_ID`, or selects the clients' profile with `AWS_PROFILE`, signs its S3 requests with that key; S3 answers `InvalidAccessKeyId` for a key ExtendDB created, and the startup log has the warning `The S3 bulk store credentials are an access key this server also accepts from its clients`. Start the server without the clients' variables (see the Admin Guide, AWS credentials for S3). S3 answers `ExpiredToken` once temporary keys given in the environment or written into the shared config or credentials files expire; restart the server with new keys, or give it credentials the SDK renews (see the Admin Guide, AWS credentials for S3). The AWS SDK reads the shared config and credentials files once, at startup, so restart the server after changing them; until the credentials resolve, the environment, web identity, container, and instance metadata providers are asked again for each request that needs credentials. For 5xx answers or network failures, check the S3 endpoint and the network path from the server. Then start the load again. A retry with the same `ClientToken` returns an operation that ended `FAILED`, so send it with a new token or none.
+
+### `AWS refused the S3 bulk store credentials (<code>)`
+
+**Cause:** At startup AWS STS refused the credentials the server found for the S3 store: `InvalidClientTokenId` for an access key ID AWS does not know, such as one ExtendDB created, or a session token altered or left out; `SignatureDoesNotMatch` for a wrong secret key; `ExpiredToken` for a session token past its expiry. The store's S3 requests are refused the same way.
+
+**Fix:** Give the server credentials AWS accepts and restart it (see the Admin Guide, AWS credentials for S3). If the server started from a shell that holds the clients' ExtendDB key, start it without the clients' variables.
+
+### `The S3 bulk store credentials are an access key this server also accepts from its clients`
+
+**Cause:** The server started with an access key its own clients sign with, in its environment or in the profile it selected, for example after exporting the key for the AWS CLI as the Getting Started guide does. S3 refuses a key ExtendDB created. An imported AWS key makes the store read and write as that key's AWS identity.
+
+**Fix:** Start the server without the clients' variables and profile; the Admin Guide, AWS credentials for S3, gives the `env -u` commands.
+
+### `The S3 bulk store credentials are temporary keys the AWS SDK cannot renew`
+
+**Cause:** The credentials carry a session token and no expiry, as temporary keys given in environment variables or written into a credentials file do. The SDK cannot renew them, and once they expire S3 answers `ExpiredToken`. Keys a `credential_process` prints get no warning, since the SDK runs the process again.
+
+**Fix:** Give the server credentials the SDK renews: an instance or container role, web identity, IAM Identity Center, or a profile with a `credential_process`. Until then, restart the server with new keys before the old ones expire.
+
+### `S3 bulk store credentials could not be checked with AWS STS`
+
+**Cause:** AWS STS gave no answer within five seconds, the request could not be sent (for example from a network with no route to STS), or STS answered with a code that says nothing about the credentials, such as a server error, a throttling error, or `IncompleteSignature`. The check only reports; the store works as it would without it.
+
+**Fix:** The store needs nothing. For the check to run, give the server a network path to STS: an STS interface endpoint with private DNS on, or one named in `AWS_ENDPOINT_URL_STS` or in a profile's `services` entry for `sts`.
+
+### `S3 bulk store credentials could not be checked with AWS STS: the server clock is more than 15 minutes off`
+
+**Cause:** AWS STS refused the time the request was signed at. Its message, which the line repeats, starts with `Signature expired` when the server's clock is behind and `Signature not yet current` when it is ahead, and names the signed time and STS's time.
+
+**Fix:** Correct the server's clock, for example with NTP. S3 refuses requests signed that far off with `RequestTimeTooSkewed`.
+
 ### `Path must resolve under one of the configured allowed paths`
 
 **Cause:** An import or export file path does not resolve under the calling
@@ -876,7 +965,7 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Cause:** The `FileSource.Path` in an `ImportTable` request points to a file or directory that does not exist on the server's filesystem.
 
-**Fix:** Verify the path is correct and accessible to the extenddb process. Paths are relative to the server's working directory.
+**Fix:** Verify the path is correct and accessible to the extenddb process. A relative path resolves against the directory `extenddb serve` was started in.
 
 ### `Cannot open source file: <error>`
 

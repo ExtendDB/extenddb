@@ -4,7 +4,7 @@
 
 ## Current Status
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 7, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends.
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 8, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the bulk put items tables on PostgreSQL and SQLite; Cassandra and MongoDB record it as not applicable.
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -39,7 +39,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 8 are breaking: do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ### Migration 6: the backup catalog index
 
@@ -178,6 +178,46 @@ To discard data written after the upgrade as well, restore `<data-db>` from its 
 This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
 
 Data written after the upgrade in schema shapes the previous version cannot represent is lost with the restore.
+
+## Bulk Operations During Backup and Restore
+
+A bulk operation's progress lives in both databases. The catalog holds its
+row in `bulk_operations` and its input files in `bulk_operation_input_files`:
+status, counters, resume cursor, and lease. The data database holds the rows
+the operation wrote, the `bulk_row_outcomes` ledger, which records each row
+written past the last checkpoint with its outcome and what it replaced, and
+the `bulk_write_owners` record that names the claim allowed to write. The
+two are a matched pair: the cursor names how far the data rows and the
+ledger have advanced.
+
+A backup taken while an operation is running holds whatever rows were
+committed when each `pg_dump` read began, which is some prefix of the load
+unrelated to any checkpoint, and the catalog dump holds the cursor as of its
+own read. If the two dumps are not taken at one quiet moment they are
+already a mismatched pair.
+
+On restore, bring both databases back to the same point. Restoring them to
+different points leaves a runner to resume against a mismatched pair. A
+resumed runner reads the input from the cursor forward and never re-reads the
+rows behind it:
+
+- Catalog behind the data (the rollback procedure above restores only the
+  catalog). The cursor moves back, so the runner applies the input rows
+  after it again. The ledger keeps only the rows past the latest checkpoint,
+  so it does not cover them. A plain put writes the same item again. A
+  condition row is evaluated again against the item now in the table, so it
+  can fail where it passed before, and the operation's counters and reports
+  come from the second evaluation.
+- Data behind the catalog. The cursor stays ahead of the rows the data
+  restore removed, so the runner starts past them and never writes them
+  again. Those rows are missing from the table while the catalog counters
+  report them as processed. This loses data with no error.
+
+Before a backup you intend to restore from, quiesce bulk operations first.
+Cancel every non-terminal operation (see the Admin Guide, Cancelling a bulk
+operation as the operator), or lower `max_concurrent_bulk_operations` to stop
+new starts and let the running operations finish. Then back up both
+databases, and on restore bring both back to the same point.
 
 ## Version History
 
@@ -801,6 +841,18 @@ This change needs no catalog migration of its own. Before upgrading a deployment
 **What changed.** `?` in a policy pattern matches one UTF-16 code unit and `*` matches any number of them, as in IAM. Before this release both counted bytes of the value's UTF-8 encoding. The rule applies to `Action`, `NotAction`, `Resource` and `NotResource` patterns and to the `StringLike`, `StringNotLike`, `ArnLike` and `ArnNotLike` condition operators. ASCII values evaluate as before.
 
 **Who is affected.** A policy whose pattern uses `?` against a request value with a character outside ASCII. A character up to U+FFFF, such as `é` or `日`, is one unit and now takes one `?`; before this release it took one `?` per byte (two for `é`, three for `日`). A character above U+FFFF, such as an emoji, is two units and takes `??`, where it took four. A pattern written with one `?` per byte stops matching such a value and a pattern with one `?` per unit starts matching it, so a `Deny` or an `Allow` that relies on such a pattern can change its decision. Review policies that use `?` on condition keys that carry caller data, such as `dynamodb:LeadingKeys` and `dynamodb:Attributes`. No catalog migration is required.
+
+### v0.1.15: a daemonized `serve` keeps the directory it started in
+
+**What changed.** `extenddb serve` without `--foreground` keeps the directory it was started in as the daemon's working directory. Before this release the daemon changed to `/`. A relative path in the configuration or the environment now resolves against the start directory, as it does in the foreground: the `[import]` and `[export]` roots, the bulk store's filesystem root, the run directory and PID file, and the files the AWS SDK reads from its environment. When the start directory cannot be read, the daemon changes to `/` as before.
+
+**Who is affected.** A daemonized deployment that gives one of those paths as a relative path. Before this release the path resolved against `/`; now it resolves against the directory `serve` started in. Absolute paths resolve as before. No catalog migration is required.
+
+### v0.1.15: `PutItem` checks the nesting depth of `ExpressionAttributeValues` before the table lookup
+
+**What changed.** `PutItem` checks the nesting depth of every `ExpressionAttributeValues` value with its other condition checks, before it looks up the table and checks the item. Before this release that check ran after the table lookup and the item checks. The bulk put runner uses the same sequence for each row, so a row's condition fault carries the message `PutItem` returns.
+
+**Who is affected.** A `PutItem` request that carries a value nested deeper than the limit, and also names a table that does not exist or carries an item that fails its checks, now gets the nesting-depth `ValidationException`. Before this release it got the error of the table lookup or of the item. A request with one of those faults alone gets the answer it got before. No catalog migration is required.
 
 ---
 

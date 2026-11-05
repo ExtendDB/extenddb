@@ -474,6 +474,7 @@ Activate when the user asks about installing, configuring, running, or debugging
 | `crates/storage/src/lib.rs` | Storage trait definitions |
 | `crates/core/src/types.rs` | DynamoDB type definitions |
 | `crates/engine/src/` | Operation handlers |
+| `crates/s3/src/lib.rs` | S3 client building and the startup checks of the server's AWS credentials, for every S3 store |
 | `crates/bin/src/main.rs` | CLI entry point |
 
 ## Environment Variables

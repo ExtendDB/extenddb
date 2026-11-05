@@ -219,6 +219,9 @@ Query, Scan (key conditions, filters, projections, pagination, index selection)
 ### Batch & Transactions
 BatchGetItem (100 keys), BatchWriteItem (25 ops), TransactGetItems (100 items), TransactWriteItems (100 ops)
 
+### Bulk Operations
+StartBulkPutItems, DescribeBulkOperation, ListBulkOperations, CancelBulkOperation (newline-delimited DynamoDB JSON read from the configured `[bulk]` store, S3 buckets or a filesystem root, with error reports written to the same store; not available on the MongoDB or Cassandra backends)
+
 ### Vector Search
 SearchVectors, and vector indexes on CreateTable and UpdateTable (cosine, Euclidean and dot product; on-demand tables only). On PostgreSQL this requires the pgvector extension on the data database; without it every vector operation is refused and nothing else is affected.
 

@@ -488,7 +488,7 @@ spec:
 ### 9.3 Docker Build
 
 ```dockerfile
-# Static musl build for minimal container image (REQ-DEPLOY-006: < 50 MB)
+# Static musl build for minimal container image (REQ-DEPLOY-006: < 60 MB)
 FROM rust:1.77-alpine AS builder
 RUN apk add --no-cache musl-dev
 RUN rustup target add x86_64-unknown-linux-musl
