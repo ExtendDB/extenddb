@@ -69,8 +69,6 @@ DOCUMENTS = [
      "docs/manuals/07-upgrade-manual.md"),
     (8, "first-requests", "First Requests", "getting-started",
      "docs/first-requests.md"),
-    (9, "writing-migrations", "Writing a Catalog Migration", "reference",
-     "docs/manuals/14-writing-migrations.md"),
     (10, "security-model", "Security Model", "architecture",
      "docs/manuals/10-security-model.md"),
     (11, "deployment-guide", "Deployment Guide", "architecture",
@@ -131,12 +129,14 @@ def get_extenddb_version() -> str:
 
 
 def get_catalog_version() -> str:
-    """Extract CATALOG_VERSION from storage-postgres lib.rs."""
-    lib_rs = ROOT / "crates" / "storage-postgres" / "src" / "lib.rs"
-    text = lib_rs.read_text()
-    m = re.search(r"CatalogVersion::new\((\d+),\s*(\d+),\s*(\d+)\)", text)
-    if m:
-        return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+    """The catalog the manuals describe: `migration <n>`, the last id of the
+    `migration_ids!` list in crates/storage/src/migrations/registry.rs, as
+    `extenddb version` prints it."""
+    registry = ROOT / "crates" / "storage" / "src" / "migrations" / "registry.rs"
+    text = registry.read_text()
+    ids = [int(n) for n in re.findall(r"^\s*[A-Z][A-Za-z0-9]* = (\d+), \"", text, re.MULTILINE)]
+    if ids:
+        return f"migration {max(ids)}"
     return "unknown"
 
 

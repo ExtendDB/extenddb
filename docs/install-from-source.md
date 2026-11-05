@@ -211,12 +211,12 @@ Check the build:
 
 ```
 extenddb 0.1.14
-catalog 0.0.4 (postgres)
+catalog migration 5 (postgres)
 commit ceb6a63a
 built 2026-10-24T08:37:05Z
 ```
 
-`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: 0.0.4 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
+`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 5 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
 
 ## 3. Initialize the deployment
 
@@ -380,10 +380,10 @@ chmod 600 ~/.extenddb/tls/key.pem
 Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 5
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
   OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
@@ -400,7 +400,7 @@ Catalog database: extenddb_catalog
 ```
 
 ```
-extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
+extenddb 0.1.14 (catalog migration 5) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
@@ -495,12 +495,12 @@ The server is ready. [First requests](first-requests.md) walks through tables, i
 
 ## Upgrading after a `git pull`
 
-When the new binary expects a newer catalog version than the deployed one, `serve` refuses to start and `verify` reports a version mismatch. Rebuild and migrate:
+When the new binary carries catalog migrations the deployment has not applied, `serve` refuses to start and `verify` exits 3, each naming the pending migrations. Rebuild and migrate:
 
 ```bash
 cargo build --release
-./target/release/extenddb migrate --config extenddb.toml --pg-user <admin>
-./target/release/extenddb migrate --config extenddb.toml --pg-user <admin> --yes
+./target/release/extenddb migrate --config extenddb.toml
+./target/release/extenddb migrate --config extenddb.toml --yes
 ```
 
 The first command prints what is pending and changes nothing (exit status 3 when work is pending); the second applies it. Table data is not touched. The [upgrade manual](manuals/07-upgrade-manual.md) has the backup step, the rollback procedure and the per-release behavior changes.
@@ -535,7 +535,7 @@ docker exec extenddb-cassandra cqlsh -u cassandra -p cassandra \
 | Symptom | Fix |
 |---|---|
 | `connection refused` on port 18443 | The server is not running: `./target/release/extenddb serve --config extenddb.toml` |
-| `Catalog version mismatch: expected X, found Y` | `./target/release/extenddb migrate --config extenddb.toml --pg-user <admin> --yes` |
+| `serve` exits 3, naming pending catalog migrations | `./target/release/extenddb migrate --config extenddb.toml --yes`, then start the server |
 | `role "postgres" does not exist` | PostgreSQL runs as your user: omit `--pg-user` |
 | `FATAL: Peer authentication failed` | Allow `trust` or `md5` for local connections in `pg_hba.conf` |
 | `Database '<name>' already exists` from `init` | `./target/release/extenddb destroy --config extenddb.toml --yes`, then `init` again |

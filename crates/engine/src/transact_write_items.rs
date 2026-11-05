@@ -20,11 +20,13 @@ use crate::transact_write_helpers::{
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
+    AttributeNameRequestForm, validate_attribute_name_sizes,
+    validate_attribute_values_nesting_depth, validate_expression_attribute_name_sizes,
     validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
 
@@ -73,6 +75,14 @@ pub async fn handle_transact_write_items(
                 "TransactItems[{i}] must contain exactly one of ConditionCheck, Put, Delete, or Update"
             )));
         }
+    }
+
+    // Attribute names over the size limit are request-shape validation of
+    // each member, run for every member in request order before any member's
+    // table lookup: a request whose first member names a missing table
+    // answers with a later member's name refusal.
+    for twi in &input.transact_items {
+        validate_member_attribute_name_sizes(twi, &ctx.limits)?;
     }
 
     // Resolve table key info, validate inputs, parse expressions, and check
@@ -344,6 +354,52 @@ fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -
     assigned
 }
 
+/// Check the attribute names one `TransactWriteItems` member carries: the
+/// member's expression maps (any member type), then a `Put` member's item
+/// names and map keys. An over-limit name fails the whole request with a
+/// top-level ValidationException and no cancellation reasons.
+///
+/// Order, measured on the service (2026-10-21) with over-limit names in two
+/// places at once: a `Put` with a long `#n` and a long key in `:c` reports
+/// `:c` (values before names, as the `Update` member does), and a `Put` with a
+/// long item name and a long `#n` reports `#n` (expression maps before the
+/// item). A standalone `PutItem` with a long item name and a long `#n`
+/// reports the item, so that handler keeps the opposite order.
+fn validate_member_attribute_name_sizes(
+    twi: &TransactWriteItem,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let form = AttributeNameRequestForm::TransactionMember;
+    let (names, values) = if let Some(put) = &twi.put {
+        (
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(del) = &twi.delete {
+        (
+            del.expression_attribute_names.as_ref(),
+            del.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(upd) = &twi.update {
+        (
+            upd.expression_attribute_names.as_ref(),
+            upd.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(cc) = &twi.condition_check {
+        (
+            cc.expression_attribute_names.as_ref(),
+            cc.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    validate_expression_attribute_name_sizes(names, values, limits, form)?;
+    if let Some(put) = &twi.put {
+        validate_attribute_name_sizes(&put.item, limits, form)?;
+    }
+    Ok(())
+}
+
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
 async fn prepare_write_op(
     twi: &TransactWriteItem,
@@ -356,7 +412,6 @@ async fn prepare_write_op(
             .map_err(storage_err_to_dynamo)?;
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-        validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let maps = build_expression_maps(
             put.expression_attribute_names.as_ref(),
