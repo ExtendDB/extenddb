@@ -39,6 +39,8 @@ mod keyspace_migrations;
 mod metadata_engine;
 #[path = "direct/policies.rs"]
 mod policies;
+#[path = "direct/pool_size.rs"]
+mod pool_size;
 #[path = "direct/put_get_item.rs"]
 mod put_get_item;
 #[path = "direct/query.rs"]

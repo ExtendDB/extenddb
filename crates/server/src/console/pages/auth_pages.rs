@@ -9,12 +9,14 @@ use axum::Form;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
+use extenddb_storage::management_store::RateLimitStore;
 use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
 use crate::management::CallerIdentity;
-use crate::rate_limit;
+use crate::management::auth::log_password_check_error;
+use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
 
 use super::extract_session_token;
 
@@ -35,40 +37,23 @@ pub async fn login_submit(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let source_ip = addr.ip().to_string();
-
-    // Rate limit / lockout check before attempting authentication.
-    if let Err(msg) =
-        rate_limit::check_login_allowed(&*state.catalog_store, &form.username, Some(&source_ip))
-            .await
-    {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Html(login_html(Some(&msg), &state.listen_url)),
-        )
-            .into_response();
-    }
-
-    // Try admin auth first.
-    let identity =
-        match try_admin_login(&form.username, &form.password, &*state.catalog_store).await {
-            AdminLoginResult::Authenticated(id) => Some(id),
-            AdminLoginResult::WrongPassword => None, // Admin exists, wrong password — do NOT fall through.
-            AdminLoginResult::NotFound => {
-                // Admin not found — try IAM user auth.
-                try_iam_login(&form.username, &form.password, &*state.catalog_store).await
-            }
-        };
-
-    let Some(identity) = identity else {
-        rate_limit::record_failed_login(&*state.catalog_store, &form.username, Some(&source_ip))
-            .await;
-        return (
-            StatusCode::OK,
-            Html(login_html(Some("Invalid credentials"), &state.listen_url)),
-        )
-            .into_response();
+    // Reserve the attempt before any password is checked. Limits are per
+    // username and peer address, so failures from elsewhere do not lock this
+    // address out.
+    let attempt = match rate_limit::begin_login(&*state.catalog_store, &form.username, addr).await {
+        Ok(attempt) => attempt,
+        Err(refusal) => return refusal_page(refusal, &state.listen_url),
     };
+
+    // Try admin auth first, then IAM user auth. A storage error (including a
+    // timed-out wait for a bcrypt slot) is answered 500 and recorded as
+    // nothing: no password was checked.
+    let checked = check_credentials(&form.username, &form.password, &*state.catalog_store).await;
+    let identity =
+        match settle_attempt(attempt, checked, &*state.catalog_store, &state.listen_url).await {
+            Ok(identity) => identity,
+            Err(page) => return page,
+        };
 
     let (token, _csrf) = state.sessions.create(identity).await;
     let cookie = format!(
@@ -139,37 +124,203 @@ enum AdminLoginResult {
     NotFound,
 }
 
+/// The login page with a server error, answered when the store failed before
+/// or while the password was checked. Nothing is recorded against the caller.
+fn internal_error(listen_url: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Html(login_html(
+            Some("Internal error. Please try again later."),
+            listen_url,
+        )),
+    )
+        .into_response()
+}
+
+/// The login page answered to a wrong password or an unknown principal.
+fn invalid_credentials(listen_url: &str) -> Response {
+    (
+        StatusCode::OK,
+        Html(login_html(Some("Invalid credentials"), listen_url)),
+    )
+        .into_response()
+}
+
+/// The login page answered to an attempt the rate limiter did not admit.
+fn refusal_page(refusal: LoginRefusal, listen_url: &str) -> Response {
+    match refusal {
+        LoginRefusal::TooManyAttempts(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Html(login_html(Some(msg), listen_url)),
+        )
+            .into_response(),
+        LoginRefusal::InvalidCredentials => invalid_credentials(listen_url),
+        LoginRefusal::Internal => internal_error(listen_url),
+    }
+}
+
+/// Check the form's credentials, admin first and then IAM user. `Ok(None)`
+/// is a wrong password or an unknown principal; `Err(())` is a storage
+/// error, including a timed-out wait for a bcrypt slot.
+async fn check_credentials(
+    username: &str,
+    password: &str,
+    store: &dyn extenddb_storage::CatalogStore,
+) -> Result<Option<CallerIdentity>, ()> {
+    match try_admin_login(username, password, store).await? {
+        AdminLoginResult::Authenticated(id) => Ok(Some(id)),
+        // Admin exists, wrong password: do NOT fall through.
+        AdminLoginResult::WrongPassword => Ok(None),
+        // Admin not found: try IAM user auth.
+        AdminLoginResult::NotFound => try_iam_login(username, password, store).await,
+    }
+}
+
+/// Settle an admitted attempt with the result of its password check. A
+/// wrong password is recorded as a failure and answered with the form's
+/// error. A storage error is answered 500 and recorded as nothing; dropping
+/// the attempt releases its reservation.
+async fn settle_attempt(
+    attempt: LoginAttempt,
+    checked: Result<Option<CallerIdentity>, ()>,
+    rate_limiter: &dyn RateLimitStore,
+    listen_url: &str,
+) -> Result<CallerIdentity, Response> {
+    match checked {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => {
+            attempt.record_failure(rate_limiter).await;
+            Err(invalid_credentials(listen_url))
+        }
+        Err(()) => Err(internal_error(listen_url)),
+    }
+}
+
+/// `Err(())` is a storage error; the caller answers 500 and records nothing.
 async fn try_admin_login(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::management_store::AdminStore,
-) -> AdminLoginResult {
-    let Ok(result) = store.verify_admin_password(username, password).await else {
-        return AdminLoginResult::NotFound;
-    };
-    match result {
+) -> Result<AdminLoginResult, ()> {
+    let result = store
+        .verify_admin_password(username, password)
+        .await
+        .map_err(|e| log_password_check_error("Console login: DB error during admin auth", &e))?;
+    Ok(match result {
         Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),
         Some(false) => AdminLoginResult::WrongPassword,
         None => AdminLoginResult::NotFound,
-    }
+    })
 }
 
+/// `Ok(None)` is a wrong password or an unknown user; `Err(())` is a storage
+/// error, which the caller answers 500 and records as nothing.
 async fn try_iam_login(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::management_store::ManagementStore,
-) -> Option<CallerIdentity> {
-    let (acct_id, uname) = username.split_once('/')?;
+) -> Result<Option<CallerIdentity>, ()> {
+    let Some((acct_id, uname)) = username.split_once('/') else {
+        return Ok(None);
+    };
     let ok = store
         .verify_iam_user_password(acct_id, uname, password)
         .await
-        .ok()?;
-    if ok {
-        Some(CallerIdentity::IamUser {
-            account_id: acct_id.to_owned(),
-            user_name: uname.to_owned(),
-        })
-    } else {
-        None
+        .map_err(|e| {
+            log_password_check_error("Console login: DB error during IAM user auth", &e)
+        })?;
+    Ok(ok.then(|| CallerIdentity::IamUser {
+        account_id: acct_id.to_owned(),
+        user_name: uname.to_owned(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_storage::password::VERIFY_OVERLOADED;
+
+    use super::*;
+    use crate::management::auth::tests::FailingAdmins;
+    use crate::rate_limit::PRINCIPAL_LIMITED;
+    use crate::rate_limit::tests::{MemoryStore, capture_logs, peer};
+
+    const LISTEN_URL: &str = "https://127.0.0.1:8443";
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refused_attempt_is_answered_by_its_reason() {
+        let limited = refusal_page(LoginRefusal::TooManyAttempts(PRINCIPAL_LIMITED), LISTEN_URL);
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body_text(limited).await.contains(PRINCIPAL_LIMITED));
+
+        // The attempts store could not be read: a server error, not a limit.
+        let internal = refusal_page(LoginRefusal::Internal, LISTEN_URL);
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A principal over the length limit gets the wrong-password page.
+        let too_long = refusal_page(LoginRefusal::InvalidCredentials, LISTEN_URL);
+        assert_eq!(too_long.status(), StatusCode::OK);
+        assert!(body_text(too_long).await.contains("Invalid credentials"));
+    }
+
+    #[tokio::test]
+    async fn a_store_error_in_the_admin_check_is_an_error_not_an_unknown_admin() {
+        let admins = FailingAdmins {
+            message: "store is down",
+        };
+        let (logs, _guard) = capture_logs();
+        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        let text = logs.text();
+        assert!(
+            text.contains("ERROR") && text.contains("Console login: DB error during admin auth"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bcrypt_slot_timeout_is_an_error_and_is_not_logged_as_a_store_error() {
+        let admins = FailingAdmins {
+            message: VERIFY_OVERLOADED,
+        };
+        let (logs, _guard) = capture_logs();
+        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        let text = logs.text();
+        assert!(!text.contains("DB error"), "{text}");
+    }
+
+    // Each test uses its own source address: the in-flight registry is
+    // process-wide.
+
+    #[tokio::test]
+    async fn a_store_error_during_the_password_check_answers_500_and_records_nothing() {
+        let attempts = MemoryStore::default();
+        let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.90"))
+            .await
+            .unwrap();
+        let page = settle_attempt(attempt, Err(()), &attempts, LISTEN_URL)
+            .await
+            .unwrap_err();
+        assert_eq!(page.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(attempts.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_answers_the_form_error_and_records_one_failure() {
+        let attempts = MemoryStore::default();
+        let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.91"))
+            .await
+            .unwrap();
+        let page = settle_attempt(attempt, Ok(None), &attempts, LISTEN_URL)
+            .await
+            .unwrap_err();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(body_text(page).await.contains("Invalid credentials"));
+        assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
     }
 }

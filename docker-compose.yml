@@ -71,6 +71,12 @@ services:
         CONFIG=/var/lib/extenddb/extenddb.toml
         if [ -f "$$CONFIG" ]; then
           echo "bootstrap: existing config detected; running migrations"
+          # The preview takes no lock and exits 3 when migrations are
+          # pending. migrate --yes waits for a running server to stop, so it
+          # runs only then, and an `up` on a running stack exits 0 here.
+          rc=0
+          extenddb migrate --config "$$CONFIG" || rc=$$?
+          [ "$$rc" -eq 3 ] || exit "$$rc"
           exec extenddb migrate --config "$$CONFIG" --yes \
             --pg-user "$$PG_ADMIN_USER"
         fi
