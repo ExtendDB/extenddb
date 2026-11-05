@@ -12,7 +12,7 @@ The `auth` crate provides pluggable authentication and authorization for extendd
 
 The crate depends on `extenddb-core` (for types and errors) and `async_trait` (for object-safe async trait dispatch). It has no HTTP framework or storage dependencies.
 
-> **No caching.** All credential lookups, policy fetches, and identity resolution read directly from Postgres on every request. The latency is sub-millisecond for indexed lookups, and this approach eliminates stale-cache bugs and cache invalidation complexity entirely. Multiple extenddb instances sharing the same catalog see consistent data without coordination. If profiling under production load shows database round-trips are a bottleneck, caching can be added as a transparent layer without changing any interfaces.
+> **Caching.** Credential lookups and policy fetches go through in-memory caches with write-through invalidation and a TTL: the credential cache in this crate (`credential_cache.rs`) and the authorization caches in the server crate (`authz_cache.rs`). `docs/design/12-auth-authz-cache.md` describes that design and replaces the "no caching" decision this document originally recorded.
 
 ## 2. Key Design Decisions (from 2026-04-15 review session)
 
@@ -266,7 +266,7 @@ When `extenddb init` creates the first admin user, it seeds a default policy. Wh
 }
 ```
 
-Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. Policy variable support (REQ-ABAC-006) remains deferred.
+Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. IAM policy variables are expanded when a policy is evaluated (REQ-ABAC-006, `policy/variables.rs`).
 
 ## 6. Catalog Schema Changes for Multi-Account
 

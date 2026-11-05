@@ -17,9 +17,8 @@
 //! CREATING.
 
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary,
-    ContinuousBackupsDescription, GsiInput, Item, KeySchemaElement, LsiInput,
-    PointInTimeRecoveryDescription, Projection, SourceTableDetails, StreamSpecification,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput, Item,
+    KeySchemaElement, LsiInput, Projection, SourceTableDetails, StreamSpecification,
     TableDescription, TimeToLiveDescription, TimeToLiveStatus,
 };
 use extenddb_storage::backup_definition::{
@@ -46,8 +45,9 @@ const BACKUP_SERVER_SLOTS_MAX: usize = 16;
 /// `LimitExceeded`.
 pub(crate) const BACKUP_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Backups the whole process may run at once, across accounts:
-/// `pool_size / 2 - 1`, clamped to `1..=16`.
+/// Backups and table snapshots the whole process may run at once, across
+/// accounts. The formula is stated once, on `SqliteConfig::pool_size`
+/// (`config.rs`); this computes it.
 ///
 /// A file-backed backup holds one pooled connection for its whole duration
 /// (the WAL snapshot its items are read from) and its batches and final
@@ -67,20 +67,26 @@ pub(crate) fn backup_server_slot_count(pool_size: u32) -> usize {
 
 /// Take a server slot for a backup, waiting at most `wait`; `LimitExceeded`
 /// when none frees up in time.
-async fn acquire_backup_permit(
+pub(crate) async fn acquire_backup_permit(
     slots: std::sync::Arc<tokio::sync::Semaphore>,
     slot_count: usize,
     wait: std::time::Duration,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, StorageError> {
     tokio::time::timeout(wait, slots.acquire_owned())
         .await
-        .map_err(|_| {
-            StorageError::LimitExceeded(format!(
-                "Too many backups are in progress on this server (at most {slot_count} at once); \
-                 retry later"
-            ))
-        })?
+        .map_err(|_| slots_exhausted(slot_count))?
         .map_err(|e| StorageError::Internal(format!("backup slot: {e}")))
+}
+
+/// The refusal when every server slot is held. Backups and table snapshots
+/// (`snapshot_engine.rs`) share the slots, so the message names both: with
+/// snapshots holding every slot a `CreateBackup` is refused with no backup
+/// running.
+pub(crate) fn slots_exhausted(slot_count: usize) -> StorageError {
+    StorageError::LimitExceeded(format!(
+        "Too many backups or table snapshots are in progress on this server (at most \
+         {slot_count} at once); retry later"
+    ))
 }
 
 /// Read the next batch of `(cursor, item_data)` from `table` after
@@ -1304,95 +1310,6 @@ impl BackupEngine for SqliteEngine {
             })?
         })
     }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = ? AND table_name = ?)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if !exists {
-                return Err(StorageError::TableNotFound(table_name));
-            }
-
-            let pitr: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups WHERE account_id = ? AND table_name = ?",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let enabled = pitr.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if enabled { "ENABLED" } else { "DISABLED" }
-                        .to_owned(),
-                    earliest_restorable_date_time: enabled.then_some(now - 35.0 * 24.0 * 3600.0),
-                    latest_restorable_date_time: enabled.then_some(now),
-                }),
-            })
-        })
-    }
-
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_owned();
-        let table_name = table_name.to_owned();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = ? AND table_name = ?)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if !exists {
-                return Err(StorageError::TableNotFound(table_name));
-            }
-            {
-                // D1: every writer holds the engine write lock. Scoped so the
-                // read-only describe below runs after release.
-                let _writer = self.write_lock.lock().await;
-                sqlx::query(
-                    "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-                     VALUES (?, ?, ?) \
-                     ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = excluded.pitr_enabled",
-                )
-                .bind(&account_id)
-                .bind(&table_name)
-                .bind(pitr_enabled)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            }
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1494,12 +1411,12 @@ mod restore_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("propagation");
@@ -2112,9 +2029,9 @@ mod restore_tests {
 
     /// A database with the schema catalog 0.0.3 shipped, holding a backup in
     /// the row shape 0.0.3 wrote (`pk` empty, `sk` NULL, no definition), is
-    /// brought to 0.0.4 by re-applying the schema, which is what
-    /// `extenddb migrate` does on this backend; the old backup then restores
-    /// as it did before: keys and items, no secondary indexes.
+    /// brought to the latest migration by the runner, as `extenddb migrate
+    /// --yes` does; the old backup then restores as it did before: keys and
+    /// items, no secondary indexes.
     #[tokio::test]
     async fn a_0_0_3_database_migrates_and_its_backups_restore() {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
@@ -2124,7 +2041,7 @@ mod restore_tests {
             .execute(&engine.pool)
             .await
             .expect("0.0.3 schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
@@ -2133,7 +2050,16 @@ mod restore_tests {
             .execute(&engine.pool)
             .await
             .expect("account");
-        assert!(engine.check_catalog_version().await.is_err());
+        let on_pool = crate::migrations::SqliteMigrations::on_pool(engine.pool.clone(), ":memory:")
+            .expect("one connection");
+        let runner = extenddb_storage::migrations::Runner::new(&on_pool, "test");
+        assert!(
+            matches!(
+                runner.status().await.expect("status"),
+                extenddb_storage::migrations::CatalogStatus::Behind { version: None, .. }
+            ),
+            "a 0.0.3 database has no ledger"
+        );
 
         // A backup exactly as the 0.0.3 binary wrote one.
         let arn = format!("arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/old/backup/1-00000000");
@@ -2163,38 +2089,20 @@ mod restore_tests {
             .expect("old backup item");
         }
 
-        // The dry run names the rebuild, with the row count.
-        assert_eq!(
-            crate::schema::pending_shape_migrations(&engine.pool)
-                .await
-                .expect("pending"),
-            vec!["rebuild backup_items (3 rows)".to_owned()]
-        );
-        let (log_guard, logs) = crate::schema::log_capture::capture();
-        crate::schema::apply(&engine.pool).await.expect("migrate");
-        drop(log_guard);
-        let logs = logs.lock().expect("logs").clone();
+        // Migration 1 rebuilds backup_items and says how many rows it copied.
+        let report = runner.migrate().await.expect("migrate");
+        let baseline_notes = report.applied[0].notes.join("\n");
         assert!(
-            logs.iter().any(|l| l.starts_with("INFO")
-                && l.contains("rebuilding backup_items")
-                && l.contains("(3 rows)")),
-            "{logs:#?}"
+            baseline_notes.contains("copying 3 row(s)"),
+            "{baseline_notes}"
         );
         assert!(
-            logs.iter()
-                .any(|l| l.starts_with("INFO") && l.contains("rebuilt backup_items (3 rows)")),
-            "{logs:#?}"
+            matches!(
+                runner.status().await.expect("status after"),
+                extenddb_storage::migrations::CatalogStatus::Current { .. }
+            ),
+            "current after the run"
         );
-        assert!(
-            crate::schema::pending_shape_migrations(&engine.pool)
-                .await
-                .expect("pending after")
-                .is_empty()
-        );
-        engine
-            .check_catalog_version()
-            .await
-            .expect("0.0.4 after migrate");
         let id_is_primary_key: i64 = sqlx::query_scalar(
             "SELECT pk FROM pragma_table_info('backup_items') WHERE name = 'id'",
         )
@@ -2419,12 +2327,12 @@ mod restore_tests {
         )
         .await
         .expect("file engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("propagation");
@@ -2439,7 +2347,7 @@ mod restore_tests {
     async fn close_file_engine(engine: SqliteEngine, path: &std::path::Path) {
         engine.pool.close().await;
         drop(engine);
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
@@ -3500,10 +3408,7 @@ mod restore_tests {
             .expect("first");
         match acquire_backup_permit(slots.clone(), 1, Duration::from_millis(50)).await {
             Err(StorageError::LimitExceeded(m)) => {
-                assert!(
-                    m.contains("backups are in progress on this server (at most 1"),
-                    "{m}"
-                );
+                assert!(m.contains("in progress on this server (at most 1"), "{m}");
             }
             other => panic!("a full bound refuses: {:?}", other.err()),
         }

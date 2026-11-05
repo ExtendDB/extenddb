@@ -18,9 +18,13 @@ use super::matcher::wildcard_match;
 /// - Base (bare) operators on a **single-valued** key: key must be present and
 ///   its value must match at least one policy value.
 /// - Base (bare) operators on a **multivalued** key (`dynamodb:Attributes`,
-///   `dynamodb:LeadingKeys`): never match. AWS IAM requires a
-///   `ForAllValues:`/`ForAnyValue:` qualifier for multivalued keys; a bare
-///   operator on such a key is a no-op regardless of value count (BR-7085).
+///   `dynamodb:LeadingKeys`, `aws:TagKeys`): never match while the key is
+///   present. AWS IAM requires a `ForAllValues:`/`ForAnyValue:` qualifier for
+///   multivalued keys; a bare operator on a present multivalued key is a no-op
+///   regardless of value count (BR-7085). A bare NEGATED operator on an
+///   **absent** multivalued key matches on IAM; here it matches only when the
+///   context's `bare_negated_matches_absent_multivalued_key` says so for the
+///   key, which the `DynamoDB` request context does for `aws:TagKeys` alone.
 /// - `IfExists`: passes if the key is absent; otherwise evaluates as the base
 ///   operator (and so never matches a present multivalued key).
 /// - `Null`: checks key presence/absence.
@@ -28,15 +32,33 @@ use super::matcher::wildcard_match;
 ///   Absent key is vacuously true.
 /// - `ForAnyValue`: at least one context value must match some policy value.
 ///   Absent key is false (unless wrapped in `IfExists`).
+///
+/// Policy variables in the values are read as in a `2012-10-17` document;
+/// [`evaluate_condition_with`] takes the document's choice.
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
+    evaluate_condition_with(condition, true, context)
+}
+
+/// [`evaluate_condition`] for a statement of a document whose `Version` is
+/// `2012-10-17` when `version_2012` is true
+/// ([`super::document::PolicyDocument::expands_policy_variables`]).
+///
+/// The value says how the text between `${` and `}` in a condition value is
+/// read ([`reads_iam_variable_syntax`]); `${key}` expands whatever it is.
+pub fn evaluate_condition_with(
+    condition: &Condition,
+    version_2012: bool,
+    context: &impl ConditionContext,
+) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
+    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
     let expanded_values: Vec<String> = condition
         .values
         .iter()
-        .map(|v| expand_policy_variables(v, context))
+        .map(|v| expand_policy_variables(v, iam_syntax, context))
         .collect();
 
     match &condition.operator {
@@ -50,6 +72,12 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => true,
+                // No Arn set check here, unlike `ForAnyValue`: a value that
+                // is not an ARN fails `compare_single` for every Arn operator,
+                // so the `all` below is already false for any non-empty
+                // policy value list. With an empty list the negative form is
+                // true, as IAM evaluates it (simulate-custom-policy,
+                // 2026-10-28).
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: each context value must satisfy the
@@ -77,6 +105,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => {
                     if is_negative_operator(base_op) {
                         // Negative operators: at least one context value must
@@ -109,18 +138,32 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             Some(vals) => evaluate_single_value_condition(inner, &vals, &expanded_values),
         },
         other => match context_values {
-            // A negated operator on an absent single-valued key evaluates true
-            // in AWS IAM: the key has no value, so it cannot equal the policy
-            // value, so "not equals" holds. This makes a Deny gated on
-            // StringNotEquals apply when the caller omits the key (the
-            // confused-deputy guard). Measured on live IAM/STS and DynamoDB.
-            // Bare operators on multivalued keys
-            // never match, present or absent (BR-7085), so the rule is scoped
-            // to single-valued keys.
-            None => is_negative_operator(other) && !is_multivalued,
-            // Bare operator on a multivalued key never matches (BR-7085). This is
-            // fail-safe: a bare Deny becomes a no-op (matching AWS, which forces the
-            // author to use ForAnyValue:), and a bare Allow allowlist stops granting.
+            // A negated operator on an absent key evaluates true in AWS IAM:
+            // the key has no value, so it cannot equal the policy value, so
+            // "not equals" holds. This makes a Deny gated on StringNotEquals
+            // apply when the caller omits the key (the confused-deputy guard).
+            // Measured on live IAM/STS and DynamoDB for single-valued keys, and
+            // on IAM for the absent multivalued keys `aws:TagKeys`,
+            // `dynamodb:LeadingKeys` and `dynamodb:Attributes`. For a
+            // multivalued key the context decides whether that answer applies:
+            // it is right only where ExtendDB leaves the key absent on the same
+            // requests the service does. ExtendDB leaves `dynamodb:Attributes`
+            // absent on writes, on `AttributesToGet` reads and on batch and
+            // transaction targets, and `dynamodb:LeadingKeys` absent on query
+            // shapes it cannot pin to a partition value, where the service
+            // populates them; matching there would grant an Allow the service
+            // refuses, so those keys keep the no-match rule. `aws:TagKeys` is
+            // populated on exactly the three operations the service reference
+            // lists it for, so its absent-key answer is IAM's.
+            None => {
+                is_negative_operator(other)
+                    && (!is_multivalued
+                        || context.bare_negated_matches_absent_multivalued_key(&condition.key))
+            }
+            // Bare operator on a present multivalued key never matches
+            // (BR-7085). This is fail-safe: a bare Deny becomes a no-op
+            // (matching AWS, which forces the author to use ForAnyValue:), and a
+            // bare Allow allowlist stops granting.
             Some(_) if is_multivalued => false,
             Some(vals) => evaluate_single_value_condition(other, &vals, &expanded_values),
         },
@@ -153,20 +196,88 @@ pub enum ConditionMatch {
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3). Otherwise returns `Match`
-/// or `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// context reports it as service-populated (case 3), and when a condition value
+/// reads such a key through a `${name}` policy variable, or through a
+/// `${name, 'default'}` one where [`reads_iam_variable_syntax`] holds, since
+/// the variable has no value to expand to and the service, which has one,
+/// would not use the default. Otherwise returns `Match` or `NoMatch` from the
+/// ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is as
+/// in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
-    if context.resolve_key(&condition.key).is_none() && context.is_unresolvable_key(&condition.key)
+    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
+    if is_unresolvable(&condition.key, context)
+        || reads_unresolvable_variable(condition, iam_syntax, context)
     {
         return ConditionMatch::Unresolvable;
     }
-    if evaluate_condition(condition, context) {
+    if evaluate_condition_with(condition, version_2012, context) {
         ConditionMatch::Match
     } else {
         ConditionMatch::NoMatch
+    }
+}
+
+/// Whether `key` is unresolved and the context reports it as one the service
+/// populates.
+fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
+    context.resolve_key(key).is_none() && context.is_unresolvable_key(key)
+}
+
+/// Whether a value of `condition` names, as a `${name}` or `${name, 'default'}`
+/// policy variable, a key [`is_unresolvable`] reports.
+///
+/// The names come from [`super::variables::variable_key_names`], which reads
+/// the text between the braces the way [`expand_policy_variables`] expands
+/// it with the same `iam_syntax`, so with it a default written beside such a
+/// key does not hide the key from this check.
+fn reads_unresolvable_variable(
+    condition: &Condition,
+    iam_syntax: bool,
+    context: &impl ConditionContext,
+) -> bool {
+    condition.values.iter().any(|value| {
+        super::variables::variable_key_names(value, iam_syntax)
+            .any(|name| is_unresolvable(name, context))
+    })
+}
+
+/// Whether the values of a condition under `operator`, in a document whose
+/// `Version` is `2012-10-17` when `version_2012` is true, are read with IAM's
+/// variable syntax: the `${key, 'default'}` form, and a key name trimmed of
+/// the code points up to U+0020.
+///
+/// IAM reads that syntax only in a `2012-10-17` document and under the string
+/// and ARN operators, with or without a set qualifier or `IfExists` (IAM
+/// policy simulator, 2026-11-03, two samples per row). In a `2008-10-17`
+/// document and in one with no `Version`, `${aws:username, 'x'}` is compared
+/// as written under `StringEquals` and `StringNotEquals`. In a `2012-10-17`
+/// document a default does not take part under `NumericEquals`,
+/// `DateGreaterThan`, `IpAddress`, `Bool` or `Null`, while it does under
+/// `StringEquals` and `ArnLike`. Elsewhere the text between the braces is the
+/// key name as written, which is how condition values were read before the
+/// default form: `${key}` still expands there, as it did.
+fn reads_iam_variable_syntax(operator: &ConditionOperator, version_2012: bool) -> bool {
+    version_2012 && operator_reads_variables(operator)
+}
+
+/// Whether `operator`, unwrapped from its set qualifier and `IfExists`, is a
+/// string or ARN operator.
+fn operator_reads_variables(operator: &ConditionOperator) -> bool {
+    match operator {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => operator_reads_variables(inner),
+        ConditionOperator::StringEquals
+        | ConditionOperator::StringNotEquals
+        | ConditionOperator::StringEqualsIgnoreCase
+        | ConditionOperator::StringNotEqualsIgnoreCase
+        | ConditionOperator::StringLike
+        | ConditionOperator::StringNotLike => true,
+        other => is_arn_operator(other),
     }
 }
 
@@ -175,14 +286,17 @@ pub fn evaluate_condition_match(
 /// `NoMatch` dominates: if any condition is definitely not satisfied the
 /// statement does not apply, even if another condition is unresolvable. Failing
 /// that, any unresolvable condition makes the block `Unresolvable` (fail
-/// closed). Otherwise every condition matched.
+/// closed). Otherwise every condition matched. `version_2012` is whether the
+/// statement's document has `Version` `2012-10-17`, as in
+/// [`evaluate_condition_with`].
 pub fn evaluate_statement_conditions(
     conditions: &[Condition],
+    version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
     let mut any_unresolvable = false;
     for condition in conditions {
-        match evaluate_condition_match(condition, context) {
+        match evaluate_condition_match(condition, version_2012, context) {
             ConditionMatch::Match => {}
             ConditionMatch::NoMatch => return ConditionMatch::NoMatch,
             ConditionMatch::Unresolvable => any_unresolvable = true,
@@ -197,40 +311,29 @@ pub fn evaluate_statement_conditions(
 
 /// Expand IAM policy variables in a string value.
 ///
-/// Replaces `${variable}` patterns with their resolved values from the context.
-/// Supported variables: `aws:PrincipalTag/*` and any key the context can
-/// resolve. Unresolvable variables are left as-is (IAM behavior).
-fn expand_policy_variables(value: &str, context: &impl ConditionContext) -> String {
-    if !value.contains("${") {
-        return value.to_owned();
-    }
-
-    let mut result = String::with_capacity(value.len());
-    let mut rest = value;
-
-    while let Some(start) = rest.find("${") {
-        result.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        if let Some(end) = after_start.find('}') {
-            let var_name = &after_start[..end];
-            if let Some(vals) = context.resolve_key(var_name) {
-                // Use the first value for single-valued expansion.
-                if let Some(v) = vals.first() {
-                    result.push_str(v);
-                }
-            } else {
-                // Unresolvable — leave the variable literal.
-                result.push_str(&rest[start..start + 3 + end]);
-            }
-            rest = &after_start[end + 1..];
-        } else {
-            // No closing brace — copy literally.
-            result.push_str(&rest[start..]);
-            rest = "";
-        }
-    }
-    result.push_str(rest);
-    result
+/// Replaces `${variable}` and `${variable, 'default'}` patterns with their
+/// resolved values from the context (see [`super::variables`]). Supported
+/// variables: `aws:PrincipalTag/*` and any single-valued key the context can
+/// resolve. A variable whose key the request does not carry, with no default,
+/// stays literal, which gives IAM's answer except when the compared value
+/// holds the variable's text. A variable that names a multivalued key
+/// (`aws:TagKeys`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`) also stays
+/// literal: a set of values has no one value to expand to. IAM leaves such a
+/// variable as text (measured 2026-10-27: a Deny on `aws:ResourceTag/team`
+/// equal to `${aws:TagKeys}` applies to no request, whatever order the
+/// request lists its tag keys in, and the same Deny under `StringNotEquals`
+/// applies to every request). A variable naming a key the context reports
+/// unresolvable also stays literal here, with or without a default; the
+/// condition fails closed on it before this expansion is compared
+/// ([`evaluate_condition_match`]). Without `iam_syntax`
+/// ([`reads_iam_variable_syntax`]) the default form is not read, so
+/// `${key, 'default'}` stays literal too.
+fn expand_policy_variables(
+    value: &str,
+    iam_syntax: bool,
+    context: &impl ConditionContext,
+) -> String {
+    super::variables::expand_condition_value(value, iam_syntax, context)
 }
 
 /// Unwrap an `IfExists` wrapper if present.
@@ -294,6 +397,45 @@ fn is_negative_operator(op: &ConditionOperator) -> bool {
     )
 }
 
+/// Returns true for the Arn condition operators.
+fn is_arn_operator(op: &ConditionOperator) -> bool {
+    matches!(
+        op,
+        ConditionOperator::ArnEquals
+            | ConditionOperator::ArnNotEquals
+            | ConditionOperator::ArnLike
+            | ConditionOperator::ArnNotLike
+    )
+}
+
+/// Whether `op` is an Arn operator and at least one of `context_values` is
+/// not an ARN by [`super::matcher::is_arn`].
+///
+/// IAM evaluates an Arn condition over a multi-valued key as false when any
+/// value in the set is not an ARN, whatever the pattern and whatever the set
+/// qualifier. Measured with simulate-custom-policy on 2026-10-23 with the
+/// values [`arn:aws:dynamodb:us-east-1:123456789012:table/Tother`,
+/// `notanarn`]: the `ForAnyValue:` and `ForAllValues:` forms of ArnEquals,
+/// ArnNotEquals, ArnLike and ArnNotLike returned implicitDeny with a pattern
+/// that matches the ARN value (`table/*`) and with one that does not
+/// (`table/Z*`), and the bare form returned implicitDeny with `table/*`. On
+/// 2026-10-28, with `aws:TagKeys` holding [`.../table/V`, `notanarn`], the
+/// two set forms with and without `IfExists` returned implicitDeny for both
+/// patterns, and the two set forms without `IfExists` returned implicitDeny
+/// with `j*` over [`junk`]. The rows are in the description of PR #471.
+/// `ForAnyValue:` checks this before comparing per value,
+/// so `ForAnyValue:ArnEquals` does not pass on the one well-formed value and
+/// `ForAnyValue:ArnNotEquals` does not pass on a non-matching pattern.
+/// `ForAllValues:` needs no such check: a value that is not an ARN fails
+/// `compare_single` against every policy value, so per-value evaluation
+/// already returns false there for any non-empty policy value list. With an
+/// empty policy value list `ForAllValues:` with a negative Arn operator is
+/// true and `ForAnyValue:` is false, as IAM evaluates them (measured
+/// 2026-10-28; pinned in `tests/arn_operators.rs`).
+fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
+    is_arn_operator(op) && !context_values.iter().all(|cv| super::matcher::is_arn(cv))
+}
+
 /// Compare a single context value against a single policy value.
 ///
 /// Returns `true` if the comparison holds for the given operator.
@@ -345,10 +487,28 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
         ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => super::matcher::arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !super::matcher::arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
+        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
+        // case sensitive, and both sides need the same number of fields,
+        // except that a bare `*` pattern matches any six-field value
+        // (`arn_match` returns before it compares fields; derived, since the
+        // simulator refuses `*` against an ARN).
+        // A context value that is not an ARN (fewer than six fields) matches
+        // neither the positive nor the negative operator, so a Deny on
+        // ArnNotEquals does not apply to a malformed value; under
+        // `ForAnyValue:` `arn_operator_sees_non_arn` applies the same rule to
+        // the whole set before this per-value comparison. The rows measured
+        // with simulate-custom-policy are in the description of PR #471; the
+        // non-ARN rule was measured for all four operators on 2026-10-28 with
+        // the values `notanarn` and `arn:aws:dynamodb`.
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
+            super::matcher::is_arn(context_value)
+                && super::matcher::arn_match(policy_value, context_value)
+        }
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike => {
+            super::matcher::is_arn(context_value)
+                && !super::matcher::arn_match(policy_value, context_value)
+        }
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
         // matches only when they are the same family and the address is not in

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -63,10 +63,11 @@ fn authorize_self_service(
 pub async fn create_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -104,10 +105,11 @@ pub async fn create_access_key(
 pub async fn list_access_keys(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -144,10 +146,11 @@ pub async fn list_access_keys(
 pub async fn delete_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name, key_id)): Path<(String, String, String)>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -174,11 +177,12 @@ pub async fn delete_access_key(
 pub async fn change_user_password(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<ChangePasswordRequest>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
@@ -223,11 +227,12 @@ pub async fn change_user_password(
 pub async fn import_access_key(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
     axum::Json(body): axum::Json<ImportAccessKeyRequest>,
 ) -> Response {
     let caller =
-        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, None).await {
+        match authenticate(&headers, &*state.catalog_store, &*state.catalog_store, addr).await {
             Ok(c) => c,
             Err(e) => return e,
         };
