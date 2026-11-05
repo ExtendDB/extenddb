@@ -249,13 +249,9 @@ async fn a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item() {
 
     // An outside transaction holds `b`. The write transaction locks `a`, then
     // waits on `b`. The outside transaction then asks for `a`, which closes the
-    // cycle. The write transaction waited first, so its deadlock check runs
-    // first and PostgreSQL aborts it.
-    let mut holder = s.db.begin().await.expect("begin the outside transaction");
-    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *holder)
-        .await
-        .expect("read the backend pid");
+    // cycle. The write transaction's deadlock check runs first (see
+    // `outside_transaction`), so PostgreSQL aborts it.
+    let (mut holder, holder_pid) = outside_transaction(&s.db).await;
     sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
         .execute(&mut *holder)
         .await
@@ -337,12 +333,9 @@ async fn a_deadlock_after_an_empty_index_key_answers_the_empty_key() {
     // Update of `a` runs first: it locks `a`, applies `SET a1 = e` and
     // records the empty key. The Put of `b` then waits on `b`, and the
     // outside transaction asks for `a`, which closes the cycle. The write
-    // transaction waited first, so PostgreSQL aborts it.
-    let mut holder = s.db.begin().await.expect("begin the outside transaction");
-    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *holder)
-        .await
-        .expect("read the backend pid");
+    // transaction's deadlock check runs first (see `outside_transaction`), so
+    // PostgreSQL aborts it.
+    let (mut holder, holder_pid) = outside_transaction(&s.db).await;
     sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
         .execute(&mut *holder)
         .await
@@ -678,6 +671,32 @@ async fn create_in_flight(
     .await
     .expect("insert the item");
     (creator, pid)
+}
+
+/// Begin the outside transaction of a deadlock test, with its deadlock check
+/// later than the write transaction's, and return it with its backend pid.
+///
+/// PostgreSQL aborts the transaction whose deadlock check finds the cycle, and
+/// each waiter checks once, `deadlock_timeout` after it starts to wait. The
+/// write transaction waits first, but with the default 1 s on both sides the
+/// two checks are milliseconds apart, and under load the outside
+/// transaction's can run first and abort it instead. With 5 s here, the write
+/// transaction's check runs 1 s into its wait, with the cycle closed, and the
+/// outside transaction gets its lock when the write transaction aborts.
+/// `SET LOCAL` ends with the transaction, so the pooled connection keeps the
+/// server default. The role must be allowed to set `deadlock_timeout` (a
+/// superuser, as in CI).
+async fn outside_transaction(db: &PgPool) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut holder = db.begin().await.expect("begin the outside transaction");
+    sqlx::query("SET LOCAL deadlock_timeout = '5s'")
+        .execute(&mut *holder)
+        .await
+        .expect("set the outside transaction's deadlock timeout");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the backend pid");
+    (holder, pid)
 }
 
 /// Wait until `n` backends other than `own_pid` wait on a lock.
@@ -1074,11 +1093,7 @@ async fn a_conflict_cancellation_keeps_the_token_used_and_the_same_request_runs_
 
     // The deadlock of a_deadlock_cancels_with_transaction_conflict_on_the_waiting_item,
     // with a token.
-    let mut holder = s.db.begin().await.expect("begin the outside transaction");
-    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *holder)
-        .await
-        .expect("read the backend pid");
+    let (mut holder, holder_pid) = outside_transaction(&s.db).await;
     sqlx::query(&format!("SELECT 1 FROM {table} WHERE pk = 'b' FOR UPDATE"))
         .execute(&mut *holder)
         .await
