@@ -19,7 +19,9 @@ stream ARN. The order table between them was measured on 2026-10-28 as the
 admin only.
 
 StreamArn (DescribeStream, GetShardIterator), the same for every principal, so
-before the IAM decision:
+before the IAM decision. The other accounts in this file, 111111111111 and
+abc, answer as accounts that do not exist; the 2026-11-05 tables below add an
+account that exists.
 
   | spelling                                          | answer                              |
   |---------------------------------------------------|-------------------------------------|
@@ -75,6 +77,52 @@ ResourceArn (ListTagsOfResource, TagResource, UntagResource):
 
 A GetRecords token the service did not issue is ValidationException "Invalid
 ShardIterator" whatever stream ARN it carries.
+
+Another account, measured on 2026-11-05 from 08:07 to 08:09 UTC in us-east-1
+for an admin and a no-policy caller, which got the same answers, in an account
+that exists and in 999999999999, which does not. ExtendDB treats an account as
+existing when its catalog holds it; tests/test_authz_cross_account.py asserts
+these cells against an account it creates and one it does not.
+
+StreamArn (DescribeStream, GetShardIterator):
+
+  | StreamArn                                          | account that exists   | account that does not exist |
+  |----------------------------------------------------|-----------------------|-----------------------------|
+  | a table, index or backup ARN (the same in the      | ValidationException   | ValidationException         |
+  |   caller's own account)                            |   "Invalid StreamArn" |   "Invalid StreamArn"       |
+  | the canonical stream ARN                           | AccessDeniedException,| AccessDeniedException       |
+  |                                                    |   the resource-policy |   "Access is denied"        |
+  |                                                    |   denial              |                             |
+  | aws-cn; aws-us-gov; DynamoDB; DYNAMODB; s3;        | ValidationException   | AccessDeniedException       |
+  |   us-west-2; US-EAST-1; an empty region            |   "Invalid StreamArn" |   "Access is denied"        |
+  | an empty partition or service                      | ValidationException   | ValidationException         |
+  |                                                    |   "Invalid StreamArn" |   "Invalid StreamArn"       |
+
+ResourceArn (ListTagsOfResource, TagResource, UntagResource) holding a stream
+ARN:
+
+  | ResourceArn                                        | account that exists   | account that does not exist |
+  |----------------------------------------------------|-----------------------|-----------------------------|
+  | canonical; aws-cn; aws-us-gov; DynamoDB; DYNAMODB; | AccessDeniedException,| AccessDeniedException       |
+  |   s3; us-west-2; US-EAST-1                         |   the resource-policy |   "Access is denied"        |
+  |                                                    |   denial              |                             |
+  | an empty region                                    | AccessDeniedException | AccessDeniedException       |
+  |                                                    |   "User: <principal>  |   "Access is denied"        |
+  |                                                    |   is not authorized   |                             |
+  |                                                    |   to perform:         |                             |
+  |                                                    |   dynamodb:<op> on    |                             |
+  |                                                    |   resource: <ARN as   |                             |
+  |                                                    |   sent>", with no     |                             |
+  |                                                    |   reason clause       |                             |
+
+The resource-policy denial is "User: <principal> is not authorized to perform:
+dynamodb:<op> on resource: <ARN as sent> because no resource-based policy
+allows the dynamodb:<op> action". So on StreamArn the service checks the kind
+of ARN and the empty partition and service fields first, then whether the
+account exists, then the partition, service and region. ExtendDB gives every
+answer in these two tables except the empty region in a tag ResourceArn of an
+account that exists, where it answers the resource-policy denial with its
+reason clause.
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -343,9 +391,12 @@ class TestStreamArnScope:
 
     def test_stream_arn_in_another_account_is_denied(self):
         """Another 12-digit account, `abc`, and another account combined with
-        aws-cn, us-west-2 or an unknown label: AccessDeniedException "Access is
-        denied" on all five operations, for every principal, so before the IAM
-        decision and before the partition, region or label is looked at."""
+        aws-cn, us-west-2 or an unknown label, none of which the catalog holds:
+        AccessDeniedException "Access is denied" on all five operations, for
+        every principal, so before the IAM decision and before the partition,
+        region or label is looked at. This is the service's answer for an
+        account that does not exist; an account that exists is covered in
+        tests/test_authz_cross_account.py (measured 2026-11-05)."""
         for who, p in self._principals().items():
             for label in ACCOUNT_VARIANTS:
                 arn = self.variants[label]
@@ -377,9 +428,10 @@ class TestStreamArnScope:
     def test_partition_then_account_then_region(self):
         """The order cells measured on 2026-10-28 (the order table above), on
         DescribeStream and GetShardIterator: an empty partition or service is
-        "Invalid StreamArn" even in another account; another account is
-        "Access is denied" whatever the region field holds; the caller's
-        account with an empty or another region is "Invalid StreamArn".
+        "Invalid StreamArn" even in another account; another account that the
+        catalog does not hold is "Access is denied" whatever the region field
+        holds; the caller's account with an empty or another region is
+        "Invalid StreamArn".
         Measured as an admin; GetShardIterator and the empty service at 21:51
         UTC."""
         admin = self._principal(ALLOW_ALL)

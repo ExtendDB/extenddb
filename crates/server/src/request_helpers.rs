@@ -137,27 +137,39 @@ pub(crate) async fn authorize_request(
         }
     }
 
-    // The checks from here to the dev-mode return are input validation, not the
-    // IAM decision. The service applies them to every principal, so they run in
-    // dev mode too, and a dev-mode server refuses the same malformed,
-    // out-of-scope and unissued resources as any other build (#450, #451).
+    // The checks from here to the dev-mode return answer a request before the
+    // IAM decision, and the service gives each answer to every principal. So
+    // they run in dev mode too, and a dev-mode server refuses the same
+    // malformed, out-of-scope and unissued resources, and the same resources in
+    // another account, as any other build (#450, #451).
     //
-    // Tag operations validate the ResourceArn shape before the IAM decision, as
-    // the service does: an index ARN (tags are accepted only on a table or
-    // stream) is rejected with ValidationException for every principal, before
-    // authorization. A table ARN passes; its account, region, and existence
-    // are checked after authorization by the engine tag handler. A stream ARN
-    // must name the caller's account here, before authorization, as the
-    // service does (AccessDeniedException "Access is denied" for every
-    // principal, #450); its partition, service and region are checked by the
-    // engine after authorization, which runs on the ARN as sent (#451).
+    // A StreamArn (DescribeStream, GetShardIterator) that is not a stream ARN,
+    // a table, index or backup ARN included, or that has an empty partition,
+    // service or account field, is refused with ValidationException "Invalid
+    // StreamArn" before the account is looked at, in every account (measured
+    // 2026-10-28 and 2026-11-05).
+    authz_resource::validate_stream_arn_kind(operation, input)?;
+
+    // A request that names a resource in another account by ARN is refused
+    // with the service's answer for the operation and for whether this
+    // deployment knows the account, for an admin and a no-policy caller alike
+    // (measured 2026-11-03 and 2026-11-05; see `authz_resource::cross_account`).
+    // For an account the catalog holds, the shape checks below run first.
+    authz_resource::cross_account::refuse(state, identity, operation, input, account_id).await?;
+
+    // The tag operations' ResourceArn shape is validated before the IAM
+    // decision: an index ARN in this account (tags are accepted only on a
+    // table or stream) is rejected with ValidationException for every
+    // principal. A table or stream ARN passes; its partition, service, region
+    // and existence are checked after authorization by the engine tag handler,
+    // and the IAM decision runs on the ARN as sent (#451).
     if matches!(
         operation,
         "TagResource" | "UntagResource" | "ListTagsOfResource"
     ) && let Some(arn) = input.get("ResourceArn").and_then(Value::as_str)
         && !arn.is_empty()
     {
-        authz_resource::validate_tag_resource_arn_shape(arn, account_id)?;
+        authz_resource::validate_tag_resource_arn_shape(arn)?;
     }
 
     // A StreamArn (DescribeStream, GetShardIterator) or BackupArn
@@ -166,12 +178,11 @@ pub(crate) async fn authorize_request(
     // ValidationException before the IAM decision. Without this, an ARN the
     // engine resolves one way and authorization reads another lets a Deny on
     // the real resource be bypassed. A StreamArn must also be in this
-    // deployment's scope (partition, service, region) and the caller's account,
-    // so the stream authorized is the stream the engine reads and a respelled
-    // ARN is never served (#450, #451). A restore's source ARN, and an export
-    // TableArn of another kind, are refused by the engine after the IAM
-    // decision.
-    authz_resource::validate_operation_arns(operation, input, &state.region, account_id)?;
+    // deployment's partition, service and region, so the stream authorized is
+    // the stream the engine reads and a respelled ARN is never served (#450,
+    // #451). A restore's source ARN, and an export TableArn of another kind,
+    // are refused by the engine after the IAM decision.
+    authz_resource::validate_operation_arns(operation, input, &state.region)?;
 
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field, so the iterator is decoded here for the stream
@@ -261,8 +272,7 @@ pub(crate) async fn authorize_request(
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,
-            "GetRecords",
-            &resource_arn,
+            &authz_resource::AuthzTarget::new("GetRecords", resource_arn),
             false,
             base_params(request_tags, request_tag_keys),
         )
@@ -328,8 +338,7 @@ pub(crate) async fn authorize_request(
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                operation,
-                &resource_arn,
+                &authz_resource::AuthzTarget::new(operation, resource_arn),
                 false,
                 base_params(request_tags, request_tag_keys),
             )
@@ -339,9 +348,13 @@ pub(crate) async fn authorize_request(
                 // The RequestItems key (or TransactItems TableName) may be a
                 // bare name or a table ARN; canonicalize either to this
                 // deployment's table ARN so a respelled ARN cannot evade a
-                // per-table Deny.
-                let resource_arn =
-                    authz_resource::table_resource_arn(&target.table, &state.region, account_id);
+                // per-table Deny. The denial names the key as written.
+                let authz_target = authz_resource::table_target(
+                    &target.action,
+                    &target.table,
+                    &state.region,
+                    account_id,
+                );
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
                     ..base_params(request_tags.clone(), request_tag_keys.clone())
@@ -349,8 +362,7 @@ pub(crate) async fn authorize_request(
                 authorization::check_authorization(
                     state.authz_cache.as_ref(),
                     identity,
-                    &target.action,
-                    &resource_arn,
+                    &authz_target,
                     false,
                     params,
                 )
@@ -360,11 +372,12 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // Derive the (action, resource ARN) pairs the service authorizes this
-    // operation against. The resource comes from the field the operation
-    // actually carries it in (ResourceArn, StreamArn, BackupArn, TableArn,
-    // IndexName, or a table ARN in TableName), canonicalized to this
-    // deployment, never a `table/*` fallback. See `authz_resource`.
+    // Derive the targets the service authorizes this operation against. The
+    // resource comes from the field the operation actually carries it in
+    // (ResourceArn, StreamArn, BackupArn, TableArn, IndexName, or a table ARN
+    // in TableName), canonicalized to this deployment for the policy match,
+    // never a `table/*` fallback, with the field as written kept for the
+    // denial message. See `authz_resource`.
     let targets = authz_resource::authz_targets(operation, input, &state.region, account_id);
     let is_scan = operation == "Scan";
 
@@ -393,12 +406,10 @@ pub(crate) async fn authorize_request(
                 .map(ToOwned::to_owned),
             ..base_params(request_tags, request_tag_keys)
         };
-        let (action, resource_arn) = &targets[0];
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,
-            action,
-            resource_arn,
+            &targets[0],
             is_scan,
             params,
         )
@@ -407,12 +418,11 @@ pub(crate) async fn authorize_request(
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
         // request.
-        for (action, resource_arn) in &targets {
+        for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                action,
-                resource_arn,
+                target,
                 false,
                 base_params(request_tags.clone(), request_tag_keys.clone()),
             )
@@ -498,14 +508,7 @@ mod tests {
             );
         }
 
-        let internal = [
-            StorageError::Internal("backend fault".to_owned()),
-            StorageError::CatalogVersionMismatch {
-                expected: "3".to_owned(),
-                found: "2".to_owned(),
-            },
-            StorageError::CatalogNotInitialized,
-        ];
+        let internal = [StorageError::Internal("backend fault".to_owned())];
         for err in internal {
             let out = key_info_for_authz(Err(err.clone()));
             assert!(

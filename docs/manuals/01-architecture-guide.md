@@ -205,9 +205,8 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-The catalog version is 0.0.4 on PostgreSQL, SQLite, and Cassandra. PostgreSQL and SQLite store it in the `settings` table under the key `catalog_version` and check it at startup; Cassandra has no startup check (see the Upgrade Manual).
-The MongoDB backend tracks its own catalog version, 0.0.2. <!-- version-literal-ok: MongoDB's backend has its own catalog version, deliberately not the compiled-in constant the documentation guard checks -->
-A mismatch between the compiled-in version and the stored one prevents a PostgreSQL or SQLite server from starting; run `extenddb migrate` to upgrade.
+On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
+A server that refuses its catalog prints the status and the command that resolves it; for pending migrations that is `extenddb migrate --yes`.
 
 ## Pluggable Architecture
 
@@ -261,14 +260,14 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts, version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies for users, groups, and roles (JSON editor with template)
-- **Metrics dashboard**: Real-time and historical operation metrics with interactive charts
+- **Metrics dashboard**: Real-time and historical operation metrics for every account, with interactive charts (admin only)
 - **Settings viewer**: Read-only display of runtime settings and static configuration (admin only)
 - **Documentation browser**: All project manuals rendered as HTML, with PDF download (`/console/docs`)
 
@@ -282,7 +281,7 @@ The console uses the `ManagementStore` trait for all data access — it never qu
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
-- Login rate limiting with account lockout on excessive failures
+- Login rate limiting per user and source address, shared with the management API (see the security model manual)
 
 ### Unauthenticated Routes
 

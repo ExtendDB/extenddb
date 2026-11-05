@@ -309,8 +309,8 @@ mod tests {
     fn deployment_scope_uses_the_shared_predicate() {
         const R: &str = "us-east-1";
         let stream =
-            "arn:aws:dynamodb:us-east-1:964157134968:table/T/stream/2026-10-20T16:17:40.188";
-        let table = "arn:aws:dynamodb:us-east-1:964157134968:table/T";
+            "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
+        let table = "arn:aws:dynamodb:us-east-1:444455556666:table/T";
         for base in [stream, table] {
             for arn in [
                 base.to_owned(),
