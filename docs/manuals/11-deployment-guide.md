@@ -204,7 +204,7 @@ extenddb init \
 - [ ] Set `auth.provider = "builtin"` in `extenddb.toml`
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
-- [ ] Disable credential import if not needed: `extenddb settings set allow_credential_import false`
+- [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
 
 ### Transport
 

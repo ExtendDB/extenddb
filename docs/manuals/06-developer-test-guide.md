@@ -158,6 +158,7 @@ The `run-tests` script automatically:
 - Sets `control_plane_delay_seconds` to 0.05 for fast test cycles
 - Sets `index_propagation_delay_ms` to 0 for immediate GSI updates
 - Enables throttling for production-like behavior
+- Sets `allow_credential_import` to `true` for the access key import tests
 - Configures import/export paths for file operation tests
 - Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests
 
@@ -195,6 +196,8 @@ devtools/run-tests --extenddb --pytest --parallel
 devtools/run-tests --extenddb --pytest --parallel=4
 
 # Direct execution (for quick iteration during development)
+# The access key import tests need import enabled. devtools/run-tests sets it.
+./target/debug/extenddb settings --config extenddb.toml set allow_credential_import true
 python3 -m pytest tests/ -v
 python3 -m pytest tests/test_put_item.py -v
 python3 -m pytest tests/test_put_item.py::test_put_item_basic -v

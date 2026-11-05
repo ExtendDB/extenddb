@@ -355,16 +355,16 @@ By default, control plane operations (CreateTable, DeleteTable) emulate real Dyn
 
 ### Credential Import
 
-Controls whether `extenddb manage import-access-key` is allowed (default: `true`).
+Controls whether `extenddb manage import-access-key` is allowed (default: `false`). An import stores an access key ID and secret that the caller chooses, so only a deployment that sets this to `true` accepts imported keys.
 
 ```bash
-# Disable credential import
-./target/release/extenddb settings --config extenddb.toml set \
-    allow_credential_import false
-
-# Re-enable
+# Enable credential import
 ./target/release/extenddb settings --config extenddb.toml set \
     allow_credential_import true
+
+# Disable it again
+./target/release/extenddb settings --config extenddb.toml set \
+    allow_credential_import false
 ```
 
 ### GSI Propagation Delay
@@ -918,6 +918,13 @@ Admins can also create access keys on behalf of any user:
 
 Import real AWS credentials (or any AKIA* key) into extenddb. This enables the "just change the endpoint URL" workflow — use the same credentials against both extenddb and real DynamoDB.
 
+The `allow_credential_import` runtime setting gates credential import (default: `false`). Enable it before the first import:
+
+```bash
+./target/release/extenddb settings --config extenddb.toml set \
+    allow_credential_import true
+```
+
 Both `--secret-access-key` and `--yes` are required:
 
 ```bash
@@ -930,12 +937,7 @@ Both `--secret-access-key` and `--yes` are required:
 
 > **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable for the password.
 
-Credential import is gated by the `allow_credential_import` runtime setting (default: `true`). To disable:
-
-```bash
-./target/release/extenddb settings --config extenddb.toml set \
-    allow_credential_import false
-```
+Set `allow_credential_import` back to `false` to refuse further imports. Keys already imported keep working.
 
 Every import is logged to syslog (access key ID, account, user — never the secret).
 
