@@ -17,6 +17,21 @@
 //! to any value: a caller that pins them to its deployment does so itself, and a
 //! caller that ignores them (authorization canonicalizes every supplied ARN to
 //! its own deployment) reads only the table and sub-resource.
+//!
+//! The bulk operations read their ARNs through the `bulk` and `table`
+//! submodules: a bulk operation ARN, and a `TableName` written as a table ARN.
+//! The server's authorization layer and the engine's bulk handlers call the
+//! same functions. The engine keeps ARN construction (operation ids,
+//! formatting) beside its handlers.
+
+mod bulk;
+mod table;
+pub use bulk::{
+    BulkOperationArn, BulkOperationArnError, TableArnError, bulk_operation_arn_id_error,
+    bulk_operation_arn_shape_error, bulk_operation_does_not_exist, own_bulk_operation_arn,
+    own_table_arn_name, parse_bulk_operation_arn,
+};
+pub use table::{check_table_arn_name, table_arn_refusal};
 
 /// A table sub-resource: a secondary index, a stream, or a backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
