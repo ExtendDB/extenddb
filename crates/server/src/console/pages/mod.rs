@@ -47,6 +47,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::console::ConsoleState;
+use crate::console::html;
 use crate::console::session::SessionCheck;
 use crate::management::CallerIdentity;
 
@@ -137,9 +138,10 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Format a `CallerIdentity` for display in the nav bar.
-fn identity_label(identity: &CallerIdentity) -> String {
-    match identity {
+/// Describe a `CallerIdentity` for the nav bar: its display label, and
+/// whether it is an admin, which decides the admin-only links.
+fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
+    let label = match identity {
         CallerIdentity::Admin(name) => format!("Admin: {name}"),
         CallerIdentity::IamUser {
             account_id,
@@ -147,12 +149,27 @@ fn identity_label(identity: &CallerIdentity) -> String {
         } => {
             format!("{account_id}/{user_name}")
         }
+    };
+    html::NavIdentity {
+        label,
+        is_admin: is_admin(identity),
     }
 }
 
 /// Check if the caller is an admin. Returns true for admins, false for IAM users.
 fn is_admin(identity: &CallerIdentity) -> bool {
     matches!(identity, CallerIdentity::Admin(_))
+}
+
+/// Let an admin session through to an admin-only page: Metrics, Settings and
+/// Cache. An IAM-user session gets a redirect to the console dashboard.
+#[allow(clippy::result_large_err)]
+fn require_admin(session: &SessionData) -> Result<(), Response> {
+    if is_admin(&session.identity) {
+        Ok(())
+    } else {
+        Err(Redirect::to("/console").into_response())
+    }
 }
 
 /// Extract the user-facing message from a storage `OpError`.

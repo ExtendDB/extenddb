@@ -267,7 +267,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies for users, groups, and roles (JSON editor with template)
-- **Metrics dashboard**: Real-time and historical operation metrics with interactive charts
+- **Metrics dashboard**: Real-time and historical operation metrics for every account, with interactive charts (admin only)
 - **Settings viewer**: Read-only display of runtime settings and static configuration (admin only)
 - **Documentation browser**: All project manuals rendered as HTML, with PDF download (`/console/docs`)
 
