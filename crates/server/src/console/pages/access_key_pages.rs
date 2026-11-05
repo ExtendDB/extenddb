@@ -13,7 +13,8 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, op_error_message, require_csrf};
 
 use crate::management::CallerIdentity;
 
@@ -24,7 +25,7 @@ pub async fn create_access_key(
     Path((account_id, user_name)): Path<(String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -119,7 +120,7 @@ pub async fn delete_access_key(
     Path((account_id, user_name, key_id)): Path<(String, String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };

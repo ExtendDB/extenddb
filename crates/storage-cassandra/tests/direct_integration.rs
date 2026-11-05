@@ -33,10 +33,14 @@ mod delete_item;
 mod groups;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/keyspace_migrations.rs"]
+mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
 #[path = "direct/policies.rs"]
 mod policies;
+#[path = "direct/pool_size.rs"]
+mod pool_size;
 #[path = "direct/put_get_item.rs"]
 mod put_get_item;
 #[path = "direct/query.rs"]
@@ -51,6 +55,8 @@ mod scan_rows_without_item;
 mod scan_sort_key_types;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
+#[path = "direct/snapshot_engine.rs"]
+mod snapshot_engine;
 #[path = "direct/stream_ownership.rs"]
 mod stream_ownership;
 #[path = "direct/streams.rs"]

@@ -18,16 +18,27 @@ pub mod error;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;
+pub mod migrations;
 pub mod operations;
+pub mod password;
 pub mod policy_migration;
+pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
+pub mod snapshot;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod snapshot_conformance;
+#[doc(hidden)]
+#[cfg(feature = "test-hooks")]
+pub mod test_pause;
 pub mod transact;
 pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
+pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
 
@@ -316,7 +327,11 @@ pub trait DataEngine: Send + Sync {
     /// Update an item by primary key using update actions.
     ///
     /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
-    /// containing the key attributes plus the SET values.
+    /// containing the key attributes plus the SET values. The exception is an
+    /// update whose actions all remove data (`REMOVE`, `DELETE`): on a missing
+    /// item it writes nothing, emits no stream record, and returns
+    /// `(None, None)` whatever `return_old` and `return_new` say
+    /// (`extenddb_core::expression::removes_only`).
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
     /// (or empty item for new) inside a transaction.
@@ -696,7 +711,11 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
+/// Backup operations.
+///
+/// Point-in-time recovery is deliberately absent: no backend implements it, so
+/// the engine answers `DescribeContinuousBackups`, `UpdateContinuousBackups`,
+/// and `RestoreTableToPointInTime` itself without consulting storage.
 pub trait BackupEngine: Send + Sync {
     /// Create a backup of a table, snapshotting all items.
     fn create_backup(
@@ -789,21 +808,6 @@ pub trait BackupEngine: Send + Sync {
         account_id: &str,
         request: RestoreRequest,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
 }
 
 /// Supertrait combining all `DynamoDB` operation traits.
@@ -812,17 +816,26 @@ pub trait BackupEngine: Send + Sync {
 /// DynamoDB-compatible API. This trait has NO additional methods beyond
 /// the trait bounds — backend-specific concerns belong in `ServerRuntimeHooks`.
 pub trait StorageEngine:
-    TableEngine + DataEngine + MetadataEngine + StreamEngine + BackupEngine + WorkerStore + Send + Sync
+    TableEngine
+    + DataEngine
+    + MetadataEngine
+    + StreamEngine
+    + BackupEngine
+    + SnapshotEngine
+    + WorkerStore
+    + Send
+    + Sync
 {
 }
 
-// Blanket implementation: any type implementing all 6 traits is a StorageEngine
+// Blanket implementation: any type implementing all 7 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
         + MetadataEngine
         + StreamEngine
         + BackupEngine
+        + SnapshotEngine
         + WorkerStore
         + Send
         + Sync

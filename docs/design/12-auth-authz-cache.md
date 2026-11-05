@@ -36,7 +36,7 @@ This document specifies an in-memory cache with stale-while-revalidate semantics
 - Eliminate the per-request catalog roundtrips for credentials, policies, boundaries, principal tags, resource tags, and TableKeyInfo on the steady-state hot path.
 - Eliminate the per-request `PolicyDocument::from_json` parse cost.
 - Refresh stale entries **without** making the user request wait (refresh-ahead, a.k.a. stale-while-revalidate).
-- Bound memory with an LRU upper limit per cache.
+- Bound memory with an upper limit on entries per cache.
 - Allow operators to disable the cache entirely as a kill switch.
 - Propagate self-induced changes (admin API mutations) instantly within a single process via write-through invalidation hooks.
 
@@ -192,7 +192,7 @@ enabled            = true
 ttl_seconds        = 60   # hard TTL — entries beyond this are full misses
 soft_ttl_seconds   = 30   # entries beyond soft_ttl trigger background refresh on access
 negative_ttl_seconds = 5  # how long to cache "not found" results
-max_entries        = 10000 # per-cache LRU size limit
+max_entries        = 10000 # maximum entries per cache
 ```
 
 Default rationale:
@@ -200,7 +200,7 @@ Default rationale:
 - **60 s hard TTL** mirrors AWS IAM's "policy propagation" expectation (~30 s–2 min). Long enough to absorb the perf bottleneck (60 s of caching → 99.99%+ hit rate per hot key under any meaningful load), short enough to bound the blast radius of off-instance credential revocation.
 - **30 s soft TTL** = TTL / 2 keeps refreshes from clustering at the boundary.
 - **5 s negative TTL** is short enough that newly-issued keys work quickly, long enough to absorb a dictionary attack against `lookup_credential`.
-- **10 000 entries per cache** is a generous default for typical deployments; under memory pressure the LRU evicts cold entries.
+- **10 000 entries per cache** is a generous default for typical deployments; beyond it, moka's TinyLFU policy drops the entries it rates least likely to be reused, which can be the new one.
 - **`enabled = false`** is a kill switch for incident response.
 
 The cache is configured statically (`extenddb.toml`). Runtime tunability is not added — cache TTL changes are rare and a server restart is acceptable. Adding it to the existing `settings` poller table is an option for a follow-up if operationally needed.
@@ -416,12 +416,12 @@ Each phase is a separate PR. After each phase the test suite runs green and the 
 > **Propagation timing for invalidations**:
 >
 > - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) bump an internal epoch counter and drop the moka entry immediately. The next request blocks on a fresh load.
-> - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole`'s session sweep, `DeleteGroup`'s member fanout) use moka's `invalidate_entries_if`, which is **asynchronous** — predicate evaluation runs on moka's internal worker after the management call returns. There is a small window (~ms) between the API responding 200/204 and the matching entries actually being evicted from the underlying store. The accompanying epoch bump ensures any in-flight refresh on those keys is dropped on completion, but a request that reads the slot during this window can still see the pre-invalidation value. Operators should treat fanout invalidation as "eventually consistent within a few ms"; for hard cutover (e.g. revoking a compromised key), prefer the single-key invalidations (`DeleteAccessKey`) over the cascade ones.
+> - **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole`'s session sweep, `DeleteGroup`'s member fanout) take effect before the management call returns. The account and role sweeps use moka's `invalidate_entries_if`, which registers the predicate and returns; moka removes the entries from its map during later cache operations, but `get` applies registered predicates, so matching entries are not served once the call returns. The accompanying epoch bump drops any refresh in flight on that cache when it completes. `DeleteGroup` awaits the invalidation of each member. If a group's members cannot be listed, those members' entries age out at TTL.
 > - **Off-instance changes** (a separate process modifying the catalog directly, or a different instance in a multi-node deployment) take up to `auth.cache.ttl_seconds` to propagate. The cross-process invalidation channel described in Appendix B is not yet implemented.
 >
 > Self-induced single-key changes via the admin API or the web console propagate instantly on the local instance via write-through invalidation; both paths share the same `AuthCacheRegistry`.
 >
-> To force-flush the cache without restart: not currently supported. To disable: set `auth.cache.enabled = false` in `extenddb.toml` and restart.
+> To force-flush the cache without a restart, use the manual invalidation API (§6.1) on each instance. To disable: set `auth.cache.enabled = false` in `extenddb.toml` and restart.
 
 ---
 
