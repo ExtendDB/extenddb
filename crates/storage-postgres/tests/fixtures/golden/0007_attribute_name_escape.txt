@@ -1,0 +1,51 @@
+tables raw_tbl
+  key_schema: [{"KeyType": "HASH", "AttributeName": "a\u0001\u0002\u0001\u0002z"}]
+  attribute_definitions: [{"AttributeName": "a\u0001\u0002\u0001\u0002z", "AttributeType": "S"}, {"AttributeName": "g\u0001\u0002\u0002k", "AttributeType": "S"}]
+tables seed_simple
+  key_schema: [{"KeyType": "HASH", "AttributeName": "id"}]
+  attribute_definitions: [{"AttributeName": "id", "AttributeType": "N"}]
+tables seed_tbl
+  key_schema: [{"KeyType": "HASH", "AttributeName": "pk"}, {"KeyType": "RANGE", "AttributeName": "sk"}]
+  attribute_definitions: [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}, {"AttributeName": "gpk", "AttributeType": "S"}, {"AttributeName": "lsk", "AttributeType": "N"}]
+indexes gsi1
+  key_schema: [{"KeyType": "HASH", "AttributeName": "gpk"}, {"KeyType": "RANGE", "AttributeName": "sk"}]
+  projection: {"ProjectionType": "ALL"}
+indexes lsi1
+  key_schema: [{"KeyType": "HASH", "AttributeName": "pk"}, {"KeyType": "RANGE", "AttributeName": "lsk"}]
+  projection: {"ProjectionType": "ALL"}
+indexes raw_gsi
+  key_schema: [{"KeyType": "HASH", "AttributeName": "g\u0001\u0002\u0002k"}]
+  projection: {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n\u0001\u0002\u0001\u0002"]}
+indexes text_gsi
+  key_schema: [{"KeyType": "HASH", "AttributeName": "lit\\u0001"}]
+  projection: {"ProjectionType": "KEYS_ONLY"}
+backups raw_backup
+  key_schema: [{"KeyType": "HASH", "AttributeName": "a\u0001\u0002\u0001\u0002z"}]
+  attribute_definitions: [{"AttributeName": "a\u0001\u0002\u0001\u0002z", "AttributeType": "S"}, {"AttributeName": "g\u0001\u0002\u0002k", "AttributeType": "S"}]
+  vector_indexes: {"Version": 1, "VectorIndexes": [{"IndexName": "raw_vidx", "Dimensions": 2, "Projection": {"ProjectionType": "ALL"}, "SearchSchema": [{"AttributeName": "t\u0001\u0002\u0002", "SearchSchemaElementType": "HASH"}], "VectorAttribute": {"AttributeName": "v\u0001\u0002\u0001\u0002"}, "DistanceFunction": "COSINE"}]}
+backups seed_backup
+  key_schema: [{"KeyType": "HASH", "AttributeName": "pk"}, {"KeyType": "RANGE", "AttributeName": "sk"}]
+  attribute_definitions: [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"}, {"AttributeName": "gpk", "AttributeType": "S"}, {"AttributeName": "lsk", "AttributeType": "N"}]
+  vector_indexes: {"Version": 1, "VectorIndexes": []}
+backup_definitions raw_backup
+  definition: {"Version": 1, "BillingMode": "PAY_PER_REQUEST", "LocalSecondaryIndexes": [], "GlobalSecondaryIndexes": [{"IndexName": "raw_gsi", "KeySchema": [{"KeyType": "HASH", "AttributeName": "g\u0001\u0002\u0002k"}], "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n\u0001\u0002\u0001\u0002"]}}]}
+vector_indexes raw_vidx
+  vector_attribute: {"AttributeName": "v\u0001\u0002\u0001\u0002"}
+  search_schema: [{"AttributeName": "t\u0001\u0002\u0002", "SearchSchemaElementType": "HASH"}]
+  projection: {"ProjectionType": "ALL"}
+gsi_pending 00000000-0000-4000-8000-000000000006
+  index_context: {"index": {"index_id": "00000000-0000-4000-8000-000000000016", "key_schema": [{"KeyType": "HASH", "AttributeName": "g\u0001\u0002\u0002k"}], "projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n\u0001\u0002\u0001\u0002"]}}, "base_key_schema": [{"KeyType": "HASH", "AttributeName": "a\u0001\u0002\u0001\u0002z"}], "attribute_definitions": [{"AttributeName": "a\u0001\u0002\u0001\u0002z", "AttributeType": "S"}, {"AttributeName": "g\u0001\u0002\u0002k", "AttributeType": "S"}]}
+  new_item: {"a\u0001\u0001z": {"S": "x"}, "g\u0001\u0002k": {"S": "y"}}
+catalog notes:
+tables.key_schema: 1 document rewritten
+tables.attribute_definitions: 1 document rewritten
+indexes.key_schema: 1 document rewritten
+indexes.projection: 1 document rewritten
+backups.key_schema: 1 document rewritten
+backups.attribute_definitions: 1 document rewritten
+backups.vector_indexes: 1 document rewritten
+backup_definitions.definition: 1 document rewritten
+vector_indexes.vector_attribute: 1 document rewritten
+vector_indexes.search_schema: 1 document rewritten
+data notes:
+gsi_pending.index_context: 1 document rewritten

@@ -13,6 +13,7 @@ mod authorization_store;
 mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
+mod catalog_json;
 mod catalog_store;
 pub mod config;
 mod create_table;

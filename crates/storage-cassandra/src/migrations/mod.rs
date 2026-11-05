@@ -150,6 +150,11 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
     }
 }
 

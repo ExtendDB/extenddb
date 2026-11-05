@@ -118,6 +118,11 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "SQLite stores the documents that carry attribute names as JSON text in TEXT columns, \
+             where U+0000 is the six-character escape \\u0000, so every name reads back as it was \
+             written",
+        ),
     }
 }
 
