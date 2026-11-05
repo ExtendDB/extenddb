@@ -50,7 +50,10 @@
 #     `tag: v*` rule when the tag trigger was removed). A dispatch from any
 #     other ref cannot read the token at all.
 #   Required reviewers: the candidate push must be approved before it happens.
-#   Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub PAT, Read/Write).
+#   Secrets: none. The Docker Hub credential is read at run time from AWS
+#     Secrets Manager (extenddb/dockerhub-publish) through the OIDC role
+#     ExtendDBDockerHubPublisher, authorized by the dockerhub environment's
+#     sub claim. No Docker Hub token is stored in GitHub.
 #
 # The backend is a dispatch choice rather than a matrix: a partial failure
 # must not publish one backend's candidate and not the other under the same
@@ -70,6 +73,7 @@ on:
         options:
           - extenddb-postgres
           - extenddb-mongodb
+          - extenddb-cassandra
         default: extenddb-postgres
 
 # Nothing is committed, so no write scope on the repo is needed.
@@ -143,6 +147,13 @@ jobs:
               SMOKE_SCRIPT='./ci/smoke-test-mongodb-container.sh'
               SMOKE_ENV='EXTENDDB_MONGODB_IMAGE'
               ;;
+            extenddb-cassandra)
+              IMAGE_REPO='extenddb/extenddb-cassandra'
+              DOCKERFILE='Dockerfile.cassandra'
+              LICENSE_BACKEND='cassandra'
+              SMOKE_SCRIPT='./ci/smoke-test-cassandra-container.sh'
+              SMOKE_ENV='EXTENDDB_CASSANDRA_IMAGE'
+              ;;
             *)
               echo "::error::image '$RAW_IMAGE' is not in the allowlist"
               exit 1
@@ -172,8 +183,8 @@ jobs:
           fi
 
           # 5. Deterministic metadata: the build date is the tagged commit's
-          #    own timestamp, so re-running the same release reproduces the
-          #    same image config instead of minting a new digest per run.
+          #    own timestamp, so the image label and the binary's build time
+          #    are the same in every run of the release.
           BUILD_DATE=$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$SHA")
 
           {
@@ -198,17 +209,37 @@ jobs:
         # distributed image than in source. The script pins cargo-about itself
         # and refuses to run against any other version.
         env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DOCKERFILE: ${{ steps.meta.outputs.dockerfile }}
+          SMOKE_SCRIPT: ${{ steps.meta.outputs.smoke_script }}
           LICENSE_BACKEND: ${{ steps.meta.outputs.license_backend }}
         run: |
           set -euo pipefail
-          if [[ "$LICENSE_BACKEND" == mongodb ]] \
-              && ! grep -q -- '--backend' devtools/generate-software-license-notices; then
-            echo "::error::tagged commit does not contain MongoDB image license support; use a tag created after MongoDB container support was merged"
-            exit 1
-          fi
+          # A tag cut before an image's container support merged has no
+          # Dockerfile or smoke test for it; say so before a build is paid for.
+          # (Dockerfile.mongodb and the generator's --backend flag arrived
+          # together, so this also covers the earlier MongoDB-specific check.)
+          for f in "$DOCKERFILE" "$SMOKE_SCRIPT"; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error::tagged commit has no ${f}; use a tag created after ${IMAGE} container support was merged"
+              exit 1
+            fi
+          done
           cargo install --locked --version 0.9.0 --features cli cargo-about
           ./devtools/generate-software-license-notices --check \
-            --backend '${{ steps.meta.outputs.license_backend }}'
+            --backend "$LICENSE_BACKEND"
+
+      - name: Gate - the release freezes the catalog migrations it ships
+        # RELEASED_THROUGH must reach the last migration id, so each
+        # backend's checksum test pins every body this tag ships. A tag
+        # before the migration framework has no registry and passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
 
   build:
     needs: gate
@@ -272,8 +303,14 @@ jobs:
             VERSION=${{ needs.gate.outputs.version }}
             VCS_REF=${{ needs.gate.outputs.sha }}
             BUILD_DATE=${{ needs.gate.outputs.build_date }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # No gha build cache, as in release-dev-image.yml. The image built
+          # here is the one that is scanned, pushed and signed, so a layer
+          # restored from the Actions cache would ship in a signed release
+          # (actions/cache-poisoning/poisonable-step). The cache did little
+          # for release builds: the cargo build layer's inputs change with
+          # every release, so it was restored only when the same release was
+          # built a second time, and exporting the cache took up to two and
+          # a half minutes per build.
 
       - name: Confirm the image really is ${{ matrix.arch }}
         # Cheap guard against a silent platform fallback: a mislabelled image
@@ -287,21 +324,23 @@ jobs:
             || { echo "::error::expected ${{ matrix.arch }}, image reports $ACTUAL"; exit 1; }
 
       - name: Smoke test the built image
-        # EXTENDDB_IMAGE puts ci/smoke-test-container.sh into prebuilt mode: it
-        # reads VERSION / VCS_REF / BUILD_DATE back off the image labels, runs
-        # `compose up --no-build`, and asserts every container is running this
-        # exact image ID.
+        # Each image has its own smoke script and its own image variable (the
+        # gate picks both). Setting the variable puts the script into prebuilt
+        # mode: it reads VERSION / VCS_REF / BUILD_DATE back off the image
+        # labels, runs `compose up --no-build`, and asserts every container is
+        # running this exact image ID.
         env:
           IMAGE: ${{ needs.gate.outputs.image_repo }}:sha-${{ needs.gate.outputs.sha }}-${{ matrix.arch }}
           SMOKE_ENV: ${{ needs.gate.outputs.smoke_env }}
           SMOKE_SCRIPT: ${{ needs.gate.outputs.smoke_script }}
         run: |
           set -euo pipefail
-          if [[ "$SMOKE_ENV" == 'EXTENDDB_MONGODB_IMAGE' ]]; then
-            EXTENDDB_MONGODB_IMAGE="$IMAGE" "$SMOKE_SCRIPT"
-          else
-            EXTENDDB_IMAGE="$IMAGE" "$SMOKE_SCRIPT"
-          fi
+          case "$SMOKE_ENV" in
+            EXTENDDB_IMAGE)           EXTENDDB_IMAGE="$IMAGE" "$SMOKE_SCRIPT" ;;
+            EXTENDDB_MONGODB_IMAGE)   EXTENDDB_MONGODB_IMAGE="$IMAGE" "$SMOKE_SCRIPT" ;;
+            EXTENDDB_CASSANDRA_IMAGE) EXTENDDB_CASSANDRA_IMAGE="$IMAGE" "$SMOKE_SCRIPT" ;;
+            *) echo "::error::unknown smoke-test variable '$SMOKE_ENV'"; exit 1 ;;
+          esac
 
       - name: Save the tested image as an artifact
         # docker save preserves the image ID, so what publish pushes is exactly
@@ -372,11 +411,23 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-release-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Log in to Docker Hub
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Push the commit-addressed candidate only
         id: push
@@ -388,13 +439,19 @@ jobs:
           CANDIDATE="sha-${SHA}"
 
           # Idempotent no-overwrite: if the candidate tag exists and holds
-          # EXACTLY what this run built, fall through to sign and propagate
-          # (a failed earlier run must be finishable by re-dispatch, or the
-          # failure-prone tail strands a published-but-unsigned candidate no
-          # re-dispatch can fix). Identity is compared by per-arch image
-          # config digest — the image ID, which docker save/load preserves
-          # and the smoke test certified — with NO registry mutation: a
-          # different artifact errors before anything is pushed.
+          # EXACTLY what this run built, fall through to sign and propagate,
+          # so a run that failed after pushing can still be finished.
+          # Identity is compared by per-arch image config digest (the image
+          # ID, which docker save/load preserves and the smoke test
+          # certified) with NO registry mutation: a different artifact
+          # errors before anything is pushed. The build has no layer cache,
+          # so a new dispatch builds images with different IDs and, if the
+          # earlier run pushed the candidate, stops here. To finish a failed
+          # run, use "Re-run failed jobs" on that run while its image
+          # artifacts are kept (retention-days: 1 above); this job then
+          # reloads the images it pushed and they match. Once the artifacts
+          # have expired the run cannot be finished this way; sign-image.yml
+          # covers signing a candidate that was pushed but not signed.
           if EXISTING=$(docker buildx imagetools inspect "${REPO}:${CANDIDATE}" --format '{{.Manifest.Digest}}' 2>/dev/null); then
             RAW=$(skopeo inspect --no-creds --raw "docker://${REPO}@${EXISTING}")
             MATCH=true

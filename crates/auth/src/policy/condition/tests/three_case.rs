@@ -18,13 +18,19 @@ fn present_key_matches_or_not() {
         "aws:PrincipalArn",
         vec!["arn:a"],
     );
-    assert_eq!(evaluate_condition_match(&eq, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&eq, true, &ctx),
+        ConditionMatch::Match
+    );
     let ne = cond(
         ConditionOperator::StringEquals,
         "aws:PrincipalArn",
         vec!["arn:b"],
     );
-    assert_eq!(evaluate_condition_match(&ne, &ctx), ConditionMatch::NoMatch);
+    assert_eq!(
+        evaluate_condition_match(&ne, true, &ctx),
+        ConditionMatch::NoMatch
+    );
 }
 
 #[test]
@@ -38,7 +44,7 @@ fn absent_key_keeps_iam_semantics() {
         vec!["x"],
     );
     assert_eq!(
-        evaluate_condition_match(&pos, &ctx),
+        evaluate_condition_match(&pos, true, &ctx),
         ConditionMatch::NoMatch
     );
     let neg = cond(
@@ -46,7 +52,10 @@ fn absent_key_keeps_iam_semantics() {
         "aws:PrincipalTag/team",
         vec!["x"],
     );
-    assert_eq!(evaluate_condition_match(&neg, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&neg, true, &ctx),
+        ConditionMatch::Match
+    );
 }
 
 #[test]
@@ -62,10 +71,67 @@ fn unresolvable_key_is_unresolvable_for_every_operator() {
     ] {
         let c = cond(op, "aws:PrincipalOrgID", vec!["o-1"]);
         assert_eq!(
-            evaluate_condition_match(&c, &ctx),
+            evaluate_condition_match(&c, true, &ctx),
             ConditionMatch::Unresolvable
         );
     }
+}
+
+#[test]
+fn variable_naming_unresolvable_key_is_unresolvable_with_or_without_default() {
+    // Case 3 read through a condition value: the variable has no value to
+    // expand to, and the service, which has one, would not use the default.
+    // Every operator yields Unresolvable, so a Deny applies and an Allow does
+    // not grant whatever the operator says. A later value of the condition
+    // that names the key counts as the first one does.
+    let ctx = TestContext::new()
+        .with("aws:PrincipalTag/team", vec!["blue"])
+        .unresolvable("aws:PrincipalOrgID");
+    for values in [
+        vec!["${aws:PrincipalOrgID}"],
+        vec!["${aws:PrincipalOrgID, 'blue'}"],
+        vec!["${aws:PrincipalOrgID,'blue'}"],
+        vec!["x-${aws:PrincipalOrgID, 'blue'}-y"],
+        vec!["red", "${aws:PrincipalOrgID, 'blue'}"],
+    ] {
+        for op in [
+            ConditionOperator::StringEquals,
+            ConditionOperator::StringNotEquals,
+            ConditionOperator::StringLike,
+        ] {
+            let c = cond(op, "aws:PrincipalTag/team", values.clone());
+            assert_eq!(
+                evaluate_condition_match(&c, true, &ctx),
+                ConditionMatch::Unresolvable,
+                "{values:?}"
+            );
+        }
+    }
+    // The key present: its value is used, not the default.
+    let present = TestContext::new()
+        .with("aws:PrincipalTag/team", vec!["blue"])
+        .with("aws:PrincipalOrgID", vec!["blue"])
+        .unresolvable("aws:PrincipalOrgID");
+    let c = cond(
+        ConditionOperator::StringEquals,
+        "aws:PrincipalTag/team",
+        vec!["${aws:PrincipalOrgID, 'red'}"],
+    );
+    assert_eq!(
+        evaluate_condition_match(&c, true, &present),
+        ConditionMatch::Match
+    );
+    // The key absent, not unresolvable: the default is used.
+    let absent = TestContext::new().with("aws:PrincipalTag/team", vec!["blue"]);
+    let c = cond(
+        ConditionOperator::StringEquals,
+        "aws:PrincipalTag/team",
+        vec!["${aws:PrincipalOrgID, 'blue'}"],
+    );
+    assert_eq!(
+        evaluate_condition_match(&c, true, &absent),
+        ConditionMatch::Match
+    );
 }
 
 #[test]
@@ -80,7 +146,10 @@ fn resolved_unresolvable_key_uses_its_value() {
         "aws:PrincipalArn",
         vec!["arn:a"],
     );
-    assert_eq!(evaluate_condition_match(&c, &ctx), ConditionMatch::Match);
+    assert_eq!(
+        evaluate_condition_match(&c, true, &ctx),
+        ConditionMatch::Match
+    );
 }
 
 #[test]
@@ -103,7 +172,7 @@ fn statement_nomatch_dominates_unresolvable() {
         ),
     ];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::NoMatch
     );
 }
@@ -126,7 +195,7 @@ fn statement_unresolvable_when_only_unresolvable_present() {
         ),
     ];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::Unresolvable
     );
 }
@@ -140,12 +209,12 @@ fn statement_all_match() {
         vec!["contractors"],
     )];
     assert_eq!(
-        evaluate_statement_conditions(&conds, &ctx),
+        evaluate_statement_conditions(&conds, true, &ctx),
         ConditionMatch::Match
     );
     // An empty condition block always matches.
     assert_eq!(
-        evaluate_statement_conditions(&[], &ctx),
+        evaluate_statement_conditions(&[], true, &ctx),
         ConditionMatch::Match
     );
 }
