@@ -432,10 +432,14 @@ impl OperationContext {
 
 /// Dispatch an operation by name.
 ///
+/// `raw_body` is the request text `body` was parsed from; `Scan` reads the
+/// member order of its `ExclusiveStartKey` from it.
+///
 /// Returns the JSON response body and sideband metrics for the metrics collector.
 pub async fn dispatch(
     operation: &str,
     body: serde_json::Value,
+    raw_body: &[u8],
     ctx: &OperationContext,
     server_addr: &str,
 ) -> Result<DispatchResult, DynamoDbError> {
@@ -464,7 +468,7 @@ pub async fn dispatch(
         "DeleteItem" => handle_delete_item(body, ctx).await,
         "UpdateItem" => handle_update_item(body, ctx).await,
         "Query" => handle_query(body, ctx).await,
-        "Scan" => handle_scan(body, ctx).await,
+        "Scan" => handle_scan(body, raw_body, ctx).await,
         "SearchVectors" => handle_search_vectors(body, ctx).await,
         "BatchGetItem" => handle_batch_get_item(body, ctx).await,
         "BatchWriteItem" => handle_batch_write_item(body, ctx).await,

@@ -16,14 +16,22 @@ Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
 nesting text, 31 reaches the unused-value check. A malformed number at the
 bottom is reported first, at the depths 31 to 60 that were measured.
 
-The faults of ``ExclusiveStartKey`` come at two places (measured on
-2026-11-05, each request twice): a value that is empty, carries an unknown type
-descriptor or two descriptors is reported after the constraint clauses and the
-request parameter checks, with the prefix ``The provided starting key is
-invalid: ``, and ahead of the expression checks; a number or set fault is
-reported after the expression and request checks, with no prefix, and ahead of
-the table lookup. With faults in two members the service's choice follows the
-attribute names and the request's order, so those tests accept either fault.
+The service follows one of two check orders (measured 2026-10-31 and
+2026-11-05, each request twice; MEASURED-scan-r3 section 6). A request that
+holds a value that is not one AttributeValue (empty, an unknown or lower-case
+type descriptor, two descriptors) in ``ExpressionAttributeValues``,
+``ExclusiveStartKey`` or a ``ScanFilter`` list follows order U: the constraint
+clauses in the older form with the ``Select`` enum among them, the request
+parameter checks, the key's faults (shape and value together, the first faulty
+member in the fitted member order, a shape fault with the prefix ``The provided
+starting key is invalid: ``), the unreadable ``ExpressionAttributeValues``
+entries, the nesting depth, the expression checks, the table. Every other
+request follows order R: the constraint clauses in the newer form, the parameter
+mix, the nesting depth, a set fault in ``ExpressionAttributeValues``, the request
+parameter checks, the ``Select`` enum, the expression checks, the key's number
+and set faults, the table. The set texts quote their members in order R and not
+in order U. With two value faults in two key members the service's own sends
+disagreed, so those tests accept either fault.
 """
 
 from __future__ import annotations
@@ -186,22 +194,49 @@ KEYS_ALONE = [
      NS_EMPTY),
 ]
 
-# Measured 2026-11-05: faults in two members of one key. The service's choice
-# follows the attribute names and, on some tables, the request's member order:
-# {"pk": {}, "sk": {"N": "bob"}} answered bob on 2026-10-31, and {"a": {}, "b":
-# {"N": "bob"}} the empty value. Each row accepts either member's fault.
+# Measured 2026-10-31 and 2026-11-05: faults in two members of one key, one of
+# them a shape fault. The service names the first faulty member in the fitted
+# member order (MEASURED-scan-r3 section 6.3: sk ahead of pk and of z in both
+# request orders; the set texts of order U where the set member comes first).
 TWO_MEMBER_FAULTS = [
-    ("empty-pk-then-bob", '{"pk": {}, "sk": {"N": "bob"}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
-    ("bob-then-empty-pk", '{"sk": {"N": "bob"}, "pk": {}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
-    ("type-X-pk-then-bob", '{"pk": {"X": "1"}, "sk": {"N": "bob"}}',
-     (EMPTY_KEY_VALUE, NUMERIC_BOB)),
-    ("bob-then-empty-sk", '{"pk": {"N": "bob"}, "sk": {}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
-    ("two-descriptors-then-bob", '{"pk": {"S": "x", "N": "1"}, "sk": {"N": "bob"}}',
-     (TWO_DESCRIPTORS, NUMERIC_BOB)),
+    ("empty-pk-then-bob", '{"pk": {}, "sk": {"N": "bob"}}', NUMERIC_BOB),
+    ("bob-then-empty-pk", '{"sk": {"N": "bob"}, "pk": {}}', NUMERIC_BOB),
+    ("type-X-pk-then-bob", '{"pk": {"X": "1"}, "sk": {"N": "bob"}}', NUMERIC_BOB),
+    ("bob-then-empty-sk", '{"pk": {"N": "bob"}, "sk": {}}', EMPTY_KEY_VALUE),
+    ("two-descriptors-then-bob", '{"pk": {"S": "x", "N": "1"}, "sk": {"N": "bob"}}', NUMERIC_BOB),
+    ("empty-then-NS-empty", '{"pk": {}, "sk": {"NS": []}}', NS_EMPTY),
+    ("NS-empty-then-empty", '{"pk": {"NS": []}, "sk": {}}', EMPTY_KEY_VALUE),
+    ("empty-then-NS-bob", '{"pk": {}, "sk": {"NS": ["1", "bob"]}}', NUMERIC_BOB),
+    ("empty-in-an-L-then-bob", '{"pk": {"L": [{}]}, "sk": {"N": "bob"}}', NUMERIC_BOB),
+    ("type-X-then-bob-in-z", '{"pk": {"X": "1"}, "sk": {"S": "x"}, "z": {"N": "bob"}}',
+     NUMERIC_BOB),
+    ("two-descriptors-then-SS-empty", '{"pk": {"S": "x", "N": "1"}, "sk": {"SS": []}}',
+     KEY_PREFIX + SS_EMPTY),
+    ("empty-then-NS-duplicates", '{"pk": {}, "sk": {"NS": ["1", "1"]}}',
+     "Input collection contains duplicates"),
+    ("empty-then-SS-duplicates", '{"pk": {}, "sk": {"SS": ["a", "a"]}}',
+     INVALID + "Input collection [a, a] contains duplicates."),
+]
+
+# Two value faults in two members: the service's two sends disagreed on 8 of
+# 22 such rows (2026-11-05), so each row accepts either member's fault.
+TWO_VALUE_FAULTS = [
     ("NS-empty-then-bob", '{"pk": {"NS": []}, "sk": {"N": "bob"}}', (NS_EMPTY, NUMERIC_BOB)),
-    ("empty-then-NS-empty", '{"pk": {}, "sk": {"NS": []}}', (EMPTY_KEY_VALUE, NS_EMPTY)),
-    ("NS-empty-then-empty", '{"pk": {"NS": []}, "sk": {}}', (EMPTY_KEY_VALUE, NS_EMPTY)),
-    ("empty-then-NS-bob", '{"pk": {}, "sk": {"NS": ["1", "bob"]}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+    ("SS-duplicates-then-bob", '{"pk": {"SS": ["a", "a"]}, "sk": {"N": "bob"}}',
+     (SS_DUP, NUMERIC_BOB)),
+]
+
+# Measured 2026-11-05 (R5, MEASURED-scan-r3 section 6.3) on tables with other
+# key names: (id, table fixture, key, expected). HASH a, RANGE b: a first; HASH
+# pk, RANGE a: a first in both request orders; HASH id, RANGE ts: the member
+# first in the request; the GSI key of three members: gpk ahead of pk.
+MEMBER_ORDER_ROWS = [
+    ("ab-empty-and-bob", "ab_table", '{"a": {}, "b": {"N": "bob"}}', EMPTY_KEY_VALUE),
+    ("ab-bob-and-empty", "ab_table", '{"a": {"N": "bob"}, "b": {}}', NUMERIC_BOB),
+    ("pa-empty-and-bob", "pa_table", '{"pk": {}, "a": {"N": "bob"}}', NUMERIC_BOB),
+    ("pa-bob-and-empty-reversed", "pa_table", '{"a": {"N": "bob"}, "pk": {}}', NUMERIC_BOB),
+    ("it-empty-and-bob", "it_table", '{"id": {}, "ts": {"N": "bob"}}', EMPTY_KEY_VALUE),
+    ("it-bob-and-empty-reversed", "it_table", '{"ts": {"N": "bob"}, "id": {}}', NUMERIC_BOB),
 ]
 
 # Measured 2026-11-05 (MEASURED-scan-r3 section 2): beside each class of key
@@ -223,8 +258,8 @@ STAGES = [
     # prefix of the text.
     ("ExpressionAttributeValues-with-no-expression",
      '"ExpressionAttributeValues": {":a": {"S": "x"}}', "parameter"),
-    # An expression check (S3): ahead of a number or set fault, after a shape
-    # fault.
+    # An expression check: ahead of a number or set fault (order R), after the
+    # key's faults (order U).
     ("unused-value",
      '"FilterExpression": "a = :p", "ExpressionAttributeValues": {":p": {"S": "x"}, ":u": {"S": "y"}}',
      "expression"),
@@ -243,13 +278,191 @@ N_KEY_FAULTS = [
      "Attempting to store more than 38 significant digits in a Number"),
 ]
 
-
 def nest(leaf: dict, levels: int) -> dict:
     """``leaf`` inside ``levels`` lists."""
     value = leaf
     for _ in range(levels):
         value = {"L": [value]}
     return value
+
+
+EAV_VALUE = "ExpressionAttributeValues contains invalid value: "
+EAV_EMPTY_E = (EAV_VALUE + "Supplied AttributeValue is empty, must contain exactly one of the "
+               "supported datatypes for key :e")
+EAV_EMPTY_A = EAV_EMPTY_E.replace(":e", ":a")
+EAV_TWO_A = (EAV_VALUE + "Supplied AttributeValue has more than one datatypes set, must contain "
+             "exactly one of the supported datatypes for key :a")
+EAN_NO_EXPRESSION = "ExpressionAttributeNames can only be specified when using expressions"
+CONDOP = "ConditionalOperator can only be used when Filter or Expected has two or more elements"
+UNDEFINED_ZZ = ("Invalid FilterExpression: An expression attribute value used in expression "
+                "is not defined; attribute value: :zz")
+BEGINS_N = ("Invalid FilterExpression: Incorrect operand type for operator or function; "
+            "operator or function: begins_with, operand type: N")
+SEGMENT_ALONE = ("The TotalSegments parameter is required but was not present in the request "
+                 "when Segment parameter is present")
+EMPTY_KEY = '"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}'
+FILTER_P = '"FilterExpression": "a = :p"'
+NEST32_S = json.dumps(nest({"S": "x"}, 32))
+NEST32_N = json.dumps(nest({"N": "1"}, 32))
+
+# Measured 2026-10-31 (B4-7) and 2026-11-05 (R5, MEASURED-scan-r3 section 6):
+# representative rows of each order. An expected text given as ("startswith",
+# prefix) asserts the check's place where the text predates this branch (#722,
+# #838, #839). "4th" names the rows that fail on 45705bf27.
+TWO_ORDERS = [
+    # Order U: an unreadable ExpressionAttributeValues entry, read or unused,
+    # after the Select enum, the request parameter checks and the key's faults,
+    # ahead of the nesting check, the unused values and the table.
+    ("B4-7", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":d": '
+     + NEST32_N + ', ":e": {}}', EAV_EMPTY_E),
+    ("B4-7-flat", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":e": {}}',
+     EAV_EMPTY_E),
+    ("B4-7-X", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":e": {"X": "1"}}',
+     EAV_EMPTY_E),
+    ("eav-empty-select-bad", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":e": {}}, "Select": "BAD"', SELECT_ENUM),
+    ("eav-empty-unused-and-key-empty", FILTER_P + ', "ExpressionAttributeValues": '
+     '{":p": {"S": "x"}, ":e": {}}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+    ("eav-empty-read-plus-unused",
+     '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}, ":u": {"S": "x"}}',
+     EAV_EMPTY_A),
+    ("eav-read-X", '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"X": "1"}}',
+     EAV_EMPTY_A),
+    ("eav-read-two",
+     '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"S": "x", "N": "1"}}',
+     EAV_TWO_A),
+    ("eav-read-empty-begins",
+     '"FilterExpression": "begins_with(a, :a)", "ExpressionAttributeValues": {":a": {}}',
+     EAV_EMPTY_A),
+    ("B4-7-noexpr-empty", '"ExpressionAttributeValues": {":e": {}}',
+     ("startswith", EAV_NO_EXPRESSION)),
+    ("B4-7-noexpr-two", '"ExpressionAttributeValues": {":e": {"S": "x", "N": "1"}}',
+     ("startswith", EAV_NO_EXPRESSION)),
+    # Order U: the nesting check after the key's faults (the three b.*.nesting
+    # rows of R3 and the nest-*-key-empty rows of R5).
+    ("nesting-beside-empty-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
+     + NEST32_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+    ("nesting-beside-type-X-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
+     + NEST32_S + '}, "ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"S": "x"}}',
+     EMPTY_KEY_VALUE),
+    ("nesting-beside-two-descriptors-key", FILTER_P + ', "ExpressionAttributeValues": {":p": '
+     + NEST32_S + '}, "ExclusiveStartKey": {"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}',
+     TWO_DESCRIPTORS),
+    ("nest-read-N-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": '
+     + NEST32_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+    ("nest-unused-S-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":d": ' + NEST32_S + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+    ("nest-unused-N-key-empty", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":d": ' + NEST32_N + '}, ' + EMPTY_KEY, EMPTY_KEY_VALUE),
+    # Order U: the parameter mix and the other request parameter checks ahead of
+    # the key's shape fault (RS-f Minor-1; arity-key-empty-and-eav-noexpr).
+    ("mix-beside-empty-key", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
+     '"AttributeValueList": [{"N": "1"}]}}, "FilterExpression": "a = :p", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}}, ' + EMPTY_KEY, MIX),
+    ("arity-key-empty-and-ean-noexpr", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", '
+     '"AttributeValueList": []}}, "ExpressionAttributeNames": {"#a": "a"}, ' + EMPTY_KEY,
+     EAN_NO_EXPRESSION),
+    # Order R: the nesting check ahead of the Select enum, the filter syntax,
+    # the no-expression check and the key's number.
+    ("nest-unused-S-select-bad", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":d": ' + NEST32_S + '}, "Select": "BAD"', NESTING),
+    ("nest-read-S-filter-syntax", '"FilterExpression": "a = = :p", "ExpressionAttributeValues": '
+     '{":p": ' + NEST32_S + '}', NESTING),
+    ("nest-read-S-eav-noexpr-sibling", '"ProjectionExpression": "a", '
+     '"ExpressionAttributeValues": {":p": ' + NEST32_S + '}', NESTING),
+    ("nest-read-S-key-bob", FILTER_P + ', "ExpressionAttributeValues": {":p": ' + NEST32_S
+     + '}, ' + BOB_KEY, NESTING),
+    ("B4-5a", '"ExpressionAttributeValues": {":d": ' + NEST32_N + '}', NESTING),
+    # Order R: a set fault in ExpressionAttributeValues ahead of the
+    # no-expression check; the set texts with the members JSON-quoted.
+    ("B4-7-noexpr-NSe", '"ExpressionAttributeValues": {":e": {"NS": []}}', NS_EMPTY),
+    ("eav-read-NSe", '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"NS": []}}',
+     NS_EMPTY),
+    ("eav-read-SSdup",
+     '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {"SS": ["a", "a"]}}',
+     SS_DUP),
+    # Order R: the constraint enums and the request parameter checks among
+    # themselves, and the Select enum after the no-expression check.
+    ("mix-rcc-bad", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": '
+     '[{"N": "1"}]}}, "FilterExpression": "a = :p", "ExpressionAttributeValues": '
+     '{":p": {"N": "1"}}, "ReturnConsumedCapacity": "BAD"', RCC_ENUM),
+    ("rcc-bad-select-bad", '"ReturnConsumedCapacity": "BAD", "Select": "BAD"', RCC_ENUM),
+    ("mix-select-bad", '"ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": '
+     '[{"N": "1"}]}}, "FilterExpression": "a = :p", "ExpressionAttributeValues": '
+     '{":p": {"N": "1"}}, "Select": "BAD"', MIX),
+    ("select-bad-eav-noexpr", '"ExpressionAttributeValues": {":p": {"S": "x"}}, "Select": "BAD"',
+     ("startswith", EAV_NO_EXPRESSION)),
+    ("eav-noexpr-ean-noexpr", '"ExpressionAttributeValues": {":p": {"S": "x"}}, '
+     '"ExpressionAttributeNames": {"#a": "a"}', EAN_NO_EXPRESSION),
+    ("ean-noexpr-condop", '"ExpressionAttributeNames": {"#a": "a"}, "ConditionalOperator": "AND"',
+     EAN_NO_EXPRESSION),
+    ("condop-arity", '"ConditionalOperator": "AND", "ScanFilter": {"a": {"ComparisonOperator": '
+     '"EQ", "AttributeValueList": []}}', CONDOP),
+    # Order R: the expression checks among themselves (section 6 step 5).
+    ("filter-syntax-segment-alone", '"FilterExpression": "a = = :p", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}}, "Segment": 0',
+     ("startswith", "Invalid FilterExpression:")),
+    ("segment-alone-unused", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":u": {"S": "y"}}, "Segment": 0', UNUSED_U),
+    ("undefined-unused", '"FilterExpression": "a = :zz", "ExpressionAttributeValues": '
+     '{":u": {"S": "y"}}', UNDEFINED_ZZ),
+    ("undefined-segment-alone", '"FilterExpression": "a = :zz", "Segment": 0', UNDEFINED_ZZ),
+    ("undefined-select-specific", '"FilterExpression": "a = :zz", "Select": "SPECIFIC_ATTRIBUTES"',
+     UNDEFINED_ZZ),
+    ("begins-n-segment-alone", '"FilterExpression": "begins_with(a, :p)", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}}, "Segment": 0', BEGINS_N),
+    ("begins-n-unused", '"FilterExpression": "begins_with(a, :p)", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}, ":u": {"S": "y"}}', BEGINS_N),
+    ("projection-syntax-filter-syntax", '"FilterExpression": "a = = :p", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}}, "ProjectionExpression": "a,,b"',
+     ("startswith", "Invalid FilterExpression:")),
+    ("select-specific-filter-syntax", '"FilterExpression": "a = = :p", '
+     '"ExpressionAttributeValues": {":p": {"N": "1"}}, "Select": "SPECIFIC_ATTRIBUTES"',
+     ("startswith", "Invalid FilterExpression:")),
+    ("allproj-noindex-filter-syntax", '"Select": "ALL_PROJECTED_ATTRIBUTES", '
+     '"FilterExpression": "a = = :p", "ExpressionAttributeValues": {":p": {"N": "1"}}',
+     ("startswith", "Invalid FilterExpression:")),
+    ("select-count-pe-unused", '"Select": "COUNT", "ProjectionExpression": "a", ' + FILTER_P
+     + ', "ExpressionAttributeValues": {":p": {"S": "x"}, ":u": {"S": "y"}}', UNUSED_U),
+    ("segment-ge-total-unused", FILTER_P + ', "ExpressionAttributeValues": {":p": {"S": "x"}, '
+     '":u": {"S": "y"}}, "Segment": 2, "TotalSegments": 2', UNUSED_U),
+    ("select-count-atg-segment-alone", '"Select": "COUNT", "AttributesToGet": ["a"], "Segment": 0',
+     ("startswith", "Cannot specify the ")),
+    ("select-count-atg-unused", '"Select": "COUNT", "AttributesToGet": ["a"], '
+     '"ExpressionAttributeValues": {":u": {"S": "y"}}', ("startswith", EAV_NO_EXPRESSION)),
+    # Order R: the key's value faults after the expression checks, their texts.
+    ("key-bob-eav-bob", '"FilterExpression": "a = :n", "ExpressionAttributeValues": '
+     '{":n": {"N": "fred"}}, ' + BOB_KEY, NUMERIC_FRED),
+    ("key-bob-and-NSe-one-member",
+     '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"NS": ["bob", "1", "1"]}}',
+     NUMERIC_BOB),
+    ("key-NS-dup-and-bob",
+     '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"NS": ["1", "1", "bob"]}}',
+     NUMERIC_BOB),
+    ("key-BS-dup",
+     '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"BS": ["YQ==", "YQ=="]}}',
+     INVALID + 'Input collection ["YQ==","YQ=="]of type BS contains duplicates.'),
+    ("key-SS-dup-quotes",
+     '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, "z": {"SS": ["a\\"b", "a\\"b"]}}',
+     INVALID + 'Input collection ["a\\"b", "a\\"b"] contains duplicates.'),
+    ("key-bob-schema-mismatch", '"ExclusiveStartKey": {"pk": {"N": "bob"}}', NUMERIC_BOB),
+    # Order U: the key's set faults beside an unreadable expression value, the
+    # order-U texts (the NS duplicate text bare, the SS members unquoted).
+    ("key-bob-eav-empty-read-and-NSe", '"FilterExpression": "a = :a", '
+     '"ExpressionAttributeValues": {":a": {}}, "ExclusiveStartKey": {"pk": {"NS": []}, '
+     '"sk": {"S": "x"}}', NS_EMPTY),
+    ("key-NS-dup-beside-eav-empty", '"FilterExpression": "a = :a", '
+     '"ExpressionAttributeValues": {":a": {}}, "ExclusiveStartKey": {"pk": {"NS": ["1", "1"]}, '
+     '"sk": {"S": "x"}}', "Input collection contains duplicates"),
+    ("key-SS-dup-beside-eav-empty", '"FilterExpression": "a = :a", '
+     '"ExpressionAttributeValues": {":a": {}}, "ExclusiveStartKey": {"pk": {"SS": ["a", "a"]}, '
+     '"sk": {"S": "x"}}', INVALID + "Input collection [a, a] contains duplicates."),
+    # Order U: the key's shape fault ahead of the table's index rules.
+    ("key-empty-and-consistent-gsi", '"IndexName": "gsi", "ConsistentRead": true, '
+     '"ExclusiveStartKey": {"gpk": {"S": "g"}, "pk": {"S": "p"}, "sk": {}}', EMPTY_KEY_VALUE),
+    ("key-shape-M-nested-N-bob", '"ExclusiveStartKey": {"pk": {"S": "x"}, "sk": {"S": "x"}, '
+     '"z": {"M": {"k": {"N": "bob"}, "j": {}}}}', EMPTY_KEY_VALUE),
+]
 
 
 def unused_value(value: dict) -> str:
@@ -336,6 +549,47 @@ def n_table(dynamodb_client):
     wait_for_deleted(dynamodb_client, name)
 
 
+def _two_member_table(dynamodb_client, prefix: str, hash_key: str, range_key: str):
+    name = unique_name(prefix)
+    dynamodb_client.create_table(
+        TableName=name,
+        AttributeDefinitions=[{"AttributeName": hash_key, "AttributeType": "S"},
+                              {"AttributeName": range_key, "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": hash_key, "KeyType": "HASH"},
+                   {"AttributeName": range_key, "KeyType": "RANGE"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    wait_for_active(dynamodb_client, name)
+    return name
+
+
+@pytest.fixture(scope="module")
+def ab_table(dynamodb_client):
+    """HASH a S, RANGE b S, no items."""
+    name = _two_member_table(dynamodb_client, "scanreqab", "a", "b")
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+    wait_for_deleted(dynamodb_client, name)
+
+
+@pytest.fixture(scope="module")
+def pa_table(dynamodb_client):
+    """HASH pk S, RANGE a S, no items."""
+    name = _two_member_table(dynamodb_client, "scanreqpa", "pk", "a")
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+    wait_for_deleted(dynamodb_client, name)
+
+
+@pytest.fixture(scope="module")
+def it_table(dynamodb_client):
+    """HASH id S, RANGE ts S, no items."""
+    name = _two_member_table(dynamodb_client, "scanreqit", "id", "ts")
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+    wait_for_deleted(dynamodb_client, name)
+
+
 class TestRequestChecks:
     """The parameter mix, the length constraint and the numbers in the key."""
 
@@ -391,13 +645,32 @@ class TestExclusiveStartKey:
         fields = '"ExclusiveStartKey": ' + key
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
 
-    @pytest.mark.parametrize("key, either", [r[1:] for r in TWO_MEMBER_FAULTS],
+    @pytest.mark.parametrize("key, expected", [r[1:] for r in TWO_MEMBER_FAULTS],
                              ids=[r[0] for r in TWO_MEMBER_FAULTS])
-    def test_two_faulty_members_answer_one_of_the_two_faults(
-            self, dynamodb_client, table, key, either):
+    def test_two_faulty_members_answer_the_first_in_the_fitted_order(
+            self, dynamodb_client, table, key, expected):
+        fields = '"ExclusiveStartKey": ' + key
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    @pytest.mark.parametrize("key, either", [r[1:] for r in TWO_VALUE_FAULTS],
+                             ids=[r[0] for r in TWO_VALUE_FAULTS])
+    def test_two_value_faults_answer_one_of_the_two(self, dynamodb_client, table, key, either):
         fields = '"ExclusiveStartKey": ' + key
         message = _validation_message(*_scan(dynamodb_client, table, fields))
         assert message in either, message
+
+    @pytest.mark.parametrize("fixture, key, expected", [r[1:] for r in MEMBER_ORDER_ROWS],
+                             ids=[r[0] for r in MEMBER_ORDER_ROWS])
+    def test_the_member_order_on_other_tables(self, dynamodb_client, request, fixture, key,
+                                              expected):
+        name = request.getfixturevalue(fixture)
+        fields = '"ExclusiveStartKey": ' + key
+        assert _validation_message(*_scan(dynamodb_client, name, fields)) == expected
+
+    def test_the_member_order_on_a_gsi_key_of_three_members(self, dynamodb_client, table):
+        fields = ('"IndexName": "gsi", "ExclusiveStartKey": {"gpk": {}, "pk": {"N": "bob"}, '
+                  '"sk": {"S": "x"}}')
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == EMPTY_KEY_VALUE
 
     def test_two_number_faults_name_one_of_them(self, dynamodb_client, table):
         # The service named bob twice on 2026-10-31 (23:54 to 23:56 UTC) and
@@ -468,6 +741,32 @@ class TestExclusiveStartKey:
                              ids=[r[0] for r in N_KEY_FAULTS])
     def test_the_number_texts_on_an_n_hash_key(self, dynamodb_client, n_table, fields, expected):
         assert _validation_message(*_scan(dynamodb_client, n_table, fields)) == expected
+
+
+class TestTwoOrders:
+    """Representative rows of each order (measured 2026-10-31 and 2026-11-05)."""
+
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in TWO_ORDERS],
+                             ids=[r[0] for r in TWO_ORDERS])
+    def test_rows(self, dynamodb_client, table, fields, expected):
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        if isinstance(expected, tuple):
+            # The text predates this branch (#722, #838, #839): the check's
+            # place is asserted.
+            assert message.startswith(expected[1]), message
+        else:
+            assert message == expected
+
+    def test_an_unreadable_expression_value_on_a_missing_table(self, dynamodb_client):
+        # Measured 2026-11-05: ahead of ResourceNotFoundException.
+        fields = '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}'
+        status, payload = _scan(dynamodb_client, unique_name("nosuch"), fields)
+        assert payload.get("message") == EAV_EMPTY_A, payload
+
+    def test_bob_in_the_key_of_an_n_table(self, dynamodb_client, n_table):
+        # Measured 2026-11-05.
+        fields = '"ExclusiveStartKey": {"pk": {"N": "bob"}}'
+        assert _validation_message(*_scan(dynamodb_client, n_table, fields)) == NUMERIC_BOB
 
 
 class TestNestingDepth:

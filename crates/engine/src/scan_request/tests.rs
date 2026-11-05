@@ -9,7 +9,7 @@
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
-use super::validate_scan_request_body;
+use super::{CheckOrder, validate_scan_request_body};
 
 const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value: bob";
 const LIMIT_RANGE: &str = "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
@@ -25,7 +25,7 @@ fn message(result: Result<(), DynamoDbError>) -> Option<String> {
 }
 
 fn check(body: &Value) -> Option<String> {
-    message(validate_scan_request_body(body))
+    message(validate_scan_request_body(body, CheckOrder::of(body)))
 }
 
 /// A Scan whose filter reads `:n = {"N": "bob"}`.
@@ -204,12 +204,11 @@ fn parameter_mix_beats_the_enum_and_the_numbers() {
              Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
         )
     );
+    // The ReturnConsumedCapacity enum comes ahead of the mix (measured
+    // 2026-11-05).
     assert_eq!(
         check(&with(mix, "ReturnConsumedCapacity", json!("NOPE"))).as_deref(),
-        Some(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-        )
+        Some(RCC_ENUM)
     );
     let atg = with(
         with(bad_number(), "AttributesToGet", json!(["a"])),
@@ -272,9 +271,18 @@ fn enum_checks_sit_on_either_side_of_the_numbers() {
         json!("NOPE"),
     );
     assert_eq!(check(&both).as_deref(), Some(RCC_ENUM));
-    // With the numbers valid, an invalid Select is reported.
+    // With every value readable (order R) the Select enum is not a
+    // request-time check: the handler reports it after the no-expression check
+    // and the nesting check (measured 2026-11-05); beside an unreadable value
+    // (order U) it is one.
+    assert_eq!(check(&json!({"TableName": "t", "Select": "NOPE"})), None);
     assert_eq!(
-        check(&json!({"TableName": "t", "Select": "NOPE"})).as_deref(),
+        check(&json!({
+            "TableName": "t",
+            "Select": "NOPE",
+            "ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}},
+        }))
+        .as_deref(),
         Some(SELECT_ENUM)
     );
     // A valid request passes.
@@ -308,7 +316,7 @@ fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
     for body in shape_faults {
         assert!(
             matches!(
-                validate_scan_request_body(&body),
+                validate_scan_request_body(&body, CheckOrder::of(&body)),
                 Err(DynamoDbError::SerializationException(_))
             ),
             "{body}"

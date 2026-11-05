@@ -11,7 +11,7 @@
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
 
-use super::validate_scan_request_body;
+use super::{CheckOrder, validate_scan_request_body};
 
 const LIMIT: &str = "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
 const SEGMENT_LOW: &str = "Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0";
@@ -20,7 +20,7 @@ const TOTAL_LOW: &str = "Value at 'TotalSegments' failed to satisfy constraint: 
 const TOTAL_HIGH: &str = "Value at 'TotalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000";
 
 fn check(body: &Value) -> Option<String> {
-    match validate_scan_request_body(body) {
+    match validate_scan_request_body(body, CheckOrder::of(body)) {
         Ok(()) => None,
         Err(DynamoDbError::ValidationException(msg)) => Some(msg),
         Err(other) => panic!("unexpected error {other:?}"),
