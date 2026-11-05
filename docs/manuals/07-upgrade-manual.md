@@ -330,6 +330,87 @@ An earlier PostgreSQL or SQLite binary refuses to start against the migrated cat
 
 ---
 
+### v0.1.15: IAM policy variables expand in `Resource` and `NotResource`
+
+**What changed.** In a `2012-10-17` policy document, a `${key}` variable in a
+`Resource` or `NotResource` pattern is now expanded from the request before the
+pattern is matched, as IAM does. Before this release the pattern was compared as
+literal text and matched no table. Text from a variable value or a default is
+matched literally, a variable whose key the request does not carry, with no
+default, makes the pattern match nothing, and a `2008-10-17` document, or one
+with no `Version`, still matches the pattern as written. With a default, the
+default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none`
+when the request has no `team` tag (measured with the IAM policy simulator,
+issue #533). Four decisions change for stored policies:
+
+1. A pattern with a variable now matches the table it names. `Allow
+   table/${aws:username}` now grants the caller's own table, where it granted
+   nothing. `Deny table/${aws:PrincipalTag/team}` now denies the team's table,
+   where it denied nothing. `Deny NotResource table/${aws:PrincipalTag/team}` now
+   spares the team's table, where it denied every table, and an `Allow
+   NotResource` written that way no longer grants the team's table.
+2. A condition value naming a multivalued key, such as `${dynamodb:LeadingKeys}`
+   or `${aws:TagKeys}` in a trust policy, is no longer expanded to the key's first
+   value; the text is compared as written. Under a positive operator such as
+   `StringEquals` the condition no longer matches, and under a negated operator
+   such as `StringNotEquals` it now matches. For example, an `Allow` with the
+   condition `StringNotEquals` on `aws:PrincipalTag/team` and the value
+   `${dynamodb:LeadingKeys}` now grants a caller tagged `team=blue` whose request
+   has the leading key `blue`, where it did not, and a `Deny` with that condition
+   now applies to the same request.
+3. In a `2012-10-17` document, a condition value written as
+   `${key, 'default'}` under a string or ARN operator now expands to the
+   request's value for `key`, or to `default` when the request does not carry
+   `key`. Before, the whole text was compared as written. For example, an
+   `Allow` with the condition `StringEquals` on `aws:ResourceTag/owner` and the
+   value `${aws:username, 'anon'}` now grants `alice` a table tagged
+   `owner=alice`, and a caller with no user name a table tagged `owner=anon`;
+   before, it granted neither. In a `2008-10-17` document, in one with no
+   `Version`, and under the numeric, date, `Bool` and `Null` operators, the
+   text is still compared as written; IAM does not read the default form
+   there either (measured with the IAM policy simulator). A user, group or
+   role policy or boundary write refuses an `IpAddress` value written as a
+   variable as a malformed CIDR, as before. A role trust policy follows its
+   own `Version`.
+4. Spaces, and the other code points up to U+0020, around the key name of a
+   variable are now ignored, in `Resource` and `NotResource` patterns and in the
+   condition values item 3 covers. An `Allow` with the condition `StringEquals`
+   on `aws:ResourceTag/owner` and the value `${ aws:username }` now grants
+   `alice` a table tagged `owner=alice`. Before, the spaces were part of the
+   key name, so the variable named a key no request carries, the value was
+   compared as written, and the `Allow` granted nothing.
+
+**Policy writes check `Version`.** Writing a user, group or role policy or a
+permissions boundary, through the management API or the console, now refuses a
+document whose `Version` is not the string `2012-10-17` or `2008-10-17`, for
+example `"2012-10-18"` or the number `20121017`, with `Invalid policy document:
+policy parse error: invalid Version ...`, or for a permissions boundary `Invalid
+permissions boundary document: policy parse error: invalid Version ...`. A
+document already stored with such a value keeps evaluating, with its `Resource`
+patterns matched as written, but sending it again unchanged is refused with the
+same message. A stored `Deny` whose `Resource` or `NotResource` holds a variable
+in such a document keeps denying what the pattern as written matches, which for
+`table/${aws:PrincipalTag/team}` is nothing, until its `Version` is changed to
+`2012-10-17`. To find such documents before upgrading, list the stored policies
+and boundaries with the commands under **Who is affected** below and check each
+document's `Version`. A session policy passed to `AssumeRole` is checked only
+for its `Version` and `Statement` members.
+
+**Who is affected.** Any deployment with a stored policy whose `Resource`,
+`NotResource` or condition values contain `${`: inline user, group and role
+policies, permissions boundaries and session policies, and, for the condition
+value changes in items 2 to 4, role trust policies. Search the stored policies for `${`
+(`extenddb manage list-user-policies`, `list-group-policies` and
+`list-role-policies` print inline policies, `get-user-boundary` and
+`get-role-boundary` permissions boundaries, and `list-roles` trust policies) and
+check each match against the cases above before upgrading, in particular an
+`Allow` that now grants (a `Resource` pattern with a variable, or a negated
+condition whose value names a multivalued key), a `Deny` that now applies (the
+same two forms), and a `Deny NotResource` that now spares a table. No catalog
+migration is required.
+
+---
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
@@ -659,6 +740,16 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 - `dynamodb:LeadingKeys`, `dynamodb:Attributes` and `aws:TagKeys` hold values the caller or the admin chooses: the partition key values in a request (every key in a batch), the attribute names in a projection, and the session tag keys in an AssumeRole call. Each value can be ARN-shaped or not. A `ForAnyValue:` or `ForAllValues:` Arn condition over one of these keys is now false while any value in the set is not an ARN and the policy lists at least one value. A `Deny` gated on `ForAnyValue:ArnNotLike` with `arn:aws:dynamodb:us-east-1:123456789012:table/Z*` on `dynamodb:LeadingKeys` no longer applies to a request whose partition key values include one that is not an ARN, and `ForAnyValue:ArnLike` with `j*` on the same key no longer holds for the partition key value `junk`.
 
 A policy whose Arn values are literal ARNs, applied to a context value that is an ARN, evaluates as before.
+
+---
+
+### v0.1.15: console account pages serve an IAM user its own account only
+
+**What changed.** Every console page and form under `/console/accounts/{account_id}` now redirects an IAM-user session to `/console` when `{account_id}` is not the session's own account, and the answer is the same whether or not an account has that ID. Before this release the account, user, group and role pages checked only that a console session existed. An IAM user who requested another account's ID read that account's name, the names of its users, groups and roles, each user's access key IDs, inline policy names, groups and tags, and each role's trust policy. The forms under that path already refused IAM users, except the access key forms, which accept an IAM user's own keys. A refused form for another account now redirects to `/console`. Before this release 8 of the 17 forms redirected to a page of that account (the forms that create and delete users, groups and roles, and that add and remove group members), the delete account form redirected to `/console/accounts`, and the 2 access key forms and 6 policy forms redirected to `/console`. The console home page now shows the deployment's account count and admin count to admin sessions only, and shows an IAM-user session a link to its own account.
+
+**Who is affected.** IAM users who opened another account's pages in the console. They are redirected to `/console`. The pages of an IAM user's own account and every page an admin session sees are unchanged.
+
+No catalog migration is required.
 
 ---
 

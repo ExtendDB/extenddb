@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -26,12 +26,14 @@ struct PolicyEntry {
 pub async fn put_user_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name, policy_name)): Path<(String, String, String)>,
     axum::Json(document): axum::Json<Value>,
 ) -> Response {
     put_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "user",
         &user_name,
@@ -44,19 +46,22 @@ pub async fn put_user_policy(
 pub async fn list_user_policies(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
-    list_policies(&state, &headers, &account_id, "user", &user_name).await
+    list_policies(&state, &headers, addr, &account_id, "user", &user_name).await
 }
 
 pub async fn delete_user_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name, policy_name)): Path<(String, String, String)>,
 ) -> Response {
     delete_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "user",
         &user_name,
@@ -68,12 +73,14 @@ pub async fn delete_user_policy(
 pub async fn put_group_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, group_name, policy_name)): Path<(String, String, String)>,
     axum::Json(document): axum::Json<Value>,
 ) -> Response {
     put_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "group",
         &group_name,
@@ -86,19 +93,22 @@ pub async fn put_group_policy(
 pub async fn list_group_policies(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, group_name)): Path<(String, String)>,
 ) -> Response {
-    list_policies(&state, &headers, &account_id, "group", &group_name).await
+    list_policies(&state, &headers, addr, &account_id, "group", &group_name).await
 }
 
 pub async fn delete_group_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, group_name, policy_name)): Path<(String, String, String)>,
 ) -> Response {
     delete_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "group",
         &group_name,
@@ -110,12 +120,14 @@ pub async fn delete_group_policy(
 pub async fn put_role_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name, policy_name)): Path<(String, String, String)>,
     axum::Json(document): axum::Json<Value>,
 ) -> Response {
     put_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "role",
         &role_name,
@@ -128,19 +140,22 @@ pub async fn put_role_policy(
 pub async fn list_role_policies(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
-    list_policies(&state, &headers, &account_id, "role", &role_name).await
+    list_policies(&state, &headers, addr, &account_id, "role", &role_name).await
 }
 
 pub async fn delete_role_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name, policy_name)): Path<(String, String, String)>,
 ) -> Response {
     delete_policy(
         &state,
         &headers,
+        addr,
         &account_id,
         "role",
         &role_name,
@@ -153,9 +168,11 @@ pub async fn delete_role_policy(
 // Shared implementation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn put_policy(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
@@ -163,7 +180,7 @@ async fn put_policy(
     document: &Value,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }
@@ -216,12 +233,13 @@ async fn put_policy(
 async fn list_policies(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }
@@ -254,13 +272,14 @@ async fn list_policies(
 async fn delete_policy(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
     policy_name: &str,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }

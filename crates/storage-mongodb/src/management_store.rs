@@ -13,6 +13,7 @@ use extenddb_storage::management_store::{
     MetricsRow, OpError, OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument,
     UserDetail, UserListEntry,
 };
+use extenddb_storage::secret_cipher::encrypt_secret;
 
 use crate::catalog_store::MongoCatalogStore;
 
@@ -642,11 +643,7 @@ impl ManagementStore for MongoCatalogStore {
             };
 
             let hash = hash.to_owned();
-            Ok(tokio::task::spawn_blocking(move || {
-                bcrypt::verify(password, &hash).unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false))
+            extenddb_storage::password::verify_password(password, hash).await
         })
     }
 
@@ -2275,9 +2272,11 @@ impl extenddb_storage::management_store::RateLimitStore for MongoCatalogStore {
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         Box::pin(async move {
             let coll = self.catalog_db().collection::<Document>("failed_logins");
             let cutoff = time::OffsetDateTime::now_utc()
@@ -2286,6 +2285,7 @@ impl extenddb_storage::management_store::RateLimitStore for MongoCatalogStore {
             let count = coll
                 .count_documents(doc! {
                     "principal": &principal,
+                    "source_ip": &source_ip,
                     "attempted_at": { "$gte": cutoff_bson },
                 })
                 .await
@@ -2475,13 +2475,8 @@ impl extenddb_storage::management_store::AdminStore for MongoCatalogStore {
                 return Ok(None);
             };
             let hash = hash.to_owned();
-            Ok(Some(
-                tokio::task::spawn_blocking(move || {
-                    bcrypt::verify(password, &hash).unwrap_or(false)
-                })
-                .await
-                .unwrap_or(false),
-            ))
+            let verified = extenddb_storage::password::verify_password(password, hash).await?;
+            Ok(Some(verified))
         })
     }
 }
@@ -2524,37 +2519,6 @@ fn generate_secret_key() -> String {
         .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
         .collect();
     format!("extenddb{suffix}")
-}
-
-fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-
-    let payload = Payload {
-        msg: plaintext.as_bytes(),
-        aad: aad.as_bytes(),
-    };
-    let ciphertext = cipher
-        .encrypt(nonce, payload)
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
 }
 
 /// A stored policy or boundary as the resource-tag migration reads it: its

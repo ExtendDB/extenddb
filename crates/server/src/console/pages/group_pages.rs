@@ -15,7 +15,8 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
 
 /// GET /console/accounts/{id}/groups/new
 pub async fn new_group_form(
@@ -23,7 +24,7 @@ pub async fn new_group_form(
     headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -77,7 +78,7 @@ pub async fn create_group(
     Path(account_id): Path<String>,
     Form(form): Form<CreateGroupForm>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -139,7 +140,7 @@ pub async fn group_detail(
     headers: HeaderMap,
     Path((account_id, group_name)): Path<(String, String)>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -262,7 +263,7 @@ pub async fn delete_group(
     Path((account_id, group_name)): Path<(String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -335,7 +336,7 @@ pub async fn add_group_member(
     Path((account_id, group_name)): Path<(String, String)>,
     Form(form): Form<AddMemberForm>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -390,7 +391,7 @@ pub async fn remove_group_member(
     Path((account_id, group_name, user_name)): Path<(String, String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
