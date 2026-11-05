@@ -1191,64 +1191,6 @@ fn restore_storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     }
 }
 
-/// Handle `DescribeContinuousBackups`.
-pub(crate) async fn handle_describe_continuous_backups(
-    body: Value,
-    ctx: &OperationContext,
-) -> Result<Value, DynamoDbError> {
-    let table_name = required_str(&body, "TableName", "tableName")?;
-
-    let desc = ctx
-        .storage
-        .describe_continuous_backups(&ctx.account_id, table_name)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
-}
-
-/// Handle `UpdateContinuousBackups`.
-pub(crate) async fn handle_update_continuous_backups(
-    body: Value,
-    ctx: &OperationContext,
-) -> Result<Value, DynamoDbError> {
-    let table_name = required_str(&body, "TableName", "tableName")?;
-
-    let pitr_enabled = body
-        .get("PointInTimeRecoverySpecification")
-        .and_then(|v| v.get("PointInTimeRecoveryEnabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    let desc = ctx
-        .storage
-        .update_continuous_backups(&ctx.account_id, table_name, pitr_enabled)
-        .await
-        .map_err(storage_err_to_dynamo)?;
-
-    serialize_output(&json!({ "ContinuousBackupsDescription": desc }))
-}
-
-/// Handle `RestoreTableToPointInTime`.
-///
-/// Point-in-time recovery is not yet implemented. The previous implementation
-/// faked a restore by snapshotting the current table state (ignoring
-/// `RestoreDateTime`), which violates tenet 1 (fidelity over features).
-/// Until real PITR is implemented, return an error. There is no storage
-/// method behind this; it was removed from `BackupEngine` as unreachable.
-pub(crate) async fn handle_restore_table_to_point_in_time(
-    _body: Value,
-    _ctx: &OperationContext,
-) -> Result<Value, DynamoDbError> {
-    // TODO(fidelity): Implement real PITR using PostgreSQL temporal/history
-    // table approach — item_history table capturing every mutation, DISTINCT ON
-    // query to reconstruct state at time T, 35-day retention via background
-    // pruning.
-    Err(DynamoDbError::ValidationException(
-        "Point-in-time recovery restore is not yet supported".to_owned(),
-    ))
-}
-
 /// Convert storage errors to `DynamoDB` errors.
 fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
     match e {
@@ -1286,5 +1228,11 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
 }
 
 mod overrides;
+mod pitr;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use pitr::{
+    handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
+    handle_update_continuous_backups,
+};

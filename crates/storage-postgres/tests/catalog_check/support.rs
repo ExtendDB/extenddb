@@ -141,11 +141,16 @@ impl Deployment {
         .expect("connect");
         init.create_catalog_db().await.expect("catalog db");
         init.create_data_db().await.expect("data db");
-        init.run_catalog_migrations()
-            .await
-            .expect("catalog migrations");
+        let catalog: PgConnectOptions =
+            format!("{base}/{catalog_db}").parse().expect("catalog URL");
+        extenddb_storage_postgres::migrations::migrate(
+            &extenddb_storage_postgres::migrations::PostgresTarget::new(catalog, data_db.clone()),
+            "test",
+            Duration::ZERO,
+        )
+        .await
+        .expect("catalog migrations");
         init.record_data_connection().await.expect("record");
-        init.run_data_migrations().await.expect("data migrations");
 
         let catalog_url = format!("{base}/{catalog_db}");
         let catalog = PgPoolOptions::new()
@@ -161,11 +166,14 @@ impl Deployment {
         // No background workers run here, so transitions and index writes
         // must complete inline.
         for key in ["control_plane_delay_seconds", "index_propagation_delay_ms"] {
-            sqlx::query("UPDATE settings SET value = '0' WHERE key = $1")
-                .bind(key)
-                .execute(&catalog)
-                .await
-                .expect("pin a delay to zero");
+            sqlx::query(
+                "INSERT INTO settings (key, value) VALUES ($1, '0') \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(key)
+            .execute(&catalog)
+            .await
+            .expect("pin a delay to zero");
         }
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
             .bind(ACCOUNT)
