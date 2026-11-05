@@ -20,6 +20,8 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # The resolver setting in .cargo/config.toml applies to the fuzz build.
+      - '.cargo/**'
       - 'crates/core/**'
       - 'crates/auth/**'
       - 'crates/cache/**'
@@ -38,6 +40,9 @@ concurrency:
 
 jobs:
   fuzz:
+    # A fork inherits the schedule but not the runner group below, so the job
+    # runs only in repositories that the ExtendDB organization owns.
+    if: github.repository_owner == 'ExtendDB'
     # Dedicated ExtendDB runner group (Ubuntu 24.04, 4 vCPU / 16 GB, capped at
     # 20 concurrent).
     runs-on: extenddb_ubuntu-2404_4-core
