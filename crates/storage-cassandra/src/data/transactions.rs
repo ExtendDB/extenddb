@@ -6,7 +6,6 @@
 use super::transact_stream::{commit_old_image, secondary_effect_batches};
 use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::frame::Envelope;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::value::Bytes;
 use extenddb_core::expression::{self, ExpressionMaps};
@@ -23,7 +22,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
-use crate::cassandra_util::{get_column, query_optional};
+use crate::cassandra_util::{execute_at, get_column, lwt_params, query_optional_at, read_params};
 use crate::data::ddl::data_table_name;
 use crate::data::transaction_ledger::{LedgerOp, TransactionState};
 use crate::data::{
@@ -338,6 +337,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
+            true,
         )
         .await?
         else {
@@ -375,6 +375,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
+            true,
         )
         .await?
         else {
@@ -1243,10 +1244,11 @@ impl CassandraEngine {
         );
 
         // Fast path: token already present (common on retry).
-        if let Some(row) = query_optional::<StorageError>(
+        if let Some(row) = query_optional_at::<StorageError>(
             &self.session,
             &select_query,
             cdrs_tokio::query_values!(account_id, token),
+            true,
             "check_idempotency_token",
         )
         .await?
@@ -1265,20 +1267,28 @@ impl CassandraEngine {
              (account_id, \"token\", fingerprint, created_at) VALUES (?, ?, ?, ?) IF NOT EXISTS"
         );
         let now = crate::cassandra_util::now_millis();
-        let result = crate::cassandra_util::apply_lwt(
-            &self.session,
-            &insert_query,
-            cdrs_tokio::query_values!(account_id, token, fingerprint, now),
-            "check_idempotency_token insert",
-        )
-        .await?;
+        let result = crate::cassandra_util::lwt_applied(
+            &execute_at::<StorageError>(
+                &self.session,
+                &insert_query,
+                lwt_params(cdrs_tokio::query_values!(
+                    account_id,
+                    token,
+                    fingerprint,
+                    now
+                )),
+                "check_idempotency_token insert",
+            )
+            .await?,
+        )?;
 
         if !result {
             // Lost the LWT race — read back to return the right error.
-            let row = query_optional::<StorageError>(
+            let row = query_optional_at::<StorageError>(
                 &self.session,
                 &select_query,
                 cdrs_tokio::query_values!(account_id, token),
+                true,
                 "check_idempotency_token recheck",
             )
             .await?;
@@ -1306,7 +1316,7 @@ impl CassandraEngine {
             "DELETE FROM {keyspace}.idempotency_tokens_by_account \
              WHERE account_id = ? AND \"token\" = ?"
         );
-        if let Err(e) = crate::cassandra_util::execute::<StorageError>(
+        if let Err(e) = crate::cassandra_util::execute_quorum::<StorageError>(
             &self.session,
             &delete_query,
             cdrs_tokio::query_values!(account_id, token),
@@ -1373,7 +1383,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
-            consistency,
+            consistency.unwrap_or(crate::cassandra_util::read_consistency(true)),
         )
         .await?
         else {
@@ -1469,6 +1479,7 @@ impl CassandraEngine {
                 pk_text.as_str(),
                 sk.as_ref(),
                 sk_col.as_deref(),
+                true,
             )
             .await
             .map_err(|e| CancellationReason::validation_error(e.to_string()))?;
@@ -1531,7 +1542,10 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str()))
+            .query_with_params(
+                &query,
+                read_params(true, cdrs_tokio::query_values!(pk_text.as_str())),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("check_partition_max_delete_timestamp: {e}");
@@ -1596,13 +1610,13 @@ impl CassandraEngine {
                     "INSERT INTO {keyspace}.{ddb_table} (pk, {sk_col}, item_data, prepared_txn_id, prepared_txn_timestamp, created_to_prepare) \
                      VALUES (?, ?, ?, ?, ?, true) IF NOT EXISTS"
                 );
-                query_with_pk_sk_item_txnid_ts(&self.session, &query, pk_text.as_str(), &sk, &item_text, txn_id_bytes, txn_timestamp).await
+                query_with_pk_sk_item_txnid_ts(&self.session, &query, pk_text.as_str(), &sk, &item_text, txn_id_bytes, txn_timestamp, lwt_params).await
             } else {
                 let query = format!(
                     "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = ?, prepared_txn_timestamp = ? \
                      WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = null"
                 );
-                query_with_txnid_ts_pk_sk(&self.session, &query, txn_id_bytes, txn_timestamp, pk_text.as_str(), &sk).await
+                query_with_txnid_ts_pk_sk(&self.session, &query, txn_id_bytes, txn_timestamp, pk_text.as_str(), &sk, lwt_params).await
             }
         } else if is_new_item {
             let item_text = serde_json::to_value(key)
@@ -1613,7 +1627,7 @@ impl CassandraEngine {
                  VALUES (?, ?, ?, ?, true) IF NOT EXISTS"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp))
+                .query_with_params(&query, lwt_params(cdrs_tokio::query_values!(pk_text.as_str(), item_text, txn_id_bytes, txn_timestamp)))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         } else {
@@ -1622,7 +1636,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = null"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str()))
+                .query_with_params(&query, lwt_params(cdrs_tokio::query_values!(txn_id_bytes, txn_timestamp, pk_text.as_str())))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -1803,9 +1817,9 @@ impl CassandraEngine {
 
                 let result = self
                     .session
-                    .query_with_values(
+                    .query_with_params(
                         &update_max_ts_null_query,
-                        cdrs_tokio::query_values!(txn_timestamp, pk_text.as_str()),
+                        lwt_params(cdrs_tokio::query_values!(txn_timestamp, pk_text.as_str())),
                     )
                     .await
                     .map_err(|e| {
@@ -1824,13 +1838,13 @@ impl CassandraEngine {
 
                     let _result2 = self
                         .session
-                        .query_with_values(
+                        .query_with_params(
                             &update_max_ts_query,
-                            cdrs_tokio::query_values!(
+                            lwt_params(cdrs_tokio::query_values!(
                                 txn_timestamp,
                                 pk_text.as_str(),
                                 txn_timestamp
-                            ),
+                            )),
                         )
                         .await
                         .map_err(|e| {
@@ -1860,6 +1874,7 @@ impl CassandraEngine {
                         pk_text.as_str(),
                         &sk,
                         txn_id_bytes,
+                        lwt_params,
                     )
                     .await
                 } else {
@@ -1867,9 +1882,9 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ?"
                     );
                     self.session
-                        .query_with_values(
+                        .query_with_params(
                             &delete_query,
-                            cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
+                            lwt_params(cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes)),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
@@ -1940,16 +1955,24 @@ impl CassandraEngine {
                 "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
                  IF prepared_txn_id = ? AND created_to_prepare = true"
             );
-            query_with_pk_sk_txnid(&self.session, &query, pk_text.as_str(), &sk, txn_id_bytes).await
+            query_with_pk_sk_txnid(
+                &self.session,
+                &query,
+                pk_text.as_str(),
+                &sk,
+                txn_id_bytes,
+                lwt_params,
+            )
+            .await
         } else {
             let query = format!(
                 "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? \
                  IF prepared_txn_id = ? AND created_to_prepare = true"
             );
             self.session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes),
+                    lwt_params(cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes)),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2014,16 +2037,16 @@ impl CassandraEngine {
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                    lwt_params(cdrs_tokio::query::QueryValues::SimpleValues(vec![
                         item_text.as_str().into(),
                         next_version.into(),
                         txn_timestamp.into(),
                         cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                         super::index::sk_to_value(&sk),
                         txn_id_bytes.into(),
-                    ]),
+                    ])),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2033,7 +2056,7 @@ impl CassandraEngine {
                  WHERE pk = ? IF prepared_txn_id = ?"
             );
             self.session
-                .query_with_values(&query, cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes))
+                .query_with_params(&query, lwt_params(cdrs_tokio::query_values!(item_text, next_version, txn_timestamp, pk_text.as_str(), txn_id_bytes)))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2142,7 +2165,7 @@ impl CassandraEngine {
             return Ok(());
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch_builder();
         let mut async_enqueued = 0;
 
         if !indexes.is_empty() {
@@ -2251,13 +2274,13 @@ impl CassandraEngine {
                 "UPDATE {keyspace}.{ddb_table} SET prepared_txn_id = null WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?"
             );
 
-            let dr = query_with_pk_sk_txnid(&self.session, &delete_query, pk_text.as_str(), &sk, txn_id_bytes.clone())
+            let dr = query_with_pk_sk_txnid(&self.session, &delete_query, pk_text.as_str(), &sk, txn_id_bytes.clone(), lwt_params)
                 .await
                 .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
             if check_lwt_applied(&dr, "rollback delete").is_ok() {
                 return Ok(());
             }
-            query_with_pk_sk_txnid(&self.session, &update_query, pk_text.as_str(), &sk, txn_id_bytes).await
+            query_with_pk_sk_txnid(&self.session, &update_query, pk_text.as_str(), &sk, txn_id_bytes, lwt_params).await
         } else {
             let delete_query = format!(
                 "DELETE FROM {keyspace}.{ddb_table} WHERE pk = ? IF prepared_txn_id = ? AND created_to_prepare = true"
@@ -2267,7 +2290,7 @@ impl CassandraEngine {
             );
 
             let dr = self.session
-                .query_with_values(&delete_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone()))
+                .query_with_params(&delete_query, lwt_params(cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes.clone())))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
                 .map_err(|e| { tracing::error!("rollback delete: {e}"); e })?;
@@ -2275,7 +2298,7 @@ impl CassandraEngine {
                 return Ok(());
             }
             self.session
-                .query_with_values(&update_query, cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes))
+                .query_with_params(&update_query, lwt_params(cdrs_tokio::query_values!(pk_text.as_str(), txn_id_bytes)))
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
         }
@@ -2413,7 +2436,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            Consistency::LocalSerial,
         )
         .await?;
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
@@ -2440,7 +2463,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            Consistency::LocalSerial,
         )
         .await?
         else {
@@ -2493,10 +2516,11 @@ impl CassandraEngine {
             "SELECT account_id, table_name FROM {}.tables WHERE table_id = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows(
+        let rows = crate::cassandra_util::query_rows_at(
             &self.session,
             &query,
             cdrs_tokio::query_values!(table_id),
+            false,
             "recover_index_rows_by_table_id",
         )
         .await?;
@@ -2565,14 +2589,18 @@ impl CassandraEngine {
                     "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
                      IF prepared_txn_id = ? AND created_to_prepare = true",
                 );
-                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes).await
+                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes, lwt_params)
+                    .await
             } else {
                 let dq = format!(
                     "DELETE FROM {keyspace}.{table} WHERE pk = ? \
                      IF prepared_txn_id = ? AND created_to_prepare = true",
                 );
                 self.session
-                    .query_with_values(&dq, cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes))
+                    .query_with_params(
+                        &dq,
+                        lwt_params(cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes)),
+                    )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))
             }
@@ -2614,16 +2642,16 @@ impl CassandraEngine {
                          WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .query_with_params(
                             &query,
-                            cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                            lwt_params(cdrs_tokio::query::QueryValues::SimpleValues(vec![
                                 item_data.into(),
                                 next_version.into(),
                                 txn_timestamp.into(),
                                 cdrs_tokio::types::value::Value::from(op.pk.as_str()),
                                 super::index::sk_to_value(sk_val),
                                 txn_id_bytes.into(),
-                            ]),
+                            ])),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2635,15 +2663,15 @@ impl CassandraEngine {
                          WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .query_with_params(
                             &query,
-                            cdrs_tokio::query_values!(
+                            lwt_params(cdrs_tokio::query_values!(
                                 item_data,
                                 next_version,
                                 txn_timestamp,
                                 op.pk.as_str(),
                                 txn_id_bytes
-                            ),
+                            )),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2687,9 +2715,9 @@ impl CassandraEngine {
                 );
                 let r1 = self
                     .session
-                    .query_with_values(
+                    .query_with_params(
                         &update_null,
-                        cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str()),
+                        lwt_params(cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str())),
                     )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2705,9 +2733,13 @@ impl CassandraEngine {
                     );
                     let _ = self
                         .session
-                        .query_with_values(
+                        .query_with_params(
                             &update_cmp,
-                            cdrs_tokio::query_values!(txn_timestamp, op.pk.as_str(), txn_timestamp),
+                            lwt_params(cdrs_tokio::query_values!(
+                                txn_timestamp,
+                                op.pk.as_str(),
+                                txn_timestamp
+                            )),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2723,16 +2755,23 @@ impl CassandraEngine {
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ? \
                          IF prepared_txn_id = ?",
                     );
-                    query_with_pk_sk_txnid(&self.session, &query, &op.pk, sk_val, txn_id_bytes)
-                        .await
+                    query_with_pk_sk_txnid(
+                        &self.session,
+                        &query,
+                        &op.pk,
+                        sk_val,
+                        txn_id_bytes,
+                        lwt_params,
+                    )
+                    .await
                 } else {
                     let query = format!(
                         "DELETE FROM {keyspace}.{table} WHERE pk = ? IF prepared_txn_id = ?",
                     );
                     self.session
-                        .query_with_values(
+                        .query_with_params(
                             &query,
-                            cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                            lwt_params(cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes)),
                         )
                         .await
                         .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2783,13 +2822,19 @@ impl CassandraEngine {
                 "UPDATE {keyspace}.{table} SET prepared_txn_id = null \
                  WHERE pk = ? AND {sk_col} = ? IF prepared_txn_id = ?",
             );
-            let dr =
-                query_with_pk_sk_txnid(&self.session, &dq, &op.pk, sk_val, txn_id_bytes.clone())
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("recover_rollback_op delete: {e}");
-                        StorageError::Internal("Database error".to_owned())
-                    })?;
+            let dr = query_with_pk_sk_txnid(
+                &self.session,
+                &dq,
+                &op.pk,
+                sk_val,
+                txn_id_bytes.clone(),
+                lwt_params,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("recover_rollback_op delete: {e}");
+                StorageError::Internal("Database error".to_owned())
+            })?;
             (dr, uq)
         } else {
             let dq = format!(
@@ -2802,9 +2847,12 @@ impl CassandraEngine {
             );
             let dr = self
                 .session
-                .query_with_values(
+                .query_with_params(
                     &dq,
-                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes.clone()),
+                    lwt_params(cdrs_tokio::query_values!(
+                        op.pk.as_str(),
+                        txn_id_bytes.clone()
+                    )),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))
@@ -2821,12 +2869,20 @@ impl CassandraEngine {
 
         // Item was pre-existing - clear the transaction marker
         let result = if let Some((sk_val, _sk_col)) = &sk {
-            query_with_pk_sk_txnid(&self.session, &update_query, &op.pk, sk_val, txn_id_bytes).await
+            query_with_pk_sk_txnid(
+                &self.session,
+                &update_query,
+                &op.pk,
+                sk_val,
+                txn_id_bytes,
+                lwt_params,
+            )
+            .await
         } else {
             self.session
-                .query_with_values(
+                .query_with_params(
                     &update_query,
-                    cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes),
+                    lwt_params(cdrs_tokio::query_values!(op.pk.as_str(), txn_id_bytes)),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))

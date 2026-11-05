@@ -3,8 +3,6 @@
 
 //! `update_item` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use extenddb_core::expression::{self, Expr, ExpressionMaps, UpdateAction};
 use extenddb_core::types::{Item, KeyType, TableKeyInfo};
 use extenddb_core::validation;
@@ -15,6 +13,7 @@ use extenddb_storage::util::{parse_sk, pk_to_text, sk_column};
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{lwt_params, query_optional_at, read_params};
 use crate::stream_util::stream_record_statement;
 
 // 400 KB limit from DynamoDB specification
@@ -266,7 +265,9 @@ impl CassandraEngine {
         ))
     }
 
-    /// Read `item_data`, `version`, and `prepared_txn_id` for OCC.
+    /// Read `item_data`, `version`, and `prepared_txn_id` for OCC, at
+    /// `LOCAL_QUORUM`: the update and its condition are evaluated against this
+    /// image, so the read intersects every acknowledged write.
     ///
     /// Returns `(existing_item, version)`. A null `version` column (rows written
     /// before the OCC protocol was enforced) is treated as `0`.
@@ -287,7 +288,10 @@ impl CassandraEngine {
             let q = format!(
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
-            let result = query_with_pk_sk(&self.session, &q, pk_text, sk).await?;
+            let result = query_with_pk_sk(&self.session, &q, pk_text, sk, |values| {
+                read_params(true, values)
+            })
+            .await?;
             result
                 .response_body()
                 .map_err(|e| StorageError::Internal(format!("occ_read response_body: {e}")))?
@@ -299,10 +303,11 @@ impl CassandraEngine {
             let q = format!(
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ?"
             );
-            crate::cassandra_util::query_optional(
+            query_optional_at(
                 &self.session,
                 &q,
                 cdrs_tokio::query_values!(pk_text),
+                true,
                 "occ_read",
             )
             .await?
@@ -430,7 +435,7 @@ impl CassandraEngine {
             // Preserve f997485's Paxos linearization for ordinary writes.
             let result = self
                 .session
-                .query_with_values(&lwt_cql, lwt_qv)
+                .query_with_params(&lwt_cql, lwt_params(lwt_qv))
                 .await
                 .map_err(|e| StorageError::Internal(format!("occ_write lwt: {e}")))?;
             if !crate::cassandra_util::lwt_applied(&result)? {
@@ -451,7 +456,7 @@ impl CassandraEngine {
         // index statements carry the version that LWT stored, so index rows
         // resolve in base-row commit order, and its queue rows and stream
         // record keep Cassandra's timestamp (`data::version`).
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = crate::cassandra_util::batch_builder();
         if let Some(timestamp) = mutation_timestamp {
             batch = batch.with_timestamp(timestamp);
         }

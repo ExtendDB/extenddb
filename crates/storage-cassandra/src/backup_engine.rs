@@ -1536,6 +1536,7 @@ impl LegacyBackupReader for CassandraEngine {
                             None,
                             None,
                             None,
+                            true,
                         )
                         .await
                         .map_err(CopyError::Failed)?;

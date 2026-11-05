@@ -728,7 +728,9 @@ pub async fn put_item_then_lock(
 /// True when the suite should be skipped because no Cassandra is reachable.
 ///
 /// The workspace `cargo test` job in test.yml runs with no services, so these
-/// suites probe 127.0.0.1:9042 and skip themselves when nothing is listening.
+/// suites probe the node [`test_contact_point`] names (`127.0.0.1:9042`
+/// unless `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` sets another address) and
+/// skip themselves when nothing is listening there.
 /// The dedicated integration-cassandra workflow provides a service container
 /// and sets `EXTENDDB_TEST_CASSANDRA=required`, under which this never skips:
 /// if Cassandra is down there, setup fails loudly rather than the suite

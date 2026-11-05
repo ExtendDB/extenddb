@@ -12,6 +12,10 @@
 //! `migrations/{catalog,account}/0001_baseline.expected.json` instead of
 //! comparing.
 
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
+
 #[path = "common/mod.rs"]
 mod helpers;
 #[path = "migrations/lock.rs"]

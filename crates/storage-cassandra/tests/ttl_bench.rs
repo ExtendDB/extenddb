@@ -15,6 +15,10 @@
 //! Reported: put latency on a TTL-enabled vs plain table (the write-path tax),
 //! and expiration drain throughput (the sweep ceiling).
 
+// The suites set up and inspect Cassandra state with driver calls at the
+// driver default; the lint in `clippy.toml` guards `src/data/` only.
+#![allow(clippy::disallowed_methods)]
+
 #[path = "common/mod.rs"]
 mod helpers;
 

@@ -51,5 +51,6 @@ decision, write a new ADR.
 | [0022](0022-trust-policy-deny-over-allow.md) | Role trust-policy evaluation follows IAM Deny-over-Allow order | Accepted |
 | [0023](0023-catalog-migrations.md) | One list of catalog migrations for every backend, with a ledger in every store | Accepted |
 | [0024](0024-read-options-parameter.md) | Read consistency reaches storage as a `ReadOptions` parameter | Accepted |
+| [0025](0025-cassandra-statement-consistency-levels.md) | Cassandra: every data-path statement states its consistency level | Accepted |
 | [0026](0026-credential-crypto-on-aws-lc.md) | Credential cryptography uses AWS-LC through aws-lc-rs | Accepted |
 | [0027](0027-cassandra-index-row-version-stamps.md) | Cassandra: index rows carry the base-row version as their write timestamp | Accepted |

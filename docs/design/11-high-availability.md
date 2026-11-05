@@ -137,10 +137,19 @@ This is the minimal mechanism needed to honor DynamoDB's consistency model. It w
 ```
 
 - Storage layer maps DynamoDB consistency to native consistency levels.
-  - `ConsistentRead = true` → `QUORUM` or `LOCAL_QUORUM`
-  - `ConsistentRead = false` → `ONE` or `LOCAL_ONE`
+  - `ConsistentRead = true` → `LOCAL_QUORUM`
+  - `ConsistentRead = false` → `LOCAL_ONE`
+  - Base-row writes are acknowledged at `LOCAL_QUORUM` (lightweight
+    transactions with serial consistency `LOCAL_SERIAL`). The backend creates
+    each keyspace with `NetworkTopologyStrategy` in the one datacenter named
+    by `datacenter`, so a `LOCAL_QUORUM` read and a `LOCAL_QUORUM` write each
+    reach a majority of the same `replication_factor` replicas (ADR-0025).
+  - The driver sends statements to every node it discovers; a coordinator in
+    a datacenter that holds no replica of the keyspace refuses `LOCAL_QUORUM`
+    and `LOCAL_ONE` statements. ExtendDB is run against nodes in `datacenter`.
 - No separate primary/replica distinction — the storage adapter handles it.
-- Suitable for: large-scale deployments, multi-datacenter.
+- Suitable for: large-scale deployments within one datacenter; a second
+  datacenter needs coordinator routing that the backend does not have yet.
 
 ### Model 5: Multi-Region (Future)
 
@@ -414,7 +423,9 @@ This avoids adding yet another trait that every storage backend must implement. 
 
 Status (2026-10-25): done, as `ReadOptions` rather than a bare `bool` and
 without the `ConsistencyLevel` enum (section 8 status note, ADR-0024). All
-four in-tree backends accept the parameter; none routes on it.
+four in-tree backends accept the parameter. The Cassandra backend routes on
+it since issue #560 (Model 4, ADR-0025); the SQLite, PostgreSQL and MongoDB
+backends ignore it.
 
 **Deliverable:** Add `consistent_read: bool` parameter to `get_item`, `query`, and `scan` in the `DataEngine` trait. Thread it from the engine layer call sites. The PostgreSQL backend accepts the parameter but ignores it (all reads go to the single connection). All existing tests pass unchanged.
 
@@ -548,7 +559,7 @@ Each frontend attempts to acquire the lock on its worker tick interval. If it ge
 | Backend | Write Leader | Strong Read Leader | Eventually Consistent Read |
 |---------|-------------|-------------------|---------------------------|
 | PostgreSQL (streaming replication) | Primary node | Primary node | Any replica |
-| Cassandra | Coordinator (any node) | QUORUM nodes | ONE node |
+| Cassandra | Coordinator (any node in `datacenter`), acknowledged at `LOCAL_QUORUM` | `LOCAL_QUORUM` nodes in `datacenter` | `LOCAL_ONE` node in `datacenter` |
 | MongoDB (replica set) | Primary member | Primary member | Secondary preferred (falls back to primary if no secondaries available) |
 | Single PostgreSQL (no replicas) | The single node | The single node | The single node (no distinction) |
 
