@@ -1,0 +1,37 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "extenddb-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The hooks a store's tests build clients with: `S3Clients::new` over a
+# configuration of the test's own, `S3Clients::with_retry`,
+# `S3Clients::config` and `retry::RetryPolicy::NONE`. A store enables it in
+# its dev-dependencies, so production code cannot reach them.
+test-util = []
+
+[dependencies]
+# The S3 client and the standard AWS credential chain.
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+# The startup identity check (GetCallerIdentity), and the key it reads an
+# endpoint set for STS alone with.
+aws-sdk-sts = { workspace = true }
+aws-types = { workspace = true }
+# The credential features the temporary-keys warning reads.
+aws-credential-types = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The client tests answer canned S3 and STS responses through the SDK's
+# replay HTTP client.
+aws-smithy-http-client = { workspace = true, features = ["test-util"] }
+# `test-util` gives the identity check tests a paused clock, so its
+# five-second bound is passed without a five-second sleep.
+tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true }

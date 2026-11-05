@@ -9,6 +9,7 @@ members = [
     "crates/engine",
     "crates/storage",
     "crates/config",
+    "crates/s3",
     "crates/storage-postgres",
     "crates/storage-cassandra",
     "crates/storage-mongodb",
@@ -33,6 +34,7 @@ extenddb-backup-store = { path = "crates/backup-store" }
 extenddb-engine = { path = "crates/engine" }
 extenddb-storage = { path = "crates/storage" }
 extenddb-config = { path = "crates/config" }
+extenddb-s3 = { path = "crates/s3" }
 extenddb-storage-cassandra = { path = "crates/storage-cassandra" }
 extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
 extenddb-storage-postgres = { path = "crates/storage-postgres" }
@@ -43,7 +45,7 @@ extenddb-app = { path = "crates/app" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }
 toml = "0.8"
 
 # Error handling
@@ -99,10 +101,12 @@ dashmap = "6"
 # them past that, and the 1.88 leg of .github/workflows/test.yml fails if
 # they drift. The feature set is that of tests/rust/Cargo.toml plus `sso` on
 # aws-config, so a server whose credentials come from an SSO profile
-# (`sso_session` in the shared config) can reach the backup bucket.
-# tests/rust does not enable `sso`: its client takes explicit credentials
-# from the environment, falling back to the default chain without SSO.
-aws-config = { version = "=1.8.13", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process", "sso"] }
+# (`sso_session` in the shared config) can reach the backup bucket, and
+# `credentials-login`, so a profile written by `aws login` resolves instead
+# of stopping the credential chain with FeatureNotEnabled. tests/rust
+# enables neither: its client takes explicit credentials from the
+# environment, falling back to the default chain without SSO.
+aws-config = { version = "=1.8.13", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "credentials-process", "sso", "credentials-login"] }
 aws-sdk-s3 = { version = "=1.122.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 # Already in the graph through aws-config; named directly so the S3 store can
 # read the S3-specific endpoint setting the way aws-sdk-s3 does.
@@ -118,6 +122,15 @@ aws-smithy-http-client = { version = "=1.1.9", default-features = false, feature
 # Already in the graph through aws-config and aws-sdk-s3; named directly so
 # the S3 store refuses at open the endpoints the SDK's URL parser refuses.
 url = { version = "=2.5.8" }
+# The bulk store's S3 clients (extenddb-s3) use the aws-config and aws-sdk-s3
+# above. Their startup identity check calls STS: aws-sdk-sts is already in
+# the graph through aws-config, and is named directly at the version
+# Cargo.lock holds, with the features aws-sdk-s3 uses.
+aws-sdk-sts = { version = "=1.97.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+# The credential features the bulk store's temporary-keys warning reads
+# (`AwsCredentialFeature`). Already in the graph through aws-config; this is
+# the version Cargo.lock holds.
+aws-credential-types = { version = "=1.2.11", default-features = false }
 bytes = "1"
 
 # Crypto & checksums

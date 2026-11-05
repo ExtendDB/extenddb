@@ -40,6 +40,11 @@ pub struct AppConfig {
     /// operations. If empty or absent, exports are denied (secure default).
     #[serde(default, rename = "export")]
     pub export_config: ImportExportPathConfig,
+    /// Bulk operation store configuration (`[bulk]` section). Absent means
+    /// bulk operations are disabled (secure default); dev mode substitutes a
+    /// filesystem store at `./.extenddb/buckets` when the section is absent.
+    #[serde(rename = "bulk")]
+    pub bulk: Option<BulkConfig>,
     /// Maximum import file size in bytes. Defaults to 10 GB.
     pub max_import_bytes: Option<u64>,
     /// Path to the rendered documentation directory (`/console/docs`).
@@ -59,6 +64,13 @@ pub struct ImportExportPathConfig {
     #[serde(default)]
     pub paths: Vec<String>,
 }
+
+mod bulk;
+mod bulk_s3;
+mod s3_client;
+pub use bulk::{BulkConfig, BulkFilesystemConfig, BulkStoreKind, DEV_DEFAULT_BULK_PATH};
+pub use bulk_s3::BulkS3Config;
+pub use s3_client::{S3_CREDENTIAL_KEYS, S3ClientSection};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
