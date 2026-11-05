@@ -98,6 +98,8 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `backend` | `postgres` | Storage backend (only `postgres` supported) |
 
+ExtendDB owns the collections, tables and indexes of its catalog and data databases. A change to them, such as an added index, is not supported and can make a later migration fail.
+
 #### [storage.postgres]
 
 | Key | Default | Description |
@@ -945,7 +947,7 @@ The IAM policy does not allow the operation. Check attached policies with `list-
 
 **Slow queries:**
 
-Check PostgreSQL query performance with `EXPLAIN ANALYZE`. Ensure indexes exist on key columns.
+Check PostgreSQL query performance with `EXPLAIN ANALYZE`.
 
 **High connection count:**
 

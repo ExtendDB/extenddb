@@ -735,100 +735,9 @@ async fn migration_6_refuses_copies_it_cannot_resolve_and_writes_nothing() {
     d.drop_databases().await;
 }
 
-/// An index of `access_keys` that would make the build fail is refused
-/// before anything is written: `access_key_id_1` without `unique`, which an
-/// operator may have created for the lookups, and the unique index under
-/// another name. Each refusal prints its `dropIndex` command, and once it
-/// has run `migrate --yes` applies migration 6. A non-unique index on the
-/// ID under another name stays beside the new one.
-#[tokio::test(flavor = "multi_thread")]
-async fn migration_6_refuses_an_index_the_build_would_fail_on() {
-    let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "index6").await;
-    fixture::load(&d, &fixture::read("0.1.14")).await;
-    let (owner, fixture_id, account, created) = fixture_key(&d).await;
-    let keys = d.catalog().collection::<Document>("access_keys");
-    keys.insert_one(stored_key(
-        1,
-        &fixture_id,
-        &account,
-        "cu-tester",
-        created + 60_000,
-    ))
-    .await
-    .unwrap();
-    keys.create_index(id_index(None, false)).await.unwrap();
-    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
-    let catalog = d.target.catalog.clone();
-    let item = refused_index(&d).await;
-    assert!(
-        item.starts_with(&format!(
-            "migration 6 unique_access_key_ids: the index access_key_id_1 on \
-             {catalog}.access_keys ("
-        )) && item.ends_with(&format!(
-            ") is not the unique index on access_key_id that this migration creates under \
-             that name, and the build refuses a second index of the name; drop it with \
-             db.getSiblingDB(\"{catalog}\").access_keys.dropIndex(\"access_key_id_1\") in \
-             mongosh"
-        )),
-        "{item}"
-    );
-    assert_eq!(
-        d.migrate().await.expect_err("refused").exit_code(),
-        exit::ATTENTION
-    );
-    assert_eq!(
-        Deployment::documents(&d.catalog(), "access_keys").await,
-        documents
-    );
-    keys.drop_index(ACCESS_KEY_ID_INDEX).await.unwrap();
-    d.migrate().await.expect("migrate");
-    assert_eq!(looked_up(&d, &fixture_id).await, owner);
-    assert_eq!(
-        keys.count_documents(doc! { "access_key_id": &fixture_id })
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(unique_index(&d).await, Some(true));
-    d.drop_databases().await;
-
-    let d = Deployment::new(&uri, "renamed6").await;
-    fixture::load(&d, &fixture::read("0.1.14")).await;
-    let keys = d.catalog().collection::<Document>("access_keys");
-    keys.create_index(id_index(Some("akid"), true))
-        .await
-        .unwrap();
-    keys.create_index(id_index(Some("akid_plain"), false))
-        .await
-        .unwrap();
-    let catalog = d.target.catalog.clone();
-    let item = refused_index(&d).await;
-    assert!(
-        item.starts_with(&format!(
-            "migration 6 unique_access_key_ids: the unique index akid on {catalog}.access_keys ("
-        )) && item.ends_with(&format!(
-            ") is the index this migration creates under the name access_key_id_1, and the \
-             build refuses a second name for it; drop it with \
-             db.getSiblingDB(\"{catalog}\").access_keys.dropIndex(\"akid\") in mongosh"
-        )),
-        "{item}"
-    );
-    keys.drop_index("akid").await.unwrap();
-    d.migrate().await.expect("migrate");
-    assert_eq!(unique_index(&d).await, Some(true));
-    assert!(
-        access_key_indexes(&d)
-            .await
-            .contains(&"akid_plain".to_owned())
-    );
-    d.drop_databases().await;
-}
-
 /// The body's own `run` refuses what `detect` refuses, which the runner's
-/// `detect` otherwise stops first: copies and an index written after the
-/// runner read the collection. It returns NeedsAttention and writes
-/// nothing.
+/// `detect` otherwise stops first: copies written after the runner read the
+/// collection. It returns NeedsAttention and writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_6_run_refuses_copies_written_after_detect() {
     use extenddb_storage::migrations::MigrationId;
@@ -864,32 +773,6 @@ async fn migration_6_run_refuses_copies_written_after_detect() {
         documents
     );
     assert_eq!(unique_index(&d).await, None);
-
-    // An index the build would fail on, beside an ID the body itself
-    // resolves: `run` refuses the index and deletes no copy.
-    let keys = d.catalog().collection::<Document>("access_keys");
-    keys.delete_one(doc! { "_id": oid(1) }).await.unwrap();
-    keys.insert_one(stored_key(
-        2,
-        &fixture_id,
-        &account,
-        "cu-tester",
-        created + 60_000,
-    ))
-    .await
-    .unwrap();
-    keys.create_index(id_index(None, false)).await.unwrap();
-    let documents = Deployment::documents(&d.catalog(), "access_keys").await;
-    let items = run_body(&d).await;
-    assert_eq!(items.len(), 1, "{items:?}");
-    assert!(
-        items[0].starts_with("the index access_key_id_1 on "),
-        "{items:?}"
-    );
-    assert_eq!(
-        Deployment::documents(&d.catalog(), "access_keys").await,
-        documents
-    );
     assert!(
         d.catalog_ledger().await.iter().all(|row| row.id != 6),
         "migration 6 is not recorded"
@@ -940,23 +823,6 @@ fn oid(n: u8) -> ObjectId {
     ObjectId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n])
 }
 
-/// An index on `{ access_key_id: 1 }`, with a name when it is given.
-fn id_index(name: Option<&str>, unique: bool) -> mongodb::IndexModel {
-    let options = match name {
-        Some(name) => mongodb::options::IndexOptions::builder()
-            .name(name.to_owned())
-            .unique(unique)
-            .build(),
-        None => mongodb::options::IndexOptions::builder()
-            .unique(unique)
-            .build(),
-    };
-    mongodb::IndexModel::builder()
-        .keys(doc! { "access_key_id": 1 })
-        .options(options)
-        .build()
-}
-
 /// Whether `access_key_id_1` is unique, or `None` when it does not exist.
 async fn unique_index(d: &Deployment) -> Option<bool> {
     use futures::TryStreamExt;
@@ -984,24 +850,15 @@ async fn status_items(d: &Deployment) -> Vec<String> {
     }
 }
 
-/// The one item for which the status refuses migration 6.
-async fn refused_index(d: &Deployment) -> String {
-    let mut items = status_items(d).await;
-    assert_eq!(items.len(), 1, "{items:?}");
-    items.pop().unwrap()
-}
-
-/// Once its index is built, migration 6 groups only the documents whose ID
-/// is an array, which the unique index takes and a lookup reads for each ID
-/// in it; beside an index named `access_key_id_1` that is not its own, it
-/// groups every document. A catalog at migration 5 holds an ID of two
-/// users, an array ID, a document without an ID and one whose ID is the
-/// number 42. Beside a non-unique `access_key_id_1`, the status refuses the
-/// ID of two users, the array and the index. With the unique index built by
-/// hand and hidden, it refuses the array and the hidden index, with the
-/// command that unhides it, and once the index is shown, the array alone.
-/// After the array is deleted `migrate --yes` applies 6, and
-/// `--reconverge` refuses an array ID written later and nothing else.
+/// A catalog at migration 5 holds an ID of two users and an array ID. It
+/// also holds a document without an ID and one whose ID is the number 42.
+/// Beside a non-unique `access_key_id_1`, the status refuses the ID of two
+/// users and the array. With the second user's copy deleted and that index
+/// replaced by the unique index built by hand, the status refuses the array
+/// alone. After the array is deleted, `migrate --yes` applies 6 and keeps
+/// the document without an ID and the one with the number 42. Then
+/// `--reconverge` refuses an array ID written later, and it refuses neither
+/// of those two documents.
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_6_refuses_array_ids_beside_its_own_index() {
     use extenddb_storage::migrations::MigrationId;
@@ -1031,8 +888,13 @@ async fn migration_6_refuses_array_ids_beside_its_own_index() {
     ])
     .await
     .unwrap();
-    keys.create_index(id_index(None, false)).await.unwrap();
-    let catalog = d.target.catalog.clone();
+    keys.create_index(
+        mongodb::IndexModel::builder()
+            .keys(doc! { "access_key_id": 1 })
+            .build(),
+    )
+    .await
+    .unwrap();
     let prefix = "migration 6 unique_access_key_ids: ";
     let refused_array = |n: u8| {
         format!(
@@ -1040,14 +902,12 @@ async fn migration_6_refuses_array_ids_beside_its_own_index() {
             Bson::ObjectId(oid(n))
         )
     };
-    let refused_index = format!("{prefix}the index access_key_id_1 on {catalog}.access_keys (");
 
     let items = status_items(&d).await;
-    assert_eq!(items.len(), 3, "{items:?}");
+    assert_eq!(items.len(), 2, "{items:?}");
     for start in [
         format!("{prefix}the access key ID {fixture_id} is stored 2 times"),
         refused_array(31),
-        refused_index.clone(),
     ] {
         assert!(
             items.iter().any(|item| item.starts_with(&start)),
@@ -1056,33 +916,13 @@ async fn migration_6_refuses_array_ids_beside_its_own_index() {
     }
 
     // The importer's copy and the index go, and the manual's unique index
-    // is built hidden.
+    // is built by hand.
     keys.delete_one(doc! { "_id": oid(1) }).await.unwrap();
     keys.drop_index(ACCESS_KEY_ID_INDEX).await.unwrap();
     d.catalog()
         .run_command(doc! { "createIndexes": "access_keys", "indexes": [
-            { "key": { "access_key_id": 1 }, "name": ACCESS_KEY_ID_INDEX, "unique": true, "hidden": true },
+            { "key": { "access_key_id": 1 }, "name": ACCESS_KEY_ID_INDEX, "unique": true },
         ], "commitQuorum": "majority" })
-        .await
-        .unwrap();
-    let items = status_items(&d).await;
-    assert_eq!(items.len(), 2, "{items:?}");
-    assert!(items[0].starts_with(&refused_array(31)), "{items:?}");
-    assert!(
-        items[1].starts_with(&refused_index)
-            && items[1].ends_with(&format!(
-                ") is the unique index on access_key_id that this migration creates, hidden \
-                 from the query planner, so a credential lookup does not use it; unhide it \
-                 with db.getSiblingDB(\"{catalog}\").access_keys.unhideIndex(\"access_key_id_1\") \
-                 in mongosh"
-            )),
-        "{items:?}"
-    );
-
-    d.catalog()
-        .run_command(doc! { "collMod": "access_keys", "index": {
-            "name": ACCESS_KEY_ID_INDEX, "hidden": false,
-        } })
         .await
         .unwrap();
     let items = status_items(&d).await;
@@ -1330,221 +1170,4 @@ async fn migration_6_keeps_the_copy_a_lookup_reads_under_query_settings() {
         std::panic::resume_unwind(panic);
     }
     d.drop_databases().await;
-}
-
-/// How migration 6 must treat an index an operator may have on
-/// `access_keys`, as measured with `createIndexes` on MongoDB 7.0.45 and
-/// 8.0.34: whether `detect` refuses it, and whether the build of
-/// `access_key_id_1` fails beside it. The unique hidden `access_key_id_1`
-/// is refused, because a lookup does not use a hidden index and MongoDB 8
-/// answers the build with IndexOptionsConflict, although MongoDB 7 answers
-/// that the index exists.
-const INDEX_VARIANTS: &[IndexVariant] = &[
-    ("access_key_id_1, not unique", Refused::BuildFails, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1" }
-    }),
-    ("access_key_id_1, background", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "background": true }
-    }),
-    ("access_key_id_1, sparse: false", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "sparse": false }
-    }),
-    (
-        "access_key_id_1, the key direction a Decimal128",
-        Refused::No,
-        || {
-            doc! { "key": { "access_key_id": decimal_one() }, "name": "access_key_id_1", "unique": true }
-        },
-    ),
-    (
-        "access_key_id_1, the key direction the Decimal128 1.0",
-        Refused::No,
-        || {
-            doc! { "key": { "access_key_id": decimal("1.0") }, "name": "access_key_id_1", "unique": true }
-        },
-    ),
-    (
-        "access_key_id_1, the key direction a Decimal128 just above 1",
-        Refused::BuildFails,
-        || {
-            doc! { "key": { "access_key_id": decimal(JUST_ABOVE_ONE) }, "name": "access_key_id_1", "unique": true }
-        },
-    ),
-    ("access_key_id_1, partial", Refused::BuildFails, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true,
-        "partialFilterExpression": { "access_key_id": { "$exists": true } } }
-    }),
-    ("access_key_id_1, TTL", Refused::BuildFails, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "expireAfterSeconds": 3600 }
-    }),
-    ("access_key_id_1, hidden", Refused::ByVersion, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true, "hidden": true }
-    }),
-    ("access_key_id_1 on account_id", Refused::BuildFails, || {
-        doc! { "key": { "account_id": 1 }, "name": "access_key_id_1" }
-    }),
-    ("akid", Refused::BuildFails, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true }
-    }),
-    (
-        "akid, the key direction a Double",
-        Refused::BuildFails,
-        || {
-            doc! { "key": { "access_key_id": 1.0 }, "name": "akid", "unique": true }
-        },
-    ),
-    (
-        "akid, the key direction an Int64",
-        Refused::BuildFails,
-        || {
-            doc! { "key": { "access_key_id": 1_i64 }, "name": "akid", "unique": true }
-        },
-    ),
-    (
-        "akid, the key direction a Decimal128",
-        Refused::BuildFails,
-        || {
-            doc! { "key": { "access_key_id": decimal_one() }, "name": "akid", "unique": true }
-        },
-    ),
-    (
-        "akid, the key direction a Decimal128 just above 1",
-        Refused::No,
-        || {
-            doc! { "key": { "access_key_id": decimal(JUST_ABOVE_ONE) }, "name": "akid", "unique": true }
-        },
-    ),
-    ("akid, the key direction the Double 2", Refused::No, || {
-        doc! { "key": { "access_key_id": 2.0 }, "name": "akid", "unique": true }
-    }),
-    ("akid, the key direction the Double -1", Refused::No, || {
-        doc! { "key": { "access_key_id": -1.0 }, "name": "akid", "unique": true }
-    }),
-    ("akid, the key direction the Int64 -1", Refused::No, || {
-        doc! { "key": { "access_key_id": -1_i64 }, "name": "akid", "unique": true }
-    }),
-    ("akid, sparse: false", Refused::BuildFails, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true, "sparse": false }
-    }),
-    ("akid, sparse", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true, "sparse": true }
-    }),
-    ("akid, partial", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true,
-        "partialFilterExpression": { "access_key_id": { "$exists": true } } }
-    }),
-    ("akid, collation", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid", "unique": true,
-        "collation": { "locale": "en", "strength": 2 } }
-    }),
-    ("akid, descending", Refused::No, || {
-        doc! { "key": { "access_key_id": -1 }, "name": "akid", "unique": true }
-    }),
-    ("akid, not unique", Refused::No, || {
-        doc! { "key": { "access_key_id": 1 }, "name": "akid" }
-    }),
-    ("akid, compound", Refused::No, || {
-        doc! { "key": { "access_key_id": 1, "account_id": 1 }, "name": "akid", "unique": true }
-    }),
-];
-
-/// A variant's label, whether `detect` refuses it, and its spec.
-type IndexVariant = (&'static str, Refused, fn() -> Document);
-
-/// Whether `detect` refuses an index, and why.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Refused {
-    /// Accepted: the build succeeds beside it.
-    No,
-    /// Refused: the build fails beside it.
-    BuildFails,
-    /// Refused: the build fails beside it on some versions.
-    ByVersion,
-}
-
-fn decimal_one() -> Bson {
-    decimal("1")
-}
-
-fn decimal(text: &str) -> Bson {
-    Bson::Decimal128(text.parse().unwrap())
-}
-
-/// A Decimal128 that a Double rounds to 1 and the server compares as
-/// another value than 1.
-const JUST_ABOVE_ONE: &str = "1.0000000000000000000000000000001";
-
-/// Each index of [`INDEX_VARIANTS`], alone beside migration 1's indexes on
-/// a catalog at migration 5 that holds one key: `detect` refuses it exactly
-/// when it is marked refused. The body's own `createIndexes`, sent beside a
-/// refused index, fails, and `migrate --yes` applies migration 6 beside an
-/// accepted one.
-#[tokio::test(flavor = "multi_thread")]
-async fn migration_6_refuses_an_index_exactly_when_the_build_fails_on_it() {
-    use extenddb_storage::migrations::MigrationId;
-
-    let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "variants6").await;
-    fixture::load(&d, &fixture::read("0.1.14")).await;
-    d.migrate_through(MigrationId::DropContinuousBackups)
-        .await
-        .expect("migrations 1 to 5");
-    let keys = d.catalog().collection::<Document>("access_keys");
-    for (label, refused, spec) in INDEX_VARIANTS {
-        for name in access_key_indexes(&d).await {
-            if !["_id_", "account_id_1_user_name_1"].contains(&name.as_str()) {
-                keys.drop_index(name).await.unwrap();
-            }
-        }
-        d.catalog()
-            .run_command(doc! { "createIndexes": "access_keys", "indexes": [spec()] })
-            .await
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        let status = d.status().await;
-        match refused {
-            Refused::No => {
-                assert_eq!(status.label(), "Behind", "{label}: {status}");
-                d.migrate().await.unwrap_or_else(|e| panic!("{label}: {e}"));
-                assert_eq!(unique_index(&d).await, Some(true), "{label}");
-                forget_6(&d).await;
-            }
-            Refused::BuildFails | Refused::ByVersion => {
-                let CatalogStatus::NeedsAttention { items } = status else {
-                    panic!("{label}: not refused: {status}");
-                };
-                assert_eq!(items.len(), 1, "{label}: {items:?}");
-                let built = d
-                    .catalog()
-                    .run_command(doc! { "createIndexes": "access_keys", "indexes": [
-                        { "key": { "access_key_id": 1 }, "name": "access_key_id_1", "unique": true },
-                    ], "commitQuorum": "majority" })
-                    .await;
-                if *refused == Refused::BuildFails {
-                    assert!(built.is_err(), "{label}: the build succeeds: {built:?}");
-                }
-            }
-        }
-    }
-    d.drop_databases().await;
-}
-
-/// `migrate --forget 6`.
-async fn forget_6(d: &Deployment) {
-    use extenddb_storage::migrations::Runner;
-    use extenddb_storage_mongodb::migrations::{MigrationLock, Timing};
-
-    let held = MigrationLock::acquire(
-        &d.target,
-        std::time::Duration::from_secs(10),
-        Timing::PRODUCTION,
-    )
-    .await
-    .expect("lock");
-    let migrations = MongoMigrations::open(&d.target, Some(&held))
-        .await
-        .expect("open");
-    let forgot = Runner::new(&migrations, "test").forget(6).await;
-    migrations.close().await;
-    held.release().await;
-    forgot.expect("forget 6");
 }

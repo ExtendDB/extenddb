@@ -15,15 +15,13 @@
 //! documents by ID, keeping the IDs that more than one document holds and
 //! the array IDs. `detect` refuses what the body cannot decide: an ID whose
 //! documents belong to more than one user, two or more documents that have
-//! no ID or share an ID that is not a string, a document whose ID is an
-//! array, which a lookup reads for each ID in it, an index that would make
-//! the build fail, and this migration's index when it is hidden, which a
-//! lookup does not use. `run` reads again and refuses the same before it
-//! writes. Then, for each ID that one user holds more than once, it finds
-//! the copy a lookup reads, logs the other copies, deletes them and keeps
-//! that copy, so every key authenticates as it did before. Last it creates
-//! the index, committed once a majority of the replica set's data-bearing
-//! voting members have built it.
+//! no ID or share an ID that is not a string, and a document whose ID is an
+//! array, which a lookup reads for each ID in it. `run` reads again and
+//! refuses the same before it writes. Then, for each ID that one user holds
+//! more than once, it finds the copy a lookup reads, logs the other copies,
+//! deletes them and keeps that copy, so every key authenticates as it did
+//! before. Last it creates the index, committed once a majority of the
+//! replica set's data-bearing voting members have built it.
 //!
 //! A lookup reads the copy its query plan meets first. For each ID stored
 //! more than once the body reads which of its listed copies still hold it,
@@ -45,7 +43,7 @@
 //! edit.
 
 use async_trait::async_trait;
-use bson::{Bson, Decimal128, Document, doc};
+use bson::{Bson, Document, doc};
 use extenddb_storage::migrations::{CatalogStatus, CodeBody, Done, MigrationError};
 use futures::TryStreamExt;
 use mongodb::IndexModel;
@@ -96,32 +94,6 @@ struct Listed {
     /// Whether the server reports the index built. It also lists an index
     /// whose build is running, with the spec of a built one.
     built: bool,
-}
-
-/// Why this migration refuses an index of `access_keys`.
-enum Clash {
-    /// It is the unique index on the ID under another name, and the build
-    /// refuses a second name for it.
-    Renamed,
-    /// It is named `access_key_id_1` and is not the index this migration
-    /// creates, and the build refuses a second index of the name.
-    Named,
-    /// It is this migration's index, hidden, and the query planner does not
-    /// use a hidden index for a lookup.
-    Hidden,
-}
-
-/// An index of `access_keys` that this migration refuses.
-struct Conflict {
-    name: String,
-    spec: Document,
-    clash: Clash,
-}
-
-/// What `detect` and `run` read.
-struct State {
-    groups: Vec<Group>,
-    conflicts: Vec<Conflict>,
 }
 
 /// What the record IDs of an ID's copies tell about the copy a forward
@@ -225,65 +197,9 @@ impl Group {
     }
 }
 
-impl Conflict {
-    fn refusal(&self, db: &str) -> String {
-        let command = |method: &str| {
-            format!("db.getSiblingDB(\"{db}\").{COLLECTION}.{method}(\"{}\")", self.name)
-        };
-        match self.clash {
-            Clash::Renamed => format!(
-                "the unique index {} on {db}.{COLLECTION} ({}) is the index this migration \
-                 creates under the name {INDEX}, and the build refuses a second name for it; \
-                 drop it with {} in mongosh",
-                self.name,
-                self.spec,
-                command("dropIndex")
-            ),
-            Clash::Named => format!(
-                "the index {INDEX} on {db}.{COLLECTION} ({}) is not the unique index on \
-                 access_key_id that this migration creates under that name, and the build \
-                 refuses a second index of the name; drop it with {} in mongosh",
-                self.spec,
-                command("dropIndex")
-            ),
-            Clash::Hidden => format!(
-                "the index {INDEX} on {db}.{COLLECTION} ({}) is the unique index on \
-                 access_key_id that this migration creates, hidden from the query planner, so \
-                 a credential lookup does not use it; unhide it with {} in mongosh",
-                self.spec,
-                command("unhideIndex")
-            ),
-        }
-    }
-}
-
-/// A Decimal128 as its sign, its digits without leading and trailing
-/// zeros, and the power of ten of the last of them, or `None` for NaN and
-/// the infinities. A zero has no digits.
-fn decimal_parts(value: &Decimal128) -> Option<(bool, String, i64)> {
-    let text = value.to_string();
-    let (negative, unsigned) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text.as_str()),
-    };
-    let (mantissa, exponent) = match unsigned.split_once('E') {
-        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
-        None => (unsigned, 0),
-    };
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = format!("{whole}{fraction}");
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let digits = digits.trim_start_matches('0');
-    let significant = digits.trim_end_matches('0');
-    let trailing = digits.len() - significant.len();
-    Some((negative, significant.to_owned(), exponent - fraction.len() as i64 + trailing as i64))
-}
-
-/// Whether the server counts `value` as true, as it reads an index option:
-/// false, a zero, null and a missing value are false, and anything else is
-/// true.
+/// Whether `value` is true as an index option. False, null, a missing
+/// value and a zero Int32, Int64 or Double are false, and any other value
+/// is true.
 fn true_value(value: Option<&Bson>) -> bool {
     match value {
         None | Some(Bson::Null) | Some(Bson::Undefined) => false,
@@ -291,19 +207,18 @@ fn true_value(value: Option<&Bson>) -> bool {
         Some(Bson::Int32(n)) => *n != 0,
         Some(Bson::Int64(n)) => *n != 0,
         Some(Bson::Double(n)) => *n != 0.0,
-        Some(Bson::Decimal128(n)) => decimal_parts(n).map_or(true, |(_, digits, _)| !digits.is_empty()),
         Some(_) => true,
     }
 }
 
-/// Whether `value` is the number 1, in any numeric type: the server
-/// compares key directions by value, a Decimal128 exactly.
+/// Whether `value` is the number 1 as an Int32, an Int64 or a Double. An
+/// index whose key direction has another type, such as a Decimal128, is not
+/// this migration's index here. The read beside it groups every document.
 fn is_one(value: Option<&Bson>) -> bool {
     match value {
         Some(Bson::Int32(n)) => *n == 1,
         Some(Bson::Int64(n)) => *n == 1,
         Some(Bson::Double(n)) => *n == 1.0,
-        Some(Bson::Decimal128(n)) => decimal_parts(n) == Some((false, "1".to_owned(), 0)),
         _ => false,
     }
 }
@@ -313,63 +228,28 @@ fn on_the_id(spec: &Document) -> bool {
     spec.get_document("key").map_or(false, |key| key.len() == 1 && is_one(key.get("access_key_id")))
 }
 
-/// The options of `spec` that the build compares: none of `v`, `key`,
-/// `name`, `ns` and `background`, which has no effect, and `sparse` and
-/// `hidden` only when true, because false is their default.
+/// The options of `spec` that [`is_ours`] compares: every field but `v`,
+/// `key`, `name`, `ns`, `background` and `hidden`. `background` has no
+/// effect, and a hidden index refuses a second copy of an ID as a visible
+/// one does. `sparse` counts only when true, because false is its default.
 fn options(spec: &Document) -> Document {
     let mut options = spec.clone();
-    for field in ["v", "key", "name", "ns", "background"] {
+    for field in ["v", "key", "name", "ns", "background", "hidden"] {
         options.remove(field);
     }
-    for field in ["sparse", "hidden"] {
-        if !true_value(options.get(field)) {
-            options.remove(field);
-        }
+    if !true_value(options.get("sparse")) {
+        options.remove("sparse");
     }
     options
 }
 
-/// Whether `spec` is the index this migration creates.
+/// Whether `spec` is the index this migration creates, hidden or not.
 fn is_ours(spec: &Document) -> bool {
     let mut options = options(spec);
     spec.get_str("name") == Ok(INDEX)
         && on_the_id(spec)
         && true_value(options.remove("unique").as_ref())
         && options.is_empty()
-}
-
-/// `spec` without its `hidden` option.
-fn unhidden(spec: &Document) -> Document {
-    let mut spec = spec.clone();
-    spec.remove("hidden");
-    spec
-}
-
-/// The conflict `spec` makes, as `createIndexes` decides on MongoDB 7 and
-/// 8: any index named `access_key_id_1` other than the one this migration
-/// creates, and the unique index on the ID under another name. A collation,
-/// a partial filter or `sparse: true` makes that unique index a different
-/// one, which the build creates beside it. This migration's index, hidden,
-/// is refused too: MongoDB 8 answers the build with IndexOptionsConflict,
-/// and MongoDB 7 answers that the index exists.
-fn conflict(spec: &Document) -> Option<Conflict> {
-    let name = spec.get_str("name").unwrap_or_default().to_owned();
-    let mut shown = spec.clone();
-    shown.remove("v");
-    shown.remove("ns");
-    if name == INDEX {
-        if is_ours(spec) {
-            return None;
-        }
-        let clash = if is_ours(&unhidden(spec)) { Clash::Hidden } else { Clash::Named };
-        return Some(Conflict { name, spec: shown, clash });
-    }
-    let options = options(spec);
-    let distinct = options.contains_key("collation")
-        || options.contains_key("partialFilterExpression")
-        || options.contains_key("sparse");
-    (on_the_id(spec) && true_value(options.get("unique")) && !distinct)
-        .then(|| Conflict { name, spec: shown, clash: Clash::Renamed })
 }
 
 /// Whether an `explain` reply reports a forward collection scan: `LIMIT`
@@ -410,10 +290,10 @@ fn scanned_first(found: &[Document]) -> Scanned {
 }
 
 /// Whether the read needs to group only the documents whose ID is an
-/// array: this migration's index, hidden or not, is built and refuses a
-/// second copy of any other ID.
+/// array. It does when this migration's index is built, because that index
+/// refuses a second copy of any other ID.
 fn arrays_only(indexes: &[Listed]) -> bool {
-    indexes.iter().any(|i| i.built && is_ours(&unhidden(&i.spec)))
+    indexes.iter().any(|i| i.built && is_ours(&i.spec))
 }
 
 /// The server's error code of a failed command, if it reported one.
@@ -597,26 +477,23 @@ async fn looked_up(stores: &MongoStores, id: &str, group: &Group) -> Result<Opti
         .map(|read| (read, held_ids)))
 }
 
-async fn read(stores: &MongoStores) -> Result<State, MigrationError> {
+/// What `detect` and `run` read.
+async fn read(stores: &MongoStores) -> Result<Vec<Group>, MigrationError> {
     let indexes = indexes(stores).await?;
-    Ok(State {
-        groups: groups(stores, arrays_only(&indexes)).await?,
-        conflicts: indexes.iter().filter_map(|i| conflict(&i.spec)).collect(),
-    })
+    groups(stores, arrays_only(&indexes)).await
 }
 
 /// The items `detect` and `run` refuse the migration for.
-async fn refusals(stores: &MongoStores, state: &State) -> Result<Vec<String>, MigrationError> {
+async fn refusals(stores: &MongoStores, groups: &[Group]) -> Result<Vec<String>, MigrationError> {
     let db = stores.catalog.name();
     let mut items = Vec::new();
-    for group in state.groups.iter().filter(|g| !g.resolvable()) {
+    for group in groups.iter().filter(|g| !g.resolvable()) {
         let read = match group.access_key_id() {
             Some(id) => looked_up(stores, id, group).await?.map(|(read, _)| read),
             None => None,
         };
         items.push(group.refusal(db, read.as_ref()));
     }
-    items.extend(state.conflicts.iter().map(|c| c.refusal(db)));
     Ok(items)
 }
 
@@ -627,22 +504,22 @@ impl CodeBody<MongoStores> for UniqueAccessKeyIds {
     }
 
     async fn detect(&self, stores: &MongoStores) -> Result<Vec<String>, MigrationError> {
-        let state = read(stores).await?;
-        refusals(stores, &state).await
+        let groups = read(stores).await?;
+        refusals(stores, &groups).await
     }
 
     async fn run(&self, stores: &MongoStores) -> Result<Done, MigrationError> {
         let db = &stores.catalog;
         let collection = db.collection::<Document>(COLLECTION);
-        let state = read(stores).await?;
+        let groups = read(stores).await?;
         // `detect` refused these before the run; what was written since is
         // refused the same way, before this body writes anything.
-        let items = refusals(stores, &state).await?;
+        let items = refusals(stores, &groups).await?;
         if !items.is_empty() {
             return Err(MigrationError::Status(CatalogStatus::NeedsAttention { items }));
         }
         let mut notes = Vec::new();
-        for group in state.groups.iter().filter(|g| g.resolvable() && g.copies.len() > 1) {
+        for group in groups.iter().filter(|g| g.resolvable() && g.copies.len() > 1) {
             let Some(id) = group.access_key_id() else {
                 continue;
             };
@@ -737,40 +614,52 @@ mod tests {
     }
 
     #[test]
-    fn a_decimal_key_direction_is_one_only_when_its_value_is_one() {
-        for text in ["1", "1.0", "1.000", "10E-1", "0.1E+1", "100E-2", "0.0001E+4"] {
-            assert!(is_one(Some(&decimal(text))), "{text}");
+    fn a_key_direction_is_one_only_as_the_number_1() {
+        for value in [Bson::Int32(1), Bson::Int64(1), Bson::Double(1.0)] {
+            assert!(is_one(Some(&value)), "{value}");
         }
-        for text in [
-            "1.0000000000000000000000000000001",
-            "0.9999999999999999999999999999999",
-            "1E+1",
-            "1E-1",
-            "11",
-            "101E-2",
-            "-1",
-            "0",
-            "-0",
-            "NaN",
-            "Infinity",
-            "-Infinity",
+        for value in [
+            Bson::Int32(0),
+            Bson::Int32(-1),
+            Bson::Int32(2),
+            Bson::Int64(0),
+            Bson::Int64(-1),
+            Bson::Int64(2),
+            Bson::Double(0.0),
+            Bson::Double(-1.0),
+            Bson::Double(2.0),
+            Bson::Double(1.5),
+            Bson::Double(1.000_000_000_000_000_2),
+            decimal("1"),
         ] {
-            assert!(!is_one(Some(&decimal(text))), "{text}");
-        }
-        assert!(is_one(Some(&Bson::Int64(1))) && is_one(Some(&Bson::Double(1.0))));
-        for value in [Bson::Int64(-1), Bson::Double(-1.0), Bson::Double(2.0), Bson::Double(1.000_000_000_000_000_2)] {
             assert!(!is_one(Some(&value)), "{value}");
         }
+        assert!(!is_one(None));
     }
 
     #[test]
-    fn a_decimal_option_is_true_unless_its_value_is_zero() {
-        for text in ["1", "-1", "1E-6176", "0.0000001", "NaN", "Infinity"] {
-            assert!(true_value(Some(&decimal(text))), "{text}");
+    fn an_option_is_false_only_when_false_zero_null_or_missing() {
+        for value in [
+            Bson::Boolean(true),
+            Bson::Int32(1),
+            Bson::Int32(-1),
+            Bson::Int64(1),
+            Bson::Double(0.5),
+        ] {
+            assert!(true_value(Some(&value)), "{value}");
         }
-        for text in ["0", "-0", "0E+10", "0.000"] {
-            assert!(!true_value(Some(&decimal(text))), "{text}");
+        for value in [
+            Bson::Boolean(false),
+            Bson::Int32(0),
+            Bson::Int64(0),
+            Bson::Double(0.0),
+            Bson::Double(-0.0),
+            Bson::Null,
+            Bson::Undefined,
+        ] {
+            assert!(!true_value(Some(&value)), "{value}");
         }
+        assert!(!true_value(None));
     }
 
     #[test]
@@ -899,23 +788,34 @@ mod tests {
     }
 
     #[test]
-    fn this_migrations_index_hidden_is_refused_with_the_command_that_unhides_it() {
-        let hidden = doc! { "v": 2, "key": { "access_key_id": 1 }, "name": INDEX, "unique": true, "hidden": true };
-        let refused = conflict(&hidden).expect("refused");
-        assert!(matches!(refused.clash, Clash::Hidden));
-        assert_eq!(
-            refused.refusal("cat"),
-            "the index access_key_id_1 on cat.access_keys ({ \"key\": { \"access_key_id\": 1 }, \
-             \"name\": \"access_key_id_1\", \"unique\": true, \"hidden\": true }) is the unique \
-             index on access_key_id that this migration creates, hidden from the query planner, \
-             so a credential lookup does not use it; unhide it with \
-             db.getSiblingDB(\"cat\").access_keys.unhideIndex(\"access_key_id_1\") in mongosh"
-        );
-        let mut hidden_plain = hidden.clone();
-        hidden_plain.remove("unique");
-        assert!(matches!(conflict(&hidden_plain).map(|c| c.clash), Some(Clash::Named)));
-        let mut shown = hidden.clone();
-        shown.insert("hidden", false);
-        assert!(conflict(&shown).is_none());
+    fn the_index_built_by_hand_is_ours_with_options_that_do_not_change_it() {
+        // The upgrade manual builds the index by hand on a large collection,
+        // and the read then groups the array IDs alone.
+        let with = |field: &str, value: Bson| {
+            let mut spec = ours();
+            spec.insert(field, value);
+            spec
+        };
+        let keyed = |direction: Bson| with("key", doc! { "access_key_id": direction }.into());
+        for spec in [
+            ours(),
+            with("background", true.into()),
+            with("sparse", false.into()),
+            with("hidden", true.into()),
+        ] {
+            assert!(is_ours(&spec), "{spec}");
+        }
+        for spec in [
+            with("unique", false.into()),
+            with("sparse", true.into()),
+            with("expireAfterSeconds", 3600.into()),
+            with("partialFilterExpression", doc! { "access_key_id": { "$exists": true } }.into()),
+            with("name", "akid".into()),
+            with("key", doc! { "account_id": 1 }.into()),
+            keyed(decimal("1")),
+            keyed((-1).into()),
+        ] {
+            assert!(!is_ours(&spec), "{spec}");
+        }
     }
 }
