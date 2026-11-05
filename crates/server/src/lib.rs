@@ -19,6 +19,7 @@ pub mod key_info_cache;
 mod leading_keys;
 pub mod management;
 mod metrics_endpoint;
+mod parameter_keys;
 pub mod rate_limit;
 mod registration;
 mod request_attributes;

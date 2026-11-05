@@ -271,12 +271,15 @@ pub(crate) async fn authorize_request(
     // the set of keys that table receives; transaction operations authorize
     // once per item with that item's key. Each target carries the
     // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
-    // table's key schema, and the `dynamodb:Attributes` names of that table's
-    // part of the batch or of that item (see `request_attributes`). The
+    // table's key schema, the `dynamodb:Attributes` names of that table's
+    // part of the batch or of that item (see `request_attributes`), and its
+    // `dynamodb:Select`, `dynamodb:ReturnValues` and
+    // `dynamodb:ReturnConsumedCapacity` values (see `parameter_keys`). The
     // resource ARN per target is unchanged: each is still that table's ARN.
-    // (Measured against live DynamoDB 2026-10-20 and 2026-10-31.) Targets with
-    // the same (action, table, LeadingKeys, Attributes) are evaluated once,
-    // since the decision depends only on those four for a given identity.
+    // (Measured against live DynamoDB 2026-10-20, 2026-10-31 and 2026-11-01.)
+    // Targets with the same action, table and condition key values are
+    // evaluated once, since the decision depends only on those for a given
+    // identity.
     if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
         // A request outside the operation's count limits is refused before any
         // key info is read or any policy is evaluated, with the engine's own
@@ -340,6 +343,9 @@ pub(crate) async fn authorize_request(
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
                     attributes: target.attributes,
+                    select: target.parameters.select,
+                    return_values: target.parameters.return_values,
+                    return_consumed_capacity: target.parameters.return_consumed_capacity,
                     ..base_params(request_tags.clone(), request_tag_keys.clone())
                 };
                 authorization::check_authorization(
@@ -366,7 +372,11 @@ pub(crate) async fn authorize_request(
 
     if targets.len() == 1 {
         // Single-resource operations carry the request params the policy engine
-        // reads for item-level condition keys.
+        // reads for item-level condition keys. `dynamodb:Select`,
+        // `dynamodb:ReturnValues` and `dynamodb:ReturnConsumedCapacity` hold
+        // the value the operation uses when the request leaves the parameter
+        // out (see `parameter_keys`).
+        let parameters = crate::parameter_keys::single_table(operation, input);
         let params = extenddb_auth::policy::context::RequestParams {
             leading_keys: crate::leading_keys::single_table_leading_keys(
                 input,
@@ -380,18 +390,9 @@ pub(crate) async fn authorize_request(
                 key_info.as_ref(),
                 &state.limits,
             ),
-            select: input
-                .get("Select")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned),
-            return_values: input
-                .get("ReturnValues")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned),
-            return_consumed_capacity: input
-                .get("ReturnConsumedCapacity")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned),
+            select: parameters.select,
+            return_values: parameters.return_values,
+            return_consumed_capacity: parameters.return_consumed_capacity,
             ..base_params(request_tags, request_tag_keys)
         };
         authorization::check_authorization(
