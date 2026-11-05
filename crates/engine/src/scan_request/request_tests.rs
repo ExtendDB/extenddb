@@ -6,9 +6,12 @@
 //! `ExpressionAttributeValues`.
 //!
 //! Every row is a request sent to the service (us-east-1, each request twice,
-//! a Scan of an existing table) with the answer it gave: on 2026-10-25 at
-//! 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, and on 2026-10-31 between
-//! 23:54 and 23:56 UTC where a test says so.
+//! a Scan of a table the probe created) with the answer it gave: on 2026-10-25
+//! at 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, on 2026-10-31 between
+//! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The tests of
+//! `StartKeyBody::take` and `ExpressionValuesBody::take` check which values
+//! they hold back, with no service answer, and the test with faults in two key
+//! members accepts either member's fault.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -19,23 +22,9 @@ const MIX: &str = "Can not use both expression and non-expression parameters in 
 const LENGTH: &str = "1 validation error detected: Value at 'AttributesToGet' failed to satisfy constraint: Member must have length greater than or equal to 1";
 const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value: bob";
 const NESTING: &str = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit";
-const EMPTY_KEY_VALUE: &str = "The provided starting key is invalid: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
 
 fn check(body: &Value) -> Option<String> {
     match validate_scan_request_body(body) {
-        Ok(()) => None,
-        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
-        Err(other) => panic!("unexpected error {other:?}"),
-    }
-}
-
-/// The key's own checks on `body`, as the handler makes them after the
-/// request-time checks: `StartKeyBody::take` on a copy of the body, then
-/// `validate`. Panics on a `SerializationException`, which no row here
-/// expects.
-fn check_key(body: &Value) -> Option<String> {
-    let mut body = body.clone();
-    match StartKeyBody::take(&mut body).validate() {
         Ok(()) => None,
         Err(DynamoDbError::ValidationException(msg)) => Some(msg),
         Err(other) => panic!("unexpected error {other:?}"),
@@ -126,13 +115,60 @@ fn with_key(key: Value) -> Value {
     scan(json!({"ExclusiveStartKey": key}))
 }
 
+/// The key's shape stage on `body`, as the handler makes it after the request
+/// parameter checks: `StartKeyBody::take` on a copy of the body, then
+/// `validate_shape`.
+fn check_key_shape(body: &Value) -> Option<String> {
+    let mut body = body.clone();
+    match StartKeyBody::take(&mut body).validate_shape() {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+/// The key's value stage on `body`, as the handler makes it after the
+/// expression checks: `StartKeyBody::take` on a copy of the body, then
+/// `validate_values`, for a key whose shape stage passes.
+fn check_key_values(body: &Value) -> Option<String> {
+    let mut body = body.clone();
+    let key = StartKeyBody::take(&mut body);
+    assert!(key.validate_shape().is_ok(), "{body}");
+    match key.validate_values() {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+/// The message of a `ValidationException`, `None` for `Ok`.
+fn validation_message(result: Result<(), DynamoDbError>) -> Option<String> {
+    match result {
+        Ok(()) => None,
+        Err(DynamoDbError::ValidationException(msg)) => Some(msg),
+        Err(other) => panic!("unexpected error {other:?}"),
+    }
+}
+
+/// Both stages in the handler's order: the first fault of either.
+fn check_key(body: &Value) -> Option<String> {
+    check_key_shape(body).or_else(|| check_key_values(body))
+}
+
+const KEY_PREFIX: &str = "The provided starting key is invalid: ";
+const EMPTY_VALUE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+const INVALID: &str = "One or more parameter values were invalid: ";
+
 #[test]
 fn a_malformed_number_in_the_exclusive_start_key_is_reported_with_the_number_text() {
     let key = |number: &str| json!({"pk": {"N": number}, "sk": {"S": "x"}});
     let bad = with(with_key(key("bob")), filter("1"));
-    // The request-time checks leave the key to its own stage.
+    // The request-time checks and the shape stage leave the number to the
+    // value stage.
     assert_eq!(check(&bad), None);
-    assert_eq!(check_key(&bad).as_deref(), Some(NUMERIC_BOB));
+    assert_eq!(check_key_shape(&bad), None);
+    assert_eq!(check_key_values(&bad).as_deref(), Some(NUMERIC_BOB));
     assert_eq!(check_key(&with(with_key(key("1")), filter("1"))), None);
     // Measured 2026-10-30 12:40 UTC: with no filter, the same text.
     assert_eq!(
@@ -170,12 +206,14 @@ fn a_malformed_number_in_the_exclusive_start_key_is_reported_with_the_number_tex
     }
 }
 
-/// Measured 2026-10-31 between 23:54 and 23:56 UTC with `{"pk": {"N": "bob"},
-/// "sk": {"S": "x"}}` as the key: each request-time check answers its own text
-/// ahead of the key's number (the `Select` rule for `SPECIFIC_ATTRIBUTES`, the
-/// filter syntax and the unused-value check, which the handler makes after
-/// deserializing, do too; the wire tests send those rows). Measured
-/// 2026-10-30 12:40 UTC: the `ReturnConsumedCapacity` enum ahead of the key.
+/// Measured 2026-10-31 between 23:54 and 23:56 UTC and 2026-11-05 with `{"pk":
+/// {"N": "bob"}, "sk": {"S": "x"}}` as the key: each request-time check answers
+/// its own text ahead of the key's number, in the newer form; beside a key
+/// value that is empty or carries an unknown type descriptor the constraint
+/// clauses take the older form (2026-11-05). The request parameter checks, the
+/// expression checks and the Segment pairing, which the handler makes after
+/// deserializing, come ahead of the key's number too; the wire tests send
+/// those rows.
 #[test]
 fn every_request_time_check_comes_ahead_of_the_number_in_the_exclusive_start_key() {
     let bob = json!({"pk": {"N": "bob"}, "sk": {"S": "x"}});
@@ -218,48 +256,160 @@ fn every_request_time_check_comes_ahead_of_the_number_in_the_exclusive_start_key
         let body = with(with_key(bob.clone()), extra);
         assert_eq!(check(&body).as_deref(), Some(text), "{body}");
     }
+    // Beside a key value the shape stage refuses, the older form (2026-11-05).
+    for key in [
+        json!({"pk": {}, "sk": {"S": "x"}}),
+        json!({"pk": {"X": "1"}, "sk": {"S": "x"}}),
+    ] {
+        assert_eq!(
+            check(&with(with_key(key.clone()), json!({"Limit": 0}))).as_deref(),
+            Some(
+                "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            ),
+            "{key}"
+        );
+    }
 }
 
-/// Measured 2026-10-31 between 23:54 and 23:56 UTC: inside the key a number
-/// fault comes ahead of a value that is empty or has an unknown type
-/// descriptor, in either member order; with two number faults the first
-/// member is named; a key whose only fault is an empty value answers the
-/// service's key text.
+/// Measured 2026-11-05: a key value that is empty, carries an unknown or
+/// lower-case type descriptor, or carries two, at its top or inside an `L` or
+/// `M`, in a key member or in a member that is not a key attribute, answers the
+/// service's text with the key prefix at the shape stage.
 #[test]
-fn a_number_fault_in_the_key_comes_ahead_of_an_empty_or_unknown_descriptor_value() {
+fn a_shape_fault_in_a_key_value_answers_the_prefixed_text_at_the_shape_stage() {
+    let empty = format!("{KEY_PREFIX}{EMPTY_VALUE}");
     for key in [
-        json!({"pk": {}, "sk": {"N": "bob"}}),
-        json!({"sk": {"N": "bob"}, "pk": {}}),
-        json!({"pk": {"X": "1"}, "sk": {"N": "bob"}}),
-        json!({"pk": {"N": "bob"}, "sk": {"N": "fred"}}),
+        json!({"pk": {}, "sk": {"S": "x"}}),
+        json!({"pk": {"X": "1"}, "sk": {"S": "x"}}),
+        json!({"pk": {"s": "x"}, "sk": {"S": "x"}}),
+        json!({"pk": {"L": [{}]}, "sk": {"S": "x"}}),
+        json!({"pk": {"M": {"k": {}}}, "sk": {"S": "x"}}),
+        json!({"pk": {"S": "p0"}, "sk": {"S": "x"}, "z": {}}),
+        json!({"pk": {}}),
     ] {
         let body = with_key(key.clone());
-        // The request-time checks leave the key to its own stage.
         assert_eq!(check(&body), None, "{key}");
-        assert_eq!(check_key(&body).as_deref(), Some(NUMERIC_BOB), "{key}");
+        assert_eq!(
+            check_key_shape(&body).as_deref(),
+            Some(empty.as_str()),
+            "{key}"
+        );
     }
-    let empty = with_key(json!({"pk": {}, "sk": {"S": "x"}}));
-    assert_eq!(check_key(&empty).as_deref(), Some(EMPTY_KEY_VALUE));
-    // Measured 2026-10-31 between 23:54 and 23:56 UTC too: a Limit fault
-    // beside the empty value answers the Limit clause, in the older form.
+    let two = with_key(json!({"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}));
     assert_eq!(
-        check(&with(empty, json!({"Limit": 0}))).as_deref(),
+        check_key_shape(&two).as_deref(),
         Some(
-            "1 validation error detected: Value '0' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
+            "The provided starting key is invalid: Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"
         )
     );
+    // A readable key passes the shape stage.
+    assert_eq!(
+        check_key_shape(&with_key(json!({"pk": {"N": "bob"}, "sk": {"NS": []}}))),
+        None
+    );
+}
+
+/// Measured 2026-11-05: the set faults of a key answer the service's texts with
+/// no prefix at the value stage, after every number in the key.
+#[test]
+fn a_set_fault_in_a_key_value_answers_the_service_text_without_a_prefix() {
+    for (key, text) in [
+        (json!({"NS": []}), "An number set  may not be empty"),
+        (json!({"SS": []}), "An string set  may not be empty"),
+        (json!({"BS": []}), "Binary sets should not be empty"),
+        (
+            json!({"NS": ["1", "1"]}),
+            "Input collection contains duplicates.",
+        ),
+        (
+            json!({"NS": ["1", "1.0"]}),
+            "Input collection contains duplicates.",
+        ),
+        (
+            json!({"SS": ["a", "a"]}),
+            r#"Input collection ["a", "a"] contains duplicates."#,
+        ),
+    ] {
+        let body = with_key(json!({"pk": key, "sk": {"S": "x"}}));
+        assert_eq!(
+            check_key_values(&body),
+            Some(format!("{INVALID}{text}")),
+            "{key}"
+        );
+    }
+    // A number in a set is reported with the number text.
+    let bob = with_key(json!({"pk": {"NS": ["bob"]}, "sk": {"S": "x"}}));
+    assert_eq!(check_key_values(&bob).as_deref(), Some(NUMERIC_BOB));
+    // A set with distinct numbers passes.
+    assert_eq!(
+        check_key_values(&with_key(
+            json!({"pk": {"NS": ["1", "2"]}, "sk": {"S": "x"}})
+        )),
+        None
+    );
+}
+
+/// Faults in two members of one key. The service's choice follows the attribute
+/// names and, on some tables, the request's member order (measured 2026-11-05
+/// on three tables): `{"pk": {}, "sk": {"N": "bob"}}` answered `bob` on
+/// 2026-10-31 and `{"a": {}, "b": {"N": "bob"}}` the empty value. The code
+/// reports a shape fault in any member ahead of a value fault in any member,
+/// then the members in sorted order; this test accepts either member's fault.
+#[test]
+fn two_faulty_members_answer_one_of_the_two_faults() {
+    let empty = format!("{KEY_PREFIX}{EMPTY_VALUE}");
+    let ns_empty = format!("{INVALID}An number set  may not be empty");
+    let fred = NUMERIC_BOB.replace("bob", "fred");
+    for (key, either) in [
+        (
+            json!({"pk": {}, "sk": {"N": "bob"}}),
+            [empty.as_str(), NUMERIC_BOB],
+        ),
+        (
+            json!({"sk": {"N": "bob"}, "pk": {}}),
+            [empty.as_str(), NUMERIC_BOB],
+        ),
+        (
+            json!({"pk": {"X": "1"}, "sk": {"N": "bob"}}),
+            [empty.as_str(), NUMERIC_BOB],
+        ),
+        (
+            json!({"pk": {"N": "bob"}, "sk": {}}),
+            [empty.as_str(), NUMERIC_BOB],
+        ),
+        (
+            json!({"pk": {"N": "bob"}, "sk": {"N": "fred"}}),
+            [NUMERIC_BOB, fred.as_str()],
+        ),
+        (
+            json!({"pk": {"NS": []}, "sk": {"N": "bob"}}),
+            [ns_empty.as_str(), NUMERIC_BOB],
+        ),
+        (
+            json!({"pk": {}, "sk": {"NS": []}}),
+            [empty.as_str(), ns_empty.as_str()],
+        ),
+    ] {
+        let answer = check_key(&with_key(key.clone()));
+        assert!(
+            either.contains(&answer.as_deref().unwrap_or_default()),
+            "{key}: {answer:?}"
+        );
+    }
 }
 
 /// `StartKeyBody::take` holds back a key the deserializer refuses for its
 /// value and leaves one of the wrong JSON shape in the body, where the typed
-/// deserialization reports it ahead of every check.
+/// deserialization reports it ahead of every check; no service answer is
+/// asserted here.
 #[test]
 fn a_key_of_the_wrong_shape_stays_in_the_body_and_an_unreadable_value_is_held_back() {
     for key in [json!("x"), json!({"pk": "x"}), json!({"pk": {"N": 5}})] {
         let mut body = with_key(key.clone());
         let start_key = StartKeyBody::take(&mut body);
         assert!(body.get("ExclusiveStartKey").is_some(), "{key}");
-        assert!(start_key.validate().is_ok(), "{key}");
+        assert!(start_key.validate_shape().is_ok(), "{key}");
+        assert!(start_key.validate_values().is_ok(), "{key}");
         let shape = serde_json::from_value::<extenddb_core::types::ScanInput>(body)
             .map_err(crate::deserialize_error);
         assert!(
@@ -271,24 +421,72 @@ fn a_key_of_the_wrong_shape_stays_in_the_body_and_an_unreadable_value_is_held_ba
         json!({"pk": {}}),
         json!({"pk": {"X": "1"}}),
         json!({"pk": {"S": "x", "N": "1"}}),
+        json!({"pk": {"NS": []}}),
+        json!({"pk": {"SS": ["a", "a"]}}),
     ] {
         let mut body = with_key(key.clone());
         let start_key = StartKeyBody::take(&mut body);
         assert!(body.get("ExclusiveStartKey").is_none(), "{key}");
-        assert!(start_key.validate().is_err(), "{key}");
+        assert!(
+            start_key
+                .validate_shape()
+                .and(start_key.validate_values())
+                .is_err(),
+            "{key}"
+        );
         assert!(
             serde_json::from_value::<extenddb_core::types::ScanInput>(body).is_ok(),
             "{key}"
         );
     }
-    // A readable key stays in the body and passes.
+    // A readable key stays in the body and passes both stages.
     let mut body = with_key(json!({"pk": {"S": "p0"}, "sk": {"S": "x"}}));
     let start_key = StartKeyBody::take(&mut body);
     assert!(body.get("ExclusiveStartKey").is_some());
-    assert!(start_key.validate().is_ok());
+    assert!(start_key.validate_shape().is_ok());
+    assert!(start_key.validate_values().is_ok());
     // No key at all.
     let mut body = scan(json!({}));
-    assert!(StartKeyBody::take(&mut body).validate().is_ok());
+    let start_key = StartKeyBody::take(&mut body);
+    assert!(
+        start_key
+            .validate_shape()
+            .and(start_key.validate_values())
+            .is_ok()
+    );
+}
+
+/// `ExpressionValuesBody::take` puts a readable stand-in in the body for a
+/// value the deserializer refuses for its content and keeps the deserializer's
+/// fault for the map as written (measured 2026-11-05: the fault comes after the
+/// key's value stage); a value of the wrong JSON shape stays in the body.
+#[test]
+fn an_unreadable_expression_value_is_held_back_and_a_stand_in_takes_its_place() {
+    let mut body = scan(json!({
+        "FilterExpression": "a = :a",
+        "ExpressionAttributeValues": {":a": {}},
+    }));
+    let values = super::ExpressionValuesBody::take(&mut body);
+    assert_eq!(body["ExpressionAttributeValues"], json!({":a": {"S": ""}}));
+    assert_eq!(
+        validation_message(values.validate()).as_deref(),
+        Some(
+            "ExpressionAttributeValues contains invalid value: Supplied AttributeValue is empty, must contain exactly one of the supported datatypes for key :a"
+        )
+    );
+    let mut body = scan(json!({"ExpressionAttributeValues": {":a": {"X": "1"}}}));
+    let values = super::ExpressionValuesBody::take(&mut body);
+    assert_eq!(body["ExpressionAttributeValues"], json!({":a": {"S": ""}}));
+    assert!(
+        matches!(values.validate(), Err(DynamoDbError::SerializationException(msg)) if msg.contains("unknown AttributeValue type descriptor: X"))
+    );
+    // A readable value and a value of the wrong JSON shape stay as written.
+    for value in [json!({"S": "x"}), json!({"N": 5})] {
+        let mut body = scan(json!({"ExpressionAttributeValues": {":a": value}}));
+        let values = super::ExpressionValuesBody::take(&mut body);
+        assert_eq!(body["ExpressionAttributeValues"], json!({":a": value}));
+        assert!(values.validate().is_ok());
+    }
 }
 
 #[test]

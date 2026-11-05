@@ -211,7 +211,8 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
 }
 
 /// The type descriptors an AttributeValue may carry.
-const TYPE_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+pub(crate) const TYPE_DESCRIPTORS: &[&str] =
+    &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The legacy condition maps of `Scan` whose `AttributeValueList` entries
 /// [`has_unreadable_attribute_value`] reads.

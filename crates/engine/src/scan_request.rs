@@ -46,20 +46,47 @@
 //!    "BAD"` answers the nesting text). Both enums invalid answers the
 //!    `ReturnConsumedCapacity` error alone, so the two are not aggregated.
 //!
-//! The numbers in `ExclusiveStartKey` are checked by the handler at the key's
-//! own stage, after the checks the service makes ahead of them (measured
-//! 2026-10-31 between 23:54 and 23:56 UTC with `{"pk": {"N": "bob"}, "sk":
-//! {"S": "x"}}` as the key): each of the six checks above, the `Select` rule
-//! for `SPECIFIC_ATTRIBUTES`, the `FilterExpression` syntax and the
-//! unused-value check answers its own text ahead of the number text, and a
-//! malformed number in `ExpressionAttributeValues` is reported ahead of one in
-//! the key. The number text is the value check's, with no filter and on an
-//! index scan too (measured 2026-10-30). Inside the key a number fault
-//! anywhere, an `NS` member or a value nested in the `L` of a non-key
-//! attribute included, comes ahead of a value that is empty or has an unknown
-//! type descriptor, in either member order; with two number faults the first
-//! member is named (`{"pk": {"N": "bob"}, "sk": {"N": "fred"}}` names `bob`).
-//! See [`StartKeyBody`].
+//! The faults of `ExclusiveStartKey` come at two of the handler's stages,
+//! measured 2026-11-05 (us-east-1, each request twice; a request parameter
+//! check, an expression check and the table's indexes beside each class of
+//! fault, and each key alone):
+//!
+//! - the shape faults, after the request parameter checks
+//!   (`ExpressionAttributeValues` or `ExpressionAttributeNames` with no
+//!   expression, `ConditionalOperator` with no `ScanFilter`, a `ScanFilter`
+//!   condition's value count, the parameter mix) and ahead of the expression
+//!   checks: a value that is empty, carries a type descriptor the service does
+//!   not have (`X`, a lower-case `s`) or more than one, at the top of a member
+//!   or inside its `L` or `M`, in a key member or in a member that is not a key
+//!   attribute. Text: `The provided starting key is invalid: Supplied
+//!   AttributeValue is empty, must contain exactly one of the supported
+//!   datatypes`, or the same prefix and `Supplied AttributeValue has more than
+//!   one datatypes set, must contain exactly one of the supported datatypes`.
+//!   Beside such a value the constraint clauses take the older form (D1);
+//! - the value faults, after the expression and request checks (the filter
+//!   syntax, an undefined value, the operand types, the projection syntax, the
+//!   `Select` rules, the unused values, the `Segment` pairing) and ahead of the
+//!   table lookup, with no prefix: a number that does not parse (`The parameter
+//!   cannot be converted to a numeric value: bob`, in an `N`, an `NS` member,
+//!   an `L` or `M` member, a non-key member or an index key), an empty set
+//!   (`One or more parameter values were invalid: An number set  may not be
+//!   empty`, `... An string set  may not be empty`, `... Binary sets should
+//!   not be empty`) and a set with duplicates (`... Input collection contains
+//!   duplicates.` for an `NS`, `["1", "1"]` and `["1", "1.0"]` alike; `...
+//!   Input collection ["a", "a"] contains duplicates.` for an `SS`). A value
+//!   of `ExpressionAttributeValues` the deserializer refuses (an empty value)
+//!   is reported after them and ahead of the table lookup.
+//!
+//! See [`StartKeyBody`] and [`ExpressionValuesBody`]. With faults in two
+//! members the service names one of them by the attribute names and, on some
+//! tables, the request's order: `{"pk": {}, "sk": {"N": "bob"}}` answered the
+//! number on 2026-10-31 and `{"a": {}, "b": {"N": "bob"}}` the empty value on
+//! 2026-11-05. The code reports a shape fault in any member ahead of a value
+//! fault in any member, then the members in sorted order; no test pins which
+//! member. Inside one value the members of an `M` are read in the JSON map's
+//! order and those of an `NS` in the request's order; the service named `bob`
+//! and then `fred` for `{"M": {"b": {"N": "fred"}, "a": {"N": "bob"}}}` and
+//! `fred` twice for `{"NS": ["fred", "bob"]}` in a non-key member.
 //!
 //! Not measured, and checked in the order listed above: the `AttributesToGet`
 //! length clause beside a `Segment` or `TotalSegments` fault without a `Limit`
@@ -68,16 +95,15 @@
 //! listed last, as the older form reverses the newer one), the length clause
 //! against the enums, `M` levels in the nesting count, and the nesting of a
 //! value an expression reads or of a request with no expression. Not measured
-//! at the key's stage: the key's checks against the table lookup, the index
-//! resolution, the `ConsistentRead` and `Select` index rules and the `Segment`
-//! pairing, which the handler makes ahead of them; a key whose only fault is
-//! an empty or unknown-descriptor value against the filter syntax and
-//! unused-value checks (the handler reports it after them, with the service's
-//! prefix `The provided starting key is invalid: ` on the deserializer's
-//! text, measured for the empty value alone); and which of two number faults
-//! is named when
-//! the request lists the members the other way round (the check reads members
-//! in sorted order, which names `bob` either way).
+//! at the key's stages: a `BS` with duplicates (the deserializer's text); a
+//! number fault and a duplicate in one `NS` (the number first); an `SS` or `BS`
+//! member that is not a string (the deserializer's text at the value stage); a
+//! value of `ExpressionAttributeValues` the deserializer refuses for a reason
+//! other than an empty value (two descriptors, an unknown descriptor, a set),
+//! reported with the empty value's; and the nesting check beside a key shape
+//! fault, where the service answered the key's text for a value the filter
+//! reads (2026-11-05) and the nesting text ahead of the `Select` enum for an
+//! unused value (2026-10-30): the check keeps its request-time place.
 //!
 //! The JSON parser accepts 128 levels of nesting, which is 62 `L` levels; a
 //! body nested deeper is a `SerializationException` from the parser, ahead of
@@ -102,8 +128,8 @@ use extenddb_core::types::{AttributeValue, Item, ScanInput, saturated_int32};
 use serde_json::Value;
 
 use crate::query_key_values::{
-    SCAN_CONDITIONS, has_unreadable_attribute_value, is_shape_fault, non_empty, present,
-    shape_fault_first, validate_expression_attribute_value_numbers, validate_number_text,
+    SCAN_CONDITIONS, TYPE_DESCRIPTORS, has_unreadable_attribute_value, is_shape_fault, non_empty,
+    present, shape_fault_first, validate_expression_attribute_value_numbers, validate_number_text,
 };
 
 /// The `Scan` checks that run on the raw request body, in the service's order:
@@ -186,40 +212,57 @@ fn attribute_value_map(body: &Value, field: &str) -> Option<HashMap<String, Attr
     serde_json::from_value(body.get(field)?.clone()).ok()
 }
 
-/// The service's prefix on a fault in an `ExclusiveStartKey` value (measured
-/// 2026-10-31 between 23:54 and 23:56 UTC: `{"pk": {}, "sk": {"S": "x"}}`
-/// answers `The provided starting key is invalid: Supplied AttributeValue is
-/// empty, must contain exactly one of the supported datatypes`).
+/// The service's prefix on a shape fault in an `ExclusiveStartKey` value
+/// (measured 2026-10-31 and 2026-11-05: `{"pk": {}, "sk": {"S": "x"}}` answers
+/// `The provided starting key is invalid: Supplied AttributeValue is empty,
+/// must contain exactly one of the supported datatypes`). A number or set
+/// fault in the key carries no prefix (measured 2026-11-05).
 const START_KEY_PREFIX: &str = "The provided starting key is invalid: ";
 
+/// The service's text for a value that is empty or carries a type descriptor
+/// it does not have (an unknown or lower-case one, measured 2026-11-05).
+const EMPTY_VALUE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// The service's text for a value with more than one type descriptor.
+const MORE_THAN_ONE_DESCRIPTOR: &str = "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes";
+
+/// The prefix of the service's set texts.
+const INVALID_PARAMETER_VALUES: &str = "One or more parameter values were invalid: ";
+
 /// The `ExclusiveStartKey` of a `Scan` body as the request wrote it, with the
-/// checks the service makes on the key at the key's own stage: after the
-/// request-time checks of [`validate_scan_request_body`], the `Select` rule for
-/// `SPECIFIC_ATTRIBUTES`, the `FilterExpression` syntax and the unused-value
-/// check, and ahead of the key schema (measured 2026-10-31 between 23:54 and
-/// 23:56 UTC; see the module doc).
+/// checks the service makes on the key at the key's two stages (measured
+/// 2026-11-05, us-east-1; see the module doc):
 ///
-/// A key whose value is empty, carries an unknown type descriptor or more than
-/// one, or is a set that is empty or has duplicates does not deserialize as a
-/// map of attribute values. [`StartKeyBody::take`] takes such a key out of the
-/// body, so that the typed deserialization of the body does not report it
-/// ahead of the checks the service makes first, and [`StartKeyBody::validate`]
-/// reports it at the key's stage, after the key's numbers: `{"pk": {}, "sk":
-/// {"N": "bob"}}` and `{"sk": {"N": "bob"}, "pk": {}}` answer the number text
-/// for `bob`. A key of the wrong JSON shape (not an object, a value that is
-/// not an object, an `N` that is not a string) stays in the body, as the
-/// service reports a shape fault ahead of every check; see
+/// - [`StartKeyBody::validate_shape`], after the request parameter checks and
+///   ahead of the expression checks: a value that is empty, carries an unknown
+///   or lower-case type descriptor or more than one descriptor, at the top of a
+///   member or inside its `L` or `M`, in any member of the key, with the prefix
+///   `The provided starting key is invalid: `;
+/// - [`StartKeyBody::validate_values`], after the expression and request checks
+///   and ahead of the table lookup: every number in the key with the value
+///   check's rules and text, and the set faults (an empty `NS`, `SS` or `BS`,
+///   a set with duplicates), with no prefix.
+///
+/// A key with such a value does not deserialize as a map of attribute values.
+/// [`StartKeyBody::take`] takes it out of the body, so that the typed
+/// deserialization of the body does not report it ahead of the checks the
+/// service makes first, and keeps the deserializer's fault for a value the two
+/// stages do not classify. A key of the wrong JSON shape (not an object, a
+/// value that is not an object, an `N` that is not a string) stays in the body,
+/// as the service reports a shape fault ahead of every check; see
 /// [`shape_fault_first`].
+///
+/// With faults in two members the service's choice follows the attribute names
+/// and, on some tables, the request's member order (measured 2026-11-05 on
+/// three tables); the stages here read the members in sorted order, and a
+/// shape fault in any member comes ahead of a value fault in any member.
 pub(crate) struct StartKeyBody {
     /// The key as the request wrote it; `None` when the body has none.
     raw: Option<Value>,
-    /// The deserializer's fault in a key taken out of the body, to report
-    /// after the key's numbers. A `ValidationException` carries the service's
-    /// prefix for the key (measured for an empty value; the texts for more
-    /// than one descriptor and for an empty or duplicate set follow it,
-    /// unmeasured). The `SerializationException` for an unknown type
-    /// descriptor keeps the deserializer's text (unmeasured on its own; beside
-    /// a `Limit` fault or a number fault the service reports those).
+    /// The deserializer's fault in a key taken out of the body, reported at the
+    /// value stage when neither stage classifies the value (an `SS` member that
+    /// is not a string, for one).
     deferred: Option<DynamoDbError>,
 }
 
@@ -234,9 +277,13 @@ impl StartKeyBody {
         {
             Some(Err(e)) => match crate::deserialize_error(e) {
                 shape if is_shape_fault(&shape) => None,
-                DynamoDbError::ValidationException(msg) => Some(
-                    DynamoDbError::ValidationException(format!("{START_KEY_PREFIX}{msg}")),
-                ),
+                DynamoDbError::ValidationException(msg)
+                    if msg == EMPTY_VALUE || msg == MORE_THAN_ONE_DESCRIPTOR =>
+                {
+                    Some(DynamoDbError::ValidationException(format!(
+                        "{START_KEY_PREFIX}{msg}"
+                    )))
+                }
                 other => Some(other),
             },
             Some(Ok(_)) | None => None,
@@ -249,25 +296,55 @@ impl StartKeyBody {
         Self { raw, deferred }
     }
 
-    /// The key's checks at its own stage: every number in the key with the
-    /// value check's rules and text (an `N`, the members of an `NS`, and the
-    /// values nested in `L` and `M`, in the sorted order of the key's members,
-    /// so that two faults name the same one on every backend), then the
-    /// deserializer's fault in a key [`StartKeyBody::take`] took out of the
-    /// body.
+    /// The key's members in sorted order, so that two faults name the same
+    /// member on every backend (the MongoDB build keeps the request's order in
+    /// its JSON maps, the others sort them).
+    fn members(&self) -> Vec<&Value> {
+        let Some(members) = self.raw.as_ref().and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&String> = members.keys().collect();
+        names.sort();
+        names.into_iter().map(|name| &members[name]).collect()
+    }
+
+    /// The key's shape stage: the first member, in sorted order, whose value is
+    /// empty, carries a type descriptor the service does not have or more than
+    /// one, at its top or inside an `L` or `M` member, answers the service's
+    /// text with the key prefix.
     ///
     /// # Errors
     ///
-    /// Returns `DynamoDbError::ValidationException` with the service's text, or
-    /// the deserializer's `SerializationException` for an unknown type
-    /// descriptor.
-    pub(crate) fn validate(&self) -> Result<(), DynamoDbError> {
-        if let Some(members) = self.raw.as_ref().and_then(Value::as_object) {
-            let mut names: Vec<&String> = members.keys().collect();
-            names.sort();
-            for name in names {
-                validate_raw_value_numbers(&members[name])?;
+    /// Returns `DynamoDbError::ValidationException` with the prefixed text.
+    pub(crate) fn validate_shape(&self) -> Result<(), DynamoDbError> {
+        for member in self.members() {
+            if let Some(text) = shape_fault(member) {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "{START_KEY_PREFIX}{text}"
+                )));
             }
+        }
+        Ok(())
+    }
+
+    /// The key's value stage: every number in the key with the value check's
+    /// rules and text (an `N`, the members of an `NS`, and the values nested in
+    /// `L` and `M`), and the set faults, member by member in sorted order; then
+    /// the deserializer's fault in a key [`StartKeyBody::take`] took out of the
+    /// body that neither stage classified.
+    ///
+    /// Inside one value the members of an `M` are read in the JSON map's order
+    /// (the request's order on the MongoDB build) and those of an `NS` in the
+    /// request's order: the service named `bob` and then `fred` on two sends
+    /// of `{"M": {"b": {"N": "fred"}, "a": {"N": "bob"}}}` and `fred` twice for
+    /// `{"NS": ["fred", "bob"]}` (2026-11-05), so no order is pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DynamoDbError::ValidationException` with the service's text.
+    pub(crate) fn validate_values(&self) -> Result<(), DynamoDbError> {
+        for member in self.members() {
+            validate_key_value(member)?;
         }
         match &self.deferred {
             Some(fault) => Err(fault.clone()),
@@ -276,11 +353,32 @@ impl StartKeyBody {
     }
 }
 
-/// Every number in one raw attribute value: an `N` text, the members of an
-/// `NS`, and the values nested in `L` and `M`. A value that is not one
-/// attribute value, or whose inner JSON is not of the descriptor's shape, holds
-/// no number to check here; the deserializer reports it.
-fn validate_raw_value_numbers(value: &Value) -> Result<(), DynamoDbError> {
+/// The service's text for the first shape fault in one raw key value, depth
+/// first: an object with no type descriptor or with one the service does not
+/// have is an empty value, one with more than one descriptor is the
+/// more-than-one text, and the members of an `L` or `M` are read the same way.
+/// A value that is not an object is a shape fault the deserializer reports.
+fn shape_fault(value: &Value) -> Option<&'static str> {
+    let fields = value.as_object()?;
+    let mut fields = fields.iter();
+    match (fields.next(), fields.next()) {
+        (None, _) => Some(EMPTY_VALUE),
+        (Some(_), Some(_)) => Some(MORE_THAN_ONE_DESCRIPTOR),
+        (Some((descriptor, inner)), None) => match (descriptor.as_str(), inner) {
+            ("L", Value::Array(members)) => members.iter().find_map(shape_fault),
+            ("M", Value::Object(members)) => members.values().find_map(shape_fault),
+            (descriptor, _) if TYPE_DESCRIPTORS.contains(&descriptor) => None,
+            _ => Some(EMPTY_VALUE),
+        },
+    }
+}
+
+/// The value faults of one raw key value: an `N` text, the members of an `NS`
+/// (every number first, then an empty set, then duplicates by numeric value:
+/// `["1", "1.0"]` has a duplicate), an empty `SS` or `BS` and their duplicates,
+/// and the values nested in `L` and `M`. A member of a set that is not a string
+/// holds nothing to check here; the deserializer reports it.
+fn validate_key_value(value: &Value) -> Result<(), DynamoDbError> {
     let Some(fields) = value.as_object() else {
         return Ok(());
     };
@@ -290,13 +388,149 @@ fn validate_raw_value_numbers(value: &Value) -> Result<(), DynamoDbError> {
     };
     match (descriptor.as_str(), inner) {
         ("N", Value::String(text)) => validate_number_text(text),
-        ("NS", Value::Array(texts)) => texts
-            .iter()
-            .filter_map(Value::as_str)
-            .try_for_each(validate_number_text),
-        ("L", Value::Array(members)) => members.iter().try_for_each(validate_raw_value_numbers),
-        ("M", Value::Object(members)) => members.values().try_for_each(validate_raw_value_numbers),
+        ("NS", Value::Array(members)) => validate_number_set(members),
+        ("SS", Value::Array(members)) => validate_string_set(members),
+        ("BS", Value::Array(members)) => validate_binary_set(members),
+        ("L", Value::Array(members)) => members.iter().try_for_each(validate_key_value),
+        ("M", Value::Object(members)) => members.values().try_for_each(validate_key_value),
         _ => Ok(()),
+    }
+}
+
+/// A `ValidationException` with the service's prefix for an invalid parameter
+/// value.
+fn invalid_parameter(text: &str) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!("{INVALID_PARAMETER_VALUES}{text}"))
+}
+
+/// An `NS` of the key: every member's number text, then `One or more parameter
+/// values were invalid: An number set  may not be empty` (the service's two
+/// spaces), then `... Input collection contains duplicates.` for two members
+/// with one numeric value (measured 2026-11-05 for `["1", "1"]` and `["1",
+/// "1.0"]`).
+fn validate_number_set(members: &[Value]) -> Result<(), DynamoDbError> {
+    let texts: Vec<&str> = members.iter().filter_map(Value::as_str).collect();
+    texts
+        .iter()
+        .try_for_each(|text| validate_number_text(text))?;
+    if members.is_empty() {
+        return Err(invalid_parameter("An number set  may not be empty"));
+    }
+    let mut normalized: Vec<String> = texts
+        .iter()
+        .map(|text| {
+            let folded = crate::decimal_digits::fold_decimal_digits(text);
+            extenddb_core::validation::number::validate_and_normalize_number(&folded)
+                .unwrap_or_else(|_| folded.into_owned())
+        })
+        .collect();
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.len() != texts.len() {
+        return Err(invalid_parameter("Input collection contains duplicates."));
+    }
+    Ok(())
+}
+
+/// An `SS` of the key: `One or more parameter values were invalid: An string
+/// set  may not be empty`, then `... Input collection ["a", "a"] contains
+/// duplicates.` with every member quoted (measured 2026-11-05).
+fn validate_string_set(members: &[Value]) -> Result<(), DynamoDbError> {
+    if members.is_empty() {
+        return Err(invalid_parameter("An string set  may not be empty"));
+    }
+    let texts: Vec<&str> = members.iter().filter_map(Value::as_str).collect();
+    let mut distinct = texts.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != texts.len() {
+        let listed: Vec<String> = texts
+            .iter()
+            .map(|text| serde_json::to_string(text).unwrap_or_default())
+            .collect();
+        return Err(invalid_parameter(&format!(
+            "Input collection [{}] contains duplicates.",
+            listed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// A `BS` of the key: `One or more parameter values were invalid: Binary sets
+/// should not be empty` (measured 2026-11-05); duplicates answer the
+/// deserializer's text for a binary set, which is not measured for the key.
+fn validate_binary_set(members: &[Value]) -> Result<(), DynamoDbError> {
+    if members.is_empty() {
+        return Err(invalid_parameter("Binary sets should not be empty"));
+    }
+    let texts: Vec<&str> = members.iter().filter_map(Value::as_str).collect();
+    let mut distinct = texts.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != texts.len() {
+        return Err(invalid_parameter(&format!(
+            "Input collection [{}]of type BS contains duplicates.",
+            texts.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The `ExpressionAttributeValues` of a `Scan` body whose values do not all
+/// deserialize: an empty value, an unknown type descriptor, two descriptors, an
+/// empty or duplicate set. The service reports such a value after the key's
+/// value stage and ahead of the table lookup (measured 2026-11-05: `{":a": {}}`
+/// read by the filter answers `ExpressionAttributeValues contains invalid
+/// value: Supplied AttributeValue is empty, must contain exactly one of the
+/// supported datatypes for key :a` with no key and with a valid key, and the
+/// key's number or set text beside a key with such a fault). [`Self::take`]
+/// puts a readable stand-in in the body for each such value, so that the typed
+/// deserialization and the expression checks run on the other values, and
+/// keeps the deserializer's fault for the map as the request wrote it;
+/// [`Self::validate`] reports it. The request is refused before the scan reads
+/// the stand-in. A value of the wrong JSON shape stays in the body.
+pub(crate) struct ExpressionValuesBody {
+    deferred: Option<DynamoDbError>,
+}
+
+impl ExpressionValuesBody {
+    /// Replaces each value the deserializer refuses for a reason that is not a
+    /// shape fault with a readable stand-in and keeps the deserializer's fault.
+    pub(crate) fn take(body: &mut Value) -> Self {
+        let Some(Value::Object(entries)) = body.get_mut("ExpressionAttributeValues") else {
+            return Self { deferred: None };
+        };
+        let raw = Value::Object(entries.clone());
+        let mut substituted = false;
+        for value in entries.values_mut() {
+            if let Err(e) = serde_json::from_value::<AttributeValue>(value.clone())
+                && !is_shape_fault(&crate::deserialize_error(e))
+            {
+                *value = serde_json::json!({"S": ""});
+                substituted = true;
+            }
+        }
+        if !substituted {
+            return Self { deferred: None };
+        }
+        // The deserializer's own wording and key order for the map as written.
+        let probe = serde_json::json!({"TableName": "t", "ExpressionAttributeValues": raw});
+        let deferred = serde_json::from_value::<ScanInput>(probe)
+            .err()
+            .map(crate::deserialize_error);
+        Self { deferred }
+    }
+
+    /// The deferred fault, at the stage after the key's value checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deserializer's fault for the first value it refused.
+    pub(crate) fn validate(&self) -> Result<(), DynamoDbError> {
+        match &self.deferred {
+            Some(fault) => Err(fault.clone()),
+            None => Ok(()),
+        }
     }
 }
 

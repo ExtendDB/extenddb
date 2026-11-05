@@ -16,10 +16,14 @@ Depth is the number of ``L`` wrappers around the leaf: 32 or more answers the
 nesting text, 31 reaches the unused-value check. A malformed number at the
 bottom is reported first, at the depths 31 to 60 that were measured.
 
-The numbers in ``ExclusiveStartKey`` are checked after every other check in
-this file and after the filter syntax and unused-value checks, and inside the
-key a number fault comes ahead of an empty value or an unknown type
-descriptor (2026-10-31).
+The faults of ``ExclusiveStartKey`` come at two places (measured on
+2026-11-05, each request twice): a value that is empty, carries an unknown type
+descriptor or two descriptors is reported after the constraint clauses and the
+request parameter checks, with the prefix ``The provided starting key is
+invalid: ``, and ahead of the expression checks; a number or set fault is
+reported after the expression and request checks, with no prefix, and ahead of
+the table lookup. With faults in two members the service's choice follows the
+attribute names and the request's order, so those tests accept either fault.
 """
 
 from __future__ import annotations
@@ -76,10 +80,24 @@ SELECT_SPECIFIC = (
     "SPECIFIC_ATTRIBUTES"
 )
 UNUSED_U = "Value provided in ExpressionAttributeValues unused in expressions: keys: {:u}"
+KEY_PREFIX = "The provided starting key is invalid: "
 EMPTY_KEY_VALUE = (
-    "The provided starting key is invalid: Supplied AttributeValue is empty, "
-    "must contain exactly one of the supported datatypes"
+    KEY_PREFIX + "Supplied AttributeValue is empty, must contain exactly one of the "
+    "supported datatypes"
 )
+TWO_DESCRIPTORS = (
+    KEY_PREFIX + "Supplied AttributeValue has more than one datatypes set, must contain "
+    "exactly one of the supported datatypes"
+)
+INVALID = "One or more parameter values were invalid: "
+NS_EMPTY = INVALID + "An number set  may not be empty"
+SS_EMPTY = INVALID + "An string set  may not be empty"
+BS_EMPTY = INVALID + "Binary sets should not be empty"
+NS_DUP = INVALID + "Input collection contains duplicates."
+SS_DUP = INVALID + 'Input collection ["a", "a"] contains duplicates.'
+NUMERIC_FRED = NUMERIC_BOB.replace("bob", "fred")
+EAV_NO_EXPRESSION = "ExpressionAttributeValues can only be specified when using expressions"
+MISSING_INDEX = "The table does not have the specified index: nope"
 
 VALID_FILTER = '"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "1"}}'
 BOB_FILTER = '"FilterExpression": "a = :n", "ExpressionAttributeValues": {":n": {"N": "bob"}}'
@@ -115,8 +133,8 @@ REFUSED = [
      '"ReturnConsumedCapacity": "BAD"', RCC_ENUM),
 ]
 
-# Measured 2026-10-31 between 23:54 and 23:56 UTC: every other check comes
-# ahead of the number in ExclusiveStartKey.
+# Measured 2026-10-31 between 23:54 and 23:56 UTC: each check sent beside the
+# key comes ahead of the number in ExclusiveStartKey.
 KEY_AFTER_THE_OTHER_CHECKS = [
     ("Limit-0", BOB_KEY + ', "Limit": 0', LIMIT),
     ("Segment-minus-1", BOB_KEY + ', "Segment": -1, "TotalSegments": 2', SEGMENT),
@@ -131,17 +149,10 @@ KEY_AFTER_THE_OTHER_CHECKS = [
      '"ExclusiveStartKey": {"pk": {"N": "fred"}, "sk": {"S": "x"}}, ' + BOB_FILTER, NUMERIC_BOB),
 ]
 
-# Measured 2026-10-31 between 23:54 and 23:56 UTC: inside the key a number
-# fault anywhere comes ahead of an empty value or an unknown type descriptor,
-# in either member order; two number faults name the first member; a key
-# whose only fault is an empty value answers the service's key text.
-KEY_FAULTS = [
-    ("empty-pk-then-bob", '"ExclusiveStartKey": {"pk": {}, "sk": {"N": "bob"}}', NUMERIC_BOB),
-    ("bob-then-empty-pk", '"ExclusiveStartKey": {"sk": {"N": "bob"}, "pk": {}}', NUMERIC_BOB),
-    ("type-X-pk-then-bob", '"ExclusiveStartKey": {"pk": {"X": "1"}, "sk": {"N": "bob"}}',
-     NUMERIC_BOB),
-    ("bob-then-fred", '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"N": "fred"}}',
-     NUMERIC_BOB),
+# Measured 2026-10-31 and 2026-11-05: a number fault anywhere in the key, in
+# an NS, in an L, in a non-key attribute and in an LSI key, answers the number
+# text with no prefix.
+KEY_NUMBER_FAULTS = [
     ("bob-in-an-NS", '"ExclusiveStartKey": {"pk": {"NS": ["bob"]}, "sk": {"S": "x"}}',
      NUMERIC_BOB),
     ("bob-in-an-L", '"ExclusiveStartKey": {"pk": {"L": [{"N": "bob"}]}, "sk": {"S": "x"}}',
@@ -152,7 +163,73 @@ KEY_FAULTS = [
     ("bob-in-the-index-key-of-an-LSI-scan",
      '"IndexName": "lsi", "ExclusiveStartKey": {"pk": {"S": "p0"}, "sk": {"S": "x"}, '
      '"ln": {"N": "bob"}}', NUMERIC_BOB),
-    ("empty-pk-alone", '"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+]
+
+# Measured 2026-11-05: each key alone (the keys of MEASURED-scan-r3 section 4).
+# A shape fault answers the service's text with the key prefix; a set fault
+# answers the service's text with no prefix.
+KEYS_ALONE = [
+    ("empty", '{"pk": {}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+    ("type-X", '{"pk": {"X": "1"}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+    ("lower-case-s", '{"pk": {"s": "x"}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+    ("empty-in-an-M", '{"pk": {"M": {"k": {}}}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+    ("empty-in-an-L", '{"pk": {"L": [{}]}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE),
+    ("empty-non-key-attribute", '{"pk": {"S": "p0"}, "sk": {"S": "x"}, "z": {}}', EMPTY_KEY_VALUE),
+    ("two-descriptors", '{"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}', TWO_DESCRIPTORS),
+    ("NS-empty", '{"pk": {"NS": []}, "sk": {"S": "x"}}', NS_EMPTY),
+    ("SS-empty", '{"pk": {"SS": []}, "sk": {"S": "x"}}', SS_EMPTY),
+    ("BS-empty", '{"pk": {"BS": []}, "sk": {"S": "x"}}', BS_EMPTY),
+    ("NS-duplicates", '{"pk": {"NS": ["1", "1"]}, "sk": {"S": "x"}}', NS_DUP),
+    ("NS-duplicates-by-value", '{"pk": {"NS": ["1", "1.0"]}, "sk": {"S": "x"}}', NS_DUP),
+    ("SS-duplicates", '{"pk": {"SS": ["a", "a"]}, "sk": {"S": "x"}}', SS_DUP),
+    ("NS-empty-non-key-attribute", '{"pk": {"S": "p0"}, "sk": {"S": "x"}, "z": {"NS": []}}',
+     NS_EMPTY),
+]
+
+# Measured 2026-11-05: faults in two members of one key. The service's choice
+# follows the attribute names and, on some tables, the request's member order:
+# {"pk": {}, "sk": {"N": "bob"}} answered bob on 2026-10-31, and {"a": {}, "b":
+# {"N": "bob"}} the empty value. Each row accepts either member's fault.
+TWO_MEMBER_FAULTS = [
+    ("empty-pk-then-bob", '{"pk": {}, "sk": {"N": "bob"}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+    ("bob-then-empty-pk", '{"sk": {"N": "bob"}, "pk": {}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+    ("type-X-pk-then-bob", '{"pk": {"X": "1"}, "sk": {"N": "bob"}}',
+     (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+    ("bob-then-empty-sk", '{"pk": {"N": "bob"}, "sk": {}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+    ("two-descriptors-then-bob", '{"pk": {"S": "x", "N": "1"}, "sk": {"N": "bob"}}',
+     (TWO_DESCRIPTORS, NUMERIC_BOB)),
+    ("NS-empty-then-bob", '{"pk": {"NS": []}, "sk": {"N": "bob"}}', (NS_EMPTY, NUMERIC_BOB)),
+    ("empty-then-NS-empty", '{"pk": {}, "sk": {"NS": []}}', (EMPTY_KEY_VALUE, NS_EMPTY)),
+    ("NS-empty-then-empty", '{"pk": {"NS": []}, "sk": {}}', (EMPTY_KEY_VALUE, NS_EMPTY)),
+    ("empty-then-NS-bob", '{"pk": {}, "sk": {"NS": ["1", "bob"]}}', (EMPTY_KEY_VALUE, NUMERIC_BOB)),
+]
+
+# Measured 2026-11-05 (MEASURED-scan-r3 section 2): beside each class of key
+# fault, a check of each stage. The request parameter checks come ahead of
+# every key fault; the shape faults come ahead of the expression checks and of
+# the table lookup; the expression checks come ahead of the number and set
+# faults, which come ahead of the table lookup.
+KEY_CLASSES = [
+    ("empty", '{"pk": {}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE, True),
+    ("type-X", '{"pk": {"X": "1"}, "sk": {"S": "x"}}', EMPTY_KEY_VALUE, True),
+    ("two-descriptors", '{"pk": {"S": "x", "N": "1"}, "sk": {"S": "x"}}', TWO_DESCRIPTORS, True),
+    ("bob", '{"pk": {"N": "bob"}, "sk": {"S": "x"}}', NUMERIC_BOB, False),
+    ("NS-empty", '{"pk": {"NS": []}, "sk": {"S": "x"}}', NS_EMPTY, False),
+    ("SS-duplicates", '{"pk": {"SS": ["a", "a"]}, "sk": {"S": "x"}}', SS_DUP, False),
+]
+STAGES = [
+    # A request parameter check (S1): ahead of every key fault. The head's
+    # text carries a suffix the service dropped (#722), so the test asserts the
+    # prefix of the text.
+    ("ExpressionAttributeValues-with-no-expression",
+     '"ExpressionAttributeValues": {":a": {"S": "x"}}', "parameter"),
+    # An expression check (S3): ahead of a number or set fault, after a shape
+    # fault.
+    ("unused-value",
+     '"FilterExpression": "a = :p", "ExpressionAttributeValues": {":p": {"S": "x"}, ":u": {"S": "y"}}',
+     "expression"),
+    # The table's indexes (S5): after every key fault.
+    ("missing-index", '"IndexName": "nope"', "table"),
 ]
 
 # Measured 2026-10-31 between 23:54 and 23:56 UTC on a table with an N hash
@@ -275,8 +352,7 @@ class TestRequestChecks:
 
 
 class TestExclusiveStartKey:
-    """The numbers in the key, after every other check and ahead of the key's
-    other faults (measured 2026-10-31 between 23:54 and 23:56 UTC)."""
+    """The key's two stages (measured 2026-10-31 and 2026-11-05)."""
 
     @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_AFTER_THE_OTHER_CHECKS],
                              ids=[r[0] for r in KEY_AFTER_THE_OTHER_CHECKS])
@@ -289,8 +365,8 @@ class TestExclusiveStartKey:
 
     def test_the_select_rule_is_checked_ahead_of_the_key(self, dynamodb_client, table):
         # The service answers '1 validation error detected: ' and then this
-        # text. The Scan text here has no prefix, so only the check's place
-        # is asserted.
+        # text (#832). The Scan text here has no prefix, so only the check's
+        # place is asserted.
         fields = BOB_KEY + ', "Select": "SPECIFIC_ATTRIBUTES"'
         message = _validation_message(*_scan(dynamodb_client, table, fields))
         assert message.endswith(SELECT_SPECIFIC), message
@@ -304,11 +380,89 @@ class TestExclusiveStartKey:
         message = _validation_message(*_scan(dynamodb_client, table, fields))
         assert message.startswith("Invalid FilterExpression:"), message
 
-    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_FAULTS],
-                             ids=[r[0] for r in KEY_FAULTS])
-    def test_a_number_fault_comes_ahead_of_the_other_faults_in_the_key(
-            self, dynamodb_client, table, fields, expected):
+    @pytest.mark.parametrize("fields, expected", [r[1:] for r in KEY_NUMBER_FAULTS],
+                             ids=[r[0] for r in KEY_NUMBER_FAULTS])
+    def test_a_number_fault_anywhere_in_the_key(self, dynamodb_client, table, fields, expected):
         assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    @pytest.mark.parametrize("key, expected", [r[1:] for r in KEYS_ALONE],
+                             ids=[r[0] for r in KEYS_ALONE])
+    def test_each_key_alone(self, dynamodb_client, table, key, expected):
+        fields = '"ExclusiveStartKey": ' + key
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == expected
+
+    @pytest.mark.parametrize("key, either", [r[1:] for r in TWO_MEMBER_FAULTS],
+                             ids=[r[0] for r in TWO_MEMBER_FAULTS])
+    def test_two_faulty_members_answer_one_of_the_two_faults(
+            self, dynamodb_client, table, key, either):
+        fields = '"ExclusiveStartKey": ' + key
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message in either, message
+
+    def test_two_number_faults_name_one_of_them(self, dynamodb_client, table):
+        # The service named bob twice on 2026-10-31 (23:54 to 23:56 UTC) and
+        # fred on 2026-11-04 (23:45 UTC) for this key.
+        fields = '"ExclusiveStartKey": {"pk": {"N": "bob"}, "sk": {"N": "fred"}}'
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message in (NUMERIC_BOB, NUMERIC_FRED), message
+
+    @pytest.mark.parametrize("key, key_text, shape", [r[1:] for r in KEY_CLASSES],
+                             ids=[r[0] for r in KEY_CLASSES])
+    @pytest.mark.parametrize("check, stage", [(r[1], r[2]) for r in STAGES],
+                             ids=[r[0] for r in STAGES])
+    def test_each_stage_beside_each_key_fault(
+            self, dynamodb_client, table, key, key_text, shape, check, stage):
+        fields = '"ExclusiveStartKey": ' + key + ", " + check
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        if stage == "parameter":
+            assert message.startswith(EAV_NO_EXPRESSION), message
+        elif stage == "expression" and not shape:
+            assert message == UNUSED_U
+        else:
+            # A shape fault comes ahead of the expression check; every key
+            # fault comes ahead of the index resolution.
+            assert message == key_text
+
+    def test_the_segment_pairing_is_checked_ahead_of_a_number_in_the_key(
+            self, dynamodb_client, table):
+        # Measured 2026-11-05: Segment without TotalSegments answers its own
+        # text beside bob in the key, and the key's text beside an empty value.
+        fields = BOB_KEY + ', "Segment": 0'
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message == ("The TotalSegments parameter is required but was not present in the "
+                           "request when Segment parameter is present"), message
+        fields = '"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}, "Segment": 0'
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == EMPTY_KEY_VALUE
+
+    def test_an_undefined_filter_value_is_checked_ahead_of_a_number_in_the_key(
+            self, dynamodb_client, table):
+        # Measured 2026-11-05.
+        fields = BOB_KEY + ', "FilterExpression": "a = :zz"'
+        message = _validation_message(*_scan(dynamodb_client, table, fields))
+        assert message == ("Invalid FilterExpression: An expression attribute value used in "
+                           "expression is not defined; attribute value: :zz"), message
+
+    def test_a_missing_table_is_reported_after_a_number_in_the_key(self, dynamodb_client):
+        # Measured 2026-11-05: the key's number text ahead of
+        # ResourceNotFoundException.
+        status, payload = _scan(dynamodb_client, unique_name("nosuch"), BOB_KEY)
+        assert status == 400, payload
+        assert payload.get("__type", "").endswith("ValidationException"), payload
+        assert payload.get("message") == NUMERIC_BOB, payload
+
+    def test_an_empty_expression_value_is_reported_after_the_key_and_ahead_of_the_table(
+            self, dynamodb_client, table):
+        # Measured 2026-11-05: {":a": {}} read by the filter answers its own
+        # text with no key and the key's text beside bob or an empty set.
+        eav = '"FilterExpression": "a = :a", "ExpressionAttributeValues": {":a": {}}'
+        text = ("ExpressionAttributeValues contains invalid value: Supplied AttributeValue is "
+                "empty, must contain exactly one of the supported datatypes for key :a")
+        assert _validation_message(*_scan(dynamodb_client, table, eav)) == text
+        assert _validation_message(*_scan(dynamodb_client, table, BOB_KEY + ", " + eav)) == NUMERIC_BOB
+        fields = '"ExclusiveStartKey": {"pk": {"NS": []}, "sk": {"S": "x"}}, ' + eav
+        assert _validation_message(*_scan(dynamodb_client, table, fields)) == NS_EMPTY
+        status, payload = _scan(dynamodb_client, unique_name("nosuch"), eav)
+        assert payload.get("message") == text, payload
 
     @pytest.mark.parametrize("fields, expected", [r[1:] for r in N_KEY_FAULTS],
                              ids=[r[0] for r in N_KEY_FAULTS])
