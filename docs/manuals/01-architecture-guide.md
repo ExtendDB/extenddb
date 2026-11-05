@@ -247,7 +247,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- Sessions expire after 8 hours of inactivity
+- Sessions expire after 8 hours of inactivity, and 24 hours after login however active they are
 
 ### Input Validation
 
@@ -277,7 +277,7 @@ The console reads all data through four of the traits that `CatalogStore` combin
 
 ### Authentication Model
 
-- Session-based authentication; sessions expire after 8 hours of inactivity
+- Session-based authentication; sessions expire after 8 hours of inactivity, and 24 hours after login however active they are
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers

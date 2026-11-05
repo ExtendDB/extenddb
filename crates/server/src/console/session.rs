@@ -5,8 +5,9 @@
 //!
 //! Sessions are random 32-byte hex tokens stored in a cookie. They map to a
 //! `CallerIdentity` (admin or IAM user) and a CSRF token for form protection.
-//! Sessions expire after 8 hours of inactivity. A background reaper is not
-//! needed: expired sessions are pruned lazily on lookup.
+//! Sessions expire after 8 hours of inactivity, and 24 hours after login
+//! however active they are. A background reaper is not needed: expired
+//! sessions are pruned lazily on lookup.
 //!
 //! Each session also holds a [`CredentialStamp`] of the password hash its
 //! principal logged in with. [`SessionStore::validate`] reads the principal's
@@ -27,6 +28,14 @@ use crate::management::CallerIdentity;
 
 /// How long a session remains valid without activity.
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+
+/// How long a session remains valid after login, however active it is.
+///
+/// Activity refreshes the idle timeout, so without this cap a session token
+/// that is used at least every [`SESSION_TTL`] would stay valid until the
+/// process restarts. The cookie's `Max-Age` does not bound it: the server
+/// never sees that attribute, and a stolen token can be sent without it.
+const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 /// Maximum sessions before lazy pruning triggers on insert.
 const MAX_SESSIONS: usize = 10_000;
@@ -51,7 +60,17 @@ struct SessionEntry {
     identity: CallerIdentity,
     csrf_token: String,
     stamp: CredentialStamp,
+    created_at: Instant,
     last_active: Instant,
+}
+
+impl SessionEntry {
+    /// Whether the session has been idle longer than `ttl`, or has existed
+    /// longer than `max_lifetime`, as of `now`.
+    fn is_expired(&self, now: Instant, ttl: Duration, max_lifetime: Duration) -> bool {
+        now.saturating_duration_since(self.last_active) > ttl
+            || now.saturating_duration_since(self.created_at) > max_lifetime
+    }
 }
 
 /// Result of [`SessionStore::validate`].
@@ -81,6 +100,9 @@ pub struct SessionStore {
     /// How long a session lasts without activity: [`SESSION_TTL`], except in
     /// tests.
     ttl: Duration,
+    /// How long a session lasts after login: [`SESSION_MAX_LIFETIME`], except
+    /// in tests.
+    max_lifetime: Duration,
 }
 
 impl Default for SessionStore {
@@ -96,16 +118,18 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             ttl: SESSION_TTL,
+            max_lifetime: SESSION_MAX_LIFETIME,
         }
     }
 
     /// Create an empty session store whose sessions last `ttl` without
-    /// activity.
+    /// activity and `max_lifetime` after login.
     #[cfg(test)]
-    fn with_ttl(ttl: Duration) -> Self {
+    fn with_limits(ttl: Duration, max_lifetime: Duration) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             ttl,
+            max_lifetime,
         }
     }
 
@@ -118,18 +142,19 @@ impl SessionStore {
     ) -> (String, String) {
         let token = generate_token();
         let csrf = generate_token();
+        let now = Instant::now();
         let entry = SessionEntry {
             identity,
             csrf_token: csrf.clone(),
             stamp,
-            last_active: Instant::now(),
+            created_at: now,
+            last_active: now,
         };
         let mut map = self.sessions.lock().await;
         // Lazy prune if too many sessions.
         if map.len() >= MAX_SESSIONS {
-            let now = Instant::now();
-            let ttl = self.ttl;
-            map.retain(|_, e| now.duration_since(e.last_active) < ttl);
+            let (ttl, max_lifetime) = (self.ttl, self.max_lifetime);
+            map.retain(|_, e| !e.is_expired(now, ttl, max_lifetime));
         }
         map.insert(token.clone(), entry);
         (token, csrf)
@@ -166,11 +191,12 @@ impl SessionStore {
     }
 
     /// Look up a session by token. Returns `(identity, csrf_token, stamp)` if
-    /// it has not expired. Does not refresh the last-active timestamp.
+    /// it has neither been idle too long nor outlived its maximum lifetime.
+    /// Does not refresh the last-active timestamp.
     async fn lookup(&self, token: &str) -> Option<(CallerIdentity, String, CredentialStamp)> {
         let mut map = self.sessions.lock().await;
         let entry = map.get(token)?;
-        if entry.last_active.elapsed() > self.ttl {
+        if entry.is_expired(Instant::now(), self.ttl, self.max_lifetime) {
             map.remove(token);
             return None;
         }
