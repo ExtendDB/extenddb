@@ -21,10 +21,10 @@
 #             untested. Each job builds with `load: true`, smoke tests the
 #             result, saves the image as a workflow artifact, and fails if the
 #             saved tarball has a fixable high or critical vulnerability in
-#             its operating system packages. `docker
-#             save`/`load` preserves the image ID, so the artifact is
-#             bit-for-bit what was tested. These jobs hold NO registry
-#             credentials.
+#             its operating system packages. It also writes the image SBOM
+#             from the same tarball. `docker save`/`load` preserves the image
+#             ID, so the artifact is bit-for-bit what was tested. These jobs
+#             hold NO registry credentials and no OIDC token.
 #
 #   publish   Runs once, after both architectures pass. The only job with
 #             Docker Hub credentials; the token never coexists with a job
@@ -38,6 +38,12 @@
 #             idempotent, fail-closed, digest-asserted. GHCR writes are gated
 #             by the ghcr environment's own reviewers; the ECR role's OIDC
 #             trust covers both protected environments.
+#
+#   attest    After publish, alongside propagate: GitHub artifact attestations
+#             of the build provenance (the index and both architectures) and
+#             of each architecture's SBOM. No registry credential and no
+#             approval of its own; it runs only first-party pinned actions,
+#             because its OIDC token can sign as this workflow.
 #
 # Trigger: manual workflow_dispatch only. There is intentionally no
 # `push: tags:` trigger: a tag-triggered run executes the workflow definition
@@ -355,6 +361,11 @@ jobs:
         # Scans the saved tarball, so the result describes the bytes publish
         # pushes, and the scanner gets no Docker socket. --ignore-unfixed: a
         # finding with no fixed package version cannot be cleared by a rebuild.
+        # --skip-files keeps the extenddb binary out of the gate, where it was
+        # before cargo-auditable made its crate list visible to the scanner.
+        # That list comes from Cargo's resolution and can name crates the
+        # binary does not link, so gating on it could block a release over an
+        # unlinked crate. The SBOM lists it; gating on it is a separate decision.
         env:
           TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
         run: |
@@ -362,9 +373,61 @@ jobs:
           docker run --rm \
             -v "$PWD/image-${{ matrix.arch }}.tar.gz:/image.tar.gz:ro" \
             "$TRIVY_IMAGE" image --input /image.tar.gz \
-            --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
+            --scanners vuln --skip-files usr/local/bin/extenddb \
+            --ignore-unfixed --severity HIGH,CRITICAL \
             --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
             --exit-code 1 --no-progress
+
+      - name: Generate the SBOM from the saved tarball
+        # Same pinned scanner and the same tarball as the gate above, so the
+        # SBOM describes the bytes publish pushes: the OS packages and, through
+        # cargo-auditable, the crates Cargo resolved for the binary. It is made
+        # here, in a job with no credential and no OIDC token, and attested by
+        # the attest job. The scanner records the image ID (the config digest,
+        # computed from the tarball) in the SBOM, which lets that job confirm
+        # the registry holds this exact image before it attests anything.
+        # Crates are required only when the tagged commit's Dockerfile builds
+        # with cargo-auditable; a tag cut before that has an OS-only SBOM.
+        env:
+          TRIVY_IMAGE: public.ecr.aws/aquasecurity/trivy:0.76.0@sha256:2416d1f74045b57274df1a340eee6b510cacd73c66a6ccb8da092b117eb7d222
+          ARCH: ${{ matrix.arch }}
+          DOCKERFILE: ${{ needs.gate.outputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          # The SBOM goes to stdout (logs go to stderr), so the scanner needs
+          # no writable mount.
+          docker run --rm \
+            -v "$PWD/image-${ARCH}.tar.gz:/image.tar.gz:ro" \
+            "$TRIVY_IMAGE" image --input /image.tar.gz \
+            --format cyclonedx --no-progress --skip-version-check \
+            > "sbom/sbom-${ARCH}.cdx.json"
+          REQUIRE_CRATES=0
+          grep -q 'cargo auditable build' "$DOCKERFILE" && REQUIRE_CRATES=1
+          python3 - "sbom/sbom-${ARCH}.cdx.json" "$REQUIRE_CRATES" <<'PY'
+          import json, re, sys
+          bom = json.load(open(sys.argv[1]))
+          crates = [c for c in bom.get("components", []) if c.get("purl", "").startswith("pkg:cargo/")]
+          ids = [p.get("value", "") for p in bom.get("metadata", {}).get("component", {}).get("properties", [])
+                 if p.get("name") == "aquasecurity:trivy:ImageID"]
+          if (bom.get("bomFormat") != "CycloneDX" or not bom.get("components") or len(ids) != 1
+                  or not re.fullmatch(r"sha256:[0-9a-f]{64}", ids[0])):
+              print(f"::error::{sys.argv[1]} is not a CycloneDX SBOM of one image")
+              sys.exit(1)
+          if not crates:
+              if sys.argv[2] == "1":
+                  print(f"::error::{sys.argv[1]} lists no crates, but the Dockerfile builds with cargo-auditable")
+                  sys.exit(1)
+              print(f"::warning::{sys.argv[1]} lists no crates: this tag's Dockerfile predates cargo-auditable")
+          print(f"{len(bom['components'])} components, {len(crates)} of them crates; image {ids[0]}")
+          PY
+
+      - name: Upload the SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: sbom-${{ matrix.arch }}
+          path: sbom/
+          retention-days: 7      # a failed attest job can be re-run for a week
 
       - name: Upload the image artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -627,16 +690,107 @@ jobs:
           skopeo logout ghcr.io || true
           skopeo logout public.ecr.aws || true
 
+  # Build provenance and the SBOMs, as GitHub artifact attestations
+  # (Sigstore-signed, stored in this repository's attestation API) bound to the
+  # published digests. GitHub generates the provenance from this run's OIDC
+  # identity: the workflow, the ref, the commit of main it ran from, and the
+  # run. The commit it BUILT is the image's org.opencontainers.image.revision
+  # label, which the digest covers. These are GitHub attestations rather than
+  # BuildKit's: BuildKit's cannot be loaded into the classic docker image store
+  # that `load: true` uses on these runners.
+  #
+  # A separate job, so it never holds the Docker Hub credential. Its OIDC token
+  # can sign as this workflow, so it runs only first-party pinned actions and
+  # the runner's skopeo and jq; the SBOM is generated in build, not here. If it
+  # fails, re-run it from the same run: the SBOM artifacts are kept 7 days.
+  attest:
+    needs: [gate, publish-candidate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write       # Sigstore certificate for the attestations
+      attestations: write   # store them in this repository's attestation API
+    env:
+      SUBJECT: docker.io/${{ needs.gate.outputs.image_repo }}
+      DIGEST: ${{ needs.publish-candidate.outputs.digest }}
+    steps:
+      - name: Download the SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          path: sbom
+          pattern: sbom-*
+          merge-multiple: true
+
+      - name: Resolve the subjects; refuse images this run did not build
+        id: subjects
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::publish digest is malformed: ${DIGEST}"; exit 1; }
+          # The runner's skopeo (1.13 on ubuntu-24.04) does not check that
+          # `inspect --raw` bytes hash to the requested digest, so every read
+          # is checked here before any field in it is trusted. The index digest
+          # then pins both per-arch manifests, and each pins its image ID.
+          fetch() {
+            skopeo inspect --no-creds --retry-times 3 --raw "docker://${SUBJECT}@$1" > "$2"
+            echo "${1#sha256:}  $2" | sha256sum --check --quiet --strict - \
+              || { echo "::error::registry bytes for ${SUBJECT}@$1 do not match that digest"; exit 1; }
+          }
+          fetch "$DIGEST" index.json
+          # Exactly the two images this run built: an extra entry would put a
+          # platform this run never built under the index's provenance.
+          jq -e '(.manifests | length) == 2' index.json > /dev/null \
+            || { echo "::error::${SUBJECT}@${DIGEST} lists images other than the two this run built"; exit 1; }
+          printf '%s %s\n' "${DIGEST#sha256:}" "$SUBJECT" > subjects.txt
+          SBOM_OK=true
+          for arch in amd64 arm64; do
+            MD=$(jq -r --arg a "$arch" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $a) | .digest] | if length == 1 then .[0] else "" end' index.json)
+            [[ "$MD" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || { echo "::error::expected exactly one linux/${arch} manifest in ${SUBJECT}@${DIGEST}"; exit 1; }
+            fetch "$MD" "manifest-${arch}.json"
+            REMOTE_ID=$(jq -r '.config.digest' "manifest-${arch}.json")
+            LOCAL_ID=$(jq -r '[.metadata.component.properties[] | select(.name == "aquasecurity:trivy:ImageID") | .value] | if length == 1 then .[0] else "" end' "sbom/sbom-${arch}.cdx.json")
+            if [[ ! "$LOCAL_ID" =~ ^sha256:[0-9a-f]{64}$ || "$REMOTE_ID" != "$LOCAL_ID" ]]; then
+              echo "::error::linux/${arch} ${MD} is image ${REMOTE_ID}, not ${LOCAL_ID} which this run built and described; refusing to attest"
+              exit 1
+            fi
+            jq -e '[.components[]? | select((.purl // "") | startswith("pkg:cargo/"))] | length > 0' \
+              "sbom/sbom-${arch}.cdx.json" > /dev/null || SBOM_OK=false
+            printf '%s %s\n' "${MD#sha256:}" "$SUBJECT" >> subjects.txt
+            echo "${arch}=${MD}" >> "$GITHUB_OUTPUT"
+          done
+          cat subjects.txt
+          # An SBOM without the binary's crates (a tag cut before
+          # cargo-auditable) would understate the image, so it is not attested.
+          echo "sbom=${SBOM_OK}" >> "$GITHUB_OUTPUT"
+          [[ "$SBOM_OK" == "true" ]] || echo "::warning::no crate list in the SBOMs; attesting provenance only"
+
+      - name: Attest the build provenance (the index and both architectures)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-checksums: subjects.txt
+
+      - name: Attest the linux/amd64 SBOM
+        if: steps.subjects.outputs.sbom == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: ${{ env.SUBJECT }}
+          subject-digest: ${{ steps.subjects.outputs.amd64 }}
+          sbom-path: sbom/sbom-amd64.cdx.json
+
+      - name: Attest the linux/arm64 SBOM
+        if: steps.subjects.outputs.sbom == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+        with:
+          subject-name: ${{ env.SUBJECT }}
+          subject-digest: ${{ steps.subjects.outputs.arm64 }}
+          sbom-path: sbom/sbom-arm64.cdx.json
+
 # Deliberate omissions, and what closing them would cost.
 #
 # No version tag or `latest`: promotion is promote-image's job — a separate
 # human decision (soak time), one approved dispatch, all three registries.
-#
-# No provenance or SBOM attestations. Those are produced by the registry/OCI
-# exporter, while `load: true` requires the local docker exporter, and `load`
-# is what makes it possible to smoke test the image before any credential
-# exists in the job. A staging-repository push-then-promote flow would enable
-# them; considered follow-up.
 #
 # Neither the smoke test nor the licence check runs on pull requests. This
 # gates releases, not merges.
