@@ -9,10 +9,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use extenddb_storage::BoxedFuture as BoxFuture;
 
 use super::fixtures::{ACCOUNT, EVENTS, ORDERS, USERS, gsi_info, lsi_info, table_info};
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{
     BackupDescription, BackupDetails, BackupSummary, CreateTableInput, DeleteTableInput,
@@ -20,13 +22,18 @@ use extenddb_core::types::{
     StreamDescription, StreamRecord, TableDescription, TableKeyInfo, Tag, TimeToLiveDescription,
     UpdateTableInput,
 };
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim,
+    RestoreJobRow, RestoreTargetKey, StoreIdentity, TimeBounds,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupEngine, BackupRestoreSource, DataEngine, IdempotencyKey, ItemPairResult, MetadataEngine,
-    QueryResult, ReadOptions, RestoreRequest, SnapshotEngine, StreamCapture, StreamEngine,
-    StreamListResult, StreamRecordsResult, TableEngine, TableSnapshot, TransactGetOp,
-    TransactWriteOp, TtlTableInfo, WorkerStore,
+    BackupCatalog, BackupRestoreSource, DataEngine, IdempotencyKey, ItemPairResult, JobPermit,
+    LegacyBackupReader, MetadataEngine, QueryResult, ReadOptions, RestoreRequest, SnapshotEngine,
+    StreamCapture, StreamEngine, StreamListResult, StreamRecordsResult, TableEngine, TableSnapshot,
+    TransactGetOp, TransactWriteOp, TtlTableInfo, WorkerStore,
 };
+use futures::stream::BoxStream;
 
 /// One read that reached storage.
 #[derive(Debug, Clone)]
@@ -465,17 +472,111 @@ impl WorkerStore for RecordingStorage {
     }
 }
 
-impl BackupEngine for RecordingStorage {
-    fn create_backup(
+impl BackupCatalog for RecordingStorage {
+    fn catalog_id(&self) -> BoxFuture<'_, Result<String, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn claim_backup<'a>(
+        &'a self,
+        _row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn list_backup_rows<'a>(
+        &'a self,
+        _status: Option<BackupStatus>,
+        _store: &'a StoreIdentity,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn list_account_backup_rows<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _table_name: Option<&'a str>,
+        _bounds: &'a TimeBounds,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn read_backup_row<'a>(
+        &'a self,
+        _arn: &'a BackupArn,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn start_backup_delete<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn set_backup_deleted<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn remove_backup_row<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn backup_in_use<'a>(
+        &'a self,
+        _key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<Option<String>, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn remove_restore_target<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn list_dead_restore_jobs(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn fail_restore_job<'a>(
+        &'a self,
+        _key: &'a RestoreTargetKey,
+        _owner_generation: u64,
+        _heartbeat_at: f64,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+}
+
+impl LegacyBackupReader for RecordingStorage {
+    fn create(
         &self,
         _account_id: &str,
         _table_name: &str,
         _backup_name: &str,
+        _permit: JobPermit,
     ) -> BoxFuture<'_, Result<BackupDetails, StorageError>> {
         unimplemented!("not reached by read handlers")
     }
 
-    fn describe_backup(
+    fn describe(
         &self,
         _account_id: &str,
         _backup_arn: &str,
@@ -483,7 +584,7 @@ impl BackupEngine for RecordingStorage {
         unimplemented!("not reached by read handlers")
     }
 
-    fn list_backups(
+    fn list(
         &self,
         _account_id: &str,
         _table_name: Option<&str>,
@@ -491,7 +592,7 @@ impl BackupEngine for RecordingStorage {
         unimplemented!("not reached by read handlers")
     }
 
-    fn delete_backup(
+    fn delete(
         &self,
         _account_id: &str,
         _backup_arn: &str,
@@ -499,7 +600,7 @@ impl BackupEngine for RecordingStorage {
         unimplemented!("not reached by read handlers")
     }
 
-    fn backup_restore_source(
+    fn restore_source(
         &self,
         _account_id: &str,
         _backup_arn: &str,
@@ -507,11 +608,19 @@ impl BackupEngine for RecordingStorage {
         unimplemented!("not reached by read handlers")
     }
 
-    fn restore_table_from_backup(
+    fn restore(
         &self,
         _account_id: &str,
         _request: RestoreRequest,
+        _permit: JobPermit,
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
+        unimplemented!("not reached by read handlers")
+    }
+
+    fn abandoned_creating_backups(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
         unimplemented!("not reached by read handlers")
     }
 }
