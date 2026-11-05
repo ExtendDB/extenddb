@@ -38,8 +38,11 @@
 //!
 //! In the SET clause, a sign before a value that is not a number comes after
 //! the number literals of the clause that break an item number rule, in
-//! either order (measured 2026-11-02 with a unary plus). Those numbers are
-//! otherwise left to the checks made once the statement parses.
+//! either order (measured 2026-11-02 with a unary plus), and after a
+//! negative zero decimal (measured 2026-11-05). Those numbers are otherwise
+//! left to the checks made once the statement parses; a negative zero
+//! decimal in the SET, REMOVE and VALUE parts is reported here, in its
+//! place among them (see [`Parser::note_number`]).
 //!
 //! The walk goes over the condition as a tree, while the parser reads it in
 //! the order it is written. The walk meets an operator before its operands
@@ -50,8 +53,8 @@
 //! while the condition is read (an operator a condition does not take, an
 //! unknown function, MISSING as a value, a literal nested too deep, a
 //! parameter inside a literal), a number literal that breaks an item number
-//! rule, also inside a list or map literal, and, for a request, a `?` with no
-//! parameter left in it. The order is the same within the operator limit and
+//! rule or is a negative zero decimal, also inside a list or map literal,
+//! and, for a request, a `?` with no parameter left in it. The order is the same within the operator limit and
 //! past it. Some checks are met after the operands they apply to (measured
 //! 2026-11-02): the refusal of `IS INT4` after its left side (`1e126 IS INT4`
 //! is refused for the number), an operand that is not a condition, as an
@@ -72,6 +75,7 @@
 //! ahead of its part of the statement in this order.
 
 use super::limits::{MAX_IN_OPERANDS, too_many_in_operands, too_many_operators};
+use super::operands::SignedNumber;
 use super::{
     EXISTS_OUTSIDE_TRANSACTION, IN_OPERANDS, PARAMETER_COUNT_MISMATCH, PResult, ParseError, Parser,
     Statement,
@@ -105,8 +109,13 @@ pub(super) struct Findings {
     /// value.
     values_is_sign: bool,
     /// The first number literal in a SET value that breaks an item number
-    /// rule.
+    /// rule, or the first negative zero decimal in the clause when it comes
+    /// ahead of those numbers (see [`Parser::note_number`]).
     set_number: Option<String>,
+    /// Whether a number literal read in the SET, REMOVE and VALUE parts
+    /// breaks an item number rule. The engine reports that number once the
+    /// statement parses.
+    value_rule_number: bool,
     /// The first refusal found after the WHERE condition.
     after_where: Option<String>,
 }
@@ -214,6 +223,44 @@ impl Parser {
     pub(super) fn walk_after_operands(&mut self, refusal: &str) {
         if self.in_where {
             keep_first(&mut self.found.walk, refusal);
+        }
+    }
+
+    /// Note a number literal read with its signs at `path` inside its value
+    /// (`root`, `root[0]`, `root.k`). A negative zero decimal is refused at
+    /// the number (see `number::is_zero_decimal`), before the statement's
+    /// target is resolved (measured 2026-11-05: on a table that does not
+    /// exist, and ahead of the key type check of an INSERT). In the
+    /// condition the walk meets it as it meets a number that breaks an item
+    /// number rule (see [`Parser::walk_number`]). In the SET, REMOVE and
+    /// VALUE parts the two come in the order they are written (measured
+    /// 2026-11-05: `{'x':1e126,'y':-0.0}` is refused for the overflow,
+    /// `{'x':-0.0,'y':1e126}` and `{'x':{'b':-0.0,'a':1e126}}` for the
+    /// zero), so a number that breaks a rule first leaves the clause to the
+    /// engine. A sign before a value that is not a number comes after a
+    /// negative zero, as after those numbers (measured 2026-11-05 with
+    /// `SET x = +b, y = -0.0`).
+    pub(super) fn note_number(&mut self, number: &SignedNumber, path: &str) {
+        let zero = number
+            .negative_zero
+            .then(|| crate::partiql::number::negative_zero_refusal(path, &number.at));
+        match self.part() {
+            Part::Where => match zero {
+                Some(refusal) => keep_first(&mut self.found.walk, &refusal),
+                None => self.walk_number(&number.text, path),
+            },
+            Part::Values if !self.found.value_rule_number => match zero {
+                Some(refusal) if self.found.values_is_sign => {
+                    self.found.set_number.get_or_insert(refusal);
+                }
+                Some(refusal) => keep_first(&mut self.found.values, &refusal),
+                None => {
+                    self.found.value_rule_number =
+                        crate::partiql::number::literal_number_refusal(&number.text, path)
+                            .is_some();
+                }
+            },
+            _ => {}
         }
     }
 

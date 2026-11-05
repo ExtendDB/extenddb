@@ -230,3 +230,118 @@ fn literals_in_range_pass() {
     .unwrap();
     assert!(check_literal_numbers(&stmt).is_ok());
 }
+
+#[test]
+fn a_zero_with_a_point_or_an_exponent_is_a_zero_decimal() {
+    for text in [
+        "0.0", ".0", "0.", "00.0", "0.00", "0e0", "0E-3", "0.0e0", "-0.0", "+0e5",
+    ] {
+        assert!(is_zero_decimal(text), "{text}");
+    }
+    for text in ["0", "00", "-0", "0.5", "1.0", "1e0", "10e-1", ".", ""] {
+        assert!(!is_zero_decimal(text), "{text}");
+    }
+}
+
+/// The refusal of a negative zero decimal at `path`, the number `number`
+/// being its first occurrence in `sql` from byte `from` on.
+fn negative_zero(sql: &str, number: &str, path: &str, from: usize) -> String {
+    let column = sql[from..].find(number).unwrap() + from + 1;
+    negative_zero_refusal(path, &format!("1:{column}:{}", number.len()))
+}
+
+#[test]
+fn a_negative_zero_decimal_is_refused_at_the_number_after_its_signs() {
+    let insert = |value: &str| format!("INSERT INTO \"t\" VALUE {{'pk':'a','x':{value}}}");
+    for (value, number, path) in [
+        ("-0.0", "0.0", "root"),
+        ("- 0.0", "0.0", "root"),
+        ("- -0.0", "0.0", "root"),
+        ("- - -0.0", "0.0", "root"),
+        ("+-0.0", "0.0", "root"),
+        ("-+0.0", "0.0", "root"),
+        ("-00.0", "00.0", "root"),
+        ("-0.00", "0.00", "root"),
+        ("-.0", ".0", "root"),
+        ("-0.", "0.", "root"),
+        ("-0E-3", "0E-3", "root"),
+        ("-0.0e0", "0.0e0", "root"),
+        ("[-0.0]", "0.0", "root[0]"),
+        ("{'y':-0.0}", "0.0", "root.y"),
+        ("<<-0.0, 1>>", "0.0", "root"),
+    ] {
+        let sql = insert(value);
+        let from = sql.find("'x'").unwrap();
+        assert_eq!(err(&sql), negative_zero(&sql, number, path, from), "{sql}");
+    }
+    // A key attribute too: the parse refuses it ahead of the key type check.
+    let sql = "INSERT INTO \"t\" VALUE {'pk':-0.0,'sk':'b'}";
+    assert_eq!(err(sql), negative_zero(sql, "0.0", "root", 0));
+    let update = |value: &str| format!("UPDATE \"t\" SET x = {value} WHERE pk = 'a'");
+    for (value, number, path) in [
+        ("-0e0", "0e0", "root"),
+        ("-(0.0)", "0.0", "root"),
+        ("(-0.0)", "0.0", "root"),
+        ("-(-0.0)", "0.0", "root"),
+        ("+(-0.0)", "0.0", "root"),
+        ("-(+0.0)", "0.0", "root"),
+        ("{'y': -0.0}", "0.0", "root.y"),
+        ("[1, -0.0]", "0.0", "root[1]"),
+        ("set_add(x, <<-0.0>>)", "0.0", "root"),
+    ] {
+        let sql = update(value);
+        assert_eq!(err(&sql), negative_zero(&sql, number, path, 0), "{sql}");
+    }
+    let select = |condition: &str| format!("SELECT * FROM \"t\" WHERE pk = 'a' AND {condition}");
+    for (condition, number, path) in [
+        ("x = -0.0", "0.0", "root"),
+        ("x = -0e0", "0e0", "root"),
+        ("x = - -0.0", "0.0", "root"),
+        ("x = -+0.0", "0.0", "root"),
+        ("x IN [-0.0]", "0.0", "root"),
+        ("x = [-0.0]", "0.0", "root[0]"),
+    ] {
+        let sql = select(condition);
+        assert_eq!(err(&sql), negative_zero(&sql, number, path, 0), "{sql}");
+    }
+}
+
+#[test]
+fn a_zero_with_no_minus_sign_or_written_as_an_integer_is_taken() {
+    for sql in [
+        "INSERT INTO \"t\" VALUE {'pk':'a','x':-0,'y':+0.0}",
+        "SELECT * FROM \"t\" WHERE pk = 'a' AND x = -0",
+    ] {
+        let stmt = parse(sql).unwrap();
+        assert!(check_literal_numbers(&stmt).is_ok(), "{sql}");
+    }
+}
+
+#[test]
+fn a_negative_zero_decimal_comes_in_statement_order_with_the_number_rules() {
+    let overflow = |path: &str| format!("{OVERFLOW_MESSAGE} under {path}");
+    let insert = |value: &str| format!("INSERT INTO \"t\" VALUE {{'pk':'a',{value}}}");
+    // In a value, the number written first is reported.
+    assert_eq!(err(&insert("'x':1e126,'y':-0.0")), overflow("root"));
+    let sql = insert("'x':-0.0,'y':1e126");
+    assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
+    // The members of a map in the order they are written, not by name.
+    let sql = insert("'x':{'b':-0.0,'a':1e126}");
+    assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root.b", 0));
+    assert_eq!(err(&insert("'x':{'y':1e126},'z':-0.0")), overflow("root.y"));
+    // Of two zeros, the first.
+    let sql = insert("'x':-0.0,'y':-0.0");
+    assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
+    let update = |sets: &str, condition: &str| {
+        format!("UPDATE \"t\" SET {sets} WHERE pk = 'a'{condition}")
+    };
+    let sql = update("x = -0.0, y = 1e126", "");
+    assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
+    assert_eq!(err(&update("x = 1e126, y = -0.0", "")), overflow("root"));
+    // The condition's numbers come first.
+    assert_eq!(err(&update("x = -0.0", " AND a = 1e126")), overflow("root"));
+    let select = |condition: &str| format!("SELECT * FROM \"t\" WHERE pk = 'a' AND {condition}");
+    assert_eq!(err(&select("a = 1e126 AND b = -0.0")), overflow("root"));
+    let sql = select("a = -0.0 AND b = 1e126");
+    assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
+}

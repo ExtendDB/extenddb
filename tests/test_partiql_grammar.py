@@ -1301,3 +1301,164 @@ def test_an_is_test_on_an_operand_in_parentheses_names_the_operand(dynamodb_clie
         "Unsupported data type for IS operator: Integer4Type. Supported data types are [MISSING, "
         f"NULL, BOOLEAN, BLOB, STRING, NUMERIC, STRUCT, TUPLE, LIST] at 1:{column}:1"
     )
+
+
+# ---- negative-zero decimals ----------------------------------------------------
+#
+# Measured 2026-11-05. A zero written with a decimal point or an exponent and a
+# minus sign before it, anywhere in the run of signs and parentheses before it,
+# is refused at the number, naming where it sits in its value. Among the other
+# refusals of a value it comes in statement order with the number rules and a
+# parameter inside a literal, after the condition's, and ahead of a sign
+# before a SET value that is not a number and of the table lookup. An integer
+# zero and a parameter are stored as 0.
+
+NEGATIVE_ZERO = "Negative zero decimal is not supported under key {} at 1:{}:{}"
+
+
+def _negative_zero(statement, number, path, start=0):
+    column = statement.index(number, start) + 1
+    return NEGATIVE_ZERO.format(path, column, len(number))
+
+
+@pytest.mark.parametrize(
+    ("value", "number", "path"),
+    [
+        ("-0.0", "0.0", "root"),
+        ("- 0.0", "0.0", "root"),
+        ("- -0.0", "0.0", "root"),
+        ("-+0.0", "0.0", "root"),
+        ("+-0.0", "0.0", "root"),
+        ("-0e0", "0e0", "root"),
+        ("-0E-3", "0E-3", "root"),
+        ("-.0", ".0", "root"),
+        ("-0.", "0.", "root"),
+        ("-00.0", "00.0", "root"),
+        ("-0.0e0", "0.0e0", "root"),
+        ("[1, -0.0]", "0.0", "root[1]"),
+        ("{'y': -0.0}", "0.0", "root.y"),
+        ("<<-0.0, 1>>", "0.0", "root"),
+    ],
+)
+def test_a_negative_zero_decimal_in_an_insert_is_refused(dynamodb_client, stable, value, number, path):
+    pk = f"nz-{uuid.uuid4().hex[:8]}"
+    statement = f"INSERT INTO \"{stable}\" VALUE {{'pk': '{pk}', 'x': {value}}}"
+    start = statement.index("'x'")
+    assert _message(dynamodb_client, statement) == _negative_zero(statement, number, path, start)
+    got = dynamodb_client.get_item(TableName=stable, Key={"pk": {"S": pk}}, ConsistentRead=True)
+    assert "Item" not in got
+
+
+@pytest.mark.parametrize(
+    ("template", "number", "path"),
+    [
+        ("UPDATE {t} SET x = -0e0 WHERE pk = '{k}'", "0e0", "root"),
+        ("UPDATE {t} SET x = -(0.0) WHERE pk = '{k}'", "0.0", "root"),
+        ("UPDATE {t} SET x = (-0.0) WHERE pk = '{k}'", "0.0", "root"),
+        ("UPDATE {t} SET x = -(+0.0) WHERE pk = '{k}'", "0.0", "root"),
+        ("UPDATE {t} SET x = {{'y': -0.0}} WHERE pk = '{k}'", "0.0", "root.y"),
+        ("UPDATE {t} SET x = set_add(x, <<-0.0>>) WHERE pk = '{k}'", "0.0", "root"),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND x = -0.0", "0.0", "root"),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND x = - -0.0", "0.0", "root"),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND x IN [-0.0]", "0.0", "root"),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND x = [-0.0]", "0.0", "root[0]"),
+        ("SELECT * FROM {t}-absent WHERE pk = '{k}' AND x = -0.0", "0.0", "root"),
+    ],
+    ids=[
+        "set-exponent",
+        "set-sign-before-parentheses",
+        "set-sign-in-parentheses",
+        "set-minus-before-a-plus",
+        "set-map-member",
+        "set-add-bag",
+        "where",
+        "where-two-minus-signs",
+        "where-in",
+        "where-list",
+        "ahead-of-the-table-lookup",
+    ],
+)
+def test_a_negative_zero_decimal_in_a_set_or_a_condition_is_refused(
+    dynamodb_client, stable, template, number, path
+):
+    pk = f"nz-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.put_item(TableName=stable, Item={"pk": {"S": pk}, "x": {"N": "0"}})
+    statement = template.format(t=f'"{stable}"', k=pk).replace('"-absent', '-absent"')
+    start = statement.index("x =") if "x =" in statement else statement.index("x IN")
+    assert _message(dynamodb_client, statement) == _negative_zero(statement, number, path, start)
+    item = dynamodb_client.get_item(TableName=stable, Key={"pk": {"S": pk}}, ConsistentRead=True)
+    assert item["Item"]["x"] == {"N": "0"}
+
+
+def test_an_integer_zero_and_a_negative_zero_parameter_are_zero(dynamodb_client, stable):
+    first, second = (f"nz-{uuid.uuid4().hex[:8]}" for _ in range(2))
+    dynamodb_client.execute_statement(
+        Statement=f"INSERT INTO \"{stable}\" VALUE {{'pk': '{first}', 'x': -0, 'y': +0.0}}"
+    )
+    dynamodb_client.execute_statement(
+        Statement=f"INSERT INTO \"{stable}\" VALUE {{'pk': '{second}', 'x': ?}}",
+        Parameters=[{"N": "-0.0"}],
+    )
+    for pk in (first, second):
+        item = dynamodb_client.get_item(TableName=stable, Key={"pk": {"S": pk}}, ConsistentRead=True)
+        assert item["Item"]["x"] == {"N": "0"}
+    statement = f"SELECT x FROM \"{stable}\" WHERE pk = '{second}' AND x = ?"
+    assert _select(dynamodb_client, statement, Parameters=[{"N": "-0.0"}]) == [{"x": {"N": "0"}}]
+
+
+@pytest.mark.parametrize(
+    ("value", "first"),
+    [
+        ("'x': 1e126, 'y': -0.0", "overflow"),
+        ("'x': -0.0, 'y': 1e126", "zero"),
+        ("'x': {'b': -0.0, 'a': 1e126}", "zero"),
+        ("'x': [-0.0, ?]", "zero"),
+        ("'x': [?, -0.0]", "parameter"),
+    ],
+)
+def test_a_negative_zero_in_an_insert_keeps_statement_order(dynamodb_client, stable, value, first):
+    statement = f"INSERT INTO \"{stable}\" VALUE {{'pk': 'nz-order', {value}}}"
+    parameters = [{"N": "1"}] if "?" in statement else None
+    kwargs = {"Parameters": parameters} if parameters else {}
+    if first == "overflow":
+        expected = OVERFLOW.format("root")
+    elif first == "zero":
+        path = "root.b" if "'b'" in value else ("root[0]" if "[" in value else "root")
+        expected = _negative_zero(statement, "0.0", path, statement.index("-0.0"))
+    else:
+        column = statement.index("?") + 1
+        expected = f"Unsupported data type: Parameter under key root[0] at 1:{column}:1"
+    assert _message(dynamodb_client, statement, **kwargs) == expected
+
+
+@pytest.mark.parametrize(
+    ("assignment", "condition", "first"),
+    [
+        ("x = -0.0, y = 1e126", "", "zero"),
+        ("x = 1e126, y = -0.0", "", "overflow"),
+        ("x = +b, y = -0.0", "", "zero"),
+        ("x = -0.0", " AND a = 1e126", "overflow"),
+    ],
+    ids=["zero-first", "overflow-first", "ahead-of-a-sign", "after-the-condition"],
+)
+def test_a_negative_zero_in_a_set_keeps_its_place(dynamodb_client, stable, assignment, condition, first):
+    statement = f"UPDATE \"{stable}\" SET {assignment} WHERE pk = 'nz-order'{condition}"
+    if first == "zero":
+        expected = _negative_zero(statement, "0.0", "root", statement.index("-0.0"))
+    else:
+        expected = OVERFLOW.format("root")
+    assert _message(dynamodb_client, statement) == expected
+
+
+def test_a_negative_zero_in_a_batch_and_a_transaction(dynamodb_client, stable):
+    statement = f"INSERT INTO \"{stable}\" VALUE {{'pk': 'nz-batch', 'x': -0.0}}"
+    expected = _negative_zero(statement, "0.0", "root", statement.index("'x'"))
+    responses = dynamodb_client.batch_execute_statement(Statements=[{"Statement": statement}])[
+        "Responses"
+    ]
+    assert responses == [{"Error": {"Code": "ValidationError", "Message": expected}}]
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[{"Statement": statement}])
+    assert e.value.response["Error"]["Message"] == (
+        f"Validation failed in TransactStatements[0]: {expected}"
+    )

@@ -226,7 +226,7 @@ impl Parser {
             self.defer(&literal_nesting_refusal(path));
         }
         if let Some(number) = self.signed_number() {
-            self.walk_number(&number.text, path);
+            self.note_number(&number, path);
             return Ok(AttributeValue::N(number.text));
         }
         match self.peek().kind.clone() {

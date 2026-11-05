@@ -271,3 +271,27 @@ fn a_sign_in_a_set_clause_comes_after_its_numbers() {
     // parses.
     assert!(parse("UPDATE \"tbl\" SET q = 1e126 WHERE pk = 'a'").is_ok());
 }
+
+#[test]
+fn a_negative_zero_decimal_keeps_its_place_among_the_refusals_of_a_value() {
+    let zero = |sql: &str, path: &str| {
+        let column = sql.find("-0.0").unwrap() + 2;
+        format!("Negative zero decimal is not supported under key {path} at 1:{column}:3")
+    };
+    // With a parameter inside a literal, the one written first.
+    let sql = "INSERT INTO \"tbl\" VALUE {'pk':'a','x':[-0.0, ?]}";
+    assert_eq!(refusal(sql, 1), zero(sql, "root[0]"));
+    let sql = "INSERT INTO \"tbl\" VALUE {'pk':'a','x':[?, -0.0]}";
+    assert_eq!(refusal(sql, 1), parameter_in_a_list(sql));
+    // Ahead of a sign before a SET value that is not a number.
+    let sql = "UPDATE \"tbl\" SET x = +b, y = -0.0 WHERE pk = 'a'";
+    assert_eq!(refusal(sql, 0), zero(sql, "root"));
+    // After what the walk of the condition meets.
+    assert_eq!(
+        refusal(
+            "UPDATE \"tbl\" SET x = -0.0 WHERE pk = 'a' AND a = 1 + 1",
+            0
+        ),
+        PLUS
+    );
+}

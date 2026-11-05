@@ -16,6 +16,10 @@ pub(super) struct SignedNumber {
     pub text: String,
     /// The `line:column:length` span of the number itself.
     pub at: String,
+    /// Whether the number is a zero written with a decimal point or an
+    /// exponent and a minus sign is among the signs before it (see
+    /// `number::is_zero_decimal`).
+    pub negative_zero: bool,
 }
 
 impl Parser {
@@ -248,10 +252,14 @@ impl Parser {
     pub(super) fn signed_number(&mut self) -> Option<SignedNumber> {
         let start = self.pos;
         let mut negative = false;
+        let mut minus = false;
         let mut open = 0usize;
         loop {
             match self.peek().kind {
-                TokenKind::Minus => negative = !negative,
+                TokenKind::Minus => {
+                    negative = !negative;
+                    minus = true;
+                }
                 TokenKind::Plus => {}
                 TokenKind::LParen => open += 1,
                 TokenKind::Number(_) => break,
@@ -272,6 +280,7 @@ impl Parser {
                 return None;
             }
         }
+        let negative_zero = minus && crate::partiql::number::is_zero_decimal(&n);
         let text = if negative {
             match n.strip_prefix('-') {
                 Some(positive) => positive.to_owned(),
@@ -280,12 +289,16 @@ impl Parser {
         } else {
             n
         };
-        Some(SignedNumber { text, at })
+        Some(SignedNumber {
+            text,
+            at,
+            negative_zero,
+        })
     }
 
     fn operand_atom(&mut self) -> PResult<Operand> {
         if let Some(number) = self.signed_number() {
-            self.walk_number(&number.text, LITERAL_ROOT);
+            self.note_number(&number, LITERAL_ROOT);
             return self.literal_steps(Operand::Literal(AttributeValue::N(number.text)), &number.at);
         }
         // A sign before anything but a number is an operator with one
