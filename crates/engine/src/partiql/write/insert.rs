@@ -9,10 +9,13 @@ use serde_json::{Map, Value, json};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::ast::InsertStatement;
-use extenddb_core::types::AttributeValue;
+use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
+use extenddb_core::validation::validate_index_key_types;
 
 use super::expr_builder::ExprBuilder;
-use super::{key_names, reshape, resolve_av, to_json, validate_insert_keys};
+use super::{
+    from_wire, index_keys, internal, key_names, reshape, resolve_av, to_json, validate_insert_keys,
+};
 use crate::create_table::storage_err_to_dynamo;
 use crate::partiql::authorize::Gate;
 use crate::partiql::{SingleRequest, common, item_depth};
@@ -100,6 +103,28 @@ pub(crate) async fn build_insert_parts(
         condition,
         names: builder.names,
     })
+}
+
+/// The refusal of the `PutItem` request of `parts` on the table `key_info`
+/// when its item gives a secondary index key a value of the wrong type.
+///
+/// # Errors
+///
+/// A fault of reading back the item.
+pub(crate) fn insert_refusal(
+    parts: &PutParts,
+    key_info: &TableKeyInfo,
+) -> Result<Option<DynamoDbError>, DynamoDbError> {
+    let Value::Object(item) = &parts.item else {
+        return Err(internal());
+    };
+    let item: Item = from_wire(item)?;
+    Ok(validate_index_key_types(
+        &item,
+        &index_keys(key_info),
+        &key_info.attribute_definitions,
+    )
+    .err())
 }
 
 /// Map a create-only condition failure to the PartiQL duplicate-key error.

@@ -824,6 +824,21 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
             _key_update("pk"),
         ),
         ("UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1", INDEX_KEY_TYPE),
+        (
+            "UPDATE {t} SET gs = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+            INDEX_KEY_TYPE.replace("Index Key g ", "Index Key gs "),
+        ),
+        (
+            "UPDATE {t} SET g = 1, pk = 'z' WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+            _key_update("pk"),
+        ),
+        # An index key given the value of another attribute is checked on
+        # the written item, after the path into a key attribute.
+        (
+            "UPDATE {t} SET g = a WHERE pk = '{k}' AND sk = 'b' AND NOT pk.c = 1",
+            "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
+            "allowed: Key: pk",
+        ),
     ],
     ids=[
         "set-partition-key",
@@ -836,6 +851,9 @@ def test_two_writes_that_reach_one_item_are_duplicates(dynamodb_client, gtable, 
         "insert-index-key-type",
         "set-partition-key-ahead-of-a-path-into-a-key",
         "set-index-key-type-ahead-of-a-path-into-a-key",
+        "set-index-sort-key-type-ahead-of-a-path-into-a-key",
+        "set-partition-key-ahead-of-an-index-key-type",
+        "index-key-from-another-attribute-after-a-path-into-a-key",
     ],
 )
 def test_an_error_of_the_item_operation_names_the_table(

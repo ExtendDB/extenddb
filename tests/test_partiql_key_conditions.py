@@ -44,6 +44,7 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
+import partiql_gsi_table as gsi
 from conftest import scoped_table
 
 KEY_TYPE = "Key attribute's data type should match its data type in table's schema: Key {}"
@@ -1084,3 +1085,234 @@ def _transaction_message(client, statements):
     err = e.value.response["Error"]
     assert err["Code"] == "ValidationException", err
     return err["Message"]
+
+
+# ---- a path into a key attribute beside the refusals of an UPDATE ------------
+#
+# Measured 2026-11-05 on a table with the index gsi on the string attributes
+# g and gs. An UPDATE whose WHERE reads a path into a key attribute among its
+# other conditions is first refused as its UpdateItem request is: for a SET
+# or REMOVE of a key attribute, then for a value of the wrong type given to an
+# index key, whether or not the item exists. An index key given the value of
+# another attribute is checked on the written item, so the path into the key
+# is refused first. In ExecuteTransaction a member has the first of these as
+# its reason, and each member has its own reason.
+
+INDEX_KEY_TYPE = (
+    "One or more parameter values were invalid: Type mismatch for Index Key {} Expected: S "
+    "Actual: N IndexName: gsi"
+)
+UPDATE_OF_A_KEY = (
+    "One or more parameter values were invalid: Cannot update attribute {}. This attribute "
+    "is part of the key"
+)
+_IN_THE_CONDITION = " AND NOT pk.c = 1"
+
+
+@pytest.fixture(scope="module")
+def itable(dynamodb_client):
+    """A table keyed on string pk and sk, with the index gsi on string g and gs."""
+    with gsi.gsi_table(dynamodb_client, "extenddb-test-keypath-gsi") as name:
+        yield name
+
+
+@pytest.mark.parametrize(
+    ("template", "parameters", "message"),
+    [
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b' AND NOT sk.c = 1",
+            None,
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET gs = 1 WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            INDEX_KEY_TYPE.format("gs"),
+        ),
+        (
+            "UPDATE {t} SET g = ? WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            [{"N": "1"}],
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{n}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION
+            + " RETURNING ALL NEW *",
+            None,
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            UPDATE_OF_A_KEY.format("pk"),
+        ),
+        (
+            "UPDATE {t} REMOVE sk WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            UPDATE_OF_A_KEY.format("sk"),
+        ),
+        (
+            "UPDATE {t} SET g = 1, pk = 'z' WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            UPDATE_OF_A_KEY.format("pk"),
+        ),
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'",
+            None,
+            INDEX_KEY_TYPE.format("g"),
+        ),
+        (
+            "UPDATE {t} SET g = 'v' WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            KEY_PATH_CONDITION.format("pk"),
+        ),
+        (
+            "UPDATE {t} SET g = a WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            KEY_PATH_CONDITION.format("pk"),
+        ),
+        (
+            "UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION,
+            None,
+            KEY_PATH_CONDITION.format("pk"),
+        ),
+        (
+            "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1",
+            None,
+            SCALAR_KEY.format("pk"),
+        ),
+    ],
+    ids=[
+        "index-key-type",
+        "index-key-type-and-a-path-into-the-sort-key",
+        "index-sort-key-type",
+        "index-key-type-from-a-parameter",
+        "index-key-type-on-a-missing-item",
+        "index-key-type-with-returning",
+        "set-of-a-key",
+        "remove-of-the-sort-key",
+        "set-of-a-key-ahead-of-an-index-key-type",
+        "index-key-type-alone",
+        "index-key-of-the-right-type",
+        "index-key-from-another-attribute",
+        "a-path-into-a-key-alone",
+        "a-path-into-a-key-tested-against-a-value",
+    ],
+)
+def test_the_update_refusals_ahead_of_a_path_into_a_key(
+    dynamodb_client, itable, template, parameters, message
+):
+    pk = gsi.put(dynamodb_client, itable, f"kp-{uuid.uuid4().hex[:6]}")
+    absent = f"{pk}-absent"
+    statement = template.format(t=f'"{itable}"', k=pk, n=absent)
+    kwargs = {"Parameters": parameters} if parameters else {}
+    assert _message(dynamodb_client, statement, **kwargs) == message
+    assert gsi.get(dynamodb_client, itable, pk) == gsi.item(pk)
+    assert gsi.get(dynamodb_client, itable, absent) is None
+
+
+def _validation_error(message):
+    return {"Code": "ValidationError", "Message": message}
+
+
+_SET_INDEX_KEY = "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'"
+_SET_INDEX_KEY_IN_THE_CONDITION = _SET_INDEX_KEY + _IN_THE_CONDITION
+_INTO_A_KEY = "UPDATE {t} SET x = 1 WHERE pk = '{j}' AND sk = 'b'" + _IN_THE_CONDITION
+_INDEX_REASON = _validation_error(INDEX_KEY_TYPE.format("g"))
+_INTO_A_KEY_REASON = _validation_error(KEY_PATH_CONDITION.format("pk"))
+
+
+@pytest.mark.parametrize(
+    ("templates", "reasons"),
+    [
+        ([_SET_INDEX_KEY_IN_THE_CONDITION], [_INDEX_REASON]),
+        ([_SET_INDEX_KEY_IN_THE_CONDITION.replace("{k}", "{n}")], [_INDEX_REASON]),
+        (
+            ["UPDATE {t} SET pk = 'z' WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION],
+            [_validation_error(UPDATE_OF_A_KEY.format("pk"))],
+        ),
+        (
+            ["UPDATE {t} SET g = 1, pk = 'z' WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION],
+            [_validation_error(UPDATE_OF_A_KEY.format("pk"))],
+        ),
+        (
+            ["UPDATE {t} SET g = a WHERE pk = '{k}' AND sk = 'b'" + _IN_THE_CONDITION],
+            [_INTO_A_KEY_REASON],
+        ),
+        ([_SET_INDEX_KEY], [_INDEX_REASON]),
+        ([_INTO_A_KEY], [_INTO_A_KEY_REASON]),
+        ([_SET_INDEX_KEY, _INTO_A_KEY], [_INDEX_REASON, _INTO_A_KEY_REASON]),
+        ([_INTO_A_KEY, _SET_INDEX_KEY], [_INTO_A_KEY_REASON, _INDEX_REASON]),
+        (
+            ["UPDATE {t} SET x = 2 WHERE pk = '{j}' AND sk = 'b'",
+             _SET_INDEX_KEY_IN_THE_CONDITION],
+            [{"Code": "None"}, _INDEX_REASON],
+        ),
+        (
+            [_SET_INDEX_KEY_IN_THE_CONDITION,
+             _SET_INDEX_KEY_IN_THE_CONDITION.replace("{k}", "{j}")],
+            [_INDEX_REASON, _INDEX_REASON],
+        ),
+        (
+            [_SET_INDEX_KEY,
+             "DELETE FROM {t} WHERE pk = '{j}' AND sk = 'b'" + _IN_THE_CONDITION],
+            [_INDEX_REASON, _INTO_A_KEY_REASON],
+        ),
+        (
+            [_SET_INDEX_KEY,
+             "EXISTS(SELECT * FROM {t} WHERE pk = '{j}' AND sk = 'b'" + _IN_THE_CONDITION + ")"],
+            [_INDEX_REASON, _INTO_A_KEY_REASON],
+        ),
+        (
+            ["INSERT INTO {t} VALUE {{'pk': '{n}', 'sk': 'b', 'g': 1}}", _INTO_A_KEY],
+            [_INDEX_REASON, _INTO_A_KEY_REASON],
+        ),
+    ],
+    ids=[
+        "index-key-type",
+        "index-key-type-on-a-missing-item",
+        "set-of-a-key",
+        "set-of-a-key-ahead-of-an-index-key-type",
+        "index-key-from-another-attribute",
+        "index-key-type-alone",
+        "a-path-into-a-key-alone",
+        "index-key-type-then-a-path-into-a-key",
+        "a-path-into-a-key-then-index-key-type",
+        "update-then-index-key-type",
+        "index-key-type-in-two-members",
+        "index-key-type-then-a-delete",
+        "index-key-type-then-an-exists-check",
+        "insert-index-key-type-then-a-path-into-a-key",
+    ],
+)
+def test_a_transaction_member_has_the_update_refusal_ahead_of_a_path_into_a_key(
+    dynamodb_client, itable, templates, reasons
+):
+    run = uuid.uuid4().hex[:6]
+    first = gsi.put(dynamodb_client, itable, f"kpt-{run}-k")
+    second = gsi.put(dynamodb_client, itable, f"kpt-{run}-j")
+    absent = f"{first}-absent"
+    statements = [
+        {"Statement": t.format(t=f'"{itable}"', k=first, j=second, n=absent)} for t in templates
+    ]
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=statements)
+    response = e.value.response
+    codes = ", ".join(reason["Code"] for reason in reasons)
+    assert response["Error"] == {
+        "Code": "TransactionCanceledException",
+        "Message": f"{CANCELLED} [{codes}]",
+    }
+    assert response["CancellationReasons"] == reasons
+    assert gsi.get(dynamodb_client, itable, first) == gsi.item(first)
+    assert gsi.get(dynamodb_client, itable, second) == gsi.item(second)
+    assert gsi.get(dynamodb_client, itable, absent) is None

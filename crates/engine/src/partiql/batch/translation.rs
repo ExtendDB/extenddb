@@ -24,22 +24,15 @@
 //! on UPDATE and DELETE). The write refusals name the table, as the errors of
 //! a write that reached its item do.
 
-use std::collections::HashMap;
-
 use serde_json::{Map, Value};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::{InsertStatement, UpdateStatement, WhereExpr};
-use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
-use extenddb_core::validation::{
-    IndexKeyRef, validate_index_key_literal_operands, validate_index_key_types,
-};
+use extenddb_core::partiql::ast::WhereExpr;
+use extenddb_core::types::{AttributeValue, TableKeyInfo};
 
 use crate::OperationContext;
-use crate::expression_helpers::{build_expression_maps, parse_update_expr};
 use crate::partiql::{SingleRequest, common, write};
-use crate::transact_write_helpers::validate_no_key_updates;
 
 /// How far a statement that parsed gets before the batch runs it.
 pub(super) enum Translation {
@@ -93,10 +86,15 @@ pub(super) async fn translate_write(
     };
     let params = &req.parameters;
     let refusal = match stmt {
-        Statement::Update(update) => update_refusal(ctx, update, params, key_info)
-            .await?
-            .or_else(|| condition_key_refusal(update.where_clause.as_ref(), key_info, params)),
-        Statement::Insert(insert) => insert_refusal(ctx, insert, params, key_info).await?,
+        Statement::Update(update) => {
+            let parts = write::build_update_parts(ctx, update, params).await?;
+            write::update_refusal(&ctx.limits, &parts, key_info)?
+                .or_else(|| condition_key_refusal(update.where_clause.as_ref(), key_info, params))
+        }
+        Statement::Insert(insert) => {
+            let parts = write::build_insert_parts(ctx, insert, params).await?;
+            write::insert_refusal(&parts, key_info)?
+        }
         Statement::Delete(delete) => {
             condition_key_refusal(Some(&delete.where_clause), key_info, params)
         }
@@ -118,54 +116,6 @@ pub(super) async fn translate_write(
     })
 }
 
-/// The refusal of the `UpdateItem` an UPDATE translates into, when the
-/// update sets or removes a key attribute or gives a secondary index key a
-/// value of the wrong type, in the words and the order `UpdateItem` gives
-/// them.
-async fn update_refusal(
-    ctx: &OperationContext,
-    update: &UpdateStatement,
-    params: &[AttributeValue],
-    key_info: &TableKeyInfo,
-) -> Result<Option<DynamoDbError>, DynamoDbError> {
-    let parts = write::build_update_parts(ctx, update, params).await?;
-    let names: HashMap<String, String> = from_wire(&parts.names)?;
-    let values: HashMap<String, AttributeValue> = from_wire(&parts.values)?;
-    let maps = build_expression_maps(Some(&names), Some(&values));
-    let actions = parse_update_expr(&parts.update_expression, &ctx.limits)?;
-    Ok(validate_no_key_updates(&actions, key_info, &maps)
-        .and_then(|()| {
-            validate_index_key_literal_operands(
-                &actions,
-                &index_keys(key_info),
-                &key_info.attribute_definitions,
-                &maps,
-            )
-        })
-        .err())
-}
-
-/// The refusal of the `PutItem` an INSERT translates into, when its item
-/// gives a secondary index key a value of the wrong type.
-async fn insert_refusal(
-    ctx: &OperationContext,
-    insert: &InsertStatement,
-    params: &[AttributeValue],
-    key_info: &TableKeyInfo,
-) -> Result<Option<DynamoDbError>, DynamoDbError> {
-    let parts = write::build_insert_parts(ctx, insert, params).await?;
-    let Value::Object(item) = &parts.item else {
-        return Err(internal());
-    };
-    let item: Item = from_wire(item)?;
-    Ok(validate_index_key_types(
-        &item,
-        &index_keys(key_info),
-        &key_info.attribute_definitions,
-    )
-    .err())
-}
-
 /// The refusal of a write whose WHERE pins its item and reads a path into a
 /// key attribute among its other conditions (see
 /// `common::condition_key_refusal`). An UPDATE gets it after the refusals
@@ -181,29 +131,4 @@ fn condition_key_refusal(
     };
     common::condition_key_refusal(where_clause?, pk, sk, params)
         .map(DynamoDbError::ValidationException)
-}
-
-/// The key schema of each secondary index of the table.
-fn index_keys(key_info: &TableKeyInfo) -> Vec<IndexKeyRef<'_>> {
-    key_info
-        .global_secondary_indexes
-        .iter()
-        .chain(&key_info.local_secondary_indexes)
-        .map(|index| IndexKeyRef {
-            index_name: &index.index_name,
-            key_schema: &index.key_schema,
-        })
-        .collect()
-}
-
-/// Read back a map the translation built in wire form.
-fn from_wire<T: serde::de::DeserializeOwned>(map: &Map<String, Value>) -> Result<T, DynamoDbError> {
-    serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
-        tracing::error!(internal_error = %e, "failed to read a translated PartiQL map");
-        internal()
-    })
-}
-
-fn internal() -> DynamoDbError {
-    DynamoDbError::InternalServerError("Internal server error".to_owned())
 }

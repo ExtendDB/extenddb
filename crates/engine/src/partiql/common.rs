@@ -397,8 +397,9 @@ fn pinned_key(
 /// item and whose other conditions read a path into a key attribute in a
 /// way [`where_key`] does not refuse, naming the attribute
 /// `plan::condition_key_path` gives; `None` otherwise. The service makes
-/// this check after the key's types and after the refusal of a SET of a key
-/// attribute, whether or not the item exists. A batch member's error names
+/// this check after the key's types, the refusal of a SET of a key
+/// attribute and the refusal of a secondary index key given a value of the
+/// wrong type, whether or not the item exists. A batch member's error names
 /// its table, and the member counts as a write but not in the check for two
 /// statements on one item; a transaction member has it as its cancellation
 /// reason (measured 2026-11-05).

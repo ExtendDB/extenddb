@@ -192,10 +192,12 @@ pub(super) fn check_parameter_count(
 /// other conditions of an `UPDATE`, a `DELETE` or an `EXISTS` is a
 /// `ValidationError` with its refusal (see [`condition_key_reason`]); a `SET` of a
 /// key attribute and an `INSERT` without one are `ValidationError`s naming
-/// the attribute (measured 2026-11-02). A `DELETE` key value of the wrong type
-/// is treated like an `UPDATE` one, a `REMOVE` of a key attribute like a
-/// `SET`, and an `INSERT` key value of the wrong type gets the message a
-/// `TransactWriteItems` `Put` gives for it.
+/// the attribute (measured 2026-11-02); a secondary index key given a value
+/// of the wrong type is a `ValidationError` with the `UpdateItem` or
+/// `PutItem` refusal (see [`index_key_reason`]). A `DELETE` key value of the
+/// wrong type is treated like an `UPDATE` one, a `REMOVE` of a key attribute
+/// like a `SET`, and an `INSERT` key value of the wrong type gets the message
+/// a `TransactWriteItems` `Put` gives for it.
 ///
 /// # Errors
 ///
@@ -219,15 +221,53 @@ pub(super) async fn member_reason(
     let condition_key =
         |where_clause: Option<&WhereExpr>| condition_key_reason(where_clause, &key_info, params);
     match stmt {
-        Statement::Insert(insert) => insert_key_reason(insert, &key_info, params),
-        Statement::Update(update) => Ok(key_reason(stmt, &key_info, params)?
-            .or_else(|| key_update_reason(update, &key_info))
-            .or_else(|| condition_key(update.where_clause.as_ref()))),
+        Statement::Insert(insert) => match insert_key_reason(insert, &key_info, params)? {
+            Some(reason) => Ok(Some(reason)),
+            None => Ok(index_key_reason(ctx, stmt, &key_info, params).await),
+        },
+        Statement::Update(update) => {
+            if let Some(reason) = key_reason(stmt, &key_info, params)?
+                .or_else(|| key_update_reason(update, &key_info))
+            {
+                return Ok(Some(reason));
+            }
+            Ok(match index_key_reason(ctx, stmt, &key_info, params).await {
+                Some(reason) => Some(reason),
+                None => condition_key(update.where_clause.as_ref()),
+            })
+        }
         Statement::Delete(delete) => Ok(key_reason(stmt, &key_info, params)?
             .or_else(|| condition_key(Some(&delete.where_clause)))),
         Statement::Exists(select) => Ok(condition_key(select.where_clause.as_ref())),
         Statement::Select(_) => Ok(None),
     }
+}
+
+/// The reason an `INSERT` or an `UPDATE` member reports when its request
+/// gives a secondary index key a value of the wrong type: the `INSERT`'s
+/// item, or a value the `UPDATE` sets. Each member that does so has the
+/// reason beside the reasons of the other members, and an `UPDATE` has it
+/// after a SET of a key attribute and ahead of a path into a key attribute
+/// among its other conditions (measured 2026-11-05). A member whose request
+/// cannot be built has none here: its refusal comes when it is built.
+async fn index_key_reason(
+    ctx: &OperationContext,
+    stmt: &Statement,
+    key_info: &TableKeyInfo,
+    params: &[AttributeValue],
+) -> Option<CancellationReason> {
+    let refusal = match stmt {
+        Statement::Insert(insert) => {
+            let parts = write::build_insert_parts(ctx, insert, params).await.ok()?;
+            write::insert_refusal(&parts, key_info).ok()?
+        }
+        Statement::Update(update) => {
+            let parts = write::build_update_parts(ctx, update, params).await.ok()?;
+            write::update_index_key_refusal(&ctx.limits, &parts, key_info).ok()?
+        }
+        Statement::Delete(_) | Statement::Exists(_) | Statement::Select(_) => None,
+    };
+    refusal.map(|error| CancellationReason::validation_error(error.message()))
 }
 
 /// The reason a member reports when its WHERE pins its item and reads a

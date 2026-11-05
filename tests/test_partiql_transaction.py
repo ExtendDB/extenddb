@@ -27,6 +27,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
+from partiql_gsi_table import get as _gget
 from partiql_gsi_table import gsi_table, item, key, put
 
 
@@ -1125,6 +1126,84 @@ def test_a_read_cancellation_gives_every_member_its_reason(
     err = excinfo.value.response
     assert err["Error"]["Code"] == "TransactionCanceledException"
     assert err["CancellationReasons"] == reasons
+
+
+# --- an index key of the wrong type -----------------------------------------------
+# A write member that gives an index key a value of the wrong type, in an
+# UPDATE's SET or an INSERT's item, has that refusal as its reason, beside
+# the reasons of the other members: each such member has it, a member on a
+# missing table or without the full key has its own, and no condition is
+# evaluated. A member without the full key has that reason instead. An empty
+# value set on an index key by an UPDATE is no reason (measured 2026-11-05).
+
+_INDEX_KEY = _invalid("Type mismatch for Index Key g Expected: S Actual: N IndexName: gsi")
+_SET_INDEX_KEY = "UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 'b'"
+_INSERT_INDEX_KEY = "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','g':1}}"
+
+
+@pytest.mark.parametrize(
+    "templates, reasons",
+    [
+        ([_SET_INDEX_KEY], [_INDEX_KEY]),
+        ([_INSERT_INDEX_KEY], [_INDEX_KEY]),
+        ([_SET_INDEX_KEY, "UPDATE {t} SET g = 1 WHERE pk = '{j}' AND sk = 'b'"],
+         [_INDEX_KEY, _INDEX_KEY]),
+        ([_SET_INDEX_KEY, _INSERT_INDEX_KEY], [_INDEX_KEY, _INDEX_KEY]),
+        ([_INSERT_INDEX_KEY, _SET_INDEX_KEY], [_INDEX_KEY, _INDEX_KEY]),
+        ([_SET_INDEX_KEY, "UPDATE {t} SET x = 1 WHERE pk = '{j}'"], [_INDEX_KEY, _KEY_MISMATCH]),
+        (["UPDATE {t} SET x = 1 WHERE pk = '{j}'", _SET_INDEX_KEY], [_KEY_MISMATCH, _INDEX_KEY]),
+        ([_SET_INDEX_KEY, "UPDATE {t} SET pk = 'z' WHERE pk = '{j}' AND sk = 'b'"],
+         [_INDEX_KEY, _invalid("Cannot update attribute pk. This attribute is part of the key")]),
+        ([_SET_INDEX_KEY, "UPDATE {t} SET x = 1 WHERE pk = '{j}' AND sk = 'b' AND a = 99"],
+         [_INDEX_KEY, _NONE]),
+        ([_SET_INDEX_KEY, "UPDATE nosuch_tbl SET x = 1 WHERE pk = 'a' AND sk = 'b'"],
+         [_INDEX_KEY, _NOT_FOUND]),
+        (["UPDATE {t} SET g = 1 WHERE pk = '{k}'"], [_KEY_MISMATCH]),
+        (["UPDATE {t} SET g = 1 WHERE pk = '{k}' AND sk = 1"], [_KEY_MISMATCH]),
+        ([_SET_INDEX_KEY, "UPDATE {t} SET g = '' WHERE pk = '{j}' AND sk = 'b'"],
+         [_INDEX_KEY, _NONE]),
+    ],
+    ids=[
+        "update",
+        "insert",
+        "two-updates",
+        "update-then-insert",
+        "insert-then-update",
+        "update-then-partial-key",
+        "partial-key-then-update",
+        "update-then-set-of-a-key",
+        "update-then-failed-condition",
+        "update-then-missing-table",
+        "partial-key-in-the-member",
+        "key-type-in-the-member",
+        "update-then-empty-index-key",
+    ],
+)
+def test_each_member_that_gives_an_index_key_the_wrong_type_has_the_reason(
+    dynamodb_client, gtable, templates, reasons
+):
+    run = uuid.uuid4().hex[:6]
+    first = put(dynamodb_client, gtable, f"ik-{run}-k")
+    second = put(dynamodb_client, gtable, f"ik-{run}-j")
+    absent = f"{first}-absent"
+    statements = [
+        {"Statement": t.format(t=f'"{gtable}"', k=first, j=second, n=absent)} for t in templates
+    ]
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, statements)
+    err = excinfo.value.response
+    codes = ", ".join(reason["Code"] for reason in reasons)
+    assert err["Error"] == {
+        "Code": "TransactionCanceledException",
+        "Message": (
+            "Transaction cancelled, please refer cancellation reasons for specific reasons "
+            f"[{codes}]"
+        ),
+    }
+    assert err["CancellationReasons"] == reasons
+    assert _gget(dynamodb_client, gtable, first) == item(first)
+    assert _gget(dynamodb_client, gtable, second) == item(second)
+    assert _gget(dynamodb_client, gtable, absent) is None
 
 
 # --- ConsumedCapacity of an index ------------------------------------------------

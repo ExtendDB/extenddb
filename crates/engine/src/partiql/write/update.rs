@@ -3,22 +3,29 @@
 
 //! The UPDATE statement: an UpdateItem of an item that exists, and the checks of its paths.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value, json};
 
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::expression::{ExpressionMaps, UpdateAction};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::partiql::ast::{
     Path, PathStep, SetMembersAction, SetMembersOp, UpdateStatement,
 };
-use extenddb_core::types::AttributeValue;
+use extenddb_core::types::{AttributeValue, TableKeyInfo};
+use extenddb_core::validation::validate_index_key_literal_operands;
 
 use super::expr_builder::ExprBuilder;
 use super::{
-    build_condition, full_key_error, key_names, reshape, resolve_av, returning_to_return_values,
-    split_key_where,
+    build_condition, from_wire, full_key_error, index_keys, key_names, reshape, resolve_av,
+    returning_to_return_values, split_key_where,
 };
 use crate::create_table::storage_err_to_dynamo;
+use crate::expression_helpers::{build_expression_maps, parse_update_expr};
 use crate::partiql::authorize::Gate;
 use crate::partiql::{SingleRequest, common, item_depth};
+use crate::transact_write_helpers::validate_no_key_updates;
 use crate::update_item::handle_update_item_with;
 use crate::{DispatchResult, OperationContext};
 
@@ -33,12 +40,19 @@ pub(super) async fn run_update(
     let parts = build_update_parts(ctx, update, &req.parameters).await?;
     // The item check below reads the item.
     gate.pass().await?;
-    // A SET or REMOVE of a key attribute is refused first, by the update
-    // below (measured 2026-11-05).
-    if let Some(refusal) = &parts.condition_key_refusal
-        && !targets_a_key(update, &parts.key)
-    {
-        return Err(DynamoDbError::ValidationException(refusal.clone()));
+    // A path into a key attribute among the WHERE's other conditions is
+    // refused after the refusals of the `UpdateItem` request, which the
+    // update below gives: a SET or REMOVE of a key attribute, then a
+    // secondary index key given a value of the wrong type (measured
+    // 2026-11-05).
+    if let Some(refusal) = &parts.condition_key_refusal {
+        let key_info = ctx
+            .table_key_info(&update.table)
+            .await
+            .map_err(storage_err_to_dynamo)?;
+        if update_refusal(&ctx.limits, &parts, &key_info)?.is_none() {
+            return Err(DynamoDbError::ValidationException(refusal.clone()));
+        }
     }
     if item_depth::sets_a_value_past_the_item_limit(update, &req.parameters)
         && let Some(err) = item_depth::unwritable_update_error(ctx, &parts, req).await
@@ -94,16 +108,67 @@ pub(crate) struct UpdateParts {
     pub condition_key_refusal: Option<String>,
 }
 
-/// Whether an `UPDATE` sets, removes or changes the members of an attribute
-/// of the key `key`.
-fn targets_a_key(update: &UpdateStatement, key: &Map<String, Value>) -> bool {
-    update
-        .sets
-        .iter()
-        .map(|action| &action.path)
-        .chain(update.set_members.iter().map(|action| &action.path))
-        .chain(&update.removes)
-        .any(|path| key.contains_key(&path.root))
+/// The refusal `UpdateItem` gives the request of `parts` on the table
+/// `key_info` before it reads the item, in its words and in its order: a
+/// SET or REMOVE of a key attribute, then a secondary index key given a
+/// value of the wrong type. A statement is refused for a path into a key
+/// attribute among its other conditions only after these (measured
+/// 2026-11-05 on `ExecuteStatement` and `BatchExecuteStatement`).
+///
+/// # Errors
+///
+/// A fault of reading back the request.
+pub(crate) fn update_refusal(
+    limits: &LimitsConfig,
+    parts: &UpdateParts,
+    key_info: &TableKeyInfo,
+) -> Result<Option<DynamoDbError>, DynamoDbError> {
+    let (actions, maps) = request_actions(limits, parts)?;
+    Ok(validate_no_key_updates(&actions, key_info, &maps)
+        .and_then(|()| check_index_keys(&actions, key_info, &maps))
+        .err())
+}
+
+/// The second refusal of [`update_refusal`]: the request of `parts` gives a
+/// secondary index key a value of the wrong type.
+///
+/// # Errors
+///
+/// A fault of reading back the request.
+pub(crate) fn update_index_key_refusal(
+    limits: &LimitsConfig,
+    parts: &UpdateParts,
+    key_info: &TableKeyInfo,
+) -> Result<Option<DynamoDbError>, DynamoDbError> {
+    let (actions, maps) = request_actions(limits, parts)?;
+    Ok(check_index_keys(&actions, key_info, &maps).err())
+}
+
+/// The actions and the expression maps of the request of `parts`, read as
+/// `UpdateItem` reads them.
+fn request_actions(
+    limits: &LimitsConfig,
+    parts: &UpdateParts,
+) -> Result<(Vec<UpdateAction>, ExpressionMaps), DynamoDbError> {
+    let names: HashMap<String, String> = from_wire(&parts.names)?;
+    let values: HashMap<String, AttributeValue> = from_wire(&parts.values)?;
+    let maps = build_expression_maps(Some(&names), Some(&values));
+    Ok((parse_update_expr(&parts.update_expression, limits)?, maps))
+}
+
+/// Refuse an action that gives a secondary index key of the table a value
+/// of the wrong type as a literal operand, as `UpdateItem` does.
+fn check_index_keys(
+    actions: &[UpdateAction],
+    key_info: &TableKeyInfo,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    validate_index_key_literal_operands(
+        actions,
+        &index_keys(key_info),
+        &key_info.attribute_definitions,
+        maps,
+    )
 }
 
 /// Translate an `UPDATE` into its `UpdateItem` pieces. Does not dispatch.

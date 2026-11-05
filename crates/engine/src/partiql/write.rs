@@ -24,6 +24,7 @@ use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Operand, Returning, WhereExpr};
 use extenddb_core::partiql::plan::SCALAR_KEY_REFUSAL;
 use extenddb_core::types::{AttributeValue, ScalarAttributeType, TableKeyInfo};
+use extenddb_core::validation::IndexKeyRef;
 
 use super::authorize::Gate;
 use super::{SingleRequest, bind_parameter, common};
@@ -36,8 +37,11 @@ use update::run_update;
 
 pub(super) use delete::build_delete_parts;
 pub(super) use exists::build_exists_parts;
-pub(super) use insert::build_insert_parts;
-pub(super) use update::{UpdateParts, build_update_parts, check_overlapping_paths, first_overlap};
+pub(super) use insert::{build_insert_parts, insert_refusal};
+pub(super) use update::{
+    UpdateParts, build_update_parts, check_overlapping_paths, first_overlap,
+    update_index_key_refusal, update_refusal,
+};
 
 mod delete;
 mod exists;
@@ -342,6 +346,31 @@ fn returning_clause_text(returning: Returning) -> &'static str {
         Returning::AllNew => "ALL NEW *",
         Returning::ModifiedNew => "MODIFIED NEW *",
     }
+}
+
+/// The key schema of each secondary index of the table.
+fn index_keys(key_info: &TableKeyInfo) -> Vec<IndexKeyRef<'_>> {
+    key_info
+        .global_secondary_indexes
+        .iter()
+        .chain(&key_info.local_secondary_indexes)
+        .map(|index| IndexKeyRef {
+            index_name: &index.index_name,
+            key_schema: &index.key_schema,
+        })
+        .collect()
+}
+
+/// Read back a map the translation built in wire form.
+fn from_wire<T: serde::de::DeserializeOwned>(map: &Map<String, Value>) -> Result<T, DynamoDbError> {
+    serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
+        tracing::error!(internal_error = %e, "failed to read a translated PartiQL map");
+        internal()
+    })
+}
+
+fn internal() -> DynamoDbError {
+    DynamoDbError::InternalServerError("Internal server error".to_owned())
 }
 
 /// Serialize an item map to the DynamoDB JSON wire form.
