@@ -227,7 +227,7 @@ An admin session can read and change every account. Every page and form under `/
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
+- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).

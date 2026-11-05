@@ -56,9 +56,7 @@ pub async fn login_submit(
         };
 
     let (token, _csrf) = state.sessions.create(identity).await;
-    let cookie = format!(
-        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=28800"
-    );
+    let cookie = session_cookie(&token, 28800, state.secure_cookies);
 
     (
         StatusCode::SEE_OTHER,
@@ -72,13 +70,22 @@ pub async fn logout(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) 
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove(&token).await;
     }
-    let cookie =
-        "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
+    let cookie = session_cookie("", 0, state.secure_cookies);
     (
         StatusCode::SEE_OTHER,
         [("location", "/console/login"), ("set-cookie", &cookie)],
     )
         .into_response()
+}
+
+/// The `Set-Cookie` value for the console session. With `secure`, the cookie
+/// carries `Secure`, so a browser does not attach it to a plain `http://`
+/// request to the host (browsers exempt `localhost` from this rule).
+fn session_cookie(token: &str, max_age_secs: u32, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}{secure}"
+    )
 }
 
 fn login_html(error: Option<&str>, listen_url: &str) -> String {
@@ -322,5 +329,66 @@ mod tests {
         assert_eq!(page.status(), StatusCode::OK);
         assert!(body_text(page).await.contains("Invalid credentials"));
         assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
+    }
+}
+
+#[cfg(test)]
+mod session_cookie_tests {
+    use super::session_cookie;
+
+    /// The `name=value` pair, which must come first, and the attributes after
+    /// it, sorted, since their order carries no meaning.
+    fn parts(cookie: &str) -> (&str, Vec<&str>) {
+        let mut parts = cookie.split(';').map(str::trim);
+        let pair = parts.next().unwrap_or_default();
+        let mut attributes: Vec<&str> = parts.collect();
+        attributes.sort_unstable();
+        (pair, attributes)
+    }
+
+    #[test]
+    fn a_tls_server_marks_the_session_cookie_secure() {
+        let login = session_cookie("t0k", 28800, true);
+        let (pair, attributes) = parts(&login);
+        assert_eq!(pair, "extenddb_session=t0k");
+        assert_eq!(
+            attributes,
+            [
+                "HttpOnly",
+                "Max-Age=28800",
+                "Path=/console",
+                "SameSite=Strict",
+                "Secure"
+            ]
+        );
+        let logout = session_cookie("", 0, true);
+        let (pair, attributes) = parts(&logout);
+        assert_eq!(pair, "extenddb_session=");
+        assert_eq!(
+            attributes,
+            [
+                "HttpOnly",
+                "Max-Age=0",
+                "Path=/console",
+                "SameSite=Strict",
+                "Secure"
+            ]
+        );
+    }
+
+    /// Dev mode serves plain HTTP, where `Secure` protects nothing, and an
+    /// HTTP client that does not treat the loopback origin as secure, such as
+    /// the Python `requests` client the console tests use, would not send the
+    /// cookie back.
+    #[test]
+    fn a_plain_http_server_leaves_secure_off() {
+        for cookie in [
+            session_cookie("t0k", 28800, false),
+            session_cookie("", 0, false),
+        ] {
+            let (_, attributes) = parts(&cookie);
+            assert!(!attributes.contains(&"Secure"), "{cookie}");
+            assert!(attributes.contains(&"HttpOnly") && attributes.contains(&"SameSite=Strict"));
+        }
     }
 }
