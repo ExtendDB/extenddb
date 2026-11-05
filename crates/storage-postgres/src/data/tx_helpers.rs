@@ -395,17 +395,60 @@ pub(super) async fn write_stream_record_in_tx(
 ///
 /// The token is scoped to `account_id`: the same token value from different
 /// accounts is stored and matched independently. Returns `Ok(())` for new
-/// tokens (inserted), `Err(IdempotentReplay)` for matching replays,
-/// `Err(IdempotentMismatch)` for fingerprint conflicts.
+/// tokens (inserted, or a stored row taken for this run),
+/// `Err(IdempotentReplay)` for matching replays, `Err(IdempotentMismatch)`
+/// for fingerprint conflicts.
+///
+/// Two sends of one request with one token can reach this check at the same
+/// time (#851). The second send's insert waits on the first send's token row
+/// and, once the first send commits, locks the committed row. The select of
+/// the same statement reads with the snapshot taken when the statement
+/// started, before that commit, so it returns no row, or the `cancelled:` row
+/// that the committed row replaced. The locked row is neither: the insert's
+/// `WHERE` is false on it, so it is less than 10 minutes old and is not this
+/// request's cancelled row. In those two cases the statement runs once more.
+/// At READ COMMITTED the second statement takes a new snapshot, which sees
+/// the locked row. This transaction holds the lock until it ends, so the row
+/// cannot change between the two statements and the second one does not wait
+/// on it. A committed row of this request then answers as a replay, the
+/// answer the first send got.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
     token: &str,
     fingerprint: &str,
 ) -> Result<(), StorageError> {
-    // A token older than 10 minutes, or one the same request left cancelled
-    // (see `StoredToken::of`), is taken for this run.
-    let row: Option<(String, bool)> = sqlx::query_as(
+    let mut row = run_token_statement(tx, account_id, token, fingerprint).await?;
+    let stale_read = match &row {
+        None => true,
+        Some((stored, false)) => StoredToken::of(stored, fingerprint) == StoredToken::Rerun,
+        Some((_, true)) => false,
+    };
+    if stale_read {
+        row = run_token_statement(tx, account_id, token, fingerprint).await?;
+    }
+
+    match row {
+        Some((_, true)) | None => Ok(()),
+        Some((stored, false)) => match StoredToken::of(&stored, fingerprint) {
+            StoredToken::Replay => Err(StorageError::IdempotentReplay),
+            StoredToken::Rerun | StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
+        },
+    }
+}
+
+/// One statement of [`check_idempotency_token_in_tx`]: insert the token row,
+/// or take a stored row that is older than 10 minutes or that this request
+/// left cancelled (see `StoredToken::of`), and return it with `true`.
+/// Otherwise return the stored row with `false`, read with the statement's
+/// snapshot, or no row when that snapshot holds none less than 10 minutes old.
+async fn run_token_statement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<Option<(String, bool)>, StorageError> {
+    sqlx::query_as(
         r"WITH ins AS (
             INSERT INTO idempotency_tokens (account_id, token, fingerprint)
             VALUES ($1, $2, $3)
@@ -431,15 +474,7 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(cancelled_token_fingerprint(fingerprint))
     .fetch_optional(&mut **tx)
     .await
-    .map_err(db_error)?;
-
-    match row {
-        Some((_, true)) | None => Ok(()),
-        Some((stored, false)) => match StoredToken::of(&stored, fingerprint) {
-            StoredToken::Replay => Err(StorageError::IdempotentReplay),
-            StoredToken::Rerun | StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
-        },
-    }
+    .map_err(db_error)
 }
 
 /// Keep a token used after its request was cancelled past the request-level
