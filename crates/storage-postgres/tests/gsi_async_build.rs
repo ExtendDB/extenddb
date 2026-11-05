@@ -130,10 +130,13 @@ async fn scratch() -> Scratch {
             .await
             .expect("apply a shipped migration");
     }
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
