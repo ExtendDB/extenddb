@@ -29,13 +29,18 @@
 //! step into a sub-document. A key attribute named `a.b` would be inserted as
 //! `item_data: { a: { b: ... } }`, where PutItem stores the field `"a.b"`,
 //! and the same path conflicts with an update of an attribute named `a`.
-//! A table with a key attribute name that `key_names_are_plain_paths`
-//! rejects therefore does not take the native upsert; it takes the session
-//! path, which writes the document `item_to_document` builds.
+//! A key attribute name containing U+0000 or U+0001 has the same problem in
+//! another form: `item_to_document` stores it escaped
+//! (`extenddb_storage::util::control_chars`), and the path would name the
+//! raw text. A table with a key attribute name that
+//! `key_names_are_plain_paths` rejects therefore does not take the native
+//! upsert; it takes the session path, which writes the document
+//! `item_to_document` builds.
 
 use bson::Document;
 use extenddb_core::types::{Item, KeySchemaElement, TableKeyInfo};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::needs_escape;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 
 use super::{TRANSIENT_RETRY_ATTEMPTS, backoff_sleep};
@@ -44,9 +49,11 @@ use crate::data::key_fields::insert_only_key_fields;
 
 /// Whether `name` is usable as one field name in a MongoDB update path. A dot
 /// would split it into nested fields and a leading `$` would read as an
-/// operator or positional path.
+/// operator or positional path. A name containing U+0000 or U+0001 is stored
+/// in escaped form, so a path built from the raw name would address a
+/// different field (and BSON refuses U+0000 in a field name).
 pub(super) fn is_plain_path_name(name: &str) -> bool {
-    !name.contains('.') && !name.starts_with('$')
+    !name.contains('.') && !name.starts_with('$') && !needs_escape(name)
 }
 
 /// Whether every key attribute of `key_schema` is a plain path name, so that
@@ -170,6 +177,27 @@ mod tests {
             assert!(
                 !key_names_are_plain_paths(&schema(&keys)),
                 "range key {range:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_name_with_u0000_or_u0001_leaves_the_native_upsert() {
+        // item_to_document stores these names escaped, so the
+        // `item_data.<name>` path of the upsert would name another field.
+        assert!(key_names_are_plain_paths(&schema(&[(
+            "a\u{2}b",
+            KeyType::Hash
+        )])));
+        for name in ["a\u{0}b", "a\u{1}b", "\u{1}\u{2}"] {
+            assert!(
+                !key_names_are_plain_paths(&schema(&[(name, KeyType::Hash)])),
+                "hash key {name:?}"
+            );
+            let keys = [("pk", KeyType::Hash), (name, KeyType::Range)];
+            assert!(
+                !key_names_are_plain_paths(&schema(&keys)),
+                "range key {name:?}"
             );
         }
     }

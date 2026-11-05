@@ -32,15 +32,15 @@
 use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, ScalarAttributeType};
 use extenddb_core::validation::vector_item::{vector_components, vector_norm};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{
-    SortKeyValue, composite_pk_to_text, parse_sk, sk_column, sk_column_n,
-};
+use extenddb_storage::util::{SortKeyValue, sk_column, sk_column_n};
+
+use super::key_text::{composite_pk_to_text, parse_sk};
 use extenddb_storage::vector_lifecycle::{
     VectorApplyContext, VectorIndexMeta, item_is_indexable, item_partition, projected_payload,
 };
 use pgvector::Vector;
 
-use super::{all_sort_key_info, vector_table_name};
+use super::{all_sort_key_info, item_to_json, vector_table_name};
 
 /// Read the vector index metadata for a table from the catalog.
 ///
@@ -403,8 +403,7 @@ impl<'a> VectorInsertPlan<'a> {
         // vector attribute are the shared payload rules, so a live-written row and a
         // backfilled one cannot differ in shape.
         let projected = projected_payload(item, base_key_schema, meta);
-        let item_json =
-            serde_json::to_value(&projected).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let item_json = item_to_json(&projected)?;
 
         // A plain INSERT, deliberately, where the GSI sibling upserts. Two callers reach
         // it and only one deletes first: the live write path through

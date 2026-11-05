@@ -57,6 +57,10 @@ pub struct PostgresStores {
     lock: Option<LockHandle>,
     /// The `application_name` of this runner's sessions.
     pub(crate) application: String,
+    /// Whether migration 6's `detect` looks for other sessions: in a run, not
+    /// in a status read, and not for a target that allows them
+    /// ([`PostgresTarget::with_other_sessions_allowed`]).
+    pub(crate) checks_sessions: bool,
 }
 
 impl PostgresStores {
@@ -277,6 +281,7 @@ impl PostgresMigrations {
                 data_watch,
                 lock,
                 application,
+                checks_sessions: !read_only && !target.other_sessions_allowed,
             },
             catalog_name,
             data_name,

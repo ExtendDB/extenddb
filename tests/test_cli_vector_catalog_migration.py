@@ -9,7 +9,9 @@ released catalog to the same schema, and migration 5 drops the
 `continuous_backups` table. These tests load a deployment of a release from
 before the vector index schema, from its committed fixture, and check that
 the binary refuses to serve it, that `extenddb migrate` upgrades it, and that
-the upgraded deployment then serves. They also check that
+the upgraded deployment then serves. They also check that `migrate --yes`
+applies migration 6 to a deployment holding a table and a backup and stops
+while another session holds the catalog, that
 `--reconverge` runs every convergent migration again on a current catalog,
 and that a catalog ledger row for a migration this binary does not carry
 makes `serve` refuse.
@@ -176,6 +178,76 @@ def _init(cli_env):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def _seed_table_and_backup(cli_env):
+    """Create a table, an item and a backup through the running server, so
+    that both bodies of migration 6 check for other sessions: the data body
+    while the catalog lists a table, the catalog body while `backup_items`
+    holds a row."""
+    import uuid
+
+    import boto3
+    from conftest import wait_for_active
+    from management_helpers import ManagementClient
+
+    endpoint = f"https://127.0.0.1:{cli_env['port']}"
+    mgmt = ManagementClient(
+        endpoint, os.environ.get("EXTENDDB_ADMIN_USER") or "admin", "TestPass1!"
+    )
+    account_id = f"{uuid.uuid4().int % 10**12:012d}"
+    assert mgmt.create_account(account_id, "escape").status_code == 201
+    assert mgmt.create_user(account_id, "seed", "TestPass123!").status_code == 201
+    keys = mgmt.create_access_key(account_id, "seed").json()
+    assert mgmt.put_user_policy(
+        account_id, "seed", "full",
+        {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}]},
+    ).status_code == 204
+    client = boto3.client(
+        "dynamodb",
+        endpoint_url=endpoint,
+        aws_access_key_id=keys["access_key_id"],
+        aws_secret_access_key=keys["secret_access_key"],
+        region_name="us-east-1",
+        verify=False,
+    )
+    client.create_table(
+        TableName="escape",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    wait_for_active(client, "escape")
+    client.put_item(TableName="escape", Item={"pk": {"S": "a"}, "v": {"S": "b"}})
+    arn = client.create_backup(TableName="escape", BackupName="escape")["BackupDetails"][
+        "BackupArn"
+    ]
+    deadline = time.monotonic() + 30
+    while True:
+        details = client.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+        if details["BackupStatus"] == "AVAILABLE":
+            return
+        assert time.monotonic() < deadline, details
+        time.sleep(0.5)
+
+
+def _forget_migration_6(cli_env):
+    """Take migration 6 out of both ledgers and set the catalog version back
+    to 5, as a deployment of the release before it holds them. The rows this
+    build wrote hold no U+0001, so the migration rewrites none of them when it
+    runs again."""
+    for database in (cli_env["db_name"], _data_db(cli_env)):
+        conn = _conn(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM extenddb_migrations WHERE id = 6")
+                if database == cli_env["db_name"]:
+                    cur.execute(
+                        "UPDATE settings SET value = '5' WHERE key = 'catalog_version'"
+                    )
+        finally:
+            conn.close()
+
+
 def _serve_refused(cli_env):
     """Run `serve --foreground`; it must exit on its own, and the result is
     returned. A server that starts serving is stopped and fails the test."""
@@ -339,6 +411,76 @@ class TestVectorCatalogMigration:
         again_output = again.stdout + again.stderr
         assert again.returncode == 0, again_output
         assert "up to date" in again_output.lower(), again_output
+
+    def test_migrate_applies_migration_6_beside_its_own_sessions(self, cli_env):
+        """`migrate --yes` applies migration 6 to a deployment holding a table
+        and a backup, and stops while another session holds the catalog.
+
+        Migration 6 rewrites stored strings, so each body stops the run while a
+        session other than the migrate command's own holds the database it
+        rewrites and that database has rows to rewrite. While the check runs,
+        the command holds sessions of its own: the migration lock's session on
+        the catalog database and the runner's sessions on both databases. The
+        check leaves them out by their application_name; if it counted them,
+        it would refuse every upgrade. The deployment comes from this binary's
+        init, with migration 6 then taken out of both ledgers, as an upgrade
+        from the release before it finds them.
+        """
+        _init(cli_env)
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        served = _run_extenddb("serve", config=cli_env["config_path"])
+        assert served.returncode == 0, served.stdout + served.stderr
+        try:
+            assert _wait_for_server(cli_env["port"]), "the deployment did not serve"
+            _seed_table_and_backup(cli_env)
+        finally:
+            _run_extenddb("stop", config=cli_env["config_path"], check=False)
+            time.sleep(1)
+        _forget_migration_6(cli_env)
+        catalog, data = cli_env["db_name"], _data_db(cli_env)
+
+        pending = _run_extenddb(
+            "migrate", *_pg_args(), config=cli_env["config_path"], check=False
+        )
+        pending_output = pending.stdout + pending.stderr
+        assert pending.returncode == 3, pending_output
+        assert "6 escape_control_chars (catalog, breaking)" in pending_output, pending_output
+        assert "6 escape_control_chars (data, breaking)" in pending_output, pending_output
+
+        # Another client's session on the catalog database, which holds the
+        # backup's items: the run stops before any write, in either store.
+        holder = _conn(catalog)
+        try:
+            refused = _run_extenddb(
+                "migrate", "--yes", *_pg_args(),
+                config=cli_env["config_path"],
+                check=False,
+                timeout=90,
+            )
+        finally:
+            holder.close()
+        refused_output = refused.stdout + refused.stderr
+        assert refused.returncode == 5, refused_output
+        assert (
+            f"other session(s) hold the catalog database {catalog}" in refused_output
+        ), refused_output
+        assert 6 not in _ledger_ids(catalog)
+        assert 6 not in _ledger_ids(data)
+
+        applied = _run_extenddb(
+            "migrate", "--yes", *_pg_args(),
+            config=cli_env["config_path"],
+            check=False,
+            timeout=90,
+        )
+        output = applied.stdout + applied.stderr
+        assert applied.returncode == 0, output
+        assert "other session(s) hold" not in output, output
+        assert f"Applied 6 escape_control_chars in {catalog}" in output, output
+        assert f"Applied 6 escape_control_chars in {data}" in output, output
+        assert 6 in _ledger_ids(catalog)
+        assert 6 in _ledger_ids(data)
+        assert _catalog_version(cli_env) == str(_latest())
 
     def test_reconverge_runs_every_convergent_migration_again_on_a_current_catalog(
         self, cli_env

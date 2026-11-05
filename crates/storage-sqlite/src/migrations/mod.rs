@@ -106,6 +106,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::EscapeControlChars => Migration::NotApplicable(
+            "SQLite stores U+0000 in strings as written, so its stored form of strings does not \
+             change",
+        ),
     }
 }
 

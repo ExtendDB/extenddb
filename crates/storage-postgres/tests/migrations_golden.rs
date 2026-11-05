@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
-use extenddb_storage_postgres::migrations::{PostgresMigrations, migrate};
+use extenddb_storage_postgres::migrations::{PostgresMigrations, PostgresTarget, migrate};
 use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, id_names, skip};
 use sqlx::PgPool;
 
@@ -421,4 +421,218 @@ async fn migration_4_adds_the_base_key_index_and_skips_what_it_cannot_reach() {
     golden("0004_index_table_base_key.txt", &out);
     catalog.close().await;
     data.close().await;
+}
+
+/// The physical tables of `seed_tbl` and their text key columns.
+async fn seed_tbl_tables(catalog: &PgPool) -> Vec<(String, &'static [&'static str])> {
+    let table: String =
+        sqlx::query_scalar("SELECT table_id FROM tables WHERE table_name = 'seed_tbl'")
+            .fetch_one(catalog)
+            .await
+            .unwrap();
+    let indexes: Vec<String> =
+        sqlx::query_scalar("SELECT index_id FROM indexes WHERE table_id = $1 ORDER BY index_name")
+            .bind(&table)
+            .fetch_all(catalog)
+            .await
+            .unwrap();
+    let mut tables: Vec<(String, &'static [&'static str])> =
+        vec![(format!("_ddb_{table}"), &["pk", "sk_s"])];
+    for index in indexes {
+        tables.push((
+            format!("_ddb_{index}"),
+            &["pk", "sk_s", "base_pk", "base_sk_s"],
+        ));
+    }
+    tables
+}
+
+/// The attribute every legacy row gets: a name and a value holding U+0001
+/// as an earlier release stored it, the value followed by U+0002.
+const LEGACY_NOTE: &str = "item_data || jsonb_build_object('note' || chr(1), \
+     jsonb_build_object('S', 'v' || chr(1) || chr(2)))";
+
+/// Each row of `table` as `<table> pk=.. sk=.. <note attributes>`, with the
+/// strings in Rust's escaped form, so a control character is visible.
+async fn rows_of(pool: &PgPool, table: &str, label: &str, key: [&str; 2]) -> Vec<String> {
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT {}, {}, (SELECT string_agg(key || '=' || (value->>'S'), ',' ORDER BY key) \
+         FROM jsonb_each(item_data) WHERE key LIKE 'note%') FROM \"{table}\"",
+        key[0], key[1]
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|(pk, sk, note)| format!("{label} pk={pk:?} sk={sk:?} {note:?}"))
+        .collect()
+}
+
+/// Migration 6 on the 0.1.14 fixture whose strings an earlier release
+/// stored with a raw U+0001: in the key columns of `seed_tbl`'s table, GSI
+/// and LSI, in their documents, and in the backup's `backup_items`.
+#[tokio::test]
+async fn migration_6_escapes_the_strings_an_earlier_release_stored() {
+    let Some(base) = base_conn() else {
+        return skip("golden 6");
+    };
+    let s = Scratch::new(&base, "pgm_g6").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::DropContinuousBackups).await;
+    let catalog = s.catalog().await;
+    let data = s.data().await;
+    let tables = seed_tbl_tables(&catalog).await;
+    for (table, columns) in &tables {
+        let keys: Vec<String> = columns
+            .iter()
+            .map(|c| format!("{c} = {c} || chr(1)"))
+            .collect();
+        sqlx::query(&format!(
+            "UPDATE \"{table}\" SET {}, item_data = {LEGACY_NOTE}",
+            keys.join(", ")
+        ))
+        .execute(&data)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "UPDATE backup_items SET pk = pk || chr(1), sk = sk || chr(1), item_data = {LEGACY_NOTE}"
+    ))
+    .execute(&catalog)
+    .await
+    .unwrap();
+    // A status read does not look for other sessions: this test's own are
+    // open.
+    assert_eq!(s.status().await.label(), "Behind");
+    catalog.close().await;
+    data.close().await;
+    s.migrate_through(MigrationId::EscapeControlChars).await;
+    assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
+
+    let catalog = s.catalog().await;
+    let data = s.data().await;
+    let names = id_names(&catalog).await;
+    let mut lines = Vec::new();
+    for (table, columns) in &tables {
+        let mut label = table.clone();
+        for (id, name) in &names {
+            label = label.replace(id.as_str(), name);
+        }
+        let mut rows = rows_of(&data, table, &label, [columns[0], columns[1]]).await;
+        if columns.len() > 2 {
+            // An index row also names its base item.
+            rows = rows_of(
+                &data,
+                table,
+                &format!("{label} base"),
+                ["base_pk", "base_sk_s"],
+            )
+            .await
+            .into_iter()
+            .chain(rows)
+            .collect();
+        }
+        lines.extend(rows);
+    }
+    lines.extend(rows_of(&catalog, "backup_items", "backup_items", ["pk", "sk"]).await);
+    lines.sort();
+    let mut out = lines.join("\n");
+    for (pool, store) in [(&catalog, "catalog"), (&data, "data")] {
+        let mut note = notes(pool, 6).await;
+        for (id, name) in &names {
+            note = note.replace(id.as_str(), name);
+        }
+        write!(out, "\n{store} notes:\n{note}").unwrap();
+    }
+    out.push('\n');
+    golden("0006_escape_control_chars.txt", &out);
+    catalog.close().await;
+    data.close().await;
+}
+
+/// The id-6 rows of the ledger of the database `pool` reaches.
+async fn ledger_rows_of_6(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM extenddb_migrations WHERE id = 6")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// While another session holds the data database of a store with tables,
+/// `migrate --yes` stops with exit 5 before its first write, naming the
+/// session, and migrates once the session is gone.
+#[tokio::test]
+async fn migration_6_stops_before_any_write_while_another_session_holds_the_data() {
+    let Some(base) = base_conn() else {
+        return skip("migration 6 sessions check");
+    };
+    let s = Scratch::new(&base, "pgm_g6s").await;
+    s.load("0.1.14").await;
+    s.migrate_through(MigrationId::DropContinuousBackups).await;
+    // A server of an earlier release, still connected.
+    let server = migrations_support::pool(&s.data_url(), 1).await;
+    sqlx::query("SELECT 1").execute(&server).await.unwrap();
+    // The preview runs beside it.
+    assert_eq!(s.status().await.label(), "Behind");
+    let err = migrate(
+        &s.target_checking_sessions(),
+        "test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(err.exit_code(), 5, "{err:?}");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains(&format!(
+            "1 other session(s) hold the data database {}",
+            s.data_name
+        )),
+        "{text}"
+    );
+    let catalog = s.catalog().await;
+    let data = s.data().await;
+    assert_eq!(
+        ledger_rows_of_6(&catalog).await,
+        0,
+        "the refused run wrote the catalog ledger"
+    );
+    assert_eq!(
+        ledger_rows_of_6(&data).await,
+        0,
+        "the refused run wrote the data ledger"
+    );
+    catalog.close().await;
+    data.close().await;
+    server.close().await;
+    // Connection strings that name an application, as an operator's can: the
+    // runner names its own sessions over them, so the check does not count
+    // them.
+    let catalog = s.catalog().await;
+    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'data_database_connection_string'")
+        .bind(format!("{}?application_name=psql", s.data_url()))
+        .execute(&catalog)
+        .await
+        .unwrap();
+    catalog.close().await;
+    let named = || {
+        PostgresTarget::new(
+            format!("{}?application_name=psql", s.catalog_url())
+                .parse()
+                .unwrap(),
+            &s.data_name,
+        )
+    };
+    // PostgreSQL removes a closed session from pg_stat_activity a moment
+    // after the close returns.
+    let mut result = migrate(&named(), "test", Duration::from_secs(5)).await;
+    for _ in 0..50 {
+        if result.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        result = migrate(&named(), "test", Duration::from_secs(5)).await;
+    }
+    result.expect("migrate once the session is gone");
+    assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });
 }

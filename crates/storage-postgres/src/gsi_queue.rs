@@ -26,11 +26,11 @@
 
 use std::sync::Arc;
 
+use crate::data::key_text::composite_pk_to_text;
 use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Item, KeySchemaElement, Projection,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::composite_pk_to_text;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
@@ -157,13 +157,31 @@ const PG_UNDEFINED_TABLE: &str = "SQLSTATE 42P01";
 /// order. A local
 /// hash (not `std`'s, which is not guaranteed stable across builds) keeps the
 /// mapping fixed for a given key forever.
-fn partition_for(base_pk_text: &str) -> i32 {
+pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
     for byte in base_pk_text.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
     (hash % NUM_WORKERS) as i32
+}
+
+/// The `worker_partition` of a queued row: the partition of its base key,
+/// which `new_item` carries for puts and updates and `old_item` for deletes
+/// (the base key is immutable over an item's lifetime). The key text is the
+/// stored (escaped) form, so a key holding U+0001 hashes differently from the
+/// raw text a build without the escape hashed; catalog migration 6,
+/// `escape_control_chars`, recomputes the column of such rows through this
+/// function.
+pub(crate) fn worker_partition(
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    context: &PendingApplyContext,
+) -> Result<i32, StorageError> {
+    Ok(match new_item.or(old_item) {
+        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
+        None => 0,
+    })
 }
 
 /// Check if a `StorageError` is caused by an undefined table (SQLSTATE 42P01).
@@ -322,24 +340,10 @@ pub(crate) async fn enqueue_gsi_pending(
     delay_ms: u64,
     context: &PendingApplyContext,
 ) -> Result<(), StorageError> {
-    let old_json = old_item
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let new_json = new_item
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context_json =
-        serde_json::to_value(context).map_err(|e| StorageError::Internal(e.to_string()))?;
-
-    // Route all updates for a given base item to one worker.
-    // The base key is immutable over an item's lifetime; `new_item` carries it
-    // for puts/updates, `old_item` for deletes.
-    let worker_partition = match new_item.or(old_item) {
-        Some(item) => partition_for(&composite_pk_to_text(item, context.base_key_schema())?),
-        None => 0,
-    };
+    let old_json = old_item.map(crate::data::item_to_json).transpose()?;
+    let new_json = new_item.map(crate::data::item_to_json).transpose()?;
+    let context_json = crate::data::to_stored_json(context)?;
+    let worker_partition = worker_partition(old_item, new_item, context)?;
 
     let delay_interval = jitter_delay_ms(delay_ms) as f64 / 1000.0;
     sqlx::query(
@@ -584,16 +588,9 @@ fn decode_row(
     new_json: Option<serde_json::Value>,
     ctx_json: serde_json::Value,
 ) -> Result<(Option<Item>, Option<Item>, PendingApplyContext), StorageError> {
-    let old_item: Option<Item> = old_json
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let new_item: Option<Item> = new_json
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context: PendingApplyContext =
-        serde_json::from_value(ctx_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let old_item: Option<Item> = old_json.map(crate::data::json_to_item).transpose()?;
+    let new_item: Option<Item> = new_json.map(crate::data::json_to_item).transpose()?;
+    let context: PendingApplyContext = crate::data::stored_json_to(ctx_json)?;
     Ok((old_item, new_item, context))
 }
 

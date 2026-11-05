@@ -270,7 +270,15 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
-        i64::from(LATEST)
+        // One row for each migration that applies on SQLite; the others are
+        // recorded as not applicable.
+        i64::try_from(
+            MigrationId::ALL
+                .into_iter()
+                .filter(|id| !super::migration(*id).bodies().is_empty())
+                .count()
+        )
+        .unwrap()
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(

@@ -35,6 +35,9 @@ mod m0003_sort_key_definitions;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_escape_control_chars;
 mod postcheck;
 mod registrar;
 mod rows;
@@ -127,6 +130,24 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::EscapeControlChars => Migration::Applies {
+            kind: Kind::Breaking,
+            // The escape is not idempotent: running the bodies again would
+            // escape the strings written through the API since they ran.
+            convergent: false,
+            bodies: vec![
+                StoreBody::code(
+                    StoreKind::Catalog,
+                    &m0006_escape_control_chars::EscapeBackupItems,
+                    m0006_escape_control_chars::SOURCE,
+                ),
+                StoreBody::code(
+                    StoreKind::Data,
+                    &m0006_escape_control_chars::EscapeDataRows,
+                    m0006_escape_control_chars::SOURCE,
+                ),
+            ],
+        },
     }
 }
 
@@ -148,7 +169,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         MigrationId::Baseline
         | MigrationId::ResourceTagConditionKeys
         | MigrationId::SortKeyDefinitions
-        | MigrationId::DropContinuousBackups => RunsIn::Transaction,
+        | MigrationId::DropContinuousBackups
+        | MigrationId::EscapeControlChars => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }
@@ -174,6 +196,9 @@ pub struct PostgresTarget {
     pub data_connection_row: Option<String>,
     /// Timeout for each connection attempt.
     pub(crate) connect_timeout: Duration,
+    /// Whether a run leaves out migration 6's check for other sessions
+    /// ([`PostgresTarget::with_other_sessions_allowed`]).
+    pub(crate) other_sessions_allowed: bool,
 }
 
 impl PostgresTarget {
@@ -187,7 +212,19 @@ impl PostgresTarget {
             data_database_given: false,
             data_connection_row: None,
             connect_timeout: Duration::from_secs(10),
+            other_sessions_allowed: false,
         }
+    }
+
+    /// Leave out migration 6's check for other sessions on the databases it
+    /// rewrites, for a test harness whose own sessions hold its scratch
+    /// databases (lock holders, observers). Every path an operator runs keeps
+    /// the check, apart from `EXTENDDB_MIGRATE_IGNORE_CONNECTIONS`.
+    #[cfg(any(feature = "test-util", feature = "test-hooks"))]
+    #[must_use]
+    pub fn with_other_sessions_allowed(mut self) -> Self {
+        self.other_sessions_allowed = true;
+        self
     }
 
     /// Mark the data database as given on the command line.
@@ -351,8 +388,9 @@ pub async fn apply_all_migrations(
         return Ok(());
     }
     let data_database = data_options.get_database().unwrap_or("postgres").to_owned();
+    // The harness's own pools hold the scratch databases.
     migrate(
-        &PostgresTarget::new(catalog_options, data_database),
+        &PostgresTarget::new(catalog_options, data_database).with_other_sessions_allowed(),
         "test",
         Duration::ZERO,
     )
@@ -361,5 +399,13 @@ pub async fn apply_all_migrations(
     .map_err(|e| format!("{e:?}"))
 }
 
+#[cfg(test)]
+mod m0006_guard_tests;
+#[cfg(test)]
+mod m0006_keys_tests;
+#[cfg(test)]
+mod m0006_order_tests;
+#[cfg(test)]
+mod m0006_tests;
 #[cfg(test)]
 mod tests;
