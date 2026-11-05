@@ -42,7 +42,7 @@ The cause and fix summaries below are paraphrased for quick scanning. The catego
 
 **Error text:** `password authentication failed for user "extenddb"`
 **Cause summary:** The PostgreSQL `extenddb` user does not exist or the password does not match.
-**Fix summary:** Create the `extenddb` user and database with the password extenddb expects, per `docs/local-postgres-setup.md`.
+**Fix summary:** Create the `extenddb` user and database with the password extenddb expects, per `docs/troubleshooting.md`.
 **Full entry:** `references/02-postgres-symptoms.md#password-authentication-failed`
 
 ### migration failed

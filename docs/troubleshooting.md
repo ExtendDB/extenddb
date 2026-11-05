@@ -63,7 +63,7 @@ psql -U $(id -nu) -d postgres -c "CREATE USER extenddb WITH PASSWORD 'extenddb-l
 psql -U $(id -nu) -d postgres -c "CREATE DATABASE extenddb OWNER extenddb;"
 ```
 
-See [Local PostgreSQL setup](local-postgres-setup.md) for full setup instructions.
+See [Install from source](install-from-source.md#install-postgresql) for the PostgreSQL setup.
 
 ### `migration failed: ...`
 
@@ -81,13 +81,13 @@ See [Local PostgreSQL setup](local-postgres-setup.md) for full setup instruction
 
 **Cause:** The database holds no catalog: no migration ledger and no `catalog_version` row. `serve`, `migrate` and `verify` exit 1 and change nothing.
 
-**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See the [full walkthrough](getting-started.md).
+**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See [Install from source](install-from-source.md#3-initialize-the-deployment).
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
 **Cause:** `extenddb init` detected that the catalog or data database already exists in PostgreSQL. To prevent accidental data loss, `extenddb init` refuses to proceed when either database is present.
 
-**Fix:** If you want to re-initialize from scratch, run `extenddb destroy --config extenddb.toml` first to drop both databases, then run `extenddb init` again. If you want to keep the existing data and just apply migrations, use `extenddb migrate` instead.
+**Fix:** If you want to re-initialize from scratch, run `extenddb destroy --config extenddb.toml --yes` first to drop both databases, then run `extenddb init` again. If you want to keep the existing data and just apply migrations, use `extenddb migrate` instead.
 
 ### `Failed to bind <addr>: Address already in use`
 

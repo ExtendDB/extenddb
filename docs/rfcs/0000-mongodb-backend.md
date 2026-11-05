@@ -204,7 +204,7 @@ Backup implementation: `backup_engine.rs`.
 
 **Primary read preference.** Connection strings must use `readPreference=primary` (the driver default). Non-primary preferences are rejected at engine startup.
 
-**File descriptor limit.** Each MongoDB collection maps to one WiredTiger file. At 500 DynamoDB tables with 2 GSIs each (~1,500 collections), ensure `ulimit -n ≥ 65536` on the MongoDB host. See `docs/local-mongodb-setup.md` for platform-specific instructions.
+**File descriptor limit.** Each MongoDB collection maps to one WiredTiger file. At 500 DynamoDB tables with 2 GSIs each (~1,500 collections), ensure `ulimit -n ≥ 65536` on the MongoDB host. See `docs/install-from-source.md` for the platform setup.
 
 **Target scale.** This backend is designed for deployments of up to ~500 DynamoDB tables. At that scale, WiredTiger handles the collection count comfortably with default settings. Deployments significantly beyond this range have not been validated.
 
@@ -219,7 +219,7 @@ max_connections = 50
 max_catalog_connections = 20
 ```
 
-Configuration struct: `crates/storage-mongodb/src/config.rs`. Sample configuration: `extenddb.sample.toml` — `[storage.mongodb]` section. Setup guide: `docs/local-mongodb-setup.md`.
+Configuration struct: `crates/storage-mongodb/src/config.rs`. Sample configuration: `extenddb.sample.toml`, `[storage.mongodb]` section. Setup guide: `docs/install-from-source.md` (MongoDB section) and `docs/manuals/06-developer-test-guide.md` (local databases for the test suite).
 
 ### Implementation summary
 

@@ -13,8 +13,8 @@ This guide covers deploying ExtendDB in various environments beyond local develo
 > for concrete examples. Sections headed *PostgreSQL* apply only to that backend.
 > For other backends, see their setup docs:
 > [Cassandra setup](../cassandra-setup.md) (experimental; local and production)
-> and [MongoDB setup](../local-mongodb-setup.md). SQLite does not need a separate
-> backend service; see its section in the getting-started guide.
+> and [MongoDB setup](../install-from-source.md#install-mongodb). SQLite does not need a separate
+> backend service; see its section in [Install from source](../install-from-source.md#initialize-on-sqlite).
 
 ## Architecture Overview
 
@@ -155,7 +155,7 @@ Requirements in the air-gapped environment:
 
 This section applies to the PostgreSQL backend. For Cassandra, see
 [Cassandra setup](../cassandra-setup.md); for MongoDB, see
-[MongoDB setup](../local-mongodb-setup.md).
+[MongoDB setup](../install-from-source.md#install-mongodb).
 
 ### Remote and separated databases
 
@@ -291,16 +291,33 @@ This section covers the PostgreSQL backend.
 
 ### Connection Pool
 
-The default `pool_size = 20` is suitable for moderate workloads. For high-concurrency deployments:
+The `storage.postgres.pool_size` setting (default: 20, minimum: 10) sizes the connections used for DynamoDB data operations. It sizes **two** pools, not one: a deployment created by `extenddb init` keeps its catalog and its data in separate databases, and the engine opens a pool of `pool_size` against each. Both count against the same server-wide `max_connections`, because that limit is per cluster rather than per database. Each in-flight request that touches the database holds one connection for the duration of its transaction. Values below 10 are clamped at startup with a warning.
+
+The `storage.postgres.catalog_pool_size` setting controls the maximum number of concurrent connections for the management/catalog pool (authorization queries, IAM operations, console). Defaults to `pool_size` if not set, minimum: 10. With auth enabled (`provider = "builtin"`), each DynamoDB request makes concurrent authorization queries against this pool, size it to match expected concurrency. Values below 10 are clamped at startup with a warning.
+
+**When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
+
+**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size + [backup] max_concurrent_jobs`, plus one connection per vector index build running on the server and one while a schema migration runs. The `max_concurrent_jobs` term (default 4) is one dedicated connection per running backup or restore job, outside every pool, which holds the job's session-level advisory lock (its claim). The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the defaults already need 64 of it. Ensure `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
+
+**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 154 connections (the default `max_concurrent_jobs` of 4 included), so PostgreSQL needs `max_connections` raised to at least 154 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
 
 ```toml
 [storage.postgres]
-pool_size = 50  # Increase for higher concurrency
+pool_size = 50
+catalog_pool_size = 50
 ```
 
-Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
-
 Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests; a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+
+### Contention Characteristics
+
+- **Different items:** Fully concurrent up to `pool_size`. No contention.
+- **Same item:** Concurrent writes to the same item serialize on PostgreSQL's row lock (`SELECT ... FOR UPDATE`). All updates succeed, but throughput for a single hot item is bounded by single-row transaction rate.
+- **Reads:** GetItem and Query do not acquire row locks and proceed concurrently with writes.
+
+### Auth/authz Caching
+
+Each DynamoDB request normally issues about 6 catalog queries during auth/authz plus a 7th for the table's key schema; the in-memory stale-while-revalidate caches configured under `[auth.cache]` remove that round-trip in steady state. The keys, defaults, invalidation timing and the `/management/auth-cache-metrics` endpoint are documented in the `[auth.cache]` section of the [Administration guide](05-admin-guide.md).
 
 ### Cassandra Connection Pool
 

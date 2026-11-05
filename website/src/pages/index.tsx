@@ -9,7 +9,7 @@ import CodeBlock from '@theme/CodeBlock';
 import Heading from '@theme/Heading';
 import styles from './index.module.css';
 
-const devImage = `docker run -d -p 127.0.0.1:18080:18080 \\
+const devImage = `docker run -d --name extenddb -p 127.0.0.1:18080:18080 \\
   -v extenddb:/var/lib/extenddb extenddb/extenddb-dev
 
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \\
@@ -37,7 +37,7 @@ const cards: Card[] = [
   },
   {
     title: 'Reference',
-    body: 'Every behaviour that differs from the DynamoDB service, the limits, configuration keys, and troubleshooting.',
+    body: 'Every behavior that differs from the DynamoDB service, the limits, configuration keys, and troubleshooting.',
     to: '/reference/',
   },
   {
@@ -93,7 +93,7 @@ function QuickStarts(): ReactNode {
             <div className={styles.panel}>
               <Heading as="h3">For local development and CI</Heading>
               <p>
-                One container over SQLite, plain HTTP, a seeded example credential. Nothing to initialise and no
+                One container over SQLite, plain HTTP, a seeded example credential. Nothing to initialize and no
                 certificate to trust. Bound to the loopback interface; not for anything reachable from other
                 machines.
               </p>
@@ -105,8 +105,8 @@ function QuickStarts(): ReactNode {
             <div className={styles.panel}>
               <Heading as="h3">For a local stack with PostgreSQL</Heading>
               <p>
-                The PostgreSQL image with TLS on, started together with a PostgreSQL container by the
-                repository&apos;s Compose file, which runs the initialisation for you.
+                The extenddb/extenddb-postgres image with TLS on, started together with a PostgreSQL container by the
+                repository&apos;s Compose file, which runs the initialization for you.
               </p>
               <CodeBlock language="bash">{compose}</CodeBlock>
               <Link to="/local-dev-docker-compose/">Docker Compose walkthrough</Link>

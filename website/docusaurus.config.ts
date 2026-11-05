@@ -83,6 +83,8 @@ const config: Config = {
             '**/technical-debt.md',
             '**/0000-template.md',
             '**/NOTICE.md',
+            // Pointer kept for links into the repository; the site has the pages it lists.
+            '**/getting-started.md',
             // Directory readme that only lists files; the site generates the index.
             '**/design/README.md',
             // Draft under review (version 0.5); published when accepted.

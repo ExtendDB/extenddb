@@ -11,7 +11,7 @@ Run three operations in sequence to prove the end-to-end round trip: create a ta
 
 ## 3. Step 1: create-table
 
-From `docs/getting-started.md`:
+From `docs/first-requests.md`:
 
 ```bash
 aws dynamodb create-table \
@@ -43,7 +43,7 @@ aws dynamodb wait table-exists --table-name MyTable
 
 ## 4. Step 2: put-item
 
-From `docs/getting-started.md`:
+From `docs/first-requests.md`:
 
 ```bash
 aws dynamodb put-item \
@@ -61,7 +61,7 @@ If `--return-values ALL_OLD` is passed, the response contains the previous item 
 
 ## 5. Step 3: get-item
 
-From `docs/getting-started.md`:
+From `docs/first-requests.md`:
 
 ```bash
 aws dynamodb get-item \
