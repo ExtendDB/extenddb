@@ -42,6 +42,7 @@ on:
       - 'docker/dockerhub-overview.md'
       - 'docker/dockerhub-overview-dev.md'
       - 'docker/dockerhub-overview-mongodb.md'
+      - 'docker/dockerhub-overview-cassandra.md'
   workflow_dispatch:
     inputs:
       image:
@@ -51,6 +52,7 @@ on:
         options:
           - extenddb-postgres
           - extenddb-mongodb
+          - extenddb-cassandra
           - extenddb-dev
 
 permissions:
@@ -58,7 +60,7 @@ permissions:
 
 # One group for every run: publishes are quick and rare, and serializing them
 # is simpler and strictly safer than per-image groups now that one push can
-# carry both images.
+# carry several images.
 concurrency:
   group: dockerhub-description
   cancel-in-progress: false
@@ -71,8 +73,8 @@ jobs:
   # image. Push: the image(s) whose Overview file changed in the push,
   # resolved via the compare API rather than a full-history checkout. If the
   # push range cannot be resolved (forced push, branch creation), fall back to
-  # publishing both — the PATCH is idempotent, so over-publishing is harmless
-  # and strictly better than silently skipping one.
+  # publishing every image — the PATCH is idempotent, so over-publishing is
+  # harmless and strictly better than silently skipping one.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -92,7 +94,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
             case "$INPUT_IMAGE" in
-              extenddb-postgres|extenddb-mongodb|extenddb-dev) ;;
+              extenddb-postgres|extenddb-mongodb|extenddb-cassandra|extenddb-dev) ;;
               *) echo "::error::unknown image '$INPUT_IMAGE'"; exit 1 ;;
             esac
             IMAGES=$(jq -cn --arg i "$INPUT_IMAGE" '[$i]')
@@ -107,13 +109,15 @@ jobs:
             fi
             IMAGES='[]'
             if [[ -z "$CHANGED" ]]; then
-              # Unresolvable range: publish both (idempotent).
-              IMAGES='["extenddb-postgres","extenddb-mongodb","extenddb-dev"]'
+              # Unresolvable range: publish every image (idempotent).
+              IMAGES='["extenddb-postgres","extenddb-mongodb","extenddb-cassandra","extenddb-dev"]'
             else
               grep -qx 'docker/dockerhub-overview.md' <<< "$CHANGED" \
                 && IMAGES=$(jq -c '. + ["extenddb-postgres"]' <<< "$IMAGES")
               grep -qx 'docker/dockerhub-overview-mongodb.md' <<< "$CHANGED" \
                 && IMAGES=$(jq -c '. + ["extenddb-mongodb"]' <<< "$IMAGES")
+              grep -qx 'docker/dockerhub-overview-cassandra.md' <<< "$CHANGED" \
+                && IMAGES=$(jq -c '. + ["extenddb-cassandra"]' <<< "$IMAGES")
               grep -qx 'docker/dockerhub-overview-dev.md' <<< "$CHANGED" \
                 && IMAGES=$(jq -c '. + ["extenddb-dev"]' <<< "$IMAGES")
             fi
@@ -159,6 +163,10 @@ jobs:
             extenddb-mongodb)
               FILE='docker/dockerhub-overview-mongodb.md'
               SHORT='DynamoDB-compatible API adapter backed by your own MongoDB 7+ replica set'
+              ;;
+            extenddb-cassandra)
+              FILE='docker/dockerhub-overview-cassandra.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own Apache Cassandra 4.1+ cluster'
               ;;
             extenddb-dev)
               FILE='docker/dockerhub-overview-dev.md'
@@ -248,6 +256,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: dockerhub
+    permissions:
+      contents: read
+      id-token: write   # OIDC: read the Docker Hub credential from Secrets Manager
     strategy:
       fail-fast: false
       matrix:
@@ -273,6 +284,10 @@ jobs:
               FILE='docker/dockerhub-overview-mongodb.md'
               SHORT='DynamoDB-compatible API adapter backed by your own MongoDB 7+ replica set'
               ;;
+            extenddb-cassandra)
+              FILE='docker/dockerhub-overview-cassandra.md'
+              SHORT='DynamoDB-compatible API adapter backed by your own Apache Cassandra 4.1+ cluster'
+              ;;
             extenddb-dev)
               FILE='docker/dockerhub-overview-dev.md'
               SHORT='DynamoDB-compatible API over SQLite for local dev and CI. Plain HTTP, not for production.'
@@ -285,13 +300,23 @@ jobs:
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
 
+      - name: Fetch the Docker Hub credential via OIDC (Secrets Manager)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::975306274793:role/ExtendDBDockerHubPublisher
+          role-session-name: extenddb-dockerhub-overview-${{ github.run_id }}
+          aws-region: us-east-1
+      - name: Read the Docker Hub credential from Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@2297f9a879480a9e3af9b293ed15c70caf8e1c88 # v3.0.2
+        with:
+          secret-ids: DOCKERHUB,extenddb/dockerhub-publish
+          parse-json-secrets: true
+
       - name: Publish the Overview
         env:
           IMAGE: ${{ matrix.image }}
           FILE: ${{ steps.src.outputs.file }}
           SHORT: ${{ steps.src.outputs.short }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
 

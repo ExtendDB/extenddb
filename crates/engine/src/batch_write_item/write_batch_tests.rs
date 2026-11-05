@@ -183,22 +183,6 @@ async fn an_item_nested_past_the_depth_limit_rejects_the_batch_before_any_write(
     .await;
 }
 
-/// An attribute name of 70,000 bytes is past the limit of 65,535 bytes. The
-/// item stays under the item size limit.
-#[tokio::test]
-async fn an_attribute_name_over_the_size_limit_rejects_the_batch_before_any_write() {
-    let mut item = serde_json::Map::new();
-    item.insert("pk".to_owned(), json!({"S": "b"}));
-    item.insert("n".repeat(70_000), json!({"S": "v"}));
-
-    rejected_before_any_write(
-        table("t"),
-        json!({"PutRequest": {"Item": item}}),
-        "Size of attribute name",
-    )
-    .await;
-}
-
 /// A partition key of 3,000 bytes is past the limit of 2,048 bytes.
 #[tokio::test]
 async fn a_key_over_the_size_limit_rejects_the_batch_before_any_write() {

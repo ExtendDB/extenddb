@@ -47,7 +47,7 @@ fn native_attribute_name(path: &[PathElement], maps: &ExpressionMaps) -> Option<
         return None;
     };
     let attr_name = resolve_name_ref(raw_name, maps).ok()?;
-    (!attr_name.contains('.') && !attr_name.starts_with('$')).then(|| attr_name.into_owned())
+    update_create::is_plain_path_name(&attr_name).then(|| attr_name.into_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -808,24 +808,49 @@ impl MongoEngine {
         // indexed attribute is $set to a new value or $unset (RFC-0003
         // §2.2). The GSI cache lets us avoid a catalog query in the
         // common (no-GSI) case; when the cache is stale-or-unknown
-        // we fall through to the slow path which is authoritative.
+        // we fall through to the slow path which is authoritative. Key
+        // attribute names that are not plain path names (a dot, a leading
+        // `$`) also take the slow path, because the upsert writes the key
+        // attributes as `item_data.<name>` (see `update_create`).
         if condition.is_none()
             && !return_old
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
-            && let Some(mongo_update) = self.try_build_native_update(actions, maps)
+            && update_create::key_names_are_plain_paths(&key_info.key_schema)
+            && let Some(mongo_update) = Self::try_build_native_update(actions, maps)
         {
+            // REMOVE and DELETE on a key that holds no document change
+            // nothing (issue #478), so the native update runs without
+            // upsert: a missing document is the whole answer, and the
+            // service returns no Attributes for it under any ReturnValues.
+            if let NativeUpdate::Doc(d) = &mongo_update
+                && expression::removes_only(actions)
+            {
+                let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+                    .upsert(false)
+                    .return_document(ReturnDocument::After)
+                    .build();
+                let result = coll
+                    .find_one_and_update(key_filter.clone(), d.clone())
+                    .with_options(opts)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let new_item = if return_new {
+                    result.as_ref().map(document_to_item).transpose()?
+                } else {
+                    None
+                };
+                return Ok((None, new_item));
+            }
+
             let (fast_filter, took_fast) = match mongo_update {
                 NativeUpdate::Doc(d) => {
-                    let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-                        .upsert(true)
-                        .return_document(ReturnDocument::After)
-                        .build();
-                    let result = coll
-                        .find_one_and_update(key_filter.clone(), d)
-                        .with_options(opts)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    // The upsert's insert branch must write the document
+                    // `item_to_document` would write (issue #436); see
+                    // `update_create::upsert_native_update`.
+                    let result = self
+                        .upsert_native_update(&coll, &key_filter, d, key, key_info)
+                        .await?;
                     (Some(result), true)
                 }
                 NativeUpdate::Pipeline {
@@ -906,6 +931,9 @@ impl MongoEngine {
             enum AttemptOk {
                 Committed(Option<Item>, Option<Item>),
                 Stale,
+                /// The key holds no document and the update only removes:
+                /// nothing to write, nothing to return (issue #478).
+                NoWrite,
             }
 
             let attempt_res: Result<AttemptOk, TxErr> = async {
@@ -962,13 +990,21 @@ impl MongoEngine {
                 )
                 .map_err(|e| TxErr::Fatal(StorageError::Validation(e.to_string())))?;
 
-                // Reject wrong-type or empty index-key attributes on
-                // the resulting item — D-M10, RFC-0003 §2.3. Same
-                // shape as put_item's up-front check, but the
-                // post-update item is what actually gets written.
-                self.validate_index_keys_for_item(key_info, &new_item)
+                // Secondary-index keys on the written item. Literal operands
+                // were checked by the engine ahead of the condition; a value
+                // computed from the existing item is only known now and
+                // carries the service's computed-value wording, and a key the
+                // statement leaves empty carries the update-expression wording.
+                self.validate_index_keys_after_update(key_info, &new_item)
                     .await
                     .map_err(TxErr::Fatal)?;
+
+                // The actions were applied above so that their validation
+                // errors surface the same way as on an existing document;
+                // with no document to change, the write is skipped.
+                if existing_doc.is_none() && expression::removes_only(actions) {
+                    return Ok(AttemptOk::NoWrite);
+                }
 
                 let mut new_doc = item_to_document(
                     &new_item,
@@ -1066,6 +1102,10 @@ impl MongoEngine {
                     backoff_sleep(attempt).await;
                     continue;
                 }
+                Ok(AttemptOk::NoWrite) => {
+                    let _ = session.abort_transaction().await;
+                    return Ok((None, None));
+                }
                 Err(TxErr::Transient(cause)) => {
                     last_cause = crate::write_conflict::retrying("UpdateItem", attempt, cause);
                     let _ = session.abort_transaction().await;
@@ -1145,6 +1185,13 @@ impl MongoEngine {
         };
 
         let mut filter = doc! { "pk": &pk_text };
+
+        extenddb_storage::util::refuse_conditions_beyond_first_range(
+            key_condition,
+            &effective_key_schema,
+            &maps.names,
+            "MongoDB",
+        )?;
 
         // Determine sort key field using effective key schema
         let sk_field = sk_field_name(&effective_key_schema, &key_info.attribute_definitions);
@@ -1653,7 +1700,6 @@ impl MongoEngine {
     /// because mongo serializes doc-scoped write locks around the
     /// pipeline's read + compute + write, no OCC retry needed.
     fn try_build_native_update(
-        &self,
         actions: &[UpdateAction],
         maps: &ExpressionMaps,
     ) -> Option<NativeUpdate> {
@@ -1728,10 +1774,13 @@ impl MongoEngine {
             // Each numeric ADD is `<field> = toString(toDecimal(field
             // or 0) + delta)`; `$unset` is expressed as `<field> =
             // "$$REMOVE"`; SET actions are literal assignments. `_v`
-            // is bumped in the same stage.
+            // is bumped in the same stage. `$literal` makes each SET value a
+            // constant: a `$` string or member name is not read as an
+            // expression, and a document value replaces the attribute instead
+            // of merging into the embedded document it replaces.
             let mut stage: Document = Document::new();
             for (k, v) in &set_doc {
-                stage.insert(k, v.clone());
+                stage.insert(k, doc! { "$literal": v.clone() });
             }
             for k in unset_doc.keys() {
                 stage.insert(k, "$$REMOVE");
@@ -1876,6 +1925,40 @@ impl MongoEngine {
             .collect();
         extenddb_core::validation::validate_index_keys(item, &refs, &key_info.attribute_definitions)
             .map_err(|e| StorageError::Validation(e.to_string()))
+    }
+
+    /// Secondary-index key checks on the item an UpdateExpression produced:
+    /// a computed value of the wrong type, reported with the service's
+    /// post-apply wording, and a key left empty, reported with the
+    /// update-expression wording.
+    async fn validate_index_keys_after_update(
+        &self,
+        key_info: &TableKeyInfo,
+        item: &Item,
+    ) -> Result<(), StorageError> {
+        let idx_pairs = self.fetch_index_key_schemas(&key_info.table_id).await?;
+        if idx_pairs.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+            .iter()
+            .map(|(name, ks)| extenddb_core::validation::IndexKeyRef {
+                index_name: name.as_str(),
+                key_schema: ks.as_slice(),
+            })
+            .collect();
+        extenddb_core::validation::validate_index_key_types_after_update(
+            item,
+            &refs,
+            &key_info.attribute_definitions,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))?;
+        extenddb_core::validation::validate_index_key_not_empty(
+            item,
+            &refs,
+            extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+        )
+        .map_err(|e| StorageError::Validation(e.to_string()))
     }
 
     async fn sync_indexes_in_session(
@@ -2059,6 +2142,9 @@ impl MongoEngine {
             .next_sequence_number_in_session(&shard_id, &mut *session)
             .await?;
 
+        // One wall-clock read feeds both the record's ApproximateCreationDateTime
+        // and the created_at field, so the two never disagree.
+        let created_at = mongodb::bson::DateTime::now();
         let record = StreamRecord {
             event_id: uuid::Uuid::new_v4().to_string(),
             event_name: event,
@@ -2066,13 +2152,7 @@ impl MongoEngine {
             event_source: "aws:dynamodb".to_owned(),
             aws_region: capture.region.to_string(),
             dynamodb: StreamRecordData {
-                approximate_creation_date_time: i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-                .unwrap_or(i64::MAX),
+                approximate_creation_date_time: created_at.timestamp_millis().div_euclid(1_000),
                 keys,
                 new_image,
                 old_image,
@@ -2102,7 +2182,7 @@ impl MongoEngine {
                 "table_id": table_id,
                 "event_name": crate::stream_engine::event_name_ddb_str(record.event_name),
                 "record_data": record_bson,
-                "created_at": mongodb::bson::DateTime::now(),
+                "created_at": created_at,
             })
             .session(&mut *session)
             .await
@@ -2384,7 +2464,14 @@ impl MongoEngine {
                 }
                 Ok(AttemptOutcome::CanceledReasons(reasons)) => {
                     let _ = session.abort_transaction().await;
-                    return Err(StorageError::TransactionCanceled(reasons));
+                    // Key faults left the members as internal reasons; the
+                    // shared resolver applies the service's cross-member
+                    // precedence and decides between a cancellation and a
+                    // top-level ValidationException.
+                    return Err(match CancellationReason::resolve_key_faults(reasons) {
+                        Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                        Err(message) => StorageError::Validation(message),
+                    });
                 }
                 Ok(AttemptOutcome::Retry(cause)) => {
                     last_cause =
@@ -2446,12 +2533,13 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
-                // Index-key type/empty faults inside a transaction
-                // surface as per-item cancellation reasons (matches
-                // postgres data/transactions.rs). D-M10.
+                // Secondary-index key faults, both ahead of the condition on a
+                // Put member. They leave as internal reasons; the caller applies
+                // the service's cross-member precedence and decides between a
+                // cancellation and a top-level ValidationException.
                 let idx_pairs = self
                     .fetch_index_key_schemas(&key_info.table_id)
                     .await
@@ -2464,13 +2552,25 @@ impl MongoEngine {
                             key_schema: ks.as_slice(),
                         })
                         .collect();
-                    extenddb_core::validation::validate_index_keys(
+                    extenddb_core::validation::validate_index_key_types(
                         item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                        TransactOpError::Cancel(CancellationReason::key_type_mismatch(
+                            e.to_string(),
+                        ))
+                    })?;
+                    extenddb_core::validation::validate_index_key_not_empty(
+                        item,
+                        &idx_refs,
+                        extenddb_core::validation::SecondaryIndexEmptyContext::Item,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::index_key_empty_abort(
+                            e.to_string(),
+                        ))
                     })?;
                 }
 
@@ -2570,7 +2670,7 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);
@@ -2662,7 +2762,31 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+                })?;
+
+                // A literal operand of the wrong type on a secondary-index key
+                // is reported on the statement, ahead of the condition and
+                // ahead of applying any action.
+                let idx_pairs = self
+                    .fetch_index_key_schemas(&key_info.table_id)
+                    .await
+                    .map_err(TransactOpError::Storage)?;
+                let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
+                    .iter()
+                    .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
+                        index_name: n.as_str(),
+                        key_schema: ks.as_slice(),
+                    })
+                    .collect();
+                extenddb_core::validation::validate_index_key_literal_operands(
+                    actions,
+                    &idx_refs,
+                    &key_info.attribute_definitions,
+                    maps,
+                )
+                .map_err(|e| {
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);
@@ -2720,28 +2844,30 @@ impl MongoEngine {
                     TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
 
-                // Validate index-key types/emptiness on the post-update
-                // item; a violation here surfaces as a per-item
-                // cancellation reason. D-M10, RFC-0003 §2.3.
-                let idx_pairs = self
-                    .fetch_index_key_schemas(&key_info.table_id)
-                    .await
-                    .map_err(TransactOpError::Storage)?;
-                if !idx_pairs.is_empty() {
-                    let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = idx_pairs
-                        .iter()
-                        .map(|(n, ks)| extenddb_core::validation::IndexKeyRef {
-                            index_name: n.as_str(),
-                            key_schema: ks.as_slice(),
-                        })
-                        .collect();
-                    extenddb_core::validation::validate_index_keys(
+                // Secondary-index keys on the written item: a value computed
+                // from the existing item (an attribute reference, the fallback
+                // of if_not_exists) of the wrong type, reported with the
+                // service's computed-value wording, and a key left empty.
+                if !idx_refs.is_empty() {
+                    extenddb_core::validation::validate_index_key_types_after_update(
                         &item,
                         &idx_refs,
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| {
-                        TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                        TransactOpError::Cancel(CancellationReason::key_type_mismatch(
+                            e.to_string(),
+                        ))
+                    })?;
+                    extenddb_core::validation::validate_index_key_not_empty(
+                        &item,
+                        &idx_refs,
+                        extenddb_core::validation::SecondaryIndexEmptyContext::UpdateExpression,
+                    )
+                    .map_err(|e| {
+                        TransactOpError::Cancel(CancellationReason::index_key_empty_abort(
+                            e.to_string(),
+                        ))
                     })?;
                 }
 
@@ -2804,7 +2930,7 @@ impl MongoEngine {
                     &key_info.attribute_definitions,
                 )
                 .map_err(|e| {
-                    TransactOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TransactOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
 
                 let coll_name = data_collection_name(&key_info.table_id);
@@ -2979,6 +3105,12 @@ impl MongoEngine {
                         &key_info.attribute_definitions,
                     )
                     .map_err(|e| StorageError::Validation(e.to_string()))?;
+                    // REMOVE and DELETE on a missing key write nothing
+                    // (issue #478); the actions ran above for their
+                    // validation errors only.
+                    if expression::removes_only(actions) {
+                        return Ok((None, None));
+                    }
                     let new_doc = item_to_document(
                         &new_item,
                         &key_info.key_schema,
@@ -4111,6 +4243,16 @@ fn project_item(
     }
 }
 
+#[path = "data_engine_key_repair.rs"]
+pub(crate) mod key_repair;
+
+#[path = "data_engine_update_create.rs"]
+mod update_create;
+
+#[cfg(test)]
+#[path = "data_engine_live_tests.rs"]
+mod live_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4510,5 +4652,39 @@ transaction_read_concern = "majority""#,
         let path = vec![PathElement::Attribute("name".to_owned())];
 
         assert_eq!(native_attribute_name(&path, &maps), Some("name".to_owned()));
+    }
+
+    #[test]
+    fn native_update_pipeline_sets_each_value_as_a_literal() {
+        let names = std::collections::HashMap::from([
+            ("s".to_owned(), "s".to_owned()),
+            ("p".to_owned(), "p".to_owned()),
+            ("n".to_owned(), "n".to_owned()),
+        ]);
+        let values = std::collections::HashMap::from([
+            ("dollar".to_owned(), AttributeValue::S("$item_data".into())),
+            ("plain".to_owned(), AttributeValue::S("x".into())),
+            ("one".to_owned(), AttributeValue::N("1".into())),
+        ]);
+        let maps = ExpressionMaps::new(names, values);
+        let tokens = expression::tokenize("SET #s = :dollar, #p = :plain ADD #n :one").unwrap();
+        let actions = expression::parse_update(&tokens).unwrap();
+
+        let Some(NativeUpdate::Pipeline { pipeline, .. }) =
+            MongoEngine::try_build_native_update(&actions, &maps)
+        else {
+            panic!("a SET with a numeric ADD builds a pipeline update");
+        };
+        let stage = pipeline[0].get_document("$set").unwrap();
+        // Every SET value is wrapped, not only the ones whose text reads as a
+        // field path: a plain string under a `$literal` stays a string, and
+        // without the wrapper a later read of a non-string attribute fails.
+        let want = doc! { "$literal": { "S": "$item_data" } };
+        assert_eq!(stage.get("item_data.s"), Some(&bson::Bson::Document(want)));
+        let want_plain = doc! { "$literal": { "S": "x" } };
+        assert_eq!(
+            stage.get("item_data.p"),
+            Some(&bson::Bson::Document(want_plain))
+        );
     }
 }

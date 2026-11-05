@@ -16,8 +16,8 @@ use extenddb_core::types::{
     TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    AttributeNameRequestForm, validate_attribute_name_sizes, validate_batch_item_keys,
+    validate_batch_key_only, validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 use extenddb_storage::DataEngine;
@@ -71,6 +71,20 @@ pub async fn handle_batch_write_item(
         }
     }
 
+    // Attribute names over the size limit are request-shape validation: every
+    // PutRequest item is checked before any table lookup and before the key
+    // checks, so a request naming a missing table, or an item missing its key,
+    // answers with the name refusal.
+    for reqs in input.request_items.values() {
+        for put in reqs.iter().filter_map(|wr| wr.put_request.as_ref()) {
+            validate_attribute_name_sizes(
+                &put.item,
+                &ctx.limits,
+                AttributeNameRequestForm::BatchRequest,
+            )?;
+        }
+    }
+
     // Read every table's key info before anything is written. A lookup that
     // failed is reported where `check_batch` reaches its table, so the first
     // fault reported is the one the checks reach first.
@@ -102,7 +116,9 @@ pub async fn handle_batch_write_item(
 /// wherever the faulty request sits, which is what the `BatchWriteItem` API
 /// reference documents for these faults. The limits on the number of tables
 /// and requests are checked before this function runs, in
-/// `check_batch_counts`, and the limit on the request size by the HTTP layer.
+/// `check_batch_counts`, the attribute-name sizes in `handle_batch_write_item`
+/// ahead of the table lookups, and the limit on the request size by the HTTP
+/// layer.
 /// The writes run only after the checks, so a write that cannot be applied now
 /// never leaves a later request unchecked, and no request fault is found after
 /// a request has been applied. A storage error that a replay does not clear
@@ -419,7 +435,6 @@ fn validate_request(
         )?;
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, limits.max_item_size_bytes)?;
-        validate_attribute_name_sizes(&put.item, limits)?;
         validate_key_sizes(&put.item, &key_info.key_schema, limits)?;
         extenddb_core::validation::validate_vector_write(
             &put.item,
