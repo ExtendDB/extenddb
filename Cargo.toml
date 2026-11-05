@@ -22,7 +22,7 @@ members = [
 [workspace.package]
 version = "0.1.14"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91.1"
 license = "Apache-2.0"
 
 [workspace.dependencies]
@@ -89,14 +89,13 @@ bson = "2.13"
 dashmap = "6"
 
 # Backup store
-# Exact pins: the aws-sdk crates release in lockstep, and these are the newest
-# versions whose declared minimum supported rustc fits the workspace
-# rust-version (1.88); later releases require a newer compiler. Their
-# transitive aws-* and aws-smithy-* crates are held in Cargo.lock at the
-# newest versions that build on 1.88 (set with
-# `cargo +1.88.0 update <crate>@<version> --precise <older>`). The resolver
+# Exact pins: the aws-sdk crates release in lockstep, and each of these
+# versions declares a minimum supported rustc at or below the workspace
+# rust-version (1.91.1). Their transitive aws-* and aws-smithy-* crates are
+# held in Cargo.lock at versions that build on 1.91.1 (set with
+# `cargo +1.91.1 update <crate>@<version> --precise <older>`). The resolver
 # fallback in .cargo/config.toml keeps a plain `cargo update` from moving
-# them past that, and the 1.88 leg of .github/workflows/test.yml fails if
+# them past that, and the 1.91.1 leg of .github/workflows/test.yml fails if
 # they drift. The feature set is that of tests/rust/Cargo.toml plus `sso` on
 # aws-config, so a server whose credentials come from an SSO profile
 # (`sso_session` in the shared config) can reach the backup bucket.

@@ -45,7 +45,7 @@ pub(crate) struct LeasedManagementStore {
 pub(crate) fn stopped(left: Option<&std::sync::atomic::AtomicUsize>) -> bool {
     use std::sync::atomic::Ordering;
     // A compare-exchange loop: `fetch_update` is deprecated on current
-    // stable and its replacement does not exist on 1.88.
+    // stable and its replacement does not exist on 1.91.1.
     let Some(left) = left else {
         return false;
     };
