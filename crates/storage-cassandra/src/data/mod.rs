@@ -5,6 +5,7 @@
 //!
 //! Every statement under this module states its consistency level through
 //! [`read_params`](crate::cassandra_util::read_params),
+//! [`read_params_at`](crate::cassandra_util::read_params_at),
 //! [`write_params`](crate::cassandra_util::write_params) or
 //! [`lwt_params`](crate::cassandra_util::lwt_params); the schema statements in
 //! `ddl.rs` are the one exception. Two checks hold that. The lint below
@@ -45,10 +46,13 @@ mod put_get_item;
 mod query;
 mod query_helpers;
 mod scan;
+mod sk_range;
+mod transact_stream;
 pub mod transaction_ledger;
 mod transactions;
 pub(crate) mod ttl;
 mod update_item;
+pub mod version;
 
 #[cfg(test)]
 mod level_pairing_tests;
@@ -197,30 +201,6 @@ pub(crate) async fn query_with_pk_sk_item_txnid_ts(
     execute_bound(session, query, values, params).await
 }
 
-/// Execute a query with `(item_text, txn_timestamp, pk, sk, txn_id_bytes)` bound parameters.
-///
-/// Used for: commit PUT/UPDATE.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn query_with_item_ts_pk_sk_txnid(
-    session: &CassandraSession,
-    query: &str,
-    item_text: &str,
-    txn_timestamp: i64,
-    pk: &str,
-    sk: &SortKeyValue,
-    txn_id: Bytes,
-    params: impl FnOnce(QueryValues) -> StatementParams,
-) -> Result<Envelope, StorageError> {
-    let values = vec![
-        item_text.into(),
-        txn_timestamp.into(),
-        pk.into(),
-        sk_to_value(sk),
-        txn_id.into(),
-    ];
-    execute_bound(session, query, values, params).await
-}
-
 /// Execute a SELECT query by primary key (pk only, or pk + sort key) at
 /// [`read_consistency`](crate::cassandra_util::read_consistency)`(consistent_read)`.
 ///
@@ -237,7 +217,36 @@ pub(crate) async fn select_by_pk(
     sk_col: Option<&str>,
     consistent_read: bool,
 ) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
-    let params = |values| crate::cassandra_util::read_params(consistent_read, values);
+    let consistency = crate::cassandra_util::read_consistency(consistent_read);
+    select_by_pk_at(
+        session,
+        keyspace,
+        table,
+        columns,
+        pk,
+        sk,
+        sk_col,
+        consistency,
+    )
+    .await
+}
+
+/// [`select_by_pk`] at `consistency`: a level
+/// [`read_consistency`](crate::cassandra_util::read_consistency) returns, or
+/// `LOCAL_SERIAL`. A read at `LOCAL_SERIAL` sees every LWT that has committed,
+/// and completes one still in progress, before it answers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn select_by_pk_at(
+    session: &CassandraSession,
+    keyspace: &str,
+    table: &str,
+    columns: &str,
+    pk: &str,
+    sk: Option<&SortKeyValue>,
+    sk_col: Option<&str>,
+    consistency: cdrs_tokio::consistency::Consistency,
+) -> Result<Option<cdrs_tokio::types::rows::Row>, StorageError> {
+    let params = |values| crate::cassandra_util::read_params_at(consistency, values);
     let result = if let (Some(sk), Some(sk_col)) = (sk, sk_col) {
         let query =
             format!("SELECT {columns} FROM {keyspace}.{table} WHERE pk = ? AND {sk_col} = ?");

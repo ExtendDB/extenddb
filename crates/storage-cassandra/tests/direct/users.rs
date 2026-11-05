@@ -176,7 +176,7 @@ mod tests {
 
         // Need encryption key for access keys
         use extenddb_storage::bootstrapper::helpers::generate_encryption_key;
-        let enc_key = generate_encryption_key();
+        let enc_key = generate_encryption_key().expect("generate key");
         let catalog_store = extenddb_storage_cassandra::CassandraCatalogStore::with_encryption_key(
             engine.session_arc(),
             config.keyspace_prefix.clone(),

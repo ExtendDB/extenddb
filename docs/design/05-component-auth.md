@@ -501,7 +501,7 @@ pub enum ConditionOperator {
 }
 ```
 
-> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. extenddb v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
+> **Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`, which grants access to tables matching the caller's own team tag. extenddb expands `${key}` and `${key, 'default'}` in the `Resource` and `NotResource` patterns of a `2012-10-17` document and in condition values, where the default form is read only in a `2012-10-17` document and under a string or ARN operator (`policy/variables.rs`). In a `Resource` or `NotResource` pattern, text that comes from a value or a default is matched literally, so a value cannot add a wildcard, and a variable whose key the request does not carry, with no default, makes the pattern match nothing. With a default, the default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none` when the request has no `team` tag (measured with the IAM policy simulator, issue #533). The full rules are in the security model manual (`docs/manuals/10-security-model.md`); two gaps that remain in condition values are filed as #534. Policy variable support is tracked as REQ-ABAC-006.
 
 **JSON deserialization:**
 
@@ -541,17 +541,19 @@ pub trait ConditionContext {
 
     /// Returns `true` if `key` is a multivalued (set-valued) condition key.
     /// Arity is a property of the key, not the number of values present.
-    /// `RequestContext` reports `dynamodb:Attributes` and `dynamodb:LeadingKeys`
-    /// as multivalued; all other keys (and all trust-policy keys) are single-valued.
+    /// `RequestContext` reports `dynamodb:Attributes`, `dynamodb:LeadingKeys` and
+    /// `aws:TagKeys` as multivalued; all other keys are single-valued, except
+    /// that `AssumeRoleContext` also reports `aws:TagKeys` as multivalued.
     fn is_multivalued_key(&self, key: &str) -> bool;
 }
 ```
 
 **Condition-key arity (single-valued vs multivalued).** AWS classifies each
 condition key as single-valued or multivalued (`ArrayOfString`) in the service
-authorization reference. For DynamoDB, `dynamodb:Attributes` and
-`dynamodb:LeadingKeys` are multivalued; everything else extenddb resolves
-(`dynamodb:Select`, `dynamodb:ReturnValues`, tag keys, etc.) is single-valued.
+authorization reference. For DynamoDB, `dynamodb:Attributes`,
+`dynamodb:LeadingKeys` and `aws:TagKeys` are multivalued; everything else
+extenddb resolves (`dynamodb:Select`, `dynamodb:ReturnValues`,
+`aws:RequestTag/<key>`, etc.) is single-valued.
 A **bare** operator (one without a `ForAllValues:`/`ForAnyValue:` qualifier)
 applied to a multivalued key **never matches** — verified against real AWS IAM
 (BR-7085), and independent of how many values are present. Only the set-operator
@@ -727,6 +729,8 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             match context_values {
                 None => true,  // ForAllValues with absent key is vacuously true
                                // (same result whether or not IfExists is present)
+                // No Arn set check: a value that is not an ARN fails
+                // compare_single for every Arn operator, so `all` is false
                 Some(vals) => vals.iter().all(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -737,6 +741,7 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
             let (absent_passes, base_op) = unwrap_if_exists(inner);
             match context_values {
                 None => absent_passes,  // false normally, true if IfExists
+                Some(vals) if arn_operator_sees_non_arn(base_op, &vals) => false,
                 Some(vals) => vals.iter().any(|cv| {
                     condition.values.iter().any(|pv| compare_single(base_op, cv, pv))
                 })
@@ -768,6 +773,20 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
         ConditionOperator::IfExists(base) => (true, base),
         other => (false, other),
     }
+}
+
+/// Helper: true when `op` is an Arn operator and any context value is not an
+/// ARN (`is_arn`). IAM evaluates the condition as false for the whole set in
+/// that case, in the bare, ForAnyValue and ForAllValues forms (measured with
+/// simulate-custom-policy on the values [V, "notanarn"]). ForAnyValue checks
+/// it before comparing per value. ForAllValues needs no check, because a
+/// value that is not an ARN fails compare_single against every policy value
+/// (so `all` is false for a non-empty policy value list), and neither does
+/// the bare form, which is false on a multivalued key. With an empty policy
+/// value list, which the write paths accept, ForAllValues with a negative
+/// Arn operator is true and ForAnyValue is false, as IAM evaluates them.
+fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) -> bool {
+    is_arn_operator(op) && !context_values.iter().all(|cv| is_arn(cv))
 }
 
 /// Evaluate a non-set, non-IfExists condition operator against a single-valued key.
@@ -815,10 +834,14 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
             compare_dates(op, context_value, policy_value),
         ConditionOperator::Bool =>
             context_value.eq_ignore_ascii_case(policy_value),
-        ConditionOperator::ArnEquals => context_value == policy_value,
-        ConditionOperator::ArnNotEquals => context_value != policy_value,
-        ConditionOperator::ArnLike => arn_match(policy_value, context_value),
-        ConditionOperator::ArnNotLike => !arn_match(policy_value, context_value),
+        // IAM evaluates ArnEquals as ArnLike and ArnNotEquals as ArnNotLike:
+        // `*` and `?` match in every ARN field, and a context value that is
+        // not an ARN matches neither operator (measured with
+        // simulate-custom-policy).
+        ConditionOperator::ArnEquals | ConditionOperator::ArnLike =>
+            is_arn(context_value) && arn_match(policy_value, context_value),
+        ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike =>
+            is_arn(context_value) && !arn_match(policy_value, context_value),
         // Null, ForAllValues, ForAnyValue, IfExists are handled by the caller
         _ => false,
     }
@@ -1330,7 +1353,7 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 
 3. **Service control policies (SCPs) are not evaluated.** SCPs are an Organizations-level feature. extenddb does not query Organizations APIs.
 
-4. **Policy variable substitution is not supported.** Consistent with REQ-ABAC-006 deferral. Fetched policies containing `${aws:PrincipalTag/key}` will treat the variable syntax as a literal string.
+4. **Policy variables follow the identity-policy rules, with the condition-value gaps of #534.** Fetched policies are evaluated by the same engine, so `${aws:PrincipalTag/key}` in a `Resource`, `NotResource` or condition value expands from the request (REQ-ABAC-006), and the two condition-value gaps filed as #534 apply to them as well.
 
 5. **Cross-account access is not evaluated.** extenddb assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
 
@@ -1564,18 +1587,19 @@ impl AuthLayer {
 
 ## 10. Secret Key Encryption
 
-```rust
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+The implementation is `crates/storage/src/secret_cipher.rs`, on AWS-LC through
+aws-lc-rs ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)). `aad` is the
+access key id.
 
-pub fn encrypt_secret(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    // Generate random 12-byte nonce
-    // Encrypt with AES-256-GCM
+```rust
+pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
+    // Seal with AES-256-GCM under a fresh random 12-byte nonce
     // Return: nonce || ciphertext || tag
 }
 
-pub fn decrypt_secret(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AuthError> {
-    // Extract nonce (first 12 bytes)
-    // Decrypt with AES-256-GCM
+pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
+    // Split off the nonce (first 12 bytes)
+    // Open with the same aad; any mismatch fails
     // Return plaintext
 }
 ```

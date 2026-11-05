@@ -57,7 +57,10 @@ through one of four constructors in `cassandra_util`:
   delete, the transaction reads, the idempotency token reads, the ledger
   reads the recovery worker acts on) and a table walk (the export scan, the
   metadata walks, the global secondary index backfill) pass `true`. Catalog
-  and queue metadata reads pass `false`.
+  and queue metadata reads pass `false`. `read_params_at(level, values)` is
+  the same read at a level the caller names: `read_params` passes it
+  `read_consistency(consistent_read)`, and the reads ADR-0027 runs at
+  `LOCAL_SERIAL` pass that level.
 - `write_params(values)`: `LOCAL_QUORUM`, for every statement without an
   `IF` clause.
 - `lwt_params(values)`: `LOCAL_QUORUM` with serial `LOCAL_SERIAL`, for every

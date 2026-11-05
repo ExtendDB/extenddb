@@ -337,12 +337,21 @@ pub(super) async fn write_stream_record_in_tx(
     let idx = (hash as usize) % shards.len();
     let shard_id = &shards[idx].0;
 
-    // Generate monotonic sequence number within the transaction (CB-21).
-    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(db_error)?;
+    // Generate monotonic sequence number within the transaction (CB-21). The
+    // same statement takes the record's one clock read: clock_timestamp() is
+    // the database clock when this statement runs, after the write's locking
+    // reads, while the column default (NOW()) is the transaction start, which
+    // in a long transaction sits seconds before the record. created_at and
+    // ApproximateCreationDateTime both derive from this reading, and the
+    // retention sweep compares created_at with the database's NOW(), so the
+    // retention window is measured on the database clock alone.
+    let (seq_val, created_at): (i64, time::OffsetDateTime) =
+        sqlx::query_as("SELECT nextval('stream_seq'), clock_timestamp()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db_error)?;
     let seq = format!("{seq_val:021}");
+    let approximate_creation_date_time = created_at.unix_timestamp();
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -351,13 +360,7 @@ pub(super) async fn write_stream_record_in_tx(
         event_source: "aws:dynamodb".to_owned(),
         aws_region: capture.region.to_string(),
         dynamodb: StreamRecordData {
-            approximate_creation_date_time: i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-            .unwrap_or(i64::MAX),
+            approximate_creation_date_time,
             keys,
             new_image,
             old_image,
@@ -372,14 +375,15 @@ pub(super) async fn write_stream_record_in_tx(
         serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
 
     sqlx::query(
-        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(&record.dynamodb.sequence_number)
     .bind(shard_id)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
     .bind(&record_json)
+    .bind(created_at)
     .execute(&mut **tx)
     .await
     .map_err(db_error)?;

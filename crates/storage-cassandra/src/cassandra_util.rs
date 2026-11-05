@@ -25,8 +25,8 @@ pub type CassandraSession = Session<
 // ══════════════════════════════════════════════════════════════════════════════
 //
 // Every statement under `data/` states its level through `read_params`,
-// `write_params` or `lwt_params`; schema statements in `data/ddl.rs` are the
-// one exception. `clippy.toml` disallows the driver calls that run at the
+// `read_params_at`, `write_params` or `lwt_params`; schema statements in
+// `data/ddl.rs` are the one exception. `clippy.toml` disallows the driver calls that run at the
 // driver default, `Consistency::One`, and `data/mod.rs` turns that lint on for
 // the data path.
 
@@ -50,8 +50,24 @@ pub const fn read_consistency(consistent_read: bool) -> Consistency {
 /// Parameters for a data-path read at [`read_consistency`].
 #[must_use]
 pub fn read_params(consistent_read: bool, values: QueryValues) -> StatementParams {
+    read_params_at(read_consistency(consistent_read), values)
+}
+
+/// Parameters for a data-path read at `consistency`: a level
+/// [`read_consistency`] returns, or `LOCAL_SERIAL` for a read that must see
+/// every lightweight transaction that has committed, and complete one still
+/// in progress, before it answers (a COMMIT reading its own fenced row).
+#[must_use]
+pub fn read_params_at(consistency: Consistency, values: QueryValues) -> StatementParams {
+    debug_assert!(
+        matches!(
+            consistency,
+            Consistency::LocalQuorum | Consistency::LocalOne | Consistency::LocalSerial
+        ),
+        "a data-path read runs at LOCAL_QUORUM, LOCAL_ONE or LOCAL_SERIAL, not {consistency:?}"
+    );
     StatementParamsBuilder::new()
-        .with_consistency(read_consistency(consistent_read))
+        .with_consistency(consistency)
         .with_values(values)
         .build()
 }
@@ -508,6 +524,20 @@ mod tests {
             (false, Consistency::LocalOne),
         ] {
             let params = read_params(consistent_read, bound()).query_params;
+            assert_eq!(params.consistency, level);
+            assert_eq!(params.serial_consistency, None);
+            assert_eq!(params.values, Some(bound()));
+        }
+    }
+
+    #[test]
+    fn read_params_at_carry_the_level_they_are_given_and_no_serial_level() {
+        for level in [
+            Consistency::LocalQuorum,
+            Consistency::LocalOne,
+            Consistency::LocalSerial,
+        ] {
+            let params = read_params_at(level, bound()).query_params;
             assert_eq!(params.consistency, level);
             assert_eq!(params.serial_consistency, None);
             assert_eq!(params.values, Some(bound()));

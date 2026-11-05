@@ -448,6 +448,7 @@ pub(crate) async fn backfill_gsi(
     projection: &extenddb_core::types::Projection,
 ) -> Result<(), StorageError> {
     use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
+    use cdrs_tokio::types::IntoRustByName as _;
 
     const PAGE_SIZE: i64 = 500;
 
@@ -464,11 +465,11 @@ pub(crate) async fn backfill_gsi(
     // Token-based full-table scan matching the pattern used by scan_impl.
     // First page: no lower bound. Subsequent pages: token(pk) > last_token.
     let first_page_query = format!(
-        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
              LIMIT {PAGE_SIZE} ALLOW FILTERING"
     );
     let next_page_query = format!(
-        "SELECT pk, item_data FROM {account_keyspace}.{base_table} \
+        "SELECT pk, item_data, version FROM {account_keyspace}.{base_table} \
              WHERE token(pk) > ? LIMIT {PAGE_SIZE} ALLOW FILTERING"
     );
 
@@ -516,6 +517,15 @@ pub(crate) async fn backfill_gsi(
             let projected =
                 project_item_for_index(&item, index_key_schema, base_key_schema, projection);
 
+            // A row this scheme versioned gets the stamp its own writes give
+            // its index rows: its version (`data::version`). A delete then
+            // removes the backfilled row with its version + 1 tombstone, and a
+            // write that commits a later version while the backfill runs wins
+            // over it in either arrival order. A row with a null or counter
+            // version keeps coordinator time, as its delete takes the clock.
+            let version: Option<i64> = row.get_by_name("version").ok().flatten();
+            let stamp = version.filter(|v| *v >= super::version::CLOCK_VERSION_FLOOR);
+
             insert_index_row_multi(
                 &mut batch,
                 account_keyspace,
@@ -526,6 +536,7 @@ pub(crate) async fn backfill_gsi(
                 base_key_schema,
                 &idx_sks,
                 &base_sks,
+                stamp,
             )?;
             batch_has_rows = true;
         }

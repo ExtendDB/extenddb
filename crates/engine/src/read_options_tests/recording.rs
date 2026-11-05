@@ -15,16 +15,17 @@ use extenddb_storage::BoxedFuture as BoxFuture;
 use super::fixtures::{ACCOUNT, EVENTS, ORDERS, USERS, gsi_info, lsi_info, table_info};
 use extenddb_core::expression::{Expr, ExpressionMaps, KeyCondition, UpdateAction};
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    CreateTableInput, DeleteTableInput, DescribeStreamInput, DescribeTableInput, IndexInfo, Item,
-    ListTablesInput, ListTablesOutput, StreamDescription, StreamRecord, TableDescription,
-    TableKeyInfo, Tag, TimeToLiveDescription, UpdateTableInput,
+    BackupDescription, BackupDetails, BackupSummary, CreateTableInput, DeleteTableInput,
+    DescribeStreamInput, DescribeTableInput, IndexInfo, Item, ListTablesInput, ListTablesOutput,
+    StreamDescription, StreamRecord, TableDescription, TableKeyInfo, Tag, TimeToLiveDescription,
+    UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
     BackupEngine, BackupRestoreSource, DataEngine, IdempotencyKey, ItemPairResult, MetadataEngine,
-    QueryResult, ReadOptions, RestoreRequest, StreamCapture, StreamEngine, StreamListResult,
-    StreamRecordsResult, TableEngine, TransactGetOp, TransactWriteOp, TtlTableInfo, WorkerStore,
+    QueryResult, ReadOptions, RestoreRequest, SnapshotEngine, StreamCapture, StreamEngine,
+    StreamListResult, StreamRecordsResult, TableEngine, TableSnapshot, TransactGetOp,
+    TransactWriteOp, TtlTableInfo, WorkerStore,
 };
 
 /// One read that reached storage.
@@ -393,6 +394,7 @@ impl StreamEngine for RecordingStorage {
     fn get_stream_records(
         &self,
         _account_id: &str,
+        _stream_arn: &str,
         _shard_id: &str,
         _after_sequence: Option<&str>,
         _limit: i64,
@@ -512,21 +514,14 @@ impl BackupEngine for RecordingStorage {
     ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         unimplemented!("not reached by read handlers")
     }
+}
 
-    fn describe_continuous_backups(
+impl SnapshotEngine for RecordingStorage {
+    fn open_table_snapshot(
         &self,
         _account_id: &str,
         _table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        unimplemented!("not reached by read handlers")
-    }
-
-    fn update_continuous_backups(
-        &self,
-        _account_id: &str,
-        _table_name: &str,
-        _pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
+    ) -> BoxFuture<'_, Result<TableSnapshot, StorageError>> {
         unimplemented!("not reached by read handlers")
     }
 }

@@ -50,7 +50,7 @@ const CALLS: &[(&str, Option<usize>, Option<Kind>)] = &[
     ("query_with_pk_sk_pk_sk", Some(1), None),
     ("query_with_pk_sk_pk", Some(1), None),
     ("query_with_pk_pk_sk", Some(1), None),
-    ("query_with_pk_sk_sk_sk", Some(1), None),
+    ("query_with_pk_sks", Some(1), None),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3,6 +3,7 @@
 
 //! `delete_item` implementation for the Cassandra backend.
 
+use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -185,6 +186,9 @@ impl CassandraEngine {
         allowed_prepared_txn_id: Option<uuid::Uuid>,
         expected_claimed_item: Option<&Item>,
     ) -> Result<Option<Item>, StorageError> {
+        // Taken before the read: a write whose version is at or above it began
+        // after this delete did (`item_present_serial`).
+        let started = super::version::now_micros();
         let data_keyspace = self.account_keyspace(&key_info.account_id);
         let ddb_table = data_table_name(&key_info.table_id);
 
@@ -235,7 +239,7 @@ impl CassandraEngine {
             {
                 if let Some(row) = rows.into_iter().next() {
                     let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                    let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+                    let version: Option<i64> = row.get_by_name("version").ok().flatten();
                     let prepared_txn_id: Option<uuid::Uuid> =
                         row.get_by_name("prepared_txn_id").ok().flatten();
                     (
@@ -244,10 +248,10 @@ impl CassandraEngine {
                         prepared_txn_id,
                     )
                 } else {
-                    (None, 0, None)
+                    (None, None, None)
                 }
             } else {
-                (None, 0, None)
+                (None, None, None)
             };
 
             if let Some(expected_item) = expected_claimed_item {
@@ -286,43 +290,77 @@ impl CassandraEngine {
             } else if ttl_config.is_some() {
                 self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
                     .await?
-            } else if condition.is_some() {
-                // Conditional delete: use an OCC LWT to atomically delete only
-                // if the row hasn't changed since we read and checked it.
-                if old_item_opt.is_some() {
-                    self.update_partition_max_delete_timestamp_at(
+            } else {
+                // Ordinary delete without TTL: the OCC LWT deletes the row only
+                // if it is still at the version this request read, so the delete
+                // and any concurrent write to the key commit in one order and the
+                // index rows written afterwards carry that order (`data::version`).
+                // Deleting an absent item writes nothing.
+                let Some(old_item) = old_item_opt else {
+                    // The read above is at the driver's default consistency,
+                    // and a replica that missed the latest write reads as
+                    // absent. The fence catches a stale image but not a stale
+                    // absence, so the absence is confirmed at LOCAL_SERIAL
+                    // before the delete answers without writing. An item found
+                    // there that a write stored before this delete began is
+                    // retried from a fresh read, as a lost race is; one whose
+                    // version was read after it began is a concurrent write,
+                    // which the delete is ordered before.
+                    if self
+                        .item_present_serial(
+                            &data_keyspace,
+                            &ddb_table,
+                            &pk_text,
+                            Some((&sk, sk_col)),
+                            started,
+                        )
+                        .await?
+                    {
+                        return Err(StorageError::TransactionConflict(
+                            "delete_item read a stale absence (sort key)".to_owned(),
+                        ));
+                    }
+                    return Ok(None);
+                };
+                // Taken from the version read above, before the fence, so a
+                // create of this key that commits after the delete stamps its
+                // index rows above these tombstones (`version::delete_stamp`).
+                let stamp = super::version::delete_stamp(version)?;
+                self.update_partition_max_delete_timestamp_at(
+                    &data_keyspace,
+                    &ddb_table,
+                    &pk_text,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                let fence_cql = format!(
+                    "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
+                     IF version = ? AND prepared_txn_id = null"
+                );
+                let fence_applied = self
+                    .occ_delete_lwt(&fence_cql, pk_text.as_ref(), Some(&sk), version)
+                    .await?;
+                if !fence_applied {
+                    // The row moved between the read and the fence. Re-read and
+                    // re-evaluate (including any condition) rather than answer
+                    // from the stale image.
+                    return Err(StorageError::TransactionConflict(
+                        "delete_item lost OCC race (sort key)".to_owned(),
+                    ));
+                }
+                if !indexes.is_empty() || stream.is_some() {
+                    self.delete_item_secondary_effects(
                         &data_keyspace,
-                        &ddb_table,
-                        &pk_text,
-                        chrono::Utc::now().timestamp_millis(),
+                        key_info,
+                        &indexes,
+                        Some(&old_item),
+                        stream,
+                        sys_delay,
+                        stamp,
                     )
                     .await?;
-                    let fence_cql = format!(
-                        "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ? \
-                         IF version = ? AND prepared_txn_id = null"
-                    );
-                    let fence_applied = self
-                        .occ_delete_lwt(&fence_cql, pk_text.as_ref(), Some(&sk), version)
-                        .await?;
-                    if !fence_applied {
-                        return Err(StorageError::ConditionFailed(old_item_opt));
-                    }
-                    if !indexes.is_empty() || stream.is_some() {
-                        self.delete_item_secondary_effects(
-                            &data_keyspace,
-                            key_info,
-                            &indexes,
-                            old_item_opt.as_ref(),
-                            stream,
-                            sys_delay,
-                        )
-                        .await?;
-                    }
-                    return Ok(if return_old { old_item_opt } else { None });
                 }
-                None
-            } else {
-                None
+                return Ok(if return_old { Some(old_item) } else { None });
             };
             let mutation_timestamp = chrono::Utc::now().timestamp_micros();
 
@@ -380,10 +418,21 @@ impl CassandraEngine {
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                     sk_to_value(&sk),
                 ]);
-                let mut batch = crate::cassandra_util::batch_builder();
-                if ttl_claim.is_some() {
-                    batch = batch.with_timestamp(mutation_timestamp);
-                }
+                // Only a claimed row reaches this batch (an unclaimed delete
+                // took the fence above). The batch stays at the pinned mutation
+                // timestamp for the same reason as the claimed write path; the
+                // queue entries carry the version-domain stamp for the worker.
+                let delete_stamp =
+                    match super::version::next_row_version_at(version, mutation_timestamp) {
+                        Ok(stamp) => stamp,
+                        Err(error) => {
+                            self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                let mut batch =
+                    crate::cassandra_util::batch_builder().with_timestamp(mutation_timestamp);
                 batch = batch.add_query(delete_cql, delete_qv);
 
                 if !indexes.is_empty()
@@ -415,6 +464,7 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
+                        delete_stamp,
                     )
                     .await
                     {
@@ -491,7 +541,7 @@ impl CassandraEngine {
 
             let (old_item_opt, version, prepared_txn_id_opt) = if let Some(row) = row {
                 let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
-                let version: i64 = row.get_by_name("version").ok().flatten().unwrap_or(0);
+                let version: Option<i64> = row.get_by_name("version").ok().flatten();
                 let prepared_txn_id: Option<uuid::Uuid> =
                     row.get_by_name("prepared_txn_id").ok().flatten();
                 (
@@ -500,7 +550,7 @@ impl CassandraEngine {
                     prepared_txn_id,
                 )
             } else {
-                (None, 0, None)
+                (None, None, None)
             };
 
             if let Some(expected_item) = expected_claimed_item {
@@ -539,43 +589,61 @@ impl CassandraEngine {
             } else if ttl_config.is_some() {
                 self.acquire_ttl_mutation_claim(key_info, key, old_item_opt.as_ref())
                     .await?
-            } else if condition.is_some() {
-                // Conditional delete: use an OCC LWT to atomically delete only
-                // if the row hasn't changed since we read and checked it.
-                if old_item_opt.is_some() {
-                    self.update_partition_max_delete_timestamp_at(
+            } else {
+                // Ordinary delete without TTL: see the sort-key variant above.
+                let Some(old_item) = old_item_opt else {
+                    // The read above is at the driver's default consistency,
+                    // and a replica that missed the latest write reads as
+                    // absent. The fence catches a stale image but not a stale
+                    // absence, so the absence is confirmed at LOCAL_SERIAL
+                    // before the delete answers without writing. An item found
+                    // there that a write stored before this delete began is
+                    // retried from a fresh read, as a lost race is; one whose
+                    // version was read after it began is a concurrent write,
+                    // which the delete is ordered before.
+                    if self
+                        .item_present_serial(&data_keyspace, &ddb_table, &pk_text, None, started)
+                        .await?
+                    {
+                        return Err(StorageError::TransactionConflict(
+                            "delete_item read a stale absence (pk only)".to_owned(),
+                        ));
+                    }
+                    return Ok(None);
+                };
+                let stamp = super::version::delete_stamp(version)?;
+                self.update_partition_max_delete_timestamp_at(
+                    &data_keyspace,
+                    &ddb_table,
+                    &pk_text,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                let fence_cql = format!(
+                    "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? \
+                     IF version = ? AND prepared_txn_id = null"
+                );
+                let fence_applied = self
+                    .occ_delete_lwt(&fence_cql, pk_text.as_ref(), None, version)
+                    .await?;
+                if !fence_applied {
+                    return Err(StorageError::TransactionConflict(
+                        "delete_item lost OCC race (pk only)".to_owned(),
+                    ));
+                }
+                if !indexes.is_empty() || stream.is_some() {
+                    self.delete_item_secondary_effects(
                         &data_keyspace,
-                        &ddb_table,
-                        &pk_text,
-                        chrono::Utc::now().timestamp_millis(),
+                        key_info,
+                        &indexes,
+                        Some(&old_item),
+                        stream,
+                        sys_delay,
+                        stamp,
                     )
                     .await?;
-                    let fence_cql = format!(
-                        "DELETE FROM {data_keyspace}.{ddb_table} WHERE pk = ? \
-                         IF version = ? AND prepared_txn_id = null"
-                    );
-                    let fence_applied = self
-                        .occ_delete_lwt(&fence_cql, pk_text.as_ref(), None, version)
-                        .await?;
-                    if !fence_applied {
-                        return Err(StorageError::ConditionFailed(old_item_opt));
-                    }
-                    if !indexes.is_empty() || stream.is_some() {
-                        self.delete_item_secondary_effects(
-                            &data_keyspace,
-                            key_info,
-                            &indexes,
-                            old_item_opt.as_ref(),
-                            stream,
-                            sys_delay,
-                        )
-                        .await?;
-                    }
-                    return Ok(if return_old { old_item_opt } else { None });
                 }
-                None
-            } else {
-                None
+                return Ok(if return_old { Some(old_item) } else { None });
             };
             // Pinned here, immediately after the claim and before any further
             // await, so it is strictly newer than the image this request owns
@@ -634,10 +702,21 @@ impl CassandraEngine {
                 let delete_qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                     cdrs_tokio::types::value::Value::from(pk_text.as_str()),
                 ]);
-                let mut batch = crate::cassandra_util::batch_builder();
-                if ttl_claim.is_some() {
-                    batch = batch.with_timestamp(mutation_timestamp);
-                }
+                // Only a claimed row reaches this batch (an unclaimed delete
+                // took the fence above). The batch stays at the pinned mutation
+                // timestamp for the same reason as the claimed write path; the
+                // queue entries carry the version-domain stamp for the worker.
+                let delete_stamp =
+                    match super::version::next_row_version_at(version, mutation_timestamp) {
+                        Ok(stamp) => stamp,
+                        Err(error) => {
+                            self.release_ttl_mutation_claim(key_info, key, ttl_claim)
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                let mut batch =
+                    crate::cassandra_util::batch_builder().with_timestamp(mutation_timestamp);
                 batch = batch.add_query(delete_cql, delete_qv);
 
                 if !indexes.is_empty()
@@ -669,6 +748,7 @@ impl CassandraEngine {
                         old_item_opt.as_ref(),
                         None,
                         sys_delay,
+                        delete_stamp,
                     )
                     .await
                     {
@@ -971,6 +1051,7 @@ impl CassandraEngine {
             None,
             Some(item),
             default_delay,
+            restore_timestamp,
         )
         .await?;
         let built = batch
@@ -1036,6 +1117,7 @@ impl CassandraEngine {
                 Some(old_item),
                 None,
                 default_delay,
+                delete_timestamp_ms * 1_000,
             )
             .await?;
         }
@@ -1453,6 +1535,40 @@ impl CassandraEngine {
         Ok(())
     }
 
+    /// Whether the base row, read at `LOCAL_SERIAL`, holds an item that a
+    /// write stored before this delete began. A version at or above `started`
+    /// was read from the clock after the delete began, so that write is
+    /// concurrent with the delete, which is ordered before it and answers
+    /// without writing. A null or counter version counts as stored before.
+    async fn item_present_serial(
+        &self,
+        data_keyspace: &str,
+        ddb_table: &str,
+        pk: &str,
+        sk: Option<(&extenddb_storage::util::SortKeyValue, &str)>,
+        started: i64,
+    ) -> Result<bool, StorageError> {
+        use cdrs_tokio::types::IntoRustByName as _;
+        let row = super::select_by_pk_at(
+            &self.session,
+            data_keyspace,
+            ddb_table,
+            "item_data, version",
+            pk,
+            sk.map(|(value, _)| value),
+            sk.map(|(_, col)| col),
+            Consistency::LocalSerial,
+        )
+        .await?;
+        Ok(row.is_some_and(|row| {
+            let item_data: Option<String> = row.get_by_name("item_data").ok().flatten();
+            let version: Option<i64> = row.get_by_name("version").ok().flatten();
+            let concurrent =
+                version.is_some_and(|v| v >= super::version::CLOCK_VERSION_FLOOR && v >= started);
+            item_data.is_some() && !concurrent
+        }))
+    }
+
     /// Issue a conditional `DELETE ... IF version = ? AND prepared_txn_id = null` LWT.
     ///
     /// Returns `true` if applied (row deleted), `false` if the fence condition
@@ -1462,7 +1578,7 @@ impl CassandraEngine {
         cql: &str,
         pk: &str,
         sk: Option<&extenddb_storage::util::SortKeyValue>,
-        version: i64,
+        version: Option<i64>,
     ) -> Result<bool, StorageError> {
         use cdrs_tokio::types::value::Value;
 
@@ -1471,12 +1587,14 @@ impl CassandraEngine {
             let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
                 Value::from(pk),
                 sk_val,
-                version.into(),
+                super::version::fence_value(version),
             ]);
             crate::cassandra_util::query_lwt(&self.session, cql, qv).await?
         } else {
-            let qv =
-                cdrs_tokio::query::QueryValues::SimpleValues(vec![Value::from(pk), version.into()]);
+            let qv = cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                Value::from(pk),
+                super::version::fence_value(version),
+            ]);
             crate::cassandra_util::query_lwt(&self.session, cql, qv).await?
         };
         crate::cassandra_util::lwt_applied(&result)
@@ -1485,7 +1603,14 @@ impl CassandraEngine {
     /// Run the secondary-effects LOGGED BATCH (index removals + stream record)
     /// after an OCC LWT has already deleted the base row.
     ///
+    /// `stamp` is the write timestamp of the batch's index statements, from
+    /// [`super::version::delete_stamp`]: above every index row the deleted
+    /// item wrote, so the tombstones win however late they arrive, and below
+    /// the index rows of a create that commits after the delete. The queue
+    /// rows and the stream record keep Cassandra's timestamp.
+    ///
     /// Only called when `!indexes.is_empty() || stream.is_some()`.
+    #[allow(clippy::too_many_arguments)]
     async fn delete_item_secondary_effects(
         &self,
         data_keyspace: &str,
@@ -1494,11 +1619,12 @@ impl CassandraEngine {
         old_item: Option<&extenddb_core::types::Item>,
         stream: Option<&extenddb_storage::StreamCapture>,
         sys_delay: u64,
+        stamp: i64,
     ) -> Result<(), StorageError> {
         let mut batch = crate::cassandra_util::batch_builder();
 
         if !indexes.is_empty() {
-            super::index::sync_indexes(
+            super::index::sync_indexes_at(
                 &mut batch,
                 data_keyspace,
                 &key_info.key_schema,
@@ -1507,6 +1633,7 @@ impl CassandraEngine {
                 old_item,
                 None,
                 sys_delay,
+                Some(stamp),
             )?;
             super::index::enqueue_async_indexes(
                 &self.session,
@@ -1517,6 +1644,7 @@ impl CassandraEngine {
                 old_item,
                 None,
                 sys_delay,
+                stamp,
             )
             .await?;
         }
