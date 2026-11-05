@@ -7,8 +7,10 @@
 //! The task ([`start`]) opens the table snapshot, mints the backup id from
 //! the millisecond the open returned, reads the table's TTL, builds the
 //! manifest's `source_table` from the snapshot's description
-//! ([`source_table_schema`]), inserts the CREATING row under the job's
-//! claim (`claim_backup`), answers the request through a one-shot channel
+//! ([`source_table_schema`]), runs the deletion fence (a root another
+//! catalog adopted since the store's last check is refused before any
+//! write, `StoreFence`), inserts the CREATING row under the job's claim
+//! (`claim_backup`), answers the request through a one-shot channel
 //! (`BackupDetails` CREATING, or the refusal) and then goes on as the job
 //! ([`run`]) with the same owned values: nothing crosses a thread or a
 //! channel between the request and the job but the response (the
@@ -47,7 +49,7 @@
 //! period, ends the job with no further store or catalog access. Any other
 //! failure, and the shutdown token (reason `shutdown`), runs the failure
 //! path ([`failure::fail_row`]): FAILED, then the prefix's deletion only
-//! when that write matched.
+//! when that write matched and the fence passed.
 //!
 //! Each job records `BackupJobs` and `BackupJobDuration` (microseconds,
 //! from the snapshot's open to the end of its last catalog or store call:
@@ -93,7 +95,7 @@ use extenddb_storage::{
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool};
+use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool, StoreFence};
 use super::{create_backup_storage_err_to_dynamo, storage_err_to_dynamo};
 use failure::{FailurePath, Written};
 use heartbeat::{HeartbeatHandle, HeartbeatMetric};
@@ -115,6 +117,9 @@ pub(crate) const SHUTDOWN: &str = "shutdown";
 pub(crate) struct JobEnv {
     pub configured: Arc<ConfiguredStore>,
     pub store: Arc<dyn BackupStore>,
+    /// The store's deletion fence, which CreateBackup runs before its first
+    /// put and the failure path before its deletion.
+    pub fence: StoreFence,
     pub identity: StoreIdentity,
     pub bucket: String,
     pub key_prefix: String,
@@ -144,6 +149,7 @@ impl JobEnv {
         Ok(Self {
             configured: Arc::clone(store),
             store: Arc::clone(&store.store),
+            fence: store.fence(),
             identity,
             bucket: store.bucket.clone(),
             key_prefix: store.key_prefix.clone(),
@@ -210,6 +216,9 @@ pub(crate) struct Job {
     key_order: Option<KeyOrder>,
     limits: RestorableLimits,
     env: JobEnv,
+    /// This instance's catalog id, which the failure path's fence compares
+    /// the identity file with.
+    catalog_id: String,
     /// The id's instant, the row's `created_at`.
     created_at: f64,
     started: Instant,
@@ -319,6 +328,22 @@ where
         owner_generation: UNOWNED_GENERATION,
         heartbeat_at: 0.0,
     };
+    // The fence before the row and the first put: a root another catalog
+    // adopted since the store's last check gets no prefix from this
+    // catalog, and the store is marked unhealthy.
+    let catalog_id = env
+        .fence
+        .catalog_id(storage)
+        .await
+        .map_err(|e| internal(&format!("the catalog id could not be read: {e}")))?;
+    if let Err(problem) = env.fence.check(&catalog_id).await {
+        return Err(env.fence.refusal().unwrap_or_else(|| {
+            internal(&format!(
+                "{table_name}: the store's identity file could not be read before the first \
+                 write: {problem}"
+            ))
+        }));
+    }
     let claimed_at = Instant::now();
     // The insert too is selected against the token: a server that is
     // stopping inserts no row it would have to fail at once.
@@ -346,6 +371,7 @@ where
         key_order,
         limits: *limits,
         env: env.clone(),
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -395,6 +421,7 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         key_order,
         limits,
         env,
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -497,9 +524,22 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
                 Stop::Fail(reason) => (reason, BackupJobOutcome::Failed),
                 Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) => unreachable!("matched above"),
             };
-            match failure::fail_row(&*claim, &*env.store, &prefix, &reason, metrics).await {
+            match failure::fail_row(
+                &*claim,
+                &*env.store,
+                &env.fence,
+                &catalog_id,
+                &prefix,
+                &reason,
+                metrics,
+            )
+            .await
+            {
                 FailurePath::Deleted => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects were deleted"
+                ),
+                FailurePath::Fenced(why) => tracing::error!(
+                    "backup {arn_text}: FAILED ({reason}); its objects were not deleted: {why}"
                 ),
                 FailurePath::DeleteFailed(e) => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects could not be deleted and \

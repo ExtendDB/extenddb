@@ -29,6 +29,11 @@ deployment and reads `/health`, the server's log and the API's answers:
   shell's directory in daemon mode;
 - `extenddb backup list` and `backup purge --confirm` on an empty store, and
   `backup purge` refused while a server holds the SQLite serve lock (exit 6);
+- an in-memory SQLite server restarted onto the root it used: the second
+  start adopts the root the first start's catalog owned and syncs before it
+  listens, so the first start's backup is described and restored; every
+  `backup` command refuses the in-memory database; a root whose file names
+  a durable catalog stays unhealthy;
 - on PostgreSQL, the backup commands ending with the exit code `serve` gives
   for a catalog the factory refuses: 6 while a migration holds the serving
   key, 3 on a catalog behind the binary.
@@ -571,6 +576,97 @@ class TestSqlite:
         finally:
             server.stop()
 
+    def test_an_in_memory_server_restarted_onto_its_root_serves_the_previous_starts_backups(
+        self, sqlite_deployment, tmp_path
+    ):
+        """`sqlite-memory`'s shape with a filesystem store, restarted: the
+        catalog (and its `catalog_id`) is new at every start, so the first
+        start writes `extenddb-store.json` with `ephemeral_catalog: true`,
+        and the second adopts the root that file names (a new `catalog_id`,
+        the store id and the marker kept) and runs the startup sync before
+        it listens, so DescribeBackup, ListBackups and a restore of the first
+        start's backup answer from the first request. Between the two starts
+        every `extenddb backup` command refuses the in-memory database before
+        it opens a catalog, and the file is unchanged. A file whose marker is
+        false (a durable catalog's root) is left alone: the in-memory server
+        reports the store owned by another catalog."""
+        d = sqlite_deployment
+        env = os.environ.copy()
+        env["EXTENDDB__STORAGE__SQLITE__PATH"] = ":memory:"
+        env["EXTENDDB_ADMIN_PASSWORD"] = ADMIN_PASSWORD
+        root = tmp_path / "memory-root"
+        root.mkdir(mode=0o700)
+        identity = root / "extenddb-store.json"
+        _append(d.config, f'[backup]\nreconcile_interval_secs = 1\n[backup.store]\nkind = "filesystem"\n\n[backup.store.filesystem]\npath = "{root}"\n')
+        healthy = lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy"  # noqa: E731
+
+        server = _Server(d.config, str(tmp_path / "serve-1.log"), env=env)
+        try:
+            _wait_health(d.port, healthy, server=server)
+            first = json.loads(identity.read_text())
+            assert first["ephemeral_catalog"] is True, first
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            _create_table(ddb, "Music")
+            for k in ("a", "b"):
+                ddb.put_item(TableName="Music", Item={"pk": {"S": k}, "v": {"N": "1"}})
+            arn = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn)
+        finally:
+            server.stop()
+
+        for args in (
+            ("backup", "list"),
+            ("backup", "sync"),
+            ("backup", "sync", "--adopt-store"),
+            ("backup", "purge", "--confirm"),
+            ("backup", "remove-target", "--account", "123456789012", "Music"),
+        ):
+            res = d.run(*args, env=env)
+            out = res.stdout + res.stderr
+            assert res.returncode == 1, (args, out)
+            assert "the SQLite database is in memory ([storage.sqlite] path names no file)" in out, (args, out)
+        assert json.loads(identity.read_text()) == first, "a refused command changed the identity file"
+
+        server = _Server(d.config, str(tmp_path / "serve-2.log"), env=env)
+        try:
+            _wait_health(d.port, healthy, server=server)
+            second = json.loads(identity.read_text())
+            assert second["catalog_id"] != first["catalog_id"], (first, second)
+            assert second["store_id"] == first["store_id"] and second["created_at_ms"] == first["created_at_ms"], (first, second)
+            assert second["ephemeral_catalog"] is True, second
+            lines = server.log_text().splitlines()
+            synced = [i for i, line in enumerate(lines) if "startup sync of the in-memory catalog: 1 backup(s) adopted" in line]
+            listening = [i for i, line in enumerate(lines) if "extenddb listening on" in line]
+            assert len(synced) == 1 and listening and synced[0] < listening[0], "\n".join(lines[-40:])
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "nightly", details
+            assert arn in [s["BackupArn"] for s in ddb.list_backups()["BackupSummaries"]]
+            restored = ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
+            assert restored["TableDescription"]["TableStatus"] == "CREATING", restored
+            deadline = time.monotonic() + 60
+            while ddb.describe_table(TableName="Restored")["Table"]["TableStatus"] != "ACTIVE":
+                assert time.monotonic() < deadline, "the restore did not finish"
+                time.sleep(0.1)
+            assert ddb.scan(TableName="Restored", Select="COUNT")["Count"] == 2
+        finally:
+            server.stop()
+
+        durable = dict(second, ephemeral_catalog=False)
+        identity.write_text(json.dumps(durable, indent=2) + "\n")
+        os.chmod(identity, 0o600)
+        before = identity.read_bytes()
+        server = _Server(d.config, str(tmp_path / "serve-3.log"), env=env)
+        try:
+            health = _wait_health(d.port, lambda h: "backup_store" in h.get("components", {}), server=server)
+            assert health["components"]["backup_store"] == {
+                "status": "unhealthy", "kind": "filesystem", "reason": "owned by another catalog",
+            }, health
+            assert identity.read_bytes() == before, "an in-memory server rewrote a durable catalog's file"
+            assert "startup sync of the in-memory catalog" not in server.log_text(), server.log_text()[-3000:]
+        finally:
+            server.stop()
+
     def test_default_root_under_a_group_writable_parent_warns_and_the_same_root_explicit_fails(
         self, sqlite_deployment, tmp_path
     ):
@@ -964,7 +1060,8 @@ class TestSqlite:
         root's identity file names the old catalog. The server starts with the
         store unconfigured and a warning naming the file (not degraded, not a
         startup error), CreateBackup takes the in-catalog path with its
-        deprecation warning, and `destroy`'s output said to remove the file."""
+        deprecation warning, and `destroy`'s output named `backup sync
+        --adopt-store`."""
         d = sqlite_deployment
         server = _Server(d.config, str(tmp_path / "serve.log"))
         try:
@@ -976,7 +1073,7 @@ class TestSqlite:
             old_catalog = json.load(f)["catalog_id"]
         res = d.run("destroy", "--yes")
         assert res.returncode == 0, res.stdout + res.stderr
-        assert "needs that file removed" in res.stdout, res.stdout
+        assert "backup sync --adopt-store" in res.stdout, res.stdout
         assert os.path.isfile(identity)
         env = os.environ.copy()
         env["EXTENDDB_ADMIN_PASSWORD"] = ADMIN_PASSWORD
@@ -1578,6 +1675,7 @@ class TestPostgres:
                 ("backup", "purge"),
                 ("backup", "purge", "--confirm"),
                 ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+                ("backup", "sync"),
             ):
                 res = command(*args)
                 out = res.stdout + res.stderr
@@ -1595,6 +1693,7 @@ class TestPostgres:
             ("backup", "list"),
             ("backup", "purge", "--confirm"),
             ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+            ("backup", "sync"),
         ):
             res = command(*args)
             out = res.stdout + res.stderr

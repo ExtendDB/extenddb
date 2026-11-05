@@ -45,10 +45,10 @@ use std::time::Duration;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary};
 use extenddb_storage::backup_catalog::{
-    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
+    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, WriteOutcome, new_generation,
+    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -542,6 +542,47 @@ impl BackupCatalog for PostgresEngine {
         })
     }
 
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            // No conflict target: the primary key (`account_id`,
+            // `backup_id`) and the unique `backup_id` both make it a no-op.
+            // No advisory lock: a job that holds the id's lock and has not
+            // inserted its row yet finds this one and is refused, as it is by
+            // any row with the key.
+            let inserted = sqlx::query(
+                "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
+                 backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
+                 created_at, completed_at, failure_reason, source_table_details_json, \
+                 owner_generation, heartbeat_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
+                 $13, $14, $15, now()) ON CONFLICT DO NOTHING",
+            )
+            .bind(&row.backup_id)
+            .bind(&row.account_id)
+            .bind(&row.table_name)
+            .bind(&row.backup_arn)
+            .bind(&row.backup_name)
+            .bind(row.status.as_str())
+            .bind(row.store.store_kind.as_str())
+            .bind(&row.store.store_root)
+            .bind(&row.store.store_id)
+            .bind(row.size_bytes)
+            .bind(row.item_count)
+            .bind(row.created_at)
+            .bind(&row.failure_reason)
+            .bind(&row.source_table_details_json)
+            .bind(generation_column(UNOWNED_GENERATION))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(inserted == 1)
+        })
+    }
+
     fn list_backup_rows<'a>(
         &'a self,
         status: Option<BackupStatus>,
@@ -631,42 +672,19 @@ impl BackupCatalog for PostgresEngine {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
+        Box::pin(self.start_backup_delete_tx(key, false))
+    }
+
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await.map_err(db_err)?;
-            // FOR UPDATE is the contract a restore's registration of this
-            // row must meet: it locks the same row before its own in-use
-            // check, so the two order wholly one before the other (a
-            // registration that commits first leaves this `InUse`; one that
-            // waits behind this finds the row DELETING). `claim_restore`
-            // (`create_table.rs`, the manifest arm) takes this lock; the
-            // legacy registration locks the legacy `backups` row instead.
-            let status: Option<String> = sqlx::query_scalar(
-                "SELECT status FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
-                 FOR UPDATE",
-            )
-            .bind(&key.account_id)
-            .bind(&key.backup_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            let status = BackupStatus::parse(&status.ok_or_else(|| not_found(&key.backup_arn))?)?;
-            if status != BackupStatus::Available {
-                return Ok(DeleteStart::Status(status));
-            }
-            if let Some(table) = creating_restore_target(&mut *tx, &key.backup_arn).await? {
-                return Ok(DeleteStart::InUse(table));
-            }
-            sqlx::query(
-                "UPDATE backup_index SET status = 'DELETING' \
-                 WHERE account_id = $1 AND backup_id = $2 AND status = 'AVAILABLE'",
-            )
-            .bind(&key.account_id)
-            .bind(&key.backup_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
-            Ok(DeleteStart::Deleting)
+            Ok(match self.start_backup_delete_tx(key, true).await? {
+                DeleteStart::Deleting => ForgetRow::Removed,
+                DeleteStart::InUse(table) => ForgetRow::InUse(table),
+                DeleteStart::Status(status) => ForgetRow::Status(status),
+            })
         })
     }
 
@@ -1217,6 +1235,57 @@ const MAINTENANCE_TAKE_TRIES: u32 = 6;
 const MAINTENANCE_TAKE_PAUSE: Duration = Duration::from_millis(2);
 
 impl crate::PostgresEngine {
+    /// DeleteBackup's first step, and with `remove` the outright removal of
+    /// `forget_available_backup_row`, as one transaction: lock the row, read
+    /// its status, run the in-use rule, then write DELETING or, with
+    /// `remove`, delete the row (`Deleting` then means removed). One body,
+    /// so the two methods share the lock and the rule.
+    async fn start_backup_delete_tx(
+        &self,
+        key: &BackupKey,
+        remove: bool,
+    ) -> Result<DeleteStart, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        // FOR UPDATE is the contract a restore's registration of this row
+        // must meet: it locks the same row before its own in-use check, so
+        // the two order wholly one before the other (a registration that
+        // commits first leaves this `InUse`; one that waits behind this
+        // finds the row DELETING, or no row). `claim_restore`
+        // (`create_table.rs`, the manifest arm) takes this lock; the legacy
+        // registration locks the legacy `backups` row instead.
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
+             FOR UPDATE",
+        )
+        .bind(&key.account_id)
+        .bind(&key.backup_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let status = BackupStatus::parse(&status.ok_or_else(|| not_found(&key.backup_arn))?)?;
+        if status != BackupStatus::Available {
+            return Ok(DeleteStart::Status(status));
+        }
+        if let Some(table) = creating_restore_target(&mut *tx, &key.backup_arn).await? {
+            return Ok(DeleteStart::InUse(table));
+        }
+        let write = if remove {
+            "DELETE FROM backup_index \
+             WHERE account_id = $1 AND backup_id = $2 AND status = 'AVAILABLE'"
+        } else {
+            "UPDATE backup_index SET status = 'DELETING' \
+             WHERE account_id = $1 AND backup_id = $2 AND status = 'AVAILABLE'"
+        };
+        sqlx::query(write)
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(DeleteStart::Deleting)
+    }
+
     /// The lock step of `maintenance_claim` (the tries on one claim
     /// connection) with `tries` and `pause` in place of the take's own, so a
     /// test can hold the key's shared lock past the first try and release it

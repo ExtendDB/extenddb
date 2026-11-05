@@ -753,6 +753,159 @@ async fn live_read_store_ids_lists_the_distinct_ids_of_a_root() {
     fx.finish().await;
 }
 
+/// `insert_backup_row`: the row lands as given, unowned (the document
+/// carries `owner_generation: 0`, which the claim's upsert filter relies on),
+/// with `completed_at` and `heartbeat_at` on the server's clock; a second
+/// insert, an insert over a CREATING row a claim holds, and an insert of the
+/// id under another account (the unique `backup_id`) answer `false` and
+/// change nothing; a claim over the inserted row is refused; the row is read
+/// and listed like a created one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+    let fx = Fixture::new().await;
+    let mut adopted = row(ACCOUNT, "Music", "adopted");
+    adopted.status = BackupStatus::Available;
+    adopted.size_bytes = 1234;
+    adopted.item_count = 5;
+    // Ignored: the insert sets these three itself.
+    adopted.owner_generation = 99;
+    adopted.completed_at = None;
+    adopted.heartbeat_at = 0.0;
+    assert!(fx.engine.insert_backup_row(&adopted).await.expect("insert"));
+    let stored = fx
+        .engine
+        .read_backup_row(&arn_of(&adopted))
+        .await
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+    let completed_at = stored.completed_at.expect("completed_at is set");
+    for at in [completed_at, stored.heartbeat_at] {
+        assert!((at - adopted.created_at).abs() < 300.0, "{at}");
+    }
+    assert!(
+        (stored.created_at - adopted.created_at).abs() < 1e-3,
+        "{} is the id's instant {}",
+        stored.created_at,
+        adopted.created_at
+    );
+    assert_eq!(
+        BackupRow {
+            owner_generation: 99,
+            completed_at: None,
+            heartbeat_at: 0.0,
+            created_at: adopted.created_at,
+            ..stored.clone()
+        },
+        adopted,
+        "every other column is the row as given"
+    );
+
+    // A second insert of the key, with other values, writes nothing.
+    let mut again = adopted.clone();
+    again.backup_name = "again".to_owned();
+    again.size_bytes = 1;
+    again.status = BackupStatus::Failed;
+    assert!(!fx.engine.insert_backup_row(&again).await.expect("insert"));
+    // The id under another account: the unique `backup_id`.
+    let mut elsewhere = adopted.clone();
+    elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+    elsewhere.backup_arn =
+        extenddb_storage::util::backup_arn(REGION, OTHER_ACCOUNT, "Music", &adopted.backup_id);
+    assert!(
+        !fx.engine
+            .insert_backup_row(&elsewhere)
+            .await
+            .expect("insert")
+    );
+    assert!(
+        fx.engine
+            .read_backup_row(&arn_of(&elsewhere))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        fx.engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+        Some(stored.clone()),
+        "the refused inserts changed nothing"
+    );
+    let claimed = fx.engine.claim_backup(&adopted).await.err();
+    assert!(
+        matches!(claimed, Some(StorageError::AlreadyExists(_))),
+        "{claimed:?}"
+    );
+
+    // Over a CREATING row a live claim holds.
+    let creating = row(ACCOUNT, "Music", "job");
+    let claim = fx.engine.claim_backup(&creating).await.expect("claim");
+    let mut over = creating.clone();
+    over.status = BackupStatus::Available;
+    assert!(!fx.engine.insert_backup_row(&over).await.expect("insert"));
+    let job_row = fx
+        .engine
+        .read_backup_row(&arn_of(&creating))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job_row.status, BackupStatus::Creating);
+    assert_eq!(job_row.owner_generation, claim.generation());
+
+    // Read and listed like a created row.
+    let arns =
+        |rows: Vec<BackupRow>| -> Vec<String> { rows.into_iter().map(|r| r.backup_arn).collect() };
+    let available: Vec<BackupRow> = fx
+        .engine
+        .list_backup_rows(Some(BackupStatus::Available), &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(available, std::slice::from_ref(&stored));
+    let creating_rows: Vec<BackupRow> = fx
+        .engine
+        .list_backup_rows(Some(BackupStatus::Creating), &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        arns(creating_rows),
+        std::slice::from_ref(&creating.backup_arn)
+    );
+    for table in [None, Some("Music")] {
+        let listed: Vec<BackupRow> = fx
+            .engine
+            .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&stored),
+            "{table:?}: {:?}",
+            arns(listed.clone())
+        );
+    }
+    drop(claim);
+
+    let document = fx
+        .engine
+        .backup_index()
+        .find_one(doc! { "backup_id": &adopted.backup_id })
+        .await
+        .expect("read")
+        .expect("the document");
+    assert_eq!(document.get_i64("owner_generation"), Ok(0), "{document}");
+    assert_eq!(
+        fx.engine
+            .backup_index()
+            .count_documents(doc! { "backup_id": &adopted.backup_id })
+            .await
+            .expect("count"),
+        1
+    );
+    fx.finish().await;
+}
+
 /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is older
 /// than the window is removed outright; one with a live owner, one that is
 /// not CREATING, and one that is gone are left, answering `false`.
@@ -1289,6 +1442,11 @@ async fn live_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::InUse("del_target".to_owned())
     );
     assert_eq!(
+        fx.engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+        "the outright removal keeps the in-use rule"
+    );
+    assert_eq!(
         fx.engine
             .read_backup_row(&arn_of(&row))
             .await
@@ -1313,6 +1471,57 @@ async fn live_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::Status(BackupStatus::Deleting),
         "a retry finds the row DELETING"
     );
+    assert_eq!(
+        fx.engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+        "only an AVAILABLE row is removed outright"
+    );
+    // An AVAILABLE row goes outright, read and listed nowhere, with no
+    // tombstone; a second removal finds no row.
+    let mut adopted = self::row(ACCOUNT, "Music", "adopted");
+    adopted.status = BackupStatus::Available;
+    assert!(fx.engine.insert_backup_row(&adopted).await.expect("insert"));
+    assert_eq!(
+        fx.engine
+            .forget_available_backup_row(&adopted.key())
+            .await
+            .unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Removed
+    );
+    assert!(
+        fx.engine
+            .read_backup_row(&arn_of(&adopted))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for status in [None, Some(BackupStatus::Available)] {
+        let listed: Vec<BackupRow> = fx
+            .engine
+            .list_backup_rows(status, &adopted.store)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+            "{status:?}"
+        );
+    }
+    let by_account: Vec<BackupRow> = fx
+        .engine
+        .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        !by_account
+            .iter()
+            .any(|r| r.backup_arn == adopted.backup_arn)
+    );
+    assert!(matches!(
+        fx.engine.forget_available_backup_row(&adopted.key()).await,
+        Err(StorageError::Validation(m)) if m.contains("Backup not found")
+    ));
     assert!(
         !fx.engine.remove_backup_row(&key).await.unwrap(),
         "DELETING is not a tombstone"
