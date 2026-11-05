@@ -261,14 +261,16 @@ impl Parser {
             // and a parameter as the condition, and `a AND pk = 'a'`;
             // measured 2026-11-05 in a group, `(a AND b = 2)` and `(b = 2 AND
             // a)`, and after a NOT, `NOT a`, `(NOT a)` and `NOT (a) AND pk =
-            // 'a'`), after the walk (see [`walk`]). Before anything else the
-            // operand keeps the syntax error below. The check is made here,
-            // at the end of the recursion, so the frames each group nests
-            // stay small (see [`limits`]).
-            if self.operand_ends_a_condition() {
-                self.refuse_bare_operand(left_start);
-                return Ok(WhereExpr::Function(BARE_OPERAND.to_owned(), vec![left]));
-            }
+            // 'a'`), after the walk (see [`walk`]). Any other token after the
+            // operand ends it, and the part of the statement around the
+            // operand reads that token, so a syntax error there comes first
+            // (measured 2026-11-05: `a b` is "Unexpected token after
+            // expression", `a LIMIT 1` is refused for the LIMIT clause and
+            // `(a b)` is "Expected RIGHT_PAREN"). The check is made here, at
+            // the end of the recursion, so the frames each group nests stay
+            // small (see [`limits`]).
+            self.refuse_bare_operand(left_start);
+            return Ok(WhereExpr::Function(BARE_OPERAND.to_owned(), vec![left]));
         }
         let comparison = self.finish_comparison(left)?;
         self.after_predicate(comparison)
@@ -301,21 +303,6 @@ impl Parser {
             self.bare_left = true;
         } else {
             self.walk_after_operands(NOT_A_CONDITION);
-        }
-    }
-
-    /// Whether an operand just read ends the WHERE condition, a group, or
-    /// an argument of an AND or an OR: the end of the statement, a semicolon
-    /// that ends it, a `)` that closes a group, AND or OR follows.
-    fn operand_ends_a_condition(&self) -> bool {
-        match &self.peek().kind {
-            TokenKind::Eof => true,
-            TokenKind::Semicolon => matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::Eof)
-            ),
-            TokenKind::RParen => self.nesting.in_group(),
-            _ => self.is_keyword("AND") || self.is_keyword("OR"),
         }
     }
 

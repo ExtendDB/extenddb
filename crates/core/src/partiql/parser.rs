@@ -109,7 +109,7 @@ const BARE_OPERAND: &str = "<operand>";
 /// It never leaves the parser. No call can have this name.
 const GROUPED_OPERAND: &str = "<grouped operand>";
 
-/// The syntax error of an operand with no comparison after it, where the
+/// The syntax error of a `size` call with no comparison after it, where the
 /// service's answer is not measured.
 const NO_COMPARISON: &str = "Expected a comparison operator";
 

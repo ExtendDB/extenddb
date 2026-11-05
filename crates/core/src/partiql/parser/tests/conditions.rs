@@ -280,11 +280,24 @@ fn an_operand_in_a_group_or_after_a_not_is_refused_for_its_place() {
             "{condition}"
         );
     }
-    // Before anything else the operand keeps the syntax error.
-    for condition in ["a b", "a LIMIT 1", "(a b)"] {
+    // Any other token after the operand ends it, and the part of the
+    // statement around the operand reads that token: a syntax error there
+    // comes first.
+    // The LIMIT refusal names the clause's value, the last character.
+    let sql = "SELECT * FROM \"t\" WHERE a LIMIT 1";
+    assert_eq!(
+        err(sql),
+        format!("Unsupported clause: LIMIT at 1:{}:1", sql.len())
+    );
+    for (condition, want) in [
+        ("a b", "Unexpected token after expression"),
+        ("pk = 'a' AND a b", "Unexpected token after expression"),
+        ("(a b)", "Expected RIGHT_PAREN"),
+        ("pk = 'a' AND (a b)", "Expected RIGHT_PAREN"),
+    ] {
         assert_eq!(
             err(&format!("SELECT * FROM \"t\" WHERE {condition}")),
-            wf(NO_COMPARISON),
+            wf(want),
             "{condition}"
         );
     }

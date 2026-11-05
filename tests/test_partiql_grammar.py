@@ -1303,6 +1303,39 @@ def test_an_is_test_on_an_operand_in_parentheses_names_the_operand(dynamodb_clie
     )
 
 
+# Measured 2026-11-05: an operand followed by a token that does not go on with
+# it ends there, and the part of the statement around the operand reads that
+# token. A syntax error there comes ahead of the operand's own refusal.
+@pytest.mark.parametrize(
+    ("statement", "message"),
+    [
+        ("SELECT * FROM {t} WHERE a b", WF + "Unexpected token after expression"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND a b", WF + "Unexpected token after expression"),
+        (
+            "DELETE FROM {t} WHERE pk = 'pp' AND sk = 'b' AND a b",
+            WF + "Unexpected token after expression",
+        ),
+        ("SELECT * FROM {t} WHERE (a b)", WF + "Expected RIGHT_PAREN"),
+        ("SELECT * FROM {t} WHERE pk = 'pp' AND (a b)", WF + "Expected RIGHT_PAREN"),
+        ("SELECT * FROM {t} WHERE (pk = 'pp' AND a LIMIT 1)", WF + "Expected RIGHT_PAREN"),
+        (
+            "SELECT * FROM {t} WHERE a ORDER BY pk",
+            "WHERE clause must contain an expression that resolves to a boolean",
+        ),
+    ],
+)
+def test_a_token_after_an_operand_ends_it(dynamodb_client, ctable, statement, message):
+    assert _message(dynamodb_client, statement.format(t=f'"{ctable}"')) == message
+
+
+def test_a_limit_after_an_operand_is_refused_for_the_clause(dynamodb_client, ctable):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE a LIMIT 1"
+    # The refusal names the clause's value, the last character.
+    assert _message(dynamodb_client, statement) == (
+        f"Unsupported clause: LIMIT at 1:{len(statement)}:1"
+    )
+
+
 # ---- negative-zero decimals ----------------------------------------------------
 #
 # Measured 2026-11-05. A zero written with a decimal point or an exponent and a
