@@ -14,6 +14,7 @@
 use super::check_user_authorization;
 use crate::authz_cache::CachedAuthzStore;
 use crate::authz_cache::tests::{CountingAuthzStore, fast_authz_cfg};
+use crate::authz_resource::AuthzTarget;
 use extenddb_auth::policy::context::RequestParams;
 use extenddb_core::error::DynamoDbError;
 use serde_json::json;
@@ -66,7 +67,15 @@ fn store_for(policy: String, boundary: Option<String>) -> CountingAuthzStore {
 async fn get_item_from(store: CountingAuthzStore) -> Result<(), DynamoDbError> {
     let cache = CachedAuthzStore::new(Arc::new(store), fast_authz_cfg());
     let params = RequestParams::default();
-    check_user_authorization(&cache, ACCOUNT, "u", "GetItem", TABLE, false, params).await
+    check_user_authorization(
+        &cache,
+        ACCOUNT,
+        "u",
+        &AuthzTarget::new("GetItem", TABLE.to_owned()),
+        false,
+        params,
+    )
+    .await
 }
 
 /// `GetItem` by user `u` with `policy` as its only inline policy and

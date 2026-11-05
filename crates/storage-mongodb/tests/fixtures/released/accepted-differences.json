@@ -1,0 +1,8 @@
+{
+  "dotted-ttl": [
+    {
+      "line": "index extenddb_data.T_cu_dotted {\"key\":{\"item_data.exp.at.N\":1},\"name\":\"idx_ttl_exp.at\",\"sparse\":true}",
+      "reason": "Releases before v0.1.12 created this index for a TTL attribute with a dot in its name, and v0.1.12 and later create none. No migration removes it: the TTL sweep does not use it, and disabling TTL on the table drops it (crates/storage-mongodb/src/metadata_engine.rs, the legacy dotted-name index)."
+    }
+  ]
+}
