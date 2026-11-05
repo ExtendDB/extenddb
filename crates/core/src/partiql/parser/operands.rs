@@ -37,7 +37,15 @@ impl Parser {
             }
             _ => return Err(self.term_error()),
         };
-        let mut steps = Vec::new();
+        self.path_steps(Path {
+            root,
+            steps: Vec::new(),
+        })
+    }
+
+    /// The steps after `path`: `.name` and what brackets hold (see
+    /// [`Parser::bracket_step`]), as many as follow.
+    pub(super) fn path_steps(&mut self, mut path: Path) -> PResult<Path> {
         loop {
             if self.eat(&TokenKind::Dot) {
                 match &self.peek().kind {
@@ -45,12 +53,12 @@ impl Parser {
                         let s = s.clone();
                         self.bump();
                         self.refuse_empty_component(&s);
-                        steps.push(PathStep::Attribute(s));
+                        path.steps.push(PathStep::Attribute(s));
                     }
                     TokenKind::Ident(s) if word_class(s) == WordClass::Name => {
                         let s = s.clone();
                         self.bump();
-                        steps.push(PathStep::Attribute(s));
+                        path.steps.push(PathStep::Attribute(s));
                     }
                     TokenKind::Star => {
                         return Err(ParseError::new(format!(
@@ -63,27 +71,105 @@ impl Parser {
                     _ => return Err(ParseError::well_formed("Invalid path dot component")),
                 }
             } else if self.eat(&TokenKind::LBracket) {
-                let idx = match &self.peek().kind {
-                    TokenKind::Number(n) => n.parse::<usize>().map_err(|_| {
-                        ParseError::new(format!("Unexpected path component at {}", self.span()))
-                    })?,
-                    _ => {
-                        return Err(ParseError::new(format!(
-                            "Unexpected path component at {}",
-                            self.span()
-                        )));
-                    }
-                };
-                self.bump();
+                let step = self.bracket_step()?;
+                // (measured 2026-11-05: `m['k'`, `m[k`, `m['k' 'j']` and `m[k
+                // j]`; a bracket left open wins over a refusal of what it
+                // holds, as `m[-1` and `m[k.j` show)
                 if !self.eat(&TokenKind::RBracket) {
-                    return Err(ParseError::new("Expected ] after list index"));
+                    return Err(ParseError::well_formed("Expected RIGHT_BRACKET"));
                 }
-                steps.push(PathStep::Index(idx));
+                path.steps.push(step);
             } else {
                 break;
             }
         }
-        Ok(Path { root, steps })
+        Ok(path)
+    }
+
+    /// What a pair of brackets after a path holds, with the current token
+    /// after the `[`. A number is a list index. A string, a quoted name or
+    /// a name is a map member, as after a dot (measured 2026-11-05: `m['k']`,
+    /// `m["k"]` and `m[k]` read as `m.k` in a condition, a SET target, a
+    /// REMOVE, a SET value and the select list, and `m['my key']` names a
+    /// member a dot cannot). A reserved word there is a syntax error. Anything
+    /// else parses and is refused once the statement parses, at its first
+    /// token (measured 2026-11-05: `m[?]`, `m[1.5]`, `m[true]`, `m[k.j]`,
+    /// `m['k'.x]` and `m[-1.5]`, at the number); a minus before a whole
+    /// number is refused as an index out of range. The step returned for a
+    /// refused content stands for it and is never used.
+    fn bracket_step(&mut self) -> PResult<PathStep> {
+        let at = self.span();
+        let refuse = |p: &mut Self, at: &str| {
+            p.defer(&format!("Unexpected path component at {at}"));
+            Ok(PathStep::Index(0))
+        };
+        match self.peek().kind.clone() {
+            TokenKind::Number(n) => {
+                self.bump();
+                match n.parse::<usize>() {
+                    Ok(index) => Ok(PathStep::Index(index)),
+                    Err(_) => refuse(self, &at),
+                }
+            }
+            TokenKind::String(name) | TokenKind::QuotedIdent(name) => {
+                if matches!(
+                    self.nth_kind(1),
+                    Some(TokenKind::Dot | TokenKind::LBracket)
+                ) {
+                    self.bump();
+                    self.path_steps(Path {
+                        root: name,
+                        steps: Vec::new(),
+                    })?;
+                    return refuse(self, &at);
+                }
+                self.bump();
+                self.refuse_empty_component(&name);
+                Ok(PathStep::Attribute(name))
+            }
+            TokenKind::Ident(word) => match word_class(&word) {
+                WordClass::Name => {
+                    if matches!(
+                        self.nth_kind(1),
+                        Some(TokenKind::Dot | TokenKind::LBracket)
+                    ) {
+                        self.path()?;
+                        return refuse(self, &at);
+                    }
+                    self.bump();
+                    Ok(PathStep::Attribute(word))
+                }
+                WordClass::Literal => {
+                    self.bump();
+                    refuse(self, &at)
+                }
+                WordClass::Operator => Err(ParseError::well_formed("Unexpected operator")),
+                WordClass::Keyword | WordClass::Special => {
+                    Err(ParseError::well_formed("Unexpected term"))
+                }
+            },
+            TokenKind::Minus if matches!(self.nth_kind(1), Some(TokenKind::Number(_))) => {
+                self.bump();
+                let at = self.span();
+                let TokenKind::Number(n) = self.bump().kind else {
+                    unreachable!("a number follows the minus");
+                };
+                if n.bytes().all(|b| b.is_ascii_digit()) {
+                    self.defer(&format!(
+                        "List index is not within the allowable range; index: [-{n}] at {at}"
+                    ));
+                    Ok(PathStep::Index(0))
+                } else {
+                    refuse(self, &at)
+                }
+            }
+            TokenKind::Param => {
+                self.bump();
+                self.take_param_index();
+                refuse(self, &at)
+            }
+            _ => Err(ParseError::new(format!("Unexpected path component at {at}"))),
+        }
     }
 
     // --- operands ---

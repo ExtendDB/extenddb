@@ -4,6 +4,8 @@
 //! Unit tests for literal values, parameters, numbers and paths.
 
 use super::*;
+use crate::partiql::ast::PathStep;
+use crate::partiql::number::OVERFLOW_MESSAGE;
 
 #[test]
 fn duplicate_bag_members_are_named() {
@@ -350,5 +352,72 @@ fn a_name_as_an_insert_value_is_refused_naming_itself() {
     assert_eq!(
         err(sql),
         format!("Unsupported data type: Id under key root[0] at 1:{column}:2")
+    );
+}
+
+#[test]
+fn a_string_or_a_name_in_brackets_is_a_map_member() {
+    let member = |name: &str| PathStep::Attribute(name.to_owned());
+    for (condition, steps) in [
+        ("m['k'] = 1", vec![member("k")]),
+        ("m[\"k\"] = 1", vec![member("k")]),
+        ("m[k] = 1", vec![member("k")]),
+        ("m['my key'] = 1", vec![member("my key")]),
+        ("m['k'][0] = 1", vec![member("k"), PathStep::Index(0)]),
+        ("m[k].j = 1", vec![member("k"), member("j")]),
+        ("m[2] = 1", vec![PathStep::Index(2)]),
+    ] {
+        let sql = format!("SELECT * FROM \"t\" WHERE {condition}");
+        let WhereExpr::Compare(Operand::Path(path), ..) = where_of(&sql) else {
+            panic!("not a comparison of a path: {condition}");
+        };
+        assert_eq!(path.root, "m", "{condition}");
+        assert_eq!(path.steps, steps, "{condition}");
+    }
+    let Ok(Statement::Update(update)) = parse("UPDATE \"t\" SET m['k'] = 5 REMOVE m[k] WHERE pk = 'p'")
+    else {
+        panic!("not an update");
+    };
+    assert_eq!(update.sets[0].path.steps, vec![member("k")]);
+    assert_eq!(update.removes[0].steps, vec![member("k")]);
+}
+
+#[test]
+fn other_contents_of_brackets_are_refused() {
+    let condition = |c: &str| err(&format!("SELECT * FROM \"t\" WHERE pk = 'p' AND {c}"));
+    // What the brackets hold starts at column 40.
+    for (brackets, want) in [
+        ("m[''] = 1", "Path component cannot be an empty string".to_owned()),
+        ("m[\"\"] = 1", "Path component cannot be an empty string".to_owned()),
+        ("m[?] = 1", "Unexpected path component at 1:40:1".to_owned()),
+        ("m[1.5] = 1", "Unexpected path component at 1:40:3".to_owned()),
+        ("m[true] = 1", "Unexpected path component at 1:40:4".to_owned()),
+        ("m[k.j] = 1", "Unexpected path component at 1:40:1".to_owned()),
+        ("m[k[0]] = 1", "Unexpected path component at 1:40:1".to_owned()),
+        ("m['k'.x] = 1", "Unexpected path component at 1:40:3".to_owned()),
+        (
+            "m[-1] = 1",
+            "List index is not within the allowable range; index: [-1] at 1:41:1".to_owned(),
+        ),
+        ("m[-1.5] = 1", "Unexpected path component at 1:41:3".to_owned()),
+        ("m[select] = 1", wf("Unexpected term")),
+        ("m[desc] = 1", wf("Unexpected term")),
+        ("m[and] = 1", wf("Unexpected operator")),
+        ("m['k' 'j'] = 1", wf("Expected RIGHT_BRACKET")),
+        ("m['k'", wf("Expected RIGHT_BRACKET")),
+        ("m[0", wf("Expected RIGHT_BRACKET")),
+        ("m[-1", wf("Expected RIGHT_BRACKET")),
+        ("m[k.j", wf("Expected RIGHT_BRACKET")),
+    ] {
+        assert_eq!(condition(brackets), want, "{brackets}");
+    }
+    // In statement order with the other problems the walk meets.
+    assert_eq!(
+        condition("a = 1e126 AND m[k.j] = 1"),
+        format!("{OVERFLOW_MESSAGE} under root")
+    );
+    assert_eq!(
+        condition("m[k.j] = 1e126"),
+        "Unexpected path component at 1:40:1"
     );
 }

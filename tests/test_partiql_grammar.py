@@ -981,3 +981,180 @@ def test_a_parameter_as_a_whole_value(dynamodb_client, stable):
     dynamodb_client.execute_statement(Statement=statement, Parameters=[{"S": "v"}])
     item = dynamodb_client.get_item(TableName=stable, Key={"pk": {"S": "m6"}}, ConsistentRead=True)
     assert item["Item"]["w"] == {"S": "v"}
+
+
+# ---- items for the path and parenthesis tests ----------------------------------
+
+OVERFLOW = (
+    "Number overflow. Attempting to store a number with magnitude larger than supported "
+    "range under {}"
+)
+
+
+@pytest.fixture(scope="module")
+def pair(dynamodb_client, ctable):
+    """The partition key of two items P/b and P/c in a partition of their own,
+    each with a = 1, b = 2, x = 0 and m = {k: 1, 'my key': 1}."""
+    pk = f"pp-{uuid.uuid4().hex[:8]}"
+    for sk in ("b", "c"):
+        dynamodb_client.put_item(
+            TableName=ctable,
+            Item={
+                "pk": {"S": pk},
+                "sk": {"S": sk},
+                "a": {"N": "1"},
+                "b": {"N": "2"},
+                "x": {"N": "0"},
+                "m": {"M": {"k": {"N": "1"}, "my key": {"N": "1"}}},
+            },
+        )
+    return pk
+
+
+def _sorts(client, statement, **kwargs):
+    return sorted(i["sk"]["S"] for i in _select(client, statement, **kwargs))
+
+
+# ---- a string or a name in brackets ---------------------------------------------
+#
+# Measured 2026-11-05. A string, a quoted name or a name in brackets after a
+# path is a map member, as after a dot: m['k'], m["k"] and m[k] are m.k, in a
+# condition, a SET target, a REMOVE, a SET value and the select list. A
+# number is a list index as before. Anything else in brackets parses and is
+# refused once the statement parses; a reserved word there is a syntax
+# error, and so is a bracket left open.
+
+
+@pytest.mark.parametrize(
+    ("condition", "sorts"),
+    [
+        ("m['k'] = 1", ["b", "c"]),
+        ("m['my key'] = 1", ["b", "c"]),
+        ("m[k] = 1", ["b", "c"]),
+        ('m["k"] = 1', ["b", "c"]),
+        ("m[ 'k' ] = 1", ["b", "c"]),
+        ("m['k'] = 1 AND m.k = 1", ["b", "c"]),
+        ("m['k'].z IS MISSING", ["b", "c"]),
+        ("m[k].j IS MISSING", ["b", "c"]),
+        ("m['0'] = 1", []),
+        ("m['a.b'] = 1", []),
+        ("m.k = 1", ["b", "c"]),
+    ],
+)
+def test_a_string_or_a_name_in_brackets_is_a_map_member(dynamodb_client, ctable, pair, condition, sorts):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = '{pair}' AND {condition}"
+    assert _sorts(dynamodb_client, statement) == sorts
+
+
+def test_a_member_in_brackets_in_the_select_list(dynamodb_client, ctable, pair):
+    for path in ("m['k']", "m[k]"):
+        statement = f"SELECT {path} FROM \"{ctable}\" WHERE pk = '{pair}' AND sk = 'b'"
+        assert _select(dynamodb_client, statement) == [{"k": {"N": "1"}}]
+
+
+@pytest.mark.parametrize(
+    ("clause", "m", "x"),
+    [
+        ("SET m['k'] = 5", {"k": {"N": "5"}, "my key": {"N": "1"}}, {"N": "0"}),
+        ("SET m['new key'] = 7", {"k": {"N": "1"}, "my key": {"N": "1"}, "new key": {"N": "7"}}, {"N": "0"}),
+        ("REMOVE m['k']", {"my key": {"N": "1"}}, {"N": "0"}),
+        ("SET x = m['my key']", {"k": {"N": "1"}, "my key": {"N": "1"}}, {"N": "1"}),
+    ],
+)
+def test_a_member_in_brackets_in_an_update(dynamodb_client, ctable, clause, m, x):
+    pk = f"pb-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.put_item(
+        TableName=ctable,
+        Item={
+            "pk": {"S": pk},
+            "sk": {"S": "b"},
+            "x": {"N": "0"},
+            "m": {"M": {"k": {"N": "1"}, "my key": {"N": "1"}}},
+        },
+    )
+    dynamodb_client.execute_statement(
+        Statement=f"UPDATE \"{ctable}\" {clause} WHERE pk = '{pk}' AND sk = 'b'"
+    )
+    item = dynamodb_client.get_item(
+        TableName=ctable, Key={"pk": {"S": pk}, "sk": {"S": "b"}}, ConsistentRead=True
+    )["Item"]
+    assert item["m"] == {"M": m}
+    assert item["x"] == x
+
+
+def test_a_member_in_brackets_and_after_a_dot_is_one_path(dynamodb_client, ctable):
+    statement = f"UPDATE \"{ctable}\" SET m['k'] = 5, m.k = 6 WHERE pk = 'pb' AND sk = 'b'"
+    assert _message(dynamodb_client, statement) == (
+        "Two document paths overlap with each other; must remove or rewrite one of these paths; "
+        "path one: [m, k], path two: [m, k]"
+    )
+
+
+@pytest.mark.parametrize(
+    ("brackets", "refusal", "at"),
+    [
+        ("['']", "Path component cannot be an empty string", None),
+        ('[""]', "Path component cannot be an empty string", None),
+        ("[?]", "Unexpected path component", "?"),
+        ("[1.5]", "Unexpected path component", "1.5"),
+        ("[1e0]", "Unexpected path component", "1e0"),
+        ("[true]", "Unexpected path component", "true"),
+        ("[MISSING]", "Unexpected path component", "MISSING"),
+        ("[-1]", "List index is not within the allowable range; index: [-1]", "1"),
+        ("[- 1]", "List index is not within the allowable range; index: [-1]", "1"),
+        ("[-1.5]", "Unexpected path component", "1.5"),
+        ("[k.j]", "Unexpected path component", "k"),
+        ("[k[0]]", "Unexpected path component", "k"),
+        ('["k".x]', "Unexpected path component", '"k"'),
+        ("['k'.x]", "Unexpected path component", "'k'"),
+        ("[select]", WF + "Unexpected term", None),
+        ("[from]", WF + "Unexpected term", None),
+        ("[desc]", WF + "Unexpected term", None),
+        ("[and]", WF + "Unexpected operator", None),
+        ("['k' 'j']", WF + "Expected RIGHT_BRACKET", None),
+        ("[k j]", WF + "Expected RIGHT_BRACKET", None),
+    ],
+)
+def test_other_contents_of_brackets_are_refused(dynamodb_client, ctable, brackets, refusal, at):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = 'pb' AND m{brackets} = 1"
+    kwargs = {"Parameters": [{"S": "k"}]} if "?" in statement else {}
+    expected = refusal
+    if at is not None:
+        column = statement.index(at, statement.index("m[") + 2) + 1
+        expected = f"{refusal} at 1:{column}:{len(at)}"
+    assert _message(dynamodb_client, statement, **kwargs) == expected
+
+
+@pytest.mark.parametrize("tail", ["m['k'", "m[k", "m[0", "m[-1", "m[1.5", "m[?", "m[k.j"])
+def test_a_bracket_left_open_is_a_syntax_error(dynamodb_client, ctable, tail):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = 'pb' AND {tail}"
+    kwargs = {"Parameters": [{"S": "k"}]} if "?" in statement else {}
+    assert _message(dynamodb_client, statement, **kwargs) == WF + "Expected RIGHT_BRACKET"
+
+
+@pytest.mark.parametrize(
+    ("condition", "first"),
+    [
+        ("a = 1e126 AND m[''] = 1", "overflow"),
+        ("m[''] = 1 AND a = 1e126", "empty"),
+        ("a = 1e126 AND m[k.j] = 1", "overflow"),
+        ("m[k.j] = 1e126", "path"),
+    ],
+)
+def test_a_refusal_in_brackets_keeps_its_place_in_the_condition(dynamodb_client, ctable, condition, first):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = 'pb' AND {condition}"
+    if first == "overflow":
+        expected = OVERFLOW.format("root")
+    elif first == "empty":
+        expected = "Path component cannot be an empty string"
+    else:
+        expected = f"Unexpected path component at 1:{statement.index('k.j') + 1}:1"
+    assert _message(dynamodb_client, statement) == expected
+
+
+def test_a_path_into_a_key_in_brackets_is_refused(dynamodb_client, ctable):
+    statement = f"SELECT * FROM \"{ctable}\" WHERE pk = 'pb' AND sk['x'] = 'b'"
+    assert _message(dynamodb_client, statement) == (
+        "Key attributes must be scalars; list random access '[]' and map lookup '.' are not "
+        "allowed: Key sk"
+    )
