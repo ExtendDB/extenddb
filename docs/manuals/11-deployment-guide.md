@@ -4,27 +4,36 @@
 
 This guide covers deploying extenddb in various environments beyond local development.
 
+> **Backend-specific sections.** This guide covers deployment concerns common to
+> all storage backends, and uses PostgreSQL — the default and reference backend —
+> for concrete examples. Sections headed *PostgreSQL* apply only to that backend.
+> For other backends, see their setup docs:
+> [Cassandra setup](../cassandra-setup.md) (experimental; local and production)
+> and [MongoDB setup](../local-mongodb-setup.md). SQLite does not need a separate
+> backend service; see its section in the getting-started guide.
+
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to PostgreSQL. All durable state lives in PostgreSQL; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
+extenddb is a single Rust binary that connects to a storage backend. All durable state lives in the backend; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
-- Multiple extenddb instances can share a PostgreSQL catalog (with caveats — see Multi-Instance below)
-- Standard PostgreSQL HA, backup, and replication tools provide durability
-- extenddb can run anywhere PostgreSQL is reachable
+- Multiple extenddb instances can share one backend catalog (with caveats — see Multi-Instance below)
+- The backend's own HA, backup, and replication tools provide durability
+- extenddb can run anywhere the storage backend is reachable
 
 ## Deployment Models
 
 ### Single-Node
 
-extenddb and PostgreSQL on the same host. Simplest setup, suitable for development, CI, and small workloads.
+ExtendDB and its storage backend on the same host. Simplest setup, suitable for development, CI, and small workloads.
 
 ```
-┌─────────────────────────┐
-│  Host                   │
-│  ┌─────┐  ┌──────────┐ │
-│  │ extenddb│──│PostgreSQL │ │
-│  └─────┘  └──────────┘ │
-└─────────────────────────┘
+┌──────────────────────────────┐
+│  Host                        │
+│  ┌──────────┐  ┌───────────┐ │
+│  │ ExtendDB │──│  Storage  │ │
+│  │          │  │  backend  │ │
+│  └──────────┘  └───────────┘ │
+└──────────────────────────────┘
 ```
 
 ```bash
@@ -34,51 +43,32 @@ extenddb serve --config extenddb.toml
 
 ### Separated Database
 
-extenddb on an application server, PostgreSQL on a dedicated database server or managed service.
+ExtendDB on an application server, the storage backend on a dedicated database
+server or managed service.
 
 ```
 ┌──────────┐       ┌──────────────┐
-│  App Host│──────▶│  DB Host     │
-│  extenddb    │       │  PostgreSQL  │
+│ App Host │──────▶│   DB Host    │
+│ ExtendDB │       │   Backend    │
 └──────────┘       └──────────────┘
 ```
 
-```bash
-extenddb init \
-  --pg-host db.example.com \
-  --pg-pass
-```
+Point ExtendDB at the remote backend at init time, and use an encrypted
+connection. The flags and connection-string format are backend-specific: for
+PostgreSQL see [Configuring PostgreSQL](#configuring-postgresql) below; for
+Cassandra see [Cassandra setup](../cassandra-setup.md).
 
-Configure the connection string in `extenddb.toml`:
+### Managed Database
 
-```toml
-[storage.postgres]
-connection_string = "postgresql://extenddb:<password>@db.example.com:5432/extenddb_catalog?sslmode=require"
-pool_size = 20
-```
-
-Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted database connections.
-
-### Managed PostgreSQL
-
-extenddb works with any PostgreSQL 14+ service:
-
-- **Amazon RDS for PostgreSQL** / **Amazon Aurora PostgreSQL**
-- **Google Cloud SQL for PostgreSQL**
-- **Azure Database for PostgreSQL**
-- **Self-managed PostgreSQL** with streaming replication
-
-```bash
-# Amazon RDS / Aurora example
-extenddb init \
-  --pg-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
-  --pg-user extenddb_admin \
-  --pg-pass
-```
+ExtendDB works with managed database services as well as self-managed servers.
+The managed-service topology is the same as Separated Database: ExtendDB on an
+application host, the backend provided as a service. For the PostgreSQL managed
+services ExtendDB supports (Amazon RDS and Aurora, Google Cloud SQL, Azure
+Database), see [Configuring PostgreSQL](#configuring-postgresql).
 
 ### Containerized
 
-extenddb runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to PostgreSQL.
+ExtendDB runs in Docker or Kubernetes. The binary has no runtime dependencies beyond libc and network access to the storage backend.
 
 Example Dockerfile:
 
@@ -113,9 +103,19 @@ file and never creates `run_dir`, so the root filesystem can be read-only. Use
 #!/bin/sh
 # entrypoint.sh
 set -e
-# Safe to run on every start: already-applied migrations are skipped.
-extenddb migrate --yes --config /etc/extenddb/extenddb.toml
-exec extenddb serve --foreground --config /etc/extenddb/extenddb.toml
+CONFIG=/etc/extenddb/extenddb.toml
+# The preview takes no lock and exits 3 when migrations are pending. Only then
+# does migrate --yes run, which waits for every running server of the catalog
+# to stop, so a start beside another server with nothing to apply does not
+# wait for it.
+rc=0
+extenddb migrate --config "$CONFIG" || rc=$?
+if [ "$rc" -eq 3 ]; then
+  extenddb migrate --yes --config "$CONFIG"
+elif [ "$rc" -ne 0 ]; then
+  exit "$rc"
+fi
+exec extenddb serve --foreground --config "$CONFIG"
 ```
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
@@ -124,10 +124,10 @@ graceful shutdown. Outside a container, where you may want `stop` to work, add
 `--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
-What the health check covers: `extenddb healthcheck` exits 0 when the server is
+`extenddb healthcheck` exits 0 when the server is
 listening, completing TLS, and serving HTTP. Use it as a liveness probe, which is
 what a Docker `HEALTHCHECK` and a Kubernetes `livenessProbe` are for. `/health`
-does not query PostgreSQL, and for a liveness probe that is the behaviour you
+does not query the storage backend, and for a liveness probe that is the behaviour you
 want: one that failed on a database outage would restart every replica at once.
 A backend that is unreachable at startup does stop the server from listening, so
 container start-up failures are still caught.
@@ -141,11 +141,61 @@ For Kubernetes, run `extenddb init` as an init container or a one-time Job, then
 
 ### Air-Gapped
 
-extenddb requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
+ExtendDB requires no internet connectivity. All functionality is self-contained in the binary. Build on a connected host, transfer the binary and `extenddb.toml` to the air-gapped environment, and run.
 
 Requirements in the air-gapped environment:
-- PostgreSQL 14+ (reachable from the extenddb host)
+- A supported storage backend, reachable from the ExtendDB host
 - The `extenddb` binary (statically linked or with matching libc)
+
+## Configuring PostgreSQL
+
+This section applies to the PostgreSQL backend. For Cassandra, see
+[Cassandra setup](../cassandra-setup.md); for MongoDB, see
+[MongoDB setup](../local-mongodb-setup.md).
+
+### Remote and separated databases
+
+Point ExtendDB at a remote PostgreSQL server at init time:
+
+```bash
+extenddb init \
+  --pg-host db.example.com \
+  --pg-pass
+```
+
+Configure the connection string in `extenddb.toml`:
+
+```toml
+[storage.postgres]
+connection_string = "postgresql://extenddb:<password>@db.example.com:5432/extenddb_catalog?sslmode=require"
+pool_size = 20
+```
+
+Use `sslmode=require` (or `verify-full` with a CA certificate) for encrypted
+database connections.
+
+The Cassandra backend cannot encrypt its connection today: the driver is
+compiled without TLS, so credentials and item data cross the network in clear
+text and there is no config option to turn encryption on. Run ExtendDB and the
+Cassandra cluster on a trusted, isolated network; do not route Cassandra traffic
+over an untrusted network.
+
+### Managed PostgreSQL services
+
+ExtendDB works with any PostgreSQL 14+ service:
+
+- **Amazon RDS for PostgreSQL** / **Amazon Aurora PostgreSQL**
+- **Google Cloud SQL for PostgreSQL**
+- **Azure Database for PostgreSQL**
+- **Self-managed PostgreSQL** with streaming replication
+
+```bash
+# Amazon RDS / Aurora example
+extenddb init \
+  --pg-host mydb.cluster-abc123.us-east-1.rds.amazonaws.com \
+  --pg-user extenddb_admin \
+  --pg-pass
+```
 
 ## Production Checklist
 
@@ -160,18 +210,18 @@ Requirements in the air-gapped environment:
 
 - [ ] TLS is enabled by default. Verify it is not disabled in `extenddb.toml`
 - [ ] Replace the self-signed certificate with a CA-signed certificate
-- [ ] Use `sslmode=require` or `sslmode=verify-full` in the PostgreSQL connection string
+- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string. The Cassandra backend cannot encrypt its connection — place ExtendDB and the Cassandra cluster on a trusted, isolated network instead
 
 ### Network
 
 - [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
-- [ ] Firewall: allow only necessary ports (extenddb port, PostgreSQL port)
-- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
+- [ ] Firewall: allow only necessary ports (extenddb port, storage backend port)
+- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Unless the proxy preserves the client address, login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
-### Database
+### Database (PostgreSQL)
 
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
-- [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
+- [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
 - [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
@@ -229,9 +279,11 @@ Run one extenddb instance per catalog. Multiple instances behind a load balancer
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
 - `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
 
-On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL and MongoDB it is not enforced; if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
+On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
-## Performance Tuning
+## Performance Tuning (PostgreSQL)
+
+This section covers the PostgreSQL backend.
 
 ### Connection Pool
 
@@ -244,7 +296,23 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests; a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+
+### Cassandra Connection Pool
+
+The Cassandra backend opens `max_connections` connections per node (default 10)
+and scatters requests across them:
+
+```toml
+[storage.cassandra]
+max_connections = 10  # connections per node
+```
+
+Keep this above 1. A single connection serializes every request's protocol
+stream id onto one socket and leaves no headroom if that socket drops. Spreading
+requests over several connections also divides the stream-id space, which eases a
+driver-level stream-id reuse hazard seen under sustained load with a slow
+statement in flight.
 
 ### PostgreSQL Tuning
 
@@ -253,7 +321,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ `2 * pool_size + catalog_pool_size`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, and `max_connections` is per cluster, so the default pool sizes need 60 of PostgreSQL's default 100
+- `max_connections`: ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, each backup or restore job holds one claim connection outside every pool, and `max_connections` is per cluster, so the default pool sizes and the default `max_concurrent_jobs` of 4 need 64 of PostgreSQL's default 100
 
 ### Monitoring Queries
 

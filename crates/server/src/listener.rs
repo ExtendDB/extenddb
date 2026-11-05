@@ -11,19 +11,23 @@ use std::time::Duration;
 use axum::Router;
 
 use crate::ServerTlsConfig;
+use crate::registration::Admission;
 
-/// Serve `app` on `listener` until a shutdown signal arrives.
+/// Serve `app` on `listener` until a shutdown signal arrives, or until
+/// `admission` asks for a stop after the serving registration was lost.
 ///
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with
 /// rustls. When `tls` is `None`, the server serves plaintext HTTP. Both arms
 /// run on the same `axum-server` builder, so the request timeouts, the
-/// shutdown handle and `TCP_NODELAY` apply to every listener mode.
+/// shutdown handle and `TCP_NODELAY` apply to every listener mode, and a
+/// signal and a stop drain the listener the same way.
 pub(crate) async fn serve_app(
     listener: tokio::net::TcpListener,
     app: Router,
     request_timeout: Duration,
     tls: Option<ServerTlsConfig>,
     pid_file: Option<PathBuf>,
+    admission: Admission,
 ) -> Result<(), anyhow::Error> {
     let local_addr = listener.local_addr()?;
 
@@ -31,7 +35,7 @@ pub(crate) async fn serve_app(
     let shutdown_handle = handle.clone();
     let shutdown_pid = pid_file.clone();
     tokio::spawn(async move {
-        shutdown_signal().await;
+        signal_or_stop(&admission).await;
         shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
         // P50: Log timeout but don't call std::process::exit — let the
         // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
@@ -418,6 +422,20 @@ fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAdd
     );
     // Best-effort write — if it fails, the client already got a connection error.
     let _ = stream.try_write(response.as_bytes());
+}
+
+/// Resolves on a shutdown signal, or once `admission` asks for a stop
+/// because the serving registration could not be taken again.
+async fn signal_or_stop(admission: &Admission) {
+    tokio::select! {
+        () = shutdown_signal() => admission.mark_signalled(),
+        () = admission.stop_requested() => {
+            tracing::info!(
+                "Stopping because the serving registration could not be taken again, draining \
+                 connections..."
+            );
+        }
+    }
 }
 
 #[cfg(unix)]

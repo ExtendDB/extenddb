@@ -355,8 +355,6 @@ pub async fn apply_lwt<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<bool, E> {
-    use cdrs_tokio::types::IntoRustByName;
-
     let result = session
         .query_with_values(query, values)
         .await
@@ -364,6 +362,48 @@ pub async fn apply_lwt<E: FromDbError>(
             tracing::error!("{context} lwt failed: {e}");
             E::db_error("Database error".to_owned())
         })?;
+    lwt_applied_flag(&result, context)
+}
+
+/// [`apply_lwt`] with the commit phase at `LOCAL_QUORUM`.
+///
+/// [`apply_lwt`] commits at the driver's default consistency, `ONE`, so a
+/// `LOCAL_QUORUM` read issued after it returns can still miss the write. Use
+/// this where a later quorum read must see the change. The serial phase keeps
+/// the default, `SERIAL`, which every other LWT on these rows also uses.
+///
+/// # Errors
+/// Returns an error if Cassandra does not acknowledge the statement at quorum
+/// or the response cannot be parsed.
+pub async fn apply_lwt_quorum<E: FromDbError>(
+    session: &Arc<CassandraSession>,
+    query: &str,
+    values: QueryValues,
+    context: &str,
+) -> Result<bool, E> {
+    use cdrs_tokio::consistency::Consistency;
+    use cdrs_tokio::statement::StatementParamsBuilder;
+
+    let params = StatementParamsBuilder::new()
+        .with_consistency(Consistency::LocalQuorum)
+        .with_values(values)
+        .build();
+    let result = session
+        .query_with_params(query, params)
+        .await
+        .map_err(|e| {
+            tracing::error!("{context} quorum lwt failed: {e}");
+            E::db_error("Database error".to_owned())
+        })?;
+    lwt_applied_flag(&result, context)
+}
+
+/// The `[applied]` flag of an LWT response, `false` when the response has no row.
+fn lwt_applied_flag<E: FromDbError>(
+    result: &cdrs_tokio::frame::Envelope,
+    context: &str,
+) -> Result<bool, E> {
+    use cdrs_tokio::types::IntoRustByName;
 
     let body = result.response_body().map_err(|e| {
         tracing::error!("{context} lwt response_body failed: {e}");

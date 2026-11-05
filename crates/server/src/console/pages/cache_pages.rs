@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
@@ -21,7 +21,7 @@ use crate::management::cache_invalidate::{
     self, InvalidateRequest, Scope, Selectors, apply as apply_invalidation,
 };
 
-use super::{identity_label, is_admin, require_csrf, require_session};
+use super::{identity_label, require_admin, require_csrf, require_session};
 
 /// Confirmation token the operator must type for `scope=all`. Mirrors
 /// the CLI's `--yes` requirement; intentionally distinctive so the
@@ -34,12 +34,8 @@ pub async fn cache_page(State(state): State<Arc<ConsoleState>>, headers: HeaderM
         Ok(s) => s,
         Err(redirect) => return redirect,
     };
-    if !is_admin(&session.identity) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Cache controls are visible to admin users only",
-        )
-            .into_response();
+    if let Err(redirect) = require_admin(&session) {
+        return redirect;
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
@@ -180,12 +176,8 @@ pub async fn invalidate_cache(
         Ok(s) => s,
         Err(r) => return r,
     };
-    if !is_admin(&session.identity) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Cache controls are visible to admin users only",
-        )
-            .into_response();
+    if let Err(redirect) = require_admin(&session) {
+        return redirect;
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
@@ -193,7 +185,9 @@ pub async fn invalidate_cache(
 
     let admin_name = match &session.identity {
         crate::management::CallerIdentity::Admin(n) => n.clone(),
-        crate::management::CallerIdentity::IamUser { .. } => unreachable!("checked by is_admin"),
+        crate::management::CallerIdentity::IamUser { .. } => {
+            unreachable!("checked by require_admin")
+        }
     };
 
     let scope = match parse_scope(&form.scope) {

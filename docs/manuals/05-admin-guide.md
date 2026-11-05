@@ -90,7 +90,7 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation. Requests must carry a credential scope for this region; any other region is rejected with `InvalidSignatureException`, as the service rejects a scope for a region other than the endpoint's. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
+| `region` | `us-east-1` | AWS region for ARN generation. Requests must carry a credential scope for this region; any other region is rejected with `InvalidSignatureException`, as the service rejects a scope for a region other than the endpoint's. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (under a value outside that class `CreateBackup` is refused with a `ValidationException` naming `server.region`, since no backup ARN can be formed; backups taken before the upgrade under such a region keep an ARN `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup` refuse as "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
 | `request_timeout_secs` | `30` | Seconds a connection may take to deliver its request headers, and seconds a request body may stall without delivering data, before the server closes it (a stalled body gets HTTP 408). A connection that is accepted, or that completes the TLS handshake, and then sends no byte is closed after the same number of seconds, as is one that sends only part of the 24-byte HTTP/2 preface. The same value bounds how long an idle keep-alive connection waits for its next request, so SDK connection pools see idle connections closed after it (they reopen transparently), and it is the HTTP/2 keep-alive PING interval and timeout, so a stalled HTTP/2 connection is closed within twice the value. Must be at least 1 and at most 86400 (a day); the server refuses a larger value at startup, because the per-connection timers add it to the current instant and a value near `u64::MAX` overflows that addition |
 
 #### [storage]
@@ -107,9 +107,9 @@ These settings require a server restart to take effect.
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
 
-Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
+Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, below), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 
-`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
+`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock (the job's claim) for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) the lock lands on a pooled server connection and is not released with the job, so later jobs can be refused as already claimed; do not run backups or restores through one.
 
 #### [storage.sqlite]
 
@@ -117,6 +117,20 @@ Restores on PostgreSQL are bounded per server process: at most 4 per account and
 |-----|---------|-------------|
 | `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
 | `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
+
+#### [backup]
+
+The knobs backup and restore jobs and the reconciler read; every key has a default, and the section may be left out.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `data_file_target_bytes` | `67108864` | Uncompressed bytes per backup data file (minimum 32 MiB); read by the store-backed backup writer |
+| `heartbeat_interval_secs` | `15` | The job heartbeat timer. The in-catalog backup and restore paths of this release heartbeat every 15 s whatever this says |
+| `stale_job_after_secs` | `300` | Heartbeat age after which a job's owner is dead and the reconciler fails the job and removes its restore target. Must be at least three heartbeat periods, where the period is the larger of `heartbeat_interval_secs` and the 15 s the jobs of this release heartbeat at (so 45 at the least, whatever `heartbeat_interval_secs` says); on SQLite a long write transaction delays a heartbeat, so keep a margin above that floor |
+| `failed_row_retention_secs` | `604800` | How long FAILED backup rows are kept for the operator (7 days) |
+| `reconcile_interval_secs` | `60` | The reconciler's cycle; it also runs once at startup |
+| `max_concurrent_jobs` | `4` | Backup and restore jobs this instance runs at once (at most 1024); a request over it waits up to 30 s for a slot, then `LimitExceededException`. On PostgreSQL the pool sizes are raised to `2 * max_concurrent_jobs + 10` when smaller |
+| `spool_path` | (unset) | Restore download area for an S3 store, used by a later release |
 
 #### [auth]
 
@@ -134,14 +148,14 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
 | `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
-| `max_entries` | `10000` | Per-cache LRU cap. |
+| `max_entries` | `10000` | Maximum entries per cache. |
 
 Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
 **Invalidation timing**:
 
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
-- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous** — there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. The account and role sweeps register a predicate with moka, and moka's `get` applies it, so matching entries are not served once the call returns; moka removes them from its map during later cache operations. The group fanout drops each member's entries in turn. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
 
 #### [server.tls]
@@ -186,7 +200,7 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
-| `control_plane_delay_seconds` | `5` | Delay for table status transitions (0 = instant) |
+| `control_plane_delay_seconds` | `0.25` | Delay for table status transitions, in seconds (0 = instant). PostgreSQL and SQLite write 0.25 into the catalog when it is created; MongoDB and Cassandra use 0.25 when the setting is absent. On PostgreSQL and SQLite a value below 1 makes DeleteTable remove the table in the request; on PostgreSQL, if a session holds a lock on the table's data (a reader, an open write transaction, an index build), DeleteTable returns `DELETING` instead (after at most about a second), the drop finishes in the background within about a second of that session's release, and a CreateTable of the same name is refused until then. |
 | `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
 | `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
@@ -801,20 +815,22 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Features
 
-- **Dashboard**: Account and admin user counts, version info
-- **Account management**: Create, view, delete accounts
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
+- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies with JSON editor
+- **Metrics dashboard**: Operation metrics for every account, with charts (admin only; an IAM-user session is redirected to the console home page, `/console`)
+- **Settings and Cache**: The read-only settings viewer and the auth cache invalidation form (admin only; an IAM-user session is redirected to `/console`)
 
 ### Authentication
 
 - Admin users: enter username and password
 - IAM users: enter `account_id/user_name` as username, console password as password
 
-Sessions expire after 8 hours. Click "Logout" to end immediately.
+Sessions expire after 8 hours of inactivity. Click "Logout" to end immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
 
 ## Monitoring
 
@@ -924,14 +940,9 @@ Error: error communicating with database
 
 Check that PostgreSQL is running and the connection string in `extenddb.toml` is correct.
 
-**Catalog version mismatch:**
+**The catalog has pending migrations, or is ahead of the binary:**
 
-<!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
-```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.4
-```
-
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 4, and ExtendDB <release> needs migration 5`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

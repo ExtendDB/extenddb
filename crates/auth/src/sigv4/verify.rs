@@ -226,20 +226,15 @@ fn parse_iso8601_basic(s: &str) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
-/// Constant-time byte comparison to prevent timing attacks.
+/// Constant-time byte comparison to prevent timing attacks, through AWS-LC's
+/// `CRYPTO_memcmp` (`aws_lc_rs::constant_time::verify_slices_are_equal`).
 ///
-/// The early return on length mismatch leaks timing information about whether
-/// lengths match. Callers must ensure both inputs have equal length (e.g.,
-/// hex-encoded signatures are always 64 bytes).
+/// The comparison of the contents is constant time; the length check is not.
+/// Inputs of different lengths return `false` at once, which reveals whether
+/// the lengths match. Callers compare against values of a fixed length that
+/// is not secret: hex-encoded signatures (always 64 bytes) and session tokens.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    aws_lc_rs::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ mod listener;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
+mod registration;
 mod repeated_headers;
 mod request_helpers;
 mod request_tags;
@@ -29,7 +30,9 @@ mod serve;
 mod throttle_helpers;
 mod workers;
 
-pub use serve::{BuildInfo, LogTarget, ServeParams, log_to_syslog_raw, serve};
+pub use serve::{
+    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, log_to_syslog_raw, serve,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,6 +58,8 @@ use tower_http::timeout::RequestBodyTimeoutLayer;
 /// Application state shared across all handlers.
 pub struct AppState {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The job slots and configured backup store the backup operations read.
+    pub backup_runtime: Arc<extenddb_engine::BackupRuntime>,
     pub auth: Arc<dyn AuthProvider>,
     pub limits: Arc<LimitsConfig>,
     // Fix #9: Use Arc<str> to avoid per-request cloning
@@ -99,6 +104,10 @@ pub struct AppState {
     pub config_entries: Vec<(String, String)>,
     /// Runtime documentation store. `None` if `docs_dir` is not configured.
     pub docs_store: Option<console::docs_embed::DocsStore>,
+    /// Whether new requests are admitted, and whether the server must stop:
+    /// set while the backend's serving registration is lost
+    /// ([`registration`]).
+    pub(crate) admission: registration::Admission,
 }
 
 /// TLS configuration passed from the binary crate.
@@ -118,6 +127,10 @@ pub struct ServerTlsConfig {
 ///
 /// When `tls` is `Some`, the server serves HTTPS using `axum-server` with rustls.
 /// When `tls` is `None`, the server serves plaintext HTTP.
+///
+/// It stops on SIGINT or SIGTERM, or when `state`'s admission asks for a
+/// stop after the serving registration was lost; both drain the listener
+/// the same way and remove the PID file.
 pub async fn start_server(
     listener: tokio::net::TcpListener,
     state: AppState,
@@ -144,6 +157,7 @@ pub async fn start_server(
         format!("{scheme}://{addr}")
     };
     let config_entries = state.config_entries.clone();
+    let admission = state.admission.clone();
     let shared = Arc::new(state);
 
     // Security headers applied to all responses.
@@ -198,6 +212,7 @@ pub async fn start_server(
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
+            secure_cookies: tls_enabled,
         });
         let console_router = console::router().with_state(console_state);
         app = app
@@ -209,6 +224,13 @@ pub async fn start_server(
                 get(|| async { Redirect::permanent("/console") }),
             );
     }
+
+    // While the serving registration is lost, every route answers
+    // ServiceUnavailable before its handler runs.
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        admission.clone(),
+        registration::refuse_while_unregistered,
+    ));
 
     // Refuse a repeated host or authorization header on every route, then
     // apply security headers to all routes (the refusal carries them too).
@@ -232,7 +254,7 @@ pub async fn start_server(
         app
     };
 
-    listener::serve_app(listener, app, request_timeout, tls, pid_file).await
+    listener::serve_app(listener, app, request_timeout, tls, pid_file, admission).await
 }
 
 /// GET /health — REQ-OBS-006
