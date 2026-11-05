@@ -820,6 +820,146 @@ def _members(table, templates, **names):
     return [{"Statement": _sql(t, table, **names)} for t in templates]
 
 
+# --- which refusal a transaction with several faults reports -----------------
+# The service checks each member in order and stops at the first member that
+# fails: its statement, its parameters, its form against its table (an index
+# read, a read without the full key, a key-only EXISTS, an EXISTS on an index
+# ahead of a missing table, a RETURNING clause), then whether it is a read
+# beside a write. A missing table and a key value of the wrong type cancel the
+# request once every member passes (measured 2026-11-05).
+
+_MIXED = (
+    "ExecuteTransaction API does not support both read and write operations in the same "
+    "request."
+)
+_SEED_READ = "SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b'"
+_SYNTAX = "SELECT * FROM"
+_INDEX_READ = "SELECT * FROM {t}.\"gsi\" WHERE g = 'a' AND gs = '1'"
+_PARTIAL_READ = "SELECT * FROM {t} WHERE pk = '{s}'"
+_KEY_ONLY_EXISTS = "EXISTS(SELECT * FROM {t} WHERE pk = '{s}' AND sk = 'b')"
+_MISSING_READ = "SELECT * FROM nosuch_tbl WHERE pk = 'a' AND sk = 'b'"
+_INSERT = "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','a':1}}"
+_UNBOUND_INSERT = "INSERT INTO {t} VALUE {{'pk':'{n}','sk':?}}"
+_RETURNING_UPDATE = "UPDATE {t} SET x = 1 WHERE pk = '{r}' AND sk = 'b' RETURNING ALL NEW *"
+
+
+def _positional(index, message):
+    return f"Validation failed in TransactStatements[{index}]: {message}"
+
+
+_RETURNING = "RETURNING clause is not supported in ExecuteTransaction."
+_INDEX = "Reads on indices are not supported within transactions."
+_PARTIAL_KEY = (
+    "Select statements within ExecuteTransaction must specify the primary key in the where "
+    "clause."
+)
+_EXISTS_FORM = "EXISTS() must contain a single item read with additional condition"
+_EXISTS_INDEX = "Operations on indices are not supported in transactions"
+_UNBOUND = "Number of parameters in request and statement don't match."
+_UNEXPECTED_TERM = "Statement wasn't well formed, can't be processed: Unexpected term"
+
+
+@pytest.mark.parametrize(
+    "templates, message",
+    [
+        ([_SEED_READ, _INSERT, _SYNTAX], _MIXED),
+        ([_RETURNING_UPDATE, _SYNTAX], _positional(0, _RETURNING)),
+        ([_INDEX_READ, _INSERT], _positional(0, _INDEX)),
+        ([_PARTIAL_READ, _MISSING_READ], _positional(0, _PARTIAL_KEY)),
+        ([_KEY_ONLY_EXISTS, _SEED_READ], _positional(0, _EXISTS_FORM)),
+        (["EXISTS(SELECT * FROM \"nosuch_tbl\".\"idx\" WHERE pk = 'a' AND x = 1)"],
+         _positional(0, _EXISTS_INDEX)),
+        ([_SEED_READ, _UNBOUND_INSERT], _positional(1, _UNBOUND)),
+        ([_MISSING_READ, _PARTIAL_READ], _positional(1, _PARTIAL_KEY)),
+        ([_MISSING_READ, _INDEX_READ], _positional(1, _INDEX)),
+        ([_SEED_READ, _RETURNING_UPDATE], _positional(1, _RETURNING)),
+        ([_INSERT, _INDEX_READ], _positional(1, _INDEX)),
+        ([_INSERT, _PARTIAL_READ], _positional(1, _PARTIAL_KEY)),
+        ([_SEED_READ, _KEY_ONLY_EXISTS], _positional(1, _EXISTS_FORM)),
+        ([_SEED_READ,
+          "EXISTS(SELECT * FROM {t}.\"gsi\" WHERE g = 'a' AND gs = '1' AND x = 0)"],
+         _positional(1, _EXISTS_INDEX)),
+        ([_SEED_READ, "UPDATE {t} SET a = ? WHERE pk = '{n}' AND sk = 'b'"],
+         _positional(1, _UNBOUND)),
+        ([_SEED_READ, _INDEX_READ, _INSERT], _positional(1, _INDEX)),
+        ([_UNBOUND_INSERT, _RETURNING_UPDATE], _positional(0, _UNBOUND)),
+        ([_KEY_ONLY_EXISTS, _UNBOUND_INSERT], _positional(0, _EXISTS_FORM)),
+        (["INSERT INTO nosuch_tbl VALUE {{'pk':'a','sk':'b'}}", _RETURNING_UPDATE],
+         _positional(1, _RETURNING)),
+        (["UPDATE {t} SET x = 1 WHERE pk = '{n}'", _RETURNING_UPDATE],
+         _positional(1, _RETURNING)),
+        (["INSERT INTO nosuch_tbl VALUE {{'pk':'a','sk':'b'}}", _KEY_ONLY_EXISTS],
+         _positional(1, _EXISTS_FORM)),
+        (["SELECT * FROM {t} WHERE pk = '{s}' AND sk = 1", _PARTIAL_READ],
+         _positional(1, _PARTIAL_KEY)),
+        ([_MISSING_READ, _SYNTAX], _positional(1, _UNEXPECTED_TERM)),
+        ([_SEED_READ, "INSERT INTO nosuch_tbl VALUE {{'pk':'a','sk':'b'}}"], _MIXED),
+        ([_INSERT, _MISSING_READ], _MIXED),
+        (["UPDATE nosuch_tbl SET x = 1 WHERE pk = 'a' AND sk = 'b' RETURNING ALL NEW *",
+          _SEED_READ], _MIXED),
+    ],
+    ids=[
+        "read-write-then-syntax",
+        "returning-then-syntax",
+        "index-read-then-write",
+        "partial-key-then-missing-table",
+        "key-only-exists-then-read",
+        "exists-on-an-index-of-a-missing-table",
+        "read-then-unbound-insert",
+        "missing-table-then-partial-key",
+        "missing-table-then-index-read",
+        "read-then-returning",
+        "write-then-index-read",
+        "write-then-partial-key",
+        "read-then-key-only-exists",
+        "read-then-exists-on-an-index",
+        "read-then-unbound-set",
+        "read-then-index-read-then-write",
+        "unbound-insert-then-returning",
+        "key-only-exists-then-unbound-insert",
+        "write-on-a-missing-table-then-returning",
+        "partial-key-write-then-returning",
+        "write-on-a-missing-table-then-key-only-exists",
+        "key-type-then-partial-key",
+        "missing-table-then-syntax",
+        "read-then-write-on-a-missing-table",
+        "write-then-read-of-a-missing-table",
+        "returning-on-a-missing-table-then-read",
+    ],
+)
+def test_the_first_member_that_fails_is_reported(dynamodb_client, gtable, templates, message):
+    run = uuid.uuid4().hex[:6]
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, _members(gtable, templates, s="seed", n=f"tq-{run}",
+                                       r=f"tq-r-{run}"))
+    assert _error(excinfo) == ("ValidationException", message)
+
+
+_KEY_TYPE_READ = "SELECT * FROM {t} WHERE pk = '{s}' AND sk = 1"
+
+
+@pytest.mark.parametrize(
+    "templates, reasons",
+    [
+        ([_MISSING_READ, _KEY_TYPE_READ], [_NOT_FOUND, _KEY_MISMATCH]),
+        ([_KEY_TYPE_READ, _MISSING_READ], [_KEY_MISMATCH, _NOT_FOUND]),
+        ([_MISSING_READ, "SELECT * FROM nosuch_tbl2 WHERE pk = 'a' AND sk = 'b'", _SEED_READ],
+         [_NOT_FOUND, _NOT_FOUND, _NONE]),
+        (["SELECT * FROM \"nosuch_tbl\".\"idx\" WHERE pk = 'a'"], [_NOT_FOUND]),
+    ],
+    ids=["missing-table-then-key-type", "key-type-then-missing-table", "two-missing-tables",
+         "index-read-of-a-missing-table"],
+)
+def test_a_read_cancellation_gives_every_member_its_reason(
+    dynamodb_client, gtable, templates, reasons
+):
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, _members(gtable, templates, s="seed"))
+    err = excinfo.value.response
+    assert err["Error"]["Code"] == "TransactionCanceledException"
+    assert err["CancellationReasons"] == reasons
+
+
 # --- ConsumedCapacity of an index ------------------------------------------------
 # A write transaction charges each write to an index at the units an
 # UpdateItem charges it, beside the doubled units of the table (measured

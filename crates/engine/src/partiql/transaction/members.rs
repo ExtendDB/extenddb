@@ -92,13 +92,8 @@ async fn exists_member(
     select: &SelectStatement,
     req: &SingleRequest,
 ) -> Result<Value, DynamoDbError> {
-    // A condition check through an index is refused with its position
-    // (measured 2026-11-02 on an index the table does not have).
     if select.from.index.is_some() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Validation failed in TransactStatements[{index}]: Operations on indices are \
-             not supported in transactions"
-        )));
+        return Err(exists_index_refusal(index));
     }
     let parts = write::build_exists_parts(ctx, select, &req.parameters)
         .await?
@@ -123,11 +118,22 @@ async fn exists_member(
     Ok(json!({ "ConditionCheck": check }))
 }
 
+/// The refusal of a condition check through an index, at position `index`
+/// (measured 2026-11-02 on an index the table does not have).
+fn exists_index_refusal(index: usize) -> DynamoDbError {
+    DynamoDbError::ValidationException(format!(
+        "Validation failed in TransactStatements[{index}]: Operations on indices are \
+         not supported in transactions"
+    ))
+}
+
 /// Refuse an `EXISTS` member at position `index` whose form the service
 /// refuses (see [`exists_member`]), before the members are authorized: a
 /// caller that may not read the table gets the refusal of the form
-/// (measured 2026-11-03). A member on a missing table is left to the checks
-/// made after authorization, as before.
+/// (measured 2026-11-03). A check through an index is refused ahead of a
+/// missing table (measured 2026-11-05 with a table and an index that do not
+/// exist); any other member on a missing table is left to the checks made
+/// after authorization.
 ///
 /// # Errors
 ///
@@ -141,6 +147,9 @@ pub(super) async fn check_exists_form(
     let Statement::Exists(select) = stmt else {
         return Ok(());
     };
+    if select.from.index.is_some() {
+        return Err(exists_index_refusal(index));
+    }
     if ctx.table_key_info(&select.from.table).await.is_err() {
         return Ok(());
     }

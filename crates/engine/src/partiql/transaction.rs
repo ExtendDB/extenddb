@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
-use extenddb_core::partiql::ast::Returning;
+use extenddb_core::partiql::ast::{Returning, SelectStatement};
 use extenddb_core::partiql::parser::parse_for_request;
 use extenddb_core::types::CancellationReason;
 
@@ -66,31 +66,21 @@ pub(super) async fn run(
             )
         })?;
 
-    // A transaction is atomic, so a malformed statement fails the whole
-    // request, its message prefixed with the statement's position (measured
-    // 2026-11-02 on an empty WHERE). A parameter that cannot be converted is
-    // reported without the statement's position (measured 2026-11-02); the
-    // checks on a parsed statement name it.
+    // The service checks each member in order and stops at the first that
+    // fails, so a refusal of a member wins over any refusal of a later one
+    // (measured 2026-11-05). The members are read and parsed up to the first
+    // whose statement fails its checks; that refusal is reported once the
+    // members before it have passed the checks they get against their tables.
     let mut parsed: Vec<(SingleRequest, Statement)> = Vec::with_capacity(statements.len());
+    let mut refusal = None;
     for (i, obj) in statements.iter().enumerate() {
-        let req = SingleRequest::from_body(obj)?;
-        super::check_parameters(obj.get("Parameters"))
-            .map_err(DynamoDbError::ValidationException)?;
-        let stmt = parse_for_request(&req.statement, req.parameters.len()).map_err(|e| {
-            DynamoDbError::ValidationException(format!(
-                "Validation failed in TransactStatements[{i}]: {}",
-                e.message
-            ))
-        })?;
-        // A projected call (`COUNT(*)`) is among these checks, so it is
-        // refused ahead of every table lookup, naming the statement (measured
-        // 2026-11-02).
-        super::check_statement(&stmt, &req.parameters).map_err(|message| {
-            DynamoDbError::ValidationException(format!(
-                "Validation failed in TransactStatements[{i}]: {message}"
-            ))
-        })?;
-        parsed.push((req, stmt));
+        match parse_member(i, obj) {
+            Ok(member) => parsed.push(member),
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
     }
 
     // Each table the statements name is read from the catalog once, and
@@ -102,33 +92,126 @@ pub(super) async fn run(
         .collect();
     let ctx = &super::snapshot::snapshot_context(ctx, &tables).await?;
 
-    // A RETURNING clause is refused per member, in order, once that member's
-    // table resolves: a member on a missing table skips the check and the
-    // missing table is reported later as a cancellation. The refusal comes
-    // ahead of the mixed read and write refusal (measured 2026-11-02).
-    for (i, (_, stmt)) in parsed.iter().enumerate() {
-        if let Some(table) = returning_table(stmt)
-            && ctx.table_key_info(table).await.is_ok()
-        {
-            reject_returning(stmt, i)?;
+    // A member's refusals against its table come ahead of the refusal of a
+    // read and a write in one request, which a member that differs from the
+    // members before it gets (measured 2026-11-05: an index read, a read
+    // without the full key, a key-only EXISTS and a RETURNING clause after a
+    // member of the other kind are refused for themselves).
+    let mut reads = None;
+    for (i, (req, stmt)) in parsed.iter().enumerate() {
+        check_member(ctx, i, stmt, req).await?;
+        if *reads.get_or_insert(stmt.is_read()) != stmt.is_read() {
+            return Err(DynamoDbError::ValidationException(
+                "ExecuteTransaction API does not support both read and write operations in the same request."
+                    .to_owned(),
+            ));
         }
     }
-
-    let reads = parsed.iter().filter(|(_, s)| s.is_read()).count();
-    let writes = parsed.len() - reads;
-    if reads > 0 && writes > 0 {
-        return Err(DynamoDbError::ValidationException(
-            "ExecuteTransaction API does not support both read and write operations in the same request."
-                .to_owned(),
-        ));
+    if let Some(refusal) = refusal {
+        return Err(refusal);
     }
 
     let rcc = body.get("ReturnConsumedCapacity").and_then(Value::as_str);
 
-    if writes == 0 {
+    if reads == Some(true) {
         run_read(ctx, &parsed, rcc).await
     } else {
         run_write(ctx, body, &parsed, rcc).await
+    }
+}
+
+/// Read and parse the member at position `i`, and make the checks its
+/// statement gets before its table is read.
+///
+/// A malformed statement fails the whole request, its message prefixed
+/// with the statement's position (measured 2026-11-02 on an empty WHERE). A
+/// parameter that cannot be converted is reported without the statement's
+/// position (measured 2026-11-02); the checks on a parsed statement name it.
+/// A projected call (`COUNT(*)`) is among those checks, so it is refused
+/// ahead of every table lookup (measured 2026-11-02), and so is a `?`
+/// without a parameter (measured 2026-11-05).
+fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), DynamoDbError> {
+    let positional = |message: &str| {
+        DynamoDbError::ValidationException(format!(
+            "Validation failed in TransactStatements[{i}]: {message}"
+        ))
+    };
+    let req = SingleRequest::from_body(obj)?;
+    super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
+    let stmt = parse_for_request(&req.statement, req.parameters.len())
+        .map_err(|e| positional(&e.message))?;
+    super::check_statement(&stmt, &req.parameters).map_err(|message| positional(&message))?;
+    check_parameter_count(&stmt, req.parameters.len(), i)?;
+    Ok((req, stmt))
+}
+
+/// The refusals the member at position `i` gets against its table, before
+/// any member is authorized. A member on a missing table gets none of them:
+/// the missing table cancels the request once every member is checked.
+///
+/// A read is refused when it reads an index, then when its WHERE does not
+/// give the full primary key; a key value of the wrong type cancels the
+/// request later (measured 2026-11-05). An EXISTS is refused when it reads
+/// an index, ahead of a missing table, then when it is not a read of one
+/// item with a further condition (see `members::check_exists_form`). A
+/// `RETURNING` clause is refused (see [`reject_returning`]).
+///
+/// # Errors
+///
+/// The member's refusal.
+async fn check_member(
+    ctx: &OperationContext,
+    i: usize,
+    stmt: &Statement,
+    req: &SingleRequest,
+) -> Result<(), DynamoDbError> {
+    match stmt {
+        Statement::Select(select) => check_read_form(ctx, i, select, req).await,
+        Statement::Exists(_) => check_exists_form(ctx, i, stmt, req).await,
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            if let Some(table) = returning_table(stmt)
+                && ctx.table_key_info(table).await.is_ok()
+            {
+                reject_returning(stmt, i)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The refusals a read member at position `i` gets against its table: a
+/// read of an index, existing or not, GSI or vector, then a read whose WHERE
+/// is not of one item by its full primary key.
+async fn check_read_form(
+    ctx: &OperationContext,
+    i: usize,
+    select: &SelectStatement,
+    req: &SingleRequest,
+) -> Result<(), DynamoDbError> {
+    let Ok(key_info) = ctx.table_key_info(&select.from.table).await else {
+        return Ok(());
+    };
+    if select.from.index.is_some() {
+        return Err(DynamoDbError::ValidationException(format!(
+            "Validation failed in TransactStatements[{i}]: Reads on indices are not \
+             supported within transactions."
+        )));
+    }
+    // A multi-part base table key (this engine's preview extension) is
+    // refused once the members are authorized (see `run_read`).
+    if common::ensure_single_attribute_keys(&key_info.key_schema).is_err() {
+        return Ok(());
+    }
+    let (pk, sk) = common::key_names(&key_info.key_schema);
+    let pk = pk.ok_or_else(|| {
+        DynamoDbError::InternalServerError("table has no partition key".to_owned())
+    })?;
+    match common::point_read_key(select, pk, sk, &req.parameters)? {
+        Some(_) => Ok(()),
+        None => Err(DynamoDbError::ValidationException(format!(
+            "Validation failed in TransactStatements[{i}]: Select statements within \
+             ExecuteTransaction must specify the primary key in the where clause."
+        ))),
     }
 }
 
@@ -136,91 +219,63 @@ pub(super) async fn run(
 ///
 /// The members are authorized once their form is checked: after the
 /// refusals of a read of an index and of a read without the full primary
-/// key, which fail the request, and ahead of a missing table and a key
-/// value of the wrong type, which cancel it (see `authorize::gate`).
+/// key, which fail the request (see [`check_member`]), and ahead of a
+/// missing table and a key value of the wrong type, which cancel it (see
+/// `authorize::gate`).
 async fn run_read(
     ctx: &OperationContext,
     parsed: &[(SingleRequest, Statement)],
     rcc: Option<&str>,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Resolve every table first. On the service an unknown table in a read
-    // transaction cancels the whole request with a positional ResourceNotFound
-    // reason (`None` for the statements whose tables exist), and this happens
-    // before any per-statement validation, including the index refusal.
-    let mut key_infos = Vec::with_capacity(parsed.len());
-    let mut reasons = Vec::with_capacity(parsed.len());
-    let mut missing = false;
-    for (_, stmt) in parsed {
-        let Statement::Select(select) = stmt else {
-            unreachable!("read transaction holds only SELECT statements");
-        };
-        if let Ok(info) = ctx.table_key_info(&select.from.table).await {
-            key_infos.push(Some(info));
-            reasons.push(CancellationReason::none());
-        } else {
-            missing = true;
-            key_infos.push(None);
-            reasons.push(not_found_reason());
-        }
-    }
-    if missing {
-        authorize_members(ctx, parsed).await?;
-        return Err(cancellation(reasons));
-    }
-
+    // A member on a missing table reports ResourceNotFound and a member whose
+    // key value has the wrong type reports that the key does not match the
+    // schema, in one cancellation (measured 2026-11-05 with the two in either
+    // order); every other member reports `None`.
     let mut transact_items: Vec<Value> = Vec::with_capacity(parsed.len());
-    let mut key_reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
-    for (i, ((req, stmt), key_info)) in parsed.iter().zip(&key_infos).enumerate() {
+    let mut reasons: Vec<CancellationReason> = Vec::with_capacity(parsed.len());
+    let mut multi_attribute = None;
+    for (req, stmt) in parsed {
         let Statement::Select(select) = stmt else {
             unreachable!("read transaction holds only SELECT statements");
         };
-        let key_info = key_info
-            .as_ref()
-            .expect("every table resolved above or the request was cancelled");
-        let table = select.from.table.clone();
-
-        // Measured: any index segment, existing or not, GSI or vector, is
-        // refused with this positional message before the key is examined.
-        if select.from.index.is_some() {
-            return Err(DynamoDbError::ValidationException(format!(
-                "Validation failed in TransactStatements[{i}]: Reads on indices are not \
-                 supported within transactions."
-            )));
-        }
-
+        let Ok(key_info) = ctx.table_key_info(&select.from.table).await else {
+            reasons.push(not_found_reason());
+            continue;
+        };
         // A multi-part base table key (this engine's preview extension) is
         // refused with the service's multi-attribute message.
         if let Err(e) = common::ensure_single_attribute_keys(&key_info.key_schema) {
-            authorize_members(ctx, parsed).await?;
-            return Err(e);
+            multi_attribute.get_or_insert(e);
+            reasons.push(CancellationReason::none());
+            continue;
         }
-
         let (pk, sk) = common::key_names(&key_info.key_schema);
         let pk = pk.ok_or_else(|| {
             DynamoDbError::InternalServerError("table has no partition key".to_owned())
         })?;
-
-        // A transaction read must be a full-primary-key point read; a partial
-        // key fails the entire request, indexed by its position.
         let key = common::point_read_key(select, pk, sk, &req.parameters)?.ok_or_else(|| {
-            DynamoDbError::ValidationException(format!(
-                "Validation failed in TransactStatements[{i}]: Select statements within \
-                 ExecuteTransaction must specify the primary key in the where clause."
-            ))
+            DynamoDbError::InternalServerError("a read member has its full key".to_owned())
         })?;
-
-        // A key value of the wrong type is a cancellation reason saying the
-        // key does not match the schema (measured 2026-11-02), as it is for a
-        // write member.
-        key_reasons.push(match common::check_key_types(&key, key_info) {
+        reasons.push(match common::check_key_types(&key, &key_info) {
             Ok(()) => CancellationReason::none(),
             Err(_) => CancellationReason::validation_error(common::KEY_SCHEMA_MISMATCH),
         });
-        transact_items.push(json!({ "Get": { "TableName": table, "Key": Value::Object(key) } }));
+        transact_items.push(json!({
+            "Get": { "TableName": select.from.table, "Key": Value::Object(key) }
+        }));
     }
     authorize_members(ctx, parsed).await?;
-    if key_reasons.iter().any(|reason| reason.code != "None") {
-        return Err(cancellation(key_reasons));
+    if reasons
+        .iter()
+        .any(|reason| reason.code == "ResourceNotFound")
+    {
+        return Err(cancellation(reasons));
+    }
+    if let Some(refusal) = multi_attribute {
+        return Err(refusal);
+    }
+    if reasons.iter().any(|reason| reason.code != "None") {
+        return Err(cancellation(reasons));
     }
 
     let mut tbody = json!({ "TransactItems": transact_items });
@@ -248,12 +303,6 @@ async fn run_write(
     parsed: &[(SingleRequest, Statement)],
     rcc: Option<&str>,
 ) -> Result<DispatchResult, DynamoDbError> {
-    for (i, (req, stmt)) in parsed.iter().enumerate() {
-        check_parameter_count(stmt, req.parameters.len(), i)?;
-    }
-    for (i, (req, stmt)) in parsed.iter().enumerate() {
-        check_exists_form(ctx, i, stmt, req).await?;
-    }
     authorize_members(ctx, parsed).await?;
 
     let mut transact_items: Vec<Value> = Vec::with_capacity(parsed.len());
