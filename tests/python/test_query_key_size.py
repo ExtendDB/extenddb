@@ -21,8 +21,11 @@ rows on 2026-10-23 (``issues/query-parity/service-435-shapes.jsonl``,
 send several RANGE clauses on one index are skipped on a server that refuses
 that shape earlier as ``Query condition missed key schema element: h``, and the
 ``idx`` accept rows are skipped on a backend that answers ``InternalServerError``
-to any Query on an index with several RANGE attributes (Cassandra, see
-``query_key_size_support.require_multi_range``). Multi-byte
+to any Query on an index with several RANGE attributes (see
+``query_key_size_support.require_multi_range``). The ``idx`` accept rows with a
+condition on a later RANGE attribute are also skipped on a backend that applies
+a key condition to the first RANGE attribute only (MongoDB and Cassandra, see
+``query_key_size_support.require_served``). Multi-byte
 values, ordered BETWEEN bounds, undefined references and a hash-only table are in
 ``test_query_key_size_values.py``; the order against other refusals is in
 ``test_query_key_size_order.py``.
@@ -44,6 +47,7 @@ from query_key_size_support import (  # noqa: F401  (fixtures are used by name)
     index_table,
     refused,
     require_multi_range,
+    require_served,
     two_hash_table,
 )
 
@@ -97,6 +101,7 @@ class TestGsiQueryKeySize:
             {":h": S(1, "h"), ":a": S(512, "a"), ":b": S(512, "b")},
         )
         require_multi_range(dynamodb_client, TableName=gsi_table, **query)
+        require_served(dynamodb_client, TableName=gsi_table, **query)
         assert dynamodb_client.query(TableName=gsi_table, **query)["Count"] == 0
 
     def test_two_range_values_totalling_1025_bytes_are_refused(
@@ -134,6 +139,7 @@ class TestGsiQueryKeySize:
             "h = :h AND a = :a AND b BETWEEN :l AND :u",
             {":h": S(1, "h"), ":a": S(600, "a"), ":l": S(1, "b"), ":u": S(424, "b")},
         )
+        require_served(dynamodb_client, TableName=gsi_table, **accepted)
         assert dynamodb_client.query(TableName=gsi_table, **accepted)["Count"] == 0
 
 

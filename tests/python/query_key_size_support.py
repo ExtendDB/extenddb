@@ -121,6 +121,30 @@ def require_multi_range(client, **query) -> None:
             pytest.skip("multi-attribute range Query is not supported by this backend yet")
 
 
+FIRST_RANGE_ONLY_MARK = "applies a key condition to the first RANGE attribute"
+
+
+def require_served(client, **query) -> None:
+    """Skip unless the backend serves ``query``'s condition on a later RANGE attribute.
+
+    The MongoDB and Cassandra backends apply a key condition to the first RANGE
+    attribute of a multi-attribute index only, and refuse a condition on a later
+    one with a ValidationException that says so. The size checks run before that
+    refusal, so only the rows that expect a Query to be served call this. Sends
+    ``query`` with every value cut to its first byte, as ``require_multi_range``
+    does.
+    """
+    probe = dict(query)
+    probe["ExpressionAttributeValues"] = {
+        name: {"S": value["S"][:1]} for name, value in query["ExpressionAttributeValues"].items()
+    }
+    try:
+        client.query(**probe)
+    except ClientError as exc:
+        if FIRST_RANGE_ONLY_MARK in exc.response["Error"]["Message"]:
+            pytest.skip("this backend applies key conditions to the first RANGE attribute only")
+
+
 @pytest.fixture(scope="module")
 def gsi_table(dynamodb_client):
     """Base HASH ``pk``; index ``idx`` on HASH ``h`` and RANGE ``a``, ``b``, ``c``, ``d``."""
