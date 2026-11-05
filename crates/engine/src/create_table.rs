@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use extenddb_core::error::{DynamoDbError, ErrorMessageKey, error_message};
 use extenddb_core::types::{CreateTableInput, CreateTableOutput};
-use extenddb_core::validation::validate_create_table;
+use extenddb_core::validation::{validate_create_table, validate_tags};
 
 use crate::OperationContext;
 use crate::serialize_output;
@@ -51,6 +51,13 @@ pub async fn handle_create_table(
     input.resolve_table_throughput_mode();
 
     validate_create_table(&input, &ctx.limits)?;
+
+    // CreateTable stores its Tags through the same rows TagResource writes, so
+    // the same key and value grammar applies here. Checked after the table
+    // definition: a request carrying a valid definition and an invalid tag key
+    // is refused for the tag (measured). Restore and import build their own
+    // CreateTableInput further in and do not pass through this handler.
+    validate_tags(input.tags.as_deref().unwrap_or_default())?;
 
     // An empty SearchSchema means the same as an absent one, so it is collapsed
     // here, once, rather than in each backend. Storing the empty list would make

@@ -1,8 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod tag;
 pub mod vector_item;
 
+pub use tag::{validate_tag_key, validate_tag_keys, validate_tag_value, validate_tags};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,

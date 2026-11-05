@@ -18,3 +18,4 @@ md-5 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+unicode-properties = { workspace = true }
