@@ -118,6 +118,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
     }
 }
 

@@ -820,23 +820,29 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
-### `Stream capture: failed to write record for <table>: <error>`
-
-**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
-
-### `Stream capture: failed to get sequence number: <error>`
-
-**Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity.
-
 ### `Stream cleanup worker: <error>`
 
 **Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
 
 **Fix:** Check PostgreSQL connectivity. The worker retries every hour automatically.
+
+### `Stream record numbering failed: <error>`
+
+**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers one batch of the records of the shard it reads before it reads them, so a consumer that keeps reading a shard still receives its records, unless the same error stops that numbering too (see the next entry). The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
+
+**Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
+### `Stream record numbering before a read of shard <shard> failed: <error>`
+
+**Cause:** GetRecords, or GetShardIterator with `LATEST`, could not number the shard's committed stream records before it read the shard, because of a database error. The call went on and answered from the records numbered before. The records left in `stream_pending` get higher sequence numbers from a later read or the background worker, and a later GetRecords call returns them.
+
+**Fix:** Check PostgreSQL connectivity and the error in the message. While the error repeats on every read of the shard and in the worker, consumers of that shard receive no new records.
+
+### GetRecords is slow on PostgreSQL while a long transaction runs
+
+**Cause:** Every stream record passes through the `stream_pending` table, and the numbering step deletes it there. A transaction that stays open on the data database, such as the one a backup of a large table reads from, keeps autovacuum from removing those deleted rows. Until it ends, each GetRecords on a busy shard and each numbering read past them.
+
+**Fix:** Find the long transaction in `pg_stat_activity` (`xact_start`). Once it ends, autovacuum removes the rows; `VACUUM stream_pending` removes them at once.
 
 ## Management Console Errors
 

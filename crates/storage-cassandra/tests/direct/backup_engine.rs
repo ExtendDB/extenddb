@@ -4164,12 +4164,17 @@ async fn test_a_migration_6_that_fails_in_its_backfill_stays_pending_and_resumes
     let (engine, account_id, _drop_keyspaces) = isolated_engine("mf", true).await;
     let catalog = engine.catalog_keyspace();
     let prefix = prefix_of(&engine);
+    // Migration 6 is pending, and so is every later migration this binary
+    // carries.
     let behind_at_5 = |status: CatalogStatus| match status {
         CatalogStatus::Behind { version, pending } => {
             version == Some(MigrationId::DropContinuousBackups.number())
                 && pending
                     .iter()
-                    .all(|p| p.id == MigrationId::BackupCatalogIndex.number())
+                    .any(|p| p.id == MigrationId::BackupCatalogIndex.number())
+                && pending
+                    .iter()
+                    .all(|p| p.id >= MigrationId::BackupCatalogIndex.number())
         }
         _ => false,
     };

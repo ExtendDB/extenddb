@@ -150,6 +150,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
+             stream records with the server's clock (#660)",
+        ),
     }
 }
 
