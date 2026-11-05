@@ -187,8 +187,8 @@ pub(in crate::partiql) const MAX_DECOMPOSED_READS: usize = 50;
 /// 1. a path into a key attribute ("Key attributes must be scalars"): on a
 ///    table anywhere in the WHERE, on an index in the filter of a disjunct
 ///    read by key;
-/// 2. an ORDER BY term that is not a key attribute (see
-///    `order::check_order_by_terms`);
+/// 2. an ORDER BY with no WHERE, then an ORDER BY term that is a path or
+///    is not a key attribute (see `order::check_order_by_terms`);
 /// 3. the key values of each disjunct read by key, in statement order;
 /// 4. the WHERE an ORDER BY reads (see `order::check_order_by_reads`),
 ///    with the refusal of more than one partition key value without the
@@ -236,11 +236,11 @@ pub(super) fn check_keys(
     if let Some(message) = path_into_key {
         return Err(DynamoDbError::ValidationException(message));
     }
-    check_order_by_terms(order, keys)?;
+    check_order_by_terms(order, analysis.is_some(), keys)?;
     for read in analysis.map(WhereAnalysis::reads).unwrap_or_default() {
         check_key_read(read, keys, key_info, params)?;
     }
-    check_order_by_reads(order, analysis, keys, table, value_of)?;
+    check_order_by_reads(order, analysis, keys, value_of)?;
     let Some(analysis) = analysis else {
         return Ok(());
     };

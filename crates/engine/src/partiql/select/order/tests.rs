@@ -7,28 +7,28 @@ use super::super::bound_value;
 use super::super::tests::{HASH_ONLY, KEYS, select};
 use super::*;
 
-/// The refusal an ORDER BY gets on a target keyed on `keys`, a table when
-/// `table` is set: of its terms, then of the WHERE it reads.
-fn refusal(sql: &str, keys: KeyNames<'_>, table: bool) -> Option<String> {
+/// The refusal an ORDER BY gets on a target keyed on `keys`: of its terms,
+/// then of the WHERE it reads. A table and an index get the same checks.
+fn refusal(sql: &str, keys: KeyNames<'_>) -> Option<String> {
     let s = select(sql);
     let value_of = |op: &Operand| bound_value(op, &[]).cloned();
     let analysis = s
         .where_clause
         .as_ref()
         .map(|w| WhereAnalysis::new(w, keys, &value_of));
-    check_order_by_terms(s.order_by.as_ref(), keys)
+    check_order_by_terms(s.order_by.as_ref(), analysis.is_some(), keys)
         .and_then(|()| {
-            check_order_by_reads(
-                s.order_by.as_ref(),
-                analysis.as_ref(),
-                keys,
-                table,
-                &value_of,
-            )
+            check_order_by_reads(s.order_by.as_ref(), analysis.as_ref(), keys, &value_of)
         })
         .err()
         .map(|e| e.message().to_owned())
 }
+
+/// The index of `an_order_by_names_key_attributes_of_what_is_read`.
+const INDEX: KeyNames<'static> = KeyNames {
+    partition: "g",
+    sort: Some("gs"),
+};
 
 const ATTRIBUTE: &str = "in ORDER BY clause must be part of the primary key";
 const NO_WHERE: &str = "Must have WHERE clause in the statement when using ORDER BY clause.";
@@ -61,37 +61,61 @@ fn an_order_by_names_key_attributes_of_what_is_read() {
         ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY \"pk\"", None),
         ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY sk, sk", None),
     ] {
-        assert_eq!(refusal(sql, KEYS, true), want, "{sql}");
+        assert_eq!(refusal(sql, KEYS), want, "{sql}");
     }
     // On an index, its own keys; the table's partition key is not one.
-    let index = KeyNames {
-        partition: "g",
-        sort: Some("gs"),
-    };
     assert_eq!(
         refusal(
             "SELECT * FROM \"t\".\"gix\" WHERE g = 'a' ORDER BY pk",
-            index,
-            false
+            INDEX
         ),
         attribute("pk")
     );
     assert_eq!(
         refusal(
             "SELECT * FROM \"t\".\"gix\" WHERE g = 'a' ORDER BY g, gs",
-            index,
-            false
+            INDEX
         ),
         None
     );
 }
 
 #[test]
+fn a_path_in_the_list_is_refused_at_its_first_token() {
+    let path = |at: &str| {
+        Some(format!(
+            "Argument to ORDER BY must be of type VariableReference. Type: PATH at {at}"
+        ))
+    };
+    for (sql, want) in [
+        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x", path("1:43:1")),
+        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m[0]", path("1:43:1")),
+        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY pk.x", path("1:43:2")),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY \"m\".\"x\"",
+            path("1:43:3"),
+        ),
+        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY sk, m.x", path("1:47:1")),
+        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x, n", path("1:43:1")),
+        // In list order with a name that is not a key attribute.
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY n, m.x",
+            Some(format!("Attribute n {ATTRIBUTE}")),
+        ),
+        // Ahead of the refusal of a WHERE that does not read by key.
+        ("SELECT * FROM \"t\" WHERE pk > 'a' ORDER BY m.x", path("1:43:1")),
+    ] {
+        assert_eq!(refusal(sql, KEYS), want, "{sql}");
+    }
+}
+
+#[test]
 fn an_order_by_needs_a_where_read_by_key() {
-    assert_eq!(
-        refusal("SELECT * FROM \"t\" ORDER BY pk", KEYS, true).as_deref(),
-        Some(NO_WHERE)
-    );
+    // With no WHERE, ahead of the list.
+    for list in ["pk", "n", "m.x"] {
+        let sql = format!("SELECT * FROM \"t\" ORDER BY {list}");
+        assert_eq!(refusal(&sql, KEYS).as_deref(), Some(NO_WHERE), "{list}");
+    }
     for condition in [
         "n = 1",
         "pk > 'a'",
@@ -107,13 +131,13 @@ fn an_order_by_needs_a_where_read_by_key() {
     ] {
         let sql = format!("SELECT * FROM \"t\" WHERE {condition} ORDER BY sk");
         assert_eq!(
-            refusal(&sql, KEYS, true).as_deref(),
+            refusal(&sql, KEYS).as_deref(),
             Some(NOT_KEYED),
             "{condition}"
         );
     }
     let sql = "SELECT * FROM \"t\" WHERE n = 1 ORDER BY pk";
-    assert_eq!(refusal(sql, HASH_ONLY, true).as_deref(), Some(NOT_KEYED));
+    assert_eq!(refusal(sql, HASH_ONLY).as_deref(), Some(NOT_KEYED));
     for condition in [
         "pk = 'a' AND sk IN ['x', 'y']",
         "pk = 'a' AND (sk = 'x' OR sk = 'y')",
@@ -121,11 +145,22 @@ fn an_order_by_needs_a_where_read_by_key() {
         "pk = 'a' AND NOT m = 'y'",
     ] {
         let sql = format!("SELECT * FROM \"t\" WHERE {condition} ORDER BY sk");
-        assert_eq!(refusal(&sql, KEYS, true), None, "{condition}");
+        assert_eq!(refusal(&sql, KEYS), None, "{condition}");
     }
-    // Not measured on an index: an index read keeps the attribute rule alone.
-    let sql = "SELECT * FROM \"t\".\"gix\" WHERE n = 1 ORDER BY pk";
-    assert_eq!(refusal(sql, KEYS, false), None);
+    // An index read gets the same refusals on its own keys (measured
+    // 2026-11-05).
+    for (condition, want) in [
+        ("g > 'a' ORDER BY g", NOT_KEYED),
+        ("g = 'a' OR n = 1 ORDER BY gs", NOT_KEYED),
+        ("gs = 'x' ORDER BY gs", NOT_KEYED),
+        ("g = 'a' AND gs <> 'x' ORDER BY gs", NOT_KEYED),
+        ("g IN ['a', 'b'] ORDER BY gs", HASH_KEY),
+    ] {
+        let sql = format!("SELECT * FROM \"t\".\"gix\" WHERE {condition}");
+        assert_eq!(refusal(&sql, INDEX).as_deref(), Some(want), "{condition}");
+    }
+    let sql = "SELECT * FROM \"t\".\"gix\" WHERE g IN ['a', 'b'] ORDER BY g, gs";
+    assert_eq!(refusal(sql, INDEX), None);
 }
 
 #[test]
@@ -148,7 +183,7 @@ fn an_order_by_over_several_partitions_names_the_partition_key() {
         ("(pk = 'a' AND sk = 'x') OR pk = 'b' ORDER BY pk, sk", None),
     ] {
         let sql = format!("SELECT * FROM \"t\" WHERE {condition}");
-        assert_eq!(refusal(&sql, KEYS, true).as_deref(), want, "{condition}");
+        assert_eq!(refusal(&sql, KEYS).as_deref(), want, "{condition}");
     }
 }
 

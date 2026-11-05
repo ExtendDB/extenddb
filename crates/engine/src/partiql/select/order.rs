@@ -34,36 +34,64 @@ pub(super) fn direction(order: Option<&OrderBy>, keys: KeyNames<'_>) -> Directio
     }
 }
 
-/// Refuse an ORDER BY term that is not a key attribute of what is read, the
-/// table's key or the index's (measured 2026-11-03: "Attribute n in ORDER BY
-/// clause must be part of the primary key", for `n`, for `PK` on a key named
-/// `pk`, and for `pk` on an index keyed on other attributes). The service
-/// makes this check after the one of a path into a key attribute and ahead
-/// of the key values (see `read_plan::check_keys`). A term with a path into
-/// an attribute is not measured and is not checked.
+/// Refuse an ORDER BY of a statement with no WHERE, then the first term of
+/// its list that is a path with steps or a name that is not a key attribute
+/// of what is read, the table's key or the index's. The service makes these
+/// checks after the one of a path into a key attribute and ahead of the key
+/// values (see `read_plan::check_keys`).
+///
+/// * No WHERE: "Must have WHERE clause in the statement when using ORDER BY
+///   clause.", ahead of the list (measured 2026-11-05: `ORDER BY n`, `ORDER
+///   BY m.x` and `ORDER BY pk.x` with no WHERE, on a table and on an index).
+/// * A path with steps: "Argument to ORDER BY must be of type
+///   VariableReference. Type: PATH at" the path's first token (measured
+///   2026-11-05: `m.x`, `m[0]`, `m['k']`, `pk.x` and `"m"."x"`, on a table
+///   and on an index, ahead of a key value of the wrong type and of a WHERE
+///   that does not read by key).
+/// * A name that is not a key attribute: "Attribute n in ORDER BY clause
+///   must be part of the primary key" (measured 2026-11-03 for `n`, for
+///   `PK` on a key named `pk`, and for `pk` on an index keyed on other
+///   attributes).
+///
+/// The terms are checked in list order (measured 2026-11-05: `ORDER BY n,
+/// m.x` names `n`, `ORDER BY m.x, n` refuses the path).
 pub(super) fn check_order_by_terms(
     order: Option<&OrderBy>,
+    has_where: bool,
     keys: KeyNames<'_>,
 ) -> Result<(), DynamoDbError> {
-    let Some(name) = order.and_then(|order| {
-        order
-            .terms
-            .iter()
-            .filter_map(|term| term.path.as_simple())
-            .find(|name| *name != keys.partition && Some(*name) != keys.sort)
-    }) else {
+    let Some(order) = order else {
         return Ok(());
     };
-    Err(DynamoDbError::ValidationException(format!(
-        "Attribute {name} in ORDER BY clause must be part of the primary key"
-    )))
+    let refuse = |message: String| Err(DynamoDbError::ValidationException(message));
+    if !has_where {
+        return refuse(
+            "Must have WHERE clause in the statement when using ORDER BY clause.".to_owned(),
+        );
+    }
+    for term in &order.terms {
+        match term.path.as_simple() {
+            None => {
+                return refuse(format!(
+                    "Argument to ORDER BY must be of type VariableReference. Type: PATH at {}",
+                    term.at
+                ));
+            }
+            Some(name) if name != keys.partition && Some(name) != keys.sort => {
+                return refuse(format!(
+                    "Attribute {name} in ORDER BY clause must be part of the primary key"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Refuse the WHERE an ORDER BY reads, in the order the service checks
-/// (measured 2026-11-03), after the key values and ahead of overlapping
-/// disjuncts (see `read_plan::check_keys`):
+/// (measured 2026-11-03 on tables and 2026-11-05 on indexes), after the key
+/// values and ahead of overlapping disjuncts (see `read_plan::check_keys`):
 ///
-/// * no WHERE;
 /// * a WHERE that does not read by key: `n = 1`, `pk > 'a'`, `pk = 'a' OR n
 ///   = 1`, and a sort key predicate that is not one key condition, such as
 ///   `sk <> 'x'`, `contains(sk, 'x')` or `sk > 'a' AND sk < 'z'`;
@@ -71,22 +99,17 @@ pub(super) fn check_order_by_terms(
 ///   the partition key (`pk IN ['a', 'b'] ORDER BY sk`; `ORDER BY sk, pk`
 ///   runs).
 ///
-/// Measured on tables; an index read keeps the term rule of
-/// [`check_order_by_terms`] alone.
+/// A statement with no WHERE was refused by [`check_order_by_terms`].
 pub(super) fn check_order_by_reads(
     order: Option<&OrderBy>,
     analysis: Option<&WhereAnalysis<'_>>,
     keys: KeyNames<'_>,
-    table: bool,
     value_of: &dyn Fn(&Operand) -> Option<AttributeValue>,
 ) -> Result<(), DynamoDbError> {
-    let Some(order) = order.filter(|_| table) else {
+    let (Some(order), Some(analysis)) = (order, analysis) else {
         return Ok(());
     };
     let refuse = |message: &str| Err(DynamoDbError::ValidationException(message.to_owned()));
-    let Some(analysis) = analysis else {
-        return refuse("Must have WHERE clause in the statement when using ORDER BY clause.");
-    };
     if !analysis.is_keyed() {
         return refuse(
             "Must have at least one non-optional hash key condition in WHERE clause when using \

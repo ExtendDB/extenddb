@@ -94,12 +94,17 @@ impl Parser {
     /// One path of an ORDER BY list and its direction, ascending unless it
     /// says `DESC`.
     fn order_term(&mut self) -> PResult<OrderTerm> {
+        let at = self.span();
         let path = self.path()?;
         let descending = self.eat_keyword("DESC");
         if !descending {
             self.eat_keyword("ASC");
         }
-        Ok(OrderTerm { path, descending })
+        Ok(OrderTerm {
+            path,
+            descending,
+            at,
+        })
     }
 
     fn projection(&mut self, deferred: &mut Option<String>) -> PResult<Projection> {
