@@ -18,8 +18,8 @@ use extenddb_core::partiql::ast::{
     CompareOp, InsertStatement, Operand, SelectStatement, WhereExpr,
 };
 use extenddb_core::partiql::plan::{
-    CONDITION_KEY_REFUSAL, KeyEquality, KeyNames, SortCondition, WhereAnalysis,
-    condition_key_path, key_equality, path_tested_against_values, same_value,
+    CONDITION_KEY_REFUSAL, KeyEquality, KeyNames, SortCondition, WhereAnalysis, condition_key_path,
+    key_equality, path_tested_against_values, same_value,
 };
 use extenddb_core::types::{
     AttributeValue, CancellationReason, KeySchemaElement, KeyType, ScalarAttributeType,
@@ -307,8 +307,7 @@ pub(super) fn where_key<'a>(
         };
         match *existing {
             Some(seen) => {
-                if conflict.is_none() && into_key.is_none() && !same_value(seen, value, &value_of)
-                {
+                if conflict.is_none() && into_key.is_none() && !same_value(seen, value, &value_of) {
                     conflict = Some(name);
                 }
             }

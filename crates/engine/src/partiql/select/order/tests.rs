@@ -88,22 +88,40 @@ fn a_path_in_the_list_is_refused_at_its_first_token() {
         ))
     };
     for (sql, want) in [
-        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x", path("1:43:1")),
-        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m[0]", path("1:43:1")),
-        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY pk.x", path("1:43:2")),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x",
+            path("1:43:1"),
+        ),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m[0]",
+            path("1:43:1"),
+        ),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY pk.x",
+            path("1:43:2"),
+        ),
         (
             "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY \"m\".\"x\"",
             path("1:43:3"),
         ),
-        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY sk, m.x", path("1:47:1")),
-        ("SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x, n", path("1:43:1")),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY sk, m.x",
+            path("1:47:1"),
+        ),
+        (
+            "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY m.x, n",
+            path("1:43:1"),
+        ),
         // In list order with a name that is not a key attribute.
         (
             "SELECT * FROM \"t\" WHERE pk = 'a' ORDER BY n, m.x",
             Some(format!("Attribute n {ATTRIBUTE}")),
         ),
         // Ahead of the refusal of a WHERE that does not read by key.
-        ("SELECT * FROM \"t\" WHERE pk > 'a' ORDER BY m.x", path("1:43:1")),
+        (
+            "SELECT * FROM \"t\" WHERE pk > 'a' ORDER BY m.x",
+            path("1:43:1"),
+        ),
     ] {
         assert_eq!(refusal(sql, KEYS), want, "{sql}");
     }

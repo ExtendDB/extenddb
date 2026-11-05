@@ -352,9 +352,9 @@ pub(super) fn value_test_of_path_into_key<'a>(
             .or_else(|| into_key(r).filter(|_| is_value(l))),
         WhereExpr::Between(v, low, high) => into_key(v).filter(|_| is_value(low) && is_value(high)),
         WhereExpr::In(v, items) => into_key(v).filter(|_| items.iter().all(is_value)),
-        WhereExpr::BeginsWith(a, b) | WhereExpr::Contains(a, b) | WhereExpr::AttributeType(a, b) => {
-            into_key(a).filter(|_| is_value(b))
-        }
+        WhereExpr::BeginsWith(a, b)
+        | WhereExpr::Contains(a, b)
+        | WhereExpr::AttributeType(a, b) => into_key(a).filter(|_| is_value(b)),
         WhereExpr::IsType(operand, _, false) => into_key(operand),
         WhereExpr::ComparedWithBoolean(inner, _) => value_test_of_path_into_key(inner, keys),
         _ => None,

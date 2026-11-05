@@ -84,13 +84,25 @@ fn a_path_into_a_key_tested_against_values_is_refused_in_statement_order() {
         ("pk = 'k' AND sk = 'b' AND 1 = sk[0]", Some("sk")),
         ("pk = 'k' AND sk = 'b' AND pk.c BETWEEN 1 AND 2", Some("pk")),
         ("pk = 'k' AND sk = 'b' AND pk.c IN [1, ?]", Some("pk")),
-        ("pk = 'k' AND sk = 'b' AND begins_with(pk.c, 'x')", Some("pk")),
+        (
+            "pk = 'k' AND sk = 'b' AND begins_with(pk.c, 'x')",
+            Some("pk"),
+        ),
         ("pk = 'k' AND sk = 'b' AND pk.c IS NULL", Some("pk")),
         ("pk = 'k' AND sk = 'b' AND pk.c = 1 = false", Some("pk")),
         ("pk = 'k' AND pk.c = 1", Some("pk")),
-        ("pk = 'k' AND sk = 'b' AND sk.c = 1 AND pk.d = 1", Some("sk")),
-        ("pk = 'k' AND sk = 'b' AND pk.c = 1 AND pk = 'z'", Some("pk")),
-        ("pk = 'k' AND pk = 'z' AND sk = 'b' AND sk.c = 1", Some("conflict pk")),
+        (
+            "pk = 'k' AND sk = 'b' AND sk.c = 1 AND pk.d = 1",
+            Some("sk"),
+        ),
+        (
+            "pk = 'k' AND sk = 'b' AND pk.c = 1 AND pk = 'z'",
+            Some("pk"),
+        ),
+        (
+            "pk = 'k' AND pk = 'z' AND sk = 'b' AND sk.c = 1",
+            Some("conflict pk"),
+        ),
         // The other conditions with a path into a key are left to the
         // refusal made once the key is checked.
         ("pk = 'k' AND sk = 'b' AND NOT pk.c = 1", None),
@@ -112,12 +124,24 @@ fn a_path_into_a_key_among_the_other_conditions_names_the_sort_key_first() {
     for (condition, want) in [
         ("pk = 'k' AND sk = 'b' AND NOT pk.c = 1", Some("pk")),
         ("pk = 'k' AND sk = 'b' AND (a = 1 OR pk.c = 1)", Some("pk")),
-        ("pk = 'k' AND sk = 'b' AND attribute_exists(pk.c)", Some("pk")),
+        (
+            "pk = 'k' AND sk = 'b' AND attribute_exists(pk.c)",
+            Some("pk"),
+        ),
         ("pk = 'k' AND sk = 'b' AND pk.c IS MISSING", Some("pk")),
-        ("pk = 'k' AND sk = 'b' AND NOT pk.c = 1 AND NOT sk.d = 1", Some("sk")),
-        ("pk = 'k' AND sk = 'b' AND NOT sk.d = 1 AND NOT pk.c = 1", Some("sk")),
+        (
+            "pk = 'k' AND sk = 'b' AND NOT pk.c = 1 AND NOT sk.d = 1",
+            Some("sk"),
+        ),
+        (
+            "pk = 'k' AND sk = 'b' AND NOT sk.d = 1 AND NOT pk.c = 1",
+            Some("sk"),
+        ),
         ("pk = 'k' AND sk = 'b' AND pk.c = sk.d", Some("sk")),
-        ("pk = 'k' AND sk = 'b' AND (pk.c = 1 OR sk = 'b')", Some("pk")),
+        (
+            "pk = 'k' AND sk = 'b' AND (pk.c = 1 OR sk = 'b')",
+            Some("pk"),
+        ),
         ("pk = 'k' AND sk = 'b' AND NOT a.c = 1", None),
         // Not a pinned item: refused before.
         ("pk = 'k' AND NOT pk.c = 1", None),

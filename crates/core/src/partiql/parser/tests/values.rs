@@ -374,7 +374,8 @@ fn a_string_or_a_name_in_brackets_is_a_map_member() {
         assert_eq!(path.root, "m", "{condition}");
         assert_eq!(path.steps, steps, "{condition}");
     }
-    let Ok(Statement::Update(update)) = parse("UPDATE \"t\" SET m['k'] = 5 REMOVE m[k] WHERE pk = 'p'")
+    let Ok(Statement::Update(update)) =
+        parse("UPDATE \"t\" SET m['k'] = 5 REMOVE m[k] WHERE pk = 'p'")
     else {
         panic!("not an update");
     };
@@ -387,19 +388,43 @@ fn other_contents_of_brackets_are_refused() {
     let condition = |c: &str| err(&format!("SELECT * FROM \"t\" WHERE pk = 'p' AND {c}"));
     // What the brackets hold starts at column 40.
     for (brackets, want) in [
-        ("m[''] = 1", "Path component cannot be an empty string".to_owned()),
-        ("m[\"\"] = 1", "Path component cannot be an empty string".to_owned()),
+        (
+            "m[''] = 1",
+            "Path component cannot be an empty string".to_owned(),
+        ),
+        (
+            "m[\"\"] = 1",
+            "Path component cannot be an empty string".to_owned(),
+        ),
         ("m[?] = 1", "Unexpected path component at 1:40:1".to_owned()),
-        ("m[1.5] = 1", "Unexpected path component at 1:40:3".to_owned()),
-        ("m[true] = 1", "Unexpected path component at 1:40:4".to_owned()),
-        ("m[k.j] = 1", "Unexpected path component at 1:40:1".to_owned()),
-        ("m[k[0]] = 1", "Unexpected path component at 1:40:1".to_owned()),
-        ("m['k'.x] = 1", "Unexpected path component at 1:40:3".to_owned()),
+        (
+            "m[1.5] = 1",
+            "Unexpected path component at 1:40:3".to_owned(),
+        ),
+        (
+            "m[true] = 1",
+            "Unexpected path component at 1:40:4".to_owned(),
+        ),
+        (
+            "m[k.j] = 1",
+            "Unexpected path component at 1:40:1".to_owned(),
+        ),
+        (
+            "m[k[0]] = 1",
+            "Unexpected path component at 1:40:1".to_owned(),
+        ),
+        (
+            "m['k'.x] = 1",
+            "Unexpected path component at 1:40:3".to_owned(),
+        ),
         (
             "m[-1] = 1",
             "List index is not within the allowable range; index: [-1] at 1:41:1".to_owned(),
         ),
-        ("m[-1.5] = 1", "Unexpected path component at 1:41:3".to_owned()),
+        (
+            "m[-1.5] = 1",
+            "Unexpected path component at 1:41:3".to_owned(),
+        ),
         ("m[select] = 1", wf("Unexpected term")),
         ("m[desc] = 1", wf("Unexpected term")),
         ("m[and] = 1", wf("Unexpected operator")),

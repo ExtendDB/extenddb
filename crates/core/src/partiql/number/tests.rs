@@ -332,9 +332,8 @@ fn a_negative_zero_decimal_comes_in_statement_order_with_the_number_rules() {
     // Of two zeros, the first.
     let sql = insert("'x':-0.0,'y':-0.0");
     assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
-    let update = |sets: &str, condition: &str| {
-        format!("UPDATE \"t\" SET {sets} WHERE pk = 'a'{condition}")
-    };
+    let update =
+        |sets: &str, condition: &str| format!("UPDATE \"t\" SET {sets} WHERE pk = 'a'{condition}");
     let sql = update("x = -0.0, y = 1e126", "");
     assert_eq!(err(&sql), negative_zero(&sql, "0.0", "root", 0));
     assert_eq!(err(&update("x = 1e126, y = -0.0", "")), overflow("root"));

@@ -207,9 +207,8 @@ pub(super) async fn member_reason(
     };
     common::ensure_single_attribute_keys(&key_info.key_schema)?;
     let params = &req.parameters;
-    let condition_key = |where_clause: Option<&WhereExpr>| {
-        condition_key_reason(where_clause, &key_info, params)
-    };
+    let condition_key =
+        |where_clause: Option<&WhereExpr>| condition_key_reason(where_clause, &key_info, params);
     match stmt {
         Statement::Insert(insert) => insert_key_reason(insert, &key_info, params),
         Statement::Update(update) => Ok(key_reason(stmt, &key_info, params)?

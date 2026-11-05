@@ -125,10 +125,7 @@ impl Parser {
                 }
             }
             TokenKind::String(name) | TokenKind::QuotedIdent(name) => {
-                if matches!(
-                    self.nth_kind(1),
-                    Some(TokenKind::Dot | TokenKind::LBracket)
-                ) {
+                if matches!(self.nth_kind(1), Some(TokenKind::Dot | TokenKind::LBracket)) {
                     self.bump();
                     self.path_steps(Path {
                         root: name,
@@ -142,10 +139,7 @@ impl Parser {
             }
             TokenKind::Ident(word) => match word_class(&word) {
                 WordClass::Name => {
-                    if matches!(
-                        self.nth_kind(1),
-                        Some(TokenKind::Dot | TokenKind::LBracket)
-                    ) {
+                    if matches!(self.nth_kind(1), Some(TokenKind::Dot | TokenKind::LBracket)) {
                         self.path()?;
                         return refuse(self, &at);
                     }
@@ -181,7 +175,9 @@ impl Parser {
                 self.take_param_index();
                 refuse(self, &at)
             }
-            _ => Err(ParseError::new(format!("Unexpected path component at {at}"))),
+            _ => Err(ParseError::new(format!(
+                "Unexpected path component at {at}"
+            ))),
         }
     }
 
@@ -299,7 +295,8 @@ impl Parser {
     fn operand_atom(&mut self) -> PResult<Operand> {
         if let Some(number) = self.signed_number() {
             self.note_number(&number, LITERAL_ROOT);
-            return self.literal_steps(Operand::Literal(AttributeValue::N(number.text)), &number.at);
+            return self
+                .literal_steps(Operand::Literal(AttributeValue::N(number.text)), &number.at);
         }
         // A sign before anything but a number is an operator with one
         // operand, refused once the statement parses (measured 2026-11-02:
