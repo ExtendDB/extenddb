@@ -28,7 +28,7 @@ use extenddb_core::types::{
     GsiInput, KeyType, LsiInput, StreamSpecification, StreamViewType, UpdateTableInput,
 };
 use extenddb_storage::{
-    BackupEngine, RestoreRequest, RestoreTableOverrides, StreamEngine, TableEngine,
+    JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides, StreamEngine, TableEngine,
 };
 
 /// U+0000 in the partition key.
@@ -169,7 +169,7 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
     // A backup copies the documents into `backups` and `backup_definitions`.
     let backup = s
         .engine
-        .create_backup(ACCOUNT, table, "bk367")
+        .create(ACCOUNT, table, "bk367", JobPermit::detached())
         .await
         .expect("CreateBackup");
     let stored = documents(
@@ -184,13 +184,13 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
     assert_stored_escaped(&stored, "the backup rows");
     let described = s
         .engine
-        .describe_backup(ACCOUNT, &backup.backup_arn)
+        .describe(ACCOUNT, &backup.backup_arn)
         .await
         .expect("DescribeBackup");
     assert_eq!(names(&described.source_table_details.key_schema), [PK, SK]);
     let source = s
         .engine
-        .backup_restore_source(ACCOUNT, &backup.backup_arn)
+        .restore_source(ACCOUNT, &backup.backup_arn)
         .await
         .expect("the restore source");
     assert_eq!(names(&source.key_schema), [PK, SK]);
@@ -215,7 +215,7 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
     )
     .expect("the restore input validates as CreateTable does");
     s.engine
-        .restore_table_from_backup(
+        .restore(
             ACCOUNT,
             RestoreRequest {
                 backup_arn: backup.backup_arn.clone(),
@@ -223,6 +223,7 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
                 restore_date_time: source.backup_creation_date_time,
                 input: restore_input,
             },
+            JobPermit::detached(),
         )
         .await
         .expect("RestoreTableFromBackup");

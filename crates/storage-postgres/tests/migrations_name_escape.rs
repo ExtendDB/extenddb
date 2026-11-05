@@ -1,10 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-//! Golden tests of migration 6, `attribute_name_escape`, on PostgreSQL: the
+//! Golden tests of migration 7, `attribute_name_escape`, on PostgreSQL: the
 //! migration rewrites the raw names a release before it stored, and a
 //! reconverge leaves the names written after it as they are. The rewritten
 //! rows and the ledger notes are compared with
-//! `tests/fixtures/golden/0006_attribute_name_escape.txt`;
+//! `tests/fixtures/golden/0007_attribute_name_escape.txt`;
 //! `EXTENDDB_BLESS_EXPECTED=1` writes the file instead. See
 //! `migrations_support` for the database these tests need.
 
@@ -14,14 +14,14 @@ use std::fmt::Write as _;
 
 use extenddb_core::types::{CreateTableInput, DescribeTableInput};
 use extenddb_storage::migrations::{CatalogStatus, MigrationId, Runner};
-use extenddb_storage::{BackupEngine, TableEngine};
+use extenddb_storage::{LegacyBackupReader, TableEngine};
 use extenddb_storage_postgres::migrations::PostgresMigrations;
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, golden, notes, skip};
 use serde_json::json;
 use sqlx::PgPool;
 
-/// Names a release before migration 6 stored raw: a U+0001 pair, which the
+/// Names a release before migration 7 stored raw: a U+0001 pair, which the
 /// escape's decoder reads as U+0000, and U+0001 U+0002, which it reads as
 /// U+0001.
 const RAW_KEY: &str = "a\u{1}\u{1}z";
@@ -47,7 +47,7 @@ async fn engine(s: &Scratch) -> PostgresEngine {
 }
 
 /// The raw documents of a table, its GSI, a backup, a vector index and a
-/// queued index update, written by SQL as a release before migration 6
+/// queued index update, written by SQL as a release before migration 7
 /// wrote them. A second GSI's name holds the six characters `\u0001`: the
 /// rewrite finds its documents and leaves them as they are.
 async fn seed_raw_names(catalog: &PgPool, data: &PgPool) {
@@ -164,7 +164,7 @@ async fn dump_documents(pool: &PgPool, sql: &str, out: &mut String) {
 #[tokio::test]
 async fn migration_6_rewrites_the_raw_names_of_every_document_that_carries_them() {
     let Some(base) = base_conn() else {
-        return skip("golden 6");
+        return skip("golden 7");
     };
     let s = Scratch::new(&base, "pgm_g6").await;
     s.load("0.1.14").await;
@@ -202,9 +202,9 @@ async fn migration_6_rewrites_the_raw_names_of_every_document_that_carries_them(
         &mut out,
     )
     .await;
-    writeln!(out, "catalog notes:\n{}", notes(&catalog, 6).await).unwrap();
-    writeln!(out, "data notes:\n{}", notes(&data, 6).await).unwrap();
-    golden("0006_attribute_name_escape.txt", &out);
+    writeln!(out, "catalog notes:\n{}", notes(&catalog, 7).await).unwrap();
+    writeln!(out, "data notes:\n{}", notes(&data, 7).await).unwrap();
+    golden("0007_attribute_name_escape.txt", &out);
 
     // This binary reads the rewritten names as the release wrote them.
     let engine = engine(&s).await;
@@ -241,7 +241,7 @@ async fn migration_6_rewrites_the_raw_names_of_every_document_that_carries_them(
     let schema = vector.search_schema.as_deref().expect("a search schema");
     assert_eq!(schema[0].attribute_name, RAW_HASH);
     let source = engine
-        .backup_restore_source(ACCOUNT, "arn:raw_backup")
+        .restore_source(ACCOUNT, "arn:raw_backup")
         .await
         .expect("the restore source");
     assert_eq!(source.key_schema[0].attribute_name, RAW_KEY);
@@ -255,13 +255,13 @@ async fn migration_6_rewrites_the_raw_names_of_every_document_that_carries_them(
     data.close().await;
 }
 
-/// Migration 6 is not convergent: a reconverge leaves the documents this
+/// Migration 7 is not convergent: a reconverge leaves the documents this
 /// release wrote after it, through the escape, as they are, and the names
 /// still read back as written.
 #[tokio::test]
 async fn a_reconverge_leaves_the_names_written_after_migration_6_as_they_are() {
     let Some(base) = base_conn() else {
-        return skip("reconverge after migration 6");
+        return skip("reconverge after migration 7");
     };
     let s = Scratch::new(&base, "pgm_g6rc").await;
     s.load("0.1.14").await;
@@ -304,12 +304,12 @@ async fn a_reconverge_leaves_the_names_written_after_migration_6_as_they_are() {
     let report = Runner::new(&m, "test").reconverge().await;
     m.close().await;
     let report = report.expect("reconverge");
-    assert!(report.applied.iter().all(|step| step.id != 6), "{report:?}");
+    assert!(report.applied.iter().all(|step| step.id != 7), "{report:?}");
     assert!(
         report
             .notes
             .iter()
-            .any(|n| n.starts_with("Skipped 6 attribute_name_escape:")),
+            .any(|n| n.starts_with("Skipped 7 attribute_name_escape:")),
         "{report:?}"
     );
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });

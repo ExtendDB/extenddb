@@ -29,11 +29,11 @@
 //! `backups.vector_indexes`, `backup_definitions.definition`,
 //! `vector_indexes.vector_attribute`, `vector_indexes.search_schema` and
 //! `vector_indexes.projection`; in the data database
-//! `gsi_pending.index_context`. Releases before catalog migration 6
+//! `gsi_pending.index_context`. Releases before catalog migration 7
 //! (`attribute_name_escape`) stored these documents raw, and a raw name that
 //! holds U+0001 followed by U+0001 or U+0002 would read back as a different
-//! name, so migration 6 rewrites every stored document through the escape
-//! once (`migrations/m0006_attribute_name_escape.rs`).
+//! name, so migration 7 rewrites every stored document through the escape
+//! once (`migrations/m0007_attribute_name_escape.rs`).
 //!
 //! The item documents (`item_data`, the stream record images, the images in
 //! `gsi_pending`) are not written through this module.
