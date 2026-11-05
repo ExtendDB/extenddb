@@ -4,7 +4,8 @@
 //! Console page handlers.
 //!
 //! Each handler queries the catalog DB directly and renders server-side HTML.
-//! Authentication is via session cookies validated against the in-memory store.
+//! Authentication is via session cookies validated against the in-memory store
+//! and, on every request, against the principal's password hash in the catalog.
 //! All state-changing POST forms include a CSRF token validated on submission.
 
 mod access_key_pages;
@@ -42,10 +43,12 @@ pub use user_pages::{create_user, delete_user, new_user_form, user_detail};
 
 use std::sync::Arc;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::console::ConsoleState;
+use crate::console::html;
+use crate::console::session::SessionCheck;
 use crate::management::CallerIdentity;
 
 /// Session data returned by `require_session`: identity + CSRF token.
@@ -54,24 +57,39 @@ pub struct SessionData {
     pub csrf_token: String,
 }
 
-/// Extract session identity and CSRF token from the cookie header. Returns
-/// the session data or a redirect to the login page.
+/// Extract the session from the cookie header and check it against the
+/// catalog. Returns the session data; a redirect to the login page when there
+/// is no session, it expired, or its principal was deleted or had its
+/// password changed; or 503 when the catalog cannot be read.
 #[allow(clippy::result_large_err)]
 async fn require_session(
     headers: &HeaderMap,
     state: &Arc<ConsoleState>,
 ) -> Result<SessionData, Response> {
-    let token = extract_session_token(headers);
-    let result = match token {
-        Some(t) => state.sessions.get(&t).await,
-        None => None,
+    let Some(token) = extract_session_token(headers) else {
+        return Err(Redirect::to("/console/login").into_response());
     };
-    match result {
-        Some((identity, csrf_token)) => Ok(SessionData {
+    session_response(state.sessions.validate(&token, &*state.catalog_store).await)
+}
+
+/// The session data for a session that passed its check, or the response a
+/// console request gets when it did not.
+#[allow(clippy::result_large_err)]
+fn session_response(check: SessionCheck) -> Result<SessionData, Response> {
+    match check {
+        SessionCheck::Valid {
+            identity,
+            csrf_token,
+        } => Ok(SessionData {
             identity,
             csrf_token,
         }),
-        None => Err(Redirect::to("/console/login").into_response()),
+        SessionCheck::Invalid => Err(Redirect::to("/console/login").into_response()),
+        SessionCheck::Unavailable => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The catalog is unavailable. Try again.",
+        )
+            .into_response()),
     }
 }
 
@@ -120,9 +138,10 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Format a `CallerIdentity` for display in the nav bar.
-fn identity_label(identity: &CallerIdentity) -> String {
-    match identity {
+/// Describe a `CallerIdentity` for the nav bar: its display label, and
+/// whether it is an admin, which decides the admin-only links.
+fn identity_label(identity: &CallerIdentity) -> html::NavIdentity {
+    let label = match identity {
         CallerIdentity::Admin(name) => format!("Admin: {name}"),
         CallerIdentity::IamUser {
             account_id,
@@ -130,12 +149,27 @@ fn identity_label(identity: &CallerIdentity) -> String {
         } => {
             format!("{account_id}/{user_name}")
         }
+    };
+    html::NavIdentity {
+        label,
+        is_admin: is_admin(identity),
     }
 }
 
 /// Check if the caller is an admin. Returns true for admins, false for IAM users.
 fn is_admin(identity: &CallerIdentity) -> bool {
     matches!(identity, CallerIdentity::Admin(_))
+}
+
+/// Let an admin session through to an admin-only page: Metrics, Settings and
+/// Cache. An IAM-user session gets a redirect to the console dashboard.
+#[allow(clippy::result_large_err)]
+fn require_admin(session: &SessionData) -> Result<(), Response> {
+    if is_admin(&session.identity) {
+        Ok(())
+    } else {
+        Err(Redirect::to("/console").into_response())
+    }
 }
 
 /// Extract the user-facing message from a storage `OpError`.
@@ -149,5 +183,45 @@ fn op_error_message(e: extenddb_storage::management_store::OpError) -> String {
         | OpError::Internal(m) => m,
         // The driver's text stays out of the page.
         OpError::Database { .. } => "Database error".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::header::LOCATION;
+
+    use super::*;
+
+    #[test]
+    fn a_passed_check_returns_the_session() {
+        let Ok(session) = session_response(SessionCheck::Valid {
+            identity: CallerIdentity::Admin("alice".to_owned()),
+            csrf_token: "csrf".to_owned(),
+        }) else {
+            panic!("a session that passed its check was refused");
+        };
+        assert!(matches!(session.identity, CallerIdentity::Admin(ref n) if n == "alice"));
+        assert_eq!(session.csrf_token, "csrf");
+    }
+
+    #[test]
+    fn an_ended_session_gets_the_login_redirect() {
+        let Err(response) = session_response(SessionCheck::Invalid) else {
+            panic!("an ended session was accepted");
+        };
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(LOCATION).map(|v| v.as_bytes()),
+            Some(&b"/console/login"[..])
+        );
+    }
+
+    #[test]
+    fn an_unreadable_catalog_gets_503() {
+        let Err(response) = session_response(SessionCheck::Unavailable) else {
+            panic!("a request was accepted while the catalog could not be read");
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(LOCATION).is_none());
     }
 }

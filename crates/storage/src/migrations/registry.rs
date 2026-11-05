@@ -67,6 +67,12 @@ migration_ids! {
     /// it.
     DropContinuousBackups = 5, "drop_continuous_backups",
         "drop the continuous_backups table, which no request reads or writes since #335";
+    /// Creates the catalog index of backups (`backup_index`), the restore
+    /// job fields on the restore registrations, the maintenance claim record
+    /// and the catalog id.
+    BackupCatalogIndex = 6, "backup_catalog_index",
+        "create the backup catalog index, the restore job fields, the maintenance claim \
+         record and the catalog id";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

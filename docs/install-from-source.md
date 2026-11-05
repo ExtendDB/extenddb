@@ -211,12 +211,12 @@ Check the build:
 
 ```
 extenddb 0.1.14
-catalog migration 5 (postgres)
+catalog migration 6 (postgres)
 commit ceb6a63a
 built 2026-10-24T08:37:05Z
 ```
 
-`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 5 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
+`extenddb -V` prints the same. A source build carries the same release version as the published `0.1.14` images and a newer catalog: migration 6 here, 0.0.3 in the images (see the [upgrade manual](manuals/07-upgrade-manual.md#upgrading-a-container-deployment)). <!-- version-literal-ok: names the published tag's catalog, which is behind the tree -->
 
 ## 3. Initialize the deployment
 
@@ -381,7 +381,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 5
+  OK: Current: the catalog is at migration 6
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -400,7 +400,7 @@ Catalog database: extenddb_catalog
 ```
 
 ```
-extenddb 0.1.14 (catalog migration 5) starting on 127.0.0.1:18443
+extenddb 0.1.14 (catalog migration 6) starting on 127.0.0.1:18443
   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 extenddb server started (pid 8644, 127.0.0.1:18443)
 ```
