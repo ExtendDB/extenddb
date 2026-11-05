@@ -40,6 +40,36 @@ pub async fn handle_describe_stream(
     serialize_output(&output)
 }
 
+/// Refuse a table ARN in the `TableName` of `ListStreams`. The field takes a
+/// table name only. The service answers a table ARN there with its table name
+/// length text, before the IAM decision, whatever the length of the ARN and
+/// whichever account it names (measured 2026-11-03 with ARNs of 54 to 57
+/// characters, #796). The bounds in the text are the deployment's, as in the
+/// other table name checks. The server runs this check before authorization.
+/// The handler runs it too, for a server in developer mode, which skips
+/// authorization.
+///
+/// # Errors
+///
+/// Returns [`DynamoDbError::ValidationException`] when `TableName` is a table
+/// ARN.
+pub fn check_list_streams_table_name(
+    input: &Value,
+    (min, max): (usize, usize),
+) -> Result<(), DynamoDbError> {
+    let Some(name) = input.get("TableName").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    match extenddb_core::arn::parse(name) {
+        Some(resource) if resource.sub.is_none() => {
+            Err(DynamoDbError::ValidationException(format!(
+                "TableName must be at least {min} characters long and at most {max} characters long"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Handle `ListStreams`.
 ///
 /// # Errors
@@ -49,6 +79,13 @@ pub async fn handle_list_streams(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<Value, DynamoDbError> {
+    check_list_streams_table_name(
+        &body,
+        (
+            ctx.limits.min_table_name_length,
+            ctx.limits.max_table_name_length,
+        ),
+    )?;
     let input: ListStreamsInput = serde_json::from_value(body)
         .map_err(|e| DynamoDbError::SerializationException(e.to_string()))?;
 
@@ -419,6 +456,50 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 
 #[cfg(test)]
 mod tests {
+    /// A table ARN in the `TableName` of `ListStreams` gets the table name
+    /// length text with the deployment's bounds, whichever account it names.
+    /// A table name, an absent field and a stream ARN pass this check.
+    #[test]
+    fn list_streams_refuses_a_table_arn_as_its_table_name() {
+        use serde_json::json;
+
+        use super::check_list_streams_table_name;
+        use extenddb_core::error::DynamoDbError;
+
+        for account in ["111122223333", "123456789012"] {
+            let arn = format!("arn:aws:dynamodb:us-east-1:{account}:table/orders");
+            match check_list_streams_table_name(&json!({ "TableName": arn }), (3, 255)) {
+                Err(DynamoDbError::ValidationException(m)) => assert_eq!(
+                    m,
+                    "TableName must be at least 3 characters long and at most 255 characters long"
+                ),
+                other => panic!("{arn}: {other:?}"),
+            }
+        }
+        match check_list_streams_table_name(
+            &json!({ "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/orders" }),
+            (1, 1024),
+        ) {
+            Err(DynamoDbError::ValidationException(m)) => assert_eq!(
+                m,
+                "TableName must be at least 1 characters long and at most 1024 characters long"
+            ),
+            other => panic!("{other:?}"),
+        }
+        for input in [
+            json!({ "TableName": "orders" }),
+            json!({}),
+            json!({
+                "TableName": "arn:aws:dynamodb:us-east-1:123456789012:table/orders/stream/2026-01-01T00:00:00.000"
+            }),
+        ] {
+            assert!(
+                check_list_streams_table_name(&input, (3, 255)).is_ok(),
+                "{input}"
+            );
+        }
+    }
+
     /// AT_SEQUENCE_NUMBER converts to AFTER by subtracting 1 and padding to
     /// the backend's stored width. Verify that an unpadded client input is
     /// normalised correctly for both the 21-digit (postgres/sqlite/mongodb)

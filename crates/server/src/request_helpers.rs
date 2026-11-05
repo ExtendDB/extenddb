@@ -214,6 +214,18 @@ pub(crate) async fn authorize_request(
     // authorization reads another lets a Deny on the real resource be bypassed.
     authz_resource::validate_operation_arns(operation, input)?;
 
+    // ListStreams reads TableName as a table name. The service refuses a table
+    // ARN there before the IAM decision, for every caller (#796).
+    if operation == "ListStreams" {
+        extenddb_engine::check_list_streams_table_name(
+            input,
+            (
+                state.limits.min_table_name_length,
+                state.limits.max_table_name_length,
+            ),
+        )?;
+    }
+
     // GetRecords carries its resource only inside the opaque shard iterator, not
     // in a request body field. Decode the iterator for the stream ARN and
     // authorize against that specific stream, as the service does. The storage

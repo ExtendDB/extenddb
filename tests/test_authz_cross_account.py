@@ -340,6 +340,26 @@ def test_tag_operations_match_the_arn_as_written(env, table):
             ), (op, spelled, msg)
 
 
+def test_list_streams_refuses_a_table_arn_as_its_table_name(env, table):
+    # Measured 2026-11-03 (#796): ListStreams answers a table ARN in TableName
+    # with the table name length text, before the IAM decision. These are the
+    # measured rows: an admin with another account that exists or one that does
+    # not, and a caller with no policy with either of those or its own account.
+    message = "TableName must be at least 3 characters long and at most 255 characters long"
+    rows = [
+        (ALLOW_ALL, env["known"]),
+        (ALLOW_ALL, env["unknown"]),
+        (NO_POLICY, env["known"]),
+        (NO_POLICY, env["unknown"]),
+        (NO_POLICY, env["caller"]),
+    ]
+    for policy, account in rows:
+        streams = _principal(env, policy)["dynamodbstreams"]
+        value = f"arn:aws:dynamodb:{env['region']}:{account}:table/{table['name']}"
+        code, msg = _error(lambda: streams.list_streams(TableName=value))
+        assert (code, msg) == ("ValidationException", message), (policy, account, code, msg)
+
+
 def test_import_table_name_is_read_as_a_name(env, table):
     # Measured 2026-11-03: the service authorizes ImportTable on
     # table/<value as written> in the caller's account, also for an ARN.
