@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 import pytest
+import requests
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
@@ -33,6 +34,21 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("EXTENDDB_TEST_DEV_MODE", "").strip() != "1",
     reason="requires a dev-mode server (set EXTENDDB_TEST_DEV_MODE=1)",
 )
+
+# The host guard runs before authentication, so its 403 does not depend on the
+# password being right. The CI dev-mode job does not set one, and the server
+# then generates a random admin password.
+_ADMIN_AUTH = (
+    os.environ.get("EXTENDDB_ADMIN_USER", "admin"),
+    os.environ.get("EXTENDDB_ADMIN_PASSWORD", "not-the-password"),
+)
+_REBIND_HOST = "rebind.example"
+_GUARD_MESSAGE = "Developer mode refused a request"
+_SECURITY_HEADERS = {
+    "x-frame-options": "DENY",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "strict-origin-when-cross-origin",
+}
 
 
 def _assert_not_denied(op_name: str, call):
@@ -159,3 +175,80 @@ class TestDevModeOpensAuthorization:
             ),
         )
         assert resp["Responses"][0]["Item"]["pk"]["S"] == "tg1"
+
+
+def _base(endpoint_url: str | None) -> str:
+    if not endpoint_url:
+        pytest.fail("MISCONFIGURED: dev-mode tests require EXTENDDB_TEST_ENDPOINT.")
+    return endpoint_url.rstrip("/")
+
+
+def _list_tables_unsigned(endpoint_url: str | None, extra_headers: dict[str, str]):
+    """POST an unsigned ListTables under the rebinding host."""
+    return requests.post(
+        f"{_base(endpoint_url)}/",
+        data=b"{}",
+        headers={
+            "Host": _REBIND_HOST,
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "DynamoDB_20120810.ListTables",
+            **extra_headers,
+        },
+        timeout=10,
+    )
+
+
+def _assert_security_headers(resp) -> None:
+    for name, value in _SECURITY_HEADERS.items():
+        assert resp.headers.get(name) == value, f"{name}: {resp.headers.get(name)!r}"
+
+
+class TestDevModeHostGuard:
+    """A dev-mode server refuses a request from a page whose name resolves to
+    loopback: a browser request (Origin or Sec-Fetch-Site) under a foreign
+    host, and any request to the admin routes under a foreign host."""
+
+    def test_browser_request_under_a_rebinding_host_is_refused(self, endpoint_url):
+        resp = _list_tables_unsigned(endpoint_url, {"Origin": f"http://{_REBIND_HOST}"})
+        assert resp.status_code == 403, resp.text
+        message = resp.json()["message"]
+        assert _GUARD_MESSAGE in message
+        assert _REBIND_HOST in message
+        _assert_security_headers(resp)
+
+    def test_same_request_without_a_marker_is_not_refused(self, endpoint_url):
+        resp = _list_tables_unsigned(endpoint_url, {})
+        assert resp.status_code != 403, resp.text
+
+    def test_admin_get_under_a_rebinding_host_is_refused(self, endpoint_url):
+        # A same-origin GET from a plain-HTTP page carries no marker.
+        resp = requests.get(
+            f"{_base(endpoint_url)}/management/accounts",
+            headers={"Host": _REBIND_HOST},
+            auth=_ADMIN_AUTH,
+            timeout=10,
+        )
+        assert resp.status_code == 403, resp.text
+        assert _GUARD_MESSAGE in resp.json()["message"]
+        _assert_security_headers(resp)
+
+    def test_admin_get_under_the_endpoint_host_is_not_refused(self, endpoint_url):
+        resp = requests.get(
+            f"{_base(endpoint_url)}/management/accounts", auth=_ADMIN_AUTH, timeout=10
+        )
+        assert resp.status_code != 403, resp.text
+
+    def test_console_browser_request_under_a_rebinding_host_gets_the_html_403(
+        self, endpoint_url
+    ):
+        resp = requests.post(
+            f"{_base(endpoint_url)}/console/login",
+            data={"username": _ADMIN_AUTH[0], "password": _ADMIN_AUTH[1]},
+            headers={"Host": _REBIND_HOST, "Origin": f"http://{_REBIND_HOST}"},
+            allow_redirects=False,
+            timeout=10,
+        )
+        assert resp.status_code == 403, resp.text
+        assert resp.headers.get("content-type", "").startswith("text/html")
+        assert _GUARD_MESSAGE in resp.text
+        _assert_security_headers(resp)

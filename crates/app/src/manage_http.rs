@@ -65,7 +65,18 @@ pub fn resolve_endpoint(
     } else {
         None
     };
-    Ok((format!("{addr}:{}", app_config.server.port), use_tls, cert))
+    Ok((host_port(addr, app_config.server.port), use_tls, cert))
+}
+
+/// `addr:port` for the TCP connect and the `Host` header. An IPv6 literal goes
+/// in brackets, which the `Host` header requires; a developer-mode server
+/// refuses a management request whose `Host` is not a valid host.
+fn host_port(addr: &str, port: u16) -> String {
+    if addr.contains(':') && !addr.starts_with('[') {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    }
 }
 
 /// Resolve the password from: CLI arg or `EXTENDDB_PASSWORD` env var.
@@ -492,4 +503,17 @@ fn dispatch_cache(c: &Ctx<'_>, action: CacheAction) -> anyhow::Result<(u16, Stri
         }),
     };
     c.req("POST", "/management/cache/invalidate", Some(&body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_port;
+
+    #[test]
+    fn host_port_brackets_an_ipv6_bind_address() {
+        assert_eq!(host_port("127.0.0.1", 18443), "127.0.0.1:18443");
+        assert_eq!(host_port("localhost", 18443), "localhost:18443");
+        assert_eq!(host_port("::1", 18443), "[::1]:18443");
+        assert_eq!(host_port("[::1]", 18443), "[::1]:18443");
+    }
 }
