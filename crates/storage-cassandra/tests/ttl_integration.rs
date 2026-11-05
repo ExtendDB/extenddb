@@ -2147,8 +2147,14 @@ async fn test_ttl_enable_rejects_asynchronous_gsi() {
             true,
         )
         .await;
+    // The refusal names the table, the asynchronous index and its delay.
     assert!(
-        matches!(result, Err(StorageError::Validation(message)) if message.contains("asynchronously propagated GSIs"))
+        matches!(&result, Err(StorageError::Validation(message))
+            if message.contains("asynchronously propagated global secondary index")
+                && message.contains(&table.key_info.table_name)
+                && message.contains("StatusIndex")
+                && message.contains("1000 ms")),
+        "expected a Validation refusal naming the table, index and delay, got {result:?}"
     );
 }
 
