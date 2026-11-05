@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""init, migrate, serve and CreateAccount on a Cassandra node that runs
+CassandraAuthorizer, as the application role init creates:
+
+    devtools/check-cassandra-authorizer <extenddb binary> <container> \\
+        <contact point> [port]
+
+<container> and <contact point> are as in devtools/check-cassandra-catalog-lock.
+The node must run PasswordAuthenticator and CassandraAuthorizer; the script
+reads the authorizer from system_views.settings and fails on any other, so
+it never passes without testing the grants.
+
+- init, as the admin role, creates the application role and grants it
+  SELECT, MODIFY, CREATE and ALTER on the catalog keyspace, CREATE on ALL
+  KEYSPACES, and the same four with DROP on the default account's keyspace
+  (LIST ALL PERMISSIONS OF the role);
+- as that role: verify reports Current, migrate --yes finds nothing to do,
+  and migrate --yes --reconverge runs every migration again;
+- serve starts, and CreateAccount through the management API creates an
+  account whose keyspace records migration 1 in its ledger; CreateTable,
+  PutItem, GetItem and DeleteTable work in that account;
+- with the server stopped, verify reports Current and migrate --yes
+  --reconverge runs again over both account keyspaces;
+- with the new account's keyspace dropped, as a CreateAccount that stopped
+  before creating it leaves an accounts row, migrate --yes as the admin role
+  creates the keyspace and grants the application role its permissions on
+  it, and the server serves the account again as the application role.
+
+Everything the script creates (the role, its keyspaces, the temporary
+directory) is removed at the end. The server binds 127.0.0.1 only.
+"""
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
+ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
+ADMIN_LOGIN_PASSWORD = "AdminPassw0rd!x"
+ACCOUNT_ID = "123456789012"  # the account devtools/provision-test-credentials creates
+
+
+def cqlsh(container: str, statements: str) -> tuple[int, str]:
+    """Run CQL statements in the node's cqlsh as the admin role."""
+    done = subprocess.run(
+        ["docker", "exec", "-i", container, "cqlsh", "-u", ADMIN_USER, "-p", ADMIN_PASSWORD],
+        input=statements,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    return done.returncode, done.stdout + done.stderr
+
+
+def permissions(container: str, role: str) -> set[tuple[str, str]]:
+    """The role's (resource, permission) pairs, from LIST ALL PERMISSIONS."""
+    code, output = cqlsh(container, f"LIST ALL PERMISSIONS OF '{role}';\n")
+    if code != 0:
+        report(False, f"list the permissions of {role}", output)
+        return set()
+    found = set()
+    for line in output.splitlines():
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) == 4 and cells[3] and cells[3] != "permission":
+            found.add((cells[2], cells[3]))
+    return found
+
+
+def item_operations(port: int, keys: dict, where: str) -> None:
+    """CreateTable, PutItem, GetItem and DeleteTable through the server with
+    the account's credentials, each reported."""
+    try:
+        import boto3
+        import urllib3
+
+        urllib3.disable_warnings()
+        client = boto3.client(
+            "dynamodb",
+            endpoint_url=f"https://127.0.0.1:{port}",
+            region_name="us-east-1",
+            aws_access_key_id=keys["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=keys["AWS_SECRET_ACCESS_KEY"],
+            verify=False,
+        )
+        client.create_table(
+            TableName="granted",
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        for _ in range(120):
+            if client.describe_table(TableName="granted")["Table"]["TableStatus"] == "ACTIVE":
+                break
+            time.sleep(0.5)
+        client.put_item(TableName="granted", Item={"pk": {"S": "a"}, "v": {"S": "b"}})
+        item = client.get_item(TableName="granted", Key={"pk": {"S": "a"}}).get("Item")
+        report(item == {"pk": {"S": "a"}, "v": {"S": "b"}}, f"CreateTable, PutItem and GetItem {where}")
+        client.delete_table(TableName="granted")
+        report(True, f"DeleteTable {where}")
+    except Exception as e:  # noqa: BLE001 - reported as a failed check
+        report(False, f"the item operations {where}", repr(e))
+
+
+def main(binary: str, container: str, contact_point: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    stem = f"eddb_authz_{secrets.token_hex(4)}"
+    app_password = f"App{secrets.token_hex(8)}"
+    work = tempfile.mkdtemp(prefix=f"{stem}.")
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    config = os.path.join(work, "extenddb.toml")
+    server = None
+    try:
+        code, output = cqlsh(
+            container, "SELECT value FROM system_views.settings WHERE name = 'authorizer';\n"
+        )
+        if not report(
+            code == 0 and "CassandraAuthorizer" in output,
+            "the node runs CassandraAuthorizer",
+            output,
+        ):
+            return finish()
+        code, output = run(
+            [
+                binary, "init", "--config", config,
+                "--cassandra-contact-points", contact_point,
+                "--cassandra-user", ADMIN_USER,
+                "--keyspace-prefix", stem, "--extenddb-user", stem,
+                "--bind-addr", "127.0.0.1",
+            ],
+            dict(
+                env,
+                EXTENDDB_CASSANDRA_PASSWORD=ADMIN_PASSWORD,
+                EXTENDDB_APP_PASSWORD=app_password,
+                EXTENDDB_ADMIN_USER="admin",
+                EXTENDDB_ADMIN_PASSWORD=ADMIN_LOGIN_PASSWORD,
+            ),
+            timeout=240,
+        )
+        if not report(code == 0, f"exit {code}: init under CassandraAuthorizer", output):
+            return finish()
+        code, output = cqlsh(container, "SELECT keyspace_name FROM system_schema.keyspaces;\n")
+        accounts = [w for w in output.split() if w.startswith(f"{stem}_account_")]
+        if not report(len(accounts) == 1, "init created the default account's keyspace", output):
+            return finish()
+        catalog, default_account = f"{stem}_catalog", accounts[0]
+        granted = permissions(container, stem)
+        wanted = {(f"<keyspace {catalog}>", p) for p in ("SELECT", "MODIFY", "CREATE", "ALTER")}
+        wanted |= {(f"<keyspace {default_account}>", p) for p in ("SELECT", "MODIFY", "CREATE", "ALTER", "DROP")}
+        wanted.add(("<all keyspaces>", "CREATE"))
+        report(
+            wanted <= granted and (f"<keyspace {catalog}>", "DROP") not in granted,
+            "init granted the application role its permissions, and no DROP on the catalog",
+            "\n".join(f"{r} {p}" for r, p in sorted(granted)),
+        )
+
+        migrate = [binary, "migrate", "--config", config]
+        verify = [binary, "verify", "--config", config]
+        expect_exit(0, "verify as the application role", verify, env, contains="OK: Current")
+        expect_exit(0, "migrate --yes as the application role", migrate + ["--yes"], env, contains="Up to date")
+        expect_exit(
+            0,
+            "migrate --yes --reconverge as the application role",
+            migrate + ["--yes", "--reconverge"],
+            env,
+            contains="Ran again 1 baseline",
+        )
+
+        log = os.path.join(work, "serve.log")
+        server = start(
+            [binary, "serve", "--config", config, "--foreground", "--port", str(port)], env, log
+        )
+        if not report(healthy(f"https://127.0.0.1:{port}/health", server, 90), "serve as the application role"):
+            with open(log, encoding="utf-8") as f:
+                report(False, "the server log", f.read()[-3000:])
+            return finish()
+        code, output = run(
+            [sys.executable, os.path.join(HERE, "provision-test-credentials")],
+            dict(
+                env,
+                EXTENDDB_TEST_ENDPOINT=f"https://127.0.0.1:{port}",
+                EXTENDDB_ADMIN_USER="admin",
+                EXTENDDB_ADMIN_PASSWORD=ADMIN_LOGIN_PASSWORD,
+            ),
+        )
+        keys = dict(re.findall(r"export (AWS_[A-Z_]+)=(\S+)", output))
+        if not report(code == 0 and "AWS_ACCESS_KEY_ID" in keys, "CreateAccount and its credentials", output):
+            return finish()
+        new_account = f"{stem}_account_{ACCOUNT_ID}"
+        code, output = cqlsh(container, f"SELECT id, outcome FROM {new_account}.extenddb_migrations;\n")
+        report(
+            code == 0 and re.search(r"^\s*1\s*\|\s*applied", output, re.M) is not None,
+            "the new account's keyspace records migration 1",
+            output,
+        )
+        item_operations(port, keys, "in the new account")
+        stop(server)
+        server = None
+        expect_exit(0, "verify over both account keyspaces", verify, env, contains="OK: Current")
+        expect_exit(
+            0,
+            "migrate --yes --reconverge over both account keyspaces",
+            migrate + ["--yes", "--reconverge"],
+            env,
+            contains="Ran again 1 baseline",
+        )
+
+        # An accounts row whose keyspace is missing, as a CreateAccount that
+        # stopped before creating it leaves one: migrate --yes as the admin
+        # role creates the keyspace, and the application role then holds its
+        # permissions on it and serves the account.
+        code, output = cqlsh(container, f"DROP KEYSPACE {new_account};\n")
+        report(code == 0, "drop the new account's keyspace", output)
+        expect_exit(
+            0,
+            "migrate --yes as the admin role creates the missing account keyspace",
+            migrate + ["--yes", "--cassandra-user", ADMIN_USER],
+            dict(env, EXTENDDB_CASSANDRA_PASSWORD=ADMIN_PASSWORD),
+        )
+        granted = permissions(container, stem)
+        wanted = {(f"<keyspace {new_account}>", p) for p in ("SELECT", "MODIFY", "CREATE", "ALTER", "DROP")}
+        report(
+            wanted <= granted,
+            "the application role holds its permissions on the keyspace migrate created",
+            "\n".join(f"{r} {p}" for r, p in sorted(granted)),
+        )
+        server = start(
+            [binary, "serve", "--config", config, "--foreground", "--port", str(port)], env, log
+        )
+        if not report(healthy(f"https://127.0.0.1:{port}/health", server, 90), "serve again as the application role"):
+            with open(log, encoding="utf-8") as f:
+                report(False, "the server log", f.read()[-3000:])
+            return finish()
+        item_operations(port, keys, "in the account whose keyspace migrate created")
+        stop(server)
+        server = None
+    finally:
+        if server is not None:
+            stop(server)
+        code, output = cqlsh(container, "SELECT keyspace_name FROM system_schema.keyspaces;\n")
+        statements = "".join(
+            f"DROP KEYSPACE IF EXISTS {word};\n" for word in output.split() if word.startswith(f"{stem}_")
+        )
+        cqlsh(container, statements + f"DROP ROLE IF EXISTS '{stem}';\n")
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (4, 5):
+        sys.exit(__doc__)
+    sys.exit(main(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) == 5 else 18456))

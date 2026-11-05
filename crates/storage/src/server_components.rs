@@ -48,14 +48,15 @@ pub enum BackendError {
     /// Failed to connect to backend database
     ConnectionFailed { backend: String, details: String },
 
-    /// Catalog schema version mismatch
-    CatalogVersionMismatch { expected: String, found: String },
-
     /// Encryption key not found in settings table
     MissingEncryptionKey,
 
     /// Generic initialization failure
     InitializationFailed(String),
+
+    /// The catalog's status refuses this server, or a migration the factory
+    /// ran failed; carries the exit code `serve` ends with.
+    Catalog(crate::migrations::MigrationError),
 }
 
 impl std::fmt::Display for BackendError {
@@ -70,15 +71,12 @@ impl std::fmt::Display for BackendError {
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
             }
-            Self::CatalogVersionMismatch { expected, found } => write!(
-                f,
-                "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate'"
-            ),
             Self::MissingEncryptionKey => write!(
                 f,
                 "Encryption key not found in settings table. Run 'extenddb init'"
             ),
             Self::InitializationFailed(msg) => write!(f, "Backend initialization failed: {msg}"),
+            Self::Catalog(e) => write!(f, "{e}"),
         }
     }
 }
@@ -86,7 +84,7 @@ impl std::fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// Options for server-component creation, beyond the storage config itself.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ServerComponentsOptions {
     /// Bootstrap the catalog at serve time when it is not initialized,
@@ -95,6 +93,23 @@ pub struct ServerComponentsOptions {
     /// Backends whose bootstrap requires operator input ignore this and fail
     /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
     pub bootstrap_if_uninitialized: bool,
+    /// The item size limit the storage layer applies to the finished item of
+    /// an update, standalone or transacted. Comes from `limits.max_item_size_bytes`
+    /// so the storage layer and the engine's put path enforce one figure.
+    pub max_item_size_bytes: usize,
+    /// The ExtendDB release that is starting, recorded in the ledger rows of
+    /// migrations the factory runs (a dev build, an in-memory database).
+    pub release: &'static str,
+}
+
+impl Default for ServerComponentsOptions {
+    fn default() -> Self {
+        Self {
+            bootstrap_if_uninitialized: false,
+            max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+            release: "",
+        }
+    }
 }
 
 /// Factory function type for creating server components.

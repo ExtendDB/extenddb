@@ -69,7 +69,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        crate::schema::apply(&pool).await.expect("apply schema");
+        crate::migrations::apply_for_tests(&pool).await;
         SqliteCatalogStore::new(pool)
     }
 
