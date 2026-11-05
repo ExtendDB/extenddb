@@ -53,13 +53,15 @@
                                 # one against the data database, which `init`
                                 # always creates separately. Total PostgreSQL
                                 # connections used: 2 * pool_size +
-                                # catalog_pool_size, plus one per vector index
+                                # catalog_pool_size + [backup] max_concurrent_jobs
+                                # (one claim connection per running backup or
+                                # restore job), plus one per vector index
                                 # build running on this server and one while a
                                 # schema migration runs. max_connections is
                                 # per cluster, not per database, so both pools
-                                # draw on the same budget. The build session and
-                                # the migration connection sit OUTSIDE every
-                                # pool, for two different reasons.
+                                # draw on the same budget. The claim connections,
+                                # the build session and the migration connection
+                                # sit OUTSIDE every pool, for different reasons.
                                 # A build's ownership lock is SESSION-scoped, so
                                 # it needs a session that ends when the build
                                 # ends: a pooled connection returns to the pool
@@ -71,10 +73,10 @@
                                 # otherwise let the lock move between backends.
                                 # Increase for higher concurrency; ensure
                                 # PostgreSQL max_connections >= 2 * pool_size
-                                # + catalog_pool_size + the number of vector
-                                # index builds you expect to overlap. The
-                                # defaults already need 60 of PostgreSQL's
-                                # default 100.
+                                # + catalog_pool_size + max_concurrent_jobs +
+                                # the number of vector index builds you expect
+                                # to overlap. The defaults already need 64 of
+                                # PostgreSQL's default 100.
 # catalog_pool_size = 20       # Maximum concurrent connections for the
                                 # management/catalog pool (authz, IAM, console).
                                 # Defaults to pool_size if not set.
@@ -172,6 +174,21 @@
 #   extenddb serve → syslog (facility: daemon, ident: extenddb)
 #   Read logs with: journalctl -t extenddb
 # No configuration needed — output always goes to syslog.
+
+# [backup]
+# Backup and restore jobs and the reconciler. Every key has a default; the
+# section may be left out. stale_job_after_secs must be at least three
+# heartbeat periods, the larger of heartbeat_interval_secs and the 15 s the
+# jobs of this release heartbeat at (45 at the least); max_concurrent_jobs is
+# at most 1024; on PostgreSQL pool_size and catalog_pool_size are raised to
+# at least 2 * max_concurrent_jobs + 10.
+# data_file_target_bytes = 67108864    # Uncompressed bytes per data file (minimum 32 MiB)
+# heartbeat_interval_secs = 15         # Job heartbeat timer
+# stale_job_after_secs = 300           # Heartbeat age after which a job's owner is dead
+# failed_row_retention_secs = 604800   # FAILED tombstones kept for the operator (7 days)
+# reconcile_interval_secs = 60         # Reconciler cycle
+# max_concurrent_jobs = 4              # Backup and restore jobs running at once on this instance
+# spool_path = "/var/lib/extenddb/spool" # Restore download area for an S3 store
 
 # Import/Export file operations are disabled by default (secure default).
 # Configure allowed directories separately for imports and exports.

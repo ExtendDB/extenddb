@@ -22,9 +22,43 @@ use extenddb_storage::migrations::{
     CatalogStatus, LedgerRow, MigrationError, MigrationId, RunReport, Runner,
 };
 use extenddb_storage_mongodb::migrations::{
-    MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock, migrate_holding,
+    Definitions, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
+    migrate_holding,
 };
 use futures::TryStreamExt;
+
+/// The definitions migration 1 creates in the catalog database.
+pub const CATALOG_BASELINE: &str =
+    include_str!("../../migrations/catalog/0001_baseline.expected.json");
+
+/// The collections and indexes migration 6 adds to the catalog database:
+/// whole collections, and the indexes it adds to a collection migration 1
+/// creates (`tables`).
+pub const CATALOG_MIGRATION_6: &str =
+    include_str!("../fixtures/0006_backup_catalog_index.expected.json");
+
+/// The catalog database's definitions after every migration: migration 1's,
+/// without `continuous_backups`, which migration 5 drops, and with what
+/// migration 6 adds.
+///
+/// # Panics
+///
+/// A committed file is not a definitions file.
+#[must_use]
+pub fn expected_catalog() -> Definitions {
+    let mut expected: Definitions = serde_json::from_str(CATALOG_BASELINE).expect("migration 1");
+    expected.remove("continuous_backups");
+    let added: Definitions = serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
+    for (name, collection) in added {
+        match expected.get_mut(&name) {
+            Some(existing) => existing.indexes.extend(collection.indexes),
+            None => {
+                expected.insert(name, collection);
+            }
+        }
+    }
+    expected
+}
 
 /// The server the tests run against, or `None` to skip.
 ///

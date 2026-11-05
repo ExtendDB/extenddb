@@ -583,9 +583,9 @@ class TestStreamAccountScoping:
             "unauthenticated /console/metrics-data should redirect to console login"
         )
 
-        # 2. With a valid console session, the route returns metrics JSON
+        # 2. With an admin console session, the route returns metrics JSON
         #    (per-table dimensions), gated by the session cookie rather than
-        #    admin Basic auth.
+        #    admin Basic auth. An IAM-user session gets 403.
         s = requests.Session()
         # The harness sets REQUESTS_CA_BUNDLE/SSL_CERT_FILE, which overrides
         # session.verify; disable env trust and pass verify=False per request so
