@@ -207,7 +207,15 @@ pub(crate) fn refusal(
 /// True when this deployment's catalog holds `account`. A deployment without
 /// a catalog store knows no other account. A lookup failure fails the request
 /// (it is refused either way) with the authorization layer's internal error.
+///
+/// An empty account field names no account the catalog can hold, so it is
+/// answered without a lookup. Cassandra refuses an empty partition key, and
+/// the lookup would fail the request with that internal error where every
+/// other backend answers that the account is not held.
 async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, DynamoDbError> {
+    if account.is_empty() {
+        return Ok(false);
+    }
     let Some(store) = state.catalog_store.as_ref() else {
         return Ok(false);
     };
