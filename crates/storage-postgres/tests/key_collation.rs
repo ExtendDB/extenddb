@@ -338,7 +338,7 @@ async fn resuming_inside_a_partition_seeks_on_the_sort_key() {
             ("gsk".to_owned(), AttributeValue::S(format!("k{i:05}"))),
         ]);
         s.engine
-            .put_item(&key_info, item, false, None, &maps, None)
+            .put_item(&key_info, item, false, None, &maps, None, None)
             .await
             .expect("put an item");
     }

@@ -25,6 +25,7 @@ mod authorization_store;
 mod backup;
 mod backup_catalog;
 mod bootstrapper;
+mod bulk_operation_store;
 mod catalog_store;
 pub mod config;
 mod create_table;

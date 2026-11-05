@@ -745,6 +745,7 @@ async fn indexed_source_with(s: &Scratch, name: &str, items: usize) -> String {
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
                 None,
+                None,
             )
             .await
             .expect("put");

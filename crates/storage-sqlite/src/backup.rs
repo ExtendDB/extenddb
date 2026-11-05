@@ -1683,6 +1683,7 @@ mod restore_tests {
                     None,
                     &extenddb_core::expression::ExpressionMaps::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("put");
@@ -2731,6 +2732,7 @@ mod restore_tests {
                     None,
                     &extenddb_core::expression::ExpressionMaps::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("put");
@@ -3192,6 +3194,7 @@ mod restore_tests {
                         None,
                         &extenddb_core::expression::ExpressionMaps::default(),
                         None,
+                        None,
                     )
                     .await
                     .expect("writer put");
@@ -3282,6 +3285,7 @@ mod restore_tests {
                 false,
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
+                None,
                 None,
             )
             .await

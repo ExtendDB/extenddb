@@ -7,6 +7,9 @@ table backup_index
 table backup_items
 table backup_maintenance
 table backups
+table bulk_operation_input_files
+table bulk_operation_report_records
+table bulk_operations
 table extenddb_migrations
 table iam_group_members
 table iam_groups
@@ -85,6 +88,51 @@ column backups.provisioned_throughput: jsonb
 column backups.stream_specification: jsonb
 column backups.created_at: timestamp with time zone NOT NULL DEFAULT now()
 column backups.vector_indexes: jsonb
+column bulk_operation_input_files.account_id: text NOT NULL
+column bulk_operation_input_files.operation_id: text NOT NULL COLLATE "C"
+column bulk_operation_input_files.file_index: bigint NOT NULL
+column bulk_operation_input_files.path: text NOT NULL
+column bulk_operation_input_files.size: bigint NOT NULL
+column bulk_operation_input_files.row_count: bigint
+column bulk_operation_input_files.etag: text
+column bulk_operation_input_files.abandon: jsonb
+column bulk_operation_report_records.account_id: text NOT NULL
+column bulk_operation_report_records.operation_id: text NOT NULL
+column bulk_operation_report_records.kind: text NOT NULL
+column bulk_operation_report_records.file_index: bigint NOT NULL
+column bulk_operation_report_records.row_index: bigint NOT NULL
+column bulk_operation_report_records.record: text NOT NULL
+column bulk_operations.account_id: text NOT NULL
+column bulk_operations.operation_id: text NOT NULL COLLATE "C"
+column bulk_operations.table_id: text NOT NULL
+column bulk_operations.table_name: text NOT NULL
+column bulk_operations.table_arn: text NOT NULL
+column bulk_operations.status: text NOT NULL
+column bulk_operations.client_token: text
+column bulk_operations.client_token_hash: text
+column bulk_operations.request_fingerprint: text NOT NULL
+column bulk_operations.input_config: jsonb NOT NULL
+column bulk_operations.output_config: jsonb NOT NULL
+column bulk_operations.input_files: jsonb NOT NULL
+column bulk_operations.max_write_request_units: bigint
+column bulk_operations.performance_tier: text
+column bulk_operations.start_time_ms: bigint NOT NULL
+column bulk_operations.end_time_ms: bigint
+column bulk_operations.processed_item_count: bigint NOT NULL DEFAULT 0
+column bulk_operations.failed_item_count: bigint NOT NULL DEFAULT 0
+column bulk_operations.processed_input_bytes: bigint NOT NULL DEFAULT 0
+column bulk_operations.total_input_bytes: bigint
+column bulk_operations.report_record_count: bigint NOT NULL DEFAULT 0
+column bulk_operations.report_bytes: bigint NOT NULL DEFAULT 0
+column bulk_operations.usage: jsonb NOT NULL
+column bulk_operations.failure_code: text
+column bulk_operations.failure_message: text
+column bulk_operations.cancel_requested: boolean NOT NULL DEFAULT false
+column bulk_operations.cursor_file_index: bigint NOT NULL DEFAULT 0
+column bulk_operations.cursor_row_index: bigint NOT NULL DEFAULT 0
+column bulk_operations.lease_owner: text
+column bulk_operations.lease_until_ms: bigint
+column bulk_operations.run_context: jsonb
 column extenddb_migrations.id: integer NOT NULL
 column extenddb_migrations.name: text NOT NULL
 column extenddb_migrations.kind: text NOT NULL
@@ -241,6 +289,9 @@ index backup_definitions_pkey: CREATE UNIQUE INDEX backup_definitions_pkey ON pu
 index backup_index_pkey: CREATE UNIQUE INDEX backup_index_pkey ON public.backup_index USING btree (account_id, backup_id)
 index backup_maintenance_pkey: CREATE UNIQUE INDEX backup_maintenance_pkey ON public.backup_maintenance USING btree (singleton)
 index backups_pkey: CREATE UNIQUE INDEX backups_pkey ON public.backups USING btree (backup_arn)
+index bulk_operation_input_files_pkey: CREATE UNIQUE INDEX bulk_operation_input_files_pkey ON public.bulk_operation_input_files USING btree (account_id, operation_id, file_index)
+index bulk_operation_report_records_pkey: CREATE UNIQUE INDEX bulk_operation_report_records_pkey ON public.bulk_operation_report_records USING btree (account_id, operation_id, kind, file_index, row_index)
+index bulk_operations_pkey: CREATE UNIQUE INDEX bulk_operations_pkey ON public.bulk_operations USING btree (account_id, operation_id)
 index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
 index iam_group_members_pkey: CREATE UNIQUE INDEX iam_group_members_pkey ON public.iam_group_members USING btree (account_id, group_name, user_name)
 index iam_groups_group_arn_key: CREATE UNIQUE INDEX iam_groups_group_arn_key ON public.iam_groups USING btree (group_arn)
@@ -261,6 +312,10 @@ index idx_backup_index_backup_id: CREATE UNIQUE INDEX idx_backup_index_backup_id
 index idx_backup_index_store_status: CREATE INDEX idx_backup_index_store_status ON public.backup_index USING btree (store_kind, store_root, store_id, status)
 index idx_backup_items_arn: CREATE INDEX idx_backup_items_arn ON public.backup_items USING btree (backup_arn)
 index idx_backups_table: CREATE INDEX idx_backups_table ON public.backups USING btree (account_id, table_name)
+index idx_bulk_ops_claim: CREATE INDEX idx_bulk_ops_claim ON public.bulk_operations USING btree (status, lease_until_ms)
+index idx_bulk_ops_list: CREATE INDEX idx_bulk_ops_list ON public.bulk_operations USING btree (account_id, start_time_ms DESC, operation_id DESC)
+index idx_bulk_ops_table_guard: CREATE UNIQUE INDEX idx_bulk_ops_table_guard ON public.bulk_operations USING btree (account_id, table_id) WHERE (status = ANY (ARRAY['IN_PROGRESS'::text, 'CANCELLING'::text]))
+index idx_bulk_ops_token: CREATE UNIQUE INDEX idx_bulk_ops_token ON public.bulk_operations USING btree (account_id, client_token_hash)
 index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
 index idx_login_attempts_principal_time: CREATE INDEX idx_login_attempts_principal_time ON public.login_attempts USING btree (principal, attempted_at DESC)
 index idx_login_attempts_source_ip_time: CREATE INDEX idx_login_attempts_source_ip_time ON public.login_attempts USING btree (source_ip, attempted_at DESC) WHERE (source_ip IS NOT NULL)
@@ -294,6 +349,9 @@ constraint backup_items.backup_items_backup_arn_fkey: FOREIGN KEY (backup_arn) R
 constraint backup_maintenance.backup_maintenance_pkey: PRIMARY KEY (singleton)
 constraint backup_maintenance.backup_maintenance_singleton_check: CHECK (singleton)
 constraint backups.backups_pkey: PRIMARY KEY (backup_arn)
+constraint bulk_operation_input_files.bulk_operation_input_files_pkey: PRIMARY KEY (account_id, operation_id, file_index)
+constraint bulk_operation_report_records.bulk_operation_report_records_pkey: PRIMARY KEY (account_id, operation_id, kind, file_index, row_index)
+constraint bulk_operations.bulk_operations_pkey: PRIMARY KEY (account_id, operation_id)
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint iam_group_members.iam_group_members_account_id_group_name_fkey: FOREIGN KEY (account_id, group_name) REFERENCES iam_groups(account_id, group_name) ON DELETE CASCADE
 constraint iam_group_members.iam_group_members_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
@@ -343,6 +401,8 @@ constraint vector_indexes.vector_indexes_pkey: PRIMARY KEY (table_id, index_name
 constraint vector_indexes.vector_indexes_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
 sequence stream_seq: bigint START 1 INCREMENT 1
 # data database
+table bulk_row_outcomes
+table bulk_write_owners
 table extenddb_migrations
 table gsi_pending
 table idempotency_tokens
@@ -351,6 +411,19 @@ table stream_pending
 table stream_records
 table stream_shards
 table vector_index_holds
+column bulk_row_outcomes.account_id: text NOT NULL
+column bulk_row_outcomes.operation_id: text NOT NULL
+column bulk_row_outcomes.file_index: bigint NOT NULL
+column bulk_row_outcomes.row_index: bigint NOT NULL
+column bulk_row_outcomes.outcome: text NOT NULL
+column bulk_row_outcomes.old_size: bigint
+column bulk_row_outcomes.old_image: jsonb
+column bulk_write_owners.account_id: text NOT NULL
+column bulk_write_owners.operation_id: text NOT NULL
+column bulk_write_owners.owner: text NOT NULL
+column bulk_write_owners.cursor_file: bigint NOT NULL
+column bulk_write_owners.cursor_row: bigint NOT NULL
+column bulk_write_owners.stalled: bigint NOT NULL
 column extenddb_migrations.id: integer NOT NULL
 column extenddb_migrations.name: text NOT NULL
 column extenddb_migrations.kind: text NOT NULL
@@ -394,6 +467,8 @@ column stream_shards.created_at: timestamp with time zone NOT NULL DEFAULT now()
 column vector_index_holds.table_id: text NOT NULL
 column vector_index_holds.index_id: text NOT NULL
 column vector_index_holds.created_at: timestamp with time zone NOT NULL DEFAULT now()
+index bulk_row_outcomes_pkey: CREATE UNIQUE INDEX bulk_row_outcomes_pkey ON public.bulk_row_outcomes USING btree (account_id, operation_id, file_index, row_index)
+index bulk_write_owners_pkey: CREATE UNIQUE INDEX bulk_write_owners_pkey ON public.bulk_write_owners USING btree (account_id, operation_id)
 index extenddb_migrations_pkey: CREATE UNIQUE INDEX extenddb_migrations_pkey ON public.extenddb_migrations USING btree (id)
 index gsi_pending_pkey: CREATE UNIQUE INDEX gsi_pending_pkey ON public.gsi_pending USING btree (id)
 index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (account_id, token)
@@ -407,6 +482,8 @@ index stream_pending_pkey: CREATE UNIQUE INDEX stream_pending_pkey ON public.str
 index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
 index stream_shards_pkey: CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)
 index vector_index_holds_pkey: CREATE UNIQUE INDEX vector_index_holds_pkey ON public.vector_index_holds USING btree (table_id, index_id)
+constraint bulk_row_outcomes.bulk_row_outcomes_pkey: PRIMARY KEY (account_id, operation_id, file_index, row_index)
+constraint bulk_write_owners.bulk_write_owners_pkey: PRIMARY KEY (account_id, operation_id)
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint gsi_pending.gsi_pending_pkey: PRIMARY KEY (id)
 constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (account_id, token)

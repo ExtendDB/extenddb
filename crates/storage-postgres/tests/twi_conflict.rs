@@ -196,7 +196,7 @@ async fn seeded_table(s: &Scratch, maps: &ExpressionMaps) -> TableKeyInfo {
         .expect("read the key info");
     for pk in ["a", "b"] {
         s.engine
-            .put_item(&key_info, item(pk, "seed"), false, None, maps, None)
+            .put_item(&key_info, item(pk, "seed"), false, None, maps, None, None)
             .await
             .expect("seed an item");
     }
@@ -457,7 +457,7 @@ async fn an_invalid_first_op_answers_without_waiting_on_later_locks() {
     let key_info = gsi_table(&s).await;
     let b = item("b", "seed");
     s.engine
-        .put_item(&key_info, b.clone(), false, None, &maps, None)
+        .put_item(&key_info, b.clone(), false, None, &maps, None, None)
         .await
         .expect("seed b");
     let table = data_table(&s.db).await;
@@ -678,7 +678,15 @@ async fn a_plain_put_waits_for_a_check_of_the_missing_item() {
         assert_eq!(read.0.expect("GetItem of 0c"), None, "GetItem sees no item");
         assert_eq!(read.1, 0, "no reader sees the placeholder row");
         s.engine
-            .put_item(&key_info, item("0c", "plain"), false, None, &maps, None)
+            .put_item(
+                &key_info,
+                item("0c", "plain"),
+                false,
+                None,
+                &maps,
+                None,
+                None,
+            )
             .await
     };
     let release = async {
@@ -781,7 +789,15 @@ async fn a_delete_that_loses_its_reservation_removes_the_winner_everywhere() {
     let maps = ExpressionMaps::default();
     let key_info = lsi_stream_table(&s).await;
     s.engine
-        .put_item(&key_info, range_item("d", &[]), false, None, &maps, None)
+        .put_item(
+            &key_info,
+            range_item("d", &[]),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("seed d");
     let table_id: String =

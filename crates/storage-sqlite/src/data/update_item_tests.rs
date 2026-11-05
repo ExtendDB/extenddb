@@ -149,7 +149,7 @@ async fn removal_on_an_existing_item_still_removes() {
     let mut item = k.clone();
     item.insert("a".to_owned(), AttributeValue::S("1".to_owned()));
     engine
-        .put_item(&key_info, item.clone(), false, None, &maps, None)
+        .put_item(&key_info, item.clone(), false, None, &maps, None, None)
         .await
         .expect("put");
 

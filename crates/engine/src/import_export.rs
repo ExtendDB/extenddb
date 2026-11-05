@@ -156,7 +156,7 @@ pub async fn handle_import_table(
 
         let maps = extenddb_core::expression::ExpressionMaps::default();
         ctx.storage
-            .put_item(&key_info, item, false, None, &maps, None)
+            .put_item(&key_info, item, false, None, &maps, None, None)
             .await
             .map_err(storage_err_to_dynamo)?;
         imported_count += 1;

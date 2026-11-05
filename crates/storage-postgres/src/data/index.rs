@@ -36,6 +36,13 @@ pub(crate) fn db_error(e: sqlx::Error) -> StorageError {
 pub(crate) fn sqlstate_message(e: &sqlx::Error) -> String {
     match e.as_database_error().and_then(|d| d.code()) {
         Some(code) => format!("SQLSTATE {code}: {e}"),
+        // An I/O error on the connection, such as a reset or a close with
+        // no message from the server: there is no code to keep. It is
+        // rendered with the code SQLSTATE defines for a lost connection,
+        // 08006 connection_failure, so every classifier that reads the
+        // prefix (the bulk write fault class among them) reads it as the
+        // connection fault it is, on a row statement as on a commit.
+        None if matches!(e, sqlx::Error::Io(_)) => format!("SQLSTATE 08006: {e}"),
         None => e.to_string(),
     }
 }

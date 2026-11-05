@@ -13,10 +13,13 @@ use extenddb_core::types::{PutItemInput, PutItemOutput, ReturnValues, item_size_
 use crate::OperationContext;
 use crate::capacity_helpers;
 use crate::create_table::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-use crate::expression_helpers::resolve_condition;
 use crate::serialize_output;
-use crate::stream_capture;
 use crate::{DispatchMetrics, DispatchResult};
+
+mod payload;
+pub(crate) use payload::{
+    PutPayloadFault, apply_put, resolve_put_condition, stream_capture_for, validate_put_payload,
+};
 
 /// Handle a `PutItem` request.
 ///
@@ -147,7 +150,7 @@ pub async fn handle_put_item(
     // Validate expressions/`Expected` before the existence check,
     // so a malformed request to a missing table returns ValidationException,
     // not ResourceNotFoundException. Key/item-content checks stay after.
-    let (condition, maps) = resolve_condition(
+    let (condition, maps) = resolve_put_condition(
         input.condition_expression.as_deref(),
         input.expression_attribute_names.as_ref(),
         input.expression_attribute_values.as_ref(),
@@ -156,51 +159,12 @@ pub async fn handle_put_item(
         &ctx.limits,
     )?;
 
-    if input.expected.is_none()
-        || input
-            .expected
-            .as_ref()
-            .is_some_and(std::collections::HashMap::is_empty)
-    {
-        let exprs: Vec<&extenddb_core::expression::Expr> = condition.iter().collect();
-        extenddb_core::expression::validate_unused_attributes(
-            &maps.names,
-            &maps.values,
-            &exprs,
-            &[],
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        )?;
-    }
-
     let key_info = ctx
         .table_key_info(&input.table_name)
         .await
         .map_err(storage_err_to_dynamo)?;
 
-    extenddb_core::validation::validate_put_item(
-        &input,
-        &ctx.limits,
-        &key_info.key_schema,
-        &key_info.attribute_definitions,
-    )?;
-
-    // The nesting-depth limit applies to every ExpressionAttributeValue on the
-    // single-item write paths, condition-only placeholders included: measured
-    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
-    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
-    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
-    // NOT get this check: the same 32-level condition-only value is accepted
-    // inside a transaction on every sub-op shape (also measured).
-    if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
-
-    extenddb_core::validation::validate_vector_write(
-        &input.item,
-        &key_info.vector_indexes,
-        &key_info.attribute_definitions,
-    )?;
+    validate_put_payload(&input.item, &key_info, &ctx.limits).map_err(|fault| fault.error)?;
 
     let return_old = input.return_values == ReturnValues::AllOld;
     let capacity_requested =
@@ -223,36 +187,26 @@ pub async fn handle_put_item(
         key_info.has_lsi,
     );
 
-    // Check if streams are enabled (need old item for stream record).
-    let view_type = stream_capture::stream_view_type(&key_info);
-
-    let stream = view_type.map(|vt| extenddb_storage::StreamCapture {
-        view_type: vt,
-        user_identity: None,
-        region: ctx.region.clone(),
-    });
     // Capacity uses the larger old/new base item and must include index entries
     // deleted by an overwrite, so request the old item whenever capacity is
-    // requested. Indexed writes already read it inside the storage transaction.
-    let need_old_for_stream = stream.is_some();
-    let need_old_for_capacity = capacity_requested;
+    // requested. Indexed writes already read it inside the storage transaction;
+    // the stream-record fetch is `apply_put`'s own.
+    let old_item = apply_put(
+        ctx.storage.as_ref(),
+        &ctx.region,
+        &key_info,
+        input.item,
+        condition.as_ref(),
+        &maps,
+        return_old || capacity_requested,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        storage_err_to_dynamo_with_ccf(e, input.return_values_on_condition_check_failure)
+    })?;
 
-    let old_item = ctx
-        .storage
-        .put_item(
-            &key_info,
-            input.item,
-            return_old || need_old_for_stream || need_old_for_capacity,
-            condition.as_ref(),
-            &maps,
-            stream.as_ref(),
-        )
-        .await
-        .map_err(|e| {
-            storage_err_to_dynamo_with_ccf(e, input.return_values_on_condition_check_failure)
-        })?;
-
-    // Stream records are now captured atomically within the storage transaction.
+    // Stream records are captured atomically within the storage transaction.
 
     let old_item_bytes = old_item.as_ref().map_or(0, item_size_bytes);
     let wcu = capacity_helpers::write_capacity_units(new_item_bytes.max(old_item_bytes));

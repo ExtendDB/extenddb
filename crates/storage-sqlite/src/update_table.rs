@@ -364,6 +364,23 @@ impl SqliteEngine {
         // out of the catalog transaction so the post-commit index DDL builds its
         // columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
+        // No index creation while a bulk operation on the table runs, read
+        // under the write lock a start also takes. The build is counted in
+        // memory only once every check below that can refuse the request
+        // has passed (see `_index_build` before the commit).
+        let creates_gsi = match &input.global_secondary_index_updates {
+            Some(updates) => {
+                crate::bulk_operation_store::refuse_index_creation_during_run(
+                    &mut tx,
+                    account_id,
+                    &table_id,
+                    &input.table_name,
+                    updates,
+                )
+                .await?
+            }
+            None => false,
+        };
         if let Some(updates) = &input.global_secondary_index_updates {
             {
                 // One index change at a time while a GSI builds, as the service
@@ -694,6 +711,13 @@ impl SqliteEngine {
             }
         }
 
+        // Every check that can refuse the request has passed, so the build
+        // is counted from here until this function returns, its backfill
+        // under the write lock included: a start that waited for the lock
+        // and reads the index `ACTIVE` after it is refused. A request
+        // refused above never moved the count. Begun before the commit.
+        let _index_build =
+            creates_gsi.then(|| crate::bulk_operation_store::BuildGuard::begin(&table_id));
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -1577,6 +1601,7 @@ mod reconciler_tests {
                 false,
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
+                None,
                 None,
             )
             .await

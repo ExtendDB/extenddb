@@ -196,6 +196,7 @@ async fn test_ttl_metadata_enable_disable_and_listing() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("populate TTL queue");
@@ -391,6 +392,7 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
                 None,
                 &Default::default(),
                 None,
+                None,
             )
             .await
             .expect("put TTL test item");
@@ -406,6 +408,7 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put initially expired item");
@@ -416,6 +419,7 @@ async fn test_ttl_queue_sweep_and_stale_candidate_protection() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -546,7 +550,15 @@ async fn test_ttl_sweep_emits_service_remove_stream_record() {
     );
     item.insert("value".to_owned(), AttributeValue::S("old".to_owned()));
     engine
-        .put_item(&key_info, item, false, None, &Default::default(), None)
+        .put_item(
+            &key_info,
+            item,
+            false,
+            None,
+            &Default::default(),
+            None,
+            None,
+        )
         .await
         .expect("put expired stream item");
 
@@ -787,6 +799,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -818,6 +831,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await;
     // The write retries the claim on a jittered backoff before giving up, and
@@ -839,6 +853,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("renewed write succeeds after claim release");
@@ -852,6 +867,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -882,6 +898,7 @@ async fn test_ttl_claim_serializes_delayed_writer() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -939,7 +956,15 @@ async fn test_concurrent_ordinary_writes_on_ttl_table_both_succeed() {
             );
             item.insert("value".to_owned(), AttributeValue::S(value));
             engine
-                .put_item(&key_info, item, false, None, &Default::default(), None)
+                .put_item(
+                    &key_info,
+                    item,
+                    false,
+                    None,
+                    &Default::default(),
+                    None,
+                    None,
+                )
                 .await
         }
     };
@@ -1199,6 +1224,7 @@ async fn ttl_table_with_expired_item(
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -1480,6 +1506,7 @@ async fn test_outbox_pages_past_poison_prefix() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1684,6 +1711,7 @@ async fn test_effects_applying_with_changed_image_completes_not_wedges() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("the key must be writable after recovery");
@@ -1759,6 +1787,7 @@ async fn test_effects_applying_recovery_restores_shared_key_gsi_row() {
             false,
             None,
             &ExpressionMaps::default(),
+            None,
             None,
         )
         .await
@@ -2062,6 +2091,7 @@ async fn test_ttl_sweep_removes_synchronous_gsi_entry() {
             None,
             &ExpressionMaps::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2203,6 +2233,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2279,6 +2310,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -2404,6 +2436,7 @@ async fn test_ttl_reconciles_same_expiry_after_queue_only_claim() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -2574,6 +2607,7 @@ async fn test_conditional_put_recreates_metadata_only_row() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2612,6 +2646,7 @@ async fn test_conditional_put_recreates_metadata_only_row() {
             false,
             Some(&condition),
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -2678,6 +2713,7 @@ async fn test_outbox_restores_bucket_for_existing_pending_row() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -2818,6 +2854,7 @@ async fn test_inflight_repair_repeats_after_late_queue_destroy() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -3059,6 +3096,7 @@ async fn test_non_ttl_put_does_not_enqueue_ttl_reconciliation() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3205,6 +3243,7 @@ async fn test_audit_restores_lost_queue_registration() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -3359,6 +3398,7 @@ async fn test_ttl_lifecycle_states() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put");
@@ -3439,6 +3479,7 @@ async fn test_backfill_cursor_resume() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await
@@ -3585,6 +3626,7 @@ async fn test_backfill_cursor_is_honored() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await

@@ -35,6 +35,7 @@ async fn test_transact_get_items_single_item() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("Put item failed");
@@ -81,6 +82,7 @@ async fn test_transact_get_items_multiple_items() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await
@@ -143,6 +145,7 @@ async fn test_transact_get_items_nonexistent_item() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -203,6 +206,7 @@ async fn test_transact_get_items_with_sort_key() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await
@@ -287,6 +291,7 @@ async fn test_transact_get_items_cross_table() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -298,6 +303,7 @@ async fn test_transact_get_items_cross_table() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -397,6 +403,7 @@ async fn test_transact_get_items_max_items() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await

@@ -677,7 +677,7 @@ async fn test_async_gsi_enqueues_row_atomically() {
     item.insert("gpk".to_string(), AttributeValue::S("g1".to_string()));
 
     engine
-        .put_item(&table.key_info, item, false, None, &maps, None)
+        .put_item(&table.key_info, item, false, None, &maps, None, None)
         .await
         .expect("put_item");
 
@@ -719,7 +719,7 @@ async fn test_async_gsi_worker_convergence() {
         item.insert("id".to_string(), AttributeValue::S("X".to_string()));
         item.insert("gpk".to_string(), AttributeValue::S(v.to_string()));
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None)
+            .put_item(&table.key_info, item, false, None, &maps, None, None)
             .await
             .expect("put_item");
     }
@@ -800,7 +800,7 @@ async fn test_async_gsi_worker_skips_dropped_index() {
         item.insert("id".to_string(), AttributeValue::S(format!("pk{i}")));
         item.insert("gpk".to_string(), AttributeValue::S(format!("g{i}")));
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None)
+            .put_item(&table.key_info, item, false, None, &maps, None, None)
             .await
             .expect("put_item");
     }
@@ -1165,11 +1165,11 @@ async fn test_async_gsi_worker_keeps_the_row_across_a_same_key_update() {
     v2.insert("data".to_string(), AttributeValue::S("v2".to_string()));
     let maps = ExpressionMaps::default();
     engine
-        .put_item(&table.key_info, v1, false, None, &maps, None)
+        .put_item(&table.key_info, v1, false, None, &maps, None, None)
         .await
         .expect("put v1");
     engine
-        .put_item(&table.key_info, v2, false, None, &maps, None)
+        .put_item(&table.key_info, v2, false, None, &maps, None, None)
         .await
         .expect("put v2");
     assert_eq!(gsi_pending_count(&engine, &account_keyspace).await, 2);
@@ -1319,6 +1319,7 @@ async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
             None,
             &maps,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1340,6 +1341,7 @@ async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
             Some(&not_exists),
             &maps,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1356,6 +1358,7 @@ async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
             false,
             None,
             &maps,
+            None,
             None,
         )
         .await
@@ -1461,6 +1464,7 @@ async fn test_every_write_path_stamps_the_index_row_with_the_stored_version() {
             false,
             None,
             &maps,
+            None,
             None,
         )
         .await
@@ -1598,6 +1602,7 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
                     false,
                     None,
                     &ExpressionMaps::default(),
+                    None,
                     None,
                 )
                 .await
@@ -1770,6 +1775,7 @@ async fn test_a_delete_stamps_its_tombstones_one_above_the_deleted_version() {
                 None,
                 &maps,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1849,7 +1855,7 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
     item.insert("id".to_owned(), AttributeValue::S("x".to_owned()));
     item.insert("status".to_owned(), AttributeValue::S("s".to_owned()));
     engine
-        .put_item(&table.key_info, item, false, None, &maps, None)
+        .put_item(&table.key_info, item, false, None, &maps, None, None)
         .await
         .unwrap();
     let keyspace = engine.account_keyspace(&table.key_info.account_id);
@@ -1992,7 +1998,15 @@ async fn test_a_queue_entry_written_over_a_version_ahead_of_the_clock_is_drained
     item.insert("gpk".to_string(), AttributeValue::S("g".to_string()));
     item.insert("data".to_string(), AttributeValue::S("v1".to_string()));
     engine
-        .put_item(&table.key_info, item.clone(), false, None, &maps, None)
+        .put_item(
+            &table.key_info,
+            item.clone(),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("put v1");
     let ahead = extenddb_storage_cassandra::data::version::now_micros() + 3_600_000_000;
@@ -2007,7 +2021,7 @@ async fn test_a_queue_entry_written_over_a_version_ahead_of_the_clock_is_drained
     .unwrap();
     item.insert("data".to_string(), AttributeValue::S("v2".to_string()));
     engine
-        .put_item(&table.key_info, item, false, None, &maps, None)
+        .put_item(&table.key_info, item, false, None, &maps, None, None)
         .await
         .expect("put v2");
     assert_eq!(gsi_pending_count(&engine, &account_keyspace).await, 2);
@@ -2052,7 +2066,7 @@ async fn test_the_gsi_worker_resolves_two_entries_for_one_item_in_version_order(
         item.insert("id".to_string(), AttributeValue::S("X".to_string()));
         item.insert("gpk".to_string(), AttributeValue::S(gpk.to_string()));
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None)
+            .put_item(&table.key_info, item, false, None, &maps, None, None)
             .await
             .expect("put");
     }

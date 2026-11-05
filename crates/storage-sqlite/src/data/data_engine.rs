@@ -32,11 +32,13 @@ impl DataEngine for SqliteEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
+        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let condition = condition.cloned();
         let maps = maps.clone();
         let stream = stream.cloned();
+        let marker = marker.cloned();
         Box::pin(async move {
             self.put_item_impl(
                 &key_info,
@@ -45,8 +47,166 @@ impl DataEngine for SqliteEngine {
                 condition.as_ref(),
                 &maps,
                 stream.as_ref(),
+                marker.as_ref(),
             )
             .await
+        })
+    }
+
+    fn put_items_batch(
+        &self,
+        key_info: &TableKeyInfo,
+        rows: Vec<extenddb_storage::BatchRow>,
+        stream: Option<&StreamCapture>,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::BatchRowResult>, StorageError>> {
+        let key_info = key_info.clone();
+        let stream = stream.cloned();
+        Box::pin(async move {
+            self.put_items_batch_impl(&key_info, rows, stream.as_ref())
+                .await
+        })
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        row_index: i64,
+    ) -> BoxFuture<'_, Result<Option<extenddb_storage::RowOutcome>, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT outcome FROM bulk_row_outcomes \
+                 WHERE account_id = ? AND operation_id = ? \
+                   AND file_index = ? AND row_index = ?",
+            )
+            .bind(&account_id)
+            .bind(&operation_id)
+            .bind(file_index)
+            .bind(row_index)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            row.map(|(outcome,)| {
+                extenddb_storage::RowOutcome::parse(&outcome).ok_or_else(|| {
+                    StorageError::Internal(format!("unknown bulk row outcome '{outcome}'"))
+                })
+            })
+            .transpose()
+        })
+    }
+
+    fn bulk_write_takeover(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        owner: &str,
+        cursor: (i64, i64),
+    ) -> BoxFuture<'_, Result<u32, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        let owner = owner.to_owned();
+        Box::pin(async move {
+            // Under the engine write lock, so a batch of the earlier owner
+            // either committed before this or reads the new owner.
+            let _writer = self.write_lock.lock().await;
+            let stalled: i64 = sqlx::query_scalar(
+                "INSERT INTO bulk_write_owners \
+                 (account_id, operation_id, owner, cursor_file, cursor_row, stalled) \
+                 VALUES (?, ?, ?, ?, ?, 0) \
+                 ON CONFLICT (account_id, operation_id) DO UPDATE SET \
+                 owner = excluded.owner, \
+                 stalled = CASE WHEN bulk_write_owners.cursor_file = excluded.cursor_file \
+                   AND bulk_write_owners.cursor_row = excluded.cursor_row \
+                   THEN bulk_write_owners.stalled + 1 ELSE 0 END, \
+                 cursor_file = excluded.cursor_file, cursor_row = excluded.cursor_row \
+                 RETURNING stalled",
+            )
+            .bind(&account_id)
+            .bind(&operation_id)
+            .bind(&owner)
+            .bind(cursor.0)
+            .bind(cursor.1)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(crate::sqlite_util::map_sqlx_err)?;
+            Ok(u32::try_from(stalled).unwrap_or(u32::MAX))
+        })
+    }
+
+    fn bulk_rows_recorded(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        from_row: i64,
+        limit: i64,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::RecordedRow>, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            let rows: Vec<(i64, String, Option<i64>, Option<String>)> = sqlx::query_as(
+                "SELECT row_index, outcome, old_size, old_image FROM bulk_row_outcomes \
+                 WHERE account_id = ? AND operation_id = ? AND file_index = ? \
+                   AND row_index >= ? ORDER BY row_index LIMIT ?",
+            )
+            .bind(&account_id)
+            .bind(&operation_id)
+            .bind(file_index)
+            .bind(from_row)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(crate::sqlite_util::map_sqlx_err)?;
+            rows.into_iter()
+                .map(|(row_index, outcome, old_size, old_image)| {
+                    let outcome =
+                        extenddb_storage::RowOutcome::parse(&outcome).ok_or_else(|| {
+                            StorageError::Internal(format!("unknown bulk row outcome '{outcome}'"))
+                        })?;
+                    let old_image = old_image
+                        .map(|text| serde_json::from_str(&text))
+                        .transpose()
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    Ok(extenddb_storage::RecordedRow {
+                        row_index,
+                        outcome,
+                        old_size,
+                        old_image,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        let account_id = account_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        Box::pin(async move {
+            // D1: every writer holds the engine write lock. A single DELETE
+            // is its own transaction.
+            let _writer = self.write_lock.lock().await;
+            let result = sqlx::query(
+                "DELETE FROM bulk_row_outcomes WHERE account_id = ? AND operation_id = ?",
+            )
+            .bind(&account_id)
+            .bind(&operation_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            sqlx::query("DELETE FROM bulk_write_owners WHERE account_id = ? AND operation_id = ?")
+                .bind(&account_id)
+                .bind(&operation_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            Ok(result.rows_affected())
         })
     }
 

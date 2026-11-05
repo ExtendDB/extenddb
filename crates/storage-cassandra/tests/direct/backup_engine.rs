@@ -113,7 +113,7 @@ async fn make_gsis_synchronous(engine: &CassandraEngine, table_id: &str, names: 
 
 async fn put_all(engine: &CassandraEngine, key_info: &TableKeyInfo, items: Vec<Item>) {
     let mut writes = futures::stream::iter(items)
-        .map(|item| engine.put_item(key_info, item, false, None, &Default::default(), None))
+        .map(|item| engine.put_item(key_info, item, false, None, &Default::default(), None, None))
         .buffer_unordered(32);
     while let Some(result) = writes.next().await {
         result.expect("seed item");
@@ -299,6 +299,7 @@ async fn test_backup_describe_list_delete_and_account_scope() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await
@@ -532,6 +533,7 @@ async fn test_table_name_filter_spans_table_recreation() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await

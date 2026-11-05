@@ -52,7 +52,7 @@ pub(crate) async fn seed(
     let maps = ExpressionMaps::default();
     let item = big_item(id, bytes, val);
     engine
-        .put_item(key_info, item, false, None, &maps, None)
+        .put_item(key_info, item, false, None, &maps, None, None)
         .await
         .unwrap();
 }

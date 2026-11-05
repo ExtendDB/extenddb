@@ -150,6 +150,7 @@ impl Scratch {
                 None,
                 &ExpressionMaps::default(),
                 Some(&capture()),
+                None,
             )
             .await
             .expect("store the item");

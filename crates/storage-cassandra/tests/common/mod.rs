@@ -669,6 +669,7 @@ pub async fn put_item_then_lock(
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("Initial put_item should succeed");
