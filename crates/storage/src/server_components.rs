@@ -84,7 +84,7 @@ impl std::fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// Options for server-component creation, beyond the storage config itself.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ServerComponentsOptions {
     /// Bootstrap the catalog at serve time when it is not initialized,
@@ -93,9 +93,29 @@ pub struct ServerComponentsOptions {
     /// Backends whose bootstrap requires operator input ignore this and fail
     /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
     pub bootstrap_if_uninitialized: bool,
+    /// The item size limit the storage layer applies to the finished item of
+    /// an update, standalone or transacted. Comes from `limits.max_item_size_bytes`
+    /// so the storage layer and the engine's put path enforce one figure.
+    pub max_item_size_bytes: usize,
     /// The ExtendDB release that is starting, recorded in the ledger rows of
     /// migrations the factory runs (a dev build, an in-memory database).
     pub release: &'static str,
+    /// `backup.max_concurrent_jobs`: the backup and restore jobs the
+    /// instance runs at once. A backend whose pool has to admit every job
+    /// sizes it from this ([`crate::backup_catalog::pool_size_for_jobs`]);
+    /// `0` (the default outside a server) asks for no job capacity.
+    pub max_concurrent_jobs: usize,
+}
+
+impl Default for ServerComponentsOptions {
+    fn default() -> Self {
+        Self {
+            bootstrap_if_uninitialized: false,
+            max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+            release: "",
+            max_concurrent_jobs: 0,
+        }
+    }
 }
 
 /// Factory function type for creating server components.
@@ -125,7 +145,7 @@ pub type ServerComponentsFactory =
 ///
 /// A `region` the `BackupArn` parser would refuse is logged at warn first
 /// ([`crate::config::server_region_warning`]): the server still starts, but
-/// the operator is told its own backup ARNs will not resolve.
+/// the operator is told `CreateBackup` is refused under it.
 pub async fn create_server_components(
     config: &(dyn StorageConfig + 'static),
     region: &str,

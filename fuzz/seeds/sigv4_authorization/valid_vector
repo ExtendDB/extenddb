@@ -1,0 +1,1 @@
+AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260415/us-east-1/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890

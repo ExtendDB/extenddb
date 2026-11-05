@@ -186,11 +186,18 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // Tag operations validate the ResourceArn shape before the IAM decision, as
-    // the service does: an index ARN (tags are accepted only on a table or
-    // stream) is rejected with ValidationException for every principal, before
-    // authorization. A table or stream ARN passes; its account, region, and
-    // existence are checked after authorization by the engine tag handler.
+    // A request that names a resource in another account by ARN is refused
+    // before the IAM decision, for every principal, with the service's answer
+    // for the operation and for whether this deployment knows the account
+    // (measured 2026-11-03 for an admin and a no-policy caller; see
+    // `authz_resource::cross_account`).
+    authz_resource::cross_account::refuse(state, identity, operation, input, account_id).await?;
+
+    // The tag operations' ResourceArn shape is validated before the IAM
+    // decision: an index ARN in this account (tags are accepted only on a
+    // table or stream) is rejected with ValidationException for every
+    // principal. A table or stream ARN passes; its region and existence are
+    // checked after authorization by the engine tag handler.
     if matches!(
         operation,
         "TagResource" | "UntagResource" | "ListTagsOfResource"
@@ -241,8 +248,7 @@ pub(crate) async fn authorize_request(
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,
-            "GetRecords",
-            &resource_arn,
+            &authz_resource::AuthzTarget::new("GetRecords", resource_arn),
             false,
             base_params(request_tags, request_tag_keys),
         )
@@ -308,8 +314,7 @@ pub(crate) async fn authorize_request(
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                operation,
-                &resource_arn,
+                &authz_resource::AuthzTarget::new(operation, resource_arn),
                 false,
                 base_params(request_tags, request_tag_keys),
             )
@@ -319,9 +324,13 @@ pub(crate) async fn authorize_request(
                 // The RequestItems key (or TransactItems TableName) may be a
                 // bare name or a table ARN; canonicalize either to this
                 // deployment's table ARN so a respelled ARN cannot evade a
-                // per-table Deny.
-                let resource_arn =
-                    authz_resource::table_resource_arn(&target.table, &state.region, account_id);
+                // per-table Deny. The denial names the key as written.
+                let authz_target = authz_resource::table_target(
+                    &target.action,
+                    &target.table,
+                    &state.region,
+                    account_id,
+                );
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
                     ..base_params(request_tags.clone(), request_tag_keys.clone())
@@ -329,8 +338,7 @@ pub(crate) async fn authorize_request(
                 authorization::check_authorization(
                     state.authz_cache.as_ref(),
                     identity,
-                    &target.action,
-                    &resource_arn,
+                    &authz_target,
                     false,
                     params,
                 )
@@ -340,11 +348,12 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
-    // Derive the (action, resource ARN) pairs the service authorizes this
-    // operation against. The resource comes from the field the operation
-    // actually carries it in (ResourceArn, StreamArn, BackupArn, TableArn,
-    // IndexName, or a table ARN in TableName), canonicalized to this
-    // deployment, never a `table/*` fallback. See `authz_resource`.
+    // Derive the targets the service authorizes this operation against. The
+    // resource comes from the field the operation actually carries it in
+    // (ResourceArn, StreamArn, BackupArn, TableArn, IndexName, or a table ARN
+    // in TableName), canonicalized to this deployment for the policy match,
+    // never a `table/*` fallback, with the field as written kept for the
+    // denial message. See `authz_resource`.
     let targets = authz_resource::authz_targets(operation, input, &state.region, account_id);
     let is_scan = operation == "Scan";
 
@@ -373,12 +382,10 @@ pub(crate) async fn authorize_request(
                 .map(ToOwned::to_owned),
             ..base_params(request_tags, request_tag_keys)
         };
-        let (action, resource_arn) = &targets[0];
         authorization::check_authorization(
             state.authz_cache.as_ref(),
             identity,
-            action,
-            resource_arn,
+            &targets[0],
             is_scan,
             params,
         )
@@ -387,12 +394,11 @@ pub(crate) async fn authorize_request(
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
         // request.
-        for (action, resource_arn) in &targets {
+        for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
                 identity,
-                action,
-                resource_arn,
+                target,
                 false,
                 base_params(request_tags.clone(), request_tag_keys.clone()),
             )

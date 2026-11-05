@@ -23,6 +23,7 @@
 mod admin_store;
 mod authorization_store;
 mod backup;
+mod backup_catalog;
 mod bootstrapper;
 mod catalog_store;
 pub mod config;
@@ -36,6 +37,7 @@ mod metadata;
 pub mod migrations;
 mod number_key;
 mod operations;
+mod password_hash_store;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;
@@ -198,9 +200,6 @@ use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 use crate::hooks::SqliteRuntimeHooks;
 
-/// Maximum DynamoDB item size in bytes (post-update validation bound).
-const MAX_ITEM_SIZE_BYTES: usize = 400_000;
-
 fn sqlite_server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
     region: &str,
@@ -235,12 +234,13 @@ fn sqlite_server_components_factory(
                 .await
                 .map_err(BackendError::Catalog)?;
         }
-        let mut engine = SqliteEngine::new(&db_path, pool_size, &region, MAX_ITEM_SIZE_BYTES)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "sqlite".to_owned(),
-                details: e.to_string(),
-            })?;
+        let mut engine =
+            SqliteEngine::new(&db_path, pool_size, &region, options.max_item_size_bytes)
+                .await
+                .map_err(|e| BackendError::ConnectionFailed {
+                    backend: "sqlite".to_owned(),
+                    details: e.to_string(),
+                })?;
 
         // An in-memory database exists only on the engine's single
         // connection, so its catalog is created there, by the runner, every
@@ -287,31 +287,24 @@ fn sqlite_server_components_factory(
             Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
         }
 
-        // Remove any restore target a prior crash left mid-copy. Before the
-        // server takes requests, so no restore can be in flight.
-        match engine.sweep_abandoned_restores().await {
+        // A restore the previous run left mid-copy: one process serves this
+        // file, so its owner is gone. Age every RUNNING job record so the
+        // engine's reconciler fails it and removes its target on its first
+        // cycle rather than after the stale window. Before the server takes
+        // requests, so no restore of this process can be in flight. A backup
+        // the previous run left CREATING is reported to the reconciler by
+        // `abandoned_creating_backups` without a step here: no task of this
+        // process holds its slot.
+        match engine.expire_restore_job_heartbeats().await {
             Ok(names) => {
                 for name in &names {
                     tracing::warn!(
-                        "removed table '{name}': its restore did not finish before the last \
-                         shutdown"
+                        "table '{name}': its restore did not finish before the last shutdown; \
+                         the reconciler removes it"
                     );
                 }
             }
-            Err(e) => tracing::error!("Failed to sweep abandoned restores: {e}"),
-        }
-
-        // Likewise a backup a prior crash left CREATING: its items were only
-        // partly copied, and nothing will finish them.
-        match engine.sweep_incomplete_backups().await {
-            Ok(arns) => {
-                for arn in &arns {
-                    tracing::warn!(
-                        "removed backup {arn}: its copy did not finish before the last shutdown"
-                    );
-                }
-            }
-            Err(e) => tracing::error!("Failed to sweep incomplete backups: {e}"),
+            Err(e) => tracing::error!("Failed to mark interrupted restores: {e}"),
         }
 
         // Rebuild any GSI left mid-backfill (status CREATING) by a prior crash.

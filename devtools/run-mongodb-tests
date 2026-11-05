@@ -358,6 +358,21 @@ if $RUST_LIVE; then
         echo "  ✗ MongoDB live Rust tests failed"
         RC=1
     fi
+    # The backup engine's live tests: the restore claim, the heartbeat, the
+    # reconciler's listing and FAILED write, the delete and restore orderings
+    # against a replica set. They are the only tests of several of those
+    # conditions, so they run here with the replica set required (a missing
+    # server is a failure, not a skip), one at a time as the tests above.
+    echo ""
+    echo "=== MongoDB backup engine live Rust tests (storage-mongodb, --ignored) ==="
+    if EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --lib -- \
+        --ignored --test-threads=1 backup_engine::live_tests::; then
+        echo "  ✓ MongoDB backup engine live Rust tests passed"
+    else
+        echo "  ✗ MongoDB backup engine live Rust tests failed"
+        RC=1
+    fi
 fi
 
 exit $RC

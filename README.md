@@ -115,9 +115,10 @@ key_path = "/etc/extenddb/tls/key.pem"
 ## Running in Containers
 
 The production images contain ExtendDB only. The storage backend runs as a separate service. See
-[`docker/README.md`](docker/README.md) for the PostgreSQL image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
-external database requirements, hardened local Compose stacks, smoke tests, and explicit init/migrate/serve
-production lifecycle. The SQLite and Cassandra backends have no dedicated container guide yet.
+[`docker/README.md`](docker/README.md) for the PostgreSQL image, [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
+and [`docker/README-cassandra.md`](docker/README-cassandra.md) for the Cassandra image (published from 1.0): external database requirements,
+hardened local Compose stacks, smoke tests, and explicit init/migrate/serve production lifecycle. The SQLite
+backend has no production container image; [`docs/dev-image.md`](docs/dev-image.md) covers the SQLite development image.
 
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 

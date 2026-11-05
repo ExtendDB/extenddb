@@ -63,8 +63,8 @@
 //! pool's 30 s acquire timeout). The `snapshot_open_slots` field doc says
 //! what the permits do not prevent. An open over the bound is refused with
 //! `LimitExceeded` rather than queued. The backup design's
-//! `max_concurrent_jobs` is the caller-side bound; the restore path's slots
-//! (`restore_server_slot_count`) do not count snapshots.
+//! `max_concurrent_jobs` is the caller-side bound on jobs; a restore holds no
+//! snapshot slot.
 //!
 //! `ACCESS SHARE` on the data table is held until the stream's last fetch
 //! (the transaction commits as soon as a short page shows the end), not

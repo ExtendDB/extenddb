@@ -339,7 +339,9 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         extenddb_storage::server_components::ServerComponentsOptions::default();
 
     component_options.bootstrap_if_uninitialized = dev_mode;
+    component_options.max_item_size_bytes = app_config.limits.max_item_size_bytes;
     component_options.release = build.version;
+    component_options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
 
     // Wire the node's own bind address as the instance ID so each ExtendDB node
     // has a distinct node ID (to support logical clocks for sequences, etc.).
@@ -640,8 +642,12 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         initial_throttling,
     ));
 
+    let backup_runtime = Arc::new(extenddb_engine::BackupRuntime::new(
+        app_config.backup.max_concurrent_jobs,
+    ));
     let state = AppState {
-        storage,
+        storage: storage.clone(),
+        backup_runtime,
         auth,
         limits,
         region: Arc::from(app_config.server.region.as_str()),
@@ -677,11 +683,22 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // to a runtime drop.
     let shutdown = CancellationToken::new();
     let hooks: Option<Arc<dyn extenddb_storage::ServerRuntimeHooks>> = runtime_hooks.map(Arc::from);
+    let reconciler_settings = extenddb_engine::reconciler::ReconcilerSettings {
+        interval: std::time::Duration::from_secs(app_config.backup.reconcile_interval_secs),
+        stale_job_after: std::time::Duration::from_secs(app_config.backup.stale_job_after_secs),
+    };
+    // The reconciler's once-per-record log set lives here, outside the
+    // workers, so a worker restart (each time the serving registration is
+    // taken again) does not log the same dead manifest record again.
+    let reconciler_state = Arc::new(tokio::sync::Mutex::new(
+        extenddb_engine::reconciler::ReconcilerState::default(),
+    ));
     let spawn: SpawnWorkers = {
         let catalog_store = catalog_store.clone();
         let reload_handle = reload_handle.clone();
         let config_log_level = app_config.logging.level.clone();
         let metrics = metrics.clone();
+        let storage = storage.clone();
         Box::new(move |token: CancellationToken| {
             let catalog_store = catalog_store.clone();
             let reload_handle = reload_handle.clone();
@@ -689,6 +706,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             let throttle = throttle.clone();
             let metrics = metrics.clone();
             let hooks = hooks.clone();
+            let storage = storage.clone();
+            let reconciler_state = reconciler_state.clone();
             futures::FutureExt::boxed(async move {
                 let mut handles = vec![
                     // D-22: Poll log_level from the settings table.
@@ -722,6 +741,17 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                     )),
                     // Phase 11a: Warn about approximate consumed capacity.
                     tokio::spawn(workers::capacity_warning_worker(token.clone())),
+                    // The backup reconciler: backend-agnostic, so it runs
+                    // here beside the backends' workers rather than in each
+                    // backend's `spawn_workers`, and stops and starts with
+                    // them.
+                    tokio::spawn(extenddb_engine::reconciler::run(
+                        storage,
+                        reconciler_settings,
+                        metrics.clone(),
+                        reconciler_state,
+                        token.clone(),
+                    )),
                 ];
                 // Backend-specific workers via runtime hooks.
                 if let Some(hooks) = hooks {
