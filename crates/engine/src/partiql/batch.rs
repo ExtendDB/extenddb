@@ -25,7 +25,7 @@
 //! refusal, with a caller that may not run the statement). For two
 //! statements on one item the order against authorization is not measured.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -33,12 +33,13 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{FromSource, Projection, SelectStatement};
 use extenddb_core::partiql::parser::parse_for_request;
-use extenddb_core::types::TableKeyInfo;
+use extenddb_core::types::{Item, TableKeyInfo, item_size_bytes};
 use extenddb_storage::error::StorageError;
 
 use super::authorize::{Gate, Surface};
 use super::common::{self, StatementError};
 use super::{SingleRequest, write};
+use crate::capacity_helpers;
 use crate::create_table::storage_err_to_dynamo;
 use crate::{DispatchMetrics, DispatchResult, OperationContext, handle_get_item};
 
@@ -243,6 +244,13 @@ pub(super) async fn run(
                 }
             }
             Err(error) if reached_item => {
+                if rcc.is_some()
+                    && !stmt.is_read()
+                    && is_charged_failure(&error)
+                    && let (Some(key_info), Some(key)) = (key_info, &key)
+                {
+                    capacity.add_failed(&table, failed_write_units(ctx, key_info, key).await?);
+                }
                 StatementError::from_item_error(&error).into_entry(Some(&table))
             }
             Err(error) => StatementError::from_error(&error).into_entry(Some(&table)),
@@ -457,6 +465,48 @@ fn detect_duplicate_keys(
     Ok(())
 }
 
+/// Whether a write that failed at its item is charged the write units of
+/// that item: a failed condition, a duplicate INSERT and an update that the
+/// item cannot take are; a refusal of the request is not (measured
+/// 2026-11-05).
+fn is_charged_failure(error: &DynamoDbError) -> bool {
+    match error {
+        DynamoDbError::ConditionalCheckFailedException(..)
+        | DynamoDbError::DuplicateItemException(_) => true,
+        DynamoDbError::ValidationException(message) => UPDATE_FAILURES.contains(&message.as_str()),
+        _ => false,
+    }
+}
+
+/// The refusals of an update that the stored item cannot take.
+const UPDATE_FAILURES: [&str; 2] = [
+    "An operand in the update expression has an incorrect data type",
+    "The document path provided in the update expression is invalid for update",
+];
+
+/// The write units a failed write is charged: those of the item stored under
+/// `key`, or one when there is none (measured 2026-11-05: a failed condition
+/// on a 3 KB item is charged 3 units, on a missing item 1, and a duplicate
+/// INSERT of a small item over a 3 KB item 3).
+async fn failed_write_units(
+    ctx: &OperationContext,
+    key_info: &TableKeyInfo,
+    key: &Map<String, Value>,
+) -> Result<f64, DynamoDbError> {
+    let key: Item = serde_json::from_value(Value::Object(key.clone())).map_err(|e| {
+        tracing::error!(internal_error = %e, "failed to read a translated PartiQL key");
+        DynamoDbError::InternalServerError("Internal server error".to_owned())
+    })?;
+    let stored = ctx
+        .storage
+        .get_item(key_info, &key)
+        .await
+        .map_err(storage_err_to_dynamo)?;
+    Ok(capacity_helpers::write_capacity_units(
+        stored.as_ref().map_or(0, item_size_bytes),
+    ))
+}
+
 /// A write member's `Responses[i]` entry: its table, plus the `RETURNING` row
 /// as `Item` when the statement returned one. A batch member honours
 /// `RETURNING` with the same projection `ExecuteStatement` puts in `Items`;
@@ -476,12 +526,28 @@ fn write_entry(table: &str, body: &Value) -> Value {
 }
 
 /// Accumulates per-table `ConsumedCapacity` objects from each sub-operation into
-/// the single list a batch returns, summing `CapacityUnits` (and the nested
-/// `Table` breakdown at INDEXES granularity) per table in first-seen order.
+/// the single list a batch returns, summing `CapacityUnits`, and at INDEXES
+/// granularity the nested `Table` units and the units of each global and
+/// local secondary index, per table in first-seen order (measured
+/// 2026-11-05).
+///
+/// The units of a failed write are added to its table's `CapacityUnits`
+/// alone, and only when a statement on that table succeeded: a table on
+/// which every write failed has no entry (measured 2026-11-05).
 #[derive(Default)]
 struct CapacityList {
     order: Vec<String>,
-    totals: HashMap<String, (f64, Option<f64>)>,
+    totals: HashMap<String, TableCapacity>,
+    failed: HashMap<String, f64>,
+}
+
+/// The units summed for one table of a batch.
+#[derive(Default)]
+struct TableCapacity {
+    units: f64,
+    table: Option<f64>,
+    global: BTreeMap<String, f64>,
+    local: BTreeMap<String, f64>,
 }
 
 impl CapacityList {
@@ -493,23 +559,23 @@ impl CapacityList {
         let Some(table) = cc.get("TableName").and_then(Value::as_str) else {
             return;
         };
-        let units = cc
-            .get("CapacityUnits")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let table_units = cc
-            .get("Table")
-            .and_then(|t| t.get("CapacityUnits"))
-            .and_then(Value::as_f64);
         if !self.totals.contains_key(table) {
             self.order.push(table.to_owned());
-            self.totals.insert(table.to_owned(), (0.0, None));
+            self.totals
+                .insert(table.to_owned(), TableCapacity::default());
         }
         let entry = self.totals.get_mut(table).expect("inserted above");
-        entry.0 += units;
-        if let Some(tu) = table_units {
-            entry.1 = Some(entry.1.unwrap_or(0.0) + tu);
+        entry.units += units_of(cc).unwrap_or(0.0);
+        if let Some(units) = cc.get("Table").and_then(units_of) {
+            entry.table = Some(entry.table.unwrap_or(0.0) + units);
         }
+        add_index_units(&mut entry.global, cc.get("GlobalSecondaryIndexes"));
+        add_index_units(&mut entry.local, cc.get("LocalSecondaryIndexes"));
+    }
+
+    /// Count `units` for a write on `table` that failed at its item.
+    fn add_failed(&mut self, table: &str, units: f64) {
+        *self.failed.entry(table.to_owned()).or_default() += units;
     }
 
     /// The `ConsumedCapacity` list, or `None` when nothing was accumulated.
@@ -521,17 +587,45 @@ impl CapacityList {
             .order
             .iter()
             .map(|table| {
-                let (units, table_units) = self.totals[table];
+                let entry = &self.totals[table];
+                let failed = self.failed.get(table).copied().unwrap_or(0.0);
                 let mut obj = Map::new();
                 obj.insert("TableName".to_owned(), Value::String(table.clone()));
-                obj.insert("CapacityUnits".to_owned(), json!(units));
-                if let Some(tu) = table_units {
-                    obj.insert("Table".to_owned(), json!({ "CapacityUnits": tu }));
+                obj.insert("CapacityUnits".to_owned(), json!(entry.units + failed));
+                if let Some(units) = entry.table {
+                    obj.insert("Table".to_owned(), json!({ "CapacityUnits": units }));
+                }
+                for (field, indexes) in [
+                    ("GlobalSecondaryIndexes", &entry.global),
+                    ("LocalSecondaryIndexes", &entry.local),
+                ] {
+                    if !indexes.is_empty() {
+                        let arms: Map<String, Value> = indexes
+                            .iter()
+                            .map(|(name, units)| (name.clone(), json!({ "CapacityUnits": units })))
+                            .collect();
+                        obj.insert(field.to_owned(), Value::Object(arms));
+                    }
                 }
                 Value::Object(obj)
             })
             .collect();
         Some(Value::Array(list))
+    }
+}
+
+/// The `CapacityUnits` of one arm of a `ConsumedCapacity` object.
+fn units_of(arm: &Value) -> Option<f64> {
+    arm.get("CapacityUnits").and_then(Value::as_f64)
+}
+
+/// Add the units of each index of an `INDEXES` breakdown to `totals`.
+fn add_index_units(totals: &mut BTreeMap<String, f64>, indexes: Option<&Value>) {
+    let Some(Value::Object(indexes)) = indexes else {
+        return;
+    };
+    for (name, arm) in indexes {
+        *totals.entry(name.clone()).or_default() += units_of(arm).unwrap_or(0.0);
     }
 }
 
@@ -554,5 +648,83 @@ mod tests {
             write_entry("t", &json!({ "Items": [] })),
             json!({ "TableName": "t" })
         );
+    }
+
+    fn capacity(table: &str, units: f64, gsi: f64, lsi: f64) -> Value {
+        json!({ "ConsumedCapacity": {
+            "TableName": table,
+            "CapacityUnits": units,
+            "Table": { "CapacityUnits": 1.0 },
+            "GlobalSecondaryIndexes": { "gsi": { "CapacityUnits": gsi } },
+            "LocalSecondaryIndexes": { "lsi": { "CapacityUnits": lsi } },
+        }})
+    }
+
+    #[test]
+    fn the_index_arms_are_summed_per_table() {
+        let mut list = CapacityList::default();
+        list.add(&capacity("t", 4.0, 2.0, 1.0));
+        list.add(&capacity("u", 2.0, 0.5, 0.5));
+        list.add(&capacity("t", 3.0, 1.0, 1.0));
+        assert_eq!(
+            list.into_value(),
+            Some(json!([
+                {
+                    "TableName": "t",
+                    "CapacityUnits": 7.0,
+                    "Table": { "CapacityUnits": 2.0 },
+                    "GlobalSecondaryIndexes": { "gsi": { "CapacityUnits": 3.0 } },
+                    "LocalSecondaryIndexes": { "lsi": { "CapacityUnits": 2.0 } },
+                },
+                {
+                    "TableName": "u",
+                    "CapacityUnits": 2.0,
+                    "Table": { "CapacityUnits": 1.0 },
+                    "GlobalSecondaryIndexes": { "gsi": { "CapacityUnits": 0.5 } },
+                    "LocalSecondaryIndexes": { "lsi": { "CapacityUnits": 0.5 } },
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_failed_write_counts_in_the_total_of_a_table_with_an_entry() {
+        let mut list = CapacityList::default();
+        list.add_failed("t", 3.0);
+        list.add(&json!({ "ConsumedCapacity": { "TableName": "t", "CapacityUnits": 2.0 } }));
+        list.add_failed("u", 1.0);
+        assert_eq!(
+            list.into_value(),
+            Some(json!([{ "TableName": "t", "CapacityUnits": 5.0 }]))
+        );
+        let mut failed_only = CapacityList::default();
+        failed_only.add_failed("t", 1.0);
+        assert_eq!(failed_only.into_value(), None);
+    }
+
+    #[test]
+    fn failures_at_the_item_are_charged() {
+        for error in [
+            DynamoDbError::ConditionalCheckFailedException(
+                "The conditional request failed".to_owned(),
+                None,
+            ),
+            DynamoDbError::DuplicateItemException(
+                "Duplicate primary key exists in table".to_owned(),
+            ),
+            DynamoDbError::ValidationException(UPDATE_FAILURES[0].to_owned()),
+            DynamoDbError::ValidationException(UPDATE_FAILURES[1].to_owned()),
+        ] {
+            assert!(is_charged_failure(&error), "{error:?}");
+        }
+        let key_update = DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Cannot update attribute pk. This \
+             attribute is part of the key"
+                .to_owned(),
+        );
+        assert!(!is_charged_failure(&key_update));
+        assert!(!is_charged_failure(&DynamoDbError::AccessDeniedException(
+            "refused".to_owned()
+        )));
     }
 }

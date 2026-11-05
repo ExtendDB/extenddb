@@ -842,3 +842,117 @@ def test_an_error_of_reading_the_statement_names_no_table(dynamodb_client, gtabl
     )
     assert resp["Responses"] == [_seed_answer(gtable), _validation(PARAMETERS)]
 
+
+# --- ConsumedCapacity with an index and with failed writes --------------------
+# A batch sums the units of its statements per table, with the units of each
+# index at INDEXES. A write that fails at its item is charged the units of the
+# item stored under its key (one when there is none), counted in its table's
+# CapacityUnits alone; a table on which every write failed reports nothing
+# (measured 2026-11-05).
+
+BIG = {"big": {"S": "x" * 3000}}
+
+
+def _capacity(client, table, statements, rcc, **names):
+    resp = _batch(
+        client,
+        [{"Statement": _sql(s, table, **names)} for s in statements],
+        ReturnConsumedCapacity=rcc,
+    )
+    return resp.get("ConsumedCapacity")
+
+
+def _arm(table, units, table_units=None, gsi_units=None):
+    arm = {"TableName": table, "CapacityUnits": units}
+    if table_units is not None:
+        arm["Table"] = {"CapacityUnits": table_units}
+    if gsi_units is not None:
+        arm["GlobalSecondaryIndexes"] = {"gsi": {"CapacityUnits": gsi_units}}
+    return arm
+
+
+UPDATE_A = "UPDATE {t} SET a = 9 WHERE pk = '{ok}' AND sk = 'b'"
+UPDATE_MISSING = "UPDATE {t} SET a = 9 WHERE pk = '{missing}' AND sk = 'b'"
+
+
+def test_an_index_key_change_reports_the_index_units(dynamodb_client, gtable):
+    put(dynamodb_client, gtable, "cb17")
+    assert _capacity(
+        dynamodb_client, gtable, ["UPDATE {t} SET g = 'x' WHERE pk = '{k}' AND sk = 'b'"],
+        "INDEXES", k="cb17",
+    ) == [_arm(gtable, 3.0, 1.0, 2.0)]
+
+
+@pytest.mark.parametrize(
+    "statements, rcc, expected",
+    [
+        ([UPDATE_A, UPDATE_MISSING], "TOTAL", (3.0, None, None)),
+        ([UPDATE_A, UPDATE_MISSING], "INDEXES", (3.0, 1.0, 1.0)),
+        ([UPDATE_MISSING, UPDATE_A], "INDEXES", (3.0, 1.0, 1.0)),
+        ([UPDATE_A, UPDATE_MISSING,
+          "UPDATE {t} SET a = 9 WHERE pk = '{missing2}' AND sk = 'b'"], "TOTAL", (4.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET a = 9 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (4.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET a = 9 WHERE pk = '{big}' AND sk = 'b' AND a = 99"], "INDEXES",
+         (5.0, 1.0, 1.0)),
+        ([UPDATE_A, "INSERT INTO {t} VALUE {{'pk':'{big}','sk':'b','a':1}}"], "TOTAL",
+         (5.0, None, None)),
+        ([UPDATE_A, "DELETE FROM {t} WHERE pk = '{ok2}' AND sk = 'b' AND a = 99"], "TOTAL",
+         (3.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET b = m + 1 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (3.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET a.b = 1 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (3.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET pk = 'z' WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (2.0, None, None)),
+        ([UPDATE_A, "UPDATE {t} SET g = 1 WHERE pk = '{ok2}' AND sk = 'b'"], "TOTAL",
+         (2.0, None, None)),
+        (["DELETE FROM {t} WHERE pk = '{ok}' AND sk = 'b'",
+          "DELETE FROM {t} WHERE pk = '{missing}' AND sk = 'b'"], "INDEXES", (3.0, 2.0, 1.0)),
+        (["INSERT INTO {t} VALUE {{'pk':'{missing}','sk':'b','a':1,'g':'q','gs':'1'}}",
+          "INSERT INTO {t} VALUE {{'pk':'{missing2}','sk':'b','a':1}}"], "INDEXES",
+         (3.0, 2.0, 1.0)),
+    ],
+    ids=[
+        "failed-condition-total",
+        "failed-condition-indexes",
+        "failure-first",
+        "two-failures",
+        "two-successes",
+        "failed-condition-on-a-3kb-item",
+        "duplicate-over-a-3kb-item",
+        "failed-delete-condition",
+        "operand-type",
+        "document-path",
+        "key-update-is-not-charged",
+        "index-key-type-is-not-charged",
+        "deletes",
+        "inserts",
+    ],
+)
+def test_a_failed_write_is_charged_on_its_table(dynamodb_client, gtable, statements, rcc, expected):
+    put(dynamodb_client, gtable, "cap-ok")
+    put(dynamodb_client, gtable, "cap-ok2")
+    put(dynamodb_client, gtable, "cap-big", **BIG)
+    names = {
+        "ok": "cap-ok",
+        "ok2": "cap-ok2",
+        "big": "cap-big",
+        "missing": f"cap-missing-{uuid.uuid4().hex[:6]}",
+        "missing2": f"cap-missing-{uuid.uuid4().hex[:6]}",
+    }
+    units, table_units, gsi_units = expected
+    assert _capacity(dynamodb_client, gtable, statements, rcc, **names) == [
+        _arm(gtable, units, table_units, gsi_units)
+    ]
+
+
+def test_failed_writes_alone_report_no_capacity(dynamodb_client, gtable):
+    assert _capacity(
+        dynamodb_client,
+        gtable,
+        [UPDATE_MISSING, "UPDATE {t} SET a = 9 WHERE pk = '{missing2}' AND sk = 'b'"],
+        "INDEXES",
+        missing=f"cap-missing-{uuid.uuid4().hex[:6]}",
+        missing2=f"cap-missing-{uuid.uuid4().hex[:6]}",
+    ) is None

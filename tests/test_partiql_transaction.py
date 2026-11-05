@@ -27,6 +27,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
+from partiql_gsi_table import gsi_table, key, put
 
 
 @pytest.fixture(scope="session")
@@ -795,3 +796,81 @@ def test_parameter_count_mismatch_beside_a_missing_table(dynamodb_client, ttable
         f"Validation failed in TransactStatements[{index}]: Number of parameters in request "
         "and statement don't match."
     )
+
+# --- the table with a global secondary index ------------------------------
+
+
+@pytest.fixture(scope="module")
+def gtable(dynamodb_client):
+    """The table with the index `gsi`, holding the items of the reads."""
+    with gsi_table(dynamodb_client, "extenddb-measure-2c-txng") as name:
+        put(dynamodb_client, name, "seed")
+        put(dynamodb_client, name, "seed2", gs="2")
+        put(dynamodb_client, name, "lst", l={"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]})
+        yield name
+
+
+def _sql(template, table, **names):
+    """`template` with `{t}` as the quoted table and each other field as the
+    key that name takes in this run."""
+    return template.format(t=f'"{table}"', **{n: key(v) for n, v in names.items()})
+
+
+def _members(table, templates, **names):
+    return [{"Statement": _sql(t, table, **names)} for t in templates]
+
+
+# --- ConsumedCapacity of an index ------------------------------------------------
+# A write transaction charges each write to an index at the units an
+# UpdateItem charges it, beside the doubled units of the table (measured
+# 2026-11-05). ExtendDB's TransactWriteItems has no old or new item of an
+# Update or Delete member to rate an index write from, so it reports the
+# table alone, for PartiQL and for the classic operation.
+
+TRANSACTION_INDEX_UNITS = pytest.mark.xfail(
+    bool(os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()),
+    reason="TransactWriteItems reports no index units",
+    raises=AssertionError,
+    strict=True,
+)
+
+
+@TRANSACTION_INDEX_UNITS
+def test_a_transaction_reports_its_index_units(dynamodb_client, gtable):
+    put(dynamodb_client, gtable, "ct17")
+    resp = _txn(
+        dynamodb_client,
+        _members(gtable, ["UPDATE {t} SET g = 'x' WHERE pk = '{k}' AND sk = 'b'"], k="ct17"),
+        ReturnConsumedCapacity="INDEXES",
+    )
+    assert resp["ConsumedCapacity"] == [
+        {
+            "TableName": gtable,
+            "CapacityUnits": 4.0,
+            "WriteCapacityUnits": 4.0,
+            "Table": {"CapacityUnits": 2.0, "WriteCapacityUnits": 2.0},
+            "GlobalSecondaryIndexes": {"gsi": {"CapacityUnits": 2.0, "WriteCapacityUnits": 2.0}},
+        }
+    ]
+
+
+@TRANSACTION_INDEX_UNITS
+def test_a_transaction_total_counts_its_index_units(dynamodb_client, gtable):
+    put(dynamodb_client, gtable, "twr")
+    put(dynamodb_client, gtable, "tws")
+    resp = _txn(
+        dynamodb_client,
+        _members(
+            gtable,
+            [
+                "UPDATE {t} SET a = 9 WHERE pk = '{r}' AND sk = 'b'",
+                "UPDATE {t} SET a = 9 WHERE pk = '{s}' AND sk = 'b'",
+            ],
+            r="twr",
+            s="tws",
+        ),
+        ReturnConsumedCapacity="TOTAL",
+    )
+    assert resp["ConsumedCapacity"] == [
+        {"TableName": gtable, "CapacityUnits": 6.0, "WriteCapacityUnits": 6.0}
+    ]
