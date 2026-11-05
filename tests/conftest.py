@@ -177,7 +177,13 @@ def create_and_cleanup_table(dynamodb_client, unique_table_name):
             dynamodb_client.delete_table(TableName=name)
         except dynamodb_client.exceptions.ResourceNotFoundException:
             continue
-        except dynamodb_client.exceptions.ResourceInUseException:
+        except dynamodb_client.exceptions.ResourceInUseException as exc:
+            # The test deleted the table and the delete is still running:
+            # DeleteTable of a DELETING table answers "Table is being deleted".
+            # Wait for it to go.
+            if "Table is being deleted" in exc.response["Error"]["Message"]:
+                wait_for_deleted(dynamodb_client, name)
+                continue
             # Table may be UPDATING (e.g., billing mode switch). Wait for
             # ACTIVE then retry the delete.
             wait_for_active(dynamodb_client, name)

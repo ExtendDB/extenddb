@@ -16,6 +16,58 @@ use futures::future::BoxFuture;
 
 use crate::store::SqliteEngine;
 
+/// Answer a statement that found the table's data table gone as a missing table.
+///
+/// The key info was read while the catalog row was `ACTIVE` or `DELETING`, and
+/// `DeleteTable` dropped the data table before the statement ran. SQLite
+/// reports the dropped table as `no such table`. DynamoDB answers a request on
+/// a table that is gone with `ResourceNotFoundException`, so the error is
+/// `TableNotFound` here rather than an internal error. Only this backend's data
+/// and index tables, all named `_ddb_<id>`, are matched, as PostgreSQL's
+/// `data_table_missing` matches its own. A data-plane statement also names the
+/// shared `stream_shards`, `stream_records`, `gsi_pending` and
+/// `vector_index_holds` tables; one of those missing is a catalog that lacks a
+/// migration, not a table that is gone, so it stays an internal error and is
+/// logged with its name.
+fn dropped_table_as_not_found(key_info: &TableKeyInfo, e: StorageError) -> StorageError {
+    if data_table_missing(&e) {
+        StorageError::TableNotFound(key_info.table_name.clone())
+    } else {
+        e
+    }
+}
+
+/// Whether an error is SQLite's `no such table` for a `_ddb_<id>` data or
+/// index table. SQLite names the table as the statement wrote it, with or
+/// without the `main.` schema.
+fn data_table_missing(e: &StorageError) -> bool {
+    matches!(e, StorageError::Internal(msg)
+        if msg.contains("no such table: _ddb_") || msg.contains("no such table: main._ddb_"))
+}
+
+/// The transaction form of [`dropped_table_as_not_found`]: a transaction's
+/// statements name every table in it, so the first operation's table stands
+/// for the request. DynamoDB answers a transaction on a table that is gone
+/// with `ResourceNotFoundException` without naming the table.
+fn transaction_dropped_table_as_not_found(
+    first: Option<&TableKeyInfo>,
+    e: StorageError,
+) -> StorageError {
+    match first {
+        Some(key_info) => dropped_table_as_not_found(key_info, e),
+        None => e,
+    }
+}
+
+fn transact_write_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
 impl DataEngine for SqliteEngine {
     /// Declares vector support by handing over the implementation. `Some(self)`
     /// only compiles because `SqliteEngine` implements `VectorSearchEngine`, so
@@ -47,6 +99,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -57,7 +110,11 @@ impl DataEngine for SqliteEngine {
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
         let key_info = key_info.clone();
         let key = key.clone();
-        Box::pin(async move { self.get_item_impl(&key_info, &key).await })
+        Box::pin(async move {
+            self.get_item_impl(&key_info, &key)
+                .await
+                .map_err(|e| dropped_table_as_not_found(&key_info, e))
+        })
     }
 
     fn delete_item(
@@ -84,6 +141,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -116,6 +174,7 @@ impl DataEngine for SqliteEngine {
                 stream.as_ref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -145,6 +204,7 @@ impl DataEngine for SqliteEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -170,6 +230,7 @@ impl DataEngine for SqliteEngine {
                 index_name.as_deref(),
             )
             .await
+            .map_err(|e| dropped_table_as_not_found(&key_info, e))
         })
     }
 
@@ -209,7 +270,10 @@ impl DataEngine for SqliteEngine {
                 .iter()
                 .map(|(key_info, key)| TransactGetOp { key_info, key })
                 .collect();
-            self.transact_get_items_impl(&borrowed).await
+            let first = owned.first().map(|(key_info, _)| key_info);
+            self.transact_get_items_impl(&borrowed)
+                .await
+                .map_err(|e| transaction_dropped_table_as_not_found(first, e))
         })
     }
 
@@ -228,6 +292,7 @@ impl DataEngine for SqliteEngine {
         });
         Box::pin(async move {
             let borrowed: Vec<TransactWriteOp> = owned.iter().map(OwnedWriteOp::as_op).collect();
+            let first = borrowed.first().map(transact_write_op_key_info);
             self.transact_write_items_impl(
                 &borrowed,
                 idempotency.as_ref().map(|(a, t, f)| IdempotencyKey {
@@ -237,6 +302,7 @@ impl DataEngine for SqliteEngine {
                 }),
             )
             .await
+            .map_err(|e| transaction_dropped_table_as_not_found(first, e))
         })
     }
 
@@ -416,6 +482,52 @@ impl OwnedWriteOp {
                 maps,
                 return_values_on_ccf: *rv,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod dropped_table_tests {
+    use super::*;
+
+    fn key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "t".to_owned(),
+            ..TableKeyInfo::default()
+        }
+    }
+
+    /// The table's own data or index table gone: the table is gone.
+    #[test]
+    fn a_missing_ddb_table_is_a_missing_table() {
+        for msg in [
+            "error returned from database: (code: 1) no such table: _ddb_0b0e",
+            "error returned from database: (code: 1) no such table: main._ddb_0b0e",
+        ] {
+            let e = dropped_table_as_not_found(&key_info(), StorageError::Internal(msg.to_owned()));
+            assert!(
+                matches!(e, StorageError::TableNotFound(ref n) if n == "t"),
+                "{msg}: {e:?}"
+            );
+        }
+    }
+
+    /// A shared table missing is a catalog without a migration, not a table
+    /// that is gone: it stays an internal error with the table's name.
+    #[test]
+    fn a_missing_shared_table_stays_internal() {
+        for table in [
+            "stream_shards",
+            "stream_records",
+            "gsi_pending",
+            "vector_index_holds",
+        ] {
+            let msg = format!("error returned from database: (code: 1) no such table: {table}");
+            let e = dropped_table_as_not_found(&key_info(), StorageError::Internal(msg.clone()));
+            assert!(
+                matches!(e, StorageError::Internal(ref m) if m == &msg),
+                "{table}: {e:?}"
+            );
         }
     }
 }

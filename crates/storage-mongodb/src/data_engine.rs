@@ -3697,7 +3697,7 @@ impl From<StorageError> for TxErr {
 /// UnknownTransactionCommitResult label, under which the commit may
 /// already have applied. Commit errors are classified by
 /// `classify_commit_error` instead.
-fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
+pub(crate) fn is_transient_write_conflict(e: &mongodb::error::Error) -> bool {
     if e.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR) {
         return true;
     }

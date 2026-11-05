@@ -45,3 +45,28 @@ pub async fn handle_delete_table(
     };
     serialize_output(&output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use extenddb_storage::error::StorageError;
+
+    /// A second DeleteTable during the DELETING window: the measured sentence
+    /// (2026-10-24), byte for byte. The other non-ACTIVE statuses keep theirs.
+    #[test]
+    fn a_deleting_table_has_its_own_sentence() {
+        match storage_err_to_dynamo(StorageError::TableBeingDeleted("t".to_owned())) {
+            DynamoDbError::ResourceInUseException(msg) => assert_eq!(
+                msg,
+                "Attempt to change a resource which is still in use: Table is being deleted: t"
+            ),
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+        match storage_err_to_dynamo(StorageError::TableNotActive("t".to_owned())) {
+            DynamoDbError::ResourceInUseException(msg) => {
+                assert_eq!(msg, "Table is being created, updated, or deleted: t");
+            }
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+    }
+}

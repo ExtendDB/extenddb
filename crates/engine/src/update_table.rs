@@ -321,6 +321,15 @@ fn update_table_err_to_dynamo(
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
+        // The service words a DELETING table differently from the other
+        // non-ACTIVE statuses (measured 2026-10-24); the sentence lives with
+        // the engine's other message templates.
+        StorageError::TableBeingDeleted(name) => {
+            DynamoDbError::ResourceInUseException(extenddb_core::error::error_message(
+                extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
+                &[&name],
+            ))
+        }
         StorageError::IndexAlreadyExists(name) => DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: Index already exists: {name}"
         )),
@@ -499,5 +508,26 @@ mod tests {
         let err =
             update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
         assert!(matches!(err, DynamoDbError::InternalServerError(_)));
+    }
+
+    /// UpdateTable on a DELETING table: the measured sentence (2026-10-24),
+    /// byte for byte, and the other non-ACTIVE statuses keep theirs.
+    #[test]
+    fn a_deleting_table_has_its_own_sentence() {
+        let err = update_table_err_to_dynamo(StorageError::TableBeingDeleted("t".to_owned()), "t");
+        match err {
+            DynamoDbError::ResourceInUseException(msg) => assert_eq!(
+                msg,
+                "Attempt to change a resource which is still in use: Table is being deleted: t"
+            ),
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
+        let err = update_table_err_to_dynamo(StorageError::TableNotActive("t".to_owned()), "t");
+        match err {
+            DynamoDbError::ResourceInUseException(msg) => {
+                assert_eq!(msg, "Table t is not in ACTIVE state");
+            }
+            other => panic!("expected ResourceInUseException, got {other:?}"),
+        }
     }
 }

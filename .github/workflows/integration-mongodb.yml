@@ -104,6 +104,14 @@ jobs:
           EXTENDDB_TEST_MONGODB_STANDALONE_URI: mongodb://127.0.0.1:27019/?directConnection=true
           EXTENDDB_TEST_MONGODB_REQUIRED: "1"
         run: cargo test -p extenddb-storage-mongodb snapshot_engine
+      - name: Run DELETING window tests
+        # What DeleteTable and UpdateTable answer while a table is DELETING,
+        # and that a delete which stopped after its mark is finished. Each
+        # test works in databases of its own on the replica set above.
+        env:
+          EXTENDDB_TEST_MONGODB_URI: mongodb://127.0.0.1:27018/?directConnection=true
+          EXTENDDB_TEST_MONGODB_REQUIRED: "1"
+        run: cargo test -p extenddb-storage-mongodb --lib deleting_window_tests
       - name: Stop MongoDB containers
         if: always()
         run: docker rm -f extenddb-runtests-mongo-27018 extenddb-snapshot-standalone-27019

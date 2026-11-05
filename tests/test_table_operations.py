@@ -177,12 +177,13 @@ class TestDeleteTable:
             DeletionProtectionEnabled=False,
         )
 
-    def test_delete_of_a_deleting_table_returns_its_description(
+    def test_delete_of_a_deleting_table_is_refused_as_being_deleted(
         self, create_and_cleanup_table, dynamodb_client, unique_table_name
     ):
-        """DeleteTable of a table that is already DELETING returns the table's
-        description with TableStatus DELETING and no error, as the service does,
-        and leaves the table as it was.
+        """DeleteTable of a table that is already DELETING is refused with
+        ResourceInUseException, as the service refuses it (measured 2026-10-25
+        and 2026-10-30, empty tables and tables of 300 items, 0 to 3 s into
+        the window), and leaves the table as it was.
 
         On ExtendDB the DELETING state is written into the catalog directly: on
         PostgreSQL a reader or writer holding the table leaves it there, and on
@@ -192,10 +193,17 @@ class TestDeleteTable:
         DELETING, so there the test does not apply.
         """
         create_and_cleanup_table(unique_table_name)
+        expected = (
+            "Attempt to change a resource which is still in use: "
+            f"Table is being deleted: {unique_table_name}"
+        )
         if _is_real_dynamodb():
             dynamodb_client.delete_table(TableName=unique_table_name)
-            second = dynamodb_client.delete_table(TableName=unique_table_name)
-            assert second["TableDescription"]["TableStatus"] == "DELETING"
+            with pytest.raises(ClientError) as exc_info:
+                dynamodb_client.delete_table(TableName=unique_table_name)
+            err = exc_info.value.response["Error"]
+            assert err["Code"] == "ResourceInUseException"
+            assert err["Message"] == expected
             return
         backend = configured_backend() or (
             "postgres" if config_value("storage.postgres", "connection_string") else None
@@ -207,12 +215,11 @@ class TestDeleteTable:
             _set_status(catalog, backend, unique_table_name, "DELETING")
             try:
                 before = _status_row(catalog, backend, unique_table_name)
-                second = dynamodb_client.delete_table(TableName=unique_table_name)
-                desc = second["TableDescription"]
-                assert desc["TableStatus"] == "DELETING"
-                assert desc["TableName"] == unique_table_name
-                assert desc["TableArn"].endswith(f"table/{unique_table_name}")
-                assert desc["KeySchema"] == [{"AttributeName": "pk", "KeyType": "HASH"}]
+                with pytest.raises(ClientError) as exc_info:
+                    dynamodb_client.delete_table(TableName=unique_table_name)
+                err = exc_info.value.response["Error"]
+                assert err["Code"] == "ResourceInUseException"
+                assert err["Message"] == expected
                 described = dynamodb_client.describe_table(TableName=unique_table_name)
                 assert described["Table"]["TableStatus"] == "DELETING"
                 assert _status_row(catalog, backend, unique_table_name) == before, (

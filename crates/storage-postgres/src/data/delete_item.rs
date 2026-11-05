@@ -10,7 +10,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{SortKeyValue, parse_sk, pk_to_text, sk_column, sk_info};
 
 use super::gsi_build::fix_up_stale_write;
-use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
+use super::index::{db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
 use super::query::check_condition;
 use super::tx_helpers::write_stream_record_in_tx;
 use super::{data_table_name, json_to_item};
@@ -91,11 +91,7 @@ impl PostgresEngine {
                 );
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
 
-                let mut tx = self
-                    .data_pool
-                    .begin()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let mut tx = self.data_pool.begin().await.map_err(db_error)?;
 
                 let old: Option<(serde_json::Value,)> =
                     bind_sk_fetch_optional!(&select_sql, pk_text.as_ref(), &sk, &mut *tx)?;
@@ -147,7 +143,7 @@ impl PostgresEngine {
                             .await
                     }
                 }
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .map_err(db_error)?;
 
                 // Sync GSI/LSI update within transaction (D-4).
                 let old_item_for_idx = if indexes.is_empty() {
@@ -220,9 +216,7 @@ impl PostgresEngine {
                 async_enqueued +=
                     fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
-                tx.commit()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                tx.commit().await.map_err(db_error)?;
 
                 if async_enqueued > 0
                     && let Some(ref q) = self.gsi_queue
@@ -261,7 +255,7 @@ impl PostgresEngine {
                             .await
                     }
                 }
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                .map_err(db_error)?;
                 self.fix_up_autocommit(stamp, key_info, key).await;
                 Ok(None)
             }
@@ -272,17 +266,13 @@ impl PostgresEngine {
                     format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 FOR UPDATE");
                 let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
 
-                let mut tx = self
-                    .data_pool
-                    .begin()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let mut tx = self.data_pool.begin().await.map_err(db_error)?;
 
                 let old: Option<(serde_json::Value,)> = sqlx::query_as(&select_sql)
                     .bind(pk_text.as_ref())
                     .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(db_error)?;
 
                 if let Some((ref old_json,)) = old {
                     let old_item: Item = json_to_item(old_json.clone())?;
@@ -309,7 +299,7 @@ impl PostgresEngine {
                     .bind(pk_text.as_ref())
                     .execute(&mut *tx)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(db_error)?;
 
                 // Sync GSI/LSI update within transaction (D-4).
                 let old_item_for_idx = if indexes.is_empty() {
@@ -382,9 +372,7 @@ impl PostgresEngine {
                 async_enqueued +=
                     fix_up_stale_write(&mut tx, &self.pool, stamp, key_info, &indexes, key).await?;
 
-                tx.commit()
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                tx.commit().await.map_err(db_error)?;
 
                 if async_enqueued > 0
                     && let Some(ref q) = self.gsi_queue
@@ -404,7 +392,7 @@ impl PostgresEngine {
                     .bind(pk_text.as_ref())
                     .execute(&self.data_pool)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(db_error)?;
                 self.fix_up_autocommit(stamp, key_info, key).await;
                 Ok(None)
             }

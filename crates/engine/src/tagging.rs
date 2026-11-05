@@ -46,6 +46,48 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
+/// What [`validate_resource_arn`] answers for a table that is `DELETING`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhileDeleting {
+    /// `ListTagsOfResource`: the table is listed until it is gone.
+    Serve,
+    /// `TagResource` and `UntagResource`: refused as a table still in use.
+    Refuse,
+}
+
+/// Refuse a tag change on a table that is being deleted. The service answers
+/// `TagResource` and `UntagResource` on a `DELETING` table with
+/// `ResourceInUseException` and the sentence `DeleteTable` and `UpdateTable`
+/// give in that window, and serves `ListTagsOfResource` (measured
+/// 2026-11-03). The key info carries no status, and the data plane reads a
+/// `DELETING` table as found on PostgreSQL and SQLite, so the status is read
+/// with `describe_table`. Any other answer from it is left to the existence
+/// check that follows.
+async fn refuse_while_deleting(
+    table_name: &str,
+    ctx: &OperationContext,
+) -> Result<(), DynamoDbError> {
+    if let Ok(desc) = ctx
+        .storage
+        .describe_table(
+            &ctx.account_id,
+            extenddb_core::types::DescribeTableInput {
+                table_name: table_name.to_owned(),
+            },
+        )
+        .await
+        && desc.table_status == extenddb_core::types::TableStatus::Deleting
+    {
+        return Err(DynamoDbError::ResourceInUseException(
+            extenddb_core::error::error_message(
+                extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
+                &[table_name],
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that the ARN refers to an existing table owned by the caller.
 ///
 /// The error classes and messages below match `DynamoDB`, verified against the
@@ -61,13 +103,18 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Account differs from the caller's | `AccessDeniedException` |
 /// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
+/// | Table is `DELETING`, for `TagResource` and `UntagResource` (`while_deleting` is `Refuse`) | `ResourceInUseException` (`Table is being deleted`) |
 ///
 /// Account is checked before the partition, service, and region, matching the
 /// service: a cross-account ARN is denied without revealing whether its other
 /// fields are valid. For a table ARN, a no-permissions principal is denied by
 /// authorization before this runs; the partition, service, region, and
 /// existence errors therefore surface only for an authorized principal.
-async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
+async fn validate_resource_arn(
+    arn: &str,
+    ctx: &OperationContext,
+    while_deleting: WhileDeleting,
+) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
@@ -140,6 +187,9 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         ))
     })?;
 
+    if while_deleting == WhileDeleting::Refuse {
+        refuse_while_deleting(table_name, ctx).await?;
+    }
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
         .table_key_info(&ctx.account_id, table_name)
@@ -175,7 +225,7 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Refuse).await?;
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
@@ -212,7 +262,7 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Refuse).await?;
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
@@ -247,7 +297,7 @@ pub async fn handle_list_tags_of_resource(
         ));
     }
 
-    validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Serve).await?;
 
     let tags = ctx
         .storage

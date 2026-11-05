@@ -48,7 +48,7 @@ pub(super) async fn fetch_item_in_tx(
             .bind(pk_text.as_ref())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(db_error)?;
         row.map(|(v,)| v)
     };
 
