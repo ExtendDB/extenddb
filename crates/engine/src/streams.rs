@@ -466,14 +466,14 @@ mod tests {
         use super::check_list_streams_table_name;
         use extenddb_core::error::DynamoDbError;
 
-        for account in ["111122223333", "123456789012"] {
-            let arn = format!("arn:aws:dynamodb:us-east-1:{account}:table/orders");
+        for owner in ["111122223333", "123456789012"] {
+            let arn = format!("arn:aws:dynamodb:us-east-1:{owner}:table/orders");
             match check_list_streams_table_name(&json!({ "TableName": arn }), (3, 255)) {
                 Err(DynamoDbError::ValidationException(m)) => assert_eq!(
                     m,
                     "TableName must be at least 3 characters long and at most 255 characters long"
                 ),
-                other => panic!("{arn}: {other:?}"),
+                other => panic!("a table ARN passed the check: {other:?}"),
             }
         }
         match check_list_streams_table_name(
