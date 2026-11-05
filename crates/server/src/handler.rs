@@ -77,16 +77,9 @@ pub(crate) async fn handle_request(
     // --- Pre-auth body validation ---
     // Real DynamoDB validates request format (empty body, invalid JSON) before
     // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
+    let input: Value = match crate::request_parse::parse_request_value(&body) {
         Ok(v) => v,
-        Err(e) => {
-            return error_response(
-                &DynamoDbError::SerializationException(format!(
-                    "Start of structure or map found where not expected: {e}"
-                )),
-                &request_id,
-            );
-        }
+        Err(e) => return error_response(&e, &request_id),
     };
 
     // --- Auth segment ---
