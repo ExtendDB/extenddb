@@ -51,10 +51,10 @@ use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary};
 use extenddb_storage::JobPermit;
 use extenddb_storage::backup_catalog::{
-    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
+    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, WriteOutcome, new_generation,
+    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -693,6 +693,56 @@ impl SqliteEngine {
             .await
             .map_err(db_err)
     }
+
+    /// DeleteBackup's first step, and with `remove` the outright removal of
+    /// `forget_available_backup_row`, as one write transaction under the
+    /// write lock: read the status, run the in-use rule, then write DELETING
+    /// or, with `remove`, delete the row (`Deleting` then means removed). A
+    /// restore's registration runs its in-use check the same way, so it
+    /// orders wholly before or after either. One body, so the two methods
+    /// share the lock and the rule.
+    async fn start_backup_delete_tx(
+        &self,
+        key: &BackupKey,
+        remove: bool,
+    ) -> Result<DeleteStart, StorageError> {
+        let _writer = self.write_lock.lock().await;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM backup_index WHERE account_id = ? AND backup_id = ?",
+        )
+        .bind(&key.account_id)
+        .bind(&key.backup_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let status = BackupStatus::parse(&status.ok_or_else(|| not_found(&key.backup_arn))?)?;
+        if status != BackupStatus::Available {
+            return Ok(DeleteStart::Status(status));
+        }
+        if let Some(table) = creating_restore_target(&mut *tx, &key.backup_arn).await? {
+            return Ok(DeleteStart::InUse(table));
+        }
+        let write = if remove {
+            "DELETE FROM backup_index \
+             WHERE account_id = ? AND backup_id = ? AND status = 'AVAILABLE'"
+        } else {
+            "UPDATE backup_index SET status = 'DELETING' \
+             WHERE account_id = ? AND backup_id = ? AND status = 'AVAILABLE'"
+        };
+        sqlx::query(write)
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(DeleteStart::Deleting)
+    }
 }
 
 impl BackupCatalog for SqliteEngine {
@@ -733,6 +783,7 @@ impl BackupCatalog for SqliteEngine {
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(db_err)?;
+            // OR IGNORE: typed values fail no NOT NULL or CHECK, so only a key conflict is ignored.
             let inserted = sqlx::query(&format!(
                 "INSERT OR IGNORE INTO backup_index (backup_id, account_id, table_name, \
                  backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
@@ -772,6 +823,57 @@ impl BackupCatalog for SqliteEngine {
                 generation,
                 record: JobRecord::Backup(row.key()),
             }) as Box<dyn JobClaim>)
+        })
+    }
+
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            // No slot: an unowned row has no job. A job that holds the id's
+            // slot and has not inserted its row yet finds this one and is
+            // refused, as it is by any row with the key.
+            let source_table = serde_json::to_string(&row.source_table_details_json)
+                .map_err(|e| StorageError::Internal(format!("source table details: {e}")))?;
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
+            // `ON CONFLICT DO NOTHING` covers the primary key (`account_id`,
+            // `backup_id`) and the unique `backup_id`, and no other
+            // constraint: a NOT NULL or CHECK violation is an error.
+            let inserted = sqlx::query(&format!(
+                "INSERT INTO backup_index (backup_id, account_id, table_name, \
+                 backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
+                 item_count, created_at, completed_at, failure_reason, \
+                 source_table_details_json, owner_generation, heartbeat_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {NOW}, ?, ?, ?, {NOW}) \
+                 ON CONFLICT DO NOTHING"
+            ))
+            .bind(&row.backup_id)
+            .bind(&row.account_id)
+            .bind(&row.table_name)
+            .bind(&row.backup_arn)
+            .bind(&row.backup_name)
+            .bind(row.status.as_str())
+            .bind(row.store.store_kind.as_str())
+            .bind(&row.store.store_root)
+            .bind(&row.store.store_id)
+            .bind(row.size_bytes)
+            .bind(row.item_count)
+            .bind(format_epoch_seconds(row.created_at))
+            .bind(&row.failure_reason)
+            .bind(&source_table)
+            .bind(generation_column(UNOWNED_GENERATION))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            tx.commit().await.map_err(db_err)?;
+            Ok(inserted == 1)
         })
     }
 
@@ -866,42 +968,19 @@ impl BackupCatalog for SqliteEngine {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
+        Box::pin(self.start_backup_delete_tx(key, false))
+    }
+
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
         Box::pin(async move {
-            // Under the write lock, in one write transaction: a restore's
-            // registration runs its in-use check the same way, so the two
-            // order wholly one before the other.
-            let _writer = self.write_lock.lock().await;
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(db_err)?;
-            let status: Option<String> = sqlx::query_scalar(
-                "SELECT status FROM backup_index WHERE account_id = ? AND backup_id = ?",
-            )
-            .bind(&key.account_id)
-            .bind(&key.backup_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            let status = BackupStatus::parse(&status.ok_or_else(|| not_found(&key.backup_arn))?)?;
-            if status != BackupStatus::Available {
-                return Ok(DeleteStart::Status(status));
-            }
-            if let Some(table) = creating_restore_target(&mut *tx, &key.backup_arn).await? {
-                return Ok(DeleteStart::InUse(table));
-            }
-            sqlx::query(
-                "UPDATE backup_index SET status = 'DELETING' \
-                 WHERE account_id = ? AND backup_id = ? AND status = 'AVAILABLE'",
-            )
-            .bind(&key.account_id)
-            .bind(&key.backup_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-            tx.commit().await.map_err(db_err)?;
-            Ok(DeleteStart::Deleting)
+            Ok(match self.start_backup_delete_tx(key, true).await? {
+                DeleteStart::Deleting => ForgetRow::Removed,
+                DeleteStart::InUse(table) => ForgetRow::InUse(table),
+                DeleteStart::Status(status) => ForgetRow::Status(status),
+            })
         })
     }
 

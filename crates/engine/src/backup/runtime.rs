@@ -176,6 +176,10 @@ pub struct BackupRuntime {
     /// of the same request meets while the first registration is still in
     /// flight ([`Self::begin_restore_registration`]).
     restore_registrations: Arc<std::sync::Mutex<HashMap<(String, String), InFlightRegistration>>>,
+    /// The server's region, which `backup sync` compares an adopted ARN's
+    /// region with (a backup from another region is adopted and logged);
+    /// `None` until set, when only the partition is compared.
+    region: Option<String>,
 }
 
 /// The registration outcome a waiting retry reads: `None` until the
@@ -266,8 +270,20 @@ pub struct ConfiguredStore {
     /// manifests starts with ([`Self::with_manifest_names`]; empty until
     /// set).
     pub key_prefix: String,
-    store_id: RwLock<Option<String>>,
-    health: RwLock<StoreHealth>,
+    /// The id the last passing check settled; shared with every
+    /// [`StoreFence`] of the store, which compares the file's id with it.
+    store_id: Arc<RwLock<Option<String>>>,
+    /// Shared with every [`StoreFence`] of the store, which records the
+    /// problem it finds here.
+    health: Arc<RwLock<StoreHealth>>,
+    /// This instance's catalog id, read once by the first fence check that
+    /// needs it and kept for the process. A catalog re-created under a
+    /// running process (`destroy` and `init` beside it, which MongoDB and
+    /// Cassandra allow) gets a new id the cache does not see; the fence then
+    /// finds a root that names the new catalog foreign and refuses every
+    /// deletion and CreateBackup until the process restarts, which is the
+    /// safe direction.
+    catalog_id: Arc<std::sync::OnceLock<String>>,
     /// Whether the store's `validate` has passed; the checks run it first
     /// until it has.
     validated: AtomicBool,
@@ -288,6 +304,15 @@ pub struct ConfiguredStore {
     /// Set once a defaulted root's first check failed with no rows for it:
     /// the runtime then answers as a server with no store configured.
     set_aside: AtomicBool,
+    /// Whether this instance's catalog is an in-memory SQLite database: the
+    /// identity file its checks write says so, and its checks adopt a root
+    /// another such catalog owned (`store_identity`'s module doc).
+    ephemeral_catalog: bool,
+    /// Whether the startup sync of an in-memory catalog is still to run
+    /// ([`crate::backup::sync::startup_sync`]): set with
+    /// `ephemeral_catalog`, cleared when a sync over a healthy store has
+    /// listed the whole root.
+    startup_sync_pending: AtomicBool,
 }
 
 /// The restore spool of an S3 store.
@@ -370,13 +395,16 @@ impl ConfiguredStore {
             root,
             store,
             spool,
-            store_id: RwLock::new(store_id),
-            health: RwLock::new(health),
+            store_id: Arc::new(RwLock::new(store_id)),
+            health: Arc::new(RwLock::new(health)),
+            catalog_id: Arc::new(std::sync::OnceLock::new()),
             validated: AtomicBool::new(validated),
             check_call_in_flight: Arc::new(AtomicBool::new(false)),
             call_slot: Arc::new(Semaphore::new(1)),
             defaulted: false,
             set_aside: AtomicBool::new(false),
+            ephemeral_catalog: false,
+            startup_sync_pending: AtomicBool::new(false),
         }
     }
 
@@ -398,13 +426,16 @@ impl ConfiguredStore {
             root,
             store,
             spool,
-            store_id: RwLock::new(None),
-            health: RwLock::new(StoreHealth::Checking),
+            store_id: Arc::new(RwLock::new(None)),
+            health: Arc::new(RwLock::new(StoreHealth::Checking)),
+            catalog_id: Arc::new(std::sync::OnceLock::new()),
             validated: AtomicBool::new(false),
             check_call_in_flight: Arc::new(AtomicBool::new(false)),
             call_slot: Arc::new(Semaphore::new(1)),
             defaulted: false,
             set_aside: AtomicBool::new(false),
+            ephemeral_catalog: false,
+            startup_sync_pending: AtomicBool::new(false),
         }
     }
 
@@ -448,6 +479,42 @@ impl ConfiguredStore {
         self.bucket = bucket;
         self.key_prefix = key_prefix;
         self
+    }
+
+    /// The same store for an instance whose catalog is an in-memory SQLite
+    /// database (`ephemeral_catalog`): its checks write the marker and
+    /// adopt a root another in-memory catalog owned, and the startup sync
+    /// is pending ([`crate::backup::sync::startup_sync`]).
+    #[must_use]
+    pub fn with_ephemeral_catalog(mut self, ephemeral_catalog: bool) -> Self {
+        self.ephemeral_catalog = ephemeral_catalog;
+        self.startup_sync_pending = AtomicBool::new(ephemeral_catalog);
+        self
+    }
+
+    /// Whether this instance's catalog is an in-memory SQLite database.
+    #[must_use]
+    pub fn ephemeral_catalog(&self) -> bool {
+        self.ephemeral_catalog
+    }
+
+    /// Whether the startup sync is still to run.
+    #[must_use]
+    pub fn startup_sync_pending(&self) -> bool {
+        self.startup_sync_pending.load(Ordering::Acquire)
+    }
+
+    /// Take the pending startup sync: `true` once, for the caller that runs
+    /// it, so two callers (the server's start and a reconciler cycle) never
+    /// run it at once. A caller whose sync did not list the whole root
+    /// hands it back with [`Self::retry_startup_sync`].
+    pub(crate) fn take_startup_sync(&self) -> bool {
+        self.startup_sync_pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// Hand a taken startup sync back, for the next reconciler cycle.
+    pub(crate) fn retry_startup_sync(&self) {
+        self.startup_sync_pending.store(true, Ordering::Release);
     }
 
     /// The store's identity, once a check has read its id.
@@ -526,36 +593,27 @@ impl ConfiguredStore {
             }
             Err(problem) => StoreHealth::Unhealthy(problem),
         };
-        let mut health = self
-            .health
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if health.category() == next.category() {
-            *health = next;
-            return false;
+        transition(self.kind, &self.root, &self.health, next, || {
+            self.identity().map(|i| i.store_id).unwrap_or_default()
+        })
+    }
+
+    /// The deletion fence of this store ([`StoreFence`]), sharing its
+    /// health.
+    #[must_use]
+    pub fn fence(&self) -> StoreFence {
+        StoreFence {
+            store: Arc::clone(&self.store),
+            kind: self.kind,
+            root: self.root.clone(),
+            health: Arc::clone(&self.health),
+            store_id: Arc::clone(&self.store_id),
+            catalog_id: Arc::clone(&self.catalog_id),
+            in_flight: Arc::clone(&self.check_call_in_flight),
+            call_slot: Arc::clone(&self.call_slot),
+            park: self.kind == StoreKind::Filesystem,
+            bound: self.check_timeout(),
         }
-        match (&*health, &next) {
-            (StoreHealth::Checking, StoreHealth::Healthy) => tracing::info!(
-                "backup store ({}) {} passed its check (store id {}); it serves restores and \
-                 deletes of the backups it holds",
-                self.kind,
-                self.root,
-                self.identity().map(|i| i.store_id).unwrap_or_default()
-            ),
-            (_, StoreHealth::Healthy) => {
-                tracing::info!("backup store ({}) is healthy again", self.kind);
-            }
-            (_, StoreHealth::Unhealthy(problem)) => tracing::error!(
-                "backup store ({}) {} is unhealthy: {problem}; restore and delete of a backup \
-                 in the store are refused until the check passes; the check runs again each \
-                 reconciler cycle",
-                self.kind,
-                self.root
-            ),
-            (_, StoreHealth::Checking) => {}
-        }
-        *health = next;
-        true
     }
 
     /// Whether the store's `validate` has passed.
@@ -600,6 +658,255 @@ impl ConfiguredStore {
             park: self.kind == StoreKind::Filesystem,
             timed_out: AtomicBool::new(false),
         }
+    }
+}
+
+/// Set `health` to `next`, logging a transition between categories once
+/// ([`ConfiguredStore::record_check`]); `store_id` names the id in the
+/// first healthy line. Returns whether the category changed.
+fn transition(
+    kind: StoreKind,
+    root: &str,
+    health: &RwLock<StoreHealth>,
+    next: StoreHealth,
+    store_id: impl FnOnce() -> String,
+) -> bool {
+    let mut health = health
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if health.category() == next.category() {
+        *health = next;
+        return false;
+    }
+    match (&*health, &next) {
+        (StoreHealth::Checking, StoreHealth::Healthy) => tracing::info!(
+            "backup store ({kind}) {root} passed its check (store id {}); it serves restores \
+             and deletes of the backups it holds",
+            store_id()
+        ),
+        (_, StoreHealth::Healthy) => {
+            tracing::info!("backup store ({kind}) is healthy again");
+        }
+        (_, StoreHealth::Unhealthy(problem)) => tracing::error!(
+            "backup store ({kind}) {root} is unhealthy: {problem}; restore and delete of a \
+             backup in the store are refused until the check passes; the check runs again each \
+             reconciler cycle"
+        ),
+        (_, StoreHealth::Checking) => {}
+    }
+    *health = next;
+    true
+}
+
+/// The `ValidationException` an operation that touches a store of `kind`
+/// answers while its health is not [`StoreHealth::Healthy`]; `None` when
+/// it is.
+fn health_refusal(kind: StoreKind, health: &StoreHealth) -> Option<DynamoDbError> {
+    match health {
+        StoreHealth::Healthy => None,
+        StoreHealth::Checking => Some(DynamoDbError::ValidationException(format!(
+            "The {kind} backup store configured on this server has not passed a check yet (its \
+             first check is pending); the operation is refused until it does"
+        ))),
+        StoreHealth::Unhealthy(problem) => Some(DynamoDbError::ValidationException(format!(
+            "The {kind} backup store configured on this server is unhealthy ({}); the operation \
+             is refused until the store's check passes",
+            problem.category()
+        ))),
+    }
+}
+
+/// The deletion fence of the configured store: a re-read of
+/// `extenddb-store.json` right before a call that deletes from the store or
+/// acts on its rows because of what the store lists. Its call sites:
+/// DeleteBackup's DELETING write and its deletion of the backup's objects;
+/// purge's row change (the removal of a dead CREATING row, the DELETING
+/// write) and its deletion of the prefix; the reconciler's deletion of a
+/// DELETING row's objects, its FAILED-prefix and DELETED-prefix duties and
+/// its removal of tombstones; the backup job's failure path; and
+/// CreateBackup's first put. `backup sync --prune-missing`'s removal of a
+/// row is not fenced: it deletes no object, and a root it does not own
+/// leaves it no bytes to lose.
+///
+/// A store's health is the last check's, and the check runs once per
+/// reconciler cycle; a root another catalog adopted since
+/// (`extenddb backup sync --adopt-store`, or a second in-memory server's
+/// startup) would otherwise be written and deleted under the new owner's
+/// rows until this instance's next check. The fence reads the file (one
+/// `get` through the store's bounded calls, [`BoundedCalls`], so on a
+/// filesystem root it waits for the root's one call slot and parks no
+/// second thread beside an abandoned call) and, when it names another
+/// catalog, records [`StoreProblem::ForeignCatalog`] on the store, so every
+/// operation that needs a healthy store is refused from then on, and
+/// refuses the call. A file that names this catalog under another store id
+/// than the one the store's check settled (a root replaced by another root
+/// of the same catalog) is recorded and refused the same way, as
+/// [`StoreProblem::IdMismatch`]. A file that cannot be read refuses the call without
+/// changing the health (the next check decides), and so does a root with no
+/// file: every fenced call acts on a row of this catalog for the root, and
+/// rows with no file are a problem the check reports. A store that is not
+/// healthy refuses at once, with no read. DeleteBackup takes a refusal that
+/// recorded nothing, at its read before the DELETING write, as a store
+/// failure: it writes DELETING and answers DELETED, and its read before the
+/// deletion refuses the deletion (`delete_catalog_backup`).
+///
+/// It narrows the window to the gap between one read and the call that
+/// follows it; it does not close it. A put of the file that lands in that
+/// gap is not seen. On S3 that gap is more than one request: a
+/// `delete_prefix` is a listing and then a `DeleteObjects`, each under the
+/// SDK's retries, so a throttled listing keeps it open for seconds. A
+/// check that read the file before the adoption and finishes after a fence
+/// recorded [`StoreProblem::ForeignCatalog`] records its own outcome over
+/// it, healthy, until the next cycle's check; each deletion is still
+/// fenced in that time, but a restore is accepted.
+#[derive(Clone)]
+pub struct StoreFence {
+    store: Arc<dyn BackupStore>,
+    kind: StoreKind,
+    root: String,
+    health: Arc<RwLock<StoreHealth>>,
+    store_id: Arc<RwLock<Option<String>>>,
+    catalog_id: Arc<std::sync::OnceLock<String>>,
+    /// The store's in-flight mark and call slot, which the fence's read
+    /// shares with the checks and the deletions ([`BoundedCalls`]).
+    in_flight: Arc<AtomicBool>,
+    call_slot: Arc<Semaphore>,
+    park: bool,
+    bound: Duration,
+}
+
+impl StoreFence {
+    /// This instance's catalog id: read from `catalog` once, then the
+    /// store's copy.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreProblem::Catalog`] when the catalog cannot be read.
+    pub async fn catalog_id<C: BackupCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+    ) -> Result<String, StoreProblem> {
+        if let Some(id) = self.catalog_id.get() {
+            return Ok(id.clone());
+        }
+        let id = catalog
+            .catalog_id()
+            .await
+            .map_err(|e| StoreProblem::Catalog(e.to_string()))?;
+        Ok(self.catalog_id.get_or_init(|| id).clone())
+    }
+
+    /// The fence for `catalog`'s id ([`Self::check`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::check`], or [`StoreProblem::Catalog`] when the id cannot
+    /// be read.
+    pub async fn check_catalog<C: BackupCatalog + ?Sized>(
+        &self,
+        catalog: &C,
+    ) -> Result<(), StoreProblem> {
+        let catalog_id = self.catalog_id(catalog).await?;
+        self.check(&catalog_id).await
+    }
+
+    /// The fence (type doc) for the catalog whose id is `catalog_id`.
+    ///
+    /// # Errors
+    ///
+    /// The store's problem when it is not healthy;
+    /// [`StoreProblem::ForeignCatalog`], recorded on the store, when the
+    /// file names another catalog, and [`StoreProblem::IdMismatch`],
+    /// recorded, when it names this one under another store id; the read's
+    /// problem when the file cannot be read within the bound, and
+    /// [`StoreProblem::FileUnreadable`] when the root has none (neither
+    /// recorded).
+    pub async fn check(&self, catalog_id: &str) -> Result<(), StoreProblem> {
+        match &*self
+            .health
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            StoreHealth::Healthy => {}
+            StoreHealth::Checking => {
+                return Err(StoreProblem::Transport(
+                    "the store's first check is pending".to_owned(),
+                ));
+            }
+            StoreHealth::Unhealthy(problem) => return Err(problem.clone()),
+        }
+        let via = BoundedCalls {
+            store: &self.store,
+            in_flight: &self.in_flight,
+            slot: &self.call_slot,
+            bound: self.bound,
+            what: "identity file read",
+            park: self.park,
+            timed_out: AtomicBool::new(false),
+        };
+        let read = store_identity::read_identity_file(&via).await;
+        if via.timed_out() {
+            return Err(via.did_not_finish_problem());
+        }
+        let file = read?;
+        match file {
+            Some(file) if file.catalog_id != catalog_id => {
+                let problem = StoreProblem::ForeignCatalog {
+                    file_catalog_id: file.catalog_id,
+                    catalog_id: catalog_id.to_owned(),
+                };
+                transition(
+                    self.kind,
+                    &self.root,
+                    &self.health,
+                    StoreHealth::Unhealthy(problem.clone()),
+                    String::new,
+                );
+                Err(problem)
+            }
+            Some(file) => {
+                let known = self
+                    .store_id
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                match known {
+                    Some(known) if file.store_id != known => {
+                        let problem = StoreProblem::IdMismatch {
+                            file_id: file.store_id,
+                            row_ids: vec![known],
+                        };
+                        transition(
+                            self.kind,
+                            &self.root,
+                            &self.health,
+                            StoreHealth::Unhealthy(problem.clone()),
+                            String::new,
+                        );
+                        Err(problem)
+                    }
+                    _ => Ok(()),
+                }
+            }
+            None => Err(StoreProblem::FileUnreadable(format!(
+                "the root has no {}; the next check reports it",
+                store_identity::STORE_IDENTITY_KEY
+            ))),
+        }
+    }
+
+    /// The refusal an operation answers once the fence refused it: the
+    /// store's health as the fence left it, as
+    /// [`BackupRuntime::require_healthy_store`] answers it; `None` while the
+    /// store is still healthy (the file could not be read, which the next
+    /// check decides), when the caller answers as for a failed store call.
+    pub(crate) fn refusal(&self) -> Option<DynamoDbError> {
+        let health = self
+            .health
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        health_refusal(self.kind, &health)
     }
 }
 
@@ -677,10 +984,22 @@ async fn check_through<C: BackupCatalog + ?Sized>(
         }
     }
     match store.identity() {
-        Some(identity) => store_identity::recheck(via, &identity, catalog, backend)
+        Some(identity) => {
+            store_identity::recheck(via, &identity, catalog, backend, store.ephemeral_catalog)
+                .await
+                .map(|()| identity)
+        }
+        None => {
+            store_identity::establish(
+                via,
+                store.kind,
+                &store.root,
+                catalog,
+                backend,
+                store.ephemeral_catalog,
+            )
             .await
-            .map(|()| identity),
-        None => store_identity::establish(via, store.kind, &store.root, catalog, backend).await,
+        }
     }
 }
 
@@ -708,8 +1027,8 @@ pub async fn read_identity_bounded<C: BackupCatalog + ?Sized>(
     read
 }
 
-/// The configured store as the checks, a command's identity read and the
-/// deletions call it (module doc): each call runs under `bound`, and a call
+/// The configured store as the checks, a command's identity read, the
+/// deletion fence and the deletions call it (module doc): each call runs under `bound`, and a call
 /// that does not finish is a transport failure naming `what` and the bound.
 /// On a filesystem root (`park`) each call runs as a task of its own, owning
 /// the store handle, so a call abandoned at its bound leaves the task
@@ -724,8 +1043,9 @@ pub async fn read_identity_bounded<C: BackupCatalog + ?Sized>(
 /// returns, and finishing when the first does. On an S3
 /// store the call is the SDK's request, which the dropped future ends, so
 /// nothing is marked and nothing waits. The check calls `validate`, `get`,
-/// `head` and `put_if_absent`, the deletions `delete_prefix` and `list`;
-/// `put` is forwarded for the trait's sake and bounded the same way.
+/// `head` and `put_if_absent`, and `put` when an in-memory catalog adopts
+/// the root (`store_identity::adopt`); the fence calls `get`; the deletions
+/// call `delete_prefix` and `list`.
 pub(crate) struct BoundedCalls<'a> {
     store: &'a Arc<dyn BackupStore>,
     in_flight: &'a Arc<AtomicBool>,
@@ -936,6 +1256,7 @@ impl BackupRuntime {
             source_extenddb_version: env!("CARGO_PKG_VERSION").to_owned(),
             limits: Arc::new(LimitsConfig::default()),
             restore_registrations: Arc::default(),
+            region: None,
         }
     }
 
@@ -1079,6 +1400,19 @@ impl BackupRuntime {
     #[must_use]
     pub fn source(&self) -> (&str, &str) {
         (&self.source_backend, &self.source_extenddb_version)
+    }
+
+    /// The same runtime with the server's region.
+    #[must_use]
+    pub fn with_region(mut self, region: &str) -> Self {
+        self.region = Some(region.to_owned());
+        self
+    }
+
+    /// The server's region, once set.
+    #[must_use]
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
     }
 
     /// Spawn a job task under the tracker [`Self::drain_jobs`] waits on.
@@ -1265,19 +1599,9 @@ impl BackupRuntime {
             .as_ref()
             .filter(|store| !store.is_set_aside())
             .expect("every caller checks that a store is configured first");
-        match store.health() {
-            StoreHealth::Healthy => Ok(store),
-            StoreHealth::Checking => Err(DynamoDbError::ValidationException(format!(
-                "The {} backup store configured on this server has not passed a check yet (its \
-                 first check is pending); the operation is refused until it does",
-                store.kind
-            ))),
-            StoreHealth::Unhealthy(problem) => Err(DynamoDbError::ValidationException(format!(
-                "The {} backup store configured on this server is unhealthy ({}); the operation \
-                 is refused until the store's check passes",
-                store.kind,
-                problem.category()
-            ))),
+        match health_refusal(store.kind, &store.health()) {
+            None => Ok(store),
+            Some(refusal) => Err(refusal),
         }
     }
 }

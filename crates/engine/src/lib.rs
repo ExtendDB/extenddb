@@ -11,8 +11,8 @@ mod backup;
 pub use backup::{
     BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
-    StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
-    check_configured_store, maintenance, read_identity_bounded, reconciler, store_identity,
+    StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
+    check_configured_store, maintenance, read_identity_bounded, reconciler, store_identity, sync,
 };
 mod batch_get_item;
 mod batch_write_item;

@@ -59,6 +59,8 @@ use futures::TryStreamExt;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use super::StoreFence;
+
 /// A maintenance claim with its heartbeat on a timer.
 pub struct HeldClaim {
     claim: Arc<dyn MaintenanceClaim>,
@@ -325,8 +327,12 @@ async fn busy_jobs<S: BackupCatalog + ?Sized>(
     Ok(busy)
 }
 
-/// Delete one row's objects and the row: the manifest first, then the
-/// prefix, then the row through the status machine to a tombstone and out.
+/// Delete one row's objects and the row: the deletion fence first
+/// (`fence`, which re-reads `extenddb-store.json` and refuses, marking the
+/// store unhealthy, once another catalog has adopted the root), before the
+/// row of a CREATING or AVAILABLE row is changed and again right before the
+/// first deletion, then the manifest, then the prefix, then the row through
+/// the status machine to a tombstone and out.
 /// The row is `row` as the command read it; the status another deleter may
 /// have moved it to since is read from `start_backup_delete`'s answer, and
 /// each state the row can be in when the command reaches it ends with no
@@ -337,13 +343,23 @@ async fn busy_jobs<S: BackupCatalog + ?Sized>(
 /// live one): the row goes first, through the dead-owner removal on the
 /// catalog's clock, and the prefix only once the row is gone, so an owner
 /// that heartbeated after the wait leaves the row and its objects together
-/// rather than a row over a deleted prefix. A prefix left by a failure
-/// between the two steps holds no manifest (a CREATING backup has none
-/// yet), so nothing adopts it.
+/// rather than a row over a deleted prefix. Nothing adopts the prefix
+/// between the two steps: every `backup sync` takes the maintenance claim
+/// purge holds (on SQLite both run under the serve lock), so no sync reads
+/// the rows after the removal and lists the prefix before its deletion. A
+/// prefix a failed deletion leaves after the row's removal is reported as
+/// left; if its job had written the manifest before it died (the state the
+/// dead-owner duty resolves to AVAILABLE), a later sync adopts it as a
+/// complete backup, which the next purge deletes.
 ///
 /// # Errors
 ///
-/// The reason the row was left, for the operator: a FAILED or CREATING
+/// The reason the row was left, for the operator: the fence's refusal
+/// (nothing deleted; before the row was changed it is as read, and from the
+/// second fence a CREATING row is already removed with its prefix left and
+/// an AVAILABLE one is DELETING, which a later purge or the reconciler
+/// finishes only once this catalog owns the root again), a FAILED or
+/// CREATING
 /// status another writer moved an AVAILABLE row to (neither follows
 /// AVAILABLE; the row is left for a look), a restore reading the backup, a
 /// CREATING row whose owner heartbeated after the wait, a store or catalog
@@ -351,12 +367,20 @@ async fn busy_jobs<S: BackupCatalog + ?Sized>(
 pub async fn purge_row<S: BackupCatalog + ?Sized>(
     storage: &S,
     store: &dyn BackupStore,
+    fence: &StoreFence,
     row: &BackupRow,
     stale_after: Duration,
 ) -> Result<(), String> {
     let arn = BackupArn::parse(&row.backup_arn)
         .map_err(|e| format!("the row's ARN does not parse: {e}"))?;
     let key = row.key();
+    // The fence before the catalog write as well as before the deletion: a
+    // refusal here leaves the row as it was read.
+    if matches!(row.status, BackupStatus::Creating | BackupStatus::Available) {
+        fence.check_catalog(storage).await.map_err(|problem| {
+            format!("the deletion was refused: {problem}; the row is unchanged")
+        })?;
+    }
     if row.status == BackupStatus::Creating
         && !storage
             .remove_dead_creating_backup_row(&key, stale_after)
@@ -389,6 +413,10 @@ pub async fn purge_row<S: BackupCatalog + ?Sized>(
         }
     }
     let prefix = arn.store_prefix();
+    fence
+        .check_catalog(storage)
+        .await
+        .map_err(|problem| format!("the deletion was refused: {problem}"))?;
     store
         .delete_prefix(&format!("{prefix}{EXTENDDB_MANIFEST_FILE}"))
         .await
@@ -459,14 +487,17 @@ pub enum Stop {
     Interrupted(&'static str),
 }
 
-/// The deletion phase: [`purge_row`] on each of `rows` in order, stopping
-/// before the next row (never inside one) once a heartbeat has found the
-/// claim lost or failed, or a signal has been received. A row that could not
+/// The deletion phase: [`purge_row`] on each of `rows` in order, each behind
+/// the deletion fence (`fence`), stopping before the next row (never inside
+/// one) once a heartbeat has found the claim lost or failed, or a signal has
+/// been received. A row that could not
 /// be deleted is skipped with its reason and the loop goes on; `deleted` is
 /// called with each row deleted, for the command's audit line and output.
+#[allow(clippy::too_many_arguments)]
 pub async fn purge_rows<S: BackupCatalog + ?Sized>(
     storage: &S,
     store: &dyn BackupStore,
+    fence: &StoreFence,
     rows: &[BackupRow],
     stale_after: Duration,
     claim: &HeldClaim,
@@ -483,7 +514,7 @@ pub async fn purge_rows<S: BackupCatalog + ?Sized>(
             outcome.stopped = Some(Stop::Interrupted(signal));
             break;
         }
-        match purge_row(storage, store, row, stale_after).await {
+        match purge_row(storage, store, fence, row, stale_after).await {
             Ok(()) => {
                 deleted(row);
                 outcome.deleted.push(row.backup_arn.clone());

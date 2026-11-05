@@ -7,7 +7,7 @@
 //! The request ([`request`]) runs once `check_catalog_row_for_restore` has
 //! accepted the backup's row: it takes the job permit, reads the sidecar and
 //! the manifest from the store (a missing one is `BackupNotFoundException`
-//! and an error line naming `backup sync --prune-missing`; each read
+//! and an error line naming the remedies; each read
 //! collects at most its bound, [`super::reconciler::SIDECAR_READ_BOUND`] and
 //! [`super::reconciler::MANIFEST_READ_BOUND`], and an object over it is a
 //! `ValidationException` naming a corrupt prefix, as a bad sidecar is),
@@ -146,7 +146,7 @@ pub const TARGET_NOT_EMPTY: &str = "target_not_empty";
 
 /// The reason the reconciler writes on a RUNNING record whose store is not
 /// the configured one.
-pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; backup sync --move-store re-points it";
+pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; configure that store in [backup.store] and restore again";
 
 /// What the request resolved before it spawned the task.
 pub(crate) struct RestoreRequestParts {
@@ -199,10 +199,20 @@ where
     let read = async |name: &str, bound: u64| -> Result<Vec<u8>, DynamoDbError> {
         match super::reconciler::read_object(&*env.store, &format!("{prefix}{name}"), bound).await {
             Ok(ReadObject::Bytes(bytes)) => Ok(bytes),
+            Ok(ReadObject::Absent) if name == EXTENDDB_MANIFEST_FILE => {
+                tracing::error!(
+                    "backup {arn_text} (account {account_id}): its row is AVAILABLE but the store \
+                     holds no {name} under its prefix; put the prefix back, or, unless it is the \
+                     store's newest backup (whose missing manifest makes the store unhealthy), \
+                     remove the row with backup sync --prune-missing"
+                );
+                Err(backup_not_found(&arn_text))
+            }
             Ok(ReadObject::Absent) => {
                 tracing::error!(
                     "backup {arn_text} (account {account_id}): its row is AVAILABLE but the store \
-                     holds no {name} under its prefix; backup sync --prune-missing marks the row"
+                     holds no {name} under its prefix; put the prefix back (backup sync \
+                     --prune-missing removes only a row whose manifest is gone)"
                 );
                 Err(backup_not_found(&arn_text))
             }

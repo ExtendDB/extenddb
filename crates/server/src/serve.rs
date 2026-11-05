@@ -684,8 +684,22 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             .with_metrics(metrics.clone())
             .with_shutdown(shutdown.child_token())
             .with_source(&backend_name, build.version)
-            .with_limits(Arc::clone(&limits)),
+            .with_limits(Arc::clone(&limits))
+            .with_region(&app_config.server.region),
     );
+    // An in-memory catalog is new at every start: the server syncs it with
+    // the store before it serves, when the store's check passed here (a
+    // filesystem store), so the backups of the previous starts are served
+    // from the first request. The sync is bounded
+    // (`extenddb_engine::sync::STARTUP_SYNC_TIMEOUT`, 60 s); one that does
+    // not finish, or that met a store or catalog error on a prefix, is left
+    // to the reconciler's next cycle and logged (`backup_store` module doc).
+    if backup_runtime
+        .configured_store()
+        .is_some_and(extenddb_engine::ConfiguredStore::startup_sync_pending)
+    {
+        extenddb_engine::sync::startup_sync(&*storage, &backup_runtime).await;
+    }
     let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {
         storage: storage.clone(),

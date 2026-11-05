@@ -473,6 +473,18 @@ pub enum DeleteStart {
     Status(BackupStatus),
 }
 
+/// What [`BackupCatalog::forget_available_backup_row`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetRow {
+    /// The row was AVAILABLE and is gone.
+    Removed,
+    /// A restore target registered from the backup is CREATING; its name.
+    /// The row is left.
+    InUse(String),
+    /// The row was not AVAILABLE; its status. The row is left.
+    Status(BackupStatus),
+}
+
 /// What a heartbeat found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Heartbeat {
@@ -864,7 +876,8 @@ pub trait BackupCatalog: Send + Sync {
 
     /// Insert `row` with status CREATING under a new claim, and return the
     /// claim. The claim precedes the insert or is the insert itself, so no
-    /// row ever exists unowned.
+    /// CREATING row ever exists unowned (the AVAILABLE rows
+    /// [`Self::insert_backup_row`] writes are unowned and have no job).
     ///
     /// # Errors
     ///
@@ -874,6 +887,53 @@ pub trait BackupCatalog: Send + Sync {
         &'a self,
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<Box<dyn JobClaim>, StorageError>>;
+
+    /// Insert `row` unowned, if no row with its key exists: `backup sync`'s
+    /// insert for a prefix it verified. The row is written as given (its
+    /// status, sync's being AVAILABLE, its store, sizes, `created_at`,
+    /// `failure_reason` and source table) except for three columns:
+    /// `owner_generation` is [`UNOWNED_GENERATION`], and `completed_at` and
+    /// `heartbeat_at` are the database's clock; the row's own values for
+    /// those are ignored. No claim is taken: an unowned row has no job.
+    /// Sync passes AVAILABLE; an unowned row of another status has no job to
+    /// move it (on SQLite an unowned CREATING row has no slot, and the next
+    /// cycle resolves it as dead).
+    ///
+    /// Returns `false`, writing nothing, when a row with the key exists, of
+    /// whatever status or store, with one exception on Cassandra: a stored
+    /// row equal to this one in every column the insert writes (unowned, the
+    /// same store, sizes and source table) counts as inserted, and its list
+    /// and status entries are written, which completes an insert that
+    /// stopped between the row and its entries. On PostgreSQL, SQLite and
+    /// MongoDB, which
+    /// index `backup_id` alone as unique, a row with the backup id under
+    /// another account also exists for this rule. Cassandra keys its rows
+    /// by the account and the ARN and indexes no backup id, so there the
+    /// rule is per ARN spelling: a row for the same id under another region
+    /// or partition does not count. `backup sync` closes that gap itself:
+    /// before the insert it reads the row under each spelling of the
+    /// manifest's ARN (this deployment's region and the manifest's own) and
+    /// skips a backup the other spelling has a row for, so sync never gives
+    /// an account two rows of one backup id under the manifest's account,
+    /// table and id on any backend. A row under the
+    /// manifest's own spelling is left to this method, which answers `false`
+    /// for it or, on Cassandra, completes it under the exception above.
+    ///
+    /// # Errors
+    ///
+    /// The backend's error for a failed write. On Cassandra an answer lost
+    /// in transit, and a `NotMatched` answer, is settled by a serial read of
+    /// the row: this row counts as inserted and another as existing. No row
+    /// after a lost answer means not written, and the write is sent once
+    /// more; no row after `NotMatched` answers `false` (a legacy in-catalog
+    /// backup holds the ARN, which the read does not return). An outcome
+    /// still unknown after that is an error. A failed batch of the entries
+    /// is sent once more before the error, and the next insert of the same
+    /// row writes them.
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
     /// Every row of `store` with `status`, or of every status for `None`.
     fn list_backup_rows<'a>(
@@ -933,6 +993,24 @@ pub trait BackupCatalog: Send + Sync {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
+    /// Remove an AVAILABLE row outright, leaving no DELETING or DELETED
+    /// tombstone, so no deletion duty ever acts on the backup's objects:
+    /// `backup sync --prune-missing`'s write for a row whose manifest the
+    /// configured root does not hold, whose bytes may be under another
+    /// host's root of the same path. Under the row's lock, as
+    /// [`Self::start_backup_delete`] takes it, the status check and the
+    /// in-use rule in one step with the removal: a row a CREATING restore
+    /// target reads is left ([`ForgetRow::InUse`]), and so is a row another
+    /// writer moved ([`ForgetRow::Status`]). The store is not touched.
+    ///
+    /// # Errors
+    ///
+    /// `Validation("Backup not found: <arn>")` when there is no such row.
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>>;
 
     /// Remove a CREATING row whose owner is dead: `heartbeat_at` older than
     /// `stale_after` on the catalog's clock. `false` when the row is not
