@@ -279,6 +279,36 @@ class TestCliLifecycle:
         result = _run_extenddb("destroy", "--yes", *_pg_args(), config=cli_env["config_path"])
         assert result.returncode == 0
 
+    def test_daemon_resolves_relative_paths_against_its_start_directory(self, cli_env):
+        """A daemonized serve resolves relative bulk store, import and export
+        paths against the directory it was started in, as in the foreground."""
+        _run_extenddb(
+            "init", *_init_args(cli_env),
+            config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": "TestPass1!"},
+        )
+        _patch_config_port(cli_env["config_path"], cli_env["port"])
+        start_dir = os.path.dirname(cli_env["config_path"])
+        names = ("relative-buckets", "relative-imports", "relative-exports")
+        with open(cli_env["config_path"], "a") as f:
+            f.write(
+                f'\n[bulk]\n\n[bulk.filesystem]\npath = "{names[0]}"\n'
+                f'\n[import]\npaths = ["{names[1]}"]\n'
+                f'\n[export]\npaths = ["{names[2]}"]\n'
+            )
+
+        # Serve (daemonizes), started in the directory that holds the config.
+        result = _run_extenddb(
+            "serve", config=cli_env["config_path"], cwd=start_dir, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _wait_for_server(cli_env["port"]), "Server did not become healthy"
+        for name in names:
+            assert os.path.isdir(os.path.join(start_dir, name)), name
+
+        result = _run_extenddb("stop", config=cli_env["config_path"])
+        assert result.returncode == 0
+
     def test_serve_without_init_fails(self, cli_env):
         """extenddb serve without init should fail."""
         result = _run_extenddb("serve", config=cli_env["config_path"], check=False)

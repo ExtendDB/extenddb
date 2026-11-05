@@ -1,0 +1,144 @@
+# The bulk store on an S3-compatible service. integration.yml calls this
+# workflow, so its integration gate job requires the result.
+name: Integration (S3 bulk store)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # The bulk store on an S3-compatible service: the engine's store contract
+  # tests, then the Python bulk suite against a server whose [bulk] store is
+  # s3. The service is versitygw, which selects its backend by command
+  # (posix, on the container's /tmp); a services: container takes no
+  # command, so a step starts it. PostgreSQL is the backend, as in
+  # run-integration.
+  run-integration-s3:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 127.0.0.1:5432:5432
+    env:
+      # The container's root keys. They exist only inside this job's
+      # container and grant nothing anywhere else.
+      S3_ACCESS_KEY: extenddb-ci
+      S3_SECRET_KEY: extenddb-ci-secret
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Start the S3-compatible service
+        run: |
+          # versity/versitygw v1.0.18, pinned by digest.
+          docker run -d --name s3 -p 127.0.0.1:7070:7070 \
+            -e ROOT_ACCESS_KEY="$S3_ACCESS_KEY" -e ROOT_SECRET_KEY="$S3_SECRET_KEY" \
+            versity/versitygw@sha256:90f8280610a889d705ae93ae4b4064d74ffa9f3b565aacf2e3372b0614d7a796 \
+            posix /tmp
+          for i in $(seq 1 30); do
+            # Any HTTP answer means it is serving: an unsigned request is
+            # answered 403.
+            if curl -s -o /dev/null http://127.0.0.1:7070/; then
+              echo "S3-compatible service ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs s3
+          echo "S3-compatible service failed to start"
+          exit 1
+
+      - name: Build release
+        run: cargo build --release
+
+      # Every contract case runs once per store; EXTENDDB_TEST_S3_REQUIRED
+      # makes a missing endpoint a failure rather than a skip. The smoke
+      # test reads, writes a multipart report and checks a dropped writer
+      # against the same service. The keys reach the store through the
+      # standard AWS credential variables, as they reach the server.
+      - name: Run the bulk store tests against the S3-compatible service
+        env:
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:7070
+          EXTENDDB_TEST_S3_REQUIRED: "1"
+          EXTENDDB_TEST_S3_SMOKE_ENDPOINT: http://127.0.0.1:7070
+          AWS_ACCESS_KEY_ID: ${{ env.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.S3_SECRET_KEY }}
+          AWS_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+        run: >-
+          cargo test --release -p extenddb-engine --lib --
+          bulk_put::source::contract bulk_put::s3::tests::smoke
+
+      - name: Initialize ExtendDB
+        id: init
+        run: |
+          output=$(./target/release/extenddb init --config extenddb.toml \
+            --pg-host 127.0.0.1 --pg-port 5432 --pg-user postgres --pg-pass devpass 2>&1)
+          echo "$output"
+          password=$(echo "$output" | grep -oP 'Password: \K\S+')
+          echo "admin_password=$password" >> "$GITHUB_OUTPUT"
+
+      - name: Start ExtendDB
+        run: |
+          # --write-pid-file so devtools/run-tests can restart the server
+          # with the S3 store configured and the S3 keys in its environment.
+          ./target/release/extenddb serve --config extenddb.toml --foreground --write-pid-file &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:18443/health | grep -q healthy; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # run-tests writes the [bulk] s3 store into extenddb.toml and restarts
+      # the server with the S3 keys as its AWS credentials; the suite reaches
+      # the same service with the same keys to create its buckets and read
+      # the reports.
+      - name: Run the bulk suite on the S3 store
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:7070
+          EXTENDDB_TEST_S3_ACCESS_KEY_ID: ${{ env.S3_ACCESS_KEY }}
+          EXTENDDB_TEST_S3_SECRET_ACCESS_KEY: ${{ env.S3_SECRET_KEY }}
+        run: devtools/run-tests --extenddb --pytest --bulk-store s3 --parallel --filter bulk_put
+
+      - name: Dump server syslog on failure
+        if: failure()
+        run: sudo journalctl -t extenddb --no-pager -n 500 || true
+
+      - name: Dump the S3-compatible service's log on failure
+        if: failure()
+        run: docker logs s3 || true
