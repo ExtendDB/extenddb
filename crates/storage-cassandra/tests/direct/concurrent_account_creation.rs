@@ -24,7 +24,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Every data table a fresh account keyspace must contain, from
-    /// migrations/data/V001__initial_data_schema.cql and V002__backup_items.cql.
+    /// migrations/account/0001_baseline.cql, migration 1's account body.
     const EXPECTED_DATA_TABLES: &[&str] = &[
         "schema_history",
         "stream_shards",

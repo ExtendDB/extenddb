@@ -517,7 +517,7 @@ Verify that ExtendDB is recording operational metrics:
 # Request counts and latencies
 curl -s --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:**18443**/metrics | python3 -m json.tool
 
-# Management console metrics (open in browser)
+# Management console metrics (open in a browser and log in as the admin user)
 echo "Open: https://127.0.0.1:**18443**/console/metrics"
 ```
 

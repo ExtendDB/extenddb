@@ -9,11 +9,22 @@ use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 use crate::catalog_store::CassandraCatalogStore;
 
 impl CassandraCatalogStore {
+    /// Create the account's keyspace and run every account migration on it,
+    /// then write its `accounts` row. The catalog's status reads the account
+    /// keyspaces from `accounts`, so a call that stops between the two (a
+    /// killed server) leaves a keyspace no status counts, and the status
+    /// stays `Current`. A retried call completes it: the keyspace is created
+    /// with `IF NOT EXISTS`, the migrations its ledger records do not run
+    /// again, and the row is written. A call for an account that exists
+    /// finds its keyspace complete and answers `AlreadyExists`.
     pub(crate) async fn create_account_impl(
         &self,
         account_id: &str,
         account_name: &str,
     ) -> OpResult<()> {
+        self.ensure_account_keyspace(account_id).await?;
+        self.test_stop()?;
+
         let catalog_keyspace = self.catalog_keyspace();
         let query = format!(
             "INSERT INTO {catalog_keyspace}.accounts (account_id, account_name, created_at) VALUES (?, ?, toTimestamp(now())) IF NOT EXISTS"
@@ -44,12 +55,6 @@ impl CassandraCatalogStore {
             false
         };
 
-        // Ensure account keyspace exists (whether account was just created OR already existed)
-        // This makes retries safe: if account creation succeeded but keyspace creation failed,
-        // the retry will create the keyspace before returning AlreadyExists error.
-        self.ensure_account_keyspace(account_id).await?;
-
-        // Return AlreadyExists only AFTER keyspace is guaranteed to exist
         if !applied {
             return Err(OpError::AlreadyExists("Account already exists".to_owned()));
         }
@@ -134,14 +139,6 @@ impl CassandraCatalogStore {
             &format!("DELETE FROM {catalog_keyspace}.backups_by_account WHERE account_id = ?"),
             cdrs_tokio::query_values!(account_id),
             "delete_account_backup_index",
-        )
-        .await?;
-        // continuous_backups uses plain INSERT — plain DELETE is safe
-        crate::cassandra_util::execute::<OpError>(
-            self.session(),
-            &format!("DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ?"),
-            cdrs_tokio::query_values!(account_id),
-            "delete_account_continuous_backups",
         )
         .await?;
 
