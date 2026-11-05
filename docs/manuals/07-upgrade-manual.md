@@ -816,6 +816,12 @@ No catalog migration is required.
 
 ---
 
+### Streams: a `StreamArn` with another partition is refused
+
+DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with the `arn:aws-cn:` or `arn:aws-us-gov:` partition with `ValidationException` "Invalid StreamArn", also on a deployment whose `server.region` is a China or GovCloud region. The server issues every stream ARN as `arn:aws:`, so a `StreamArn` taken from DescribeTable or ListStreams is not affected. No catalog migration is required.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
