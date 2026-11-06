@@ -257,7 +257,7 @@ impl PostgresEngine {
     /// Number up to [`NUMBER_LIMIT`] of one shard's committed pending
     /// records, in batches, and stop at a shard that another transaction
     /// numbers. Returns how many records moved.
-    async fn number_shard(&self, shard_id: &str) -> Result<u64, StorageError> {
+    pub(crate) async fn number_shard(&self, shard_id: &str) -> Result<u64, StorageError> {
         let mut numbered = 0;
         while numbered < NUMBER_LIMIT {
             match self.number_shard_batch(shard_id, None).await? {
@@ -316,7 +316,9 @@ impl PostgresEngine {
     /// committed before it. The lock conflicts with the `FOR KEY SHARE` lock
     /// a write takes on its shard's row, so no record of the shard is stored
     /// while `tx` runs, and with [`LOCK_SHARD`], so no other transaction
-    /// numbers the shard. Returns how many records moved.
+    /// numbers the shard. The close numbers the shard's backlog with
+    /// [`Self::number_shard`] before it takes the lock, so this moves the
+    /// records committed after that. Returns how many records moved.
     pub(crate) async fn number_locked_shard(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         shard_id: &str,

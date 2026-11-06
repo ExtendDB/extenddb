@@ -329,15 +329,15 @@ kept the same ARN. Each stream's shard ids carry its identity, so the change
 needs no catalog migration of its own. On MongoDB its one new index comes with
 migration 1 (below).
 
-**Upgrade every server before changing a table's stream.** A server still on
-the earlier release does not know closed shards: it writes records past a
-shard's `EndingSequenceNumber`, where no reader finds them, and re-enables a
-disabled stream under its old ARN instead of creating a new one. In a
-deployment with several servers, finish upgrading all of them before any
-`UpdateTable` changes a `StreamSpecification`. A stream disabled by the earlier
-release keeps its four shards open until the first `UpdateTable` on that table
-under the new release (an enable, or a disable, which is refused as before and
-closes them).
+**Servers of the earlier release.** Migrations 1 to 7 are breaking, so a
+server of the earlier release must not run against the migrated catalog (see
+[The Catalog Status](#the-catalog-status)). Such a server does not know closed
+shards. It writes records past a shard's `EndingSequenceNumber`, and it
+re-enables a disabled stream under its old ARN instead of creating a new one.
+A stream that the earlier release disabled keeps its four shards open under
+the new release. The first `UpdateTable` that sets a `StreamSpecification` on
+the table closes them: an enable, or a disable, which the server refuses as
+before.
 
 **MongoDB.** Migration 1 creates the `{table_id: 1, shard_id: 1}` index on the
 data database's `stream_shards`: `extenddb init` runs it on a new deployment,

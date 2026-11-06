@@ -335,9 +335,8 @@ impl PostgresEngine {
         // shard changes run once the catalog has committed.
         let pending_stream = match &input.stream_specification {
             Some(spec) => Some(
-                Self::apply_stream_specification(
+                self.apply_stream_specification(
                     &mut tx,
-                    &self.data_pool,
                     account_id,
                     &input.table_name,
                     &table_id,

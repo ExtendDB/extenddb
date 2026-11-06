@@ -82,18 +82,18 @@ impl PendingStream {
         account_id: &str,
         table_name: &str,
     ) -> Result<(), StorageError> {
-        let data_pool = &engine.data_pool;
         let Some((label, view_type)) = self.open else {
             if let Some(label) = &self.close {
-                PostgresEngine::close_stream_shards(data_pool, &self.table_id, label).await?;
+                engine.close_stream_shards(&self.table_id, label).await?;
             }
             return Ok(());
         };
-        PostgresEngine::close_streams_before(data_pool, &self.table_id, &label).await?;
-        PostgresEngine::insert_stream_shards(data_pool, &self.table_id, &label, view_type).await?;
+        engine.close_streams_before(&self.table_id, &label).await?;
+        PostgresEngine::insert_stream_shards(&engine.data_pool, &self.table_id, &label, view_type)
+            .await?;
         let row = engine.stream_table_row(account_id, table_name).await?;
         if !enable_still_current(row.as_ref().map(|(t, _)| t), &label) {
-            PostgresEngine::close_stream_shards(data_pool, &self.table_id, &label).await?;
+            engine.close_stream_shards(&self.table_id, &label).await?;
         }
         Ok(())
     }
@@ -191,35 +191,47 @@ impl PostgresEngine {
     /// re-evaluates the closed row and records nothing. What
     /// remains is the gap every backend has: a write acknowledged after the
     /// disable response that recorded into no stream, because its key info
-    /// pre-dated the disable and it found no open shard. A `TransactWriteItems`
-    /// across two tables whose disables run at the same instant can form a
-    /// lock cycle through the shard locks; PostgreSQL's deadlock detector
-    /// cancels one side, which the transaction path reports as a cancellation.
+    /// pre-dated the disable and it found no open shard.
+    ///
+    /// A write that waits for the lock holds its item locks and a pool
+    /// connection. The close therefore numbers each shard's backlog first, in
+    /// the numbering worker's batches (`PostgresEngine::number_shard`). Those
+    /// transactions lock the shard's row `FOR NO KEY UPDATE`, and a writer's
+    /// `FOR KEY SHARE` does not wait for that mode. The numbering under the
+    /// lock then moves only the records committed in between.
+    ///
+    /// The close locks the rows in shard id order, and `TransactWriteItems`
+    /// stores its records, and locks their shards, in the same order
+    /// (`transact_write_items_impl`). Both compare the ids byte by byte. Each
+    /// then waits only for a shard with a higher id than every shard it holds,
+    /// so the two cannot wait for each other. In request order, a transaction
+    /// with items on shard 2 and then shard 0 would hold shard 2 and wait for
+    /// shard 0. A close that held shard 0 would wait for shard 2, and
+    /// PostgreSQL would cancel one of the two after `deadlock_timeout`.
     pub(crate) async fn close_stream_shards(
-        data_pool: &PgPool,
+        &self,
         table_id: &str,
         label: &str,
     ) -> Result<(), StorageError> {
-        Self::close_selected_shards(data_pool, table_id, label, open_shard_ids_of).await
+        self.close_selected_shards(table_id, label, open_shard_ids_of)
+            .await
     }
 
     /// Close the open shards of every stream of the table older than `label`
     /// (`stream_lineage::open_shard_ids_before`), as [`Self::close_stream_shards`]
     /// closes one stream's.
-    async fn close_streams_before(
-        data_pool: &PgPool,
-        table_id: &str,
-        label: &str,
-    ) -> Result<(), StorageError> {
-        Self::close_selected_shards(data_pool, table_id, label, open_shard_ids_before).await
+    async fn close_streams_before(&self, table_id: &str, label: &str) -> Result<(), StorageError> {
+        self.close_selected_shards(table_id, label, open_shard_ids_before)
+            .await
     }
 
     async fn close_selected_shards(
-        data_pool: &PgPool,
+        &self,
         table_id: &str,
         label: &str,
         select: fn(&str, &str, &[ShardRow]) -> Vec<String>,
     ) -> Result<(), StorageError> {
+        let data_pool = &self.data_pool;
         let rows: Vec<ShardTuple> = sqlx::query_as(
             "SELECT table_id, shard_id, parent_shard_id, starting_sequence_number, \
                     ending_sequence_number \
@@ -233,6 +245,16 @@ impl PostgresEngine {
         if ids.is_empty() {
             return Ok(());
         }
+        // The backlog first, without blocking writers. The close logs a
+        // failure here, and the numbering under the lock below numbers what
+        // this leaves.
+        for shard_id in &ids {
+            if let Err(e) = self.number_shard(shard_id).await {
+                tracing::warn!(
+                    "Stream record numbering before the close of shard {shard_id} failed: {e}"
+                );
+            }
+        }
         // READ COMMITTED whatever the database's default: each statement after
         // the lock then reads the records of the writes the lock waited for.
         // Under REPEATABLE READ the snapshot would date from the start of the
@@ -241,9 +263,14 @@ impl PostgresEngine {
             .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
             .await
             .map_err(internal)?;
+        // PostgreSQL applies ORDER BY before the lock, so the statement locks
+        // the rows in shard id order. COLLATE "C" compares the ids byte by
+        // byte, as `TransactWriteItems` sorts its records, whatever the
+        // database's collation.
         let locked: Vec<String> = sqlx::query_scalar(
             "SELECT shard_id FROM stream_shards \
-             WHERE shard_id = ANY($1) AND ending_sequence_number IS NULL FOR UPDATE",
+             WHERE shard_id = ANY($1) AND ending_sequence_number IS NULL \
+             ORDER BY shard_id COLLATE \"C\" FOR UPDATE",
         )
         .bind(&ids)
         .fetch_all(&mut *data_tx)
@@ -286,8 +313,8 @@ impl PostgresEngine {
     /// after its catalog write), then returns the refusal; the catalog
     /// transaction has nothing to commit.
     pub(crate) async fn apply_stream_specification(
+        &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        data_pool: &PgPool,
         account_id: &str,
         table_name: &str,
         table_id: &str,
@@ -318,7 +345,7 @@ impl PostgresEngine {
                 if let Some(label) =
                     disabled_stream_to_close(current.as_ref(), current_label.as_deref(), requested)
                 {
-                    Self::close_stream_shards(data_pool, table_id, label).await?;
+                    self.close_stream_shards(table_id, label).await?;
                 }
                 return Err(refusal);
             }

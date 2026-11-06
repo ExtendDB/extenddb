@@ -284,6 +284,51 @@ async fn a_write_racing_a_disable_lands_before_the_ending_number_or_not_at_all()
     s.cleanup().await;
 }
 
+/// A disable numbers the records waiting in `stream_pending` before it locks
+/// the shard rows `FOR UPDATE`, in the numbering worker's transactions, which
+/// writers do not wait for. The transaction that closes the shards, whose id
+/// is the `xmin` of each closed row, then numbers none of the records.
+#[tokio::test]
+async fn a_disable_numbers_the_backlog_before_it_locks_the_shards() {
+    if base_conn().is_none() {
+        eprintln!("SKIP: EXTENDDB_TEST_PG_CONNECTION_STRING is not set");
+        return;
+    }
+    let s = scratch().await;
+    s.engine
+        .create_table(ACCOUNT, table_input("backlog", true))
+        .await
+        .expect("create");
+    activate(&s, "backlog").await;
+    for pk in ["k0", "k1", "k2", "k3", "k4", "k5"] {
+        put(&s, "backlog", pk, StreamViewType::NewAndOldImages).await;
+    }
+    assert_eq!(pending_count(&s).await, 6);
+
+    set_stream(&s, "backlog", serde_json::json!({"StreamEnabled": false}))
+        .await
+        .expect("disable");
+    assert_eq!(pending_count(&s).await, 0);
+    let numbered_by_the_close: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM stream_records r JOIN stream_shards s ON s.shard_id = r.shard_id \
+         WHERE r.xmin = s.xmin",
+    )
+    .fetch_one(&s.db)
+    .await
+    .expect("count the records the closing transaction numbered");
+    assert_eq!(numbered_by_the_close, 0);
+    let past_the_end: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM stream_records r JOIN stream_shards s ON s.shard_id = r.shard_id \
+         WHERE s.ending_sequence_number IS NULL OR r.sequence_number > s.ending_sequence_number",
+    )
+    .fetch_one(&s.db)
+    .await
+    .expect("count records past an ending number");
+    assert_eq!(past_the_end, 0);
+    assert_eq!(record_count(&s).await, 6);
+    s.cleanup().await;
+}
+
 /// A disable whose close failed after its catalog write, then an enable whose
 /// close of the label it read failed too: the table is enabled under a later
 /// label with no shards of its own, and the earlier stream's shards are still
