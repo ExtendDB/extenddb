@@ -66,6 +66,10 @@ pub(super) async fn run(
     ctx: &OperationContext,
     body: &Value,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // A parameter of the wrong JSON type in any statement fails the request
+    // before anything else is checked, and no statement runs (see
+    // `check_request_parameter_types`).
+    super::check_request_parameter_types(super::member_parameters(body.get("Statements")))?;
     super::request_checks::check_batch_execute_statement(body)?;
     let statements = body
         .get("Statements")
@@ -82,7 +86,10 @@ pub(super) async fn run(
     // (measured 2026-11-02), and so does a parameter the service refuses for
     // its content, after a statement of only whitespace and ahead of a
     // syntax error (measured 2026-11-06: an empty set, a set with a member
-    // twice, a NULL that is not true, an attribute value with no type or two).
+    // twice or a null member, a NULL that is not true, an attribute value
+    // with no type or two, a null member of a map or a list). The JSON types
+    // were checked above, so these are the only parameter errors left, and
+    // `from_body` reads the parameters that pass them.
     let mut checked_all = Vec::with_capacity(statements.len());
     for obj in statements {
         let parameters = super::check_parameters(obj.get("Parameters"));

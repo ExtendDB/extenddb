@@ -17,6 +17,7 @@ keys per test for isolation.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from string import Template
@@ -1438,3 +1439,239 @@ def test_a_parameter_refused_for_its_content_fails_the_request_without_a_positio
         assert _error(excinfo) == ("ValidationException", message)
     for name in ("k", "o"):
         assert _gget(raw_client, gtable, key(names[name])) == item(key(names[name]))
+
+
+# A null member of a set, a map or a list, and a value with no type, fail the
+# request without a position, as the other refusals of a parameter's content
+# do. A member the attribute value model does not name is ignored, and so is
+# a member whose value is null. A value of the wrong JSON type in any member
+# fails the request with a SerializationException, ahead of the checks of the
+# request and of every member, a statement of only whitespace included
+# (measured 2026-11-06). The service words that refusal as its JSON reader
+# does, which ExtendDB does not, so only its code is compared.
+
+_EMPTY_AV = "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+_SS_NULL = (
+    "One or more parameter values were invalid: An string set may not have a null string as a "
+    "member"
+)
+_NULL_AV = "The supplied Item contains a null AttributeValue"
+
+
+def _txn_raw(client, statements):
+    """ExecuteTransaction with `statements` sent as they are written.
+    botocore drops a null member, refuses a member the model does not name,
+    and refuses a number where a binary goes, so the request's JSON is put in
+    place before the request is signed."""
+    payload = json.dumps({"TransactStatements": statements}).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = "before-call.dynamodb.ExecuteTransaction"
+    client.meta.events.register(event, swap, unique_id="partiql-raw-body")
+    try:
+        return client.execute_transaction(TransactStatements=[{"Statement": "x"}])
+    finally:
+        client.meta.events.unregister(event, unique_id="partiql-raw-body")
+
+
+def _deep_list(levels=33):
+    value = {"L": [{"N": "1"}]}
+    for _ in range(levels):
+        value = {"L": [value]}
+    return value
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"SS": ["a", None]}, _SS_NULL),
+        ({"NS": ["1", None]}, "One or more parameter values were invalid: Numeric sets may not contain null"),
+        (
+            {"BS": ["AQ==", None]},
+            "One or more parameter values were invalid: Binary sets may not contain null or empty "
+            "values",
+        ),
+        ({"M": {"x": {"SS": ["a", None]}}}, _SS_NULL),
+        ({"L": [{"SS": ["a", None]}]}, _SS_NULL),
+        ({"X": "1"}, _EMPTY_AV),
+        ({"X": None}, _EMPTY_AV),
+        ({"s": "a"}, _EMPTY_AV),
+        ({"S": None}, _EMPTY_AV),
+        ({"M": {"x": {"X": "1"}}}, _EMPTY_AV),
+        ({"L": [{"X": "1"}]}, _EMPTY_AV),
+    ],
+)
+def test_a_null_member_or_a_value_with_no_type_fails_the_request_without_a_position(
+    raw_client, gtable, value, message
+):
+    names = {"k": f"tn-{uuid.uuid4().hex[:6]}", "o": f"tno-{uuid.uuid4().hex[:6]}"}
+    put(raw_client, gtable, names["k"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'", gtable, **names)
+    for members in (
+        [{"Statement": update, "Parameters": [value]}],
+        [{"Statement": other}, {"Statement": update, "Parameters": [value]}],
+    ):
+        with pytest.raises(ClientError) as excinfo:
+            _txn_raw(raw_client, members)
+        assert _error(excinfo) == ("ValidationException", message)
+    assert _gget(raw_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+@pytest.mark.parametrize(
+    "params, message",
+    [
+        ([{"M": {"a": {"M": {"b": None}}}}], _NULL_AV + ": b is null"),
+        ([{"L": [{"M": {"b": None}}]}], _NULL_AV + ": b is null"),
+        ([{"M": {"a": {"L": [None]}}}], _NULL_AV),
+        ([{"L": [{"L": [None]}]}], _NULL_AV),
+        ([{"M": {"x": None, "y": {"SS": []}}}], _NULL_AV + ": x is null"),
+        ([{"L": [None]}, {"SS": []}], _NULL_AV),
+        ([{"SS": []}, {"L": [None]}], _PARAMETER_SS_EMPTY),
+        ([{"L": [None, {"SS": []}]}], _NULL_AV),
+        ([{"L": [{"SS": []}, None]}], _PARAMETER_SS_EMPTY),
+        ([{"M": {"x": None}}, _deep_list()], _NULL_AV + ": x is null"),
+        (
+            [_deep_list(), {"M": {"x": None}}],
+            "Nesting Levels have exceeded supported limits: Attributes in the item have nested "
+            "levels beyond supported limit",
+        ),
+    ],
+)
+def test_a_null_member_of_a_map_or_a_list_is_refused_in_its_place(
+    raw_client, gtable, params, message
+):
+    name = f"tl-{uuid.uuid4().hex[:6]}"
+    put(raw_client, gtable, name)
+    update = _sql("UPDATE {t} SET v = ?, w = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    padded = params + [{"N": "1"}] * (2 - len(params))
+    with pytest.raises(ClientError) as excinfo:
+        _txn_raw(raw_client, [{"Statement": update, "Parameters": padded}])
+    assert _error(excinfo) == ("ValidationException", message)
+    assert _gget(raw_client, gtable, key(name)) == item(key(name))
+
+
+def test_a_member_the_model_does_not_name_is_ignored(raw_client, gtable):
+    name = f"ti-{uuid.uuid4().hex[:6]}"
+    put(raw_client, gtable, name)
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    assert _txn_raw(raw_client, [{"Statement": update, "Parameters": [{"X": "1", "S": "a"}]}])[
+        "Responses"
+    ] == []
+    assert _gget(raw_client, gtable, key(name))["v"] == {"S": "a"}
+    update = _sql("UPDATE {t} SET v = ?, w = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    params = [{"M": {"x": {"S": "a", "N": None}}}, {"N": "1"}]
+    assert _txn_raw(raw_client, [{"Statement": update, "Parameters": params}])["Responses"] == []
+    assert _gget(raw_client, gtable, key(name))["v"] == {"M": {"x": {"S": "a"}}}
+
+
+def _serialization_refusal(excinfo):
+    """The code and the HTTP status of a refusal of the request's JSON."""
+    resp = excinfo.value.response
+    return resp["Error"]["Code"], resp["ResponseMetadata"]["HTTPStatusCode"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"SS": [1]},
+        {"NS": [1]},
+        {"BS": [1]},
+        {"M": {"x": {"SS": [1]}}},
+        {"L": [{"NS": [1]}]},
+        {"BOOL": "x"},
+        {"S": 1},
+        {"SS": "a"},
+        {"B": "%%%"},
+        "a",
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_fails_the_request(raw_client, gtable, value):
+    names = {"k": f"tt-{uuid.uuid4().hex[:6]}", "o": f"tto-{uuid.uuid4().hex[:6]}"}
+    put(raw_client, gtable, names["k"])
+    put(raw_client, gtable, names["o"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'", gtable, **names)
+    for members in (
+        [{"Statement": update, "Parameters": [value]}],
+        [{"Statement": other}, {"Statement": update, "Parameters": [value]}],
+    ):
+        with pytest.raises(ClientError) as excinfo:
+            _txn_raw(raw_client, members)
+        assert _serialization_refusal(excinfo) == ("SerializationException", 400)
+    for name in ("k", "o"):
+        assert _gget(raw_client, gtable, key(names[name])) == item(key(names[name]))
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        [{"BOOL": "x"}, {"SS": []}],
+        [{"SS": []}, {"BOOL": "x"}],
+        [{"N": "abc"}, {"BOOL": "x"}],
+        [_deep_list(), {"BOOL": "x"}],
+        [{"L": [{"SS": []}, {"BOOL": "x"}]}, {"N": "1"}],
+        [{"SS": []}, {"NS": [1]}],
+        [{"SS": []}, {"SS": [1]}],
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_comes_ahead_of_the_others(raw_client, gtable, params):
+    name = f"to-{uuid.uuid4().hex[:6]}"
+    put(raw_client, gtable, name)
+    update = _sql("UPDATE {t} SET v = ?, w = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    with pytest.raises(ClientError) as excinfo:
+        _txn_raw(raw_client, [{"Statement": update, "Parameters": params}])
+    assert _serialization_refusal(excinfo) == ("SerializationException", 400)
+    assert _gget(raw_client, gtable, key(name)) == item(key(name))
+
+
+def test_a_parameter_of_the_wrong_json_type_comes_ahead_of_the_request_and_its_members(
+    raw_client, gtable
+):
+    name = f"tr-{uuid.uuid4().hex[:6]}"
+    put(raw_client, gtable, name)
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    read = _sql("SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND a = ?", gtable, k=name)
+    bad = [{"BOOL": "x"}]
+    reads = [
+        {"Statement": _sql("SELECT * FROM {t} WHERE pk = '{r}' AND sk = 'b'", gtable, r=f"r{i}")}
+        for i in range(100)
+    ]
+    cases = [
+        [{"Statement": "  ", "Parameters": bad}],
+        [{"Statement": other}, {"Statement": "  ", "Parameters": bad}],
+        [{"Statement": update + " AND", "Parameters": bad}],
+        reads + [{"Statement": read, "Parameters": bad}],
+    ]
+    inserted = []
+    for first in (
+        {"Statement": update, "Parameters": [{"SS": []}]},
+        {"Statement": update + " AND"},
+        {"Statement": "  "},
+    ):
+        two = f"trt-{uuid.uuid4().hex[:6]}"
+        insert = _sql("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b'}}", gtable, n=two)
+        cases.append([first, {"Statement": insert, "Parameters": bad}])
+        inserted.append(two)
+    two = f"trt-{uuid.uuid4().hex[:6]}"
+    insert = _sql("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b'}}", gtable, n=two)
+    cases.append([{"Statement": insert}, {"Statement": update, "Parameters": bad}])
+    inserted.append(two)
+    for members in cases:
+        with pytest.raises(ClientError) as excinfo:
+            _txn_raw(raw_client, members)
+        assert _serialization_refusal(excinfo) == ("SerializationException", 400), members
+    # A statement of only whitespace is refused ahead of the content of its
+    # parameters.
+    with pytest.raises(ClientError) as excinfo:
+        _txn_raw(raw_client, [{"Statement": "  ", "Parameters": [{"SS": []}]}])
+    assert _error(excinfo) == (
+        "ValidationException",
+        "ExecuteTransaction can not have empty statement.",
+    )
+    for two in inserted:
+        assert _gget(raw_client, gtable, key(two)) is None
+    assert _gget(raw_client, gtable, key(name)) == item(key(name))

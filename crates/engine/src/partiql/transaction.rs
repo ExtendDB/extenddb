@@ -59,6 +59,10 @@ pub(super) async fn run(
     ctx: &OperationContext,
     body: &Value,
 ) -> Result<DispatchResult, DynamoDbError> {
+    // A parameter of the wrong JSON type in any member fails the request
+    // before anything else is checked, a statement of only whitespace
+    // included (see `check_request_parameter_types`).
+    super::check_request_parameter_types(super::member_parameters(body.get("TransactStatements")))?;
     super::request_checks::check_execute_transaction(body)?;
     let statements = body
         .get("TransactStatements")
@@ -127,13 +131,14 @@ pub(super) async fn run(
 /// statement gets before its table is read.
 ///
 /// A statement of only whitespace fails the whole request without the
-/// statement's position, ahead of its parameters (measured 2026-11-05). A
-/// malformed statement fails the whole request, its message prefixed
-/// with the statement's position (measured 2026-11-02 on an empty WHERE). A
-/// parameter that cannot be converted is reported without the statement's
-/// position (measured 2026-11-02), and so is one the service refuses for its
-/// content, such as an empty set (measured 2026-11-06); the checks on a
-/// parsed statement name it.
+/// statement's position, ahead of the content of its parameters (measured
+/// 2026-11-05), but after their JSON types, which the request checked first
+/// (measured 2026-11-06). A malformed statement fails the whole request, its
+/// message prefixed with the statement's position (measured 2026-11-02 on an
+/// empty WHERE). A parameter that cannot be converted is reported without the
+/// statement's position (measured 2026-11-02), and so is one the service
+/// refuses for its content, such as an empty set (measured 2026-11-06); the
+/// checks on a parsed statement name it.
 /// A projected call (`COUNT(*)`) is among those checks, so it is refused
 /// ahead of every table lookup (measured 2026-11-02), and so are a
 /// projection list that names an identifier twice or two paths that

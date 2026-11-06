@@ -16,6 +16,7 @@ a distinct partition key per test for isolation.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -42,6 +43,24 @@ def dynamodb_client(endpoint_url):
             kwargs["verify"] = False
             kwargs["config"] = Config(parameter_validation=True)
     return session.client(**kwargs)
+
+
+def _batch_raw(client, statements):
+    """BatchExecuteStatement with `statements` sent as they are written.
+    botocore drops a null member, refuses a member the model does not name,
+    and refuses a number where a binary goes, so the request's JSON is put in
+    place before the request is signed."""
+    payload = json.dumps({"Statements": statements}).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = "before-call.dynamodb.BatchExecuteStatement"
+    client.meta.events.register(event, swap, unique_id="partiql-raw-body")
+    try:
+        return client.batch_execute_statement(Statements=[{"Statement": "x"}])
+    finally:
+        client.meta.events.unregister(event, unique_id="partiql-raw-body")
 
 
 @pytest.fixture(scope="module")
@@ -1230,3 +1249,205 @@ def test_a_parameter_refused_for_its_content_fails_only_its_statement(raw_client
     assert _gget(raw_client, gtable, key(names["k"]))["x"] == {"N": "1"}
     assert "v" not in _gget(raw_client, gtable, key(names["k"]))
     assert _gget(raw_client, gtable, key(names["j"])) == item(key(names["j"]))
+
+
+# A null member of a set, a map or a list, and a value with no type, fail
+# only their statement. A member the attribute value model does not name is
+# ignored whatever its value, and so is a member whose value is null, so
+# {"X": "1"} and {"S": null} have no type. A value of the wrong JSON type in
+# any statement fails the whole request with a SerializationException, ahead
+# of the checks of the request and of every statement, and no statement runs
+# (measured 2026-11-06). The service words that refusal as its JSON reader
+# does, which ExtendDB does not, so only its code is compared.
+
+EMPTY_AV = "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+SS_NULL = (
+    "One or more parameter values were invalid: An string set may not have a null string as a "
+    "member"
+)
+NS_NULL = "One or more parameter values were invalid: Numeric sets may not contain null"
+BS_NULL = (
+    "One or more parameter values were invalid: Binary sets may not contain null or empty values"
+)
+NULL_AV = "The supplied Item contains a null AttributeValue"
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"SS": ["a", None]}, SS_NULL),
+        ({"SS": ["a", "a", None]}, SS_NULL),
+        ({"NS": ["1", None]}, NS_NULL),
+        ({"BS": ["AQ==", None]}, BS_NULL),
+        ({"M": {"x": {"SS": ["a", None]}}}, SS_NULL),
+        ({"L": [{"NS": ["1", None]}]}, NS_NULL),
+        ({"X": "1"}, EMPTY_AV),
+        ({"X": {"a": 1}}, EMPTY_AV),
+        ({"S": None}, EMPTY_AV),
+        ({"M": {"x": {"X": "1"}}}, EMPTY_AV),
+        ({"L": [{"X": "1"}]}, EMPTY_AV),
+        ({"M": {"x": None}}, NULL_AV + ": x is null"),
+        ({"L": [None]}, NULL_AV),
+    ],
+)
+def test_a_null_member_or_a_value_with_no_type_fails_only_its_statement(
+    raw_client, gtable, value, message
+):
+    names = {n: f"bn-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "two")}
+    put(raw_client, gtable, names["k"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    insert = _sql(INSERT_TWO, gtable, **names)
+    resp = _batch_raw(
+        raw_client, [{"Statement": update, "Parameters": [value]}, {"Statement": insert}]
+    )
+    assert resp["Responses"] == [_validation(message), {"TableName": gtable}]
+    assert _gget(raw_client, gtable, key(names["two"])) is not None
+    assert _gget(raw_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+@pytest.mark.parametrize(
+    "value, stored",
+    [
+        ({"X": "1", "S": "a"}, {"S": "a"}),
+        ({"S": "a", "N": None}, {"S": "a"}),
+        ({"M": {"x": {"S": "a", "X": "1"}}}, {"M": {"x": {"S": "a"}}}),
+        ({"L": [{"S": "a", "X": "1"}]}, {"L": [{"S": "a"}]}),
+    ],
+)
+def test_a_member_the_model_does_not_name_is_ignored(raw_client, gtable, value, stored):
+    names = {n: f"bi-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "two")}
+    put(raw_client, gtable, names["k"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    insert = _sql(INSERT_TWO, gtable, **names)
+    resp = _batch_raw(
+        raw_client, [{"Statement": update, "Parameters": [value]}, {"Statement": insert}]
+    )
+    assert resp["Responses"] == [{"TableName": gtable}, {"TableName": gtable}]
+    assert _gget(raw_client, gtable, key(names["k"]))["v"] == stored
+
+
+def _deep_bool(levels=40):
+    value = {"BOOL": "x"}
+    for _ in range(levels):
+        value = {"L": [value]}
+    return value
+
+
+def _deep_list(levels=33):
+    value = {"L": [{"N": "1"}]}
+    for _ in range(levels):
+        value = {"L": [value]}
+    return value
+
+
+def _serialization_refusal(excinfo):
+    """The code and the HTTP status of a refusal of the request's JSON."""
+    resp = excinfo.value.response
+    return resp["Error"]["Code"], resp["ResponseMetadata"]["HTTPStatusCode"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        [{"SS": [1]}],
+        [{"SS": ["a", 1]}],
+        [{"SS": ["a", None, 1]}],
+        [{"SS": [True]}],
+        [{"SS": [{"S": "a"}]}],
+        [{"NS": [1]}],
+        [{"NS": [{"N": "1"}]}],
+        [{"BS": [1]}],
+        [{"BS": ["%%%"]}],
+        [{"B": "%%%"}],
+        [{"B": "AQ="}],
+        [{"BOOL": "x"}],
+        [{"BOOL": 1}],
+        [{"NULL": "x"}],
+        [{"S": 1}],
+        [{"S": {}}],
+        [{"SS": "a"}],
+        [{"L": "x"}],
+        [{"L": {}}],
+        [{"M": []}],
+        ["a"],
+        [{"M": {"x": {"SS": [1]}}}],
+        [{"L": [{"SS": [1]}]}],
+        [{"M": {"x": {"BS": [1]}}}],
+        [{"L": [{"NS": [1]}]}],
+        [_deep_bool()],
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_fails_the_request(raw_client, gtable, params):
+    names = {n: f"bt-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "two")}
+    put(raw_client, gtable, names["k"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    insert = _sql(INSERT_TWO, gtable, **names)
+    with pytest.raises(ClientError) as excinfo:
+        _batch_raw(raw_client, [{"Statement": update, "Parameters": params}, {"Statement": insert}])
+    assert _serialization_refusal(excinfo) == ("SerializationException", 400)
+    assert _gget(raw_client, gtable, key(names["two"])) is None
+    assert _gget(raw_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        [{"BOOL": "x"}, {"SS": []}],
+        [{"SS": []}, {"BOOL": "x"}],
+        [{"BOOL": "x"}, {"N": "abc"}],
+        [{"N": "abc"}, {"BOOL": "x"}],
+        [_deep_list(), {"BOOL": "x"}],
+        [{"BOOL": "x"}, _deep_list()],
+        [{"L": [{"SS": []}, {"BOOL": "x"}]}, {"N": "1"}],
+        [{"NS": [1]}, {"SS": []}],
+        [{"SS": []}, {"NS": [1]}],
+        [{"SS": [1]}, {"SS": []}],
+        [{"SS": []}, {"SS": [1]}],
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_comes_ahead_of_the_others(raw_client, gtable, params):
+    names = {n: f"bo-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "two")}
+    put(raw_client, gtable, names["k"])
+    update = _sql("UPDATE {t} SET v = ?, w = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    insert = _sql(INSERT_TWO, gtable, **names)
+    with pytest.raises(ClientError) as excinfo:
+        _batch_raw(raw_client, [{"Statement": update, "Parameters": params}, {"Statement": insert}])
+    assert _serialization_refusal(excinfo) == ("SerializationException", 400)
+    assert _gget(raw_client, gtable, key(names["two"])) is None
+    assert _gget(raw_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+def test_a_parameter_of_the_wrong_json_type_in_any_statement_fails_the_request(raw_client, gtable):
+    name = f"ba-{uuid.uuid4().hex[:6]}"
+    put(raw_client, gtable, name)
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    read = _sql("SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND a = ?", gtable, k=name)
+    bad = [{"BOOL": "x"}]
+    reads = [
+        {"Statement": _sql("SELECT * FROM {t} WHERE pk = '{r}' AND sk = 'b'", gtable, r=f"r{i}")}
+        for i in range(25)
+    ]
+    cases = [
+        reads + [{"Statement": read, "Parameters": bad}],
+        [{"Statement": read, "Parameters": []}, {"Statement": read, "Parameters": bad}],
+    ]
+    inserted = []
+    for first in (
+        {"Statement": update, "Parameters": [{"SS": []}]},
+        {"Statement": update + " AND"},
+        {"Statement": "  "},
+    ):
+        two = f"bat-{uuid.uuid4().hex[:6]}"
+        insert = _sql(INSERT_TWO, gtable, two=two)
+        cases.append([first, {"Statement": insert, "Parameters": bad}])
+        inserted.append(two)
+    two = f"bat-{uuid.uuid4().hex[:6]}"
+    cases.append([{"Statement": _sql(INSERT_TWO, gtable, two=two)}, {"Statement": update, "Parameters": bad}])
+    inserted.append(two)
+    for statements in cases:
+        with pytest.raises(ClientError) as excinfo:
+            _batch_raw(raw_client, statements)
+        assert _serialization_refusal(excinfo) == ("SerializationException", 400), statements
+    for two in inserted:
+        assert _gget(raw_client, gtable, key(two)) is None
+    assert _gget(raw_client, gtable, key(name)) == item(key(name))

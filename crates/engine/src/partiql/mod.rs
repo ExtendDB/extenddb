@@ -32,7 +32,9 @@ use serde_json::Value;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::partiql::operand_types::check_ordering_operands;
-use extenddb_core::partiql::params::check_parameter_values;
+use extenddb_core::partiql::params::{
+    check_parameter_types, check_parameter_values, modelled_value,
+};
 use extenddb_core::partiql::parser::{MAX_STATEMENT_LENGTH, parse_for_execute_statement};
 use extenddb_core::partiql::values::{check_condition_values, check_written_values};
 use extenddb_core::partiql::{Statement, table_name_refusal};
@@ -83,6 +85,7 @@ pub trait PartiqlExecutor {
 impl PartiqlExecutor for OperationContext {
     async fn execute_statement(&self, body: Value) -> Result<DispatchResult, DynamoDbError> {
         let ctx = &translation_context(self);
+        check_request_parameter_types([body.get("Parameters")])?;
         request_checks::check_execute_statement(&body)?;
         check_parameters(body.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
         let req = SingleRequest::from_body(&body)?;
@@ -194,8 +197,9 @@ pub(crate) struct SingleRequest {
 
 impl SingleRequest {
     /// The request of one statement, its parameters read. Its parameters
-    /// pass [`check_parameters`] first, so a failure here is a parameter of
-    /// the wrong JSON type, which fails the request.
+    /// pass [`check_request_parameter_types`] and [`check_parameters`]
+    /// first, so they read: a failure here is a `Parameters` member that is
+    /// not a list, which fails the request.
     pub(super) fn from_body(body: &Value) -> Result<Self, DynamoDbError> {
         let req = Self::without_parameters(body)?;
         Ok(Self {
@@ -248,10 +252,12 @@ impl SingleRequest {
     }
 }
 
-/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues). A
-/// value the attribute value deserializer refuses gets the error a classic
-/// request gets for it (see `crate::deserialize_error`); [`check_parameters`]
-/// has already refused the values the service refuses for their content.
+/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues), each
+/// value as the attribute value model reads it, without the members it
+/// ignores (see `params::modelled_value`). [`check_request_parameter_types`]
+/// and [`check_parameters`] have already refused the values the service
+/// refuses, so a value the attribute value deserializer refuses here gets the
+/// error a classic request gets for it (see `crate::deserialize_error`).
 pub(crate) fn parse_parameters(
     value: Option<&Value>,
 ) -> Result<Vec<AttributeValue>, DynamoDbError> {
@@ -263,17 +269,57 @@ pub(crate) fn parse_parameters(
     })?;
     arr.iter()
         .map(|v| {
-            serde_json::from_value::<AttributeValue>(v.clone()).map_err(crate::deserialize_error)
+            serde_json::from_value::<AttributeValue>(modelled_value(v))
+                .map_err(crate::deserialize_error)
         })
         .collect()
+}
+
+/// Check the JSON types of the parameters of a request, each item of
+/// `lists` being one statement's `Parameters` (see
+/// `params::check_parameter_types`). The service reads the JSON of the whole
+/// request first: a value of the wrong JSON type in any statement fails the
+/// request with a `SerializationException`, ahead of the checks of the
+/// request and of every statement, and in `BatchExecuteStatement` no
+/// statement runs (measured 2026-11-06). So this runs before anything else
+/// in the request is checked.
+///
+/// # Errors
+///
+/// The `SerializationException`, worded as the attribute value
+/// deserializer's refusals are (see `crate::deserialize_error`).
+pub(crate) fn check_request_parameter_types<'a>(
+    lists: impl IntoIterator<Item = Option<&'a Value>>,
+) -> Result<(), DynamoDbError> {
+    for list in lists {
+        if let Some(Value::Array(parameters)) = list {
+            check_parameter_types(parameters).map_err(|detail| {
+                DynamoDbError::SerializationException(format!(
+                    "Start of structure or map found where not expected: {detail}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The `Parameters` of each member of a request's statement list (the
+/// `Statements` of a batch or the `TransactStatements` of a transaction).
+pub(crate) fn member_parameters(list: Option<&Value>) -> impl Iterator<Item = Option<&Value>> {
+    list.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|member| member.get("Parameters"))
 }
 
 /// Check a statement's `Parameters` (as the request carries them): nesting
 /// depth, number conversion, and the values the service refuses for their
 /// content, such as an empty set (see `params::check_parameter_values`). The
-/// service answers this ahead of the target's key checks, and in
-/// `ExecuteTransaction` without a statement-position prefix (measured
-/// 2026-11-02 and 2026-11-06), so it runs before the statement is parsed.
+/// JSON types of every parameter of the request are checked first (see
+/// [`check_request_parameter_types`]). The service answers this ahead of the
+/// target's key checks, and in `ExecuteTransaction` without a
+/// statement-position prefix (measured 2026-11-02 and 2026-11-06), so it runs
+/// before the statement is parsed.
 ///
 /// The walk follows the parsed body: parameters and list elements in request
 /// order, the members of a map in the order the parsed request holds them,
@@ -459,6 +505,44 @@ mod tests {
             check_parameters(body.get("Parameters")),
             Err("The parameter cannot be converted to a numeric value".to_owned())
         );
+    }
+
+    #[test]
+    fn a_parameter_of_the_wrong_json_type_in_any_statement_fails_the_request() {
+        // (measured 2026-11-06: a content problem in an earlier statement,
+        // or in the same one, does not come first)
+        let body = serde_json::json!({ "Statements": [
+            { "Statement": "x", "Parameters": [{"SS": []}] },
+            { "Statement": "y" },
+            { "Statement": "z", "Parameters": [{"S": "a"}, {"SS": [1]}] },
+        ]});
+        match check_request_parameter_types(member_parameters(body.get("Statements"))) {
+            Err(DynamoDbError::SerializationException(message)) => assert_eq!(
+                message,
+                "Start of structure or map found where not expected: SS member must be a string"
+            ),
+            other => panic!("expected a SerializationException, got {other:?}"),
+        }
+        let body = serde_json::json!({ "Parameters": [{"SS": []}, {"X": 1}, {"S": null}] });
+        assert!(check_request_parameter_types([body.get("Parameters")]).is_ok());
+        assert!(check_request_parameter_types(member_parameters(None)).is_ok());
+    }
+
+    #[test]
+    fn a_parameter_is_read_without_the_members_the_model_ignores() {
+        let body = serde_json::json!({
+            "Statement": "x",
+            "Parameters": [{"S": "a", "X": "1"}, {"N": "10", "B": null}],
+        });
+        let req = SingleRequest::from_body(&body).unwrap();
+        assert_eq!(
+            req.parameters,
+            vec![
+                AttributeValue::S("a".to_owned()),
+                AttributeValue::N("10".to_owned())
+            ]
+        );
+        assert_eq!(req.parameter_numbers, vec![None, Some("10".to_owned())]);
     }
 
     /// The statement checks of `sql` with the parameters `params`.

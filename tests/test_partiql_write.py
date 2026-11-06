@@ -15,6 +15,7 @@ shared table.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -1042,4 +1043,220 @@ def test_a_parameter_refused_for_its_content_is_reported_when_it_is_not_used(
     pk = put(raw_client, gtable, f"parx-{uuid.uuid4().hex[:6]}")
     statement = f"UPDATE \"{gtable}\" SET v = 1 WHERE pk = '{pk}' AND sk = 'b'"
     assert _refusal(raw_client, statement, [{"SS": []}]) == ("ValidationException", SS_EMPTY)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+# --- the JSON of a parameter ----------------------------------------------------
+# A null member of a set, a map or a list, and a value with no type, are
+# refused for their content, in their place. A member the attribute value
+# model does not name is ignored whatever its value, and so is a member whose
+# value is null. A value of the wrong JSON type fails the request with a
+# SerializationException, ahead of the checks of the request and of every
+# other parameter (measured 2026-11-06 in us-east-1). The service words that
+# refusal as its JSON reader does, which ExtendDB does not, so only its code
+# is compared.
+
+EMPTY_AV = "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+SS_NULL = (
+    "One or more parameter values were invalid: An string set may not have a null string as a "
+    "member"
+)
+NS_NULL = "One or more parameter values were invalid: Numeric sets may not contain null"
+NULL_AV = "The supplied Item contains a null AttributeValue"
+
+
+def _execute_raw(client, body):
+    """ExecuteStatement with `body` as the request's JSON, as it is written.
+    botocore drops a null member, refuses a member the model does not name,
+    and refuses a number where a binary goes, so the JSON is put in place
+    before the request is signed."""
+    payload = json.dumps(body).encode()
+
+    def swap(params, **_kwargs):
+        params["body"] = payload
+
+    event = "before-call.dynamodb.ExecuteStatement"
+    client.meta.events.register(event, swap, unique_id="partiql-raw-body")
+    try:
+        return client.execute_statement(Statement="x")
+    finally:
+        client.meta.events.unregister(event, unique_id="partiql-raw-body")
+
+
+def _raw_refusal(client, body):
+    with pytest.raises(ClientError) as excinfo:
+        _execute_raw(client, body)
+    resp = excinfo.value.response
+    return resp["Error"]["Code"], resp["Error"]["Message"], resp["ResponseMetadata"]["HTTPStatusCode"]
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ({"SS": ["a", None]}, SS_NULL),
+        ({"SS": [None]}, SS_NULL),
+        ({"SS": ["a", None, "a"]}, SS_NULL),
+        ({"SS": ["a", "a", None]}, SS_NULL),
+        ({"NS": ["1", None]}, NS_NULL),
+        ({"NS": [None, "abc"]}, NS_NULL),
+        ({"NS": ["abc", None]}, "The parameter cannot be converted to a numeric value: abc"),
+        ({"NS": [""]}, "The parameter cannot be converted to a numeric value"),
+        (
+            {"BS": ["AQ==", None]},
+            "One or more parameter values were invalid: Binary sets may not contain null or empty "
+            "values",
+        ),
+        ({"M": {"x": {"SS": ["a", None]}}}, SS_NULL),
+        ({"L": [{"NS": ["1", None]}]}, NS_NULL),
+        ({"X": "1"}, EMPTY_AV),
+        ({"X": 1}, EMPTY_AV),
+        ({"X": {"a": 1}}, EMPTY_AV),
+        ({"X": [1, {"S": 1}]}, EMPTY_AV),
+        ({"X": None}, EMPTY_AV),
+        ({"s": "a"}, EMPTY_AV),
+        ({"S": None}, EMPTY_AV),
+        ({"BOOL": None}, EMPTY_AV),
+        ({"NULL": None}, EMPTY_AV),
+        ({"B": None}, EMPTY_AV),
+        ({"M": {"x": {"X": "1"}}}, EMPTY_AV),
+        ({"L": [{"X": "1"}]}, EMPTY_AV),
+        ({"M": {"x": None}}, NULL_AV + ": x is null"),
+        ({"L": [None]}, NULL_AV),
+    ],
+)
+def test_a_null_member_or_a_value_with_no_type_is_refused_for_its_content(
+    raw_client, gtable, value, message
+):
+    pk = put(raw_client, gtable, f"pan-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ? WHERE pk = '{pk}' AND sk = 'b'"
+    body = {"Statement": statement, "Parameters": [value]}
+    assert _raw_refusal(raw_client, body) == ("ValidationException", message, 400)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "params, message",
+    [
+        ([{"X": "1"}, {"SS": []}], EMPTY_AV),
+        ([{"SS": []}, {"X": "1"}], SS_EMPTY),
+        ([{"SS": ["a", None]}, {"SS": []}], SS_NULL),
+        ([{"SS": []}, {"SS": ["a", None]}], SS_EMPTY),
+        ([{"M": {"a": {"SS": []}, "b": None}}], SS_EMPTY),
+        (
+            [{"M": {"a": {"N": "abc"}, "b": None}}],
+            "The parameter cannot be converted to a numeric value: abc",
+        ),
+        ([{"M": {"a": {}, "b": None}}], EMPTY_AV),
+        ([{"M": {"a": {"M": {"c": None}}, "b": {"SS": []}}}], NULL_AV + ": c is null"),
+        ([{"M": {"a": {"SS": []}, "b": {"M": {"c": None}}}}], SS_EMPTY),
+        ([{"M": {"a": _deep_list(), "b": None}}], NESTED_PAST),
+    ],
+)
+def test_a_null_member_or_a_value_with_no_type_is_refused_in_its_place(
+    raw_client, gtable, params, message
+):
+    pk = put(raw_client, gtable, f"pao-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ?, w = ? WHERE pk = '{pk}' AND sk = 'b'"
+    padded = params + [{"N": "1"}] * (2 - len(params))
+    body = {"Statement": statement, "Parameters": padded}
+    assert _raw_refusal(raw_client, body) == ("ValidationException", message, 400)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "value, stored",
+    [
+        ({"X": "1", "S": "a"}, {"S": "a"}),
+        ({"S": "a", "N": None}, {"S": "a"}),
+        ({"S": "a", "X": None}, {"S": "a"}),
+        ({"M": {"x": {"S": "a", "X": "1"}}}, {"M": {"x": {"S": "a"}}}),
+        ({"L": [{"S": "a", "X": "1"}]}, {"L": [{"S": "a"}]}),
+        ({"SS": [""]}, {"SS": [""]}),
+    ],
+)
+def test_a_member_the_model_does_not_name_is_ignored(raw_client, gtable, value, stored):
+    pk = put(raw_client, gtable, f"pai-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ? WHERE pk = '{pk}' AND sk = 'b'"
+    assert _execute_raw(raw_client, {"Statement": statement, "Parameters": [value]})["Items"] == []
+    assert _gget(raw_client, gtable, pk)["v"] == stored
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"SS": [1]},
+        {"SS": ["a", None, 1]},
+        {"NS": [1]},
+        {"NS": [True]},
+        {"BS": [1]},
+        {"B": "%%%"},
+        {"BOOL": "x"},
+        {"BOOL": 1},
+        {"NULL": "x"},
+        {"NULL": 1},
+        {"S": 1},
+        {"S": []},
+        {"S": True},
+        {"N": 1},
+        {"N": True},
+        {"SS": "a"},
+        {"SS": {}},
+        {"M": "x"},
+        {"L": "x"},
+        "a",
+        {"M": {"x": {"SS": [1]}}},
+        {"L": [{"BS": [1]}]},
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_fails_the_request(raw_client, gtable, value):
+    pk = put(raw_client, gtable, f"pat-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ? WHERE pk = '{pk}' AND sk = 'b'"
+    code, _, status = _raw_refusal(raw_client, {"Statement": statement, "Parameters": [value]})
+    assert (code, status) == ("SerializationException", 400)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        [{"BOOL": "x"}, {"SS": []}],
+        [{"SS": []}, {"BOOL": "x"}],
+        [{"BOOL": "x"}, {"N": "abc"}],
+        [{"N": "abc"}, {"BOOL": "x"}],
+        [_deep_list(), {"BOOL": "x"}],
+        [{"BOOL": "x"}, _deep_list()],
+        [{"L": [{"SS": []}, {"BOOL": "x"}]}, {"N": "1"}],
+        [{"NS": [1]}, {"SS": []}],
+        [{"SS": []}, {"SS": [1]}],
+    ],
+)
+def test_a_parameter_of_the_wrong_json_type_comes_ahead_of_the_others(raw_client, gtable, params):
+    pk = put(raw_client, gtable, f"pao-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ?, w = ? WHERE pk = '{pk}' AND sk = 'b'"
+    code, _, status = _raw_refusal(raw_client, {"Statement": statement, "Parameters": params})
+    assert (code, status) == ("SerializationException", 400)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+def test_a_parameter_of_the_wrong_json_type_comes_ahead_of_the_request_checks(raw_client, gtable):
+    pk = put(raw_client, gtable, f"par-{uuid.uuid4().hex[:6]}")
+    read = f"SELECT * FROM \"{gtable}\" WHERE pk = '{pk}' AND sk = 'b' AND a = ?"
+    update = f"UPDATE \"{gtable}\" SET v = ? WHERE pk = '{pk}' AND sk = 'b'"
+    bad = [{"BOOL": "x"}]
+    for body in (
+        {"Statement": read, "Parameters": bad, "Limit": 0},
+        {"Statement": read + " " * 8193, "Parameters": bad},
+        {"Statement": read, "Parameters": bad, "ReturnConsumedCapacity": "NOPE"},
+        {"Statement": "  ", "Parameters": bad},
+        {"Statement": update + " AND", "Parameters": bad},
+    ):
+        code, _, status = _raw_refusal(raw_client, body)
+        assert (code, status) == ("SerializationException", 400), body
+    # Without it, a statement of only whitespace is refused for the content
+    # of its parameter.
+    assert _raw_refusal(raw_client, {"Statement": "  ", "Parameters": [{"X": "1"}]}) == (
+        "ValidationException",
+        EMPTY_AV,
+        400,
+    )
     assert _gget(raw_client, gtable, pk) == item(pk)
