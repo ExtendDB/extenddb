@@ -9,6 +9,7 @@
 
 pub mod authorization_store;
 pub mod backend;
+pub mod backup_catalog;
 pub mod backup_definition;
 pub mod bootstrapper;
 pub mod config;
@@ -18,8 +19,11 @@ pub mod error;
 pub mod hooks;
 pub mod management_store;
 pub mod management_store_factory;
+pub mod migrations;
 pub mod operations;
+pub mod password;
 pub mod policy_migration;
+pub mod secret_cipher;
 pub mod server_components;
 pub mod settings_store;
 pub mod snapshot;
@@ -35,6 +39,9 @@ pub mod vector_catalog;
 pub mod vector_lifecycle;
 
 pub use backend::{Backend, BackendAlreadySet, backend_name, set_backend, try_backend};
+pub use backup_catalog::{
+    BackupCatalog, JobClaim, JobPermit, LegacyBackupReader, MaintenanceClaim,
+};
 pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOverrides};
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
@@ -325,7 +332,11 @@ pub trait DataEngine: Send + Sync {
     /// Update an item by primary key using update actions.
     ///
     /// `UpdateItem` is an upsert: if the item doesn't exist, a new item is created
-    /// containing the key attributes plus the SET values.
+    /// containing the key attributes plus the SET values. The exception is an
+    /// update whose actions all remove data (`REMOVE`, `DELETE`): on a missing
+    /// item it writes nothing, emits no stream record, and returns
+    /// `(None, None)` whatever `return_old` and `return_new` say
+    /// (`extenddb_core::expression::removes_only`).
     ///
     /// If `condition` is `Some`, evaluates the condition against the existing item
     /// (or empty item for new) inside a transaction.
@@ -707,116 +718,6 @@ pub trait WorkerStore: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<(String, &'static str)>, StorageError>>;
 }
 
-/// Backup and point-in-time recovery operations.
-pub trait BackupEngine: Send + Sync {
-    /// Create a backup of a table, snapshotting all items.
-    fn create_backup(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        backup_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDetails, StorageError>>;
-
-    /// Describe a backup by ARN, scoped to the owning account.
-    ///
-    /// Backups belong to an account, so implementations must match on both
-    /// `account_id` and `backup_arn` and report a missing backup when the ARN
-    /// belongs to another account — consistent with `list_backups`, which is
-    /// already account-scoped.
-    fn describe_backup(
-        &self,
-        account_id: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
-
-    /// List the account's backups, optionally only those of `table_name`.
-    ///
-    /// Returns every matching backup in any order; the engine sorts, applies
-    /// `Limit` and `ExclusiveStartBackupArn`, and sets
-    /// `LastEvaluatedBackupArn`. Each summary carries the source table's
-    /// `TableId`.
-    fn list_backups(
-        &self,
-        account_id: &str,
-        table_name: Option<&str>,
-    ) -> BoxFuture<'_, Result<Vec<extenddb_core::types::BackupSummary>, StorageError>>;
-
-    /// Delete a backup by ARN, scoped to the owning account.
-    ///
-    /// Same scoping requirement as `describe_backup`: an ARN owned by another
-    /// account must be reported as missing rather than deleted.
-    fn delete_backup(
-        &self,
-        account_id: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::BackupDescription, StorageError>>;
-
-    /// The backup's recorded source, for an AVAILABLE backup owned by
-    /// `account_id`.
-    ///
-    /// The engine resolves the restore target and runs every refusal from
-    /// this, and fills DescribeBackup's `SourceTableFeatureDetails` and
-    /// `SourceTableDetails.ProvisionedThroughput` from it. `definition` is the
-    /// stored [`backup_definition::BackupTableDefinition`] (with
-    /// `time_to_live` and `stream_specification` as captured at
-    /// CreateBackup), or `None` for a backup recorded without one.
-    ///
-    /// # Errors
-    ///
-    /// `StorageError::Validation("Backup not found: <arn>")` if the backup is
-    /// missing, owned by another account, or not AVAILABLE.
-    /// `StorageError::Unsupported` for a stored definition this build cannot
-    /// read ([`backup_definition::BackupTableDefinition::from_json`]).
-    fn backup_restore_source(
-        &self,
-        account_id: &str,
-        backup_arn: &str,
-    ) -> BoxFuture<'_, Result<BackupRestoreSource, StorageError>>;
-
-    /// Restore `request.input.table_name` from `request.backup_arn`.
-    ///
-    /// `request.input` is resolved and validated by the engine; create exactly
-    /// that table, CREATING. In the same atomic step that re-checks the backup
-    /// is still AVAILABLE, register the restore (source backup ARN, source
-    /// table ARN, `restore_date_time`) so DescribeTable can report
-    /// `RestoreSummary`, DeleteBackup refuses the source, and DeleteTable
-    /// refuses the target while it is being restored. Then return the CREATING
-    /// description at once.
-    ///
-    /// The item copy runs in a detached task (`tokio::spawn`) that owns its
-    /// own clones, so the request future being dropped (a client timeout) does
-    /// not stop it. The task flips the target ACTIVE when the copy completes,
-    /// or removes the target on failure.
-    ///
-    /// # Errors
-    ///
-    /// Returned synchronously, before the copy starts:
-    /// `StorageError::Validation("Backup not found: <arn>")` if the backup is
-    /// not AVAILABLE at registration; `StorageError::TableAlreadyExists(name)`
-    /// if the name is taken; `StorageError::LimitExceeded` if the backend's
-    /// restore capacity is exhausted.
-    fn restore_table_from_backup(
-        &self,
-        account_id: &str,
-        request: RestoreRequest,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>>;
-
-    /// Describe continuous backups / PITR status for a table.
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-
-    /// Update continuous backups (enable/disable PITR).
-    fn update_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<extenddb_core::types::ContinuousBackupsDescription, StorageError>>;
-}
-
 /// Supertrait combining all `DynamoDB` operation traits.
 ///
 /// All storage backends must implement this to provide a complete
@@ -827,7 +728,8 @@ pub trait StorageEngine:
     + DataEngine
     + MetadataEngine
     + StreamEngine
-    + BackupEngine
+    + BackupCatalog
+    + LegacyBackupReader
     + SnapshotEngine
     + WorkerStore
     + Send
@@ -835,13 +737,14 @@ pub trait StorageEngine:
 {
 }
 
-// Blanket implementation: any type implementing all 7 traits is a StorageEngine
+// Blanket implementation: any type implementing all 8 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
         + MetadataEngine
         + StreamEngine
-        + BackupEngine
+        + BackupCatalog
+        + LegacyBackupReader
         + SnapshotEngine
         + WorkerStore
         + Send
@@ -856,6 +759,7 @@ impl<T> StorageEngine for T where
 pub trait CatalogStore:
     management_store::ManagementStore
     + management_store::AdminStore
+    + management_store::PasswordHashStore
     + management_store::SettingsStore
     + management_store::MetricsStore
     + management_store::RateLimitStore

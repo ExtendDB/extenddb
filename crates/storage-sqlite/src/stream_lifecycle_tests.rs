@@ -20,7 +20,7 @@ async fn engine() -> SqliteEngine {
     let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 400 * 1024)
         .await
         .unwrap();
-    crate::schema::apply(&engine.pool).await.unwrap();
+    crate::migrations::apply_for_tests(&engine.pool).await;
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'stream-test')")
         .bind(ACCOUNT)
         .execute(&engine.pool)

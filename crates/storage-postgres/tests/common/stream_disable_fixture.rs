@@ -51,9 +51,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 pub fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -105,10 +118,13 @@ pub async fn scratch() -> Scratch {
         .execute(&db)
         .await
         .expect("match the two-database layout");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -227,7 +243,26 @@ pub async fn put(s: &Scratch, name: &str, pk: &str, view_type: StreamViewType) {
         .expect("put");
 }
 
+/// Number every committed record still in `stream_pending`, as the numbering
+/// worker would: a write's record gets its sequence number after the write
+/// commits.
+pub async fn number_pending(s: &Scratch) {
+    s.engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending stream records");
+}
+
+/// The records still waiting in `stream_pending` for their numbers.
+pub async fn pending_count(s: &Scratch) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM stream_pending")
+        .fetch_one(&s.db)
+        .await
+        .expect("count pending records")
+}
+
 pub async fn last_record(s: &Scratch, shard: &str) -> Option<String> {
+    number_pending(s).await;
     sqlx::query_scalar("SELECT MAX(sequence_number) FROM stream_records WHERE shard_id = $1")
         .bind(shard)
         .fetch_one(&s.db)
@@ -236,6 +271,7 @@ pub async fn last_record(s: &Scratch, shard: &str) -> Option<String> {
 }
 
 pub async fn record_count(s: &Scratch) -> i64 {
+    number_pending(s).await;
     sqlx::query_scalar("SELECT COUNT(*) FROM stream_records")
         .fetch_one(&s.db)
         .await

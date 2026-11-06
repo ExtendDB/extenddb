@@ -47,7 +47,6 @@ use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::Mutex;
 
 use crate::INDEX_PROPAGATION_DELAY_QUERY;
-use crate::schema::CATALOG_VERSION;
 use crate::sqlite_util::sqlite_url;
 
 /// The SQLite storage engine. Implements `StorageEngine` (all data/metadata/
@@ -87,6 +86,9 @@ pub struct SqliteEngine {
     /// it; see [`crate::backup::backup_server_slot_count`].
     pub(crate) backup_server_slot_count: usize,
     pub(crate) backup_server_slots: Arc<tokio::sync::Semaphore>,
+    /// The in-process claims of the backup and restore jobs this process
+    /// runs; see [`crate::backup_catalog::JobSlots`].
+    pub(crate) job_slots: Arc<crate::backup_catalog::JobSlots>,
 }
 
 impl SqliteEngine {
@@ -129,15 +131,9 @@ impl SqliteEngine {
         }
         let pool = opts
             .after_connect(|conn, _| {
-                Box::pin(async move {
-                    use sqlx::Executor;
-                    conn.execute("PRAGMA journal_mode = WAL").await?;
-                    conn.execute("PRAGMA foreign_keys = ON").await?;
-                    conn.execute("PRAGMA synchronous = NORMAL").await?;
-                    conn.execute("PRAGMA busy_timeout = 5000").await?;
-                    conn.execute("PRAGMA cache_size = -32000").await?;
-                    Ok(())
-                })
+                Box::pin(
+                    async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
+                )
             })
             .connect(&url)
             .await
@@ -184,6 +180,7 @@ impl SqliteEngine {
             serve_lock: None,
             backup_server_slot_count,
             backup_server_slots: Arc::new(tokio::sync::Semaphore::new(backup_server_slot_count)),
+            job_slots: Arc::default(),
         })
     }
 
@@ -192,15 +189,17 @@ impl SqliteEngine {
         Arc::clone(&self.control_plane_notify)
     }
 
-    /// Bootstrap an ephemeral catalog on the engine's own (shared) connection,
-    /// at serve time. Used for in-memory databases, whose state does not
-    /// survive the `init` process, so schema, encryption key, default account,
-    /// and admin user must be created when the server starts. Idempotent.
+    /// Write the rows a server needs that `init` writes on a production
+    /// deployment (encryption key, default account, admin user) on the
+    /// engine's own connection, each only when absent. Used for an in-memory
+    /// database, whose state does not survive the `init` process, and by dev
+    /// builds, which need no `init`. The catalog schema is already in place:
+    /// the server's factory runs the migrations first.
     ///
     /// Returns `Some(password)` when a new admin user was created with a
     /// generated password (so the caller can surface it once), or `None` when
     /// the admin already existed or the password came from the environment.
-    pub(crate) async fn bootstrap_ephemeral(
+    pub(crate) async fn bootstrap_dev_rows(
         &self,
         admin_user: Option<&str>,
         admin_password: Option<&str>,
@@ -208,12 +207,6 @@ impl SqliteEngine {
         use extenddb_storage::bootstrapper::helpers;
 
         let internal = |e: String| StorageError::Internal(e);
-
-        // Schema (creates settings, accounts, admin_users, … and seeds
-        // catalog_version + index_propagation_delay_ms).
-        crate::schema::apply(&self.pool)
-            .await
-            .map_err(|e| internal(format!("apply schema: {e:?}")))?;
 
         // Encryption key.
         let key_exists: bool = sqlx::query_scalar(
@@ -223,7 +216,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| internal(format!("check encryption key: {e}")))?;
         if !key_exists {
-            let key = helpers::generate_encryption_key();
+            let key = helpers::generate_encryption_key().map_err(internal)?;
             sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('encryption_key', ?)")
                 .bind(&key)
                 .execute(&self.pool)
@@ -406,58 +399,6 @@ impl SqliteEngine {
         Ok(())
     }
 
-    /// Validate the on-disk catalog version matches the compiled expectation.
-    ///
-    /// # Errors
-    /// - [`StorageError::CatalogNotInitialized`] if the catalog is absent.
-    /// - [`StorageError::CatalogVersionMismatch`] if versions differ.
-    /// - [`StorageError::Internal`] if the stored version is malformed, carrying
-    ///   `check_stored_catalog_version`'s refusal text.
-    pub async fn check_catalog_version(&self) -> Result<(), StorageError> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| StorageError::Connection(e.to_string()))?;
-
-        if !exists {
-            return Err(StorageError::CatalogNotInitialized);
-        }
-
-        let found_str = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM settings WHERE key = 'catalog_version'",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Connection(e.to_string()))?
-        .ok_or(StorageError::CatalogNotInitialized)?
-        .0;
-
-        // An unreadable version gets the shared guard's refusal, the text
-        // `extenddb migrate` prints for the same catalog.
-        let found = found_str
-            .parse::<extenddb_core::version::CatalogVersion>()
-            .map_err(|e| {
-                StorageError::Internal(
-                    extenddb_storage::util::check_stored_catalog_version(
-                        Some(&found_str),
-                        CATALOG_VERSION,
-                    )
-                    .err()
-                    .unwrap_or_else(|| e.to_string()),
-                )
-            })?;
-
-        if found != CATALOG_VERSION {
-            return Err(StorageError::CatalogVersionMismatch {
-                expected: CATALOG_VERSION.to_string(),
-                found: found_str,
-            });
-        }
-        Ok(())
-    }
-
     /// Read the configured data database name (the file path) for the startup
     /// banner. Returns `"(not configured)"` when unset.
     pub async fn data_database_info(&self) -> String {
@@ -469,43 +410,6 @@ impl SqliteEngine {
         .ok()
         .flatten()
         .map_or_else(|| "(not configured)".to_owned(), |(v,)| v)
-    }
-}
-
-#[cfg(test)]
-mod catalog_version_tests {
-    use super::SqliteEngine;
-    use extenddb_storage::error::StorageError;
-
-    /// `serve` once printed the unreadable-version refusal as
-    /// "Internal error: <parse error>"; it now carries the shared guard's
-    /// text, which `extenddb migrate` prints for the same catalog.
-    #[tokio::test]
-    async fn an_unreadable_version_carries_the_shared_refusal() {
-        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
-            .await
-            .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        engine
-            .check_catalog_version()
-            .await
-            .expect("current catalog");
-        for stored in ["garbage", "0.0", "v0.0.4"] {
-            sqlx::query("UPDATE settings SET value = ? WHERE key = 'catalog_version'")
-                .bind(stored)
-                .execute(&engine.pool)
-                .await
-                .expect("tamper");
-            let expected = extenddb_storage::util::check_stored_catalog_version(
-                Some(stored),
-                crate::schema::CATALOG_VERSION,
-            )
-            .expect_err("unreadable");
-            match engine.check_catalog_version().await {
-                Err(StorageError::Internal(msg)) => assert_eq!(msg, expected, "{stored}"),
-                other => panic!("{stored}: {other:?}"),
-            }
-        }
     }
 }
 
@@ -524,7 +428,7 @@ mod d1_write_lock_tests {
         let engine = SqliteEngine::new(":memory:", 2, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query(
             "INSERT INTO accounts (account_id, account_name) VALUES ('000000000000', 'default')",
         )
@@ -660,45 +564,30 @@ mod d1_write_lock_tests {
 
     #[tokio::test]
     async fn delete_backup_waits_for_the_write_lock() {
-        use extenddb_storage::BackupEngine;
+        use extenddb_storage::{JobPermit, LegacyBackupReader};
         let engine = engine().await;
         create_table(&engine, "d1-bkp-t").await;
         // The backup must exist before the lock window: delete_backup resolves
         // it with a read first and returns early when it is missing, which
         // would complete without ever reaching the writes under test.
-        let details = BackupEngine::create_backup(&engine, "000000000000", "d1-bkp-t", "b")
-            .await
-            .expect("backup");
+        let details = LegacyBackupReader::create(
+            &engine,
+            "000000000000",
+            "d1-bkp-t",
+            "b",
+            JobPermit::detached(),
+        )
+        .await
+        .expect("backup");
         let e = engine.clone();
         assert_serialized(
             &engine,
             async move {
-                BackupEngine::delete_backup(&e, "000000000000", &details.backup_arn)
+                LegacyBackupReader::delete(&e, "000000000000", &details.backup_arn)
                     .await
                     .expect("delete backup");
             },
             "delete_backup",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn update_continuous_backups_waits_for_the_write_lock() {
-        use extenddb_storage::BackupEngine;
-        let engine = engine().await;
-        // The table must exist before the lock window: the pre-lock existence
-        // check returns TableNotFound otherwise, completing without reaching
-        // the write under test.
-        create_table(&engine, "d1-pitr-t").await;
-        let e = engine.clone();
-        assert_serialized(
-            &engine,
-            async move {
-                BackupEngine::update_continuous_backups(&e, "000000000000", "d1-pitr-t", true)
-                    .await
-                    .expect("update continuous backups");
-            },
-            "update_continuous_backups",
         )
         .await;
     }

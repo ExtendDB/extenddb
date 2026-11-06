@@ -53,8 +53,33 @@ SIGTERM directly. Alternatively start it with
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
-# {"status":"healthy"}
+# {"status":"healthy","components":{}}
+# with a backup store configured:
+# {"status":"healthy","components":{"backup_store":{"status":"healthy","kind":"filesystem"}}}
+# while it cannot be reached:
+# {"status":"degraded","components":{"backup_store":{"status":"unhealthy","kind":"s3","reason":"unreachable"}}}
+# right after startup, before an S3 store's first check has returned:
+# {"status":"healthy","components":{"backup_store":{"status":"checking","kind":"s3"}}}
 ```
+
+`status` is `healthy`, or `degraded` when a component is unhealthy; the HTTP
+status stays 200 either way, because a component problem never takes the data
+plane out of rotation. The one component is `backup_store`, present whenever
+the server has a store: one `[backup.store]` configures, or the default root
+beside a file-backed SQLite database when the section is absent (absent when
+no store is configured, when `kind = "disabled"`, and when a default root
+failed its check with no rows for it); its `reason` is the problem's category in
+one or two words (`unreachable`, `permission denied`, `failed validation`,
+`identity file unreadable`, `identity file missing`, `identity mismatch`,
+`owned by another catalog`, `manifest probe failed`, `catalog unreadable`) and
+nothing else: the endpoint is unauthenticated, so the ids, ARNs and table
+names a problem involves are in the server's log line only. An S3 store's
+first check runs after the listener is up (the next section); until it
+returns the component is `checking`, with the server `healthy`. The
+reconciler re-runs the store's checks every `reconcile_interval_secs`, each
+run bounded (5 s for a filesystem root, 30 s for a bucket, after which the
+check is abandoned and the store is `unreachable` until a later check
+answers), and the component recovers on its own.
 
 Or without `curl` — useful inside a minimal container image, and what a Docker
 `HEALTHCHECK` should call:
@@ -67,9 +92,8 @@ echo $?   # 0 = healthy, 1 = not
 `healthcheck` reads the port from the config file, or takes an explicit
 `--endpoint https://host:port`. It accepts the server's self-signed certificate.
 
-This checks liveness, not readiness. `/health` is a static handler that does not
-query PostgreSQL, so it reports healthy even when the database has become
-unreachable since startup. That is intentional for a liveness probe: one that
+This checks liveness, not readiness. `/health` does not query the database, so
+it reports healthy even when the database has become unreachable since startup. That is intentional for a liveness probe: one that
 failed on a database outage would restart every replica at once and prolong the
 outage. A database that is unreachable at startup stops the server from listening
 at all, so that case is still caught.
@@ -90,7 +114,7 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `bind_addr` | `127.0.0.1` | Network interface to bind |
 | `port` | `18443` | HTTP port |
-| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (a value outside that class makes the server's own backup ARNs "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
+| `region` | `us-east-1` | AWS region for ARN generation. Baked into every backup ARN the server issues, so it must stay within `[a-z0-9-]` (under a value outside that class `CreateBackup` is refused with a `ValidationException` naming `server.region`, since no backup ARN can be formed; backups taken before the upgrade under such a region keep an ARN `DescribeBackup`, `DeleteBackup`, and `RestoreTableFromBackup` refuse as "not valid"; the server logs a warning at startup). A backup ARN of the caller's account in another region is resolved in the server's region first, then as written; see the upgrade manual before changing this on a deployment with backups |
 
 #### [storage]
 
@@ -106,9 +130,9 @@ These settings require a server restart to take effect.
 | `pool_size` | `20` | Maximum concurrent database connections (minimum: 10) |
 | `catalog_pool_size` | (= `pool_size`) | Maximum connections for management/authz pool (minimum: 10) |
 
-Restores on PostgreSQL are bounded per server process: at most 4 per account and at most half of `pool_size` in total (after its minimum of 10 is applied, capped at 16; 10 with the default `pool_size` of 20). A restore that cannot get both within 30 seconds is refused with `LimitExceededException`. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its lock.
+Backup and restore jobs are bounded per server process by `[backup] max_concurrent_jobs` (default 4, below), not per account; a request that finds every slot held waits up to 30 s for one and is then refused with `LimitExceededException`. The server raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` and logs the raise with both numbers, so every job the bound admits has a connection. Each running restore holds one connection from this pool for its whole copy, plus one dedicated connection outside the pool for its claim.
 
-`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) restore locks are not released and the abandoned-restore sweep can remove a restore that is still running; do not run restores through one.
+`RestoreTableFromBackup` on PostgreSQL holds a session-level advisory lock (the job's claim) for the whole copy, so ExtendDB must reach the catalog database directly or through a session-mode pooler. Behind a transaction-mode pooler (for example PgBouncer with `pool_mode = transaction`) the lock lands on a pooled server connection and is not released with the job, so later jobs can be refused as already claimed; do not run backups or restores through one.
 
 #### [storage.sqlite]
 
@@ -116,6 +140,38 @@ Restores on PostgreSQL are bounded per server process: at most 4 per account and
 |-----|---------|-------------|
 | `path` | `extenddb.sqlite` | Database file (`init --sqlite-path` writes it); `:memory:` for an ephemeral database |
 | `pool_size` | `10` | Maximum connections. Writes are serialized by the engine whatever the size. A file database raises `pool_size = 1` to 2 and logs it at info (`SQLite pool_size 1 raised to 2 for a file-backed database: ...`), because a backup holds one reader connection for its whole duration while its batches write through another. Use 3 or more so a running backup does not contend with ordinary requests for connections |
+
+#### [backup]
+
+The knobs backup and restore jobs and the reconciler read; every key has a default, and the section may be left out.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `data_file_target_bytes` | `67108864` | Uncompressed bytes per backup data file (minimum 32 MiB); read by the store-backed backup writer |
+| `heartbeat_interval_secs` | `15` | The job heartbeat timer. The in-catalog backup and restore paths of this release heartbeat every 15 s whatever this says |
+| `stale_job_after_secs` | `300` | Heartbeat age after which a job's owner is dead and the reconciler fails the job and removes its restore target. Must be at least three heartbeat periods, where the period is the larger of `heartbeat_interval_secs` and the 15 s the jobs of this release heartbeat at (so 45 at the least, whatever `heartbeat_interval_secs` says); on SQLite a long write transaction delays a heartbeat, so keep a margin above that floor |
+| `failed_row_retention_secs` | `604800` | How long FAILED backup rows are kept for the operator (7 days) |
+| `reconcile_interval_secs` | `60` | The reconciler's cycle; it also runs once at startup |
+| `max_concurrent_jobs` | `4` | Backup and restore jobs this instance runs at once (at most 1024); a request over it waits up to 30 s for a slot, then `LimitExceededException`. On PostgreSQL the pool sizes are raised to `2 * max_concurrent_jobs + 10` when smaller |
+| `spool_path` | (unset) | Restore download area for an S3 store, created `0700` with files `0600`, holding a `.lock` another instance on the host refuses. Required with an S3 store, except on file-backed SQLite where it defaults to `backup-spool/` beside the database file. Refused inside or containing a filesystem store root, and when it is or contains the database file's directory |
+
+#### [backup.store]
+
+The store CreateBackup's backups will live in, and the one restores and deletes of store-backed backups read. The section's keys, defaults and the refusals of a bad value are the backup store crate's (`crates/backup-store/src/config.rs`); the table below is what the server adds. One definition of the shape exists, so an unknown key anywhere under `[backup]` is refused at load.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `kind` | see below | `filesystem`, `s3`, or `disabled` |
+| `filesystem.path` | `backups/` beside a SQLite database file | The root directory of a filesystem store. It must exist, be owned by the extenddb user with mode `0700`, and sit under directories owned by root or that user which others cannot write to; `validate` refuses anything else at startup. A relative path, like a relative `spool_path`, is resolved against the working directory the server was started from (the daemon's own working directory is `/`) |
+| `s3.bucket`, `s3.prefix`, `s3.region`, `s3.endpoint`, `s3.force_path_style`, `s3.allow_insecure_endpoint`, `s3.upload_part_size_bytes`, `s3.max_concurrent_uploads` | | The S3 store; see the crate's `config` module doc. Credentials come from the AWS SDK's chain and are never in the file |
+
+When the section is absent, the backend decides: on file-backed SQLite it is a filesystem store at `backups/` beside the database file, created `0700` if missing, whose validation or identity-check failure is a logged warning that leaves the store unconfigured rather than a startup error or an unhealthy store while the catalog has no backup rows for that root (so an upgrade never stops a server that never configured backups, and CreateBackup keeps working on one); once the catalog has rows for the default root, the root has been used and is handled as a configured one: a failure of its identity check or manifest probe is an unhealthy store (reported on `/health`, its rows' restores and deletes refused, `backup purge` refusing on it rather than reporting no store), and a refusal of its `open` or validation a startup error naming the root; on PostgreSQL, MongoDB, Cassandra and an in-memory SQLite database there is no default and the store is unconfigured, logged at startup. `kind = "disabled"` leaves it unconfigured on purpose on any backend. Without a configured store, CreateBackup writes the in-catalog backup format and logs a deprecation warning naming `[backup.store]` on each call; with one configured, this release's CreateBackup still writes the in-catalog format (the store-backed writer is a later release's) and the store serves restores and deletes of the backups it holds. Backups of either format stay listable, describable, restorable and deletable.
+
+Startup opens the configured store and, for a filesystem store, validates it and checks its identity before the listener is up (bounded by 5 s: a mount that stops answering after the root is opened leaves the server starting with the store `checking`; a root that does not answer at startup holds the server before the listener, as the database directory would, with the port bound and silent); an S3 store's validation and identity check are requests to the endpoint, and run after the listener is up, in the reconciler's first cycle, so an endpoint that stalls never holds the data plane down (the component is `checking` until the first result, and the operations that touch the store refuse meanwhile as they do while it is unhealthy). A configuration error, every one decided without a request to the store, stops startup with the key, path or bucket in the message: a root that does not exist or fails the owner-only rule, a filesystem root another user can reach, a filesystem root that is or contains the database directory, a bucket name the SDK routes to S3 Express, a bad part size or prefix, an insecure endpoint, an S3 store without `spool_path` on a backend with no default, a `spool_path` that breaks its placement rule, that another live instance holds or that exists with a mode other than `0700`. A transport failure (no region, no credentials, an endpoint that refuses connections or does not answer within the check's bound), a missing or denied bucket, an I/O failure of a filesystem root's probe write or resolution (a full or read-only disk, a stale network handle), or a failed identity check leaves the server running with the store unhealthy: the problem is logged once at error, `/health` reports the `backup_store` component unhealthy (status `degraded`), the restore and delete of a store-backed backup are refused with a `ValidationException` that names the store's kind and the problem's category and not its root, the reconciler acts on no row of the store, and the check runs again each `reconcile_interval_secs` until it passes, at which point the server logs `is healthy again` and resumes without a restart. Each check's store calls are bounded (5 s for a filesystem root, 30 s for a bucket); the catalog's own reads (the catalog id, the rows' store ids, the newest AVAILABLE row) run beside the calls and not under the bound, so a slow catalog costs the check time and never marks the store unhealthy. A store that has stopped answering costs a reconciler cycle that bound and nothing more, the cycle's other duties run as before, and the abandoned check is logged; on a filesystem root the abandoned call stays parked on one thread until the mount answers, no later cycle starts a check while it is (logged each cycle, the store staying `unreachable`), a root's calls run one at a time so that calls started before the first reached its bound (two `DeleteBackup` requests together, a `DeleteBackup` beside a check) wait for it under the bound, then have the bound for their own call (a slow call behind another finishes, where one bound over both would abandon it), and park no thread of their own, and `stop` or SIGTERM ends the server within 5 s with that thread still parked. The deletions `DeleteBackup` and the reconciler run against the store go through the same bound and rule: `DeleteBackup` answers the description with `BackupStatus` `DELETED` once its DELETING write has committed, and a deletion the store does not answer within the bound, or that leaves an object under the prefix, leaves the row DELETING for the reconciler and is logged, never an error to the client. A default SQLite root whose startup checks did not finish starts `checking` with its rule kept: a first check that fails while the catalog has no rows for it is the same warning and leaves the store unconfigured. CreateBackup is not refused by an unhealthy store in this release: it writes the in-catalog format, which touches no store; the store-backed create of a later release is.
+
+The store identity. The root carries `extenddb-store.json`: a random store id and the id of the catalog that owns the root. Startup creates it when the root has no file and the catalog has no rows for the root, and otherwise reads it and compares: a file naming another catalog, a store id that differs from the one the catalog's rows for the root carry, a root with no file while rows exist, or rows carrying more than one id each mark the store unhealthy. Instances that share a catalog must share one store root (one S3 bucket and prefix, or one shared mount): host-local roots configured at the same path give each instance different bytes under one root label, so each check also `head`s the manifest of the newest AVAILABLE backup and marks the store unhealthy when it is absent, which is what a second instance with a local copy of the directory sees. The file is left by `backup purge` and by every deletion; remove it only when retiring the root, or after `extenddb destroy`: a catalog re-created with `init` has a new id, and the old root's file names the old one, so the re-initialised server reports the store owned by another catalog until the file is removed or a new root configured (on the default SQLite root, that is the logged warning above and CreateBackup keeps the in-catalog path). While the catalog has no rows for a root, two host-local directories at one path cannot be told apart (each instance creates its own file and id); point every instance at one shared root before the first backup. The identity file is read up to 64 KiB; a larger object under its key is reported unreadable.
+
+`extenddb destroy` removes the databases and leaves the store untouched: it is the copy that survives destroy. `extenddb backup list [--failed]` prints the catalog's rows for the configured store's root, every store id they carry, with each row's `store_root` and `store_id`; it is a read that runs beside a server (on SQLite it takes no serve lock), reads the identity file without creating one, and runs on an unhealthy store, naming the problem in its header. `extenddb backup purge --confirm` deletes every backup of the configured store, each backup's objects (its own prefix, never a whole account prefix, so a prefix the catalog has no row for survives) and its catalog row outright, leaving no tombstone, and leaves `extenddb-store.json` and the `exports/` component; it needs the store healthy. It takes the catalog-level maintenance claim first and heartbeats it for the command's whole run, waits up to `2 * stale_job_after_secs` until no store-backed CreateBackup is running on any instance (a CREATING or FAILED row with a heartbeat within `stale_job_after_secs` on the catalog database's clock) and no restore is RUNNING, refuses and releases the claim if they have not finished, deletes a CREATING row the wait saw no live owner for as it deletes any other row, finishes any DeleteBackup left in progress as part of the purge (a backup a DeleteBackup finishes while the purge runs is counted as deleted, not left), and logs each deletion under the `extenddb::audit` target with the account and the ARN. While the claim is held, CreateBackup and RestoreTableFromBackup on every instance answer `LimitExceededException` saying that a backup maintenance command holds the catalog's maintenance claim (the message does not say which command; the second command's refusal and the claim's row do), and a second maintenance command fails at once naming the holder. Without `--confirm` it prints the plan, changes nothing and exits 0. `--config` is accepted before or after the subcommand. Neither command runs the startup recovery a server runs (on PostgreSQL the vector index rebuild, the control-plane recovery and the GSI queue workers; on MongoDB the key-repair pass; on Cassandra the control-plane transitions; on SQLite the interrupted-restore and index passes): that work belongs to the servers, and a command that ran it could exit with it half done. RUNNING restores are read by status, with no age, so a restore whose record was stamped this instant holds the wait too. On SQLite `purge --confirm` opens the database under the serve lock: stop the server first (while one runs on the file the command refuses with exit 6, as a second `serve` does); under that lock it first resolves what the stopped server left (a RUNNING restore is failed and its target removed, the CREATING target of a FAILED restore removed, an in-catalog CREATING backup removed, a DELETING row finished) and deletes a CREATING or FAILED row whatever its heartbeat says, a heartbeat stamped ahead of the clock by a backward clock step included (the server that wrote it is stopped, so the zero window the command passes selects by status alone), so such a job never makes it wait or refuse; the one exception is a RUNNING restore of kind `manifest`, which no release before PR 9a writes: the command leaves it for the reconciler that resumes it, waits on it as on any RUNNING restore and refuses naming the table; and a server starting on the file removes a claim a killed purge left, so no job is refused for the stale window, as a purge run again after the killed one takes its claim over. On the other backends it runs beside live servers, and a claim whose holder died expires after `stale_job_after_secs`. On PostgreSQL, MongoDB and Cassandra both commands open the catalog as a server does and hold a serving registration for their run, named after the command (`extenddb backup list`, `extenddb backup purge`: on PostgreSQL the session's `application_name`, on MongoDB the `command` field of its `extenddb_servers` document, on Cassandra the `release` column of its `extenddb_servers` row, after the release and ` as `), and release it when they exit: `extenddb migrate --yes` waits for them as for a server and names them while it waits, and while a migration runs they refuse at once (exit 6), as they do on a catalog at another migration than the binary's (exit 3, with the `extenddb migrate --yes` advice `serve` prints). On every backend Ctrl-C or `SIGTERM` makes the command release what it holds and exit: the serving registration after the open, if the signal came during it; the claim at once while it waits, and before its next backup while it deletes (the release itself is bounded by 10 s, past which the claim is left to the stale rule), so an interrupted purge leaves no half-deleted backup and no claim to wait out; run it again for the rest. The dry run on an unhealthy store lists the rows and says that `--confirm` refuses until the store's check passes.
 
 #### [auth]
 
@@ -133,14 +189,14 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
 | `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
-| `max_entries` | `10000` | Per-cache LRU cap. |
+| `max_entries` | `10000` | Maximum entries per cache. |
 
 Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenticated). The per-cache `pass_through` flag distinguishes "cache disabled" from "cache cold." The report includes every authorization sub-cache, among them the two principal creation-time caches (`user_created_at`, `role_created_at`) consulted on each user and role-session request to derive `aws:userid` and `aws:TokenIssueTime`.
 
 **Invalidation timing**:
 
 - **Single-key invalidations** (e.g. `DeleteAccessKey`, `PutUserPolicy`) drop the cached entry immediately; the next request sees the post-mutation state.
-- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) are **asynchronous** — there is a small window (~ms) between the API returning success and the matching entries being evicted. For hard cutover (e.g. revoking a compromised key), prefer the single-key path (`DeleteAccessKey`) over the cascade.
+- **Fanout invalidations** (e.g. `DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. The account and role sweeps register a predicate with moka, and moka's `get` applies it, so matching entries are not served once the call returns; moka removes them from its map during later cache operations. The group fanout drops each member's entries in turn. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`.
 - **Off-instance changes** (multi-node deployments, or direct catalog writes) wait up to `ttl_seconds` to be observed locally.
 
 #### [server.tls]
@@ -800,20 +856,22 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Features
 
-- **Dashboard**: Account and admin user counts, version info
-- **Account management**: Create, view, delete accounts
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
+- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies with JSON editor
+- **Metrics dashboard**: Operation metrics for every account, with charts (admin only; an IAM-user session is redirected to the console home page, `/console`)
+- **Settings and Cache**: The read-only settings viewer and the auth cache invalidation form (admin only; an IAM-user session is redirected to `/console`)
 
 ### Authentication
 
 - Admin users: enter username and password
 - IAM users: enter `account_id/user_name` as username, console password as password
 
-Sessions expire after 8 hours. Click "Logout" to end immediately.
+Sessions expire after 8 hours of inactivity. Click "Logout" to end immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
 
 ## Monitoring
 
@@ -873,8 +931,11 @@ JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 
 ```bash
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
-# {"status":"healthy"}
+# {"status":"healthy","components":{}}
 ```
+
+The `components` object carries the `backup_store` component when a backup
+store is configured (see [Health Check](#health-check) under Server Lifecycle).
 
 ## Troubleshooting
 
@@ -923,14 +984,9 @@ Error: error communicating with database
 
 Check that PostgreSQL is running and the connection string in `extenddb.toml` is correct.
 
-**Catalog version mismatch:**
+**The catalog has pending migrations, or is ahead of the binary:**
 
-<!-- version-literal-ok: the block below is an example mismatch error; 1.0.0 is the value found on disk, not a version claim -->
-```
-Error: catalog version mismatch: found 1.0.0, expected 0.0.4
-```
-
-Run `extenddb migrate --config extenddb.toml` to upgrade the catalog schema. The check is exact equality in both directions, so this also appears when a binary meets a catalog a newer build already migrated; in that case upgrade the binary rather than the catalog. `extenddb migrate` refuses a catalog newer than the binary (`catalog version X is newer than this binary's Y`) instead of stamping the older version onto it. See the Upgrade Manual for the version history and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 4, and ExtendDB <release> needs migration 5`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 

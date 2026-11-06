@@ -250,8 +250,9 @@ pub(super) async fn delete_item_in_tx(
 /// Write a stream record within an existing transaction.
 ///
 /// Builds the stream record from the old/new items and the `StreamCapture`
-/// parameters, assigns a shard, generates a sequence number, and inserts
-/// the record — all within the caller's transaction.
+/// parameters, assigns a shard, and stores the record in `stream_pending`,
+/// all within the caller's transaction. The record gets its sequence number
+/// after the transaction commits (`number_shard_batch` in `stream_engine.rs`).
 ///
 /// The event type is determined from the old/new items:
 /// - old=None, new=Some → Insert
@@ -361,12 +362,18 @@ pub(super) async fn write_stream_record_in_tx(
         return Ok(());
     }
 
-    // Generate monotonic sequence number within the transaction (CB-21).
-    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('stream_seq')")
+    // The record's one clock read: clock_timestamp() is the database clock
+    // when this statement runs, after the write's locking reads, while the
+    // column default (NOW()) is the transaction start, which in a long
+    // transaction sits seconds before the record. created_at and
+    // ApproximateCreationDateTime both derive from this reading, and the
+    // retention sweep compares created_at with the database's NOW(), so the
+    // retention window is measured on the database clock alone.
+    let (created_at,): (time::OffsetDateTime,) = sqlx::query_as("SELECT clock_timestamp()")
         .fetch_one(&mut **tx)
         .await
         .map_err(db_error)?;
-    let seq = format!("{seq_val:021}");
+    let approximate_creation_date_time = created_at.unix_timestamp();
 
     let record = StreamRecord {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -375,35 +382,47 @@ pub(super) async fn write_stream_record_in_tx(
         event_source: "aws:dynamodb".to_owned(),
         aws_region: capture.region.to_string(),
         dynamodb: StreamRecordData {
-            approximate_creation_date_time: i64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-            .unwrap_or(i64::MAX),
+            approximate_creation_date_time,
             keys,
             new_image,
             old_image,
-            sequence_number: seq,
+            // Set when the record is numbered, after this write commits.
+            sequence_number: String::new(),
             size_bytes: size,
             stream_view_type: capture.view_type,
         },
         user_identity: capture.user_identity.clone(),
     };
 
-    let record_json =
-        serde_json::to_value(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    // The record's JSON text, sent once: the database parses it into the
+    // jsonb column, and its length in bytes is stored beside it. A numbering
+    // batch adds up that length (`NUMBER_BATCH_BYTES` in stream_engine.rs).
+    // It is the record's size before TOAST compresses it, which is what the
+    // numbering copies and rewrites; `pg_column_size` would give the
+    // compressed size.
+    let record_text =
+        serde_json::to_string(&record).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let record_bytes = i64::try_from(record_text.len()).unwrap_or(i64::MAX);
 
+    // The record waits in stream_pending, with no sequence number, until this
+    // transaction commits. A reader of the shard, or the numbering worker,
+    // then moves it to stream_records under the next number
+    // (`number_shard_batch` in stream_engine.rs). A number drawn here with
+    // nextval would be handed out at once, in call order, and this write
+    // could commit after a write that drew a higher number. A reader that had
+    // already read the higher number would then never return this record
+    // (#808).
     sqlx::query(
-        "INSERT INTO stream_records (sequence_number, shard_id, table_id, event_name, record_data) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO stream_pending \
+         (shard_id, table_id, event_name, record_data, record_bytes, created_at) \
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
     )
-    .bind(&record.dynamodb.sequence_number)
     .bind(shard_id)
     .bind(&key_info.table_id)
     .bind(format!("{:?}", record.event_name))
-    .bind(&record_json)
+    .bind(&record_text)
+    .bind(record_bytes)
+    .bind(created_at)
     .execute(&mut **tx)
     .await
     .map_err(db_error)?;

@@ -179,11 +179,16 @@ impl PostgresEngine {
     /// disable: every write accepted before the stream reports `DISABLED`
     /// lands in the closed stream before its shard's `EndingSequenceNumber`,
     /// and a write after that records nothing. Held here by a lock in the data
-    /// database: the write path reads the open shards `FOR SHARE` in its data
-    /// transaction, and this close locks them `FOR UPDATE` first and takes the
-    /// ending numbers in the same transaction, so a write that read the open
-    /// set commits before the ending number is taken, and a write that arrives
-    /// after the lock re-evaluates the closed rows and records nothing. What
+    /// database: the write path locks its record's shard row `FOR KEY SHARE`
+    /// in its data transaction, and this close locks the open rows
+    /// `FOR UPDATE` first. A write stores its record in `stream_pending` with
+    /// no number, and the record is numbered after the write commits (#808),
+    /// so the close numbers each shard's pending records under its lock
+    /// (`PostgresEngine::number_locked_shard`) and then takes the ending
+    /// numbers, all in one READ COMMITTED transaction. A write that locked its
+    /// shard before the close commits first and its record is numbered at or
+    /// below the ending number, and a write that arrives after the lock
+    /// re-evaluates the closed row and records nothing. What
     /// remains is the gap every backend has: a write acknowledged after the
     /// disable response that recorded into no stream, because its key info
     /// pre-dated the disable and it found no open shard. A `TransactWriteItems`
@@ -228,8 +233,15 @@ impl PostgresEngine {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut data_tx = data_pool.begin().await.map_err(internal)?;
-        sqlx::query(
+        // READ COMMITTED whatever the database's default: each statement after
+        // the lock then reads the records of the writes the lock waited for.
+        // Under REPEATABLE READ the snapshot would date from the start of the
+        // lock statement, before those writes committed.
+        let mut data_tx = data_pool
+            .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+            .await
+            .map_err(internal)?;
+        let locked: Vec<String> = sqlx::query_scalar(
             "SELECT shard_id FROM stream_shards \
              WHERE shard_id = ANY($1) AND ending_sequence_number IS NULL FOR UPDATE",
         )
@@ -237,6 +249,11 @@ impl PostgresEngine {
         .fetch_all(&mut *data_tx)
         .await
         .map_err(internal)?;
+        // Only the rows this transaction locked: a shard another close has
+        // closed was numbered by that close.
+        for shard_id in &locked {
+            Self::number_locked_shard(&mut data_tx, shard_id).await?;
+        }
         sqlx::query(
             "UPDATE stream_shards s SET ending_sequence_number = COALESCE(\
                (SELECT MAX(r.sequence_number) FROM stream_records r \

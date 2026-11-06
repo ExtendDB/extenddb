@@ -534,6 +534,64 @@ class TestExplicitDenyOnResourceArn:
                 lambda a=arn, dd=d: dd.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]),
                 code, substr)
 
+    # -- the denial names the ARN as the caller supplied it (issue #447) --
+    # Measured on DynamoDB 2026-10-20 (TagResource, no-policy caller): the
+    # message carries the caller's partition, service and region unchanged, and
+    # an ARN in another account answers "Access is denied" for an admin and a
+    # no-policy caller alike.
+
+    def _denial_message(self, fn) -> str:
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        return err["Message"]
+
+    def test_tag_denial_names_supplied_arn_noperm(self, table):
+        v = self._ordering_variants(table)
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        for label in ("wrong_partition", "wrong_service", "cross_region", "nonexistent"):
+            arn = v[label]
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert f"on resource: {arn} because no identity-based policy allows " in msg, (label, msg)
+
+    def test_tag_cross_account_is_access_denied_for_every_principal(self, table):
+        arn = self._ordering_variants(table)["cross_account"]
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        for policy in (noperm, ALLOW_ALL):
+            d = self._ddb(policy)
+            msg = self._denial_message(
+                lambda: d.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", msg
+
+    def test_tag_cross_account_index_and_backup_arns_are_access_denied(self, table):
+        # Measured on DynamoDB 2026-10-24 (admin): another account's index or
+        # backup ARN answers "Access is denied", not the shape ValidationException
+        # the same ARN in this account gets.
+        region = table["table_arn"].split(":")[3]
+        base = f"arn:aws:dynamodb:{region}:111122223333:table/{table['name']}"
+        d = self._ddb(ALLOW_ALL)
+        for arn in (f"{base}/index/gsi1", f"{base}/backup/01700000000000-aaaaaaaa"):
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", (arn, msg)
+
+    def test_get_item_table_arn_in_tablename_denial_names_table_arn(self, table):
+        # Measured on DynamoDB 2026-10-20 (resource-probe GetItem_tableArnInTableName).
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        msg = self._denial_message(
+            lambda: d.get_item(TableName=table["table_arn"], Key={"pk": {"S": "p1"}}))
+        assert (
+            f"dynamodb:GetItem on resource: {table['table_arn']} because no identity-based "
+            "policy allows the dynamodb:GetItem action"
+        ) in msg, msg
+
     # -- permission chains: a Deny anywhere in the chain blocks the operation --
 
     def test_restore_from_backup_deny_target_item_action_blocks(self, table):
@@ -570,13 +628,18 @@ class TestExplicitDenyOnResourceArn:
     # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
 
     def test_respelled_stream_arn_cannot_bypass_deny(self, table):
-        """A Deny on the canonical stream ARN must also block a request that
-        respells the partition. ExtendDB resolves the stream in this account
-        regardless of the ARN's partition, so authorizing the respelled string
-        verbatim would bypass the Deny."""
+        """A principal with a Deny on the canonical stream ARN gets no stream
+        back for a request that respells the partition. The service refuses the
+        respelled ARN before the IAM decision with ValidationException "Invalid
+        StreamArn" (measured 2026-10-22), so ExtendDB does the same instead of
+        canonicalizing it; the fuller matrix is in test_stream_arn_scope.py."""
         respelled = table["stream_arn"].replace("arn:aws:", "arn:aws-cn:")
         s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
-        self._assert_denied(lambda: s.describe_stream(StreamArn=respelled))
+        with pytest.raises(ClientError) as exc:
+            s.describe_stream(StreamArn=respelled)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err.get("Message") == "Invalid StreamArn", err
 
     def test_table_arn_in_tablename_deny_blocks(self, table):
         """A Deny on the table ARN blocks GetItem whether TableName is the bare

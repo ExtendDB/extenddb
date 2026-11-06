@@ -37,7 +37,6 @@ fn uri() -> String {
 async fn engine() -> MongoEngine {
     let tag = uuid::Uuid::new_v4().simple().to_string();
     let client = mongodb::Client::with_uri_str(uri()).await.expect("client");
-    let slots = crate::backup_engine::restore_server_slot_count(10);
     let engine = MongoEngine {
         client: client.clone(),
         catalog_db: client.database(&format!("s{}_cat", &tag[..12])),
@@ -46,9 +45,6 @@ async fn engine() -> MongoEngine {
         gsi_cache: Arc::default(),
         tx_read_concern: mongodb::options::ReadConcern::snapshot(),
         backup_liveness: crate::backup_engine::BackupLiveness::default(),
-        restore_server_slot_count: slots,
-        restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
     };
     engine
         .catalog_db

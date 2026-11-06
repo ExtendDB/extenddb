@@ -182,8 +182,9 @@ async fn disable_on_a_table_that_never_had_a_stream_is_refused() {
 /// Writers racing a disable: every record a write lands is in the closed
 /// stream at or below its shard's `EndingSequenceNumber`, or the write records
 /// nothing. The write path locks only its own shard row, `FOR KEY SHARE`, and
-/// the close locks the open rows `FOR UPDATE` before taking the ending
-/// numbers, so a record is never written past them.
+/// the close locks the open rows `FOR UPDATE` and numbers their pending
+/// records before taking the ending numbers, so a record is never numbered
+/// past them.
 #[tokio::test]
 async fn a_write_racing_a_disable_lands_before_the_ending_number_or_not_at_all() {
     if base_conn().is_none() {
@@ -251,6 +252,13 @@ async fn a_write_racing_a_disable_lands_before_the_ending_number_or_not_at_all()
         failed += f;
     }
     assert_eq!(acked + failed, 320);
+    // The close numbered the records of every write that locked its shard
+    // before the close did, and no write stored a record after the close. A
+    // record left pending would get a number above its shard's ending number
+    // once the numbering worker numbered it, so the records are numbered here
+    // before the check below.
+    assert_eq!(pending_count(&s).await, 0, "{acked} acked, {failed} failed");
+    number_pending(&s).await;
 
     let closed = describe_stream(&s, &arn).await;
     assert!(matches!(closed.stream_status, StreamStatus::Disabled));
