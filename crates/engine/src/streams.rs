@@ -174,12 +174,12 @@ fn constraint(member: &str, rule: &str) -> String {
     )
 }
 
-/// The message `DynamoDB` returns for an expired shard iterator (measured live,
-/// `live-r2/iter-live.json`: an iterator 990 seconds old returns
-/// `ExpiredIteratorException` with exactly this text). Shared so the
-/// authorization layer answers a pre-upgrade iterator with the same text the
-/// engine uses when a current iterator ages out, so both match the service.
-pub const SHARD_ITERATOR_EXPIRED_MESSAGE: &str = "Shard iterator has expired";
+/// The message for an expired shard iterator: an alias of
+/// [`extenddb_core::error::EXPIRED_ITERATOR_MESSAGE`], kept under this name
+/// for code that already uses it. The core constant's doc gives the
+/// measurement. The authorization layer answers a pre-upgrade iterator with
+/// this text, and the engine uses it when a current iterator ages out.
+pub const SHARD_ITERATOR_EXPIRED_MESSAGE: &str = extenddb_core::error::EXPIRED_ITERATOR_MESSAGE;
 
 /// A decoded shard iterator token.
 ///
