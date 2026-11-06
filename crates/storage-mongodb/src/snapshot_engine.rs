@@ -717,6 +717,7 @@ mod tests {
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
                 None,
+                None,
             )
             .await
             .expect("put");

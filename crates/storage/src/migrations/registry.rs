@@ -79,11 +79,16 @@ migration_ids! {
     /// in (#808).
     StreamPending = 7, "stream_pending",
         "add stream_pending, which holds a PostgreSQL stream record until its write commits";
+    /// Adds the bulk put items tables: the operation records, their input
+    /// files and their pending report records in the catalog, and the
+    /// row-outcome ledger and the write owners beside the items they record.
+    BulkOperations = 8, "bulk_operations",
+        "add the bulk put items tables: operations, input files, report records, row outcomes and write owners";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 7.
+/// `forget` refuses them. The v1.0 release PR raises it to 8.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

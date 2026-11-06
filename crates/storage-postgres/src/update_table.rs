@@ -437,6 +437,23 @@ impl PostgresEngine {
         // UpdateTable, carried out of the catalog transaction so the post-commit
         // index DDL builds its columns from the same set the catalog now holds.
         let mut merged_attr_defs_for_ddl: Option<Vec<AttributeDefinition>> = None;
+        // No index creation while a bulk operation on the table runs, read
+        // under the table row lock a start shares. The build is counted in
+        // memory only once every step below that can refuse or fail the
+        // request has passed (see `_index_build` before the commit).
+        let creates_gsi = match &input.global_secondary_index_updates {
+            Some(updates) => {
+                crate::bulk_operation_store::refuse_index_creation_during_run(
+                    &mut tx,
+                    account_id,
+                    &table_id,
+                    &input.table_name,
+                    updates,
+                )
+                .await?
+            }
+            None => false,
+        };
         if let Some(updates) = &input.global_secondary_index_updates {
             {
                 // One index change at a time while a GSI builds, as the service
@@ -874,6 +891,14 @@ impl PostgresEngine {
         // moment the infrastructure is already unhappy, which is the worst time to
         // leave a table's index propagation paused for a request the client already
         // knows failed.
+        // Every step that can refuse or fail the request has passed, so the
+        // build is counted from here, with the table row still held, until
+        // this function returns, its backfill included: a start called
+        // during it, or one that waited on the row and reads the index
+        // `ACTIVE` after it, is refused. A request refused or failed above
+        // never moved the count.
+        let _index_build =
+            creates_gsi.then(|| crate::bulk_operation_store::BuildGuard::begin(&table_id));
         if let Err(e) = tx
             .commit()
             .await

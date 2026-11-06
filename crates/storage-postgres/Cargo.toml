@@ -21,7 +21,8 @@ test-util = ["extenddb-storage/test-util"]
 # a scratch database, so they need a runtime and the test macro.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The checksum test checks this backend's migration table with the framework's
-# test helper.
+# test helper, and the bulk operation store contract tests come from
+# `extenddb-storage` and run here against a scratch PostgreSQL database.
 extenddb-storage = { workspace = true, features = ["test-util"] }
 # The crate's own tests need `test-hooks` and `test-util`; a dev-dependency on
 # itself turns both features on for test builds only.

@@ -172,6 +172,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:ReturnConsumedCapacity` | String | The `ReturnConsumedCapacity` parameter value |
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
+| `s3:prefix` | String | The `InputS3Configuration.S3KeyPrefix` of a bulk operation, in its `s3:ListBucket` evaluation |
 
 Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values in a `2012-10-17` document; a `2008-10-17` document, or one with no `Version`, compares the value as written, so `${aws:username}` is the literal text, as IAM does. In a `2012-10-17` document `${*}`, `${?}` and `${$}` stand for the literal characters `*`, `?` and `$`; in `StringLike`, `ArnLike` and `ArnEquals` the escaped character is matched literally while a `*` or `?` written in the policy is a wildcard (`a${*}` matches `a*` and not `abc`), and the result of an escape is not expanded again (`a${$}{x}` is the text `a${x}`). The `${key, 'default'}` form expands to `default` when the request does not carry `key`, and code points up to U+0020 around the key name, around the comma of the default form and before the closing brace are ignored, as in IAM. A variable with no default whose key the request does not carry makes that value match nothing: a positive operator such as `StringEquals` does not match it and a negated operator such as `StringNotEquals` does, except that every `Arn*` operator is false against a request value that is not an ARN. A multivalued key such as `dynamodb:LeadingKeys` is not expanded; when the request carries it the value matches nothing, and a written default is used only when the request does not carry the key. Only the string and ARN operators (with or without `ForAnyValue:`, `ForAllValues:` or `IfExists`) expand variables. A numeric, date or address value written as a variable is compared as written. A `Bool` or `Null` value written as one is read as the boolean `false`, as IAM does, so `Null` then holds when the key is present and `Bool` holds when the request value is `false`. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`; the IAM policy simulator refuses a policy whose value has fewer, such as `${aws:ResourceTag/owner}`, and ExtendDB fails that condition closed in a document of any `Version`, so a `Deny` applies and an `Allow` does not grant. A role trust policy follows its own `Version`. Because a negated operator holds for an unresolved variable, an `Allow` written as `StringNotEquals` against `${aws:PrincipalTag/team}` grants to a caller without that tag; add a `Null` condition on the tag to require it.
 
@@ -193,10 +194,183 @@ extenddb supports the same access control patterns as real AWS IAM:
 
 Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<table-name>`. Wildcard matching (`*`, `?`) in policy Resource fields follows AWS IAM conventions. `NotResource` is also supported.
 
+### Bulk Operations
+
+`StartBulkPutItems` is gated by two IAM actions, both of which must allow
+the request, and the operation it starts performs three S3 actions as its
+caller (see S3 actions of a bulk operation below). The three control-plane
+operations each have one action, and the resource each is evaluated against
+differs per operation:
+
+| Action | Resource evaluated |
+|--------|--------------------|
+| `dynamodb:StartBulkOperation` (required by `StartBulkPutItems`) | the account's wildcard: `arn:aws:dynamodb:<region>:<account-id>:bulk-operation/*` |
+| `dynamodb:BulkPutItems` (required by `StartBulkPutItems`) | the table ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<table-name>` |
+| `dynamodb:DescribeBulkOperation` | the operation ARN from the request body: `arn:aws:dynamodb:<region>:<account-id>:bulk-operation/<operation-id>` |
+| `dynamodb:CancelBulkOperation` | the operation ARN from the request body |
+| `dynamodb:ListBulkOperations` | the account's wildcard: `arn:aws:dynamodb:<region>:<account-id>:bulk-operation/*` |
+
+The five actions and their resources are the ones the hosted service
+evaluates: the account-scoped control-plane action and the table-scoped
+data-plane action for `StartBulkPutItems`, and one action per operation,
+named for the operation, for Describe, Cancel, and List. The control-plane
+check runs first, so a caller with neither grant receives a denial naming
+`dynamodb:StartBulkOperation`. A statement granting
+`dynamodb:StartBulkPutItems` grants nothing; that is the operation name,
+not an IAM action.
+
+`ListBulkOperations` is evaluated against the `bulk-operation/*` wildcard,
+so an Allow that names a single operation ARN does not cover List; the
+policy's Resource must match the wildcard form.
+
+A bulk-operation resource carries no tags: the `bulk-operation/*`
+wildcard and every operation ARN. For `DescribeBulkOperation`,
+`CancelBulkOperation`, `ListBulkOperations`, and the
+`dynamodb:StartBulkOperation` check of `StartBulkPutItems`,
+`aws:ResourceTag/*` is absent. A condition on that key evaluates as for
+any absent key: `StringEquals` and `StringLike` do not match, so a
+tag-conditioned Allow never grants these actions, while a negated operator
+(`StringNotEquals`, `StringNotLike`), an `IfExists` form and `Null` true
+match, so a Deny written with one of them always applies to them. Only the
+`dynamodb:BulkPutItems` check on the table ARN evaluates the table's tags.
+
+#### S3 actions of a bulk operation
+
+A bulk operation reads its input and writes its reports through three S3
+actions, which the hosted service performs as the caller. ExtendDB evaluates
+the same three actions for the caller against the caller's ExtendDB
+policies, on both bulk stores, with the evaluation every other request gets:
+identity and group policies, the permissions boundary, a role session's
+session policy, and an explicit Deny first.
+
+| Action | Resource evaluated | When |
+|--------|--------------------|------|
+| `s3:ListBucket` | the input bucket: `arn:aws:s3:::<bucket>` | Once, at Start, before the input bucket is checked |
+| `s3:GetObject` | each input object: `arn:aws:s3:::<bucket>/<key>` | Before the object is opened, on a resumed run too, and at every checkpoint boundary while it is read |
+| `s3:PutObject` | each report object and the manifest: `arn:aws:s3:::<bucket>/<key>` | At the first record of each report kind, on report object 0 of that kind; before each report object is written; and before the manifest is written |
+
+The report keys are
+`<S3KeyPrefix>/AWSDynamoDB/BulkOperation/<account>:<operation id>-0/output/errors/output-<NNNNN>.json.gz`,
+the same under `condition-check-failures/`, and the manifest's is
+`<S3KeyPrefix>/AWSDynamoDB/BulkOperation/<account>:<operation id>/manifest-files.json`,
+so a statement on `arn:aws:s3:::<bucket>/<S3KeyPrefix>*` covers all of them.
+The Usage Guide lists what each denial does to the operation.
+
+The filesystem store writes a key with its empty and `.` segments removed,
+and an S3-compatible service with a file backend can also resolve `..`, so
+on the filesystem store and on the S3 store with `endpoint_url` set, the key
+a write lands under can differ from the key composed from the request's
+prefix. There `s3:PutObject` is evaluated on the key as composed and, when
+it differs, on the key the store writes, and the write is allowed only when
+both evaluations allow it. On the S3 store with `endpoint_url` set,
+`s3:ListBucket` is evaluated the same way on the input prefix as given and
+as the service resolves it. The filesystem store compares the input prefix
+as given with the paths it finds, so it evaluates `s3:ListBucket` once. A
+denial names the key whose evaluation denied; the composed key is evaluated
+first. On AWS S3 the key as composed is the key S3 stores, and it is
+evaluated alone. With `endpoint_url` set, Start refuses a prefix whose `..`
+segments outnumber the segments before them (`../other/`), since the
+service could resolve it into another bucket while the evaluations name a
+key inside this one.
+
+Condition keys in these evaluations:
+
+- `s3:prefix`, on `s3:ListBucket`: the request's
+  `InputS3Configuration.S3KeyPrefix` as given, or the empty string when the
+  request has none, and in the second evaluation described above, the
+  prefix as the service resolves it.
+- `aws:SourceIp`, `aws:UserAgent`, and `aws:SecureTransport`: the values of
+  the `StartBulkPutItems` request, recorded with the caller and used for
+  every check of the operation.
+- The principal's keys, such as `aws:PrincipalArn`, `aws:PrincipalTag/*`,
+  and `aws:username`, resolve as on every request.
+- `aws:ResourceAccount`: on the filesystem store, the caller's account,
+  which owns every bucket directory there, so a Deny of `s3:*` with
+  `StringNotEquals` `aws:ResourceAccount` `${aws:PrincipalAccount}` does
+  not apply to the caller's own buckets. On the S3 store the key is absent:
+  an S3 ARN carries no account, and ExtendDB does not know a bucket's owner.
+  The same Deny there denies every S3 check of a bulk operation. A
+  `Resource` or `NotResource` pattern that names `${aws:ResourceAccount}`
+  matches no resource on the S3 store. There, a Deny with such a pattern in
+  `Resource` does not apply, and an Allow with one does not grant. A Deny
+  with one in `NotResource` applies to every S3 check.
+- Absent: `s3:delimiter`, `s3:max-keys`,
+  `s3:x-amz-server-side-encryption`,
+  `s3:x-amz-server-side-encryption-aws-kms-key-id`, the S3 object tag keys,
+  `aws:ResourceTag/*`, and every `dynamodb:` key. A condition on one of
+  them evaluates as for any absent key.
+
+In a `2012-10-17` document, policy variables in a statement's `Resource`
+are expanded as for the DynamoDB actions (see Supported Policy Elements).
+An Allow on `arn:aws:s3:::<bucket>/home/${aws:username}/*` then grants each
+IAM user the keys under the folder named after that user. A role session has
+no `aws:username`, so the same Allow grants it nothing. A `2008-10-17`
+document, or one with no `Version`, matches the pattern as written, so the
+same Allow there grants only the folder literally named `${aws:username}`.
+
+A denial is `S3AccessDenied` with a message in S3's spelling, naming the
+caller and the resource:
+
+```
+User: arn:aws:iam::<account-id>:user/<user> is not authorized to perform: s3:PutObject on resource: "arn:aws:s3:::<bucket>/<key>" because no identity-based policy allows the s3:PutObject action
+```
+
+A matching Deny statement gives `with an explicit deny in an identity-based
+policy` in place of the `because` clause. A role session is named by its
+`arn:aws:sts::<account-id>:assumed-role/<role>/<session>` ARN. ExtendDB has
+no bucket policies, so the resource-based forms of S3's text do not occur,
+and the message carries no request-id tail because no request reached S3.
+
+A denial that a role session's session policy or a permissions boundary
+decides has the same identity-based wording: a missing Allow in either gives
+`because no identity-based policy allows`, and a Deny in a session policy
+gives `with an explicit deny in an identity-based policy`.
+
+`StartBulkPutItems` records its caller on the operation: the identity, a
+role session's session policy, session tags, and token issue time as they
+were at Start, and the request-level keys above. No response renders the
+record. The runner evaluates `s3:GetObject` and `s3:PutObject` for the
+recorded caller. Identity policies, group policies, the permissions
+boundary, and principal tags are read when each check runs, so a policy
+changed during a load takes effect at the next check. The recorded session
+data is evaluated in place of the session's current data, so a session that
+expires or is removed during a load neither fails it nor changes its access.
+An operation recorded with no caller, such as one started in developer mode
+and resumed by a server outside it, fails its first S3 check with
+`S3AccessDenied`, `Access Denied`. In developer mode no S3 action is
+evaluated, as no other action is.
+
+On the S3 store a check that passes is followed by the server's request to
+S3, which S3 evaluates for the server's credentials. A denial S3 returns
+carries S3's text and request ids, and the text reaches the caller in
+`FailureMessage`. On AWS S3 an `AccessDenied` from S3 can name the principal
+the server signs as and that principal's AWS account. The Admin Guide lists
+the permissions those credentials need. An S3 code about the server's own
+credentials, account, or clock, such as `InvalidAccessKeyId`,
+`ExpiredToken`, or `RequestTimeTooSkewed`, reaches the caller as
+`InternalServerError` without S3's text, and the server logs it. The store
+sends its requests to AWS S3, or to `[bulk.s3] endpoint_url` when it is
+set; endpoints named in the server's environment or in an AWS profile are
+ignored.
+
+On the S3 store the caller's ExtendDB policies and the buckets the server's
+credentials reach are the only separation between ExtendDB accounts: a
+caller whose policies allow the S3 actions on `*` reaches every bucket the
+server's credentials reach, the buckets other ExtendDB accounts load from
+included. Grant each account's callers the S3 actions on that account's
+buckets only (see the Admin Guide).
+
+The DynamoDB actions are evaluated when a request arrives: revoking
+`dynamodb:StartBulkOperation` or `dynamodb:BulkPutItems` stops future
+starts, and a load already running continues. The S3 actions are evaluated
+while the load runs, so revoking `s3:GetObject` on its input fails a running
+load `S3AccessDenied` at its next object or checkpoint boundary.
+`CancelBulkOperation` stops a running load.
+
 ### Supported Policy Elements
 
 - `Effect`: Allow, Deny
-- `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
+- `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`), and the three S3 actions a bulk operation performs (`s3:ListBucket`, `s3:GetObject`, `s3:PutObject`)
 - `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys` that the request carries, makes the pattern match nothing (a written default is used only when the key is absent); a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does. Code points up to U+0020 around the key name, around the comma of the default form and before the closing brace are ignored, as in IAM, and a space inside the quotes of a default is kept. A tag whose value is the empty string expands to no characters, as in IAM: `table/${aws:PrincipalTag/team}*` matches every table for a caller tagged `team=""`, while with no `team` tag it matches nothing. To refuse such a caller, add a condition such as `StringLike` on `aws:PrincipalTag/team` with the value `?*` to the `Allow` statement (measured with the IAM policy simulator). A `Deny NotResource` statement on such a pattern spares every table for that caller (also measured), and that condition on it does not change this.
 - `Condition`: Full condition block support (see operators and keys above)
 
@@ -285,7 +459,8 @@ Input validation is layered:
 
 ### Path Traversal Protection
 
-Import/export file paths are validated:
+Import and export file paths, and bulk operation paths beneath the
+`[bulk.filesystem]` store root, are validated:
 - `..` components rejected
 - Paths namespaced per account: a caller in account `A` may only resolve paths
   under `<root>/A` for each configured root. Containment in the bare root is not
@@ -299,12 +474,13 @@ Import/export file paths are validated:
 - Symlinks detected and rejected, including one planted at the export filename
 - Export refuses to overwrite an existing file, so it cannot truncate a file it
   did not create
-- Both operations record the acting account, the operation and the resolved path
+- Every file operation records the acting account, the operation and the resolved path
 - Error messages use generic text (no raw paths leaked)
 
 ## Error Message Security
 
 - DynamoDB-fidelity error messages reproduce real DynamoDB exactly (no additional information)
+- On the bulk S3 store, a `FailureMessage` S3 answered carries S3's text and S3's request ids, and an S3 denial names the principal the server signs as (see the Admin Guide, S3 store)
 - Internal errors (database connection failures, SQL errors, I/O errors) are logged server-side but return generic messages to clients
 - Stack traces, file paths, and SQL text are never exposed to clients
 

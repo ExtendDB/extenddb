@@ -165,6 +165,26 @@
 # Preview extension: allow multi-part (composite) keys on base tables.
 # GSIs always support multi-part keys regardless of this setting.
 # allow_multipart_table_keys = false
+#
+# Bulk operations (StartBulkPutItems and the workers that drive it).
+# These settings are ExtendDB's own; DynamoDB does not expose them.
+# max_concurrent_bulk_operations = 50        # per account
+# bulk_operation_retention_days = 30
+# bulk_operation_worker_concurrency = 4      # operations running at once per process
+# bulk_operation_worker_per_account = 2      # of those, at most this many per account
+# bulk_operation_lease_seconds = 60
+# bulk_put_batch_size = 25                   # rows per checkpoint
+# bulk_put_write_batch_rows = 25             # rows per storage transaction; capped at 100 and by bulk_put_batch_size
+# max_bulk_input_bytes = 10737418240         # enumerated (compressed) total per operation; Start rejects above it
+# max_bulk_input_files = 50000               # enumerated object count per operation; above it the operation fails
+# max_bulk_input_object_bytes = 5368709120   # one enumerated input object; above it the operation fails
+# max_bulk_client_token_bytes = 1024         # longest accepted ClientToken on StartBulkPutItems, in bytes
+# max_bulk_line_bytes = 4194304              # one input line; longer abandons the file
+# max_bulk_item_count = 100000000            # rows read per operation; more fails the operation
+# max_bulk_report_records = 1000000          # records kept per operation; more are dropped and logged
+# max_bulk_report_bytes = 1073741824         # serialized bytes of records kept per operation; more are dropped and logged
+# max_bulk_failed_starts_per_hour = 100      # terminal-born starts per account per hour; above it Start answers ThrottlingException
+# bulk_put_write_units_per_second = 80000    # ceiling on bulk writes per process, in 1 KB write units per second; 0 disables
 
 [logging]
 # level = "info"               # Log level: trace, debug, info, warn, error
@@ -242,6 +262,52 @@
 # this file. Uncommenting it here would place it inside the preceding table and
 # the server would refuse to start with "unknown field import_export_root".
 #     import_export_root = "/var/lib/extenddb/data"
+
+# Bulk operations ([bulk]) are disabled by default (secure default). The bulk
+# put operations read their input files and write their error reports through
+# one store, independent of [import] and [export]. store selects it:
+# "filesystem" or "s3".
+#
+# The filesystem store reads and writes beneath one root. The layout is
+# {path}/{account id}/{S3Bucket}/...: the server creates {path} and the
+# per-account directories; the caller creates the bucket directories beneath
+# its own subtree and stages files there.
+#
+# Whoever can write beneath {path}/{account id} can feed data into any table
+# that account starts a load on, so an account's subtree is as trusted as the
+# mechanism that populates it.
+#
+# [bulk]
+# store = "filesystem"
+#
+# [bulk.filesystem]
+# path = "/var/lib/extenddb/buckets"
+#
+# The S3 store reads and writes the buckets the requests name, in AWS S3 or in
+# an S3-compatible service at endpoint_url, with the credentials of the
+# standard AWS credential chain (environment variables, the shared config and
+# credentials files, web identity, container and instance credentials). This
+# file holds no credentials, and [bulk.s3] is checked at startup whatever
+# store selects. region defaults to [server] region and is one host label of
+# lowercase letters, digits and hyphens; most S3-compatible services need
+# force_path_style = true. An http:// endpoint_url must be loopback
+# (127.x.y.z, ::1 or localhost) unless allow_insecure_endpoint = true, which
+# accepts it and logs a warning at startup. Requests and responses to such an
+# endpoint cross the network unencrypted.
+#
+# Every caller reaches the buckets the server's credentials reach, as far as
+# its ExtendDB policies allow s3:ListBucket, s3:GetObject and s3:PutObject on
+# them; nothing else separates ExtendDB accounts on this store, and dev mode
+# evaluates no policy.
+#
+# [bulk]
+# store = "s3"
+#
+# [bulk.s3]
+# region = "us-east-1"
+# endpoint_url = "https://objects.example.internal:9000"
+# allow_insecure_endpoint = false
+# force_path_style = true
 
 # Runtime settings are managed via `extenddb settings set <key> <value>`, not this file.
 # See docs/getting-started.md for available runtime settings and their defaults.

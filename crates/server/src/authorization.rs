@@ -27,6 +27,8 @@ use extenddb_storage::management_store::OpError;
 use crate::authz_cache::{CachedAuthzStore, PolicyList, TagMap};
 use crate::authz_resource::AuthzTarget;
 
+pub(crate) mod full_action;
+
 /// Evaluate whether the authenticated identity is authorized for the given
 /// `DynamoDB` operation on the given resource.
 ///
@@ -46,11 +48,17 @@ pub async fn check_authorization(
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
+    let action = format!("dynamodb:{}", target.action);
     match identity {
         AuthIdentity::User {
             account_id,
             user_name,
-        } => check_user_authorization(cache, account_id, user_name, target, is_scan, params).await,
+        } => {
+            check_user_authorization(
+                cache, account_id, user_name, &action, target, is_scan, params,
+            )
+            .await
+        }
         AuthIdentity::RoleSession {
             account_id,
             role_name,
@@ -61,6 +69,8 @@ pub async fn check_authorization(
                 account_id,
                 role_name,
                 session_name,
+                None,
+                &action,
                 target,
                 is_scan,
                 params,
@@ -74,11 +84,11 @@ async fn check_user_authorization(
     cache: &CachedAuthzStore,
     account_id: &str,
     user_name: &str,
+    action: &str,
     target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
-    let action = format!("dynamodb:{}", target.action);
     let resource_arn = target.policy_resource();
 
     // Resource tags apply only to a table, and to an index through its base
@@ -125,9 +135,9 @@ async fn check_user_authorization(
             .map(String::as_str)
             .unwrap_or_default(),
     ));
-    // The target table's owner account. ExtendDB builds the resource ARN with
-    // the caller's account, so the resource account is that account.
-    params.resource_account = Some(account_id.to_owned());
+    // The target resource's owner account: the caller's for a DynamoDB
+    // resource, the one in `params` for another service's.
+    full_action::set_resource_account(&mut params, action, account_id);
     let context = RequestContext::build(
         (*principal_tags).clone(),
         (*resource_tags).clone(),
@@ -139,7 +149,7 @@ async fn check_user_authorization(
         &identity_policies,
         boundary.as_deref(),
         None,
-        &action,
+        action,
         resource_arn,
         &context,
     );
@@ -147,40 +157,42 @@ async fn check_user_authorization(
     if decision == AuthzDecision::Allow {
         Ok(())
     } else {
+        let principal = format!("arn:aws:iam::{account_id}:user/{user_name}");
         tracing::warn!(
-            principal = format!("arn:aws:iam::{account_id}:user/{user_name}"),
+            principal = principal,
             action = action,
             resource = resource_arn,
             "Authorization denied"
         );
-        let principal = format!("arn:aws:iam::{account_id}:user/{user_name}");
         let explicit = explicit_deny_matches_arc(
             &identity_policies,
             boundary.as_deref(),
             None,
-            &action,
+            action,
             resource_arn,
             &context,
         );
         Err(DynamoDbError::AccessDeniedException(deny_message(
             &principal,
-            &action,
+            action,
             &target.supplied,
             explicit,
         )))
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_role_authorization(
     cache: &CachedAuthzStore,
     account_id: &str,
     role_name: &str,
     session_name: &str,
+    session: Option<&full_action::SessionSnapshot>,
+    action: &str,
     target: &AuthzTarget,
     is_scan: bool,
     params: RequestParams,
 ) -> Result<(), DynamoDbError> {
-    let action = format!("dynamodb:{}", target.action);
     let resource_arn = target.policy_resource();
 
     // Resource tags for a table or index only, read under the canonical
@@ -196,7 +208,7 @@ async fn check_role_authorization(
     ) = tokio::try_join!(
         wrap_policies(cache.fetch_role_policies(account_id, role_name)),
         wrap_boundary(cache.fetch_role_boundary(account_id, role_name)),
-        fetch_session_data_and_tags(cache, account_id, role_name, session_name),
+        full_action::session_and_tags(cache, account_id, role_name, session_name, session),
         wrap_tags(fetch_authz_resource_tags(cache, tag_arn.as_deref())),
         wrap_created_at(cache.fetch_role_created_at(account_id, role_name)),
     )?;
@@ -218,7 +230,7 @@ async fn check_role_authorization(
             .map(String::as_str)
             .unwrap_or_default(),
     ));
-    params.resource_account = Some(account_id.to_owned());
+    full_action::set_resource_account(&mut params, action, account_id);
     // aws:TokenIssueTime for a role session is the session's issue time.
     params.token_issue_time = token_issue_time;
     // A role session is assumed without MFA, so aws:MultiFactorAuthPresent is
@@ -235,7 +247,7 @@ async fn check_role_authorization(
         &identity_slice,
         boundary.as_deref(),
         session_policy.as_deref(),
-        &action,
+        action,
         resource_arn,
         &context,
     );
@@ -243,26 +255,25 @@ async fn check_role_authorization(
     if decision == AuthzDecision::Allow {
         Ok(())
     } else {
+        let principal =
+            format!("arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name}");
         tracing::warn!(
-            principal =
-                format!("arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name}"),
+            principal = principal,
             action = action,
             resource = resource_arn,
             "Authorization denied"
         );
-        let principal =
-            format!("arn:aws:iam::{account_id}:assumed-role/{role_name}/{session_name}");
         let explicit = explicit_deny_matches_arc(
             &identity_slice,
             boundary.as_deref(),
             session_policy.as_deref(),
-            &action,
+            action,
             resource_arn,
             &context,
         );
         Err(DynamoDbError::AccessDeniedException(deny_message(
             &principal,
-            &action,
+            action,
             &target.supplied,
             explicit,
         )))
@@ -274,12 +285,12 @@ async fn check_role_authorization(
 // ---------------------------------------------------------------------------
 
 /// Build the AccessDeniedException message in the form the service uses, which
-/// depends on why the request was denied. `action` already carries the
-/// `dynamodb:` prefix; `resource_arn` is the resource as the caller supplied
-/// it, partition, service and region included. An explicit Deny statement yields "with an explicit deny
-/// in an identity-based policy"; any other denial yields "because no
-/// identity-based policy allows the <action> action", measured against live
-/// DynamoDB.
+/// depends on why the request was denied. `action` is the full action
+/// string, service prefix included; `resource_arn` is the resource as the
+/// caller supplied it, partition, service and region included. An explicit
+/// Deny statement yields "with an explicit deny in an identity-based
+/// policy"; any other denial yields "because no identity-based policy allows
+/// the <action> action", measured against live DynamoDB.
 pub(crate) fn deny_message(
     principal: &str,
     action: &str,
@@ -513,6 +524,7 @@ mod resource_tag_tests {
             cache,
             ACCOUNT,
             "u",
+            &format!("dynamodb:{op}"),
             &AuthzTarget::new(op, arn.to_owned()),
             false,
             RequestParams::default(),
@@ -540,6 +552,7 @@ mod resource_tag_tests {
             &cache,
             ACCOUNT,
             "u",
+            "dynamodb:DescribeStream",
             &target,
             false,
             RequestParams::default(),
@@ -562,6 +575,8 @@ mod resource_tag_tests {
             ACCOUNT,
             "r",
             "s",
+            None,
+            "dynamodb:DescribeStream",
             &target,
             false,
             RequestParams::default(),
@@ -608,15 +623,20 @@ mod resource_tag_tests {
                 ACCOUNT,
                 "r",
                 "s",
+                None,
+                op,
                 &AuthzTarget::new(op, arn.to_owned()),
                 false,
                 RequestParams::default(),
             )
             .await
         };
-        assert!(role("DescribeTable", TABLE).await.is_ok());
+        assert!(role("dynamodb:DescribeTable", TABLE).await.is_ok());
         let fetched = inner.resource_tags_calls.load(Ordering::SeqCst);
-        for (op, arn) in [("DescribeStream", STREAM), ("DescribeBackup", BACKUP)] {
+        for (op, arn) in [
+            ("dynamodb:DescribeStream", STREAM),
+            ("dynamodb:DescribeBackup", BACKUP),
+        ] {
             assert!(
                 matches!(
                     role(op, arn).await,

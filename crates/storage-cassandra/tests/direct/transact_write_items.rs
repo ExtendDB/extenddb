@@ -80,7 +80,15 @@ async fn test_transact_write_put_and_delete() {
     );
 
     engine
-        .put_item(&table.key_info, item1.clone(), false, None, &maps, None)
+        .put_item(
+            &table.key_info,
+            item1.clone(),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("Initial put_item should succeed");
 
@@ -161,7 +169,15 @@ async fn test_transact_write_rollback_on_condition_failure() {
     let maps = ExpressionMaps::default();
 
     engine
-        .put_item(&table.key_info, item1.clone(), false, None, &maps, None)
+        .put_item(
+            &table.key_info,
+            item1.clone(),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("Initial put_item should succeed");
 
@@ -267,6 +283,7 @@ async fn test_transact_write_rollback_update_existing_item() {
             None,
             &maps_empty,
             None,
+            None,
         )
         .await
         .expect("setup put_item");
@@ -356,7 +373,15 @@ async fn test_transact_write_rollback_delete_existing_item() {
         AttributeValue::S("keep_me".to_string()),
     );
     engine
-        .put_item(&table.key_info, existing.clone(), false, None, &maps, None)
+        .put_item(
+            &table.key_info,
+            existing.clone(),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("setup put_item");
 
@@ -417,7 +442,15 @@ async fn test_transact_write_rollback_delete_existing_item() {
 
     // Verify item is no longer locked (a subsequent write should succeed)
     engine
-        .put_item(&table.key_info, existing.clone(), false, None, &maps, None)
+        .put_item(
+            &table.key_info,
+            existing.clone(),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("put_item after rollback should succeed (item not locked)");
 }

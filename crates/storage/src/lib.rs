@@ -12,6 +12,10 @@ pub mod backend;
 pub mod backup_catalog;
 pub mod backup_definition;
 pub mod bootstrapper;
+mod bulk_operation_flags;
+pub mod bulk_operation_store;
+#[cfg(feature = "test-util")]
+pub mod bulk_operation_store_contract;
 pub mod config;
 pub mod diagnostics;
 pub mod diagnostics_store;
@@ -45,6 +49,14 @@ pub use backup_definition::{BackupRestoreSource, RestoreRequest, RestoreTableOve
 pub use snapshot::{SnapshotEngine, SnapshotInfo, TableSnapshot};
 
 pub use transact::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+
+pub use bulk_operation_flags::OperationFlags;
+pub use bulk_operation_store::{
+    AbandonKind, AbandonedFile, BulkOperationListResult, BulkOperationRecord, BulkOperationStore,
+    CANCELLED_FAILURE_CODE, CANCELLED_FAILURE_MESSAGE, CLIENT_TOKEN_WINDOW_MS, CancelOutcome,
+    FileAbandon, FinishState, FinishedFile, InitialFailure, InputFile, LeaseState, ListCursor,
+    NewBulkOperation, Progress, ReportKind, ReportRecord, StartOutcome, Terminal,
+};
 
 pub use server_components::{
     BackendError, ServerComponents, ServerComponentsFactory, create_server_components,
@@ -196,6 +208,102 @@ pub struct StreamCapture {
     pub region: Arc<str>,
 }
 
+/// Marker carried by every row of a bulk write batch. The backend inserts
+/// the row's outcome into `bulk_row_outcomes` in the same data transaction
+/// as the item write, with the size of the item the row replaced (or was
+/// evaluated against) and, when `keep_old` is set, that item, so a run
+/// resumed after a crash finds the row applied, does not apply it again,
+/// and accounts for it as the run that applied it did.
+///
+/// Carries `account_id` because the ledger key is account-scoped: the catalog
+/// primary key permits the same `operation_id` in two accounts, so an
+/// unscoped ledger would interleave two operations' rows on an id collision.
+#[derive(Debug, Clone)]
+pub struct BulkRowMarker {
+    pub account_id: String,
+    pub operation_id: String,
+    pub file_index: i64,
+    pub row_index: i64,
+    /// The lease owner of the claim writing the row. A batch whose owner is
+    /// not the one [`DataEngine::bulk_write_takeover`] last recorded for the
+    /// operation writes nothing (see [`DataEngine::put_items_batch`]).
+    pub owner: String,
+    /// Whether the ledger keeps the replaced item beside its size, for the
+    /// index charge. The item a failed condition was evaluated against is
+    /// kept whatever this says: the condition-failure record carries it.
+    pub keep_old: bool,
+    /// The cursor of the operation's last committed checkpoint, as
+    /// `(file_index, row_index)`. Ledger rows before it are covered by that
+    /// checkpoint and are deleted with the batch.
+    pub settled: (i64, i64),
+}
+
+/// One row of a bulk operation the ledger records as applied: what the
+/// write (or the failed condition) found, read back by a resumed run so it
+/// accounts for the row without writing it again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedRow {
+    pub row_index: i64,
+    pub outcome: RowOutcome,
+    /// Logical size of the item the row replaced or was evaluated against;
+    /// `None` when no item was stored under the key.
+    pub old_size: Option<i64>,
+    /// That item, when the row's marker asked for it to be kept or the
+    /// row's condition failed.
+    pub old_image: Option<Item>,
+}
+
+/// What became of a marked bulk row: the write committed, or its condition
+/// failed and the failure was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOutcome {
+    Applied,
+    ConditionFailed,
+}
+
+impl RowOutcome {
+    /// The stored vocabulary for this outcome, shared by every backend so the
+    /// column text never diverges.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::ConditionFailed => "condition_failed",
+        }
+    }
+}
+
+/// One row of a batched bulk write (`put_items_batch`). A condition row
+/// carries its parsed expression. The bulk runner sends a marker with every
+/// row, plain or conditional; `return_old` asks for the replaced image,
+/// which the caller needs to charge the write.
+#[derive(Debug, Clone)]
+pub struct BatchRow {
+    pub item: Item,
+    pub condition: Option<(Expr, ExpressionMaps)>,
+    pub marker: Option<BulkRowMarker>,
+    pub return_old: bool,
+}
+
+/// What became of one row of a batched bulk write, in input order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchRowResult {
+    Written { old: Option<Item> },
+    ConditionFailed { old: Option<Item> },
+}
+
+impl RowOutcome {
+    /// Parse the stored vocabulary back; `None` for anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "applied" => Some(Self::Applied),
+            "condition_failed" => Some(Self::ConditionFailed),
+            _ => None,
+        }
+    }
+}
+
 /// Table lifecycle operations.
 ///
 /// All methods receive `account_id` to scope operations to a single account.
@@ -288,7 +396,16 @@ pub trait DataEngine: Send + Sync {
     /// When `stream` is `Some`, the stream record is inserted in the same
     /// transaction as the data write, guaranteeing atomicity.
     ///
+    /// When `marker` is `Some` and the write commits, the backend inserts an
+    /// `Applied` row into `bulk_row_outcomes` inside the write transaction.
+    /// When the condition fails and `marker` is `Some`, the backend records a
+    /// `ConditionFailed` row as its own transaction and then returns
+    /// `StorageError::ConditionFailed` as usual. A second outcome for one
+    /// marker's position fails the write. The bulk runner writes through
+    /// [`Self::put_items_batch`]; this path records the outcome alone.
+    ///
     /// Returns the previous item if `return_old` is true and an item existed.
+    #[allow(clippy::too_many_arguments)]
     fn put_item(
         &self,
         key_info: &TableKeyInfo,
@@ -297,7 +414,102 @@ pub trait DataEngine: Send + Sync {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
+        marker: Option<&BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>>;
+
+    /// Look up the recorded outcome of a marked bulk row, if any. Scoped by
+    /// `account_id`, matching the ledger key.
+    fn bulk_row_outcome(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        row_index: i64,
+    ) -> BoxFuture<'_, Result<Option<RowOutcome>, StorageError>>;
+
+    /// Apply a batch of bulk rows and return one result per row, in order.
+    ///
+    /// Per-row outcomes are independent: a failed condition on one row is a
+    /// `ConditionFailed` result and the other rows still apply. Each marked
+    /// row's outcome (`Applied` or `ConditionFailed`) is inserted into the
+    /// ledger in the batch's transaction with the replaced item's size and,
+    /// when the marker asks, the item. The ledger key is the row's position,
+    /// so a row applied twice violates it and the batch fails. Any error
+    /// other than a condition failure is returned as `Err`, and the backend
+    /// guarantees nothing from the batch is visible in that case.
+    ///
+    /// A batch whose markers name an owner other than the one
+    /// [`Self::bulk_write_takeover`] last recorded for the operation writes
+    /// nothing and answers `StorageError::Transient`: the claim that took
+    /// the operation over continues it, and the caller stops as after any
+    /// transient fault. The batch also deletes the operation's ledger rows
+    /// before the markers' `settled` cursor.
+    ///
+    /// The method is required. The SQL backends apply the whole batch in one
+    /// transaction. A backend that does not carry bulk operations refuses
+    /// with `StorageError::Validation`, the same answer its
+    /// `BulkOperationStore::start_bulk_operation` gives, so a bulk request is
+    /// rejected before any row reaches storage.
+    fn put_items_batch(
+        &self,
+        key_info: &TableKeyInfo,
+        rows: Vec<BatchRow>,
+        stream: Option<&StreamCapture>,
+    ) -> BoxFuture<'_, Result<Vec<BatchRowResult>, StorageError>>;
+
+    /// Record `owner` as the only claim whose bulk write batches for the
+    /// operation commit, in one data transaction that waits for a batch in
+    /// flight under an earlier owner. Every batch that commits after it
+    /// carries `owner`; every batch of an earlier owner either committed
+    /// before it, and is in the ledger, or writes nothing.
+    ///
+    /// `cursor` is the checkpoint cursor the claim restored. Answers how many
+    /// claims in a row, this one included, found the checkpoint where the
+    /// claim before them found it: 0 for the first claim and for a claim
+    /// that finds the checkpoint moved.
+    fn bulk_write_takeover(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        owner: &str,
+        cursor: (i64, i64),
+    ) -> BoxFuture<'_, Result<u32, StorageError>> {
+        let _ = (account_id, operation_id, owner, cursor);
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "bulk operations are not supported by this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    /// At most `limit` ledger rows of one input file of an operation at
+    /// `from_row` or after it, ordered by row: the rows a resumed run finds
+    /// applied past its checkpoint, read a page at a time as the run
+    /// reaches them, because a row can keep a replaced item of up to the
+    /// item size limit.
+    fn bulk_rows_recorded(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+        file_index: i64,
+        from_row: i64,
+        limit: i64,
+    ) -> BoxFuture<'_, Result<Vec<RecordedRow>, StorageError>> {
+        let _ = (account_id, operation_id, file_index, from_row, limit);
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "bulk operations are not supported by this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    /// Delete every `bulk_row_outcomes` row for one operation. Returns the
+    /// number of rows deleted.
+    fn delete_bulk_row_outcomes(
+        &self,
+        account_id: &str,
+        operation_id: &str,
+    ) -> BoxFuture<'_, Result<u64, StorageError>>;
 
     /// Read a single item by primary key.
     ///
@@ -729,12 +941,13 @@ pub trait StorageEngine:
     + LegacyBackupReader
     + SnapshotEngine
     + WorkerStore
+    + BulkOperationStore
     + Send
     + Sync
 {
 }
 
-// Blanket implementation: any type implementing all 8 traits is a StorageEngine
+// Blanket implementation: any type implementing all 9 traits is a StorageEngine
 impl<T> StorageEngine for T where
     T: TableEngine
         + DataEngine
@@ -744,6 +957,7 @@ impl<T> StorageEngine for T where
         + LegacyBackupReader
         + SnapshotEngine
         + WorkerStore
+        + BulkOperationStore
         + Send
         + Sync
 {
@@ -776,9 +990,9 @@ pub trait CatalogStore:
 mod tests {
     use super::*;
 
-    /// Verify that CatalogStore is dyn-compatible (object-safe).
+    /// Verify that `CatalogStore` is dyn-compatible (object-safe).
     ///
-    /// This test ensures all catalog traits use BoxFuture instead of RPITIT,
+    /// This test ensures all catalog traits use `BoxFuture` instead of RPITIT,
     /// allowing us to use `Arc<dyn CatalogStore>` in the factory pattern.
     #[test]
     fn catalog_store_is_dyn_compatible() {
@@ -827,8 +1041,38 @@ mod vector_opt_out_tests {
             _condition: Option<&Expr>,
             _maps: &ExpressionMaps,
             _stream: Option<&StreamCapture>,
+            _marker: Option<&BulkRowMarker>,
         ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
             Box::pin(async { Ok(None) })
+        }
+        fn put_items_batch(
+            &self,
+            _key_info: &TableKeyInfo,
+            rows: Vec<BatchRow>,
+            _stream: Option<&StreamCapture>,
+        ) -> BoxFuture<'_, Result<Vec<BatchRowResult>, StorageError>> {
+            Box::pin(async move {
+                Ok(rows
+                    .into_iter()
+                    .map(|_| BatchRowResult::Written { old: None })
+                    .collect())
+            })
+        }
+        fn bulk_row_outcome(
+            &self,
+            _account_id: &str,
+            _operation_id: &str,
+            _file_index: i64,
+            _row_index: i64,
+        ) -> BoxFuture<'_, Result<Option<RowOutcome>, StorageError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn delete_bulk_row_outcomes(
+            &self,
+            _account_id: &str,
+            _operation_id: &str,
+        ) -> BoxFuture<'_, Result<u64, StorageError>> {
+            Box::pin(async { Ok(0) })
         }
         fn get_item(
             &self,

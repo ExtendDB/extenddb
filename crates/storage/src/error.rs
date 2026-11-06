@@ -91,3 +91,54 @@ pub enum StorageError {
     #[error("Internal error: {0}")]
     Internal(String),
 }
+
+impl StorageError {
+    /// Whether this error from a write is a transient fault a retry is
+    /// expected to clear, so a bulk operation whose write batch met it is
+    /// left non-terminal to resume rather than ended `FAILED`. The class is
+    /// keyed on the variant and, for an internal error, on the SQLSTATE
+    /// code the backends prefix, never on free message text, and is kept
+    /// narrow: anything not positively a transient condition is not one.
+    ///
+    /// - `Transient` is the backends' own class for a retryable fault: a
+    ///   pool timeout, an I/O error, and SQLite's BUSY and LOCKED result
+    ///   codes.
+    /// - `Connection` is a connection-level fault.
+    /// - `Internal` carrying a transient SQLSTATE: a PostgreSQL statement
+    ///   aborted by a connection or shutdown condition, a serialization or
+    ///   deadlock abort, a lock or statement timeout, or an exhausted
+    ///   resource such as a full disk surfaces as an internal error whose
+    ///   message the backend renders with the `SQLSTATE <code>:` prefix; the
+    ///   code there is the discriminant.
+    #[must_use]
+    pub fn is_transient_write_fault(&self) -> bool {
+        match self {
+            Self::Transient(_) | Self::Connection(_) => true,
+            Self::Internal(message) => has_transient_sqlstate(message),
+            _ => false,
+        }
+    }
+}
+
+/// Whether an internal storage error's message carries a PostgreSQL
+/// SQLSTATE that names a transient condition, read from the fixed `SQLSTATE
+/// <code>:` prefix the backend writes (never from the human text that
+/// follows). The transient codes: the connection exception class (`08...`),
+/// a full disk and too many connections (`53100`, `53300`), which clear once
+/// the operator frees the resource, the admin and crash shutdown family
+/// (`57P01`, `57P02`, `57P03`), a statement cancel or lock timeout (`57014`,
+/// `55P03`), and the two serialization aborts (`40001`, `40P01`).
+fn has_transient_sqlstate(message: &str) -> bool {
+    let Some(rest) = message.strip_prefix("SQLSTATE ") else {
+        return false;
+    };
+    let code = rest
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("");
+    code.starts_with("08")
+        || matches!(
+            code,
+            "53100" | "53300" | "57P01" | "57P02" | "57P03" | "57014" | "55P03" | "40001" | "40P01"
+        )
+}

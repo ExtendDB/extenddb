@@ -41,6 +41,9 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
 | `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
+| `bulk_operations` | One row per bulk put items operation: status, configuration, counters, the resume cursor and the lease. |
+| `bulk_operation_input_files` | The input files of a bulk operation, one row per file, with the progress a checkpoint records for each. |
+| `bulk_operation_report_records` | Failed-row report records a checkpoint persisted and the report renderer has not yet written out. |
 
 ### Data Tables
 

@@ -146,6 +146,7 @@ pub async fn handle_batch_write_item(
                         None,
                         &empty_maps,
                         stream.as_ref(),
+                        None,
                     )
                     .await
                     .map_err(storage_err_to_dynamo)?;

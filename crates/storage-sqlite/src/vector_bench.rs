@@ -156,7 +156,7 @@ mod tests {
             );
             item.insert("filler".to_owned(), AttributeValue::S(filler.clone()));
             engine
-                .put_item_impl(&key_info, item, false, None, &maps, None)
+                .put_item_impl(&key_info, item, false, None, &maps, None, None)
                 .await
                 .expect("put item");
         }

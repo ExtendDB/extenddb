@@ -171,6 +171,44 @@ pub async fn handle_update_table(
     }
 
     let table_name = input.table_name.clone();
+
+    // An index creation is refused while a bulk operation on the table is
+    // in progress or cancelling (measured on the hosted service,
+    // ResourceInUseException with this text and the table name).
+    // Index deletion and the other table updates are accepted during a run
+    //  and are not checked here.
+    let creates_index = input
+        .global_secondary_index_updates
+        .as_ref()
+        .is_some_and(|updates| updates.iter().any(|update| update.create.is_some()));
+    if creates_index {
+        // Counted by the table's current id, so an operation still running
+        // on a deleted table of the same name does not refuse an index on
+        // the new one. A table that does not exist answers here as the
+        // backend call below would answer it.
+        let table_id = ctx
+            .storage
+            .describe_table(
+                &ctx.account_id,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: table_name.clone(),
+                },
+            )
+            .await
+            .map_err(|e| update_table_err_to_dynamo(e, &table_name))?
+            .table_id;
+        let running = ctx
+            .storage
+            .count_non_terminal_for_table(&ctx.account_id, &table_id)
+            .await
+            .map_err(|e| update_table_err_to_dynamo(e, &table_name))?;
+        if running > 0 {
+            return Err(DynamoDbError::ResourceInUseException(
+                extenddb_storage::bulk_operation_store::index_creation_refused_message(&table_name),
+            ));
+        }
+    }
+
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.
     let vector_index_updates = input.vector_index_updates.clone();

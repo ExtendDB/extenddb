@@ -223,6 +223,9 @@ pub struct RequestParams {
     /// assumed without MFA) and leaves it absent for an IAM user with long-term
     /// keys. `Some(false)` for a role session, `None` for an IAM user.
     pub multi_factor_auth_present: Option<bool>,
+    /// The key prefix an `s3:ListBucket` evaluation lists under (`s3:prefix`).
+    /// `None` for every other evaluation, where the key is absent.
+    pub s3_prefix: Option<String>,
     /// The tags the request carries, for `aws:RequestTag/<key>`. `None` for an
     /// operation that carries no tag values, where the key is absent.
     pub request_tags: Option<HashMap<String, String>>,
@@ -283,6 +286,9 @@ pub struct RequestContext {
     /// `Some(false)` for a role session assumed without MFA, `None` for an IAM
     /// user (absent key), matching the service.
     pub multi_factor_auth_present: Option<bool>,
+    /// The key prefix of an `s3:ListBucket` evaluation (`s3:prefix`); `None`
+    /// (absent key) for every other evaluation.
+    pub s3_prefix: Option<String>,
     /// The request time formatted for `aws:CurrentTime` (RFC 3339 UTC).
     pub current_time: String,
     /// The request time formatted for `aws:EpochTime` (whole seconds).
@@ -333,6 +339,7 @@ impl RequestContext {
             resource_account: params.resource_account,
             token_issue_time: params.token_issue_time,
             multi_factor_auth_present: params.multi_factor_auth_present,
+            s3_prefix: params.s3_prefix,
             current_time,
             epoch_time,
             // An operation that carries a tag set but an empty one populates
@@ -429,6 +436,9 @@ impl ConditionContext for RequestContext {
                 // caller.
                 "aws:viaawsservice" => Some(vec!["false"]),
                 "aws:principalisawsservice" => Some(vec!["false"]),
+                // The listing prefix of an s3:ListBucket evaluation; absent for
+                // every other evaluation.
+                "s3:prefix" => self.s3_prefix.as_deref().map(|v| vec![v]),
                 _ => None,
             }
         }

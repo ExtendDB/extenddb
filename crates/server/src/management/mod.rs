@@ -52,6 +52,10 @@ pub struct ManagementState {
     /// Concrete `TableKeyInfo` cache handle, used by the auth-cache-metrics
     /// endpoint. Same instance is held in `auth_cache.table_key_info`.
     pub table_key_info_cache: Arc<crate::CachedTableKeyInfoStore>,
+    /// The bulk store, when one is configured. Account creation makes the
+    /// new account's directory beneath the filesystem store's root so a
+    /// caller can place files without a first `StartBulkPutItems`.
+    pub bulk: Option<Arc<extenddb_engine::bulk_put::store::BulkStore>>,
     /// Server region, resolved into `aws:RequestedRegion` during trust policy
     /// evaluation.
     pub region: Arc<str>,

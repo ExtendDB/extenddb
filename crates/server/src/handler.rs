@@ -108,6 +108,7 @@ pub(crate) async fn handle_request(
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
+    let bulk_caller;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -140,7 +141,21 @@ pub(crate) async fn handle_request(
             Ok(ki) => authorized_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
         }
+        // The caller a bulk operation records, captured for Start only.
+        bulk_caller = match crate::bulk_authorizer::start_caller(
+            &state,
+            &identity,
+            &operation,
+            Some(source_ip.as_str()),
+            user_agent.as_deref(),
+        )
+        .await
+        {
+            Ok(caller) => caller,
+            Err(e) => return error_response(&e, &request_id),
+        };
     }
+    let (bulk_authorizer, bulk_principal) = bulk_caller.unzip();
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
 
@@ -153,11 +168,15 @@ pub(crate) async fn handle_request(
         account_id,
         import_paths: state.import_paths.clone(),
         export_paths: state.export_paths.clone(),
+        bulk: state.bulk.clone(),
+        bulk_authorizer,
+        bulk_principal,
         authorized_key_info,
         auth_cache: state.auth_cache.clone(),
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
         ),
+        metrics: state.metrics.clone(),
     };
 
     let table_name = extract_table_name(&input);

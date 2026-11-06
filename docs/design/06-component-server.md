@@ -360,6 +360,9 @@ ExtendDB-internal:
 - `StorageQueryCount`, `StorageQueryLatency` (dimensions: source, category)
 - `PoolActiveConnections`, `PoolIdleConnections`, `PoolAcquireLatency`
 - `WorkerLastSuccess`, `WorkerCycleLatency`, `WorkerErrorCount`
+- `BulkOperationsStarted` (dimension: `TableName`)
+- `BulkOperationsFinished` (dimensions: `TableName`, and `Operation` carrying the terminal status)
+- `BulkPutItemsWritten` (dimension: `TableName`; rows the committing process wrote, excluding replayed rows and condition failures)
 
 **Dimensions** (from the `Dimension` enum):
 

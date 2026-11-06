@@ -58,7 +58,12 @@ extenddb-cache = { workspace = true, features = ["test-util"] }
 # The login tests count bcrypt checks with `count_verifications` against an
 # in-memory SQLite catalog.
 extenddb-storage = { workspace = true, features = ["test-util"] }
-extenddb-storage-sqlite = { workspace = true }
+# The bulk authorization tests drive `authorize_request` against a real
+# `AppState`. The server crate is backend-agnostic at runtime (it holds an
+# `Arc<dyn StorageEngine>`), so a concrete backend appears here only as a
+# test dependency; the sqlite in-memory database gives each test an
+# isolated engine with no file on disk, matching the engine crate's tests.
+extenddb-storage-sqlite = { workspace = true, features = ["memory"] }
 sqlx = { workspace = true, features = ["sqlite"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

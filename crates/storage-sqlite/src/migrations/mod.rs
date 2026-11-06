@@ -122,6 +122,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
             "SQLite runs one writer at a time, so its stream records commit in the order of \
              their sequence numbers",
         ),
+        MigrationId::BulkOperations => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0008_bulk_operations.sql"
+            )],
+        },
     }
 }
 

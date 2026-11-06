@@ -84,7 +84,7 @@ async fn test_transact_write_sequence_number_is_taken_after_the_item_is_written(
         let id = format!("seq-upd-{i}");
         let item = item_with(&id, "before");
         engine
-            .put_item(&table.key_info, item, false, None, &maps, None)
+            .put_item(&table.key_info, item, false, None, &maps, None, None)
             .await
             .unwrap();
         let key = key_for(&id);

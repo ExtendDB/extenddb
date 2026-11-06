@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 # Supersede an in-flight run of the SAME pull request when a new push arrives,
-# so two pushes do not each hold six slots on a capped pool. Everything that is
+# so two pushes do not each hold slots on a capped pool. Everything that is
 # not a pull request gets a group unique to the run (run_id): merge-group runs
 # can share a ref (gh-readonly-queue/main/pr-N-<sha> is reused across
 # re-queues of the same PR), and GitHub concurrency replaces a PENDING run in
@@ -181,9 +181,9 @@ jobs:
         run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
 
       # run-tests restarts the server daemonized to apply the import/export
-      # config, and a daemonized server logs to syslog, not the job log. Without
-      # this dump, the storage error behind a client-visible 500 leaves no
-      # evidence anywhere in CI.
+      # and bulk store config, and a daemonized server logs to syslog, not the
+      # job log. Without this dump, the storage error behind a client-visible
+      # 500 leaves no evidence anywhere in CI.
       - name: Dump server syslog on failure
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
@@ -782,6 +782,10 @@ jobs:
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
+  # The bulk store on an S3-compatible service (integration-s3.yml).
+  run-integration-s3:
+    uses: ./.github/workflows/integration-s3.yml
+
   integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -794,6 +798,7 @@ jobs:
         run-rust-integration,
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
+        run-integration-s3,
       ]
     if: always()
     steps:
@@ -804,6 +809,7 @@ jobs:
              [ "${{ needs.run-integration-dev-mode.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
-             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
+             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ] || \
+             [ "${{ needs.run-integration-s3.result }}" != "success" ]; then
             exit 1
           fi

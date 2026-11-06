@@ -33,6 +33,8 @@
 #                       postgres (default) or mongodb.
 #                       Gates postgres-only paths (pg connection-string
 #                       extraction, test_cli_lifecycle.py).
+#   --bulk-store NAME bulk store for the bulk tests: filesystem (default)
+#                       or s3 (see devtools/run-tests-bulk-store.sh).
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -52,6 +54,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
+# shellcheck source=devtools/run-tests-bulk-store.sh
+. "$SCRIPT_DIR/run-tests-bulk-store.sh"
 
 # Never prompt for input — redirect stdin from /dev/null for the entire script.
 # Any command that would block on stdin will get EOF immediately.
@@ -80,6 +84,7 @@ FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
 BACKEND="postgres"
+BULK_STORE="filesystem"
 
 usage() {
     cat <<'EOF'
@@ -101,6 +106,10 @@ Suites (at least one required):
 Options:
   --backend NAME    storage backend the running server uses:
                       postgres (default) or mongodb.
+  --bulk-store NAME bulk store for the bulk tests: filesystem (default)
+                      or s3 (needs EXTENDDB_TEST_S3_ENDPOINT,
+                      EXTENDDB_TEST_S3_ACCESS_KEY_ID and
+                      EXTENDDB_TEST_S3_SECRET_ACCESS_KEY)
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
@@ -137,6 +146,7 @@ while [[ $# -gt 0 ]]; do
         --catalog-check)  RUN_CATALOG_CHECK=true; shift ;;
         --config)         CONFIG_PATH="$2"; shift 2 ;;
         --backend)        BACKEND="$2"; BACKEND_GIVEN=1; shift 2 ;;
+        --bulk-store)     BULK_STORE="$2"; shift 2 ;;
         --parallel)
             # --parallel (no argument) or --parallel=N
             PARALLEL="auto"; shift
@@ -164,6 +174,9 @@ esac
 if [[ -n "${BACKEND_GIVEN:-}" ]]; then
     export EXTENDDB_TEST_BACKEND="$BACKEND"
 fi
+
+# --- Validate: bulk store ---
+bulk_store_check_name
 
 # --- Validate: target flag required ---
 if [[ -z "$TARGET" ]]; then
@@ -265,6 +278,9 @@ if $NEEDS_INTEGRATION; then
     esac
 fi
 
+# --- Validate: the S3 store's endpoint and keys ---
+bulk_store_check_s3
+
 # --- Echo target info (D3: always, before any tests) ---
 echo "=== Test target: $TARGET ==="
 echo "  commit:              $HASH"
@@ -273,6 +289,7 @@ if [[ "$TARGET" == "real-dynamodb" ]]; then
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(from ~/.aws)}"
 else
     echo "  backend            = $BACKEND"
+    echo "  bulk store         = $BULK_STORE"
     echo "  EXTENDDB_TEST_ENDPOINT = ${EXTENDDB_TEST_ENDPOINT:-}"
     echo "  AWS_ACCESS_KEY_ID  = ${AWS_ACCESS_KEY_ID:-(will be provisioned)}"
 fi
@@ -412,6 +429,8 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
             NEED_RESTART=true
             echo "  ✓ [export] paths configured for $TMP_ALLOWED"
         fi
+        bulk_store_configure "$CONFIG_FOR_SETTINGS" "$TMP_ALLOWED"
+        bulk_store_serve_env
         if $NEED_RESTART && [[ -x "$BINARY" ]]; then
             echo "  Restarting server to pick up import/export config..."
             # Report failures instead of hiding them. A health check alone is not
@@ -426,7 +445,7 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
                 exit 1
             fi
             sleep 1
-            if ! "$BINARY" serve --config "$CONFIG_FOR_SETTINGS"; then
+            if ! "${SERVE_ENV[@]}" "$BINARY" serve --config "$CONFIG_FOR_SETTINGS"; then
                 echo "  ✗ Server failed to start after config change"
                 exit 1
             fi
@@ -626,7 +645,13 @@ if $RUN_PYTEST \
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi
-    if "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE"; then
+    # pytest exits 5 when the filter selects none of these tests, which
+    # leaves this stage nothing to run rather than failing it.
+    CLI_STATUS=0
+    "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE" || CLI_STATUS=$?
+    if [[ $CLI_STATUS -eq 5 && -n "$FILTER" ]]; then
+        echo "  ✓ CLI lifecycle tests: none selected by the filter"
+    elif [[ $CLI_STATUS -eq 0 ]]; then
         echo "  ✓ CLI lifecycle tests passed"
     else
         echo "  ✗ CLI lifecycle tests failed"

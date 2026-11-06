@@ -55,6 +55,15 @@ pub enum MetricName {
     WorkerCycleLatency,
     /// P120e: Worker error count.
     WorkerErrorCount,
+    /// Bulk operations created by `StartBulkPutItems` (dimensions: table).
+    BulkOperationsStarted,
+    /// Bulk operations that reached a terminal status (dimensions: the
+    /// operation dimension carries the terminal status).
+    BulkOperationsFinished,
+    /// Items a bulk operation wrote to its table, counted in the process
+    /// whose write committed; replayed rows and condition failures are not
+    /// counted (dimensions: table).
+    BulkPutItemsWritten,
     /// Store-backed backup jobs ended, one per job; the operation dimension
     /// carries the outcome ([`BackupJobOutcome`]: `succeeded`, `failed` or
     /// `cancelled`). `/metrics` emits it under this name as JSON, as it does
@@ -136,6 +145,9 @@ impl std::fmt::Display for MetricName {
             Self::WorkerLastSuccess => f.write_str("WorkerLastSuccess"),
             Self::WorkerCycleLatency => f.write_str("WorkerCycleLatency"),
             Self::WorkerErrorCount => f.write_str("WorkerErrorCount"),
+            Self::BulkOperationsStarted => f.write_str("BulkOperationsStarted"),
+            Self::BulkOperationsFinished => f.write_str("BulkOperationsFinished"),
+            Self::BulkPutItemsWritten => f.write_str("BulkPutItemsWritten"),
             Self::BackupJobs => f.write_str("BackupJobs"),
             Self::BackupJobDuration => f.write_str("BackupJobDuration"),
             Self::BackupBytesUploaded => f.write_str("BackupBytesUploaded"),
@@ -189,6 +201,10 @@ pub enum QuerySource {
     /// A store-backed backup job (the worker metrics are recorded once per
     /// job, at its end).
     BackupJob,
+    /// Background: bulk operation claim loop.
+    BulkClaim,
+    /// Background: bulk operation retention purge.
+    BulkRetention,
     /// Management CLI commands.
     Management,
 }
@@ -211,6 +227,8 @@ impl std::fmt::Display for QuerySource {
             Self::LoginAttemptCleanup => f.write_str("LoginAttemptCleanup"),
             Self::BackupReconciler => f.write_str("BackupReconciler"),
             Self::BackupJob => f.write_str("BackupJob"),
+            Self::BulkClaim => f.write_str("BulkClaim"),
+            Self::BulkRetention => f.write_str("BulkRetention"),
             Self::Management => f.write_str("Management"),
         }
     }

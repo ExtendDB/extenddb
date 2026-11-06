@@ -501,7 +501,7 @@ The catalog database stores extenddb metadata: table definitions, indexes, tags,
 - REQ-DEPLOY-003: Graceful shutdown on SIGTERM (drain in-flight requests, close connections)
 - REQ-DEPLOY-004: Kubernetes-ready: health/readiness probes, configurable bind address, env var config
 - REQ-DEPLOY-005: VM-ready: systemd-compatible, config file based, log to stdout/file
-- REQ-DEPLOY-006: Container image < 50 MB (static musl build)
+- REQ-DEPLOY-006: Container image < 60 MB (static musl build)
 
 ### 10.5 Rust-Specific Requirements
 

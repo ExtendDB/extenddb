@@ -12,6 +12,8 @@ use crate::AppState;
 use crate::authorization;
 use crate::authz_resource;
 
+mod bulk;
+
 /// Extract operation name from X-Amz-Target header.
 /// Accepts both `DynamoDB_20120810` and `DynamoDBStreams_20120810` wire-format prefixes.
 pub(crate) fn extract_operation(headers: &HeaderMap) -> Result<String, DynamoDbError> {
@@ -369,6 +371,22 @@ pub(crate) async fn authorize_request(
                 .await?;
             }
         }
+        return Ok(authorized_key_info);
+    }
+
+    // Bulk operations evaluate operation-specific resources; see
+    // `bulk::authorize_bulk`. Every other operation falls through.
+    if bulk::authorize_bulk(
+        state,
+        identity,
+        operation,
+        input,
+        account_id,
+        table_name.as_deref(),
+        &|| base_params(request_tags.clone(), request_tag_keys.clone()),
+    )
+    .await?
+    {
         return Ok(authorized_key_info);
     }
 

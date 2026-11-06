@@ -84,7 +84,12 @@ impl DataEngine for MongoEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
+        marker: Option<&extenddb_storage::BulkRowMarker>,
     ) -> BoxFuture<'_, Result<Option<Item>, StorageError>> {
+        // Bulk operations are not implemented on this backend, so no caller
+        // can reach this method with a marker; the engine refuses the bulk
+        // request first.
+        let _ = marker;
         let key_info = key_info.clone();
         let item = item.clone();
         let condition = condition.cloned();
@@ -100,6 +105,49 @@ impl DataEngine for MongoEngine {
                 stream.as_ref(),
             )
             .await
+        })
+    }
+
+    fn put_items_batch(
+        &self,
+        _key_info: &TableKeyInfo,
+        _rows: Vec<extenddb_storage::BatchRow>,
+        _stream: Option<&StreamCapture>,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::BatchRowResult>, StorageError>> {
+        // Bulk operations are not supported on this backend; the engine
+        // refuses the request at start, so no batch reaches storage. The
+        // refusal here keeps the contract explicit now that the trait method
+        // is required.
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    fn bulk_row_outcome(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+        _file_index: i64,
+        _row_index: i64,
+    ) -> BoxFuture<'_, Result<Option<extenddb_storage::RowOutcome>, StorageError>> {
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
+        })
+    }
+
+    fn delete_bulk_row_outcomes(
+        &self,
+        _account_id: &str,
+        _operation_id: &str,
+    ) -> BoxFuture<'_, Result<u64, StorageError>> {
+        Box::pin(async {
+            Err(StorageError::Validation(
+                "Bulk operations are not supported on this storage backend".to_owned(),
+            ))
         })
     }
 

@@ -39,6 +39,7 @@ async fn put_pk_only_items(
                 None,
                 &Default::default(),
                 None,
+                None,
             )
             .await
             .expect("put_item should succeed");
@@ -126,6 +127,7 @@ async fn test_scan_composite_key_all() {
                     false,
                     None,
                     &Default::default(),
+                    None,
                     None,
                 )
                 .await
@@ -256,6 +258,7 @@ async fn test_scan_pagination_composite_key() {
                     false,
                     None,
                     &Default::default(),
+                    None,
                     None,
                 )
                 .await
@@ -397,6 +400,7 @@ async fn test_scan_gsi() {
                 None,
                 &Default::default(),
                 None,
+                None,
             )
             .await
             .expect("put_item should succeed");
@@ -463,6 +467,7 @@ async fn test_scan_gsi_pagination() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await
@@ -552,6 +557,7 @@ async fn test_scan_numeric_sort_key_all() {
                     None,
                     &Default::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("put_item should succeed");
@@ -610,6 +616,7 @@ async fn test_scan_numeric_sort_key_pagination() {
                     false,
                     None,
                     &Default::default(),
+                    None,
                     None,
                 )
                 .await
@@ -691,6 +698,7 @@ async fn test_scan_binary_sort_key_all() {
                     None,
                     &Default::default(),
                     None,
+                    None,
                 )
                 .await
                 .expect("put_item should succeed");
@@ -753,6 +761,7 @@ async fn test_scan_lsi() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await

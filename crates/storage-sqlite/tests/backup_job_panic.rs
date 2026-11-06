@@ -200,9 +200,13 @@ async fn a_job_task_that_panics_leaves_a_row_the_next_cycle_resolves_without_a_r
         account_id: Arc::from(account_id.as_str()),
         import_paths: Arc::from(Vec::new()),
         export_paths: Arc::from(Vec::new()),
+        bulk: None,
+        bulk_authorizer: None,
+        bulk_principal: None,
         authorized_key_info: Default::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
     };
 
     call(

@@ -154,6 +154,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
              stream records with the server's clock (#660)",
         ),
+        MigrationId::BulkOperations => Migration::NotApplicable(
+            "the Cassandra backend has no bulk operation store: a bulk operation request that \
+             reaches the store is refused with ValidationException",
+        ),
     }
 }
 

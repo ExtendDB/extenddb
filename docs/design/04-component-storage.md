@@ -693,7 +693,14 @@ When `UpdateTable` adds a new GSI to a table with existing data, the PostgreSQL 
    from its catalog read re-reads it and queues a repair for any GSI it missed; a write with no transaction
    queues that repair after its own statement, and loses it if the process dies in between) together cover
    writes that read the catalog just before the index row committed: the catalog and the data tables are
-   separate databases, so no transaction can tell those writes the index exists.
+   separate databases, so no transaction can tell those writes the index exists. A bulk put batch reads the
+   catalog once for all its rows and makes the same check once, before it commits: when more than 500 ms have
+   passed since that read, it re-reads the catalog and, for each GSI the re-read finds that the first read did
+   not, queues a repair for every row it wrote. A batch retried after a deadlock keeps the index set and the
+   timestamp of its first read. With PostgreSQL's default `deadlock_timeout` of one second, a retry comes more
+   than 500 ms after that read and re-reads the catalog before it commits; a retry that comes sooner, under a
+   shorter `deadlock_timeout`, does not re-read and, like a batch that commits within 500 ms, is covered by the
+   `LOCK TABLE` in this step, which waits for the table lock the batch holds until it commits.
 3. Scans the base table in keyset pages (256 rows, `FOR SHARE SKIP LOCKED`, skipped rows taken one at a time
    afterwards), writing each item's current state into the index, then deletes index rows whose item is gone.
 4. Sets the status to `ACTIVE`. A build that fails for a transient reason leaves the index `CREATING`, and a
@@ -709,6 +716,34 @@ table had no such index (the service's response), and a GSI Create, or a Delete 
 refused with LimitExceededException. A Delete of the building GSI and a throughput Update are not refused. DeleteTable stops the propagation queue for the table (a `vector_index_holds` row, which the
 claim query honours) and deletes its pending rows before it drops any data table, so a worker holding a claimed row
 and waiting on the base table cannot deadlock with the drop.
+
+A GSI Delete commits the catalog change and then drops the index's data table. A write whose catalog read came
+before the Delete writes each GSI under a savepoint, so a GSI whose table is gone is rolled back to the savepoint
+and skipped. A Delete that comes after the write's first statement on the index table waits for the write to commit,
+because the drop needs the lock the write holds.
+
+A bulk put Start and an `UpdateTable` that creates a GSI on the same table are checked against each other inside the
+transaction that acts. On PostgreSQL the Start reads the `tables` row `FOR SHARE` and counts the table's indexes that
+are not `ACTIVE`, and `UpdateTable` reads it `FOR UPDATE` and counts the table's non-terminal bulk operations; both
+rows live in the catalog database. On SQLite both checks run inside `BEGIN IMMEDIATE` under the engine's write lock.
+A GSI build in the same process is also counted in memory, so a Start called during a build, or waiting behind one,
+is refused. On PostgreSQL the build is counted from just before its catalog commit, while `UpdateTable` still holds
+the `tables` row, so a creation that is refused or fails before its commit refuses no Start. A Start whose `tables`
+row is gone, because `DeleteTable` removed it after the handler's lookup, is refused as for a `DELETING` table.
+
+On PostgreSQL an `UpdateTable` that creates a GSI takes a second connection for the index's data table while it
+holds the `tables` row, and each Start holds a connection while it waits for its locks. The Start therefore waits
+for its account's advisory lock under a `lock_timeout` of 200 ms, and then takes the row `FOR SHARE NOWAIT`. A wait
+past the timeout, or a row another transaction holds, rolls the attempt back, which returns its connection to the
+pool, and the Start tries again after a pause of 10 ms, doubling to at most 200 ms. The row's other holders are
+`UpdateTable`, `DeleteTable`, `UpdateTimeToLive`, the TTL index build and the size refresh, each for a few statements;
+a `NOWAIT` lock does not queue, so a statement that updated a `tables` row back to back would keep a Start on that
+table retrying until its deadline. After 30 seconds the Start
+answers `ServiceUnavailable`, which SDKs retry. The advisory lock is never held while a Start waits for a row, so
+Starts waiting on one table's row do not delay the account's Starts on other tables; and only the Start holding the
+advisory lock holds a table's row, so a stream of Starts on a table does not keep `UpdateTable` or `DeleteTable` on
+it waiting. The statements after the two locks, the read of the table's index states among them, run with no
+`lock_timeout`.
 
 ## 7. Pagination Token Encoding
 
@@ -937,6 +972,10 @@ fn server_components_factory(config: &StorageConfig, region: &str) -> /* ... */ 
                 
                 // Verify catalog version
                 engine.check_catalog_version().await?;
+                
+                // Verify every embedded data migration is recorded in the
+                // data database (the catalog version does not cover it)
+                engine.check_data_migrations().await?;
                 
                 // Recover control plane state
                 engine.process_control_plane_transitions().await?;

@@ -115,6 +115,7 @@ async fn put(engine: &CassandraEngine, key_info: &TableKeyInfo, pk: &str, val: u
             None,
             &Default::default(),
             Some(&capture),
+            None,
         )
         .await
         .expect("put_item");

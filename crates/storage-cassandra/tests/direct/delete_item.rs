@@ -35,6 +35,7 @@ async fn test_delete_item_pk_only_exists() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item failed");
@@ -120,6 +121,7 @@ async fn test_delete_item_with_sk_exists() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item failed");
@@ -194,6 +196,7 @@ async fn test_delete_item_return_old_false() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -350,6 +353,7 @@ async fn test_delete_item_sets_partition_max_delete_timestamp_pk_only() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item should succeed");
@@ -413,6 +417,7 @@ async fn test_delete_item_sets_partition_max_delete_timestamp_with_sk() {
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item 1 should succeed");
@@ -423,6 +428,7 @@ async fn test_delete_item_sets_partition_max_delete_timestamp_with_sk() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -511,6 +517,7 @@ async fn test_delete_item_partition_max_timestamp_increases_on_subsequent_delete
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item 1");
@@ -521,6 +528,7 @@ async fn test_delete_item_partition_max_timestamp_increases_on_subsequent_delete
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await
@@ -605,6 +613,7 @@ async fn test_delete_item_partition_max_timestamp_increases_on_subsequent_delete
             None,
             &Default::default(),
             None,
+            None,
         )
         .await
         .expect("put_item 3");
@@ -657,6 +666,7 @@ async fn test_transaction_put_rejected_by_partition_max_delete_timestamp() {
             false,
             None,
             &Default::default(),
+            None,
             None,
         )
         .await

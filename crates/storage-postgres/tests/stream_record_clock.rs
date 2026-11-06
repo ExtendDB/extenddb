@@ -264,6 +264,7 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
             None,
             &maps,
             Some(&capture),
+            None,
         )
         .await
         .expect("seed the item");
@@ -289,6 +290,7 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
         None,
         &maps,
         Some(&capture),
+        None,
     );
     let release = async {
         wait_for_lock_waiters(&s.db, holder_pid, 1).await;

@@ -530,6 +530,7 @@ async fn put<E: DataEngine>(engine: &E, key_info: &TableKeyInfo, item: Item) {
             None,
             &ExpressionMaps::default(),
             None,
+            None,
         )
         .await
         .expect("put_item");
@@ -1404,6 +1405,7 @@ async fn key_shapes<E, F, Fut>(
                     false,
                     None,
                     &ExpressionMaps::default(),
+                    None,
                     None,
                 )
                 .await

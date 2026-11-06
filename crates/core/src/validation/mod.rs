@@ -17,8 +17,8 @@ use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
 use crate::limits::LimitsConfig;
 use crate::types::{
     AttributeDefinition, AttributeValue, BillingMode, CreateTableInput, DeleteItemInput,
-    GetItemInput, Item, KeySchemaElement, KeyType, MAX_VECTOR_INDEXES_PER_TABLE, PutItemInput,
-    ReturnValues, ScalarAttributeType, Select, UpdateItemInput, VECTOR_INDEX_COUNT_LIMIT_CREATE,
+    GetItemInput, Item, KeySchemaElement, KeyType, MAX_VECTOR_INDEXES_PER_TABLE, ReturnValues,
+    ScalarAttributeType, Select, UpdateItemInput, VECTOR_INDEX_COUNT_LIMIT_CREATE,
     VECTOR_INDEX_REQUIRES_PAY_PER_REQUEST, item_size_bytes,
 };
 
@@ -1064,49 +1064,6 @@ fn validate_lsi_count(
     Ok(())
 }
 
-/// Validate a `PutItem` request.
-///
-/// Checks table name, item size, key presence/types, and `ReturnValues`.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` for invalid input.
-pub fn validate_put_item(
-    input: &PutItemInput,
-    limits: &LimitsConfig,
-    key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
-) -> Result<(), DynamoDbError> {
-    validate_table_name(&input.table_name, limits)?;
-
-    // REQ-DATA-001: PutItem only supports NONE and ALL_OLD
-    if !matches!(
-        input.return_values,
-        ReturnValues::None | ReturnValues::AllOld
-    ) {
-        return Err(DynamoDbError::ValidationException(
-            "Return values set to invalid value".to_owned(),
-        ));
-    }
-
-    // The attribute-name size check is not here: the service reports it
-    // ahead of the table lookup, so the handler runs it before this.
-    validate_item_keys(&input.item, key_schema, attr_defs)?;
-    validate_item_numbers(&input.item)?;
-    validate_item_nesting_depth(&input.item)?;
-
-    let size = item_size_bytes(&input.item);
-    if size > limits.max_item_size_bytes {
-        return Err(DynamoDbError::ValidationException(
-            "Item size has exceeded the maximum allowed size".to_owned(),
-        ));
-    }
-
-    validate_key_sizes(&input.item, key_schema, limits)?;
-
-    Ok(())
-}
-
 /// Validate a `GetItem` request.
 ///
 /// Checks table name and key presence/types.
@@ -1451,6 +1408,49 @@ fn nested_attribute_name_too_large(value: &AttributeValue, limits: &LimitsConfig
     }
 }
 
+/// Which key check of [`validate_item_keys`] fired for a rejected item.
+///
+/// Callers that decide behaviour by the fired check (the bulk put error
+/// report embeds the submitted image only for the missing-key class) match
+/// on this instead of reconstructing and comparing the message text, so a
+/// wording change here fails a compile-time match or a kind assertion
+/// rather than silently flipping the caller's rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKeyFault {
+    /// A key attribute is absent from the item.
+    MissingKey,
+    /// A key attribute is present with the wrong type.
+    TypeMismatch,
+}
+
+/// Validate that an item contains all required key attributes with correct
+/// types, reporting which check fired on rejection.
+///
+/// # Errors
+///
+/// Returns the fired [`ItemKeyFault`] and the `DynamoDbError::ValidationException`
+/// if a key attribute is missing or has the wrong type.
+pub fn validate_item_keys_reporting(
+    item: &Item,
+    key_schema: &[KeySchemaElement],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), (ItemKeyFault, DynamoDbError)> {
+    for ks in key_schema {
+        let Some(value) = item.get(&ks.attribute_name) else {
+            return Err((
+                ItemKeyFault::MissingKey,
+                DynamoDbError::ValidationException(format!(
+                    "One or more parameter values were invalid: Missing the key {} in the item",
+                    ks.attribute_name
+                )),
+            ));
+        };
+        validate_key_attribute_type(&ks.attribute_name, value, attr_defs)
+            .map_err(|error| (ItemKeyFault::TypeMismatch, error))?;
+    }
+    Ok(())
+}
+
 /// Validate that an item contains all required key attributes with correct types.
 ///
 /// # Errors
@@ -1461,16 +1461,7 @@ pub fn validate_item_keys(
     key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
-    for ks in key_schema {
-        let value = item.get(&ks.attribute_name).ok_or_else(|| {
-            DynamoDbError::ValidationException(format!(
-                "One or more parameter values were invalid: Missing the key {} in the item",
-                ks.attribute_name
-            ))
-        })?;
-        validate_key_attribute_type(&ks.attribute_name, value, attr_defs)?;
-    }
-    Ok(())
+    validate_item_keys_reporting(item, key_schema, attr_defs).map_err(|(_, error)| error)
 }
 
 /// Validate that a key map contains exactly the key attributes and nothing else.

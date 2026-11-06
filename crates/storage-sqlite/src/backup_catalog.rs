@@ -1543,9 +1543,13 @@ mod write_lock_tests {
             account_id: Arc::from(ACCOUNT),
             import_paths: Arc::from(Vec::new()),
             export_paths: Arc::from(Vec::new()),
+            bulk: None,
+            bulk_authorizer: None,
+            bulk_principal: None,
             authorized_key_info: Default::default(),
             auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
             table_key_info_lookup: None,
+            metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         };
         call(
             &ctx,

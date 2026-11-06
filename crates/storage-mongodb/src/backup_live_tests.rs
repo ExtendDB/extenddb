@@ -3300,7 +3300,7 @@ async fn live_stream_record_created_at_matches_the_record_timestamp() {
         .into_iter()
         .collect();
         fx.engine
-            .put_item(&key_info, item, false, None, &maps, Some(&capture))
+            .put_item(&key_info, item, false, None, &maps, Some(&capture), None)
             .await
             .expect("put");
     }

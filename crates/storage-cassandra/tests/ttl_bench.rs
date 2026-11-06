@@ -74,7 +74,7 @@ async fn bench_puts(
         }
         let started = std::time::Instant::now();
         engine
-            .put_item(key_info, item, false, None, &Default::default(), None)
+            .put_item(key_info, item, false, None, &Default::default(), None, None)
             .await
             .expect("bench put");
         samples.push(started.elapsed().as_micros());
@@ -161,6 +161,7 @@ async fn bench_expiration_drain_throughput() {
                 false,
                 None,
                 &Default::default(),
+                None,
                 None,
             )
             .await

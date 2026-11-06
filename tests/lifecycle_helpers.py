@@ -134,11 +134,12 @@ def _init_args(cli_env):
     return args
 
 
-def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None):
+def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None, cwd=None):
     """Run a extenddb CLI command and return the CompletedProcess.
 
     Never passes stdin — extenddb commands must be fully non-interactive.
-    Use env_override to pass EXTENDDB_ADMIN_PASSWORD etc.
+    Use env_override to pass EXTENDDB_ADMIN_PASSWORD etc., and cwd to start
+    the command in another directory.
     """
     cmd = [EXTENDDB_BINARY]
     cmd.extend(args)
@@ -156,6 +157,7 @@ def _run_extenddb(*args, config=None, timeout=30, check=True, env_override=None)
         check=check,
         stdin=subprocess.DEVNULL,
         env=env,
+        cwd=cwd,
     )
 
 

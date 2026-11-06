@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 const EXEMPT: &[(&str, &str)] = &[
     (
         "docs/manuals/07-upgrade-manual.md",
-        "documents the 0.0.2 to 0.0.3 upgrade, so both versions appear on purpose",
+        "documents past upgrades, so superseded catalog versions appear on purpose",
     ),
     (
         "docs/backlog.md",

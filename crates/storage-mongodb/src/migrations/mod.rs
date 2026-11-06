@@ -164,6 +164,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             "a MongoDB write draws its stream sequence number from its shard's counter inside its \
              transaction, so the records of a shard commit in number order",
         ),
+        MigrationId::BulkOperations => Migration::NotApplicable(
+            "the MongoDB backend has no bulk operation store: a bulk operation request that \
+             reaches the store is refused with ValidationException",
+        ),
     }
 }
 

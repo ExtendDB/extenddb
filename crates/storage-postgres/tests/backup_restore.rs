@@ -756,6 +756,7 @@ async fn put_indexed_items(s: &Scratch, name: &str, desc: &TableDescription, ite
                 None,
                 &extenddb_core::expression::ExpressionMaps::default(),
                 None,
+                None,
             )
             .await
             .expect("put");

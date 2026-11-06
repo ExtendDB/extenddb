@@ -445,11 +445,11 @@ async fn test_committing_recovery_leaves_a_row_a_later_writer_owns_alone() {
     let k2 = gsi_item("rec", "K2", "2");
     let k3 = gsi_item("rec", "K3", "3");
     engine
-        .put_item(&table.key_info, k1.clone(), false, None, &maps, None)
+        .put_item(&table.key_info, k1.clone(), false, None, &maps, None, None)
         .await
         .unwrap();
     engine
-        .put_item(&table.key_info, k3.clone(), false, None, &maps, None)
+        .put_item(&table.key_info, k3.clone(), false, None, &maps, None, None)
         .await
         .unwrap();
     let (version_before, prepared) = base_row_state(&engine, &keyspace, &table_id, "rec").await;
@@ -512,7 +512,7 @@ async fn test_committing_recovery_repairs_the_index_rows_of_a_row_it_commits() {
     let k1 = gsi_item("own", "K1", "1");
     let k2 = gsi_item("own", "K2", "2");
     engine
-        .put_item(&table.key_info, k1.clone(), false, None, &maps, None)
+        .put_item(&table.key_info, k1.clone(), false, None, &maps, None, None)
         .await
         .unwrap();
     let (version_before, _) = base_row_state(&engine, &keyspace, &table_id, "own").await;
@@ -584,7 +584,7 @@ async fn test_committing_recovery_repairs_the_index_rows_of_a_commit_that_landed
     let k1 = gsi_item("landed", "K1", "1");
     let k2 = gsi_item("landed", "K2", "2");
     engine
-        .put_item(&table.key_info, k1.clone(), false, None, &maps, None)
+        .put_item(&table.key_info, k1.clone(), false, None, &maps, None, None)
         .await
         .unwrap();
     let (version_before, _) = base_row_state(&engine, &keyspace, &table_id, "landed").await;

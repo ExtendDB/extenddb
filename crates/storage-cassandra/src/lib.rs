@@ -17,6 +17,7 @@ mod authorization_store;
 mod backup_catalog;
 mod backup_engine;
 pub mod bootstrapper;
+mod bulk_operation_store;
 pub mod cassandra_util;
 pub mod catalog_store;
 pub mod config;

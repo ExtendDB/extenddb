@@ -12,6 +12,10 @@ pub(crate) mod authorization;
 pub mod authz_cache;
 pub(crate) mod authz_resource;
 pub mod backup_store;
+#[cfg(test)]
+mod bulk_authorization_tests;
+mod bulk_authorizer;
+mod bulk_store;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
@@ -25,7 +29,10 @@ mod registration;
 mod request_helpers;
 mod request_tags;
 mod response;
+mod s3_client_key;
 mod serve;
+#[cfg(test)]
+mod test_logs;
 mod throttle_helpers;
 mod workers;
 
@@ -82,6 +89,11 @@ pub struct AppState {
     /// Allowed directories for export file operations. Empty means exports
     /// are disabled (secure default).
     pub export_paths: Arc<[Arc<std::path::PathBuf>]>,
+    /// The bulk store (`[bulk]`). Bulk put reads inputs and writes reports
+    /// through it; on the filesystem store (`[bulk.filesystem] path`) they
+    /// live beneath `{root}/{account id}/{S3Bucket}/...`. `None` means bulk
+    /// operations are disabled (secure default).
+    pub bulk: Option<Arc<extenddb_engine::bulk_put::store::BulkStore>>,
     /// Token bucket throttle manager for provisioned throughput enforcement.
     pub throttle: Arc<ThrottleManager>,
     /// Auth/authz cache handles. Used by the management API to issue
@@ -149,6 +161,7 @@ pub async fn start_server(
     let metrics_for_console = state.metrics.clone();
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
+    let bulk_for_mgmt = state.bulk.clone();
     let mgmt_region = state.region.clone();
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
@@ -198,6 +211,7 @@ pub async fn start_server(
             auth_cache: auth_cache_for_mgmt,
             authz_cache: authz_cache_for_mgmt,
             table_key_info_cache: table_key_info_cache_for_mgmt,
+            bulk: bulk_for_mgmt,
             region: mgmt_region,
             secure_transport: tls_enabled,
         });

@@ -3,6 +3,7 @@
 mod attribute_value;
 mod backup;
 mod batch;
+mod bulk_operation;
 mod capacity;
 mod import_export;
 mod item;
@@ -21,6 +22,15 @@ pub use backup::{
 pub use batch::{
     BatchGetItemInput, BatchGetItemOutput, BatchWriteItemInput, BatchWriteItemOutput,
     DeleteRequest, KeysAndAttributes, PutRequest, WriteRequest,
+};
+pub use bulk_operation::{
+    BulkOperationBytes, BulkOperationDescription, BulkOperationInputFormat,
+    BulkOperationPerformanceTier, BulkOperationStatus, BulkOperationSummary,
+    BulkOperationTableDetail, BulkOperationUsage, BulkOperationVectorBytes,
+    CancelBulkOperationInput, CancelBulkOperationOutput, DescribeBulkOperationInput,
+    DescribeBulkOperationOutput, InputCompressionType, InputS3Configuration,
+    ListBulkOperationsInput, ListBulkOperationsOutput, OutputS3Configuration, OutputType,
+    S3SseAlgorithm, StartBulkPutItemsInput, StartBulkPutItemsOutput,
 };
 pub use capacity::{
     Capacity, ConsumedCapacity, ItemCollectionMetrics, ReturnConsumedCapacity,

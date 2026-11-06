@@ -298,9 +298,15 @@ async fn put_after_winner(
     let table = data_table(&s.db).await;
     let (creator, creator_pid) = create_in_flight(&s.db, &table, &item(range, "winner")).await;
     let maps = ExpressionMaps::default();
-    let put = s
-        .engine
-        .put_item(key_info, item(range, "loser"), true, condition, &maps, None);
+    let put = s.engine.put_item(
+        key_info,
+        item(range, "loser"),
+        true,
+        condition,
+        &maps,
+        None,
+        None,
+    );
     let commit = async {
         let waited = wait_until_blocked_by(&s.db, creator_pid, "transactionid").await;
         creator.commit().await.expect("commit the create");
@@ -551,9 +557,15 @@ async fn deleted_winner_is_retried(test: &str, range: bool) {
     let s = scratch().await;
     let (key_info, data, mut gate, gate_pid) = gated_table(&s, range).await;
     let maps = ExpressionMaps::default();
-    let put = s
-        .engine
-        .put_item(&key_info, item(range, "loser"), true, None, &maps, None);
+    let put = s.engine.put_item(
+        &key_info,
+        item(range, "loser"),
+        true,
+        None,
+        &maps,
+        None,
+        None,
+    );
     let driver = async {
         let steps = async {
             wait_until_blocked_by(&s.db, gate_pid, "advisory").await?;
@@ -604,9 +616,15 @@ async fn create_race_churn_gives_up(test: &str, range: bool) {
     let s = scratch().await;
     let (key_info, data, mut gate, gate_pid) = gated_table(&s, range).await;
     let maps = ExpressionMaps::default();
-    let put = s
-        .engine
-        .put_item(&key_info, item(range, "loser"), true, None, &maps, None);
+    let put = s.engine.put_item(
+        &key_info,
+        item(range, "loser"),
+        true,
+        None,
+        &maps,
+        None,
+        None,
+    );
     let driver = async {
         let steps = async {
             for k in 1..=4 {
@@ -732,7 +750,15 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
     let maps = ExpressionMaps::default();
     let key_info = lsi_stream_table(&s).await;
     s.engine
-        .put_item(&key_info, range_item("d", &[]), false, None, &maps, None)
+        .put_item(
+            &key_info,
+            range_item("d", &[]),
+            false,
+            None,
+            &maps,
+            None,
+            None,
+        )
         .await
         .expect("seed d");
     let table_id: String =
@@ -788,7 +814,15 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
         wait_until_blocked_by(&s.db, holder_pid, "transactionid").await?;
         Ok::<_, String>(
             s.engine
-                .put_item(&key_info, loser.clone(), true, None, &maps, Some(&capture))
+                .put_item(
+                    &key_info,
+                    loser.clone(),
+                    true,
+                    None,
+                    &maps,
+                    Some(&capture),
+                    None,
+                )
                 .await,
         )
     };

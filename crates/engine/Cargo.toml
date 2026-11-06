@@ -23,15 +23,51 @@ tracing = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 crc32fast = { workspace = true }
+flate2 = "1"
+ruzstd = "0.9.1"
 hmac = "0.12"
 sha2 = "0.10"
+md-5 = "0.10"
 hex = "0.4"
+rand = { workspace = true }
 tokio = { workspace = true }
 # `TaskTracker` for the backup jobs the server drains at shutdown.
 tokio-util = { workspace = true, features = ["rt"] }
 bytes = { workspace = true }
 futures = { workspace = true }
+# The bulk put S3 store: the shared S3 clients and the server's AWS
+# credentials, and the S3 client types the store's calls use.
+extenddb-s3 = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+
+# The bulk input and report layout is POSIX-only: the component walk and
+# handle-relative write discipline need openat/mkdirat/renameat/fcntl with
+# O_NOFOLLOW/O_NONBLOCK, all through rustix without unsafe. Pinned exactly
+# to the version already in Cargo.lock.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [dev-dependencies]
-# `start_paused` for the tests of timers that must not depend on the wall clock.
+# The runner behaviour tests drive a real storage engine. The engine crate
+# is backend-agnostic at runtime (it receives Arc<dyn StorageEngine>), so a
+# concrete backend appears here only as a test dependency; the sqlite
+# in-memory database gives each test an isolated engine with no file on
+# disk.
+extenddb-storage-sqlite = { workspace = true, features = ["memory"] }
+# The runner cases that must hold on both backends also run on a throwaway
+# PostgreSQL database when EXTENDDB_TEST_PG_CONNECTION_STRING names a
+# server; sqlx creates and drops that database.
+extenddb-storage-postgres = { workspace = true }
+sqlx = { workspace = true }
+# `test-util` gives the write pacer tests a paused clock, so a one-second
+# bucket is measured without a one-second sleep, and `start_paused` to the
+# tests of timers that must not depend on the wall clock.
 tokio = { workspace = true, features = ["test-util"] }
+# The S3 store's fault tests answer canned S3 responses through the SDK's
+# replay HTTP client, and build SDK configurations without reading the
+# environment.
+aws-smithy-http-client = { workspace = true, features = ["test-util"] }
+aws-config = { workspace = true }
+# The test hooks of the shared S3 clients (`S3Clients::new`, `with_retry`,
+# `RetryPolicy::NONE`).
+extenddb-s3 = { workspace = true, features = ["test-util"] }

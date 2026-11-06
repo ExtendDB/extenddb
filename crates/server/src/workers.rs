@@ -25,9 +25,18 @@ use extenddb_storage::management_store::{MetricsStore, RateLimitStore, SettingsS
 use extenddb_storage::{CancellationToken, sleep_or_shutdown as tick};
 use tracing_subscriber::{EnvFilter, reload};
 
+/// The tracing filter for the application level `level` and the sqlx level
+/// `sqlx_level`. The AWS SDK's profile credential loader logs the S3 bulk
+/// store's access key ID at info on each load, so its target stays at warn,
+/// which keeps its warnings (a credential load that failed); a target
+/// directive outranks the bare level, so `debug` leaves it at warn too.
+pub(crate) fn log_filter(level: &str, sqlx_level: &str) -> String {
+    format!("{level},sqlx={sqlx_level},aws_config=warn")
+}
+
 /// Poll the `log_level` and `sqlx_log_level` settings from the database
 /// and reload the tracing filter when either changes (D-22, D-3).
-/// The combined filter is `{log_level},sqlx={sqlx_log_level}`.
+/// The combined filter is [`log_filter`].
 /// Falls back to `config_level` when `log_level` is absent from the DB.
 /// Runs until `token` is cancelled.
 pub(crate) async fn poll_log_level(
@@ -69,7 +78,7 @@ pub(crate) async fn poll_log_level(
         }
 
         // D-3: Combined filter encodes both levels.
-        let filter_str = format!("{new_level},sqlx={new_sqlx_level}");
+        let filter_str = log_filter(&new_level, &new_sqlx_level);
 
         match EnvFilter::try_new(&filter_str) {
             Ok(new_filter) => {
@@ -285,6 +294,48 @@ pub(crate) async fn login_attempt_cleanup_worker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_sdk_credential_loader_stays_at_warn_whatever_the_levels() {
+        use std::sync::{Arc, Mutex, PoisonError};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut buffer = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                buffer.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (level, sqlx_level) in [("info", "warn"), ("debug", "info"), ("trace", "debug")] {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(super::EnvFilter::new(super::log_filter(level, sqlx_level)))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "aws_config::profile::credentials", "loaded base credentials");
+                tracing::warn!(target: "aws_config::profile::credentials", "credential load failed");
+                tracing::info!(target: "extenddb_server::serve", "an application line");
+            });
+            let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                !logged.contains("loaded base credentials"),
+                "{level}: {logged}"
+            );
+            assert!(
+                logged.contains("credential load failed"),
+                "{level}: {logged}"
+            );
+            assert!(logged.contains("an application line"), "{level}: {logged}");
+        }
+    }
+
     use super::{login_attempt_cleanup_worker, metrics_flush_worker};
     use extenddb_core::metrics::MetricsCollector;
     use extenddb_storage::CancellationToken;
