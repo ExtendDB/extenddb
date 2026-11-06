@@ -133,6 +133,9 @@ jobs:
           EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:7070
           EXTENDDB_TEST_S3_ACCESS_KEY_ID: ${{ env.S3_ACCESS_KEY }}
           EXTENDDB_TEST_S3_SECRET_ACCESS_KEY: ${{ env.S3_SECRET_KEY }}
+          # The PostgreSQL server has no [backup.store], and the bulk suite
+          # runs no backup test.
+          EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-tests --extenddb --pytest --bulk-store s3 --parallel --filter bulk_put
 
       - name: Dump server syslog on failure
