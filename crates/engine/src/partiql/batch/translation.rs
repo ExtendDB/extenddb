@@ -144,13 +144,15 @@ pub(super) async fn translate_write(
 }
 
 /// A statement whose translation fails with `error`, which is the
-/// statement's own unless it is a fault of the server, such as a catalog
-/// read that fails.
+/// statement's own unless it is a fault of the server: an error with an HTTP
+/// status of 500 or more, such as a catalog read that fails
+/// (`InternalServerError`) or a lost connection to the storage
+/// (`ServiceUnavailable`, which a client retries). A fault fails the request.
 fn untranslated(error: DynamoDbError) -> Result<Translation, DynamoDbError> {
-    match error {
-        DynamoDbError::InternalServerError(_) => Err(error),
-        error => Ok(Translation::Untranslated(error)),
+    if error.status_code() >= 500 {
+        return Err(error);
     }
+    Ok(Translation::Untranslated(error))
 }
 
 /// The request a write statement translates into.
@@ -176,4 +178,32 @@ fn condition_key_refusal(
     };
     common::condition_key_refusal(where_clause?, pk, sk, params)
         .map(DynamoDbError::ValidationException)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fault_of_the_server_fails_the_request_and_a_refusal_is_the_statements() {
+        for fault in [
+            DynamoDbError::InternalServerError("Internal server error".to_owned()),
+            DynamoDbError::ServiceUnavailable("Service is temporarily unavailable".to_owned()),
+        ] {
+            assert!(untranslated(fault.clone()).is_err(), "{fault:?}");
+        }
+        for refusal in [
+            DynamoDbError::ValidationException("refused".to_owned()),
+            DynamoDbError::ResourceNotFoundException(String::new()),
+            DynamoDbError::SerializationException("refused".to_owned()),
+        ] {
+            assert!(
+                matches!(
+                    untranslated(refusal.clone()),
+                    Ok(Translation::Untranslated(_))
+                ),
+                "{refusal:?}"
+            );
+        }
+    }
 }
