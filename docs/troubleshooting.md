@@ -391,7 +391,13 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
 
 **Cause:** With a separate data database, a synchronous DeleteTable commits the catalog row removal first, then commits the drop of the table's data tables on the data database. If that data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. Only a process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the table's data tables on the data database with no catalog row naming them. Nothing reclaims them afterwards: DescribeTable reports the table gone, a same-name CreateTable gets a new table id, and the control plane only enumerates relations that still have a catalog row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run. (On one shared database the row and the drops commit together, so this cannot happen there.)
 
-To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
+To find such relations, stop the server and run `extenddb catalog-check` with the deployment's config file. The check lists the `_ddb_` relations in the data database's current schema and compares them with the relations the catalog's table, index and vector index rows name, through the same naming the server uses, for rows in every status. A relation no row names is reported under "orphaned data tables". A relation a row names that the data database lacks is reported under "missing data tables" with the table or index that owns it; a table or index in CREATING or DELETING is not reported missing, since its relations are being created or removed. A catalog without a data database connection string is refused, as on earlier releases: `extenddb init` always records one.
+
+The command refuses to run while it finds the server's PID file, but it does not see a server on another host, one started in the foreground without `--write-pid-file`, or one using another `run_dir` or port. When a server is running and the check finds a relation that no row names, it waits for the GSI additions in flight and reads the catalog again, so the relation of a GSI being added is not reported orphaned; a check that finds every relation named does not wait. It then lists the relations and reads the catalog a second time, and reports a relation missing only when both catalog reads expect it, so a table deleted while it runs is not reported missing. Reports made while a server change is in progress can still be wrong, and a later run does not repeat them: the relations of a table, GSI or vector index whose catalog row a server has just removed, and whose drop has not committed yet, are reported orphaned; and the relations of a table whose row is ACTIVE before its relations commit are reported missing (a CreateTable when `control_plane_delay_seconds` is 0, or one whose relations take longer to commit than that delay).
+
+`extenddb catalog-check --fix` drops the orphaned relations. Before it drops anything it waits for the GSI additions in flight to commit, reads the ids again, and keeps every relation a row names by then, so a CreateTable or UpdateTable that lands between the report and the drop loses nothing. The wait is a `SHARE` lock on the catalog's `indexes` table, requested in attempts of 100 ms for up to 30 seconds and released after the read, so a server's write to `indexes` waits behind it for at most 100 ms plus the one catalog read. Each relation is then dropped in a transaction of its own that waits at most one second for the relation's lock, and no server request waits on the command while it drops. The command prints what it did with each relation: `Dropped`; `Already gone` when another session, such as a server's DeleteTable, dropped it first; `Kept` with the reason; or `FAILED` with the error, which is what a relation another session holds gets (run the command again once that session ends). If the GSI additions in flight do not finish within 30 seconds it reports that, drops nothing, and can be run again. Relations without the `_ddb_` prefix are never touched. `--fix` treats every `_ddb_` relation in the data database's current schema as this deployment's, so run it only when no other deployment keeps data relations in that database and schema.
+
+To do the comparison by hand, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
 
 ```sql
 SELECT table_id FROM tables
@@ -407,7 +413,8 @@ SELECT d.tablename
   LEFT JOIN (VALUES ('<table_id>'), ('<index_id>'), ('<vector_index_id>')) AS live(id)
     ON d.tablename = '_ddb_' || live.id
     OR d.tablename = '_ddb_vec_' || live.id
- WHERE d.tablename LIKE '\_ddb\_%' AND live.id IS NULL;
+ WHERE d.tablename LIKE '\_ddb\_%' AND d.schemaname = current_schema()
+   AND live.id IS NULL;
 ```
 
 Each row is a data relation with no catalog row. After confirming the table is gone from the catalog (`DescribeTable` returns `ResourceNotFoundException`), drop the listed relations on the data database:
@@ -417,8 +424,6 @@ DROP TABLE IF EXISTS "_ddb_<table_id>", "_ddb_<index_id>", "_ddb_vec_<vector_ind
 ```
 
 The error log line names the exact relations for one leaked table and gives this `DROP TABLE` verbatim.
-
-**Do not** use `extenddb catalog-check --fix` to clean these up: it expects a different relation-naming scheme and, against the current schema, reports every live data table as orphaned and would drop tables still in use.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
