@@ -5,8 +5,8 @@
 
 Amazon DynamoDB rejects a request that provides ExpressionAttributeNames or
 ExpressionAttributeValues when there is no expression parameter that could
-reference them. The names message is always suffix-free; the values message
-names the null value-capable expression parameter(s) for that API.
+reference them. The names message is always suffix-free. On Query and Scan
+the values message is suffix-free as well: it ends after "expressions".
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -82,7 +82,7 @@ class TestExpressionParamsWithoutExpression:
                 TableName=hash_table,
                 ExpressionAttributeValues={":v": {"S": "x"}},
             ),
-            f"{VALUES_PREFIX}: FilterExpression is null",
+            VALUES_PREFIX,
         )
 
     def test_delete_item_names_no_expression(self, dynamodb_client, hash_table):
@@ -162,7 +162,7 @@ class TestExpressionParamsWithoutExpression:
         )
 
     def test_query_values_no_expression(self, dynamodb_client, hash_table):
-        # Query emits no values suffix, unlike Scan/Delete/Update.
+        # Query emits no values suffix, as Scan does.
         _expect_validation(
             lambda: dynamodb_client.query(
                 TableName=hash_table,
