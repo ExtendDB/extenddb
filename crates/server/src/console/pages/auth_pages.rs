@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
-use crate::console::session::CredentialStamp;
+use crate::console::session::{CredentialStamp, SESSION_MAX_LIFETIME_SECS};
 use crate::management::CallerIdentity;
 use crate::management::auth::log_password_check_error;
 use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
@@ -58,7 +58,7 @@ pub async fn login_submit(
         };
 
     let (token, _csrf) = state.sessions.create(identity, stamp).await;
-    let cookie = session_cookie(&token, 28800, state.secure_cookies);
+    let cookie = session_cookie(&token, SESSION_MAX_LIFETIME_SECS, state.secure_cookies);
 
     (
         StatusCode::SEE_OTHER,

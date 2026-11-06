@@ -5,9 +5,10 @@
 //!
 //! Sessions are random 32-byte hex tokens stored in a cookie. They map to a
 //! `CallerIdentity` (admin or IAM user) and a CSRF token for form protection.
-//! Sessions expire after 8 hours of inactivity, and 24 hours after login
-//! however active they are. A background reaper is not needed: expired
-//! sessions are pruned lazily on lookup.
+//! Sessions end 8 hours after login, however active they are, which is also
+//! when the browser drops the session cookie. A session idle for 8 hours ends
+//! too. A background reaper is not needed: expired sessions are pruned lazily
+//! on lookup.
 //!
 //! Each session also holds a [`CredentialStamp`] of the password hash its
 //! principal logged in with. [`SessionStore::validate`] reads the principal's
@@ -27,7 +28,16 @@ use tokio::sync::Mutex;
 use crate::management::CallerIdentity;
 
 /// How long a session remains valid without activity.
+///
+/// No longer than [`SESSION_MAX_LIFETIME`]: activity always follows login, so
+/// with the two equal the lifetime ends every session first. The idle check
+/// stays so that a shorter idle timeout takes effect if one is set.
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
+
+/// How long a session remains valid after login, in seconds, however active
+/// it is. The login cookie's `Max-Age` is this value, so a browser drops the
+/// cookie when the server ends the session.
+pub(crate) const SESSION_MAX_LIFETIME_SECS: u32 = 8 * 3600;
 
 /// How long a session remains valid after login, however active it is.
 ///
@@ -35,7 +45,7 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 3600);
 /// that is used at least every [`SESSION_TTL`] would stay valid until the
 /// process restarts. The cookie's `Max-Age` does not bound it: the server
 /// never sees that attribute, and a stolen token can be sent without it.
-const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(SESSION_MAX_LIFETIME_SECS as u64);
 
 /// Maximum sessions before lazy pruning triggers on insert.
 const MAX_SESSIONS: usize = 10_000;

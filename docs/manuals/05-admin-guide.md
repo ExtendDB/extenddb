@@ -829,7 +829,7 @@ The management web console is served at `/console/` on the same port as the Dyna
 - Admin users: enter username and password
 - IAM users: enter `account_id/user_name` as username, console password as password
 
-Sessions expire after 8 hours of inactivity, and 24 hours after login however active they are. Click "Logout" to end immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
+Sessions end 8 hours after login. Click "Logout" to end immediately. Deleting an admin or IAM user, or changing its password, ends its console sessions on every server at their next request.
 
 ## Monitoring
 
