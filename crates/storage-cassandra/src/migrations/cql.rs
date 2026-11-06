@@ -11,7 +11,7 @@
 //! keyspace, and [`statements`] writes the keyspace of the store the runner
 //! migrates in front of each one.
 
-use extenddb_storage::migrations::{MigrationError, split_comments};
+use extenddb_storage::migrations::MigrationError;
 
 /// One statement of a body, qualified with the store's keyspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,48 +24,129 @@ pub(crate) struct Statement {
 }
 
 /// The statements of body `file` with comments removed, split on the
-/// semicolons outside quotes, each with its table written as
-/// `keyspace.table`. A statement whose table cannot be qualified fails the
-/// whole file before any statement runs.
+/// semicolons outside string literals, quoted identifiers and comments, each
+/// with its table written as `keyspace.table`. A body that ends inside a
+/// literal, a quoted identifier or a `/* */` comment, or has a statement
+/// whose table cannot be qualified, fails the whole file before any
+/// statement runs.
 ///
 /// # Errors
 ///
-/// A statement is not one of the forms [`qualify`] recognises.
+/// The body ends inside a string literal, a quoted identifier or a `/* */`
+/// comment, or a statement is not one of the forms [`qualify`] recognises.
 pub(crate) fn statements(
     keyspace: &str,
     file: &str,
     text: &str,
 ) -> Result<Vec<Statement>, MigrationError> {
-    let (code, _) = split_comments(text, true);
-    split(&code)
-        .into_iter()
+    split(file, text)?
+        .iter()
         .map(|statement| qualify(keyspace, file, statement))
         .collect()
 }
 
-/// `code` split on the semicolons outside single and double quotes, each
-/// piece trimmed and the empty ones dropped.
-fn split(code: &str) -> Vec<&str> {
-    let mut pieces = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0;
-    for (i, c) in code.char_indices() {
-        match (quote, c) {
-            (None, '\'' | '"') => quote = Some(c),
-            (Some(q), c) if c == q => quote = None,
-            (None, ';') => {
-                pieces.push(&code[start..i]);
-                start = i + 1;
+/// The statements of body `file`: `text` read once, without its comments,
+/// split on the semicolons outside string literals, quoted identifiers and
+/// comments, each trimmed and the empty ones dropped (#675). The scanner
+/// tracks where each of these starts and ends, and no other CQL grammar:
+///
+/// - a string literal, `'...'` with `''` for a quote inside, or `$$...$$`
+/// - a quoted identifier, `"..."` with `""` for a quote inside
+/// - a `--` or `//` comment, which runs to the end of its line
+/// - a `/* */` comment, which ends at the first `*/`, as CQL does not nest
+///   comments
+///
+/// A `/* */` comment becomes a space, so the words on either side of it stay
+/// apart, and a line comment's line break stays.
+///
+/// # Errors
+///
+/// `text` ends inside a string literal, a quoted identifier or a `/* */`
+/// comment.
+fn split(file: &str, text: &str) -> Result<Vec<String>, MigrationError> {
+    let mut statements = Vec::new();
+    let mut statement = String::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match (c, chars.peek().map(|&(_, d)| d)) {
+            (';', _) => end(&mut statements, &mut statement),
+            ('\'' | '"', _) => {
+                statement.push(c);
+                loop {
+                    let Some((_, d)) = chars.next() else {
+                        let what = if c == '\'' {
+                            "a string literal"
+                        } else {
+                            "a quoted identifier"
+                        };
+                        return Err(unterminated(file, text, at, what));
+                    };
+                    statement.push(d);
+                    // A doubled quote is a quote inside, not the end.
+                    if d == c {
+                        if chars.next_if(|&(_, e)| e == c).is_none() {
+                            break;
+                        }
+                        statement.push(c);
+                    }
+                }
             }
-            _ => {}
+            ('$', Some('$')) => {
+                chars.next();
+                statement.push_str("$$");
+                let mut last = None;
+                loop {
+                    let Some((_, d)) = chars.next() else {
+                        return Err(unterminated(file, text, at, "a $$ string literal"));
+                    };
+                    statement.push(d);
+                    if last == Some('$') && d == '$' {
+                        break;
+                    }
+                    last = Some(d);
+                }
+            }
+            ('-', Some('-')) | ('/', Some('/')) => {
+                while chars.next_if(|&(_, d)| d != '\n' && d != '\r').is_some() {}
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut last = None;
+                loop {
+                    let Some((_, d)) = chars.next() else {
+                        return Err(unterminated(file, text, at, "a /* */ comment"));
+                    };
+                    if last == Some('*') && d == '/' {
+                        break;
+                    }
+                    last = Some(d);
+                }
+                statement.push(' ');
+            }
+            _ => statement.push(c),
         }
     }
-    pieces.push(&code[start..]);
-    pieces
-        .into_iter()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect()
+    end(&mut statements, &mut statement);
+    Ok(statements)
+}
+
+/// Add `statement`, trimmed, to `statements` unless it is empty, and clear
+/// it for the next one.
+fn end(statements: &mut Vec<String>, statement: &mut String) {
+    let trimmed = statement.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_owned());
+    }
+    statement.clear();
+}
+
+/// The error for body `file`, whose `text` ends inside `what`, opened at
+/// byte `at`.
+fn unterminated(file: &str, text: &str, at: usize, what: &str) -> MigrationError {
+    let line = text[..at].matches('\n').count() + 1;
+    MigrationError::Store(format!(
+        "Migration file {file} ends inside {what} that opens on line {line}"
+    ))
 }
 
 /// `statement` with its table written as `keyspace.table`. Recognises
@@ -77,8 +158,10 @@ fn qualify(keyspace: &str, file: &str, statement: &str) -> Result<Statement, Mig
     let first_line = statement.lines().next().unwrap_or_default();
     let refuse = || {
         MigrationError::Store(format!(
-            "migration file {file} has a statement that names no table the runner can qualify \
-             with a keyspace: {first_line}"
+            "Migration file {file} has a statement the runner cannot qualify with a keyspace: \
+             {first_line}. The runner supports CREATE TABLE, CREATE INDEX, ALTER TABLE, \
+             DROP TABLE IF EXISTS, INSERT INTO and DELETE FROM, each naming an unquoted table \
+             without a keyspace."
         ))
     };
     let (at, ddl) = table_offset(statement).ok_or_else(refuse)?;
@@ -285,6 +368,35 @@ mod tests {
                 "{error}"
             );
         }
+        // The message names both causes (#676): a form the runner does not
+        // handle, here an UPDATE, and a form it handles whose table it still
+        // cannot qualify, here one with a keyspace and one in quotes. It
+        // quotes the statement's first line.
+        for (sql, first_line) in [
+            (
+                "UPDATE settings\nSET value = 'x' WHERE key = 'y'",
+                "UPDATE settings",
+            ),
+            (
+                "CREATE TABLE other.t (a int PRIMARY KEY)",
+                "CREATE TABLE other.t (a int PRIMARY KEY)",
+            ),
+            (
+                "CREATE TABLE \"T\" (a int PRIMARY KEY)",
+                "CREATE TABLE \"T\" (a int PRIMARY KEY)",
+            ),
+        ] {
+            assert_eq!(
+                one(sql),
+                Err(format!(
+                    "Migration file f.cql has a statement the runner cannot qualify with a \
+                     keyspace: {first_line}. The runner supports CREATE TABLE, CREATE INDEX, \
+                     ALTER TABLE, DROP TABLE IF EXISTS, INSERT INTO and DELETE FROM, each \
+                     naming an unquoted table without a keyspace."
+                )),
+                "{sql}"
+            );
+        }
         // One bad statement refuses the whole file, before anything runs.
         assert!(statements("ks", "f.cql", "CREATE TABLE a (x int PRIMARY KEY); USE ks").is_err());
     }
@@ -306,6 +418,112 @@ mod tests {
                 "INSERT INTO ks.a (x) VALUES ('p;q')"
             ]
         );
+        // The inputs of #675. `''` and `""` are a quote inside a literal or a
+        // name, a comment between two words leaves a space between them, and
+        // CQL does not nest comments, so the first `*/` closes both `/*`.
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "CREATE TABLE IF NOT EXISTS b (k int PRIMARY KEY) -- was: ; INSERT INTO settings \
+                 (key, value) VALUES ('catalog_version', '9.9.9') ;",
+                &["CREATE TABLE IF NOT EXISTS ks.b (k int PRIMARY KEY)"],
+            ),
+            (
+                "INSERT INTO settings (key, value) VALUES ('note', 'a;b');",
+                &["INSERT INTO ks.settings (key, value) VALUES ('note', 'a;b')"],
+            ),
+            (
+                "/* header */ CREATE TABLE a (k int PRIMARY KEY);",
+                &["CREATE TABLE ks.a (k int PRIMARY KEY)"],
+            ),
+            (
+                "INSERT INTO settings (key, value) VALUES ('x -- y', 'it''s; /* not */ a comment');",
+                &[
+                    "INSERT INTO ks.settings (key, value) VALUES ('x -- y', 'it''s; /* not */ a \
+                     comment')",
+                ],
+            ),
+            (
+                r#"CREATE TABLE a ("we;ird" int PRIMARY KEY, "say ""hi""; -- x" text);"#,
+                &[r#"CREATE TABLE ks.a ("we;ird" int PRIMARY KEY, "say ""hi""; -- x" text)"#],
+            ),
+            (
+                "CREATE TABLE b (k int PRIMARY KEY); // was: ; INSERT INTO b (k) VALUES (2)\n\
+                 CREATE/* x */TABLE c (k int PRIMARY KEY);\n\
+                 /* one /* two; */ INSERT INTO b (k) VALUES (1);",
+                &[
+                    "CREATE TABLE ks.b (k int PRIMARY KEY)",
+                    "CREATE TABLE ks.c (k int PRIMARY KEY)",
+                    "INSERT INTO ks.b (k) VALUES (1)",
+                ],
+            ),
+        ];
+        for &(sql, want) in cases {
+            let got = texts_of(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    /// The statements of `sql` as the runner sends them.
+    fn texts_of(sql: &str) -> Result<Vec<String>, String> {
+        let all = statements("ks", "f.cql", sql).map_err(|e| e.to_string())?;
+        Ok(all.into_iter().map(|s| s.text).collect())
+    }
+
+    #[test]
+    fn a_dollar_quoted_literal_is_kept_whole() {
+        // A `;`, a comment marker or a quote inside `$$...$$` is part of the
+        // literal (#675).
+        assert_eq!(
+            texts_of(
+                "INSERT INTO settings (key, value) VALUES ('body', $$a;b -- c /* d$$);\n\
+                 INSERT INTO settings (key, value) VALUES ('empty', $$$$);"
+            ),
+            Ok(vec![
+                "INSERT INTO ks.settings (key, value) VALUES ('body', $$a;b -- c /* d$$)"
+                    .to_owned(),
+                "INSERT INTO ks.settings (key, value) VALUES ('empty', $$$$)".to_owned(),
+            ])
+        );
+        // Read as the start of a `'` literal, the quote would hold the rest of
+        // the file in one statement.
+        assert_eq!(
+            texts_of(
+                "INSERT INTO settings (key, value) VALUES ('note', $$it's$$);\n\
+                 INSERT INTO settings (key, value) VALUES ('next', 'x');"
+            ),
+            Ok(vec![
+                "INSERT INTO ks.settings (key, value) VALUES ('note', $$it's$$)".to_owned(),
+                "INSERT INTO ks.settings (key, value) VALUES ('next', 'x')".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_file_that_ends_inside_a_literal_a_quoted_name_or_a_comment_fails_naming_it() {
+        for (sql, inside) in [
+            (
+                "CREATE TABLE a (k int PRIMARY KEY);\nINSERT INTO a (k, v) VALUES (1, 'open;\n",
+                "a string literal that opens on line 2",
+            ),
+            (
+                "CREATE TABLE a (k int PRIMARY KEY);\nINSERT INTO a (k, v) VALUES (1, $$open;",
+                "a $$ string literal that opens on line 2",
+            ),
+            (
+                "CREATE TABLE a (k int PRIMARY KEY);\n\nCREATE TABLE \"open (k int PRIMARY KEY);",
+                "a quoted identifier that opens on line 3",
+            ),
+            (
+                "CREATE TABLE a (k int PRIMARY KEY);\n/* open\nCREATE TABLE b (k int PRIMARY KEY);",
+                "a /* */ comment that opens on line 2",
+            ),
+        ] {
+            assert_eq!(
+                texts_of(sql),
+                Err(format!("Migration file f.cql ends inside {inside}")),
+                "{sql}"
+            );
+        }
     }
 
     /// Every statement of both baselines, as the runner sends it, is the
@@ -321,14 +539,13 @@ mod tests {
             ("account", super::super::ACCOUNT_BASELINE),
         ] {
             let all = statements("ks", file, text).expect(file);
-            let (code, _) = super::split_comments(text, true);
-            let written = super::split(&code);
+            let written = super::split(file, text).expect(file);
             assert!(!all.is_empty(), "{file}");
             assert_eq!(all.len(), written.len(), "{file}");
-            for (statement, written) in all.iter().zip(written) {
+            for (statement, written) in all.iter().zip(&written) {
                 let sent = statement.text.as_str();
                 assert_eq!(sent.matches("ks.").count(), 1, "{sent}");
-                assert_eq!(sent.replacen("ks.", "", 1), written, "{file}");
+                assert_eq!(sent.replacen("ks.", "", 1), written.as_str(), "{file}");
                 assert!(!sent.contains("--"), "{sent}");
                 let (before, after) = sent.split_once("ks.").unwrap_or_default();
                 let keyword = if before.ends_with(char::is_whitespace) {
