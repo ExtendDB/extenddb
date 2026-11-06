@@ -754,6 +754,54 @@ pub async fn isolated_gsi_account(
     isolated_account(isolated, input).await
 }
 
+/// Create an account keyspace on `isolated`'s prefix that holds only an
+/// empty `gsi_pending` table, so a GSI worker pass reads one more keyspace.
+/// Cheaper than a migrated account: two schema changes. Returns its name.
+pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
+    let engine = &isolated.engine;
+    let keyspace = engine.account_keyspace(&unique_test_account());
+    isolated.keyspaces.lock().unwrap().push(keyspace.clone());
+    engine.create_keyspace(&keyspace).await.unwrap();
+    ensure_keyspace_rf(engine, &keyspace).await.unwrap();
+    engine
+        .session()
+        .query(format!(
+            "CREATE TABLE IF NOT EXISTS {keyspace}.gsi_pending ( \
+                 worker_partition int, last_ready_at timestamp STATIC, \
+                 ready_at timestamp, id timeuuid, table_id text, old_item text, \
+                 new_item text, index_context text, \
+                 PRIMARY KEY ((worker_partition), ready_at, id) \
+             ) WITH CLUSTERING ORDER BY (ready_at ASC, id ASC)"
+        ))
+        .await
+        .unwrap();
+    keyspace
+}
+
+/// The account keyspaces on `isolated`'s prefix, in the order the GSI
+/// workers read them (`system_schema` order).
+pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    let prefix = format!("{}_account_", isolated.config.keyspace_prefix);
+    isolated
+        .engine
+        .session()
+        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let name: Result<String, _> = row.get_r_by_name("keyspace_name");
+            name.ok()
+        })
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
 /// Create a migrated account on `isolated`'s prefix, registered in its
 /// catalog, with the table `input` describes.
 pub async fn isolated_account(

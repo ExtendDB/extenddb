@@ -30,7 +30,7 @@ struct Fixture {
     settings: CassandraCatalogStore,
     key_info: TableKeyInfo,
     account_keyspace: String,
-    _isolated: crate::helpers::IsolatedEngine,
+    isolated: crate::helpers::IsolatedEngine,
 }
 
 async fn fixture(tag: &str) -> Fixture {
@@ -42,7 +42,7 @@ async fn fixture(tag: &str) -> Fixture {
         settings: isolated.settings(),
         key_info: account.key_info,
         account_keyspace: account.keyspace,
-        _isolated: isolated,
+        isolated,
     }
 }
 
@@ -218,6 +218,7 @@ async fn delayed_write_reaches_the_gsi_within_its_delay() {
     }
     const DELAY_MS: &str = "50";
     const BAR: std::time::Duration = std::time::Duration::from_millis(500);
+    const FLOOR: std::time::Duration = std::time::Duration::from_millis(25);
     const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(5);
 
     let f = fixture("lat").await;
@@ -247,6 +248,159 @@ async fn delayed_write_reaches_the_gsi_within_its_delay() {
     assert!(
         observed.iter().all(|t| *t < BAR),
         "with a {DELAY_MS} ms delay, writes reached the GSI after {observed:?}; \
+         expected each under {BAR:?}"
+    );
+    // Half the delay: a write that skipped its delay lands in a few ms.
+    assert!(
+        observed.iter().all(|t| *t >= FLOOR),
+        "with a {DELAY_MS} ms delay, writes reached the GSI after {observed:?}; \
+         expected each at {FLOOR:?} or later"
+    );
+}
+
+/// A queued write waits for its delay: under a 2,000 ms delay, the GSI does
+/// not hold the item 300 ms after the put, with the workers running.
+#[tokio::test]
+async fn delayed_write_waits_for_its_delay() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    const EARLY: std::time::Duration = std::time::Duration::from_millis(300);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let f = fixture("wait").await;
+    f.settings
+        .set_setting("index_propagation_delay_ms", "2000")
+        .await
+        .unwrap();
+    let _workers = extenddb_storage_cassandra::workers::spawn_gsi_workers(f.engine.clone());
+
+    let started = std::time::Instant::now();
+    f.put("a", "g-wait").await;
+    tokio::time::sleep(EARLY.saturating_sub(started.elapsed())).await;
+    assert_eq!(
+        f.gsi_count("g-wait").await,
+        0,
+        "under a 2000 ms delay, the GSI held the item {:?} after the put",
+        started.elapsed()
+    );
+
+    // It does arrive: the queued row was applied, not lost.
+    while f.gsi_count("g-wait").await == 0 {
+        assert!(
+            started.elapsed() < GIVE_UP,
+            "the write did not reach the GSI within {GIVE_UP:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A write that lands while its worker is in a pass still reaches the GSI
+/// promptly: the wake it sends is kept until the pass ends, so the worker
+/// does not sleep its full 1 s idle wait past the write (#407).
+///
+/// The setup makes the case happen on every round:
+/// - Empty queue keyspaces make a pass slow (tens of ms).
+/// - The test's own account is listed first, so a pass reads it before the
+///   second write commits, and does not see that write.
+/// - Write `first` goes to one worker and `second` to another. `first` wakes
+///   every worker, so `second`'s worker is in a pass, finding nothing, when
+///   `second` lands.
+///
+/// If the worker dropped that wake, it would find no next due time and sleep
+/// 1 s, so `second` would take over 1 s.
+#[tokio::test]
+async fn write_during_a_pass_reaches_the_gsi_promptly() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    const BAR: std::time::Duration = std::time::Duration::from_millis(500);
+    const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(5);
+    const MIN_PASS: std::time::Duration = std::time::Duration::from_millis(40);
+    const MAX_FILLERS: usize = 80;
+    const ROUNDS: usize = 5;
+
+    let f = fixture("wake").await;
+    f.settings
+        .set_setting("index_propagation_delay_ms", "50")
+        .await
+        .unwrap();
+
+    // Add empty keyspaces listed after the test's account, until a pass takes
+    // MIN_PASS. Ones listed before it are dropped.
+    let (mut fillers, mut created) = (0, 0);
+    loop {
+        let started = std::time::Instant::now();
+        extenddb_storage_cassandra::workers::run_gsi_pass(&f.engine, 0)
+            .await
+            .unwrap();
+        let pass = started.elapsed();
+        if pass >= MIN_PASS {
+            eprintln!("{fillers} empty keyspaces; one pass takes {pass:?}");
+            break;
+        }
+        assert!(
+            fillers < MAX_FILLERS && created < 4 * MAX_FILLERS,
+            "a pass over {fillers} keyspaces took only {pass:?}; need {MIN_PASS:?} \
+             ({created} made, the ones listed before the test's account dropped)"
+        );
+        created += 10;
+        for _ in 0..10 {
+            crate::helpers::isolated_queue_keyspace(&f.isolated).await;
+        }
+        let listed = crate::helpers::isolated_account_keyspaces(&f.isolated).await;
+        let ours = listed
+            .iter()
+            .position(|name| *name == f.account_keyspace)
+            .expect("the test's account is listed");
+        for early in &listed[..ours] {
+            f.engine
+                .session()
+                .query(format!("DROP KEYSPACE IF EXISTS {early}"))
+                .await
+                .unwrap();
+        }
+        fillers = listed.len() - ours - 1;
+    }
+
+    let worker = |id: &str| {
+        let mut item = Item::new();
+        item.insert("id".to_string(), AttributeValue::S(id.to_string()));
+        extenddb_storage_cassandra::gsi_queue::worker_for_item(&item, &f.key_info.key_schema)
+            .unwrap()
+    };
+    let _workers = extenddb_storage_cassandra::workers::spawn_gsi_workers(f.engine.clone());
+    // Let every worker reach its idle wait.
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let mut observed = Vec::new();
+    for round in 0..ROUNDS {
+        // Keys for two different workers.
+        let first = format!("first-{round}");
+        let second = (0..)
+            .map(|n| format!("second-{round}-{n}"))
+            .find(|id| worker(id) != worker(&first))
+            .unwrap();
+        let gsi_pk = format!("g-wake-{round}");
+
+        f.put(&first, &format!("{gsi_pk}-first")).await;
+        let started = std::time::Instant::now();
+        f.put(&second, &gsi_pk).await;
+        while f.gsi_count(&gsi_pk).await == 0 {
+            assert!(
+                started.elapsed() < GIVE_UP,
+                "round {round}: the second write did not reach the GSI within {GIVE_UP:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        observed.push(started.elapsed());
+        // Let the workers go idle again before the next round.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    }
+    eprintln!("write-during-a-pass times: {observed:?}");
+    assert!(
+        observed.iter().all(|t| *t < BAR),
+        "a write made during its worker's pass reached the GSI after {observed:?}; \
          expected each under {BAR:?}"
     );
 }

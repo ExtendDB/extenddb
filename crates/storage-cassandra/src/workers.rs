@@ -943,6 +943,67 @@ mod tests {
         }
     }
 
+    /// A settings store whose `index_propagation_delay_ms` the test changes.
+    struct ChangingSettings {
+        delay: std::sync::Mutex<&'static str>,
+    }
+
+    impl SettingsStore for ChangingSettings {
+        fn get_setting(&self, key: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+            let value = (key == "index_propagation_delay_ms")
+                .then(|| (*self.delay.lock().unwrap()).to_owned());
+            Box::pin(async move { Ok(value) })
+        }
+        fn set_setting(&self, _key: &str, _value: &str) -> BoxFuture<'_, OpResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list_settings(&self) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// When the setting changes to a value that is not a number, the poller
+    /// sets the cached delay to the default, not the last good value, as the
+    /// live read does.
+    #[tokio::test(start_paused = true)]
+    async fn the_poller_falls_back_to_the_default_on_an_unparseable_value() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Not 0 and not the default, so the first poll is seen.
+        const UNSET: u64 = 999;
+        let store = Arc::new(ChangingSettings {
+            delay: std::sync::Mutex::new("0"),
+        });
+        let cached = Arc::new(AtomicU64::new(UNSET));
+        let shutdown = extenddb_storage::CancellationToken::new();
+        let poller = tokio::spawn(super::poll_gsi_delay(
+            store.clone(),
+            cached.clone(),
+            shutdown.clone(),
+        ));
+        // One poll interval (5 s) and a little more.
+        let poll = || tokio::time::sleep(Duration::from_millis(5_100));
+
+        poll().await;
+        assert_eq!(
+            cached.load(Ordering::Relaxed),
+            0,
+            "the poller did not read 0"
+        );
+
+        *store.delay.lock().unwrap() = "soon";
+        poll().await;
+        assert_eq!(
+            cached.load(Ordering::Relaxed),
+            crate::DEFAULT_INDEX_PROPAGATION_DELAY_MS,
+            "an unparseable value must give the default, not keep the last value"
+        );
+
+        shutdown.cancel();
+        poller.await.unwrap();
+    }
+
     /// A read of the GSI delay that gets no answer ends at its bound, so a
     /// set started after a registration again spawns its workers.
     #[tokio::test(start_paused = true)]

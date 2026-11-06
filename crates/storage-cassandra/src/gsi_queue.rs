@@ -54,6 +54,17 @@ pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
     (hash % NUM_WORKERS) as i32
 }
 
+/// The GSI worker that applies index updates for `item`, for tests that
+/// need two writes handled by different workers.
+#[doc(hidden)]
+pub fn worker_for_item(
+    item: &extenddb_core::types::Item,
+    key_schema: &[extenddb_core::types::KeySchemaElement],
+) -> Result<u64, extenddb_storage::error::StorageError> {
+    let pk_text = extenddb_storage::util::composite_pk_to_text(item, key_schema)?;
+    Ok(u64::try_from(partition_for(&pk_text)).unwrap_or_default())
+}
+
 /// Jitter a propagation delay: uniform in `[delay_ms/2 + 1, delay_ms]`.
 /// Values <= 1 are returned unchanged.
 pub(crate) fn jitter_delay_ms(delay_ms: u64) -> u64 {
