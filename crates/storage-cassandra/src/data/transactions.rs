@@ -2166,13 +2166,7 @@ impl CassandraEngine {
             // Read live once for the transaction: the first item whose table
             // has a GSI following the system setting fills `sys_delay`, and
             // later items reuse it. An item with none reads nothing.
-            let sys_delay = if indexes.iter().any(crate::engine::follows_system_delay) {
-                *sys_delay
-                    .get_or_init(|| self.index_propagation_delay())
-                    .await
-            } else {
-                0
-            };
+            let sys_delay = self.system_index_delay_once(indexes, sys_delay).await;
             super::index::sync_indexes_at(
                 &mut batch,
                 &data_keyspace,

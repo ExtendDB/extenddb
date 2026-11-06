@@ -307,15 +307,18 @@ async fn gsi_worker(worker_id: u64, engine: Arc<CassandraEngine>, shutdown: Canc
 pub struct GsiBatch {
     /// Rows applied (and deleted from the queue).
     pub applied: usize,
-    /// `ready_at` (ms) of the earliest row seen that was not yet due, across
-    /// all account keyspaces: when the worker has work again.
+    /// `ready_at` (ms) of the earliest row not yet due, across all account
+    /// keyspaces: when the worker has work again. Not read once the pass has
+    /// applied a row, so only meaningful when `applied` is 0.
     pub next_due_ms: Option<i64>,
-    /// Queued rows fetched with their payload, applied or not.
+    /// Queued rows fetched with their payload, applied or not. Counted in
+    /// every build, once per pass, for the tests that read it.
     pub payload_rows_read: usize,
 }
 
 /// Run one pass of GSI worker `worker_id` over its partition, for tests that
 /// check what a pass reads and applies without the worker loop's timing.
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub async fn run_gsi_pass(
     engine: &CassandraEngine,
@@ -327,10 +330,16 @@ pub async fn run_gsi_pass(
 /// Apply the due rows of this worker's partition, up to 100 per account
 /// keyspace, and find when the next row is due.
 ///
-/// Two reads per keyspace: the due rows (`ready_at <= now`) with their item
-/// images, then the `ready_at` alone of the first row not yet due. Item
-/// images are read only for rows this pass applies. The second read starts
-/// past `now`, so it does not walk the tombstones of applied rows.
+/// Up to two queries per account keyspace:
+/// 1. The due rows (`ready_at <= now`), with their item images.
+/// 2. Only while this pass has applied no row: the `ready_at` alone of the
+///    first row not yet due ([`keyspace_next_due`]). After a pass that
+///    applied a row, the worker starts the next pass at once and does not use
+///    the next due time.
+///
+/// So an idle pass sends two queries per keyspace, and item images are read
+/// only for rows this pass applies. The second query starts past `now`, so it
+/// does not walk the tombstones of applied rows.
 ///
 /// "Due" is judged with this server's clock. `ready_at` was set with the
 /// clock of the server that queued the row, which for a row queued by
@@ -388,28 +397,6 @@ async fn gsi_process_batch(
             }
             Err(e) => return Err(e),
         };
-
-        // `ready_at` alone of the first row not yet due: when this keyspace
-        // has work again.
-        let next_query = format!(
-            "SELECT ready_at FROM {keyspace}.gsi_pending \
-             WHERE worker_partition = ? AND ready_at > ? \
-             ORDER BY ready_at ASC \
-             LIMIT 1"
-        );
-        let next_rows = crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
-            &engine.session,
-            &next_query,
-            query_values!(worker_id_i32, now_ms),
-            "gsi_worker_next_due",
-        )
-        .await?;
-        let keyspace_next_due: Option<i64> = next_rows
-            .first()
-            .and_then(|row| row.get_by_name("ready_at").ok().flatten());
-        if let Some(due) = keyspace_next_due {
-            next_due_ms = Some(next_due_ms.map_or(due, |earliest| earliest.min(due)));
-        }
 
         for row in rows {
             // Defensive: a partition whose queued rows are all deleted can
@@ -486,6 +473,14 @@ async fn gsi_process_batch(
 
             total += 1;
         }
+
+        // The worker uses the next due time only after a pass that applied
+        // nothing, so a pass that has applied a row skips this read.
+        if total == 0
+            && let Some(due) = keyspace_next_due(engine, keyspace, worker_id_i32, now_ms).await
+        {
+            next_due_ms = Some(next_due_ms.map_or(due, |earliest| earliest.min(due)));
+        }
     }
 
     Ok(GsiBatch {
@@ -493,6 +488,48 @@ async fn gsi_process_batch(
         next_due_ms,
         payload_rows_read,
     })
+}
+
+/// `ready_at` of the first row of `keyspace`'s partition `worker_partition`
+/// that is not yet due at `now_ms`: when that keyspace has work again.
+///
+/// Reads `ready_at` alone, never the item images. On an error, logs it and
+/// returns `None`: the worker then waits at most its idle interval (1 s),
+/// and the other keyspaces of the pass still count.
+async fn keyspace_next_due(
+    engine: &CassandraEngine,
+    keyspace: &str,
+    worker_partition: i32,
+    now_ms: i64,
+) -> Option<i64> {
+    use cdrs_tokio::query_values;
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    let query = format!(
+        "SELECT ready_at FROM {keyspace}.gsi_pending \
+         WHERE worker_partition = ? AND ready_at > ? \
+         ORDER BY ready_at ASC \
+         LIMIT 1"
+    );
+    match crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+        &engine.session,
+        &query,
+        query_values!(worker_partition, now_ms),
+        "gsi_worker_next_due",
+    )
+    .await
+    {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.get_by_name("ready_at").ok().flatten()),
+        Err(e) => {
+            tracing::warn!(
+                "GSI worker {worker_partition}: cannot read the next due time of \
+                 {keyspace}.gsi_pending, ignoring it this pass: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Apply a single GSI update (delete old row, insert new row) for one pending entry.

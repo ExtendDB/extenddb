@@ -56,6 +56,7 @@ pub(crate) fn partition_for(base_pk_text: &str) -> i32 {
 
 /// The GSI worker that applies index updates for `item`, for tests that
 /// need two writes handled by different workers.
+#[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 pub fn worker_for_item(
     item: &extenddb_core::types::Item,

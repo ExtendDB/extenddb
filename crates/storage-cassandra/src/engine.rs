@@ -58,7 +58,9 @@ pub struct CassandraEngine {
     pub(crate) gsi_default_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// Catalog reads [`Self::index_propagation_delay`] has made, for tests
-    /// that check how often the write paths read the setting.
+    /// that check how often the write paths read the setting. Kept in every
+    /// build: one relaxed add per read, which costs far less than the read,
+    /// and no `cfg` lines on the write path.
     index_delay_reads: Arc<std::sync::atomic::AtomicU64>,
 
     /// Short-lived cache of per-table TTL configuration for the write path.
@@ -295,9 +297,10 @@ impl CassandraEngine {
 
         self.index_delay_reads.fetch_add(1, Ordering::Relaxed);
         // Read at the driver default, ONE, and `settings set` writes at ONE
-        // too. With replication factor above 1, a change applies once the
-        // replica this read reaches has it. One consistency policy for every
-        // statement is #770.
+        // too. With replication factor above 1, each read can reach a
+        // different replica, so until every replica has a new value,
+        // successive writes can see the old and the new value in any order.
+        // One consistency policy for every statement is #770.
         let query = format!(
             "SELECT key, value FROM {}.settings \
              WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms')",
@@ -339,6 +342,7 @@ impl CassandraEngine {
 
     /// How many times this engine has read `index_propagation_delay_ms` from
     /// the catalog.
+    #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn index_delay_reads(&self) -> u64 {
         self.index_delay_reads

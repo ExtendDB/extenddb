@@ -203,8 +203,8 @@ async fn legacy_setting_name_is_honoured() {
 }
 
 /// With the GSI workers running, a write under a 50 ms delay reaches the GSI
-/// within a small multiple of that delay, not after the workers' 1 s idle
-/// sleep (#407). The bar, 500 ms, is the one
+/// no earlier than half the delay and within a small multiple of the delay,
+/// not after the workers' 1 s idle sleep (#407). The bar, 500 ms, is the one
 /// `tests/test_gsi_async.py::test_gsi_configured_delay_range` uses on a
 /// served build.
 ///
@@ -250,7 +250,11 @@ async fn delayed_write_reaches_the_gsi_within_its_delay() {
         "with a {DELAY_MS} ms delay, writes reached the GSI after {observed:?}; \
          expected each under {BAR:?}"
     );
-    // Half the delay: a write that skipped its delay lands in a few ms.
+    // The configured delay is the longest a queued update waits: each update
+    // waits a random time from half the delay to the full delay
+    // (`jitter_delay_ms`, the same rule as PostgreSQL and SQLite). So 25 ms
+    // is the earliest correct time. A write that skipped its delay lands in
+    // a few ms.
     assert!(
         observed.iter().all(|t| *t >= FLOOR),
         "with a {DELAY_MS} ms delay, writes reached the GSI after {observed:?}; \
