@@ -751,4 +751,66 @@ mod tests {
             "refused".to_owned()
         )));
     }
+
+    /// How far the write `sql` gets on the table "t" keyed on pk, translated
+    /// without the statement checks that `run` makes first.
+    fn translated(sql: &str) -> Result<Translation, DynamoDbError> {
+        use extenddb_core::types::{
+            AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+        };
+
+        use crate::AuthorizedKeyInfo;
+        use crate::partiql::snapshot::context_with_key_info;
+        use crate::partiql::test_context::{block_on, context};
+
+        block_on(async {
+            let ctx = context(None).await;
+            let key_schema = vec![KeySchemaElement {
+                attribute_name: "pk".to_owned(),
+                key_type: KeyType::Hash,
+            }];
+            let key_info = TableKeyInfo {
+                table_name: "t".to_owned(),
+                account_id: ctx.account_id.to_string(),
+                base_key_schema: key_schema.clone(),
+                key_schema,
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                ..TableKeyInfo::default()
+            };
+            let mut snapshot = AuthorizedKeyInfo::new();
+            snapshot.insert("t".to_owned(), Some(key_info.clone()));
+            let ctx = context_with_key_info(&ctx, snapshot);
+            let req = SingleRequest::from_body(&json!({ "Statement": sql })).unwrap();
+            let stmt = extenddb_core::partiql::parse(sql).unwrap();
+            translation::translate_write(&ctx, &stmt, &req, Some(&key_info)).await
+        })
+    }
+
+    #[test]
+    fn a_refusal_of_the_translated_request_is_the_statements_own() {
+        // The statement checks refuse a call in a SET value and an empty bag
+        // before the translation. Without them, `update_refusal` refuses the
+        // call when the classic parser reads the update expression, and the
+        // bag when it reads back the values of the request. `insert_refusal`
+        // refuses the bag when it reads back the item.
+        for sql in [
+            "UPDATE \"t\" SET a = size(m) WHERE pk = 'k'",
+            "UPDATE \"t\" SET v = <<>> WHERE pk = 'k'",
+            "INSERT INTO \"t\" VALUE {'pk': 'k', 'v': <<>>}",
+        ] {
+            match translated(sql) {
+                Ok(Translation::Untranslated(DynamoDbError::ValidationException(_))) => {}
+                Ok(Translation::Untranslated(error)) => panic!("{sql}: {error:?}"),
+                Ok(_) => panic!("{sql}: the statement translated"),
+                Err(error) => panic!("{sql}: the request failed with {error:?}"),
+            }
+        }
+        assert!(matches!(
+            translated("UPDATE \"t\" SET a = 1 WHERE pk = 'k'"),
+            Ok(Translation::Runs { key: Some(_) })
+        ));
+    }
 }
