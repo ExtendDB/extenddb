@@ -371,11 +371,11 @@ impl CassandraEngine {
         //   index as ACTIVE and its data table actually existing. Without it a
         //   sweep can take a base-row claim and then fail applying index
         //   effects against a table that is not there yet.
-        let creating_async_gsi = !gsi_creates.is_empty()
-            && self
-                .gsi_default_delay_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-                != 0;
+        // A created GSI sets no delay of its own, so it follows the system
+        // setting: read it live (only when a GSI is being created), so a
+        // `settings set` made just before this request decides the fence.
+        let creating_async_gsi =
+            !gsi_creates.is_empty() && self.index_propagation_delay().await != 0;
         // Quorum and uncached: the control-lease decision below fences GSI
         // creation against TTL lifecycle changes, and a cached stale None
         // would skip that fence in exactly the window it exists for.
