@@ -393,8 +393,19 @@ jobs:
           ${{ job.services.cassandra.id }} 127.0.0.1:9042 18454
 
       # No released image carries the Cassandra backend, so the job builds
-      # the last 0.1.x release from its tag.
+      # the last 0.1.x release from its tag. A tag does not change, so the
+      # binary is cached by the tag, the cargo features and the runner OS,
+      # and the build runs only on a cache miss. Keep the key in step with
+      # the build command.
+      - name: Cache the v0.1.14 release (cassandra backend)
+        id: cache-v0-1-14
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
+          key: extenddb-v0.1.14-no-default-features-cassandra-${{ runner.os }}
+
       - name: Build the v0.1.14 release (cassandra backend)
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         run: |
           git fetch --depth 1 origin tag v0.1.14
           git worktree add "$RUNNER_TEMP/extenddb-v0.1.14" v0.1.14
