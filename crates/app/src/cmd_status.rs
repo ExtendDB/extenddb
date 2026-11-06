@@ -46,17 +46,8 @@ pub fn run(args: &StatusArgs) {
             |_| extenddb_config::pid_file_path_default(port),
             |c| extenddb_config::pid_file_path(&config::expand_tilde(&c.server.run_dir), port),
         );
-        let pid_label = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|contents| {
-                let pid = contents.trim().to_owned();
-                let pid_num: i32 = pid.parse().ok()?;
-                if crate::util::is_process_alive(pid_num) {
-                    Some(pid)
-                } else {
-                    None
-                }
-            });
+        let pid_label = server_pid(&pid_file)
+            .filter(|pid| pid.parse::<i32>().is_ok_and(crate::util::is_process_alive));
         match pid_label {
             Some(pid) => println!("extenddb is running on port {port} (pid {pid})"),
             None => println!("extenddb is running on port {port} (pid unknown)"),
@@ -69,6 +60,22 @@ pub fn run(args: &StatusArgs) {
         );
         std::process::exit(1);
     }
+}
+
+/// The PID in the PID file, when a running server holds the file. A file
+/// nothing holds names a PID the system may have given to another process.
+#[cfg(unix)]
+fn server_pid(path: &std::path::Path) -> Option<String> {
+    let contents = extenddb_server::pid_file::read(path).ok()?;
+    contents.held.then(|| contents.text.trim().to_owned())
+}
+
+/// Non-unix: PID files only exist in daemon mode, which is unix-only.
+#[cfg(not(unix))]
+fn server_pid(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_owned())
 }
 
 /// Determine the port to check: CLI override > config file > default.
