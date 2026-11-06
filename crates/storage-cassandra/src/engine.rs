@@ -105,11 +105,6 @@ pub struct CassandraEngine {
     /// a restart merely restarts the traversal from the front.
     pub(crate) ttl_repair_scan_cursors:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
-
-    /// Identifies this engine instance as the owner of the restore copies it
-    /// runs (`tables.restore_owner`). Random per process start, so a restore
-    /// left behind by a crashed process is never mistaken for a live one.
-    pub(crate) restore_owner: uuid::Uuid,
 }
 
 /// Cap on concurrently in-flight detached TTL claim releases.
@@ -169,7 +164,6 @@ impl CassandraEngine {
             ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            restore_owner: uuid::Uuid::new_v4(),
         })
     }
 

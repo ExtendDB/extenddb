@@ -441,6 +441,146 @@ mod suite {
         );
         assert!(list_keys(store, "aborted").await.is_empty());
     }
+
+    /// `put_if_absent` on an empty key stores the body and reports it; on a
+    /// key that holds an object (its own, or one `put` wrote) it reports
+    /// `None` and leaves the first body in place, whatever body the second
+    /// call carried, and the key's metadata is the first object's. The cell
+    /// over one part runs the multipart path on S3 (a conditional
+    /// `CompleteMultipartUpload`) and a plain link on the filesystem store;
+    /// its second call carries a body over one part too, so on S3 a
+    /// conditional complete meets the present key and has an upload to
+    /// abort, and its third call a body of one part.
+    pub async fn put_if_absent_creates_once(store: &dyn BackupStore) {
+        let small = b"first body".to_vec();
+        let large = patterned_bytes(usize::try_from(PART_SIZE).unwrap() * 2 + 4096);
+        let mut other_large = patterned_bytes(usize::try_from(PART_SIZE).unwrap() * 2 + 2048);
+        other_large.reverse();
+        for (key, first, seconds) in [
+            (
+                "ident/small.json",
+                small.clone(),
+                vec![b"second body, longer".to_vec()],
+            ),
+            (
+                "ident/large.bin",
+                large.clone(),
+                vec![other_large, small.clone()],
+            ),
+        ] {
+            let stored = store
+                .put_if_absent(key, chunked_body(first.clone()))
+                .await
+                .expect("first put_if_absent succeeds")
+                .expect("an empty key is created");
+            assert_eq!(stored.key, key);
+            assert_eq!(stored.size, first.len() as u64);
+            for second in seconds {
+                let again = store
+                    .put_if_absent(key, chunked_body(second.clone()))
+                    .await
+                    .expect("a later put_if_absent succeeds");
+                assert!(again.is_none(), "{key}: a present key reports None");
+                let read = read_all(store.get(key).await.unwrap()).await;
+                assert_eq!(read, first, "{key}: the first body stays");
+            }
+            let meta = store.head(key).await.unwrap().expect("object exists");
+            assert_eq!(meta.size, first.len() as u64);
+            assert_eq!(list_keys(store, key).await, vec![key.to_owned()]);
+        }
+        // A key `put` wrote is present to `put_if_absent` too.
+        store
+            .put("ident/put-first", chunked_body(b"by put"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .put_if_absent("ident/put-first", chunked_body(b"by put_if_absent"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            read_all(store.get("ident/put-first").await.unwrap()).await,
+            b"by put"
+        );
+        // And a key `put_if_absent` wrote is replaced by `put`, as any object
+        // is.
+        store
+            .put("ident/small.json", chunked_body(b"replaced"))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(store.get("ident/small.json").await.unwrap()).await,
+            b"replaced"
+        );
+        // A body that fails leaves nothing under the key and the key stays
+        // free for the next call.
+        let err = store
+            .put_if_absent("ident/failing", failing_body(b"partial"))
+            .await
+            .expect_err("mid-body failure surfaces");
+        assert!(matches!(&err, StoreError::Other(msg) if msg.contains("injected")));
+        assert!(store.head("ident/failing").await.unwrap().is_none());
+        assert!(
+            store
+                .put_if_absent("ident/failing", chunked_body(b"ok"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Concurrent `put_if_absent` calls on one key: exactly one stores its
+    /// body, every other reads `None`, and the object under the key is the
+    /// winner's body. The bodies are distinct so the winner is identifiable;
+    /// the race is driven by starting every call before any is polled to
+    /// completion (`join_all`), and repeated so a store whose calls happen to
+    /// serialise once is still exercised across rounds.
+    pub async fn concurrent_put_if_absent_leaves_the_first_body(store: &dyn BackupStore) {
+        const CALLERS: usize = 8;
+        const ROUNDS: usize = 3;
+        for round in 0..ROUNDS {
+            let key = format!("race/round-{round}/extenddb-store.json");
+            let bodies: Vec<Vec<u8>> = (0..CALLERS)
+                .map(|i| format!("{{\"round\":{round},\"caller\":{i}}}").into_bytes())
+                .collect();
+            let outcomes = futures::future::join_all(
+                bodies
+                    .iter()
+                    .map(|body| store.put_if_absent(&key, chunked_body(body.clone()))),
+            )
+            .await;
+            let winners: Vec<usize> = outcomes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, outcome)| {
+                    outcome
+                        .as_ref()
+                        .expect("every call succeeds")
+                        .as_ref()
+                        .map(|_| i)
+                })
+                .collect();
+            assert_eq!(
+                winners.len(),
+                1,
+                "round {round}: exactly one caller stores its body, got {winners:?}"
+            );
+            let read = read_all(store.get(&key).await.unwrap()).await;
+            assert_eq!(
+                read, bodies[winners[0]],
+                "round {round}: the object is the winner's body"
+            );
+            let meta = store.head(&key).await.unwrap().expect("object exists");
+            assert_eq!(meta.size, bodies[winners[0]].len() as u64);
+            assert_eq!(
+                list_keys(store, &format!("race/round-{round}")).await,
+                vec![key.clone()],
+                "round {round}: one object under the prefix"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -555,6 +695,65 @@ mod filesystem {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_creates_once() {
+        let (dir, store) = fs_store().await;
+        suite::put_if_absent_creates_once(&store).await;
+        // The link discipline: no temporary stays, whether the call stored
+        // its object, found the key present, or failed mid-body, and the
+        // object the winning call linked is private.
+        assert!(temporaries_under(dir.path()).is_empty());
+        assert_eq!(
+            mode_of(&dir.path().join("ident/large.bin")) & 0o777,
+            0o600,
+            "a linked object keeps the temporary's mode"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_put_if_absent_leaves_the_first_body() {
+        let (dir, store) = fs_store().await;
+        suite::concurrent_put_if_absent_leaves_the_first_body(&store).await;
+        assert!(temporaries_under(dir.path()).is_empty());
+    }
+
+    /// `put_if_absent` applies the destination rules `put` does: a symlink at
+    /// the key is refused without being followed and its target untouched, a
+    /// directory at the key is a key-space collision, and an object at an
+    /// ancestor of the key makes the key unusable. None of the three
+    /// consumes the body or leaves a temporary.
+    #[tokio::test]
+    async fn put_if_absent_refuses_what_put_refuses() {
+        let (dir, store) = fs_store().await;
+        let outside = private_tempdir();
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"outside").unwrap();
+        private_dir(&dir.path().join("a"));
+        std::os::unix::fs::symlink(&target, dir.path().join("a/link")).unwrap();
+        let err = store
+            .put_if_absent("a/link", chunked_body(b"x"))
+            .await
+            .expect_err("a symlink at the key is refused");
+        assert!(matches!(err, StoreError::PermissionDenied(_)), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+
+        store
+            .put("dir/under/obj", chunked_body(b"x"))
+            .await
+            .unwrap();
+        let err = store
+            .put_if_absent("dir/under", chunked_body(b"x"))
+            .await
+            .expect_err("a directory at the key is refused");
+        assert!(matches!(err, StoreError::Io { .. }), "{err}");
+        let err = store
+            .put_if_absent("dir/under/obj/below", chunked_body(b"x"))
+            .await
+            .expect_err("an object at an ancestor is refused");
+        assert!(matches!(err, StoreError::Io { .. }), "{err}");
+        assert!(temporaries_under(dir.path()).is_empty());
     }
 
     /// Every `.put-*` entry under `root`, at any depth.
@@ -1545,6 +1744,14 @@ mod filesystem {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("does-not-exist");
         assert!(FilesystemStore::open(&missing).await.is_err());
+    }
+
+    /// An empty root path is refused by name, not as a stat of "" (whose
+    /// message would show an empty name between two spaces).
+    #[tokio::test]
+    async fn open_refuses_an_empty_root_path() {
+        let err = FilesystemStore::open("").await.err().expect("refused");
+        assert!(err.to_string().contains("root path is empty"), "{err}");
     }
 
     #[tokio::test]
@@ -2553,6 +2760,41 @@ mod s3 {
         suite::list_order_is_key_bytes(&store).await;
     }
 
+    /// Both cells of the conditional write: a single `PutObject` and a
+    /// `CompleteMultipartUpload`, each with `If-None-Match: *`. A present key
+    /// answers 412 to either; the multipart cell's upload is aborted on that
+    /// answer, which the listing of open uploads below checks.
+    #[tokio::test]
+    async fn put_if_absent_creates_once() {
+        let Some(endpoint) = endpoint_or_skip() else {
+            return;
+        };
+        let prefix = unique_prefix();
+        let config = test_config(endpoint, test_bucket(), prefix.clone());
+        let store = S3Store::open(&config).await.expect("S3Store::open");
+        ensure_bucket(&config).await;
+        suite::put_if_absent_creates_once(&store).await;
+        let open = raw_client(&config)
+            .await
+            .list_multipart_uploads()
+            .bucket(&config.bucket)
+            .prefix(&prefix)
+            .send()
+            .await
+            .expect("list_multipart_uploads");
+        assert!(
+            open.uploads().is_empty(),
+            "a conditional complete that found the key present aborts its upload: {:?}",
+            open.uploads()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_put_if_absent_leaves_the_first_body() {
+        let Some(store) = store().await else { return };
+        suite::concurrent_put_if_absent_leaves_the_first_body(&store).await;
+    }
+
     #[tokio::test]
     async fn delete_prefix_removes_and_counts() {
         let Some(store) = store().await else { return };
@@ -2859,12 +3101,295 @@ mod s3 {
             .validate()
             .await
             .expect_err("nothing listens on port 9");
+        assert!(
+            matches!(err, StoreError::Transport { .. }),
+            "a transport failure keeps its class through validate, so a server can tell it \
+             from a configuration error: {err:?}"
+        );
         let text = err.to_string();
         assert!(text.contains("unused"), "names the bucket: {text}");
         assert!(
             text.contains("refused") || text.contains("connect"),
             "names the connection failure, not only the category: {text}"
         );
+    }
+
+    /// The 409 `ConditionalRequestConflict` loop of `put_if_absent`, driven
+    /// by a server of the test's own that answers from a script (moto never
+    /// answers 409): a `PutObject` answered 409 twice is re-sent and the
+    /// third answer stands; a `CompleteMultipartUpload` answered 409 and
+    /// then 412 is "present" and its upload is aborted; a `PutObject`
+    /// answered 409 nine times is the error the ninth answer is, after
+    /// eight retries. Runs in a child with the suite's own credentials, as
+    /// every request needs them. No endpoint is needed.
+    #[tokio::test]
+    async fn a_conditional_request_conflict_is_retried_from_a_reply_script() {
+        const NAME: &str = "s3::a_conditional_request_conflict_is_retried_from_a_reply_script";
+        if !is_child(NAME) {
+            run_with_test_credentials(NAME);
+            return;
+        }
+        let server = ScriptedS3::start().await;
+        let config = test_config(server.endpoint(), "scripted".to_owned(), String::new());
+        let store = S3Store::open(&config).await.expect("S3Store::open");
+
+        // Two conflicts, then created.
+        server.conflicts_before_success(2);
+        let meta = store
+            .put_if_absent("k/one-part", chunked_body(b"body"))
+            .await
+            .expect("the third answer is 200")
+            .expect("created");
+        assert_eq!(meta.size, 4);
+        let puts = server.requests("PUT /scripted/k/one-part?x-id=PutObject");
+        assert_eq!(puts, 3, "one send and two re-sends");
+
+        // The multipart cell: the complete answers 409 once, then 412.
+        server.conflicts_then_present(1);
+        let large = patterned_bytes(usize::try_from(PART_SIZE).unwrap() + 16);
+        let again = store
+            .put_if_absent("k/two-parts", chunked_body(large))
+            .await
+            .expect("412 is an answer, not an error");
+        assert!(again.is_none(), "a present key reports None");
+        assert_eq!(
+            server.requests("POST /scripted/k/two-parts?uploadId="),
+            2,
+            "the complete was re-sent once"
+        );
+        assert_eq!(
+            server.requests("DELETE /scripted/k/two-parts?x-id=AbortMultipartUpload"),
+            1,
+            "the upload the present key refused was aborted"
+        );
+
+        // Conflicts that never end: eight retries, then the error.
+        server.conflicts_before_success(u32::MAX);
+        let started = std::time::Instant::now();
+        let err = store
+            .put_if_absent("k/never", chunked_body(b"body"))
+            .await
+            .expect_err("the ninth 409 is reported");
+        let text = err.to_string();
+        assert!(
+            text.contains("ConditionalRequestConflict"),
+            "names the conflict: {text}"
+        );
+        assert_eq!(server.requests("PUT /scripted/k/never"), 9);
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(7_000)
+                && waited < std::time::Duration::from_secs(20),
+            "the back-offs sum to about 7.9 s, measured {waited:?}"
+        );
+    }
+
+    /// An HTTP/1.1 server that plays S3 from a script: every request's
+    /// method, path and query are recorded; a `PutObject` or
+    /// `CompleteMultipartUpload` is answered 409 `ConditionalRequestConflict`
+    /// a scripted number of times, then 200, or 412 `PreconditionFailed`;
+    /// `CreateMultipartUpload`, `UploadPart` and `AbortMultipartUpload` are
+    /// answered as S3 answers them.
+    struct ScriptedS3 {
+        port: u16,
+        state: std::sync::Arc<std::sync::Mutex<ScriptState>>,
+    }
+
+    #[derive(Default)]
+    struct ScriptState {
+        /// Conflicts left to answer before the terminal answer.
+        conflicts: u32,
+        /// Whether the terminal answer is 412 rather than 200.
+        then_present: bool,
+        /// `"<METHOD> <path-and-query>"` of every request, in order.
+        requests: Vec<String>,
+    }
+
+    impl ScriptedS3 {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            let state = std::sync::Arc::new(std::sync::Mutex::new(ScriptState::default()));
+            let shared = std::sync::Arc::clone(&state);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(Self::serve(socket, std::sync::Arc::clone(&shared)));
+                }
+            });
+            Self { port, state }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        fn conflicts_before_success(&self, n: u32) {
+            let mut state = self.state.lock().unwrap();
+            state.conflicts = n;
+            state.then_present = false;
+        }
+
+        fn conflicts_then_present(&self, n: u32) {
+            let mut state = self.state.lock().unwrap();
+            state.conflicts = n;
+            state.then_present = true;
+        }
+
+        /// How many recorded requests start with `prefix`.
+        fn requests(&self, prefix: &str) -> usize {
+            self.state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|r| r.starts_with(prefix))
+                .count()
+        }
+
+        async fn serve(
+            mut socket: tokio::net::TcpStream,
+            state: std::sync::Arc<std::sync::Mutex<ScriptState>>,
+        ) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buffer = Vec::new();
+            loop {
+                // Read one request: the head, then the body it announces.
+                let head_end = loop {
+                    if let Some(at) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    let mut chunk = [0u8; 8192];
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+                let mut lines = head.split("\r\n");
+                let request_line = lines.next().unwrap_or_default().to_owned();
+                let mut content_length = 0usize;
+                let mut chunked = false;
+                for line in lines {
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse().unwrap_or(0);
+                    } else if name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.eq_ignore_ascii_case("chunked")
+                    {
+                        chunked = true;
+                    }
+                }
+                buffer.drain(..head_end);
+                if chunked {
+                    // Read until the terminating chunk.
+                    loop {
+                        if buffer.windows(5).any(|w| w == b"0\r\n\r\n") {
+                            let at = buffer.windows(5).position(|w| w == b"0\r\n\r\n").unwrap();
+                            buffer.drain(..at + 5);
+                            break;
+                        }
+                        let mut chunk = [0u8; 65536];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                } else {
+                    while buffer.len() < content_length {
+                        let mut chunk = [0u8; 65536];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    buffer.drain(..content_length);
+                }
+
+                let mut parts = request_line.split(' ');
+                let method = parts.next().unwrap_or_default().to_owned();
+                let target = parts.next().unwrap_or_default().to_owned();
+                let (status, body) = {
+                    let mut state = state.lock().unwrap();
+                    state.requests.push(format!("{method} {target}"));
+                    Self::answer(&mut state, &method, &target)
+                };
+                let reason = match status {
+                    200 => "OK",
+                    204 => "No Content",
+                    409 => "Conflict",
+                    412 => "Precondition Failed",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml\r\n\
+                     Content-Length: {}\r\nETag: \"etag-1\"\r\nConnection: keep-alive\r\n\r\n{body}",
+                    body.len()
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        /// The scripted answer to one request.
+        fn answer(state: &mut ScriptState, method: &str, target: &str) -> (u16, String) {
+            let conflict = || {
+                (
+                    409,
+                    "<Error><Code>ConditionalRequestConflict</Code><Message>Conditional request \
+                     cannot succeed due to a conflicting operation against this \
+                     resource.</Message></Error>"
+                        .to_owned(),
+                )
+            };
+            let present = || {
+                (
+                    412,
+                    "<Error><Code>PreconditionFailed</Code><Message>At least one of the \
+                     pre-conditions you specified did not hold</Message></Error>"
+                        .to_owned(),
+                )
+            };
+            let conditional = |state: &mut ScriptState, success: String| {
+                if state.conflicts > 0 {
+                    state.conflicts = state.conflicts.saturating_sub(1);
+                    conflict()
+                } else if state.then_present {
+                    present()
+                } else {
+                    (200, success)
+                }
+            };
+            match method {
+                "PUT" if target.contains("partNumber=") => (200, String::new()),
+                "PUT" => conditional(state, String::new()),
+                "POST" if target.ends_with("?uploads") => (
+                    200,
+                    "<InitiateMultipartUploadResult><Bucket>scripted</Bucket><Key>k</Key>\
+                     <UploadId>upload-1</UploadId></InitiateMultipartUploadResult>"
+                        .to_owned(),
+                ),
+                "POST" if target.contains("uploadId=") => conditional(
+                    state,
+                    "<CompleteMultipartUploadResult><Bucket>scripted</Bucket><Key>k</Key>\
+                     <ETag>\"etag-1\"</ETag></CompleteMultipartUploadResult>"
+                        .to_owned(),
+                ),
+                "DELETE" => (204, String::new()),
+                _ => (
+                    404,
+                    "<Error><Code>NoSuchKey</Code><Message>no</Message></Error>".to_owned(),
+                ),
+            }
+        }
     }
 
     /// A put whose future is dropped mid-upload (a cancelled job) aborts its
@@ -5172,6 +5697,16 @@ mod s3 {
         };
         println!("request URI: {uri}");
         assert!(uri.starts_with(expected), "{uri} does not go to {expected}");
+        // The root label names the endpoint the request went to, in its one
+        // spelling, whichever source supplied it.
+        let endpoint = expected.trim_end_matches('/');
+        let label = store.store_root();
+        println!("store root: {label}");
+        assert_eq!(
+            label,
+            format!("s3://env-bucket/?endpoint={endpoint}"),
+            "the label names the effective endpoint"
+        );
     }
 
     /// Rewrites every request's URI, after the endpoint is resolved and
