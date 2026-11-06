@@ -15,6 +15,12 @@ Every launcher, in every language:
   loopback-only, plain HTTP, seeded with AWS's documented example credential).
   Resolution order: explicit option, `EXTENDDB_BINARY` env var, the platform
   package installed alongside the wrapper, then `PATH`.
+- Runs only a binary of its own release: before `serve`, it runs
+  `<binary> version` and compares the `extenddb <release>` line with the
+  wrapper's version. Another release, a failing `version`, or output with no
+  release line stops the start. The error names the wrapper's release, and
+  the binary's release when the wrapper could read it. It also says where the
+  binary came from and how to get a binary of the wrapper's release.
 - Configures the server exclusively through environment variables
   (`EXTENDDB__SERVER__PORT`, `EXTENDDB__STORAGE__SQLITE__PATH`), from a scratch
   working directory, so a config file in the project cannot leak in.
@@ -56,7 +62,8 @@ await db.stop();
 Platform binaries ship as `optionalDependencies`
 (`@extenddb/<platform>-<arch>`), so `npm install` is copy-only: no compiler,
 no node-gyp, no postinstall downloads. On an unsupported platform the wrapper
-falls back to `EXTENDDB_BINARY` or `PATH`.
+falls back to `EXTENDDB_BINARY` or `PATH`, and that binary must be the
+wrapper's release too.
 
 ## Testing
 
@@ -69,6 +76,8 @@ EXTENDDB_BINARY=/path/to/extenddb node test/launcher.test.js
 It proves the contract's load-bearing clauses: file mode is the default and
 persists across two server lifetimes, memory mode creates no files and is
 genuinely ephemeral, and contradictory options are refused.
+With fake binaries, it also proves that the wrapper refuses a binary of
+another release before `serve` runs.
 
 ## Releasing
 
@@ -97,7 +106,10 @@ deliberate second step):
 
 1. Land the release state on `main` with the workspace version bumped and
    `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
-   the tag. This is the same tag the container release consumes; the two
+   the tag. The tagged commit itself must carry the matching
+   `npm/package.json`. The launcher runs only a binary of its own release. On
+   a tag whose `package.json` lags the workspace version, the launcher tests
+   fail on every build leg. This is the same tag the container release consumes; the two
    publish workflows are dispatched independently against it. When the
    release ships a catalog migration, the same state raises
    `RELEASED_THROUGH` to the last migration and pastes the checksum lines the
