@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 import pytest
+import requests
 from botocore.config import Config
 from botocore.exceptions import ClientError, ReadTimeoutError
 
@@ -41,13 +42,98 @@ ITEMS_PER_TABLE = 60
 BACKUP_TIMEOUT_S = 900.0
 RESTORE_TIMEOUT_S = 1800.0
 
+# Where the server under test writes its backups: `filesystem` or `s3` (a
+# configured `[backup.store]`, under which CreateBackup is asynchronous and
+# backs up vector tables) or `none` (the in-catalog create). The CI jobs set
+# it beside EXTENDDB_TEST_ENDPOINT; the one test whose expected outcome
+# depends on it fails when it is unset rather than accept either outcome.
+BACKUP_STORE = os.environ.get("EXTENDDB_TEST_BACKUP_STORE", "").strip() or None
+BACKUP_STORE_VALUES = ("filesystem", "s3", "none")
+
+# RestoreTableFromBackup of a backup written to a configured store answers
+# ValidationException ("is in a backup store; this release restores
+# in-catalog backups only") until the restore job of PR 9a lands. The cells
+# that restore a backup this server created skip on such a server and come
+# back with PR 9a; the in-catalog create's backups (`none`, and the service)
+# restore as before. The marker is gated on the target as well as the
+# variable, so a stale `EXTENDDB_TEST_BACKUP_STORE=filesystem` in the
+# environment of a real-DynamoDB run (which does not require the variable)
+# cannot skip the 24 cells against the service.
+restores_a_backup_of_this_server = pytest.mark.skipif(
+    BACKUP_STORE in ("filesystem", "s3") and not _is_real_dynamodb(),
+    reason=(
+        f"EXTENDDB_TEST_BACKUP_STORE={BACKUP_STORE}: RestoreTableFromBackup of a backup "
+        "in the configured store is refused until the restore job lands (PR 9a)"
+    ),
+)
+
+
+@pytest.fixture(scope="session")
+def backup_store_component(endpoint_url):
+    """The server's `backup_store` health component, read once from
+    `/health`, checked against EXTENDDB_TEST_BACKUP_STORE: a configured store
+    (`filesystem`, `s3`) must be reported with that kind and `healthy`, and
+    `none` must report no component. A variable the harness cannot observe
+    is not a parameter: a check that only reads it asserts nothing about the
+    server, and without this, `s3` against a server with a filesystem store
+    passed every cell."""
+    if BACKUP_STORE not in BACKUP_STORE_VALUES:
+        pytest.fail(
+            f"EXTENDDB_TEST_BACKUP_STORE is {'unset' if BACKUP_STORE is None else repr(BACKUP_STORE)}; "
+            f"set it to one of {BACKUP_STORE_VALUES} to say where the server under test writes "
+            "its backups"
+        )
+    assert endpoint_url, "the backup store component is ExtendDB's; no endpoint is set"
+    health = requests.get(f"{endpoint_url.rstrip('/')}/health", verify=False, timeout=10).json()
+    component = health.get("components", {}).get("backup_store")
+    if BACKUP_STORE == "none":
+        assert component is None, (
+            f"EXTENDDB_TEST_BACKUP_STORE=none but the server reports a backup store: {component}"
+        )
+    else:
+        assert component is not None, (
+            f"EXTENDDB_TEST_BACKUP_STORE={BACKUP_STORE} but the server reports no backup store: "
+            f"{health}"
+        )
+        assert component.get("kind") == BACKUP_STORE, (
+            f"EXTENDDB_TEST_BACKUP_STORE={BACKUP_STORE} but the server's store is {component}"
+        )
+        assert component.get("status") == "healthy", (
+            f"the server's {BACKUP_STORE} store is not healthy: {component}"
+        )
+    print(f"backup store under test: {component if component else 'none'}")
+    return component
+
+
+def wait_for_backup_available(client, backup_arn: str, timeout: float = BACKUP_TIMEOUT_S) -> None:
+    """Poll DescribeBackup until the backup is AVAILABLE.
+
+    The service creates a backup asynchronously; so does ExtendDB with a
+    configured `[backup.store]` (CreateBackup answers CREATING and the job
+    uploads). A backup still CREATING refuses DeleteBackup (BackupInUse) and
+    restore, so every caller that goes on to delete, restore or read the
+    size of a backup it just created waits here first. Any other status is a
+    failure: a backup that fails is BackupNotFound, never FAILED, on the wire.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status = client.describe_backup(BackupArn=backup_arn)["BackupDescription"][
+            "BackupDetails"
+        ]["BackupStatus"]
+        if status == "AVAILABLE":
+            return
+        assert status == "CREATING", f"backup {backup_arn} is {status}"
+        assert time.monotonic() < deadline, f"backup {backup_arn} not AVAILABLE in time"
+        time.sleep(_poll_interval())
+
 
 def _create_backup(client, table_name: str) -> str:
     """CreateBackup, then wait for the backup to be AVAILABLE.
 
     The service creates a backup asynchronously and refuses to restore one
-    that is still CREATING; ExtendDB returns it AVAILABLE. A just-created
-    table can also refuse CreateBackup for a short while, which is retried.
+    that is still CREATING; so does ExtendDB with a configured store. A
+    just-created table can also refuse CreateBackup for a short while, which
+    is retried.
     """
     deadline = time.monotonic() + 60
     while True:
@@ -62,24 +148,23 @@ def _create_backup(client, table_name: str) -> str:
             if not retryable or time.monotonic() >= deadline:
                 raise
             time.sleep(0.5)
-    deadline = time.monotonic() + BACKUP_TIMEOUT_S
     try:
-        while True:
-            status = client.describe_backup(BackupArn=arn)["BackupDescription"][
-                "BackupDetails"
-            ]["BackupStatus"]
-            if status == "AVAILABLE":
-                return arn
-            assert status == "CREATING", f"backup {arn} is {status}"
-            assert time.monotonic() < deadline, f"backup {arn} not AVAILABLE in time"
-            time.sleep(_poll_interval())
+        wait_for_backup_available(client, arn)
+        return arn
     except BaseException:
         # The caller never learns the ARN, so the backup is removed here.
-        try:
-            client.delete_backup(BackupArn=arn)
-        except ClientError:
-            pass
+        _delete_backup_when_available(client, arn)
         raise
+
+
+def _delete_backup_when_available(client, backup_arn: str) -> None:
+    """DeleteBackup once the backup is no longer CREATING; a backup that is
+    gone (failed or deleted) is left as it is."""
+    try:
+        wait_for_backup_available(client, backup_arn)
+        client.delete_backup(BackupArn=backup_arn)
+    except (ClientError, AssertionError):
+        pass
 
 
 def _backup_creation_time(client, backup_arn: str):
@@ -256,7 +341,11 @@ def _index_items(client, table: str, index: str, hash_attr: str, values: list) -
 
 
 def _cleanup(client, backup_arn: str | None, *tables: str) -> None:
-    """Delete tables and the backup; each step runs even if an earlier one fails."""
+    """Delete tables and the backup; each step runs even if an earlier one fails.
+
+    A backup still CREATING (the asynchronous create) is waited for first:
+    DeleteBackup of one is BackupInUseException.
+    """
     if tables:
         try:
             _drop(client, tables[0])
@@ -265,6 +354,7 @@ def _cleanup(client, backup_arn: str | None, *tables: str) -> None:
         return
     if backup_arn:
         try:
+            wait_for_backup_available(client, backup_arn)
             client.delete_backup(BackupArn=backup_arn)
         except client.exceptions.BackupNotFoundException:
             pass
@@ -338,11 +428,13 @@ def _round_trip(client, sort_kind: str | None, hash_kind: str = "S") -> None:
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 @pytest.mark.parametrize("hash_kind", ["S", "N", "B"])
 def test_restore_hash_only_table(dynamodb_client, hash_kind):
     _round_trip(dynamodb_client, None, hash_kind)
 
 
+@restores_a_backup_of_this_server
 @pytest.mark.parametrize("sort_kind", ["S", "N", "B"])
 def test_restore_composite_key_table(dynamodb_client, sort_kind):
     _round_trip(dynamodb_client, sort_kind)
@@ -359,6 +451,7 @@ def _index_by_name(indexes: list[dict]) -> dict:
     return {i["IndexName"]: i for i in indexes}
 
 
+@restores_a_backup_of_this_server
 def test_restore_preserves_indexes_and_provisioned_throughput(dynamodb_client):
     """GSIs and LSIs, their key schemas, projections, and throughput, the
     table's provisioned throughput, and every index's contents come back."""
@@ -546,6 +639,7 @@ def test_restore_preserves_indexes_and_provisioned_throughput(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 def test_restore_normalizes_stale_throughput_after_on_demand_switch(dynamodb_client):
     """A backup taken after an on-demand switch does not restore stale capacity."""
     client = dynamodb_client
@@ -620,6 +714,7 @@ def test_restore_normalizes_stale_throughput_after_on_demand_switch(dynamodb_cli
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 def test_restore_override_pay_per_request_to_provisioned(dynamodb_client):
     client = dynamodb_client
     source = f"restore-override-ppr-{uuid.uuid4().hex[:10]}"
@@ -658,6 +753,7 @@ def test_restore_override_pay_per_request_to_provisioned(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 def test_restore_override_provisioned_to_pay_per_request(dynamodb_client):
     client = dynamodb_client
     source = f"restore-override-prov-{uuid.uuid4().hex[:10]}"
@@ -692,6 +788,7 @@ def test_restore_override_provisioned_to_pay_per_request(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 def test_provisioned_restore_override_requiring_gsi_override_leaves_no_target(
     dynamodb_client,
 ):
@@ -934,6 +1031,7 @@ def large_backup(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
+@restores_a_backup_of_this_server
 def test_restore_response_arrives_before_its_copy_finishes(dynamodb_client, large_backup):
     """The CREATING response reaches a client with a 10 s read timeout and no
     retries before the copy finishes, and the table then reaches ACTIVE with
@@ -996,6 +1094,7 @@ def _table_appears(client, name: str, timeout: float) -> bool:
             time.sleep(_poll_interval() * 5)
 
 
+@restores_a_backup_of_this_server
 def test_restore_survives_a_client_that_disconnects_before_the_response(
     dynamodb_client, large_backup
 ):
@@ -1051,6 +1150,7 @@ def test_restore_survives_a_client_that_disconnects_before_the_response(
         _cleanup(dynamodb_client, None, target)
 
 
+@restores_a_backup_of_this_server
 def test_first_read_after_active_succeeds(dynamodb_client, large_backup):
     """A read on the restore target while it is CREATING is
     ResourceNotFoundException, and the first read after DescribeTable reports
@@ -1107,6 +1207,7 @@ def test_first_read_after_active_succeeds(dynamodb_client, large_backup):
         _cleanup(client, None, target)
 
 
+@restores_a_backup_of_this_server
 def test_create_backup_of_a_creating_table_is_table_not_found(dynamodb_client, large_backup):
     """CreateBackup on a table that is still CREATING is
     TableNotFoundException "Table not found: <name>" (measured on DynamoDB),
@@ -1136,6 +1237,7 @@ def test_create_backup_of_a_creating_table_is_table_not_found(dynamodb_client, l
         _cleanup(client, None, target)
 
 
+@restores_a_backup_of_this_server
 def test_restore_into_a_creating_target_and_a_second_restore_of_its_backup_are_refused(
     dynamodb_client, large_backup
 ):
@@ -1178,6 +1280,7 @@ def test_restore_into_a_creating_target_and_a_second_restore_of_its_backup_are_r
         _cleanup(client, None, target, other)
 
 
+@restores_a_backup_of_this_server
 def test_target_and_backup_are_held_while_the_copy_runs(dynamodb_client, large_backup):
     """DeleteTable of a CREATING restore target is ResourceInUseException, and
     (ExtendDB) DeleteBackup of its source is BackupInUseException.
@@ -1628,6 +1731,7 @@ def test_backup_arn_shape_and_account_are_checked(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
+@restores_a_backup_of_this_server
 def test_empty_index_overrides_restore_no_indexes_and_sse_override_is_applied(dynamodb_client):
     client = dynamodb_client
     source = f"restore-noop-{uuid.uuid4().hex[:10]}"
@@ -1678,6 +1782,7 @@ def test_empty_index_overrides_restore_no_indexes_and_sse_override_is_applied(dy
         _cleanup(client, backup_arn, plain, restored, source)
 
 
+@restores_a_backup_of_this_server
 @pytest.mark.parametrize("billing", ["PROVISIONED", "PAY_PER_REQUEST"])
 def test_index_overrides_listing_the_backups_indexes_restore_them(dynamodb_client, billing):
     """GlobalSecondaryIndexOverride and LocalSecondaryIndexOverride built from
@@ -1848,6 +1953,7 @@ def test_index_overrides_listing_the_backups_indexes_restore_them(dynamodb_clien
         _cleanup(client, backup_arn, changed, restored, source)
 
 
+@restores_a_backup_of_this_server
 def test_on_demand_throughput_override_is_applied(dynamodb_client):
     """OnDemandThroughputOverride is the restored table's on-demand
     throughput, equal to the backup's or changed (measured on DynamoDB).
@@ -1903,8 +2009,23 @@ def test_on_demand_throughput_override_is_applied(dynamodb_client):
 
 
 @extenddb_only
-def test_create_backup_of_a_vector_table_is_refused(dynamodb_client):
-    """Refused at CreateBackup, not at restore time."""
+def test_create_backup_of_a_vector_table_is_refused(dynamodb_client, backup_store_component):
+    """CreateBackup of a table with vector indexes: the outcome of the
+    server's configured path, read from EXTENDDB_TEST_BACKUP_STORE and
+    checked against the server's `/health` (`backup_store_component`).
+
+    `none` (no `[backup.store]`, or the in-catalog create): refused at
+    CreateBackup with the ValidationException main gives, and no backup is
+    created. `filesystem` or `s3`: the store-backed create backs the table
+    up (the manifest records its vector indexes): CreateBackup answers
+    CREATING, DescribeBackup reaches AVAILABLE with the table's features,
+    ListBackups lists it, and RestoreTableFromBackup of it answers the
+    ValidationException naming the store, which PR 9a's restore job
+    replaces with the restore (its refusal then narrows to a target without
+    vector support). The test fails rather than accept either outcome when
+    the variable is unset (the fixture fails first), and prints which branch
+    ran.
+    """
     from test_vector_index_query_scan import _error_message, _signed_post
 
     client = dynamodb_client
@@ -1913,9 +2034,19 @@ def test_create_backup_of_a_vector_table_is_refused(dynamodb_client):
         "CreateTable",
         {
             "TableName": name,
-            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "AttributeDefinitions": [
+                {"AttributeName": "pk", "AttributeType": "S"},
+                {"AttributeName": "g", "AttributeType": "S"},
+            ],
             "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
             "BillingMode": "PAY_PER_REQUEST",
+            "GlobalSecondaryIndexes": [
+                {
+                    "IndexName": "by-g",
+                    "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "KEYS_ONLY"},
+                }
+            ],
             "VectorIndexes": [
                 {
                     "IndexName": "vidx",
@@ -1930,25 +2061,66 @@ def test_create_backup_of_a_vector_table_is_refused(dynamodb_client):
     if resp.status_code == 400 and "not supported" in _error_message(resp):
         pytest.skip("target backend does not support vector indexes")
     assert resp.status_code == 200, resp.text
+    backup_arn = None
     try:
         wait_for_active(client, name, timeout=180)
         vector = _signed_post("DescribeTable", {"TableName": name}).json()["Table"]
         if not vector.get("VectorIndexes"):
             pytest.skip("target accepted CreateTable but did not create the vector index")
-        with pytest.raises(ClientError) as exc_info:
-            client.create_backup(TableName=name, BackupName=f"{name}-bkp")
-        error = exc_info.value.response["Error"]
-        assert error["Code"] == "ValidationException"
-        assert error["Message"] == (
-            f"table {name} has 1 vector index(es); restoring a table with vector "
-            "indexes is not supported by this storage backend"
+        client.put_item(
+            TableName=name,
+            Item={"pk": {"S": "a"}, "g": {"S": "g1"}, "emb": {"L": [{"N": "0.1"}] * 4}},
         )
+        if BACKUP_STORE == "none":
+            print("branch: the in-catalog create refuses a vector table")
+            # A plain call, so a create that is accepted against expectation
+            # leaves its ARN for the cleanup rather than a backup nobody
+            # deletes.
+            try:
+                accepted = client.create_backup(TableName=name, BackupName=f"{name}-bkp")
+            except ClientError as e:
+                error = e.response["Error"]
+            else:
+                backup_arn = accepted["BackupDetails"]["BackupArn"]
+                pytest.fail(
+                    f"the in-catalog create accepted a vector table: {accepted['BackupDetails']}"
+                )
+            assert error["Code"] == "ValidationException"
+            assert error["Message"] == (
+                f"table {name} has 1 vector index(es); restoring a table with vector "
+                "indexes is not supported by this storage backend"
+            )
+            listed = client.list_backups(TableName=name)["BackupSummaries"]
+            assert listed == [], listed
+            return
+        print(f"branch: the {BACKUP_STORE} store backs a vector table up")
+        details = client.create_backup(TableName=name, BackupName=f"{name}-bkp")["BackupDetails"]
+        backup_arn = details["BackupArn"]
+        assert details["BackupStatus"] == "CREATING", details
+        wait_for_backup_available(client, backup_arn)
+        desc = client.describe_backup(BackupArn=backup_arn)["BackupDescription"]
+        assert desc["BackupDetails"]["BackupStatus"] == "AVAILABLE", desc
+        assert desc["SourceTableDetails"]["TableName"] == name
+        assert desc["SourceTableDetails"]["ItemCount"] == 1, desc["SourceTableDetails"]
+        gsis = desc["SourceTableFeatureDetails"]["GlobalSecondaryIndexes"]
+        assert [g["IndexName"] for g in gsis] == ["by-g"], desc["SourceTableFeatureDetails"]
         listed = client.list_backups(TableName=name)["BackupSummaries"]
-        assert listed == [], listed
+        assert [b["BackupArn"] for b in listed] == [backup_arn], listed
+        # Until PR 9a's restore job, the restore of a backup in the store is
+        # refused; PR 9a replaces this assertion with the round trip.
+        with pytest.raises(ClientError) as exc_info:
+            client.restore_table_from_backup(TargetTableName=f"{name}-r", BackupArn=backup_arn)
+        error = exc_info.value.response["Error"]
+        assert error["Code"] == "ValidationException", error
+        assert error["Message"] == (
+            f"Backup {backup_arn} is in a backup store; this release restores in-catalog "
+            "backups only"
+        ), error
     finally:
-        _cleanup(client, None, name)
+        _cleanup(client, backup_arn, name)
 
 
+@restores_a_backup_of_this_server
 def test_update_table_on_a_restored_table_reports_no_restore_summary(dynamodb_client):
     """Once a restored table is ACTIVE, no description-returning response
     carries RestoreSummary: UpdateTable's no more than DescribeTable's.
@@ -1981,6 +2153,7 @@ def test_update_table_on_a_restored_table_reports_no_restore_summary(dynamodb_cl
         _cleanup(client, backup_arn, restored, source)
 
 
+@restores_a_backup_of_this_server
 @extenddb_only
 def test_a_provisioned_gsi_without_throughput_restores_with_the_table_throughput(
     dynamodb_client,
@@ -2349,6 +2522,7 @@ def test_create_backup_accepts_the_table_arn(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
+@restores_a_backup_of_this_server
 def test_table_class_is_not_restored(dynamodb_client):
     """A STANDARD_INFREQUENT_ACCESS source restores as STANDARD (measured on
     DynamoDB); DescribeBackup still reports nothing of the

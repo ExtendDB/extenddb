@@ -48,14 +48,16 @@ use std::time::Duration;
 
 use extenddb_backup_store::{BackupStore, ByteStream, ObjectMeta, StoreError};
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::metrics::MetricsCollector;
 use extenddb_storage::backup_catalog::{
-    JobBound, StoreIdentity, StoreKind, limit_exceeded_message,
+    JOB_HEARTBEAT_INTERVAL, JobBound, StoreIdentity, StoreKind, limit_exceeded_message,
 };
-use extenddb_storage::{BackupCatalog, JobPermit};
+use extenddb_storage::{BackupCatalog, CancellationToken, JobPermit};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use tokio::sync::Semaphore;
+use tokio_util::task::TaskTracker;
 
 use super::store_identity::{self, StoreProblem};
 
@@ -71,11 +73,43 @@ const MAX_CONCURRENT_JOBS_KEY: &str = "[backup] max_concurrent_jobs";
 /// over the bound is served in turn rather than refused.
 pub const PERMIT_WAIT: Duration = Duration::from_secs(30);
 
+/// The `[backup]` durations and sizes the store-backed backup job and the
+/// reconciler read, as the server resolved them from the configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobSettings {
+    /// `data_file_target_bytes`: a data file closes once its uncompressed
+    /// bytes reach this.
+    pub data_file_target_bytes: u64,
+    /// The job's heartbeat period: `max(heartbeat_interval_secs,
+    /// JOB_HEARTBEAT_INTERVAL)`, which the server computes; a heartbeat that
+    /// has not confirmed the claim within one period aborts the job.
+    pub heartbeat_interval: Duration,
+    /// `stale_job_after_secs`: the window the maintenance-claim check reads
+    /// with, and the heartbeat age after which a job's owner is dead.
+    pub stale_job_after: Duration,
+    /// `failed_row_retention_secs`: how long a FAILED or DELETED row whose
+    /// prefix is empty is kept.
+    pub failed_row_retention: Duration,
+}
+
+impl Default for JobSettings {
+    /// The configuration's defaults: 64 MiB files, the 15 s heartbeat,
+    /// 300 s staleness, 7 days of retention.
+    fn default() -> Self {
+        Self {
+            data_file_target_bytes: 64 * 1024 * 1024,
+            heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
+            stale_job_after: Duration::from_secs(300),
+            failed_row_retention: Duration::from_secs(7 * 24 * 3600),
+        }
+    }
+}
+
 /// How long a filesystem store's check may run, at startup and in a
 /// reconciler cycle, before the store is treated as not answering: a local
 /// disk answers in milliseconds, and a network mount that takes longer is
 /// one that has stopped answering.
-pub const LOCAL_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const LOCAL_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an S3 store's check may run in a reconciler cycle. The check
 /// sends a few small requests (`validate`'s listing, the identity file's
@@ -85,14 +119,18 @@ pub const LOCAL_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// so a timed-out check is dropped before the SDK starts a retry of its
 /// stalled request, and no retry outlives the check. A stalled endpoint thus
 /// costs a cycle this bound, not the SDK's whole retry budget.
-pub const S3_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const S3_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const _: () = assert!(
     S3_CHECK_TIMEOUT.as_secs() < extenddb_backup_store::S3_ATTEMPT_TIMEOUT.as_secs(),
     "the S3 check bound must fire before the SDK's attempt timeout"
 );
 
 /// One per server process, shared by every request through the operation
-/// context.
+/// context. Besides the slots and the store it carries what a store-backed
+/// backup job needs and no request hands it: the job settings, the metrics
+/// collector, the shutdown token the jobs are cancelled on, the tracker the
+/// server drains them through ([`BackupRuntime::drain_jobs`]), and the
+/// backend and version the manifest names as its source.
 pub struct BackupRuntime {
     slots: Arc<Semaphore>,
     max_concurrent_jobs: usize,
@@ -101,15 +139,31 @@ pub struct BackupRuntime {
     permit_wait: Duration,
     /// The store this instance writes new backups to and deletes from;
     /// `None` while no store is configured, when every catalog row is a row
-    /// of another store.
-    configured_store: Option<ConfiguredStore>,
+    /// of another store. Shared with the jobs, which read its health and
+    /// identity before every put.
+    configured_store: Option<Arc<ConfiguredStore>>,
     /// Whether CreateBackup takes the in-catalog path whatever the store
     /// configuration (a backend that cannot pin a table snapshot); such a
     /// create is not refused by an unhealthy store.
     legacy_create_only: bool,
-    /// `[backup] stale_job_after_secs`: the window a job's claim check reads
-    /// the maintenance claim with.
-    stale_job_after: std::time::Duration,
+    job_settings: JobSettings,
+    /// The collector the jobs record into; `None` in commands and tests
+    /// without one.
+    metrics: Option<Arc<MetricsCollector>>,
+    /// The token the server's shutdown and a registration loss cancel the
+    /// jobs on ([`Self::with_shutdown`] makes it a child of the server's
+    /// token): a running job then runs its failure path with reason
+    /// `shutdown`. A loss cancels and replaces it ([`Self::cancel_jobs`]),
+    /// so the jobs started under a new registration run on a fresh token.
+    shutdown: RwLock<CancellationToken>,
+    /// The server's token the jobs' token is a child of.
+    shutdown_parent: CancellationToken,
+    /// Every job task spawned through [`BackupRuntime::spawn_job`].
+    jobs: TaskTracker,
+    /// The storage backend's name, the manifest's `source_backend`.
+    source_backend: String,
+    /// The build's version, the manifest's `source_extenddb_version`.
+    source_extenddb_version: String,
 }
 
 impl std::fmt::Debug for BackupRuntime {
@@ -118,19 +172,18 @@ impl std::fmt::Debug for BackupRuntime {
             .field("max_concurrent_jobs", &self.max_concurrent_jobs)
             .field(
                 "configured_store",
-                &self
-                    .configured_store
-                    .as_ref()
-                    .map(ConfiguredStore::identity),
+                &self.configured_store.as_ref().map(|store| store.identity()),
             )
             .field("legacy_create_only", &self.legacy_create_only)
+            .field("job_settings", &self.job_settings)
             .finish_non_exhaustive()
     }
 }
 
 /// The store this instance is configured with: its kind and root (the
 /// configuration's), its id once the identity check has read it, the handle,
-/// the spool for restores from it, and its health.
+/// the spool for restores from it, the names the DynamoDB-shaped manifests
+/// carry for it, and its health.
 ///
 /// The id is `None` until a check passes: a store whose startup check failed
 /// (a transport failure, say) has an unknown id, and a row of its kind and
@@ -146,6 +199,15 @@ pub struct ConfiguredStore {
     /// The restore spool for an S3 store: the directory and the
     /// `<hostname>:<spool_path>` label a restore job record names.
     pub spool: Option<Spool>,
+    /// `manifest-summary.json`'s `s3Bucket`: the bucket name on S3, the root
+    /// path on a filesystem store ([`Self::with_manifest_names`]; the root
+    /// label until set).
+    pub bucket: String,
+    /// The key prefix the store was opened with (`[backup.store.s3] prefix`;
+    /// a filesystem store has none), which every key of the DynamoDB-shaped
+    /// manifests starts with ([`Self::with_manifest_names`]; empty until
+    /// set).
+    pub key_prefix: String,
     store_id: RwLock<Option<String>>,
     health: RwLock<StoreHealth>,
     /// Whether the store's `validate` has passed; the checks run it first
@@ -245,6 +307,8 @@ impl ConfiguredStore {
         };
         Self {
             kind,
+            bucket: root.clone(),
+            key_prefix: String::new(),
             root,
             store,
             spool,
@@ -271,6 +335,8 @@ impl ConfiguredStore {
     ) -> Self {
         Self {
             kind,
+            bucket: root.clone(),
+            key_prefix: String::new(),
             root,
             store,
             spool,
@@ -313,6 +379,17 @@ impl ConfiguredStore {
     #[must_use]
     pub fn is_set_aside(&self) -> bool {
         self.set_aside.load(Ordering::Acquire)
+    }
+
+    /// The same store with the names the DynamoDB-shaped manifests carry
+    /// for it: `bucket` is `manifest-summary.json`'s `s3Bucket` (the bucket
+    /// on S3, the root path on a filesystem store) and `key_prefix` the
+    /// store's configured key prefix (empty when it has none).
+    #[must_use]
+    pub fn with_manifest_names(mut self, bucket: String, key_prefix: String) -> Self {
+        self.bucket = bucket;
+        self.key_prefix = key_prefix;
+        self
     }
 
     /// The store's identity, once a check has read its id.
@@ -433,7 +510,7 @@ impl ConfiguredStore {
     /// ([`LOCAL_CHECK_TIMEOUT`] for a filesystem root, [`S3_CHECK_TIMEOUT`]
     /// for a bucket).
     #[must_use]
-    pub fn check_timeout(&self) -> std::time::Duration {
+    pub fn check_timeout(&self) -> Duration {
         match self.kind {
             StoreKind::Filesystem => LOCAL_CHECK_TIMEOUT,
             StoreKind::S3 => S3_CHECK_TIMEOUT,
@@ -781,7 +858,9 @@ impl BackupStore for BoundedCalls<'_> {
 }
 
 impl BackupRuntime {
-    /// `max_concurrent_jobs` slots and no configured store.
+    /// `max_concurrent_jobs` slots, no configured store, the default job
+    /// settings, no metrics, a shutdown token nothing cancels, and `test` as
+    /// the source backend with this crate's version.
     #[must_use]
     pub fn new(max_concurrent_jobs: usize) -> Self {
         Self {
@@ -790,7 +869,13 @@ impl BackupRuntime {
             permit_wait: PERMIT_WAIT,
             configured_store: None,
             legacy_create_only: false,
-            stale_job_after: std::time::Duration::from_secs(300),
+            job_settings: JobSettings::default(),
+            metrics: None,
+            shutdown: RwLock::new(CancellationToken::new()),
+            shutdown_parent: CancellationToken::new(),
+            jobs: TaskTracker::new(),
+            source_backend: "test".to_owned(),
+            source_extenddb_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
 
@@ -798,21 +883,155 @@ impl BackupRuntime {
     /// the jobs' maintenance-claim check reads with (the default is the
     /// configuration's default, 300 s).
     #[must_use]
-    pub fn with_stale_job_after(mut self, stale_job_after: std::time::Duration) -> Self {
-        self.stale_job_after = stale_job_after;
+    pub fn with_stale_job_after(mut self, stale_job_after: Duration) -> Self {
+        self.job_settings.stale_job_after = stale_job_after;
         self
     }
 
     /// `[backup] stale_job_after_secs`.
     #[must_use]
-    pub fn stale_job_after(&self) -> std::time::Duration {
-        self.stale_job_after
+    pub fn stale_job_after(&self) -> Duration {
+        self.job_settings.stale_job_after
+    }
+
+    /// The same runtime with every job setting set.
+    #[must_use]
+    pub fn with_job_settings(mut self, settings: JobSettings) -> Self {
+        self.job_settings = settings;
+        self
+    }
+
+    /// The settings the jobs and the reconciler read.
+    #[must_use]
+    pub fn job_settings(&self) -> JobSettings {
+        self.job_settings
+    }
+
+    /// The same runtime with the collector the jobs record into.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<MetricsCollector>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// The collector the jobs record into, if any.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&Arc<MetricsCollector>> {
+        self.metrics.as_ref()
+    }
+
+    /// The same runtime with the server's shutdown token: the jobs run on a
+    /// child of it, which [`Self::drain_jobs`] and [`Self::cancel_jobs`]
+    /// cancel.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = RwLock::new(shutdown.child_token());
+        self.shutdown_parent = shutdown;
+        self
+    }
+
+    /// The token the jobs started now are cancelled on.
+    #[must_use]
+    pub fn shutdown(&self) -> CancellationToken {
+        self.shutdown
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Cancel the jobs running now (each runs its failure path with reason
+    /// `shutdown`: FAILED, then its prefix deleted) and give the jobs that
+    /// start afterwards a fresh token. The server calls this when its
+    /// serving registration is lost: a migration can take the catalog once
+    /// the registration is gone, and a job's heartbeats and status writes
+    /// would otherwise go on beside it. Returns how many jobs were running.
+    pub fn cancel_jobs(&self) -> usize {
+        let fresh = self.shutdown_parent.child_token();
+        let old = std::mem::replace(
+            &mut *self
+                .shutdown
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            fresh,
+        );
+        old.cancel();
+        self.jobs.len()
+    }
+
+    /// The same runtime with the backend name and build version the
+    /// manifests name as their source.
+    #[must_use]
+    pub fn with_source(mut self, backend: &str, version: &str) -> Self {
+        self.source_backend = backend.to_owned();
+        self.source_extenddb_version = version.to_owned();
+        self
+    }
+
+    /// The manifest's `source_backend` and `source_extenddb_version`.
+    #[must_use]
+    pub fn source(&self) -> (&str, &str) {
+        (&self.source_backend, &self.source_extenddb_version)
+    }
+
+    /// Spawn a job task under the tracker [`Self::drain_jobs`] waits on.
+    /// Public for the server's test of its shutdown sequence, which spawns a
+    /// task that outlives the drain; the engine's own jobs come through
+    /// CreateBackup.
+    pub fn spawn_job<F>(&self, job: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.jobs.spawn(job)
+    }
+
+    /// Jobs spawned and not yet ended.
+    #[must_use]
+    pub fn running_jobs(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// Cancel the jobs' shutdown token and wait up to `bound` for every job
+    /// to end: a cancelled job runs its failure path (the FAILED write and
+    /// the deletion of its prefix), which is what sweeps an upload still in
+    /// flight on S3, where the runtime's own shutdown sends no abort. Job
+    /// tasks still running at the bound are logged by their count (the
+    /// tracker counts tasks, from the request's spawn to the task's end,
+    /// whether or not a row exists for one yet) and left to the runtime's
+    /// shutdown; a row such a task leaves is CREATING (a task still in its
+    /// pipeline) or FAILED (one still in its `delete_prefix`), and the
+    /// reconciler resolves or sweeps it once its heartbeat is stale. Returns
+    /// the number still running, for the caller's information: the server
+    /// reads the warn line and nothing else.
+    pub async fn drain_jobs(&self, bound: Duration) -> usize {
+        self.shutdown().cancel();
+        self.jobs.close();
+        let running = self.jobs.len();
+        if running == 0 {
+            return 0;
+        }
+        tracing::info!(
+            "waiting up to {} s for {running} backup job(s) to end",
+            bound.as_secs()
+        );
+        if tokio::time::timeout(bound, self.jobs.wait()).await.is_err() {
+            let left = self.jobs.len();
+            tracing::warn!(
+                "{left} backup job task(s) did not end within {} s (tasks spawned by \
+                 CreateBackup, counted whether or not a row exists for them yet); a row one \
+                 left CREATING or FAILED is resolved or swept by the reconciler once its \
+                 heartbeat is stale",
+                bound.as_secs()
+            );
+            return left;
+        }
+        0
     }
 
     /// The same runtime with `store` configured.
     #[must_use]
     pub fn with_store(mut self, store: ConfiguredStore) -> Self {
-        self.configured_store = Some(store);
+        self.configured_store = Some(Arc::new(store));
         self
     }
 
@@ -849,14 +1068,14 @@ impl BackupRuntime {
     #[must_use]
     pub fn configured_store(&self) -> Option<&ConfiguredStore> {
         self.configured_store
-            .as_ref()
+            .as_deref()
             .filter(|store| !store.is_set_aside())
     }
 
     /// The configured store, taken out of a runtime a command built only to
     /// reach it.
     #[must_use]
-    pub fn into_configured_store(self) -> Option<ConfiguredStore> {
+    pub fn into_configured_store(self) -> Option<Arc<ConfiguredStore>> {
         self.configured_store
     }
 
@@ -922,9 +1141,11 @@ impl BackupRuntime {
     /// and the problem's category and not its root (no API error names a
     /// root). Every caller has checked that a store is configured
     /// (`is_configured_store`, or the store-backed create's own condition).
-    pub(crate) fn require_healthy_store(&self) -> Result<&ConfiguredStore, DynamoDbError> {
+    pub(crate) fn require_healthy_store(&self) -> Result<&Arc<ConfiguredStore>, DynamoDbError> {
         let store = self
-            .configured_store()
+            .configured_store
+            .as_ref()
+            .filter(|store| !store.is_set_aside())
             .expect("every caller checks that a store is configured first");
         match store.health() {
             StoreHealth::Healthy => Ok(store),

@@ -9,6 +9,9 @@ license.workspace = true
 
 [features]
 mongodb-test-hooks = []
+# The backup job's kill-point pauses (`EXTENDDB_BACKUP_PAUSE`), for the
+# binary-level crash tests.
+backup-test-hooks = ["extenddb-engine/backup-test-hooks"]
 
 [dependencies]
 extenddb-cache = { workspace = true }
@@ -52,7 +55,10 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
-# The dev-credential seeding tests run against a SQLite catalog file.
+# The login tests count bcrypt checks with `count_verifications` against an
+# in-memory SQLite catalog, and the dev-credential seeding tests run against a
+# SQLite catalog file.
+extenddb-storage = { workspace = true, features = ["test-util"] }
 extenddb-storage-sqlite = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
 tempfile = "3"

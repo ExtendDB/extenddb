@@ -27,7 +27,10 @@
 //! * a lost answer on the maintenance claim's insert, so a test can see the
 //!   re-read settle a claim whose `INSERT ... IF NOT EXISTS` committed;
 //! * a pause between a maintenance claim takeover's read and its write, so
-//!   a test can hold two takers of one stale row there and see one win.
+//!   a test can hold two takers of one stale row there and see one win;
+//! * a pause in `claim_dead_backup` between its `LOCAL_SERIAL` read and its
+//!   takeover LWT, so a test can land the owner's beat in that gap and see
+//!   the LWT's `heartbeat_at = <read>` condition refuse the takeover.
 
 use std::time::Duration;
 
@@ -80,6 +83,7 @@ mod armed {
         pub(super) before_abandoned_fence: HashMap<String, Arc<Pause>>,
         pub(super) lose_maintenance_insert_answer: bool,
         pub(super) before_maintenance_takeover: Option<Arc<Pause>>,
+        pub(super) before_takeover_write: HashMap<String, Arc<Pause>>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -150,6 +154,20 @@ pub fn pause_before_abandoned_fence(backup_arn: &str) -> std::sync::Arc<Pause> {
     pause
 }
 
+/// Arm a pause in the next `claim_dead_backup` of `backup_arn`, between its
+/// read of the row and its takeover write. The pause is taken once and then
+/// disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_takeover_write(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_takeover_write
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
 /// The period the jobs of `account_id` heartbeat at.
 pub(crate) fn heartbeat_interval(account_id: &str) -> Duration {
     #[cfg(feature = "test-hooks")]
@@ -200,6 +218,15 @@ pub(crate) async fn before_abandoned_fence(backup_arn: &str) {
     #[cfg(feature = "test-hooks")]
     if let Some(pause) = armed::with_hooks(|hooks| hooks.before_abandoned_fence.remove(backup_arn))
     {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause for the takeover of `backup_arn`.
+pub(crate) async fn before_takeover_write(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_takeover_write.remove(backup_arn)) {
         pause.hold().await;
     }
     let _ = backup_arn;

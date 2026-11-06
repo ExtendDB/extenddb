@@ -539,6 +539,10 @@ pub struct StatusFields {
     pub size_bytes: Option<i64>,
     pub item_count: Option<i64>,
     pub failure_reason: Option<String>,
+    /// The manifest's `source_table` object, which the AVAILABLE write of a
+    /// backup row carries so DescribeBackup reports the counts the manifest
+    /// has; a restore job record has no such column and ignores it.
+    pub source_table_details_json: Option<serde_json::Value>,
     pub completed: bool,
 }
 
@@ -810,10 +814,34 @@ pub trait BackupCatalog: Send + Sync {
         stale_after: Duration,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
+    /// Take over a CREATING row whose owner is dead, under a fresh
+    /// generation, and return the claim; the reconciler's way onto a row a
+    /// job left behind. Dead is `heartbeat_at` older than `stale_after` on
+    /// the database's clock (on PostgreSQL, once the owner's claim session
+    /// has ended as well: the advisory lock is tried first, so a stopped
+    /// owner whose session lives keeps its row), except on SQLite, where a
+    /// CREATING row whose in-process slot no task holds is dead at once (a
+    /// restart frees every slot, a job that panics drops its slot) and
+    /// `stale_after` is not read.
+    /// `heartbeat_at` is left as the dead owner wrote it, so the stale
+    /// window of the FAILED-prefix duty counts from the owner's last beat
+    /// and not from the takeover. `None` when the row is not CREATING, is
+    /// gone, has a live owner, or is already claimed by another task; the
+    /// old generation's writes through its [`JobClaim`] find
+    /// [`WriteOutcome::NotMatched`] from then on.
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>>;
+
     /// The rows of `store` with `status` whose `clock` column is older than
     /// `age` on the database's clock: the maintenance command's test of a
     /// live owner (a CREATING or FAILED row it does not list under the
-    /// window on [`StaleClock::Heartbeat`] has one). The comparison is the
+    /// window on [`StaleClock::Heartbeat`] has one), and the reconciler's
+    /// listing for the FAILED-prefix delay (`Failed`,
+    /// [`StaleClock::Heartbeat`]) and the tombstone retention (`Failed` or
+    /// `Deleted`, [`StaleClock::Completed`]). The comparison is the
     /// backend's, in its own query, so the engine never compares a row's
     /// timestamp with a clock of its own.
     fn list_backup_rows_older_than<'a>(
@@ -823,6 +851,17 @@ pub trait BackupCatalog: Send + Sync {
         clock: StaleClock,
         age: Duration,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>>;
+
+    /// Remove the restore registrations a backend keeps beside its rows that
+    /// name a target no longer a CREATING restore target of that backup, and
+    /// return the ARNs of the backups touched. Only Cassandra keeps such a
+    /// map (`active_restores`, maintained by lightweight transactions whose
+    /// removal step can be lost with its owner); every other backend derives
+    /// the in-use check from the target rows themselves and has nothing to
+    /// sweep, which is what the default body says.
+    fn sweep_restore_registrations(&self) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     /// The name of a CREATING restore target registered from the backup, if
     /// any: the rule under which DeleteBackup and a second restore of the
@@ -962,6 +1001,36 @@ pub trait JobClaim: Send + Sync {
     /// Refresh `heartbeat_at` on the database's clock and confirm the claim
     /// is still held. The caller treats an `Err` as [`Heartbeat::Lost`].
     fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>>;
+
+    /// [`Self::heartbeat`] under `bound`: `None` when the beat did not
+    /// return within it, which the caller treats as a lost claim. The default
+    /// bounds the whole call. A backend whose beat queues behind a lock of
+    /// its own process before it reaches the catalog (SQLite's engine write
+    /// lock, held by a GSI backfill or a large write for as long as it
+    /// takes) measures the bound from the moment the beat holds that lock,
+    /// so a writer holding it past a period delays the beat and does not end
+    /// the job: the queue is this process's, not a sign the claim is lost.
+    fn heartbeat_within(
+        &self,
+        bound: Duration,
+    ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+        Box::pin(async move { tokio::time::timeout(bound, self.heartbeat()).await.ok() })
+    }
+
+    /// Whether [`Self::heartbeat_within`] can wait outside its bound before
+    /// the bound starts (SQLite's beat queues behind the engine write lock
+    /// of its own process, so the wait is this process's and never a sign of
+    /// a takeover). The engine's pre-put check treats a beat in flight as
+    /// confirming the claim for as long as it waits where this is `true`,
+    /// and not at all where it is `false` (the default): there the bound
+    /// covers the whole call, so the check's two-period rule already covers
+    /// a beat in flight, and a process stopped and resumed (mid-beat, or
+    /// between beats, whose missed tick starts a beat at once) would
+    /// otherwise pass the check while that beat runs, though another owner
+    /// may have taken the row over during the stop.
+    fn heartbeat_parks_before_its_bound(&self) -> bool {
+        false
+    }
 
     /// Move the record from `from` to `to`, conditioned on the claim's
     /// generation and on the record being in `from`.
