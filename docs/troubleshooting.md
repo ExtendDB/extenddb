@@ -910,7 +910,7 @@ The error log line names the exact relations for one leaked table and gives this
 pool_size = 50  # default is 20
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb';` (the data database's default name).
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 

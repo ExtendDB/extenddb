@@ -76,7 +76,7 @@ Last updated: 2026-09-16
 
 ### A-1: Catalog/Data Database Separation
 
-**Design requirement:** Two databases — catalog (`extenddb`) for metadata, data (`extenddb_data`) for user items (REQ-CAT-001, REQ-CAT-002).
+**Design requirement:** Two databases — a catalog for metadata and a data database for user items (REQ-CAT-001, REQ-CAT-002); on PostgreSQL `init` names them `extenddb_catalog` and `extenddb` by default.
 
 **Current state:** Implemented on PostgreSQL. `extenddb init` creates both databases, records the data connection string in the catalog `settings` table (`storage/src/bootstrapper.rs:139`, called at `app/src/cmd_init.rs:334`), and initialises the data schema. The runtime reads that setting and opens a second pool (`storage-postgres/src/lib.rs:238-256`). Table creation, the GSI queue, the item-write paths, vector index data, and the backup and stream engines all take that pool (`create_table.rs:311`, `gsi_queue.rs`, `data/put_item.rs`, `data/vector_index.rs`, `backup_engine.rs`, `stream_engine.rs`), and `create_table.rs:300` commits catalog metadata before creating data tables. `extenddb destroy` drops both databases (`storage-postgres/src/bootstrapper.rs:725` and `:734`). SQLite co-locates catalog and data by design, which its worker module states (`storage-sqlite/src/workers.rs:11`).
 
