@@ -133,6 +133,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                None,                                // every account keyspace
                 token,
             )
             .await;

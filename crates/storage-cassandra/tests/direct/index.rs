@@ -1551,15 +1551,60 @@ async fn index_rows(engine: &CassandraEngine, account_keyspace: &str, index_id: 
     count.expect("a count")
 }
 
+/// The `UpdateTable` input that creates the GSI `StatusIndex`, keyed on
+/// `status`, on the table `table_name`.
+fn status_index_creation(table_name: &str) -> extenddb_core::types::UpdateTableInput {
+    use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
+
+    UpdateTableInput {
+        table_name: table_name.to_owned(),
+        billing_mode: None,
+        table_throughput_mode: None,
+        provisioned_throughput: None,
+        deletion_protection_enabled: None,
+        global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
+            create: Some(CreateGsiAction {
+                index_name: "StatusIndex".to_owned(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "status".to_owned(),
+                    key_type: KeyType::Hash,
+                }],
+                projection: Projection {
+                    projection_type: ProjectionType::All,
+                    non_key_attributes: None,
+                },
+                provisioned_throughput: None,
+            }),
+            update: None,
+            delete: None,
+        }]),
+        attribute_definitions: Some(vec![
+            AttributeDefinition {
+                attribute_name: "id".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: "status".to_owned(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ]),
+        stream_specification: None,
+        table_class: None,
+        on_demand_throughput: None,
+        vector_index_updates: None,
+    }
+}
+
 /// A backfill the GSI recovery worker started ends before the worker
 /// returns: once the worker's token fires, the backfill writes no more index
 /// rows and does not mark the index ACTIVE, so the server's stop at a lost
 /// registration, which waits for its workers, covers it. The table holds 40
 /// pages, so the backfill is still running when the token fires after its
-/// first page; the test fails, rather than passing, if it is not.
+/// first page; the test fails, rather than passing, if it is not. The worker
+/// scans only this test's keyspace: a worker another test started would
+/// also run this backfill, under a token this test does not fire.
 #[tokio::test]
 async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns() {
-    use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
     use extenddb_storage::TableEngine as _;
     use std::time::Duration;
 
@@ -1616,6 +1661,7 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
     let shutdown = extenddb_storage::CancellationToken::new();
     let worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
         engine.clone(),
+        &table.key_info.account_id,
         Duration::from_secs(120),
         Duration::from_secs(60),
         shutdown.clone(),
@@ -1623,43 +1669,7 @@ async fn a_backfill_the_recovery_worker_started_ends_before_the_worker_returns()
     engine
         .update_table(
             &table.key_info.account_id,
-            UpdateTableInput {
-                table_name: table.key_info.table_name.clone(),
-                billing_mode: None,
-                table_throughput_mode: None,
-                provisioned_throughput: None,
-                deletion_protection_enabled: None,
-                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
-                    create: Some(CreateGsiAction {
-                        index_name: "StatusIndex".to_owned(),
-                        key_schema: vec![KeySchemaElement {
-                            attribute_name: "status".to_owned(),
-                            key_type: KeyType::Hash,
-                        }],
-                        projection: Projection {
-                            projection_type: ProjectionType::All,
-                            non_key_attributes: None,
-                        },
-                        provisioned_throughput: None,
-                    }),
-                    update: None,
-                    delete: None,
-                }]),
-                attribute_definitions: Some(vec![
-                    AttributeDefinition {
-                        attribute_name: "id".to_owned(),
-                        attribute_type: ScalarAttributeType::S,
-                    },
-                    AttributeDefinition {
-                        attribute_name: "status".to_owned(),
-                        attribute_type: ScalarAttributeType::S,
-                    },
-                ]),
-                stream_specification: None,
-                table_class: None,
-                on_demand_throughput: None,
-                vector_index_updates: None,
-            },
+            status_index_creation(&table.key_info.table_name),
         )
         .await
         .expect("add the index");
@@ -1838,7 +1848,6 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
     // time, the backfilled row would sit above that tombstone and outlive the
     // item.
     use cdrs_tokio::types::IntoRustByName as _;
-    use extenddb_core::types::{CreateGsiAction, GlobalSecondaryIndexUpdate, UpdateTableInput};
     use extenddb_storage::TableEngine as _;
     use std::time::Duration;
 
@@ -1875,6 +1884,7 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
     let shutdown = extenddb_storage::CancellationToken::new();
     let _worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
         engine.clone(),
+        &table.key_info.account_id,
         Duration::from_secs(120),
         Duration::from_secs(60),
         shutdown.clone(),
@@ -1882,43 +1892,7 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
     engine
         .update_table(
             &table.key_info.account_id,
-            UpdateTableInput {
-                table_name: table.key_info.table_name.clone(),
-                billing_mode: None,
-                table_throughput_mode: None,
-                provisioned_throughput: None,
-                deletion_protection_enabled: None,
-                global_secondary_index_updates: Some(vec![GlobalSecondaryIndexUpdate {
-                    create: Some(CreateGsiAction {
-                        index_name: "StatusIndex".to_owned(),
-                        key_schema: vec![KeySchemaElement {
-                            attribute_name: "status".to_owned(),
-                            key_type: KeyType::Hash,
-                        }],
-                        projection: Projection {
-                            projection_type: ProjectionType::All,
-                            non_key_attributes: None,
-                        },
-                        provisioned_throughput: None,
-                    }),
-                    update: None,
-                    delete: None,
-                }]),
-                attribute_definitions: Some(vec![
-                    AttributeDefinition {
-                        attribute_name: "id".to_owned(),
-                        attribute_type: ScalarAttributeType::S,
-                    },
-                    AttributeDefinition {
-                        attribute_name: "status".to_owned(),
-                        attribute_type: ScalarAttributeType::S,
-                    },
-                ]),
-                stream_specification: None,
-                table_class: None,
-                on_demand_throughput: None,
-                vector_index_updates: None,
-            },
+            status_index_creation(&table.key_info.table_name),
         )
         .await
         .expect("add the index");
@@ -1972,6 +1946,165 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
         "the backfilled index row outlived the deleted item"
     );
     shutdown.cancel();
+}
+
+/// The tables of `keyspace`, from the schema.
+async fn keyspace_tables(engine: &CassandraEngine, keyspace: &str) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    extenddb_storage_cassandra::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
+        cdrs_tokio::query_values!(keyspace),
+        "keyspace_tables",
+    )
+    .await
+    .expect("read the keyspace's tables")
+    .iter()
+    .filter_map(|row| row.get_by_name("table_name").ok().flatten())
+    .collect()
+}
+
+/// The schema id of the table `table` in `keyspace`, or `None` when the
+/// table does not exist. A table dropped and created again has a new id.
+async fn schema_table_id(
+    engine: &CassandraEngine,
+    keyspace: &str,
+    table: &str,
+) -> Option<uuid::Uuid> {
+    use cdrs_tokio::types::IntoRustByName as _;
+
+    extenddb_storage_cassandra::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+        &engine.session_arc(),
+        "SELECT id FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
+        cdrs_tokio::query_values!(keyspace, table),
+        "schema_table_id",
+    )
+    .await
+    .expect("read the table's schema id")
+    .first()
+    .and_then(|row| row.get_by_name("id").ok().flatten())
+}
+
+/// Recovery for one account leaves the indexes of other accounts alone. The
+/// catalog holds the indexes of every account. A test's worker that scanned
+/// every keyspace would run another test's backfill under its own token, and
+/// a pass that took another account's index would create the index's data
+/// table in its own keyspace and run a backfill of a base table that
+/// keyspace does not hold. The pass over the owner's keyspace then runs the
+/// backfill.
+#[tokio::test]
+async fn recovery_for_one_account_leaves_the_indexes_of_other_accounts_alone() {
+    use extenddb_storage::TableEngine as _;
+    use std::time::Duration;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = test_config();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    let owner = crate::helpers::TestTable::new(&engine, "RecoveryOwnerTable", false).await;
+    let other = crate::helpers::TestTable::new(&engine, "RecoveryOtherTable", false).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    engine
+        .process_control_plane_transitions()
+        .await
+        .expect("activate the tables");
+    let mut item = Item::new();
+    item.insert("id".to_owned(), AttributeValue::S("x".to_owned()));
+    item.insert("status".to_owned(), AttributeValue::S("s".to_owned()));
+    engine
+        .put_item(
+            &owner.key_info,
+            item,
+            false,
+            None,
+            &ExpressionMaps::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("put_item");
+
+    // No worker runs, so the index stays CREATING with no heartbeat.
+    engine
+        .update_table(
+            &owner.key_info.account_id,
+            status_index_creation(&owner.key_info.table_name),
+        )
+        .await
+        .expect("add the index");
+    let table_id = owner.key_info.table_id.clone();
+    let (status, heartbeat, index_id) = index_state(&engine, &table_id, "StatusIndex").await;
+    assert_eq!((status.as_str(), heartbeat), ("CREATING", None));
+    let index_table = extenddb_storage_cassandra::data::ddl::index_table_name(&index_id);
+    let owner_keyspace = engine.account_keyspace(&owner.key_info.account_id);
+    let other_keyspace = engine.account_keyspace(&other.key_info.account_id);
+    let created = schema_table_id(&engine, &owner_keyspace, &index_table).await;
+
+    // A worker started for the other account passes every second. A recovery
+    // of the index would drop and create its data table first, then write
+    // its heartbeat after the first page.
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = extenddb_storage_cassandra::workers::spawn_gsi_backfill_recovery_for_tests(
+        engine.clone(),
+        &other.key_info.account_id,
+        Duration::from_secs(120),
+        Duration::from_secs(1),
+        shutdown.clone(),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (status, heartbeat, _) = index_state(&engine, &table_id, "StatusIndex").await;
+    let after = schema_table_id(&engine, &owner_keyspace, &index_table).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(30), worker)
+        .await
+        .expect("the worker returns within 30 s of its token")
+        .expect("the worker does not panic");
+    assert_eq!(
+        ((status.as_str(), heartbeat), after),
+        (("CREATING", None), created),
+        "a worker started for another account recovered the index"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        extenddb_storage_cassandra::workers::recover_stale_gsi_backfills_for_tests(
+            &engine,
+            &other.key_info.account_id,
+            Duration::from_secs(120),
+        ),
+    )
+    .await
+    .expect("the pass over the other account's keyspace ends within 180 s")
+    .expect("the pass over the other account's keyspace");
+    assert!(
+        !keyspace_tables(&engine, &other_keyspace)
+            .await
+            .contains(&index_table),
+        "the pass over another account's keyspace created {index_table} there"
+    );
+    let (status, heartbeat, _) = index_state(&engine, &table_id, "StatusIndex").await;
+    assert_eq!(
+        (status.as_str(), heartbeat),
+        ("CREATING", None),
+        "the pass over another account's keyspace ran the backfill"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        extenddb_storage_cassandra::workers::recover_stale_gsi_backfills_for_tests(
+            &engine,
+            &owner.key_info.account_id,
+            Duration::from_secs(120),
+        ),
+    )
+    .await
+    .expect("the pass over the owner's keyspace ends within 180 s")
+    .expect("the pass over the owner's keyspace");
+    let (status, _, _) = index_state(&engine, &table_id, "StatusIndex").await;
+    assert_eq!(status, "ACTIVE", "the pass over the owner's keyspace");
+    assert_eq!(index_rows(&engine, &owner_keyspace, &index_id).await, 1);
 }
 
 #[tokio::test]
