@@ -259,9 +259,9 @@ async fn create_databases(base: &str, names: &[String; 2], pgvector: bool) -> bo
 
 /// Apply every catalog and data migration the crate ships, as `extenddb
 /// migrate --yes` does (the data ones on `data_url`, which is the catalog
-/// database on the shared layout), and pgvector if asked. The lists live in
-/// the crate (`migrations.rs`), so a migration added there is applied here
-/// without this file knowing.
+/// database on the shared layout), and pgvector if asked. The table lives in
+/// the crate (`migrations/mod.rs`), so a migration added there is applied
+/// here without this file knowing.
 async fn migrate(catalog: &PgPool, data_url: &str, pgvector: bool) {
     let data = PgPoolOptions::new()
         .max_connections(2)
@@ -281,14 +281,19 @@ async fn migrate(catalog: &PgPool, data_url: &str, pgvector: bool) {
 }
 
 /// Zero the control-plane and propagation delays, and point the engine at
-/// `separate_data_url` when there is one.
+/// `separate_data_url` when there is one. The rows are written, not only
+/// updated: migration 1 seeds no setting, and the tests below that change a
+/// delay update the row written here.
 async fn configure_catalog(catalog: &PgPool, separate_data_url: Option<&String>) {
     for key in ["control_plane_delay_seconds", "index_propagation_delay_ms"] {
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = $1")
-            .bind(key)
-            .execute(catalog)
-            .await
-            .expect("setting");
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ($1, '0') \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(key)
+        .execute(catalog)
+        .await
+        .expect("setting");
     }
     if let Some(data_url) = separate_data_url {
         sqlx::query(
@@ -550,9 +555,18 @@ async fn half_the_pool_holds_snapshots(shared: bool) {
     .await
     .expect("an open over the bound is refused at once, not queued")
     .expect_err("the sixth open is over the bound");
-    assert!(
-        matches!(err, extenddb_storage::error::StorageError::LimitExceeded(_)),
-        "{err}"
+    // The one refusal text every job bound answers, naming this one.
+    assert_eq!(
+        err.to_string(),
+        extenddb_storage::error::StorageError::LimitExceeded(
+            extenddb_storage::backup_catalog::limit_exceeded_message(
+                extenddb_storage::backup_catalog::JobBound::Counted {
+                    name: extenddb_storage_postgres::SNAPSHOT_SLOT_BOUND,
+                    limit: 5,
+                }
+            )
+        )
+        .to_string()
     );
     let key: Item = [
         ("pk".to_owned(), AttributeValue::S("p000".to_owned())),
@@ -1072,6 +1086,662 @@ async fn snapshot_marker_and_key_order(shared: bool) {
 }
 on_both_layouts!(snapshot_marker_and_key_order);
 
+/// The keyset pages respect the byte budget on both layouts
+/// (`snapshot_conformance::run_page_bounds`), and the rows the server reads
+/// past each page's cut are those the row bound lets it: with a budget of
+/// eight rows the first page asks for `MIN_PAGE_ROWS` (16) and keeps eight,
+/// so it reads eight it drops; every later page is sized from the largest
+/// row of the page before (the budget divided by it, eight here), so it
+/// reads exactly the rows it keeps and drops none. The figure is asserted
+/// exactly: a counter that never moves would pass a bound (lesson 25), and a
+/// row bound sized from the average again reads the same eight, so the
+/// mixed-page case is pinned by `next_page_rows`'s unit test and by
+/// `the_row_bound_remembers_large_rows_among_small_ones`.
+async fn pages_are_cut_at_the_byte_budget(shared: bool) {
+    let s = scratch_with(shared).await;
+    let bounds = snapshot_conformance::run_page_bounds(
+        &s.hooks,
+        &s.engine,
+        ACCOUNT,
+        "page_bounds",
+        || async {
+            s.engine
+                .process_control_plane_transitions()
+                .await
+                .expect("pump");
+        },
+    )
+    .await;
+    let past_cut = bounds.rows_past_cut;
+    let first_page = u64::try_from(
+        extenddb_storage_postgres::MIN_PAGE_ROWS - snapshot_conformance::PAGE_BOUNDS_ROWS,
+    )
+    .unwrap();
+    // The figure the memory record cites beside the RSS numbers.
+    eprintln!(
+        "rows read past the cut: {past_cut} over {} pages of {} rows ({first_page} expected, all \
+         on the first page)",
+        bounds.pages,
+        bounds.budget / bounds.row_bytes
+    );
+    assert_eq!(
+        past_cut, first_page,
+        "{past_cut} rows read past the cut over {} pages: the first page reads MIN_PAGE_ROWS and \
+         drops {first_page}, and every later page is sized to the rows it keeps",
+        bounds.pages
+    );
+}
+on_both_layouts!(pages_are_cut_at_the_byte_budget);
+
+/// Every plan node type under `node`, in depth-first order.
+fn plan_node_types(node: &serde_json::Value, into: &mut Vec<String>) {
+    if let Some(t) = node.get("Node Type").and_then(serde_json::Value::as_str) {
+        into.push(t.to_owned());
+    }
+    for child in node
+        .get("Plans")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        plan_node_types(child, into);
+    }
+}
+
+/// The index names every scan node under `node` uses.
+fn plan_index_names(node: &serde_json::Value, into: &mut Vec<String>) {
+    if let Some(name) = node.get("Index Name").and_then(serde_json::Value::as_str) {
+        into.push(name.to_owned());
+    }
+    for child in node
+        .get("Plans")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        plan_index_names(child, into);
+    }
+}
+
+/// A 100k-row composite-key table (`pk` = `p00000`..`p02000`, 50 rows each,
+/// `sk_n` = 1..100000) filled straight into the data table and analyzed,
+/// with its description and a data pool; the engine's `put_item` would take
+/// minutes for 100k rows.
+async fn hundred_k_table(s: &Scratch) -> (extenddb_core::types::TableDescription, PgPool) {
+    filled_table(
+        s,
+        "hundred_k",
+        "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                   'sk', jsonb_build_object('N', i::text), \
+                                   'v', jsonb_build_object('S', repeat('x', 100))) \
+         FROM generate_series(1, 100000) AS i",
+    )
+    .await
+}
+
+/// One key value bound to a page query's seek: text (numeric keys travel
+/// as text) or bytes.
+enum Bind {
+    Text(&'static str),
+    Bytes(Vec<u8>),
+}
+
+/// `EXPLAIN (FORMAT JSON)` of the page query (with `COLLATE "C"` on its text
+/// key columns when `collate_c`, as the engine writes it for a table whose
+/// columns have that collation) after `after` (`None` for the first page) at
+/// row bound `n`: the plan's node types in depth-first order and the index
+/// names its scans use, with the plan for the message.
+async fn explain_page(
+    data: &PgPool,
+    desc: &extenddb_core::types::TableDescription,
+    collate_c: bool,
+    after: Option<Vec<Bind>>,
+    n: i64,
+) -> (Vec<String>, Vec<String>, serde_json::Value) {
+    let budget = i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap();
+    let sql =
+        extenddb_storage_postgres::page_sql_for(desc, &desc.table_id, collate_c, after.is_some());
+    let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
+    let mut explain = sqlx::query_scalar::<_, serde_json::Value>(&explain_sql);
+    let seek = after.is_some();
+    for value in after.into_iter().flatten() {
+        explain = match value {
+            Bind::Text(t) => explain.bind(t),
+            Bind::Bytes(b) => explain.bind(b),
+        };
+    }
+    let plan = explain
+        .bind(n)
+        .bind(budget)
+        .fetch_one(data)
+        .await
+        .unwrap_or_else(|e| panic!("explain (after a key: {seek}) at n = {n}: {e}"));
+    let root = &plan[0]["Plan"];
+    let mut types = Vec::new();
+    plan_node_types(root, &mut types);
+    let mut indexes = Vec::new();
+    plan_index_names(root, &mut indexes);
+    (types, indexes, plan)
+}
+
+/// Assert that a page query's plan is `Limit` over one `Index Scan` on the
+/// primary key index with no sort: the seek and the order both follow the
+/// index, so the page costs the server the rows it reads, up to `n`, each
+/// serialized once, and not the rows before them.
+fn assert_index_scan(
+    label: &str,
+    types: &[String],
+    indexes: &[String],
+    plan: &serde_json::Value,
+    pkey: &str,
+) {
+    assert!(
+        !types.iter().any(|t| t == "Sort"),
+        "{label}: the plan sorts: {types:?}\n{plan}"
+    );
+    let scans: Vec<&str> = types
+        .iter()
+        .map(String::as_str)
+        .filter(|t| t.ends_with("Scan") && *t != "Subquery Scan")
+        .collect();
+    assert_eq!(
+        scans,
+        vec!["Index Scan"],
+        "{label}: the relation is not read by one index scan: {types:?}\n{plan}"
+    );
+    assert_eq!(
+        indexes,
+        vec![pkey.to_owned()],
+        "{label}: the scan does not use the primary key index\n{plan}"
+    );
+}
+
+/// A key shape the page query is run on: the `CreateTable` input, the data
+/// table's key columns, the `SELECT` filling 20,000 rows of it, and a key in
+/// its middle to seek past.
+struct KeyShape {
+    label: &'static str,
+    input: extenddb_core::types::CreateTableInput,
+    columns: &'static str,
+    rows: &'static str,
+    middle: Vec<Bind>,
+    /// Whether the text key columns have collation "C", so the engine writes
+    /// `COLLATE "C"` into the query (every table but the legacy one).
+    collate_c: bool,
+    /// Whether the stream reports the table ordered (a multi-part range key
+    /// has no format order; a legacy table's key column has the database
+    /// collation).
+    ordered: bool,
+}
+
+fn key_shape_input(name: &str, range: &[(&str, &str)]) -> extenddb_core::types::CreateTableInput {
+    let mut key_schema = vec![serde_json::json!({"AttributeName": "pk", "KeyType": "HASH"})];
+    let mut defs = vec![serde_json::json!({"AttributeName": "pk", "AttributeType": "S"})];
+    for (attr, ty) in range {
+        key_schema.push(serde_json::json!({"AttributeName": attr, "KeyType": "RANGE"}));
+        defs.push(serde_json::json!({"AttributeName": attr, "AttributeType": ty}));
+    }
+    serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": key_schema,
+        "AttributeDefinitions": defs,
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .expect("create input")
+}
+
+/// The six key shapes a data table's primary key can have: hash only; an
+/// `S`, `N` or `B` range key; a multi-part range key; and a legacy table
+/// whose text key column carries the database collation (recollated after
+/// the fill, as `legacy_collation_table_streams_unordered_and_complete`
+/// does).
+fn key_shapes() -> Vec<KeyShape> {
+    vec![
+        KeyShape {
+            label: "hash only",
+            input: key_shape_input("hash_only", &[]),
+            columns: "pk, item_data",
+            rows: "SELECT 'p' || lpad(i::text, 5, '0'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad(i::text, 5, '0')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "S range key",
+            input: key_shape_input("range_s", &[("sk", "S")]),
+            columns: "pk, sk_s, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), 'k' || lpad(i::text, 5, '0'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('S', 'k' || lpad(i::text, 5, '0')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("k10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "N range key",
+            input: key_shape_input("range_n", &[("sk", "N")]),
+            columns: "pk, sk_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "B range key",
+            input: key_shape_input("range_b", &[("sk", "B")]),
+            columns: "pk, sk_b, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), decode(lpad(to_hex(i), 8, '0'), 'hex'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('B', encode(decode(lpad(to_hex(i), 8, '0'), 'hex'), 'base64')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![
+                Bind::Text("p00200"),
+                Bind::Bytes(10000_u32.to_be_bytes().to_vec()),
+            ],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "multi-part range key (S, N)",
+            input: key_shape_input("multi_part", &[("sk", "S"), ("sk2", "N")]),
+            columns: "pk, sk_s, sk2_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), 'k' || lpad((i / 10)::text, 4, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('S', 'k' || lpad((i / 10)::text, 4, '0')), \
+                                      'sk2', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![
+                Bind::Text("p00200"),
+                Bind::Text("k1000"),
+                Bind::Text("10000"),
+            ],
+            collate_c: true,
+            ordered: false,
+        },
+        KeyShape {
+            label: "legacy collation (pk on the database collation)",
+            input: key_shape_input("legacy", &[("sk", "N")]),
+            columns: "pk, sk_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("10000")],
+            collate_c: false,
+            ordered: false,
+        },
+    ]
+}
+
+/// On every key shape a table can have, the page query (first page and a
+/// page after a key in the table's middle, at the first page's row bound of
+/// 16 and at 1000) is `Limit` over one `Index Scan` on the primary key index
+/// with no sort, on a 20,000-row table; and the stream over the rows is
+/// complete, ordered where the shape has a format order, in 21 round trips
+/// (16 rows, then nineteen pages of 1000 and a last of 984). The legacy
+/// table carries no `COLLATE "C"` in its query and pages in its index's
+/// order. Near the end of a small table the plan differs:
+/// `the_last_page_sorts_the_rows_after_the_seek`.
+async fn the_page_query_is_an_index_scan_on_every_key_shape(shared: bool) {
+    let s = scratch_with(shared).await;
+    for shape in key_shapes() {
+        let name = shape.input.table_name.clone();
+        create_active(&s, shape.input).await;
+        let desc = s
+            .engine
+            .describe_table(
+                ACCOUNT,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: name.clone(),
+                },
+            )
+            .await
+            .expect("describe");
+        let ddb_table = data_table_name(&desc.table_id);
+        let data = s.data_pool().await;
+        sqlx::query(&format!(
+            "INSERT INTO {ddb_table} ({}) {}",
+            shape.columns, shape.rows
+        ))
+        .execute(&data)
+        .await
+        .unwrap_or_else(|e| panic!("{}: fill the table: {e}", shape.label));
+        if shape.label.starts_with("legacy") {
+            sqlx::query(&format!(
+                "ALTER TABLE {ddb_table} ALTER COLUMN pk TYPE TEXT COLLATE \"default\""
+            ))
+            .execute(&data)
+            .await
+            .expect("recollate");
+        }
+        sqlx::query(&format!("ANALYZE {ddb_table}"))
+            .execute(&data)
+            .await
+            .expect("analyze");
+        let pkey = format!("{}_pkey", ddb_table.trim_matches('"'));
+        for n in [
+            i64::try_from(extenddb_storage_postgres::MIN_PAGE_ROWS).unwrap(),
+            1000,
+        ] {
+            let (types, indexes, plan) = explain_page(&data, &desc, shape.collate_c, None, n).await;
+            assert_index_scan(
+                &format!("{}, first page at n = {n}", shape.label),
+                &types,
+                &indexes,
+                &plan,
+                &pkey,
+            );
+            let middle: Vec<Bind> = shape
+                .middle
+                .iter()
+                .map(|b| match b {
+                    Bind::Text(t) => Bind::Text(t),
+                    Bind::Bytes(v) => Bind::Bytes(v.clone()),
+                })
+                .collect();
+            let (types, indexes, plan) =
+                explain_page(&data, &desc, shape.collate_c, Some(middle), n).await;
+            assert_index_scan(
+                &format!("{}, page after a key at n = {n}", shape.label),
+                &types,
+                &indexes,
+                &plan,
+                &pkey,
+            );
+        }
+        let sql =
+            extenddb_storage_postgres::page_sql_for(&desc, &desc.table_id, shape.collate_c, true);
+        assert_eq!(
+            sql.contains("COLLATE \"C\""),
+            shape.collate_c,
+            "{}: {sql}",
+            shape.label
+        );
+        data.close().await;
+
+        let fetches_before = extenddb_storage::snapshot::paging::fetches();
+        let snapshot = s
+            .engine
+            .open_table_snapshot(ACCOUNT, &name)
+            .await
+            .expect("open");
+        assert_eq!(snapshot.key_ordered, shape.ordered, "{}", shape.label);
+        let order = extenddb_core::backup_format::KeyOrder::resolve(
+            &snapshot.description.key_schema,
+            &snapshot.description.attribute_definitions,
+        )
+        .ok();
+        let items: Vec<extenddb_core::types::Item> = {
+            use futures::StreamExt as _;
+            snapshot
+                .items
+                .map(|item| item.expect("item"))
+                .collect()
+                .await
+        };
+        assert_eq!(items.len(), 20_000, "{}: every row streams", shape.label);
+        if shape.ordered {
+            let order = order.expect("an ordered shape has a format order");
+            for pair in items.windows(2) {
+                assert_eq!(
+                    order.compare(&pair[0], &pair[1]).expect("comparable keys"),
+                    std::cmp::Ordering::Less,
+                    "{}: {:?} is not before {:?}",
+                    shape.label,
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+        let fetches = extenddb_storage::snapshot::paging::fetches() - fetches_before;
+        assert_eq!(
+            fetches, 21,
+            "{}: a first page of 16, nineteen of 1000 and a last of 984",
+            shape.label
+        );
+    }
+}
+on_both_layouts!(the_page_query_is_an_index_scan_on_every_key_shape);
+
+/// Bytes of item text in a 27 MB row of `scattered_table`: the size of
+/// #394's worst-expansion line, so three such rows fill the 64 MiB budget
+/// (0, 27, 54 MB before each) and the fourth is the next page's.
+const LARGE_ROW_PAD: usize = 27_000_000;
+
+/// A table of `small` rows of 50-byte text under keys `a0000`.., with a
+/// 27 MB row at every `every`th key (`i % every == every - 1`), filled
+/// straight into the data table. Key order does not sort items by size, so
+/// a table whose large items are a minority is this shape rather than the
+/// grouped one (`put-worst`'s `zz` keys after the `a` keys).
+async fn scattered_table(
+    s: &Scratch,
+    name: &str,
+    small: usize,
+    every: usize,
+) -> (extenddb_core::types::TableDescription, PgPool) {
+    filled_table(
+        s,
+        name,
+        &format!(
+            "SELECT 'a' || lpad(i::text, 4, '0'), i, \
+                    jsonb_build_object('pk', jsonb_build_object('S', 'a' || lpad(i::text, 4, '0')), \
+                                       'sk', jsonb_build_object('N', i::text), \
+                                       'v', jsonb_build_object('S', CASE WHEN i % {every} = {} \
+                                           THEN repeat('x', {LARGE_ROW_PAD}) ELSE repeat('x', 50) END)) \
+             FROM generate_series(0, {}) AS i",
+            every - 1,
+            small - 1
+        ),
+    )
+    .await
+}
+
+/// On a table whose 27 MB rows are scattered among small ones (every 33rd
+/// key of 300, nine large rows) the row bound's memory holds: the first
+/// page reads 16 small rows, the second asks for the row bound (1000), meets
+/// the large rows and reads every row left (284) for the 83 it keeps (up to
+/// and including the third large one, whose predecessors hold 54 MB), and
+/// every page after it asks for the floor (4) until the table ends, since
+/// the memory covers a row bound's worth of rows and the table has fewer:
+/// 201 rows read past the cut, all on the second page, over 53 round trips,
+/// every row once in key order. With one page of memory the bound returns to
+/// 1000 after four small rows and the over-read recurs (306 rows past the
+/// cut over 7 pages on this table), which is what the rule corrects; the
+/// bound that remains is the second page, and then the page that follows a
+/// row bound's worth of small rows, each reading up to `n` rows of up to the
+/// line cap: the 201 rows here are that second page's.
+async fn the_row_bound_remembers_large_rows_among_small_ones(shared: bool) {
+    let s = scratch_with(shared).await;
+    let (_desc, data) = scattered_table(&s, "scattered", 300, 33).await;
+    data.close().await;
+    let budget = extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES;
+    extenddb_storage::snapshot::paging::reset_page_counters();
+    let fetches_before = extenddb_storage::snapshot::paging::fetches();
+    let snapshot = s
+        .engine
+        .open_table_snapshot(ACCOUNT, "scattered")
+        .await
+        .expect("open");
+    assert!(snapshot.key_ordered);
+    let keys: Vec<String> = {
+        use futures::StreamExt as _;
+        snapshot
+            .items
+            .map(|item| match item.expect("item").get("pk") {
+                Some(extenddb_core::types::AttributeValue::S(v)) => v.clone(),
+                other => panic!("pk is {other:?}"),
+            })
+            .collect()
+            .await
+    };
+    let expected: Vec<String> = (0..300).map(|i| format!("a{i:04}")).collect();
+    assert_eq!(keys, expected, "every row once, in key order");
+    let fetches = extenddb_storage::snapshot::paging::fetches() - fetches_before;
+    let past_cut = extenddb_storage::snapshot::paging::rows_past_cut();
+    let first = extenddb_storage_postgres::MIN_PAGE_ROWS;
+    let second_read = 300 - first;
+    let second_kept = 99 - first;
+    let rest: usize = 300 - 99;
+    eprintln!(
+        "scattered rows: {past_cut} rows read past the cut over {fetches} pages ({} expected, all on \
+         the second page)",
+        second_read - second_kept
+    );
+    assert_eq!(
+        past_cut,
+        u64::try_from(second_read - second_kept).unwrap(),
+        "rows read past the cut: the second page reads the {second_read} rows left for the \
+         {second_kept} it keeps, and no later page asks for more than the floor"
+    );
+    // The floor is written as its value: a floor of 2 (the budget divided by
+    // a 27 MB row) would page a table of such rows two to a page with no page
+    // reaching its cut, and show here as 103 round trips.
+    assert_eq!(
+        fetches,
+        u64::try_from(2 + rest.div_ceil(4)).unwrap(),
+        "round trips: two pages, then {rest} rows at the floor of four"
+    );
+    let largest = extenddb_storage::snapshot::paging::max_page_bytes();
+    assert!(
+        largest >= budget && largest < budget + LARGE_ROW_PAD,
+        "the largest page holds {largest} bytes"
+    );
+}
+on_both_layouts!(the_row_bound_remembers_large_rows_among_small_ones);
+
+/// A table filled with `rows` straight into its data table and analyzed, as
+/// `hundred_k_table` does, with its description and a data pool; `rows` is
+/// the `SELECT` producing `(pk, sk_n, item_data)`.
+async fn filled_table(
+    s: &Scratch,
+    name: &str,
+    rows: &str,
+) -> (extenddb_core::types::TableDescription, PgPool) {
+    create_active(s, snapshot_conformance::table_input(name)).await;
+    let desc = s
+        .engine
+        .describe_table(
+            ACCOUNT,
+            extenddb_core::types::DescribeTableInput {
+                table_name: name.to_owned(),
+            },
+        )
+        .await
+        .expect("describe");
+    let ddb_table = data_table_name(&desc.table_id);
+    let data = s.data_pool().await;
+    sqlx::query(&format!(
+        "INSERT INTO {ddb_table} (pk, sk_n, item_data) {rows}"
+    ))
+    .execute(&data)
+    .await
+    .expect("fill the table");
+    sqlx::query(&format!("ANALYZE {ddb_table}"))
+        .execute(&data)
+        .await
+        .expect("analyze");
+    (desc, data)
+}
+
+/// The plan near the end of a table, where the planner's estimate of the
+/// rows after the seek is under the row bound, is the planner's choice and
+/// not always the index scan: on the 100k-row table a page after the
+/// 99,990th row at `n` = 1000 (ten rows left) is still `Limit` over the
+/// `Index Scan`, while on a table of 1,060 rows (1,000 under one key prefix,
+/// 60 under another) a page after the third
+/// of the last 60 at `n` = 810 is a `Bitmap Heap Scan` driven by a `Bitmap
+/// Index Scan` on the primary key index and a `Sort` of the 57 rows after
+/// the seek under the `Limit`, so that page sorts the rows it reads, with
+/// their text (PostgreSQL 16). The cell pins both so the module doc's
+/// statement of them stays measured; the seek uses the primary key index in
+/// both, and the sorted page returns the rows after the seek in key order.
+async fn the_last_page_sorts_the_rows_after_the_seek(shared: bool) {
+    let s = scratch_with(shared).await;
+    let (desc, data) = hundred_k_table(&s).await;
+    let ddb_table = data_table_name(&desc.table_id);
+    let pkey = vec![format!("{}_pkey", ddb_table.trim_matches('"'))];
+    let (types, indexes, plan) = explain_page(
+        &data,
+        &desc,
+        true,
+        Some(vec![Bind::Text("p01999"), Bind::Text("99990")]),
+        1000,
+    )
+    .await;
+    eprintln!("100k rows, a page after ('p01999', 99990) at n = 1000: {types:?}");
+    assert_eq!(
+        indexes, pkey,
+        "100k: the seek does not use the primary key index\n{plan}"
+    );
+    assert!(
+        types.iter().any(|t| t == "Index Scan") && !types.iter().any(|t| t == "Sort"),
+        "100k rows: the page near the end is not the index scan the module doc says it is \
+         (correct the doc if the planner changed): {types:?}\n{plan}"
+    );
+    data.close().await;
+
+    let (desc, data) = filled_table(
+        &s,
+        "small",
+        "SELECT pk, i, jsonb_build_object('pk', jsonb_build_object('S', pk), \
+                'sk', jsonb_build_object('N', i::text), \
+                'v', jsonb_build_object('S', repeat('x', 50))) \
+         FROM (SELECT 'a' || lpad(i::text, 4, '0') AS pk, i FROM generate_series(0, 999) AS i \
+               UNION ALL \
+               SELECT 'zz' || lpad(i::text, 3, '0'), i FROM generate_series(0, 59) AS i) rows",
+    )
+    .await;
+    let ddb_table = data_table_name(&desc.table_id);
+    let pkey = vec![format!("{}_pkey", ddb_table.trim_matches('"'))];
+    let (types, indexes, plan) = explain_page(
+        &data,
+        &desc,
+        true,
+        Some(vec![Bind::Text("zz002"), Bind::Text("2")]),
+        810,
+    )
+    .await;
+    eprintln!("1,060 rows, a page after ('zz002', 2) at n = 810: {types:?}");
+    assert_eq!(
+        indexes, pkey,
+        "1,060: the seek does not use the primary key index\n{plan}"
+    );
+    assert!(
+        types.iter().any(|t| t == "Sort") && types.iter().any(|t| t == "Bitmap Heap Scan"),
+        "1,060 rows: the page near the end is not the bitmap scan and Sort the module doc says \
+         PostgreSQL 16 chooses there (correct the doc if the planner changed): {types:?}\n{plan}"
+    );
+    // The sorted page's rows: the 57 after the seek, in key order.
+    let sql = extenddb_storage_postgres::page_sql_for(&desc, &desc.table_id, true, true);
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!("SELECT c0, c1 FROM ({sql}) q"))
+        .bind("zz002")
+        .bind("2")
+        .bind(810_i64)
+        .bind(i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap())
+        .fetch_all(&data)
+        .await
+        .expect("the last page");
+    let expected: Vec<(String, String)> = (3..60)
+        .map(|i| (format!("zz{i:03}"), i.to_string()))
+        .collect();
+    assert_eq!(rows, expected);
+    data.close().await;
+}
+on_both_layouts!(the_last_page_sorts_the_rows_after_the_seek);
+
 /// A hash-only table with no index, for tests that need many of them.
 fn plain_input(name: &str) -> extenddb_core::types::CreateTableInput {
     serde_json::from_value(serde_json::json!({
@@ -1222,16 +1892,18 @@ on_both_layouts!(an_open_held_with_deletes_queued_completes);
 
 /// A restored table's snapshot description carries the same
 /// `restore_summary` as `describe_table`'s (both read the `table_restores`
-/// row). The record is written directly, as `RestoreTableFromBackup` leaves
-/// it.
+/// row). The record is written directly, as a finished
+/// `RestoreTableFromBackup` leaves it: a DONE legacy job record.
 async fn a_restored_table_describes_its_restore(shared: bool) {
     let s = scratch_with(shared).await;
     create_active(&s, snapshot_conformance::table_input("restored")).await;
     snapshot_conformance::populate(&s.engine, ACCOUNT, "restored", 5).await;
     sqlx::query(
         "INSERT INTO table_restores \
-         (table_id, source_backup_arn, source_table_arn, restore_date_time) \
-         SELECT table_id, $1, $2, '2026-10-01T12:00:00.250Z' FROM tables \
+         (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+          status, kind, owner_generation, heartbeat_at, completed_at) \
+         SELECT table_id, $1, $2, '2026-10-01T12:00:00.250Z', \
+                'DONE', 'legacy', 0, now(), now() FROM tables \
          WHERE table_name = 'restored'",
     )
     .bind("arn:aws:dynamodb:us-east-1:123456789012:table/src/backup/01759320000250-0a1b2c3d")
@@ -1246,16 +1918,17 @@ async fn a_restored_table_describes_its_restore(shared: bool) {
 }
 on_both_layouts!(a_restored_table_describes_its_restore);
 
-/// The pid of the one backend whose last statement was the stream's `FETCH`.
+/// The pid of the one backend whose last statement was the stream's page
+/// query (its projection starts with the first key column's alias).
 async fn stream_backend(s: &Scratch, data: &PgPool) -> i32 {
     sqlx::query_scalar(
         "SELECT pid FROM pg_stat_activity WHERE datname = $1 \
-         AND state = 'idle in transaction' AND query LIKE 'FETCH%'",
+         AND state = 'idle in transaction' AND query LIKE 'SELECT page.k0 AS c0%'",
     )
     .bind(s.data_name())
     .fetch_one(data)
     .await
-    .expect("the stream's backend is idle in its transaction after a FETCH")
+    .expect("the stream's backend is idle in its transaction after a page query")
 }
 
 /// End the stream's backend from another session, as a server restart or
@@ -1429,7 +2102,7 @@ async fn release_wakes_the_active_poller(shared: bool, how: Release) {
                 match snapshot.items.next().await {
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break,
-                    None => panic!("the stream ended without the FETCH error"),
+                    None => panic!("the stream ended without the page query error"),
                 }
             }
             kept = Some(snapshot);
@@ -1564,7 +2237,7 @@ on_both_layouts!(cancelling_an_open_wakes_the_active_poller);
 /// first drop attempt, and its end wakes the poller, which drops the table
 /// within 3 s rather than at its next timed attempt about 9.5 s later.
 async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
-    use extenddb_storage::BackupEngine as _;
+    use extenddb_storage::{JobPermit, LegacyBackupReader as _};
     let s = scratch_with(shared).await;
     create_active(&s, snapshot_conformance::table_input("backed")).await;
     snapshot_conformance::populate(&s.engine, ACCOUNT, "backed", 20).await;
@@ -1580,7 +2253,9 @@ async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
         .await
         .expect("hold backups");
 
-    let backup = s.engine.create_backup(ACCOUNT, "backed", "held");
+    let backup = s
+        .engine
+        .create(ACCOUNT, "backed", "held", JobPermit::detached());
     let controller = async {
         let mut watcher = PgConnection::connect(&format!("{}/postgres", s.base))
             .await
@@ -1640,7 +2315,7 @@ async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
 }
 on_both_layouts!(the_in_catalog_backup_wakes_the_active_poller);
 
-/// A `FETCH` that fails (the backend ended under the stream) ends the stream
+/// A page query that fails (the backend ended under the stream) ends the stream
 /// at the error and frees its permit and connection at once: with the
 /// errored stream still held a full bound of five opens succeeds. The
 /// `SnapshotExpired` codes take this branch.
@@ -1662,10 +2337,10 @@ async fn a_fetch_error_ends_the_stream_and_frees_its_permit(shared: bool) {
         match snapshot.items.next().await {
             Some(Ok(_)) => items += 1,
             Some(Err(e)) => {
-                eprintln!("FETCH error after {items} items: {e}");
+                eprintln!("page query error after {items} items: {e}");
                 break;
             }
-            None => panic!("the stream ended without reporting the FETCH error"),
+            None => panic!("the stream ended without reporting the page query error"),
         }
     }
     assert_eq!(items, 5, "the first page, then the error");

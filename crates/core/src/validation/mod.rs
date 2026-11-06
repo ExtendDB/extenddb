@@ -1,8 +1,13 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod restorable_item;
 pub mod vector_item;
 
+pub use restorable_item::{
+    RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
+    SHOWN_VALUE_BYTES, validate_restorable_item,
+};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
@@ -267,9 +272,10 @@ mod search_schema_shape_tests {
         );
     }
 
-    /// Pins the measured number, because the obvious inference from the query-side
-    /// cap gives twenty and is wrong. A future edit "tidying" this to match the
-    /// query cap would break parity silently.
+    /// Pins the measured number. The query-side cap (`MAX_SEARCH_CONDITIONS`)
+    /// allows eighteen inline filters too, but it is a separate constant measured
+    /// separately, so a change to one must not be carried over to the other
+    /// without its own measurement.
     #[test]
     fn the_inline_filter_cap_is_eighteen_as_measured() {
         assert_eq!(MAX_SEARCH_SCHEMA_INLINE_FILTERS, 18);
@@ -296,9 +302,9 @@ const MAX_SEARCH_SCHEMA_HASH: usize = 1;
 /// Maximum `INLINE_FILTER` elements in a vector index search schema.
 ///
 /// Measured against the live service 2026-08-06 as **18**, which is deliberately
-/// recorded rather than derived: the obvious inference from the query-side cap
-/// (`MAX_SEARCH_CONDITIONS`, one HASH plus twenty filters) gives twenty, and is
-/// wrong. The schema cap and the per-query cap are different numbers.
+/// recorded rather than derived. The query-side cap (`MAX_SEARCH_CONDITIONS`,
+/// one HASH plus eighteen filters, measured 2026-10-29) is the same number, but
+/// the two are checked at different points and are kept as separate constants.
 const MAX_SEARCH_SCHEMA_INLINE_FILTERS: usize = 18;
 
 /// Validate the shape of a vector index search schema.
@@ -1083,8 +1089,9 @@ pub fn validate_put_item(
         ));
     }
 
+    // The attribute-name size check is not here: the service reports it
+    // ahead of the table lookup, so the handler runs it before this.
     validate_item_keys(&input.item, key_schema, attr_defs)?;
-    validate_attribute_name_sizes(&input.item, limits)?;
     validate_item_numbers(&input.item)?;
     validate_item_nesting_depth(&input.item)?;
 
@@ -1214,7 +1221,33 @@ fn validate_expression_attribute_value_numbers(
     Ok(())
 }
 
+/// The request form an attribute name arrived in, which selects the wording
+/// of the size refusal (REQ-LIM-004).
+///
+/// Measured on the service (2026-10-21, us-east-1) with a 65,536-byte name:
+///
+/// | Request form | Refusal |
+/// |---|---|
+/// | `PutItem` item, `UpdateItem` value map key or `AttributeUpdates` name | `1 validation error detected: Attribute name is too large, must be less than 65536 bytes` |
+/// | `PutItem`, `UpdateItem` or `DeleteItem` `ExpressionAttributeNames` value | the same, followed by ` for key #n` |
+/// | `TransactWriteItems` `Put` item, `BatchWriteItem` `PutRequest` item | `Attribute name is too large, must be less than 65536 bytes` |
+/// | `TransactWriteItems` `Put`, `Update`, `Delete` or `ConditionCheck` `ExpressionAttributeNames` value | `ExpressionAttributeNames contains invalid value: Attribute name is too large, must be less than 65536 bytes for key #n` |
+/// | `TransactWriteItems` `Put` or `Update` map key inside an `ExpressionAttributeValues` value | `ExpressionAttributeValues contains invalid value: Attribute name is too large, must be less than 65536 bytes for key :v` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeNameRequestForm {
+    /// A standalone `PutItem`, `UpdateItem` or `DeleteItem` request.
+    SingleItem,
+    /// A member of a `TransactWriteItems` request.
+    TransactionMember,
+    /// A `PutRequest` of a `BatchWriteItem` request. It carries no
+    /// expression maps.
+    BatchRequest,
+}
+
 /// Validate that no attribute name exceeds the maximum allowed size (REQ-LIM-004).
+///
+/// Top-level names and map keys at every depth are measured in UTF-8 bytes.
+/// `form` selects the refusal wording (see [`AttributeNameRequestForm`]).
 ///
 /// # Errors
 ///
@@ -1222,22 +1255,171 @@ fn validate_expression_attribute_value_numbers(
 pub fn validate_attribute_name_sizes(
     item: &Item,
     limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
 ) -> Result<(), DynamoDbError> {
     for (name, value) in item {
-        check_attribute_name_size(name, limits)?;
-        check_nested_attribute_name_sizes(value, limits)?;
+        check_attribute_name_size(name, limits, form)?;
+        check_nested_attribute_name_sizes(value, limits, form)?;
     }
     Ok(())
 }
 
-fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), DynamoDbError> {
+/// Validate the attribute names a request brings in through its expression
+/// maps (REQ-LIM-004): `PutItem`, `UpdateItem`, `DeleteItem` and every
+/// `TransactWriteItems` member.
+///
+/// Every `ExpressionAttributeNames` value is checked, used or not, and the
+/// refusal names the placeholder (`for key #n`). Every map key inside every
+/// `ExpressionAttributeValues` value is checked at every depth; a standalone
+/// request refuses it with the prefixed sentence alone, a transaction member
+/// names the value placeholder (`for key :v`). Each map is visited in sorted
+/// key order so the reported placeholder is deterministic. The order of the
+/// two maps follows the request form, as measured on the service
+/// (2026-10-21) with a long name in each map: a standalone `UpdateItem`
+/// reports the `ExpressionAttributeNames` placeholder, a transacted `Update`
+/// reports the `ExpressionAttributeValues` placeholder. Both checks are input
+/// validation: callers run them ahead of the condition, the index-key checks
+/// and any storage access. `form` selects the wording (see
+/// [`AttributeNameRequestForm`]).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first name over the limit.
+pub fn validate_expression_attribute_name_sizes(
+    names: Option<&std::collections::HashMap<String, String>>,
+    values: Option<&std::collections::HashMap<String, AttributeValue>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if form == AttributeNameRequestForm::SingleItem {
+        check_expression_attribute_names(names, limits, form)?;
+        check_expression_attribute_values(values, limits, form)
+    } else {
+        check_expression_attribute_values(values, limits, form)?;
+        check_expression_attribute_names(names, limits, form)
+    }
+}
+
+/// The `ExpressionAttributeNames` half of
+/// [`validate_expression_attribute_name_sizes`].
+fn check_expression_attribute_names(
+    names: Option<&std::collections::HashMap<String, String>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if let Some(names) = names {
+        let mut placeholders: Vec<&String> = names.keys().collect();
+        placeholders.sort();
+        for placeholder in placeholders {
+            if names[placeholder].len() > limits.max_attribute_name_bytes {
+                return Err(DynamoDbError::ValidationException(
+                    expression_attribute_name_too_large(
+                        limits,
+                        form,
+                        "ExpressionAttributeNames",
+                        placeholder,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `ExpressionAttributeValues` half of
+/// [`validate_expression_attribute_name_sizes`].
+fn check_expression_attribute_values(
+    values: Option<&std::collections::HashMap<String, AttributeValue>>,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
+    if let Some(values) = values {
+        let mut placeholders: Vec<&String> = values.keys().collect();
+        placeholders.sort();
+        for placeholder in placeholders {
+            if form == AttributeNameRequestForm::SingleItem {
+                check_nested_attribute_name_sizes(&values[placeholder], limits, form)?;
+            } else if nested_attribute_name_too_large(&values[placeholder], limits) {
+                return Err(DynamoDbError::ValidationException(
+                    expression_attribute_name_too_large(
+                        limits,
+                        form,
+                        "ExpressionAttributeValues",
+                        placeholder,
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the attribute names of a legacy `AttributeUpdates` map: each
+/// attribute it names and the map keys inside each supplied value, with the
+/// standalone `UpdateItem` wording (REQ-LIM-004).
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for the first name over the limit.
+pub fn validate_attribute_updates_name_sizes(
+    updates: &std::collections::HashMap<String, crate::types::AttributeValueUpdate>,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let form = AttributeNameRequestForm::SingleItem;
+    let mut names: Vec<&String> = updates.keys().collect();
+    names.sort();
+    for name in names {
+        check_attribute_name_size(name, limits, form)?;
+        if let Some(value) = &updates[name].value {
+            check_nested_attribute_name_sizes(value, limits, form)?;
+        }
+    }
+    Ok(())
+}
+
+/// The service's refusal for an attribute name over the limit, worded for
+/// the request form. The figure is the first refused size, one more than the
+/// configured maximum.
+fn attribute_name_too_large(limits: &LimitsConfig, form: AttributeNameRequestForm) -> String {
+    let sentence = format!(
+        "Attribute name is too large, must be less than {} bytes",
+        limits.max_attribute_name_bytes.saturating_add(1)
+    );
+    match form {
+        AttributeNameRequestForm::SingleItem => format!("1 validation error detected: {sentence}"),
+        AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
+            sentence
+        }
+    }
+}
+
+/// The refusal for an over-limit name that arrived through an expression
+/// map, naming the placeholder. A standalone request uses the prefixed
+/// sentence; a transaction member names the map the placeholder belongs to.
+fn expression_attribute_name_too_large(
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+    map: &str,
+    placeholder: &str,
+) -> String {
+    let refusal = attribute_name_too_large(limits, form);
+    match form {
+        AttributeNameRequestForm::SingleItem => format!("{refusal} for key {placeholder}"),
+        AttributeNameRequestForm::TransactionMember | AttributeNameRequestForm::BatchRequest => {
+            format!("{map} contains invalid value: {refusal} for key {placeholder}")
+        }
+    }
+}
+
+fn check_attribute_name_size(
+    name: &str,
+    limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
+) -> Result<(), DynamoDbError> {
     if name.len() > limits.max_attribute_name_bytes {
-        return Err(DynamoDbError::ValidationException(format!(
-            "One or more parameter values were invalid: Size of attribute name '{}' \
-             has exceeded the maximum size limit of {} bytes",
-            truncate_for_error(name),
-            limits.max_attribute_name_bytes
-        )));
+        return Err(DynamoDbError::ValidationException(
+            attribute_name_too_large(limits, form),
+        ));
     }
     Ok(())
 }
@@ -1245,28 +1427,28 @@ fn check_attribute_name_size(name: &str, limits: &LimitsConfig) -> Result<(), Dy
 fn check_nested_attribute_name_sizes(
     value: &AttributeValue,
     limits: &LimitsConfig,
+    form: AttributeNameRequestForm,
 ) -> Result<(), DynamoDbError> {
-    match value {
-        AttributeValue::M(map) => {
-            for (name, nested) in map {
-                check_attribute_name_size(name, limits)?;
-                check_nested_attribute_name_sizes(nested, limits)?;
-            }
-        }
-        AttributeValue::L(list) => {
-            for nested in list {
-                check_nested_attribute_name_sizes(nested, limits)?;
-            }
-        }
-        _ => {}
+    if nested_attribute_name_too_large(value, limits) {
+        return Err(DynamoDbError::ValidationException(
+            attribute_name_too_large(limits, form),
+        ));
     }
     Ok(())
 }
 
-/// Truncate a string for inclusion in error messages.
-fn truncate_for_error(s: &str) -> &str {
-    let end = s.char_indices().nth(64).map_or(s.len(), |(idx, _)| idx);
-    &s[..end]
+/// Whether any map key inside `value`, at any depth, exceeds the limit.
+fn nested_attribute_name_too_large(value: &AttributeValue, limits: &LimitsConfig) -> bool {
+    match value {
+        AttributeValue::M(map) => map.iter().any(|(name, nested)| {
+            name.len() > limits.max_attribute_name_bytes
+                || nested_attribute_name_too_large(nested, limits)
+        }),
+        AttributeValue::L(list) => list
+            .iter()
+            .any(|nested| nested_attribute_name_too_large(nested, limits)),
+        _ => false,
+    }
 }
 
 /// Validate that an item contains all required key attributes with correct types.
@@ -1524,6 +1706,34 @@ pub fn validate_index_key_types(
     Ok(())
 }
 
+/// Validate that secondary-index key attributes present in the item an
+/// UpdateExpression produced match their declared scalar type, reporting with
+/// the wording `DynamoDB` uses for a value computed from the existing item.
+///
+/// The service checks literal operands before the condition with the
+/// per-index `Type mismatch for Index Key` wording (see
+/// [`validate_index_key_literal_operands`]). A value that comes from an
+/// attribute reference or the fallback of `if_not_exists` is only known once
+/// the statement has been applied, and is then reported with this message,
+/// which names neither the attribute nor the index.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` on the first wrong-typed
+/// index key attribute, indexes in name order.
+pub fn validate_index_key_types_after_update(
+    item: &Item,
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+) -> Result<(), DynamoDbError> {
+    validate_index_key_types(item, indexes, attr_defs).map_err(|_| {
+        DynamoDbError::ValidationException(
+            "The update expression attempted to update the secondary index key to unsupported type"
+                .to_owned(),
+        )
+    })
+}
+
 /// Validate that no secondary-index key attribute in `item` is an empty string
 /// or empty binary value.
 ///
@@ -1592,6 +1802,131 @@ fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRe
     let mut ordered: Vec<&IndexKeyRef<'_>> = indexes.iter().collect();
     ordered.sort_by(|a, b| a.index_name.cmp(b.index_name));
     ordered
+}
+
+/// The type an update operand produces when it is built from literals alone,
+/// `None` when any part of it reads the item (an attribute path, or a
+/// function whose result depends on one such as `if_not_exists`).
+///
+/// `list_append` of two literals is a list; arithmetic on two literals is a
+/// number. Anything else that is literal-only is a placeholder.
+fn literal_operand_type(
+    expr: &crate::expression::Expr,
+    maps: &crate::expression::ExpressionMaps,
+) -> Option<&'static str> {
+    use crate::expression::Expr;
+    match expr {
+        Expr::Placeholder(name) => maps.values.get(name).map(attribute_value_type_tag),
+        Expr::Function { name, args } if name.eq_ignore_ascii_case("list_append") => {
+            let all_literal = args.iter().all(|a| literal_operand_type(a, maps).is_some());
+            all_literal.then_some("L")
+        }
+        Expr::Arithmetic { left, right, .. } => {
+            let both = literal_operand_type(left, maps).is_some()
+                && literal_operand_type(right, maps).is_some();
+            both.then_some("N")
+        }
+        _ => None,
+    }
+}
+
+/// Validate, before a condition is evaluated or a statement applied, that every
+/// `SET`, `ADD` or `DELETE` action whose target is a secondary-index key
+/// attribute and whose operand is built from literals alone carries a value of
+/// the key's declared type.
+///
+/// `DynamoDB` runs this check on the statement text ahead of the condition and
+/// ahead of applying the statement, so it is reported even when the condition
+/// would fail or another action in the statement could not be applied. A value
+/// that depends on the existing item (an attribute reference, the fallback of
+/// `if_not_exists`) is not checked here; the storage layer checks the written
+/// item afterwards and reports it with the computed-value wording.
+///
+/// `ADD` of a number onto a number key keeps the key's type and passes. `ADD`
+/// or `DELETE` of a set onto any index key, and `ADD` of a number onto a
+/// string or binary key, are type mismatches, because the result cannot be a
+/// scalar of the declared type. Indexes are checked in name order and actions
+/// in statement order.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the index-key type
+/// mismatch wording naming the attribute, the expected and actual types and
+/// the alphabetically-first index that keys the attribute.
+pub fn validate_index_key_literal_operands(
+    actions: &[crate::expression::UpdateAction],
+    indexes: &[IndexKeyRef<'_>],
+    attr_defs: &[AttributeDefinition],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use crate::expression::{PathElement, UpdateAction};
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let ordered = ordered_indexes(indexes);
+    for action in actions {
+        let (path, operand, is_set) = match action {
+            UpdateAction::Set { path, value } => (path, value, true),
+            UpdateAction::Add { path, value } | UpdateAction::Delete { path, value } => {
+                (path, value, false)
+            }
+            UpdateAction::Remove { .. } => continue,
+        };
+        // Only a top-level attribute can be an index key.
+        if path.len() != 1 {
+            continue;
+        }
+        let Some(PathElement::Attribute(raw)) = path.first() else {
+            continue;
+        };
+        let attr: &str = match raw.strip_prefix('#') {
+            Some(alias) => maps.resolve_name(alias)?,
+            None => raw.as_str(),
+        };
+        let Some(actual) = literal_operand_type(operand, maps) else {
+            continue;
+        };
+        for idx in &ordered {
+            for ks in idx.key_schema {
+                if ks.attribute_name != attr {
+                    continue;
+                }
+                let Some(expected) = attr_defs
+                    .iter()
+                    .find(|ad| ad.attribute_name == attr)
+                    .map(|ad| ad.attribute_type)
+                else {
+                    continue;
+                };
+                // SET must supply the declared type. ADD of a number onto a
+                // number key keeps the type and passes here (a string operand
+                // to ADD is an expression-level error the parser reports);
+                // ADD or DELETE of a set, or ADD of a number onto a string or
+                // binary key, cannot leave a scalar of the declared type.
+                let ok = if is_set {
+                    scalar_type_tag(expected) == actual
+                } else {
+                    match actual {
+                        "N" => expected == ScalarAttributeType::N,
+                        "SS" | "NS" | "BS" => false,
+                        // Any other operand type is an expression-level
+                        // operand error the evaluator reports.
+                        _ => true,
+                    }
+                };
+                if !ok {
+                    return Err(DynamoDbError::ValidationException(format!(
+                        "One or more parameter values were invalid: Type mismatch for Index Key {} Expected: {} Actual: {} IndexName: {}",
+                        attr,
+                        scalar_type_tag(expected),
+                        actual,
+                        idx.index_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Readable flags for the `is_query` parameter of [`validate_select_projection`].
@@ -1871,6 +2206,257 @@ pub fn validate_item_size(item: &Item, max_bytes: usize) -> Result<(), DynamoDbE
     if size > max_bytes {
         return Err(DynamoDbError::ValidationException(
             "Item size has exceeded the maximum allowed size".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The wording the service uses when an update, standalone or transacted, would
+/// exceed the item size limit.
+pub const ITEM_SIZE_TO_UPDATE_EXCEEDED: &str =
+    "Item size to update has exceeded the maximum allowed size";
+
+/// Fixed cost the service charges an `UpdateItem` statement, before its clauses.
+pub const UPDATE_STATEMENT_BASE_COST: usize = 3;
+/// Fixed cost per `SET` or `ADD` clause, on top of the written path and operands.
+pub const UPDATE_SET_CLAUSE_COST: usize = 18;
+/// Fixed cost of a function call in a `SET` operand, plus the function name's length.
+pub const UPDATE_FUNCTION_COST: usize = 26;
+/// Fixed cost of a `+` in a `SET` operand (26 plus the length of "addition").
+pub const UPDATE_ADDITION_COST: usize = 34;
+/// Fixed cost of a `-` in a `SET` operand (26 plus the length of "subtraction").
+pub const UPDATE_SUBTRACTION_COST: usize = 37;
+/// Cost of the first element of a document path used as a function or arithmetic
+/// operand, plus the attribute name's length. The attribute's stored value is not
+/// charged.
+pub const UPDATE_PATH_OPERAND_FIRST_COST: usize = 15;
+/// Cost of a later attribute element of such a path, plus the name's length.
+pub const UPDATE_PATH_OPERAND_NESTED_COST: usize = 14;
+/// Cost of a list index element of such a path.
+pub const UPDATE_PATH_OPERAND_INDEX_COST: usize = 15;
+/// Extra cost of a clause whose target path ends in a list index.
+pub const UPDATE_LIST_INDEX_TARGET_COST: usize = 1;
+
+/// Size a standalone `UpdateItem` the way the service does.
+///
+/// Measured against the service (us-east-1, 2026-10-19) by accept/refuse pairs
+/// either side of the item limit, for whole-attribute and document-path
+/// targets, aliases, one to three clauses on the same or different attributes,
+/// `if_not_exists`, `list_append`, nested functions, arithmetic, `ADD`,
+/// `REMOVE`, `DELETE`, and the legacy `AttributeUpdates` form. The figure the
+/// limit applies to is:
+///
+/// * a base of 3;
+/// * 18 per `SET` or `ADD` clause, nothing per `REMOVE` or `DELETE`;
+/// * the size of a skeleton item holding only the written paths: each map
+///   entry its name plus one, each map or list 3, each list element one more,
+///   siblings the statement does not touch left out. A `SET` or `ADD` leaf is
+///   charged the sizes of the clause's value placeholders; a `REMOVE` or
+///   `DELETE` leaf is charged nothing, and the `DELETE` operand is not charged;
+/// * one more for a clause whose target path ends in a list index;
+/// * for operands inside a `SET` value: 26 plus the name length per function
+///   call, 34 per `+` and 37 per `-`, and for a document path 15 plus the
+///   name for its first element, 14 plus the name for a later attribute, 15
+///   for an index, with the attribute's stored value not charged.
+///
+/// The legacy `AttributeUpdates` form is charged 3 plus, for each attribute
+/// it names that is present afterwards, the name and the finished value's
+/// bytes; an attribute it removes costs nothing.
+///
+/// The key and untouched attributes are left out, so at a short key the largest
+/// finished item an update can produce sits below the limit, and a long key or
+/// an untouched attribute buys the headroom back up to the limit itself, which
+/// the finished item never exceeds.
+///
+/// `finished` is the whole finished item; `actions` are the statement's clauses
+/// with `#name` placeholders still in place, resolved here through `maps`.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when
+/// either the statement figure or the finished item exceeds `max_bytes`.
+pub fn validate_update_item_size(
+    finished: &Item,
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    let statement = if maps.legacy_attribute_updates {
+        legacy_update_statement_size(finished, actions, maps)?
+    } else {
+        update_statement_size(actions, maps)?
+    };
+    if statement > max_bytes || item_size_bytes(finished) > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The bytes the service charges the operand expression of a `SET` clause:
+/// value placeholders at their size, function calls, arithmetic operators and
+/// document paths at their fixed costs.
+fn update_operand_size(
+    expr: &crate::expression::Expr,
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{Expr, PathElement, resolve_element_name};
+    Ok(match expr {
+        Expr::Placeholder(name) => maps
+            .values
+            .get(name)
+            .map_or(0, crate::types::attribute_value_size),
+        Expr::Path(elements) => {
+            let mut bytes = 0;
+            for (i, element) in elements.iter().enumerate() {
+                bytes += match element {
+                    PathElement::Index(_) => UPDATE_PATH_OPERAND_INDEX_COST,
+                    PathElement::Attribute(_) => {
+                        let name = resolve_element_name(element, maps)?;
+                        name.len()
+                            + if i == 0 {
+                                UPDATE_PATH_OPERAND_FIRST_COST
+                            } else {
+                                UPDATE_PATH_OPERAND_NESTED_COST
+                            }
+                    }
+                };
+            }
+            bytes
+        }
+        Expr::Function { name, args } => {
+            let mut bytes = UPDATE_FUNCTION_COST + name.len();
+            for arg in args {
+                bytes += update_operand_size(arg, maps)?;
+            }
+            bytes
+        }
+        Expr::Arithmetic { left, op, right } => {
+            let operator = match op {
+                crate::expression::ArithOp::Add => UPDATE_ADDITION_COST,
+                crate::expression::ArithOp::Sub => UPDATE_SUBTRACTION_COST,
+            };
+            operator + update_operand_size(left, maps)? + update_operand_size(right, maps)?
+        }
+        _ => 0,
+    })
+}
+
+/// A written path as a tree: map entries by name, list elements by index.
+#[derive(Default)]
+struct WrittenNode {
+    leaf_bytes: usize,
+    entries: std::collections::BTreeMap<String, WrittenNode>,
+    elements: std::collections::BTreeMap<usize, WrittenNode>,
+}
+
+fn written_node_size(node: &WrittenNode) -> usize {
+    let maps: usize = if node.entries.is_empty() {
+        0
+    } else {
+        3 + node
+            .entries
+            .iter()
+            .map(|(name, child)| name.len() + written_node_size(child) + 1)
+            .sum::<usize>()
+    };
+    let lists: usize = if node.elements.is_empty() {
+        0
+    } else {
+        3 + node
+            .elements
+            .values()
+            .map(|child| written_node_size(child) + 1)
+            .sum::<usize>()
+    };
+    node.leaf_bytes + maps + lists
+}
+
+/// Build the skeleton the statement writes and size it with the clause costs.
+fn update_statement_size(
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{PathElement, UpdateAction, resolve_element_name};
+    let mut root = WrittenNode::default();
+    let mut bytes = UPDATE_STATEMENT_BASE_COST;
+    for action in actions {
+        let (path, leaf) = match action {
+            UpdateAction::Set { path, value } | UpdateAction::Add { path, value } => {
+                bytes += UPDATE_SET_CLAUSE_COST;
+                (path, update_operand_size(value, maps)?)
+            }
+            UpdateAction::Remove { path } | UpdateAction::Delete { path, .. } => (path, 0),
+        };
+        if matches!(path.last(), Some(PathElement::Index(_))) {
+            bytes += UPDATE_LIST_INDEX_TARGET_COST;
+        }
+        let mut node = &mut root;
+        for element in path {
+            node = match element {
+                PathElement::Index(i) => node.elements.entry(*i).or_default(),
+                PathElement::Attribute(_) => {
+                    let name = resolve_element_name(element, maps)?;
+                    node.entries.entry(name.into_owned()).or_default()
+                }
+            };
+        }
+        node.leaf_bytes += leaf;
+    }
+    // The item itself is a map whose 3 bytes the base already covers.
+    Ok(bytes + written_node_size(&root).saturating_sub(3))
+}
+
+/// The legacy `AttributeUpdates` form: 3 plus, for each named attribute still
+/// present in the finished item, its name and finished value bytes. Nothing per
+/// action, no entry byte, nothing for an attribute the update removed.
+fn legacy_update_statement_size(
+    finished: &Item,
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<usize, DynamoDbError> {
+    use crate::expression::{UpdateAction, resolve_element_name};
+    let mut names: Vec<String> = Vec::new();
+    for action in actions {
+        let path = match action {
+            UpdateAction::Set { path, .. }
+            | UpdateAction::Add { path, .. }
+            | UpdateAction::Remove { path }
+            | UpdateAction::Delete { path, .. } => path,
+        };
+        if let Some(first) = path.first() {
+            let name = resolve_element_name(first, maps)?;
+            if !names.iter().any(|n| n == name.as_ref()) {
+                names.push(name.into_owned());
+            }
+        }
+    }
+    Ok(UPDATE_STATEMENT_BASE_COST
+        + names
+            .iter()
+            .filter_map(|name| finished.get(name).map(|value| (name, value)))
+            .map(|(name, value)| name.len() + crate::types::attribute_value_size(value))
+            .sum::<usize>())
+}
+
+/// Size a transacted `Update` the way the service does: the finished item
+/// against the limit, with the update wording. Measured against the service
+/// (us-east-1, 2026-10-19): a transacted Update accepts a finished item of
+/// exactly the limit and cancels one byte over with this wording, so the
+/// statement-sized rule of a standalone `UpdateItem` does not apply.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when the
+/// finished item exceeds `max_bytes`.
+pub fn validate_transact_update_item_size(
+    finished: &Item,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    if item_size_bytes(finished) > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
         ));
     }
     Ok(())
@@ -2601,7 +3187,7 @@ mod tests {
         let limits = LimitsConfig::default();
         let mut item = Item::new();
         item.insert("ok_name".to_owned(), AttributeValue::S("v".to_owned()));
-        assert!(validate_attribute_name_sizes(&item, &limits).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &limits, SINGLE).is_ok());
     }
 
     #[test]
@@ -2666,10 +3252,10 @@ mod tests {
         };
         let mut item = Item::new();
         item.insert("a".repeat(11), AttributeValue::S("v".to_owned()));
-        let err = validate_attribute_name_sizes(&item, &limits).unwrap_err();
-        assert!(
-            err.to_string().contains("Size of attribute name"),
-            "unexpected error: {err}"
+        let err = validate_attribute_name_sizes(&item, &limits, SINGLE).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "1 validation error detected: Attribute name is too large, must be less than 11 bytes"
         );
     }
 
@@ -2775,18 +3361,124 @@ mod tests {
         }
     }
 
+    /// The refusal under `short_name_limits`: the first refused size is 11.
+    const SHORT_TOO_LARGE: &str =
+        "1 validation error detected: Attribute name is too large, must be less than 11 bytes";
+
+    /// The same refusal without the prefix, as a transaction `Put` member and
+    /// a batch `PutRequest` word it.
+    const SHORT_TOO_LARGE_BARE: &str = "Attribute name is too large, must be less than 11 bytes";
+
+    const SINGLE: AttributeNameRequestForm = AttributeNameRequestForm::SingleItem;
+    const TRANSACTION: AttributeNameRequestForm = AttributeNameRequestForm::TransactionMember;
+    const BATCH: AttributeNameRequestForm = AttributeNameRequestForm::BatchRequest;
+
+    #[test]
+    fn item_name_over_limit_in_transaction_and_batch_uses_the_bare_sentence() {
+        let mut top = Item::new();
+        top.insert("a".repeat(11), AttributeValue::S("v".to_owned()));
+        let mut nested = Item::new();
+        nested.insert("doc".to_owned(), map_with_key("k".repeat(11)));
+        for item in [top, nested] {
+            for form in [TRANSACTION, BATCH] {
+                let err =
+                    validate_attribute_name_sizes(&item, &short_name_limits(), form).unwrap_err();
+                assert!(matches!(err, DynamoDbError::ValidationException(_)));
+                assert_eq!(err.to_string(), SHORT_TOO_LARGE_BARE, "{form:?}");
+            }
+            let err =
+                validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+            assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+        }
+    }
+
+    #[test]
+    fn transaction_expression_name_over_limit_names_the_map_and_placeholder() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            None,
+            &short_name_limits(),
+            TRANSACTION,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ExpressionAttributeNames contains invalid value: {SHORT_TOO_LARGE_BARE} for key #n"
+            )
+        );
+    }
+
+    #[test]
+    fn transaction_expression_value_map_key_over_limit_names_the_value_placeholder() {
+        let deep = {
+            let mut mid = Item::new();
+            mid.insert("ok".to_owned(), map_with_key("k".repeat(11)));
+            AttributeValue::M(mid)
+        };
+        let in_list = AttributeValue::L(vec![map_with_key("k".repeat(11))]);
+        for value in [map_with_key("k".repeat(11)), deep, in_list] {
+            let v = values(&[(":a", AttributeValue::S("x".to_owned())), (":v", value)]);
+            let err = validate_expression_attribute_name_sizes(
+                None,
+                Some(&v),
+                &short_name_limits(),
+                TRANSACTION,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "ExpressionAttributeValues contains invalid value: {SHORT_TOO_LARGE_BARE} for key :v"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_expression_values_are_checked_before_names() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            Some(&v),
+            &short_name_limits(),
+            TRANSACTION,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ExpressionAttributeValues contains invalid value: {SHORT_TOO_LARGE_BARE} for key :v"
+            )
+        );
+    }
+
+    #[test]
+    fn transaction_expression_maps_within_limit_pass() {
+        let n = names(&[("#n", "a".repeat(10))]);
+        let v = values(&[(":v", map_with_key("k".repeat(10)))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&n),
+                Some(&v),
+                &short_name_limits(),
+                TRANSACTION
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn nested_map_key_exceeding_limit_rejected() {
         let mut inner = Item::new();
         inner.insert("b".repeat(11), AttributeValue::S("v".to_owned()));
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(inner));
-        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!("Size of attribute name '{}'", "b".repeat(11))),
-            "error should name the nested key: {msg}"
-        );
+        let err = validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
     }
 
     #[test]
@@ -2801,11 +3493,8 @@ mod tests {
                 AttributeValue::M(inner),
             ]),
         );
-        let err = validate_attribute_name_sizes(&item, &short_name_limits()).unwrap_err();
-        assert!(
-            err.to_string().contains("Size of attribute name"),
-            "unexpected error: {err}"
-        );
+        let err = validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
     }
 
     #[test]
@@ -2822,7 +3511,7 @@ mod tests {
         );
         let mut item = Item::new();
         item.insert("root".to_owned(), AttributeValue::M(top));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_err());
     }
 
     #[test]
@@ -2836,7 +3525,7 @@ mod tests {
             "rows".to_owned(),
             AttributeValue::L(vec![AttributeValue::M(inner)]),
         );
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_ok());
     }
 
     #[test]
@@ -2846,13 +3535,229 @@ mod tests {
         at_cap.insert("é".repeat(5), AttributeValue::Null);
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(at_cap));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_ok());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_ok());
 
         let mut over = Item::new();
         over.insert("é".repeat(6), AttributeValue::Null);
         let mut item = Item::new();
         item.insert("doc".to_owned(), AttributeValue::M(over));
-        assert!(validate_attribute_name_sizes(&item, &short_name_limits()).is_err());
+        assert!(validate_attribute_name_sizes(&item, &short_name_limits(), SINGLE).is_err());
+    }
+
+    #[test]
+    fn attribute_name_limit_message_at_default_limit() {
+        let limits = LimitsConfig::default();
+        let mut item = Item::new();
+        item.insert("a".repeat(65_535), AttributeValue::Null);
+        assert!(validate_attribute_name_sizes(&item, &limits, SINGLE).is_ok());
+
+        let mut item = Item::new();
+        item.insert("a".repeat(65_536), AttributeValue::Null);
+        let err = validate_attribute_name_sizes(&item, &limits, SINGLE).unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(
+            err.to_string(),
+            "1 validation error detected: Attribute name is too large, must be less than 65536 bytes"
+        );
+    }
+
+    fn names(pairs: &[(&str, String)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    fn values(
+        pairs: &[(&str, AttributeValue)],
+    ) -> std::collections::HashMap<String, AttributeValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect()
+    }
+
+    fn map_with_key(key: String) -> AttributeValue {
+        let mut inner = Item::new();
+        inner.insert(key, AttributeValue::S("v".to_owned()));
+        AttributeValue::M(inner)
+    }
+
+    #[test]
+    fn expression_name_over_limit_names_the_placeholder() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let err =
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #n"));
+    }
+
+    #[test]
+    fn expression_name_at_limit_passes() {
+        let n = names(&[("#n", "a".repeat(10)), ("#m", "short".to_owned())]);
+        assert!(
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn expression_name_limit_counts_utf8_bytes() {
+        // Five two-byte characters is ten bytes: at the cap. Six is over.
+        let at_cap = names(&[("#n", "é".repeat(5))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&at_cap),
+                None,
+                &short_name_limits(),
+                SINGLE
+            )
+            .is_ok()
+        );
+        let over = names(&[("#n", "é".repeat(6))]);
+        assert!(
+            validate_expression_attribute_name_sizes(
+                Some(&over),
+                None,
+                &short_name_limits(),
+                SINGLE
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expression_names_report_the_first_placeholder_in_sorted_order() {
+        let n = names(&[
+            ("#zz", "z".repeat(11)),
+            ("#b", "b".repeat(11)),
+            ("#ok", "x".to_owned()),
+        ]);
+        let err =
+            validate_expression_attribute_name_sizes(Some(&n), None, &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #b"));
+    }
+
+    #[test]
+    fn expression_value_map_key_over_limit_uses_the_bare_message() {
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err =
+            validate_expression_attribute_name_sizes(None, Some(&v), &short_name_limits(), SINGLE)
+                .unwrap_err();
+        assert!(matches!(err, DynamoDbError::ValidationException(_)));
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+    }
+
+    #[test]
+    fn expression_value_map_key_inside_list_and_deeper_is_checked() {
+        let in_list = AttributeValue::L(vec![
+            AttributeValue::S("first".to_owned()),
+            map_with_key("k".repeat(11)),
+        ]);
+        let mut mid = Item::new();
+        mid.insert("ok".to_owned(), map_with_key("k".repeat(11)));
+        let deep = AttributeValue::M(mid);
+        for value in [in_list, deep] {
+            let v = values(&[(":v", value)]);
+            let err = validate_expression_attribute_name_sizes(
+                None,
+                Some(&v),
+                &short_name_limits(),
+                SINGLE,
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+        }
+    }
+
+    #[test]
+    fn expression_values_without_long_map_keys_pass() {
+        // A long string VALUE is not a name; only map keys are measured.
+        let v = values(&[
+            (":s", AttributeValue::S("s".repeat(100))),
+            (":m", map_with_key("k".repeat(10))),
+            (
+                ":l",
+                AttributeValue::L(vec![AttributeValue::N("1".to_owned())]),
+            ),
+        ]);
+        assert!(
+            validate_expression_attribute_name_sizes(None, Some(&v), &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn expression_names_are_checked_before_values() {
+        let n = names(&[("#n", "a".repeat(11))]);
+        let v = values(&[(":v", map_with_key("k".repeat(11)))]);
+        let err = validate_expression_attribute_name_sizes(
+            Some(&n),
+            Some(&v),
+            &short_name_limits(),
+            SINGLE,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), format!("{SHORT_TOO_LARGE} for key #n"));
+    }
+
+    #[test]
+    fn expression_maps_absent_pass() {
+        assert!(
+            validate_expression_attribute_name_sizes(None, None, &short_name_limits(), SINGLE)
+                .is_ok()
+        );
+    }
+
+    fn attribute_update(
+        action: &str,
+        value: Option<AttributeValue>,
+    ) -> crate::types::AttributeValueUpdate {
+        crate::types::AttributeValueUpdate {
+            value,
+            action: action.to_owned(),
+        }
+    }
+
+    #[test]
+    fn attribute_updates_name_over_limit_rejected() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "a".repeat(11),
+            attribute_update("PUT", Some(AttributeValue::S("x".to_owned()))),
+        );
+        let err =
+            validate_attribute_updates_name_sizes(&updates, &short_name_limits()).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+
+        let mut updates = std::collections::HashMap::new();
+        updates.insert("a".repeat(11), attribute_update("DELETE", None));
+        assert!(validate_attribute_updates_name_sizes(&updates, &short_name_limits()).is_err());
+    }
+
+    #[test]
+    fn attribute_updates_map_key_inside_value_rejected() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "doc".to_owned(),
+            attribute_update("PUT", Some(map_with_key("k".repeat(11)))),
+        );
+        let err =
+            validate_attribute_updates_name_sizes(&updates, &short_name_limits()).unwrap_err();
+        assert_eq!(err.to_string(), SHORT_TOO_LARGE);
+    }
+
+    #[test]
+    fn attribute_updates_within_limit_pass() {
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            "a".repeat(10),
+            attribute_update("PUT", Some(map_with_key("k".repeat(10)))),
+        );
+        updates.insert("b".to_owned(), attribute_update("DELETE", None));
+        assert!(validate_attribute_updates_name_sizes(&updates, &short_name_limits()).is_ok());
     }
 
     #[test]
@@ -3799,5 +4704,119 @@ mod tests {
     fn test_conditional_operator_absent_is_ok() {
         assert!(validate_conditional_operator_usage(false, 0).is_ok());
         assert!(validate_conditional_operator_usage(false, 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod update_size_tests {
+    //! Direct unit tests for the UpdateItem statement sizer. The byte figures
+    //! are the ones measured against the service in us-east-1 on 2026-10-19 and
+    //! exercised end to end by tests/test_item_size_at_limit.py; these assert
+    //! the same numbers at the function boundary so a developer can run them
+    //! with `cargo test` and no server.
+
+    use std::collections::HashMap;
+
+    use super::{
+        ITEM_SIZE_TO_UPDATE_EXCEEDED, legacy_update_statement_size, update_statement_size,
+        validate_update_item_size,
+    };
+    use crate::expression::{ExpressionMaps, UpdateAction, parse_update, tokenize};
+    use crate::types::{AttributeValue, Item};
+
+    fn s(v: &str) -> AttributeValue {
+        AttributeValue::S(v.to_owned())
+    }
+
+    /// Parse an update expression into actions plus a maps table whose values
+    /// are keyed as the parser keys them (the `:name` placeholder without its
+    /// colon).
+    fn build(expr: &str, values: &[(&str, AttributeValue)]) -> (Vec<UpdateAction>, ExpressionMaps) {
+        let actions = parse_update(&tokenize(expr).unwrap()).unwrap();
+        let mut map = HashMap::new();
+        for (name, value) in values {
+            map.insert((*name).to_owned(), value.clone());
+        }
+        (actions, ExpressionMaps::new(HashMap::new(), map))
+    }
+
+    fn statement(expr: &str, values: &[(&str, AttributeValue)]) -> usize {
+        let (actions, maps) = build(expr, values);
+        update_statement_size(&actions, &maps).unwrap()
+    }
+
+    #[test]
+    fn single_set_is_base_clause_path_and_value() {
+        // 3 base + 18 clause + the written path `p` (name 1, two container
+        // bytes) + the 4-byte value.
+        assert_eq!(statement("SET p = :v", &[("v", s("wxyz"))]), 27);
+    }
+
+    #[test]
+    fn two_set_clauses_each_cost_their_clause_and_path() {
+        assert_eq!(
+            statement("SET a = :v, b = :w", &[("v", s("wxyz")), ("w", s("y"))]),
+            48,
+        );
+    }
+
+    #[test]
+    fn a_nested_path_sizes_each_level_once() {
+        assert_eq!(statement("SET m.a = :v", &[("v", s("wxyz"))]), 32);
+    }
+
+    #[test]
+    fn a_list_index_target_adds_one_byte() {
+        // `p[1]` writes the attribute `p` (name 1, two container bytes) holding
+        // a one-element list (three container bytes, one per element) with the
+        // 4-byte value, plus 18 clause and 1 for writing through a list index:
+        // 3 + 18 + 1 + 10 = 32. One byte more than the same write to `p[0]`'s
+        // plain attribute would be without the list, which is the list-index
+        // target byte.
+        assert_eq!(statement("SET p[1] = :v", &[("v", s("wxyz"))]), 32);
+    }
+
+    #[test]
+    fn remove_costs_its_path_skeleton_only() {
+        // No clause cost for REMOVE: 3 base + the path `p`.
+        assert_eq!(statement("REMOVE p", &[]), 5);
+    }
+
+    #[test]
+    fn statement_over_the_limit_is_refused_with_the_update_wording() {
+        // SET p = :v with a ten-byte value is a 33-byte statement; the finished
+        // item ({p: 10 bytes}) is smaller, so the statement figure binds.
+        let (actions, maps) = build("SET p = :v", &[("v", s("0123456789"))]);
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+
+        assert!(validate_update_item_size(&finished, &actions, &maps, 33).is_ok());
+        let err = validate_update_item_size(&finished, &actions, &maps, 32).unwrap_err();
+        assert_eq!(err.to_string(), ITEM_SIZE_TO_UPDATE_EXCEEDED);
+    }
+
+    #[test]
+    fn an_oversized_finished_item_is_refused_even_when_the_statement_fits() {
+        // A small statement (REMOVE q, 7 bytes) cannot rescue a finished item
+        // that is itself over the limit.
+        let (actions, maps) = build("REMOVE q", &[]);
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+        assert!(validate_update_item_size(&finished, &actions, &maps, 5).is_err());
+    }
+
+    #[test]
+    fn legacy_attribute_updates_size_the_finished_value_not_the_statement() {
+        // The legacy form charges 3 plus the name and finished value of each
+        // attribute it names that remains in the item.
+        let (actions, mut maps) = build("SET p = :v", &[("v", s("wxyz"))]);
+        maps.legacy_attribute_updates = true;
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("wxyz"));
+        // 3 base + name `p` (1) + value (4) = 8.
+        assert_eq!(
+            legacy_update_statement_size(&finished, &actions, &maps).unwrap(),
+            8
+        );
     }
 }

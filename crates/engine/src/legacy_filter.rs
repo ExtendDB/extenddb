@@ -22,6 +22,12 @@ pub fn desugar_key_conditions(
     conditions: &HashMap<String, Condition>,
     key_schema: &[(String, bool)], // Vec of (attr_name, is_hash)
 ) -> Result<(KeyCondition, ExpressionMaps), DynamoDbError> {
+    let hash_count = key_schema.iter().filter(|(_, is_hash)| *is_hash).count();
+    let range_count = key_schema.len() - hash_count;
+    if hash_count > 1 || range_count > 1 {
+        return desugar_multipart_key_conditions(conditions, key_schema);
+    }
+
     // Find the hash key condition
     let hash_attr = key_schema
         .iter()
@@ -159,6 +165,163 @@ fn desugar_sk_condition(
         other => Err(DynamoDbError::ValidationException(format!(
             "Unsupported KeyCondition operator: {other}"
         ))),
+    }
+}
+
+/// Desugar legacy `KeyConditions` on a key schema with several HASH or several
+/// RANGE attributes into the same `KeyCondition` shape the expression parser
+/// produces, so `KeyCondition::resolve_multipart` classifies both forms by one
+/// rule (measured on the service 2026-10-21: `KeyConditions` on such an index
+/// answer the same refusals as the equivalent `KeyConditionExpression`).
+fn desugar_multipart_key_conditions(
+    conditions: &HashMap<String, Condition>,
+    key_schema: &[(String, bool)],
+) -> Result<(KeyCondition, ExpressionMaps), DynamoDbError> {
+    let mut values = HashMap::new();
+    let mut equalities: Vec<(Vec<PathElement>, Expr)> = Vec::new();
+    let mut non_equalities: Vec<(String, SortKeyCondition)> = Vec::new();
+
+    // Key-schema attributes first, in key-schema order, then any other name,
+    // so placeholder numbering and clause order are deterministic.
+    let mut ordered: Vec<&String> = key_schema
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| conditions.contains_key(*name))
+        .collect();
+    let mut others: Vec<&String> = conditions
+        .keys()
+        .filter(|name| !key_schema.iter().any(|(k, _)| k == *name))
+        .collect();
+    others.sort();
+    ordered.extend(others);
+
+    for (i, attr) in ordered.into_iter().enumerate() {
+        let cond = &conditions[attr];
+        if cond.comparison_operator == "EQ" {
+            if cond.attribute_value_list.len() != 1 {
+                return Err(DynamoDbError::ValidationException(
+                    "Query key condition must have exactly one value for EQ".to_owned(),
+                ));
+            }
+            let placeholder = format!("_kc_eq{i}");
+            values.insert(placeholder.clone(), cond.attribute_value_list[0].clone());
+            equalities.push((
+                vec![PathElement::Attribute(attr.clone())],
+                Expr::Placeholder(placeholder),
+            ));
+        } else {
+            let mut own_values = HashMap::new();
+            let sk = desugar_sk_condition(cond, attr, &mut own_values)?;
+            // Rename this condition's placeholders so two non-equalities
+            // cannot collide on `_kc_sk`.
+            let sk = rename_placeholders(sk, &own_values, &format!("_kc_ne{i}_"), &mut values);
+            non_equalities.push((attr.clone(), sk));
+        }
+    }
+
+    let hash_attrs: Vec<&str> = key_schema
+        .iter()
+        .filter(|(_, is_hash)| *is_hash)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let range_attrs: Vec<&str> = key_schema
+        .iter()
+        .filter(|(_, is_hash)| !*is_hash)
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    // Two non-equalities: the service names the RANGE attributes before the
+    // last conditioned one that lack an equality (measured: `h EQ, a GT,
+    // b GT` is `RANGE key attributes a must have equality conditions
+    // specified in the query because a condition is present on key attribute
+    // b`).
+    if non_equalities.len() > 1 {
+        let conditioned: Vec<usize> = conditions
+            .keys()
+            .filter_map(|name| range_attrs.iter().position(|r| r == name))
+            .collect();
+        if let Some(&last) = conditioned.iter().max() {
+            let without_eq: Vec<&str> = range_attrs[..last]
+                .iter()
+                .enumerate()
+                .filter(|(_, attr)| {
+                    conditions
+                        .get(**attr)
+                        .is_none_or(|c| c.comparison_operator != "EQ")
+                })
+                .map(|(_, attr)| *attr)
+                .collect();
+            if !without_eq.is_empty() {
+                return Err(DynamoDbError::ValidationException(format!(
+                    "RANGE key attributes {} must have equality conditions specified in the \
+                     query because a condition is present on key attribute {}",
+                    without_eq.join(", "),
+                    range_attrs[last]
+                )));
+            }
+        }
+        return Err(DynamoDbError::ValidationException(
+            "Query key condition not supported".to_owned(),
+        ));
+    }
+
+    let Some((pk_path, pk_value)) = equalities.first().cloned() else {
+        // No equality at all: every HASH attribute lacks one.
+        return Err(DynamoDbError::ValidationException(format!(
+            "HASH key attributes {} must have equality conditions specified in the query",
+            hash_attrs.join(", ")
+        )));
+    };
+    let extra_pk_conditions = equalities.into_iter().skip(1).collect();
+    let sk_condition = non_equalities.into_iter().next().map(|(_, sk)| sk);
+
+    Ok((
+        KeyCondition {
+            pk_path,
+            pk_value,
+            sk_condition,
+            extra_pk_conditions,
+            extra_sk_conditions: Vec::new(),
+        },
+        ExpressionMaps::new(HashMap::new(), values),
+    ))
+}
+
+/// Move `own_values` into `values` under `prefix`-ed names and rewrite the
+/// condition's placeholders to match.
+fn rename_placeholders(
+    sk: SortKeyCondition,
+    own_values: &HashMap<String, AttributeValue>,
+    prefix: &str,
+    values: &mut HashMap<String, AttributeValue>,
+) -> SortKeyCondition {
+    let mut rename = |expr: Expr| -> Expr {
+        match expr {
+            Expr::Placeholder(name) => {
+                let new_name = format!("{prefix}{name}");
+                if let Some(v) = own_values.get(&name) {
+                    values.insert(new_name.clone(), v.clone());
+                }
+                Expr::Placeholder(new_name)
+            }
+            other => other,
+        }
+    };
+    match sk {
+        SortKeyCondition::Compare { path, op, value } => SortKeyCondition::Compare {
+            path,
+            op,
+            value: rename(value),
+        },
+        SortKeyCondition::Between { path, low, high } => SortKeyCondition::Between {
+            path,
+            low: rename(low),
+            high: rename(high),
+        },
+        SortKeyCondition::BeginsWith { path, prefix: p } => SortKeyCondition::BeginsWith {
+            path,
+            prefix: rename(p),
+        },
     }
 }
 

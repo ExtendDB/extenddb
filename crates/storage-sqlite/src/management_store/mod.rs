@@ -18,7 +18,8 @@ mod users;
 
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, GroupDetail, GroupListEntry, ManagementStore, OpError,
-    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, UserDetail, UserListEntry,
+    OpResult, RoleDetail, RoleListEntry, SessionPolicyEntry, StoredDocument, UserDetail,
+    UserListEntry,
 };
 use futures::future::BoxFuture;
 use time::OffsetDateTime;
@@ -395,6 +396,23 @@ impl ManagementStore for SqliteCatalogStore {
         })
     }
 
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            self.list_policy_documents_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     fn set_user_boundary(
@@ -459,6 +477,23 @@ impl ManagementStore for SqliteCatalogStore {
     ) -> BoxFuture<'_, OpResult<Option<serde_json::Value>>> {
         let (account_id, role_name) = (account_id.to_owned(), role_name.to_owned());
         Box::pin(async move { self.get_role_boundary_impl(&account_id, &role_name).await })
+    }
+
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let (account_id, principal_type, principal_name) = (
+            account_id.to_owned(),
+            principal_type.to_owned(),
+            principal_name.to_owned(),
+        );
+        Box::pin(async move {
+            self.boundary_document_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
     }
 
     fn delete_role_boundary(
@@ -720,7 +755,7 @@ mod migration_tests {
             .execute(&pool)
             .await
             .unwrap();
-        crate::schema::apply(&pool).await.expect("apply schema");
+        crate::migrations::apply_for_tests(&pool).await;
         SqliteCatalogStore::new(pool)
     }
 
@@ -878,5 +913,56 @@ mod migration_tests {
             .unwrap();
         let p = stored.iter().find(|(n, ..)| n == "p").unwrap();
         assert_eq!(p.1, collide);
+    }
+
+    /// A stored document that does not decode is named with its account,
+    /// principal, policy and decode error, and the principal's other
+    /// policies and its boundary are still read and rewritten.
+    #[tokio::test]
+    async fn an_undecodable_policy_is_named_and_the_others_are_rewritten() {
+        let s = store().await;
+        s.create_account("333333333333", "acct").await.unwrap();
+        s.create_user("333333333333", "carol", None).await.unwrap();
+        for name in ["a_broken", "b_tagged"] {
+            s.put_policy(
+                "333333333333",
+                "user",
+                "carol",
+                name,
+                &policy("dynamodb:ResourceTag/env"),
+            )
+            .await
+            .unwrap();
+        }
+        s.set_user_boundary("333333333333", "carol", &policy("dynamodb:ResourceTag/env"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE iam_policies SET policy_document = '{not json' \
+             WHERE account_id = '333333333333' AND policy_name = 'a_broken'",
+        )
+        .execute(s.pool())
+        .await
+        .unwrap();
+
+        let report = migrate_resource_tag_condition_keys(&s, true).await;
+        assert_eq!(report.errors, 0, "{:?}", report.failures);
+        assert_eq!(report.unreadable.len(), 1, "{report:?}");
+        let broken = &report.unreadable[0];
+        assert_eq!(
+            (
+                broken.account_id.as_str(),
+                broken.principal.as_str(),
+                broken.policy_name.as_str()
+            ),
+            ("333333333333", "user/carol", "a_broken")
+        );
+        assert!(broken.error.contains("line 1"), "{}", broken.error);
+        let names: Vec<&str> = report
+            .rewritten
+            .iter()
+            .map(|r| r.policy_name.as_str())
+            .collect();
+        assert_eq!(names, ["b_tagged", "<permissions-boundary>"]);
     }
 }
