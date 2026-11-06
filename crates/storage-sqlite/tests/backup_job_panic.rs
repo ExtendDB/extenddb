@@ -101,7 +101,7 @@ async fn call(
     operation: &str,
     body: serde_json::Value,
 ) -> serde_json::Value {
-    dispatch(operation, body, ctx, "127.0.0.1:0")
+    dispatch(operation, body, &[], ctx, "127.0.0.1:0")
         .await
         .unwrap_or_else(|e| panic!("{operation}: {e:?}"))
         .body
@@ -316,6 +316,7 @@ async fn a_job_task_that_panics_leaves_a_row_the_next_cycle_resolves_without_a_r
     let described = dispatch(
         "DescribeBackup",
         json!({"BackupArn": arn_text}),
+        &[],
         &ctx,
         "127.0.0.1:0",
     )

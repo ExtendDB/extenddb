@@ -1397,7 +1397,7 @@ mod write_lock_tests {
         operation: &str,
         body: serde_json::Value,
     ) -> serde_json::Value {
-        dispatch(operation, body, ctx, "127.0.0.1:0")
+        dispatch(operation, body, &[], ctx, "127.0.0.1:0")
             .await
             .unwrap_or_else(|e| panic!("{operation}: {e:?}"))
             .body
