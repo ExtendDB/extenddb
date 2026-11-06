@@ -11,18 +11,16 @@ pub struct CassandraOperationsEngine;
 
 impl OperationsEngine for CassandraOperationsEngine {
     fn parse_connection_string(&self, conn_str: &str) -> Result<ConnectionParts, StorageError> {
-        // Cassandra connection string format: "host1:9042,host2:9042/keyspace_prefix"
-        // Split on '/' to separate hosts from keyspace
-        let (hosts_str, keyspace) = if let Some((h, k)) = conn_str.split_once('/') {
-            (h, k.to_string())
-        } else {
-            (conn_str, "extenddb".to_string())
-        };
+        // Cassandra connection string format:
+        // "[user[:password]@]host1:9042,host2:9042/keyspace_prefix"
+        let parsed = crate::config::CassandraStorageConfig::connection_parts(conn_str);
+        let keyspace = parsed.keyspace_prefix;
 
         // Parse the first contact point for compatibility with ConnectionParts
-        let first_contact = hosts_str
-            .split(',')
-            .next()
+        let first_contact = parsed
+            .contact_points
+            .first()
+            .map(String::as_str)
             .ok_or_else(|| StorageError::Internal("Empty connection string".to_string()))?;
 
         let parts: Vec<&str> = first_contact.split(':').collect();
@@ -42,15 +40,13 @@ impl OperationsEngine for CassandraOperationsEngine {
             host,
             port,
             database: format!("{keyspace}_catalog"),
-            user: String::new(),
-            password: String::new(),
+            user: parsed.username.unwrap_or_default(),
+            password: parsed.password.unwrap_or_default(),
         })
     }
 
     fn redact_connection_string(&self, conn_str: &str) -> String {
-        // Cassandra connection strings don't contain passwords
-        // Just return as-is
-        conn_str.to_string()
+        crate::config::CassandraStorageConfig::redact_connection_string(conn_str)
     }
 
     fn validate_identifier(&self, name: &str, label: &str) -> Result<(), StorageError> {
@@ -89,8 +85,17 @@ impl OperationsEngine for CassandraOperationsEngine {
         Ok(())
     }
 
-    fn catalog_version(&self) -> String {
-        crate::CATALOG_VERSION.to_string()
+    fn setting_default(&self, key: &str) -> Option<String> {
+        use extenddb_core::settings_keys::INDEX_PROPAGATION_DELAY_MS;
+        match key {
+            // CreateTable's fallback and the control-plane worker's.
+            "control_plane_delay_seconds" => {
+                Some(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS.to_string())
+            }
+            // The engine's initial GSI delay, kept while the row is absent.
+            INDEX_PROPAGATION_DELAY_MS => Some("10".to_owned()),
+            _ => None,
+        }
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {

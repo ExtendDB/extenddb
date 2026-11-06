@@ -33,7 +33,7 @@
 #     EXTENDDB_TEST_CASSANDRA_CONTACT_POINT (default 127.0.0.1:9042), which
 #     --contact-points above doesn't set. The official cassandra:4.1 image
 #     does not honour CASSANDRA_AUTHENTICATOR, so patch it after starting:
-#       docker run -d --name cassandra -p 9042:9042 \
+#       docker run -d --name cassandra -p 127.0.0.1:9042:9042 \
 #         -e CASSANDRA_CLUSTER_NAME=extenddb-ci \
 #         -e HEAP_NEWSIZE=128M -e MAX_HEAP_SIZE=1024M \
 #         cassandra:4.1

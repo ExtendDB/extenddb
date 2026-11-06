@@ -376,12 +376,15 @@ Total connection footprint on the PostgreSQL server:
   pool because its ownership lock is session-scoped
 - one connection while a schema migration runs, pinned outside the pools so its
   transaction-scoped lock cannot move between backends
+- one connection per running backup or restore job, at most `[backup]
+  max_concurrent_jobs` (default 4), opened outside every pool because the job's
+  claim is a session-level advisory lock
 
-So the total is `2 * pool_size + catalog_pool_size`, plus builds and migrations.
-There is no separate poller pool: the log-level poller borrows from the management
-pool like every other background poller. `max_connections` is per cluster rather
-than per database, so both `pool_size` pools draw on the same budget: the defaults
-need 60 of PostgreSQL's default 100.
+So the total is `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus
+builds and migrations. There is no separate poller pool: the log-level poller
+borrows from the management pool like every other background poller.
+`max_connections` is per cluster rather than per database, so both `pool_size`
+pools draw on the same budget: the defaults need 64 of PostgreSQL's default 100.
 
 ### 6.3 Row-Level Locking
 
@@ -437,11 +440,11 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 | Async runtime | tokio | De facto standard, mature |
 | HTTP framework | axum + tower | Composable middleware, hyper-based |
 | HTTP TLS server | axum_server | Adds rustls bind support on top of axum (used only when TLS is enabled) |
-| TLS | rustls | No OpenSSL dependency, pure Rust |
+| TLS | rustls | No OpenSSL dependency; cryptography from AWS-LC through aws-lc-rs |
 | PostgreSQL driver | sqlx | Async, compile-time query checking, migrations |
 | Serialization | serde + serde_json | Standard, zero-copy where possible |
-| Crypto (SigV4) | hmac + sha2 + constant_time_eq | Pure Rust, audited |
-| Crypto (encryption) | aes-gcm | AES-256-GCM for credential encryption |
+| Crypto (SigV4) | aws-lc-rs | HMAC-SHA256, SHA-256 and the constant-time signature compare from AWS-LC, the library rustls already uses ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)) |
+| Crypto (encryption) | aws-lc-rs | AES-256-GCM for credential encryption, in one module (`extenddb_storage::secret_cipher`) |
 | Compression | flate2 | gzip support |
 | CRC32 | crc32fast | SIMD-accelerated |
 | CLI | clap | Standard Rust CLI framework |
