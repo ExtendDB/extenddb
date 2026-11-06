@@ -1061,26 +1061,47 @@ be hashed, and its line has an empty `etag`.
 
 Three classes of row problem behave differently.
 
-A parse-level error abandons the rest of the file: a line that is not
-well-formed JSON, a missing or non-object `Item`, an attribute value whose
-type tag is not one of the ten DynamoDB types, a line longer than
-`max_bulk_line_bytes`, or a condition field of the wrong JSON type. The
-offending row is counted as processed and failed, the remaining rows of
-that file are not read and appear in no counter, and processing continues
-with the next file. `ProcessedInputBytes` advances to the end of the
-abandoned file. The report record carries `Expected 'Item' top level
-container. Remainder of the file will not be processed.` for a missing
-`Item`, `Expected character {. Remainder of the file will not be
-processed.` for an `Item` that is not a JSON object, and `Expected
-DynamoDB type to be one of [S, N, B, BOOL, NULL, L, M, SS, NS, BS].
-Remainder of the file will not be processed.` for every other cause.
+A parse-level error abandons the rest of the file. The offending row is
+counted as processed and failed. The remaining rows of that file are not
+read and appear in no counter, and processing continues with the next file.
+`ProcessedInputBytes` advances to the end of the abandoned file. The report
+record has no `itemIndex`. Its message names the cause and ends with
+`Remainder of the file will not be processed.`:
 
-An item-level error fails the row alone: a missing or wrongly typed key
-attribute, an item over the size limit, a condition expression that does not
-parse, expression maps supplied without a `ConditionExpression`, or any
-other item check `PutItem` applies. The row is counted as processed and
-failed, a record carrying the message `PutItem` returns for the same fault
-goes to the error report, and the next row is read.
+| Cause | Message before `Remainder of the file will not be processed.` |
+|---|---|
+| Text that is not JSON, such as a truncated object or invalid bytes between tokens | `Unexpected token.` |
+| Bytes that are not valid UTF-8 | `Expected a Unicode sequence with UTF-8 binary encoding.` |
+| A top-level key other than the four a record may carry. This check runs before the missing-`Item` check, so a misspelled `Item` gets this message. | `Unexpected top-level field. Expected one of [Item, ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues].` |
+| No `Item` | `Expected 'Item' top level container.` |
+| An `Item` that is not a JSON object | `Expected character {.` |
+| A top-level member given twice, or an attribute value with more than one type tag | `Expected character }.` |
+| A set tag whose value is not a JSON array | `Expected character [.` |
+| A `B` value that is not base64 | `Expected a binary value in base64-encoded format.` |
+| An `N` value inside `Item` that is not a number | `Expected a valid numeric.` |
+| An attribute value nested 64 or more map or list levels | `Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit.` |
+| An `ExpressionAttributeValues` map whose compact JSON text is over 2,097,152 bytes | `ExpressionAttributeValues exceeds max size.` |
+| An unknown type tag, an attribute value with no type tag, a condition field of the wrong JSON type, or a line longer than `max_bulk_line_bytes` | `Expected DynamoDB type to be one of [S, N, B, BOOL, NULL, L, M, SS, NS, BS].` |
+
+An item-level error fails the row alone. The row is counted as processed
+and failed, and a record with the message `PutItem` returns for the same
+fault goes to the error report. The next row is then read. Item-level
+errors include:
+
+- a missing or wrongly typed key attribute
+- an item over the size limit
+- a repeated attribute name inside `Item`
+- an attribute value nested 32 to 63 map or list levels
+- a condition expression that does not parse or is over 4 KB
+- an empty `ExpressionAttributeNames` or `ExpressionAttributeValues` map
+  supplied with a `ConditionExpression`
+- expression maps supplied without a `ConditionExpression`
+- any other item check that `PutItem` applies
+
+An `ExpressionAttributeValues` entry that does not decode is item-level
+too, unlike the same value inside `Item`. Its record reads
+`ExpressionAttributeValues contains invalid value: {message} for key
+{placeholder}`, where `{message}` is the single-item text for the fault.
 
 A `ConditionExpression` that evaluates false leaves the item unwritten. The
 row is counted as processed and is not counted as failed. A record with the
