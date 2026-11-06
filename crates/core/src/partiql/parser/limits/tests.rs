@@ -631,10 +631,15 @@ fn the_deepest_statements_that_parse_are_walked_on_a_small_stack() {
     };
     use crate::partiql::values::{check_condition_values, check_written_values};
     // The checks the server runs on a parsed statement and the plan walk its
-    // tree recursively, and the parser's bounds keep each walk and the drop
-    // of the tree within half the stack of a server worker thread on a debug
-    // build (the most, 870 KB, for the literal checks of the last
-    // statement's condition, a value 1000 levels deep, measured 2026-11-06).
+    // tree recursively, on the thread that serves the request: a tokio
+    // worker, whose stack is tokio's default of 2 MiB. The parser's bounds
+    // keep each walk and the drop of the tree within that stack on a debug
+    // build. The most is for the literal checks of the last statement's
+    // condition, a value 1000 levels deep: 870 KB on Linux x86_64 (measured
+    // 2026-11-06), and about 1.1 MB on macOS arm64, whose debug frames are
+    // larger. The server refuses that statement for its projected call
+    // before these checks run.
+    const WORKER_STACK_BYTES: usize = 2 << 20;
     let statements: Vec<(String, Statement)> = deepest_that_parse()
         .into_iter()
         .map(|sql| {
@@ -643,7 +648,7 @@ fn the_deepest_statements_that_parse_are_walked_on_a_small_stack() {
         })
         .collect();
     std::thread::Builder::new()
-        .stack_size(1 << 20)
+        .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
             let keys = KeyNames {
                 partition: "pk",
