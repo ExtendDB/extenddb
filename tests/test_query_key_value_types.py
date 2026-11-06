@@ -289,10 +289,10 @@ ROWS = [
      V, TYPE_MISMATCH),
     ("b20 N sk begins_with S", "ns",
      kce("pk = :u AND begins_with(sk, :b)", {":u": SX, ":b": {"S": "1"}}), V, TYPE_MISMATCH),
-    # begins_with is refused by the type of its value, on every sort key type,
-    # ahead of the unused value check; an S or B value on a sort key of another
-    # type gets the type mismatch (measured on Amazon DynamoDB in us-east-1 on
-    # 6 Nov 2026).
+    # begins_with is refused by the type of its value, on every sort key type
+    # and on an attribute outside the key schema, ahead of the unused value
+    # check; an S or B value on a sort key of another type gets the type
+    # mismatch (measured on Amazon DynamoDB in us-east-1 on 6 Nov 2026).
     ("q1 S sk begins_with N", "ss",
      kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}}), V, BEGINS_WITH_KCE + "N"),
     ("q2 N sk begins_with B", "ns",
@@ -311,6 +311,10 @@ ROWS = [
     ("p4 N sk begins_with N with unused value", "ns",
      kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}, ":x": SX}),
      V, BEGINS_WITH_KCE + "N"),
+    ("m2 non-key begins_with N, S sk", "ss",
+     kce("pk = :u AND begins_with(zz, :n)", {":u": SX, ":n": {"N": "1"}}), V, BEGINS_WITH_KCE + "N"),
+    ("m3 non-key begins_with N, N sk", "ns",
+     kce("pk = :u AND begins_with(zz, :n)", {":u": SX, ":n": {"N": "1"}}), V, BEGINS_WITH_KCE + "N"),
     ("b22 pk = N 5 AND N sk = S 5", "ns",
      kce("pk = :u AND sk = :s", {":u": N5, ":s": {"S": "5"}}), V, TYPE_MISMATCH),
     ("b23 N sk = N bob", "ns", kce("pk = :u AND sk = :s", {":u": SX, ":s": NB}), V, NUMERIC + "bob"),
