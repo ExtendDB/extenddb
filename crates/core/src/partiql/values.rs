@@ -23,6 +23,15 @@
 //! written values come ahead of overlapping SET paths, of a `?` without a
 //! parameter and of every check against the table (measured 2026-11-06).
 //!
+//! The operand type of an arithmetic literal in a SET value (`'x' + 1`) is
+//! not checked here: the service reports it after every number rule, bag and
+//! call refusal in the SET values, whatever order they are written in
+//! (measured 2026-11-06: `SET a = 'x' + 1, b = size(m)`, `SET b = size(m), a
+//! = 'x' + 1`, `SET a = 'x' + size(m)` and `SET a = size('x' + 1)` are
+//! refused for `size`, `SET a = 'x' + 1, b = <<>>` and `SET a = <<>> + 1` for
+//! the bag, `SET a = 'x' + 1e126` and `SET a = 'x' + 1, b = 1e126` for the
+//! number). The translation of the statement checks it.
+//!
 //! A map literal holds its members in name order, not in the order they are
 //! written, and a number set its members in text order, so where two
 //! members of one map both have a problem the one reported can differ from

@@ -2109,3 +2109,57 @@ def test_a_negative_zero_in_a_batch_and_a_transaction(dynamodb_client, stable):
     assert e.value.response["Error"]["Message"] == (
         f"Validation failed in TransactStatements[0]: {expected}"
     )
+
+
+# ---- the operand type of an arithmetic literal -----------------------------------
+#
+# Measured 2026-11-06. A SET value that adds or subtracts a literal that is
+# not a number is refused for the operand's type, after every number rule,
+# empty bag and call refusal in the SET values, whatever order they are
+# written in. Of two such literals, the one written first is named.
+
+OPERAND_TYPE = "Incorrect operand type for operator or function; operator or function: {}, operand type: {}"
+NOT_IN_UPDATE = "The function is not allowed in an update expression; function: size"
+
+
+@pytest.mark.parametrize(
+    ("assignments", "expected"),
+    [
+        ("a = 'x' + 1", OPERAND_TYPE.format("+", "S")),
+        ("a = 'x' - 1", OPERAND_TYPE.format("-", "S")),
+        ("a = true + 'x'", OPERAND_TYPE.format("+", "BOOL")),
+        ("a = 'x' + 1, b = 2 - true", OPERAND_TYPE.format("+", "S")),
+        ("a = if_not_exists(q, 'x' + 1)", OPERAND_TYPE.format("+", "S")),
+        ("a = 'x' + 1, b = size(m)", NOT_IN_UPDATE),
+        ("b = size(m), a = 'x' + 1", NOT_IN_UPDATE),
+        ("a = 'x' + size(m)", NOT_IN_UPDATE),
+        ("a = size('x' + 1)", NOT_IN_UPDATE),
+        ("a = 'x' + 1, b = <<>>", "Empty bags are not supported"),
+        ("a = <<>> + 1", "Empty bags are not supported"),
+        ("a = {'k': <<>>} + 1", "Empty bags are not supported"),
+        ("a = 'x' + 1e126", OVERFLOW.format("root")),
+        ("a = 1e126 + 'x'", OVERFLOW.format("root")),
+        ("a = 'x' + 1, b = 1e126", OVERFLOW.format("root")),
+        ("b = 1e126, a = 'x' + 1", OVERFLOW.format("root")),
+    ],
+)
+def test_the_operand_type_of_an_arithmetic_literal_comes_after_the_other_set_value_checks(
+    dynamodb_client, ctable, pair, assignments, expected
+):
+    statement = f"UPDATE \"{ctable}\" SET {assignments} WHERE pk = '{pair}' AND sk = 'b'"
+    assert _message(dynamodb_client, statement) == expected
+
+
+def test_the_operand_type_of_an_arithmetic_literal_comes_after_a_call_in_a_batch_and_a_transaction(
+    dynamodb_client, ctable, pair
+):
+    statement = f"UPDATE \"{ctable}\" SET a = 'x' + 1, b = size(m) WHERE pk = '{pair}' AND sk = 'b'"
+    responses = dynamodb_client.batch_execute_statement(Statements=[{"Statement": statement}])[
+        "Responses"
+    ]
+    assert responses == [{"Error": {"Code": "ValidationError", "Message": NOT_IN_UPDATE}}]
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[{"Statement": statement}])
+    assert e.value.response["Error"]["Message"] == (
+        f"Validation failed in TransactStatements[0]: {NOT_IN_UPDATE}"
+    )
