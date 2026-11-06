@@ -311,6 +311,10 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 60
     needs: build-cassandra
+    env:
+      # The cargo features of the v0.1.14 build, read by its cache key
+      # and its build command.
+      V0114_FEATURES: cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -328,8 +332,20 @@ jobs:
           --health-start-period 60s
     steps:
       - uses: actions/checkout@v6
+      # A tag does not change, so the v0.1.14 binary is cached by the tag,
+      # the cargo features and the runner's OS and architecture. On a hit
+      # the job skips that build and the Rust toolchain and cache steps,
+      # which only that build uses.
+      - name: Cache the v0.1.14 release (cassandra backend)
+        id: cache-v0-1-14
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
+          key: extenddb-v0.1.14-no-default-features-${{ env.V0114_FEATURES }}-${{ runner.os }}-${{ runner.arch }}
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         with:
           cache-on-failure: true
       - name: Configure Cassandra authentication
@@ -393,23 +409,13 @@ jobs:
           ${{ job.services.cassandra.id }} 127.0.0.1:9042 18454
 
       # No released image carries the Cassandra backend, so the job builds
-      # the last 0.1.x release from its tag. A tag does not change, so the
-      # binary is cached by the tag, the cargo features and the runner OS,
-      # and the build runs only on a cache miss. Keep the key in step with
-      # the build command.
-      - name: Cache the v0.1.14 release (cassandra backend)
-        id: cache-v0-1-14
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
-          key: extenddb-v0.1.14-no-default-features-cassandra-${{ runner.os }}
-
+      # the last 0.1.x release from its tag, on a cache miss only.
       - name: Build the v0.1.14 release (cassandra backend)
         if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         run: |
           git fetch --depth 1 origin tag v0.1.14
           git worktree add "$RUNNER_TEMP/extenddb-v0.1.14" v0.1.14
-          cargo build --release --no-default-features --features cassandra \
+          cargo build --release --no-default-features --features "$V0114_FEATURES" \
             --manifest-path "$RUNNER_TEMP/extenddb-v0.1.14/Cargo.toml" \
             --target-dir "$RUNNER_TEMP/target-v0.1.14"
 
