@@ -28,7 +28,7 @@ jobs:
     # rather than "latest" because ubuntu-latest migrates to 26.04 in Oct–Nov
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    timeout-minutes: 60
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -190,7 +190,7 @@ jobs:
 
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 

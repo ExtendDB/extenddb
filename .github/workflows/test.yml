@@ -24,7 +24,7 @@ jobs:
     # 20 concurrent). ubuntu-latest is an Amazon-wide shared pool where our jobs
     # waited 10-90 minutes to start (2026-09-29/30); see integration.yml.
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]

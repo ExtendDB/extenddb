@@ -122,7 +122,7 @@ jobs:
 
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 45
+    timeout-minutes: 60
     services:
       cassandra:
         image: cassandra:4.1
