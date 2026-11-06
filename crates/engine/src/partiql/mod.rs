@@ -31,10 +31,10 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::limits::LimitsConfig;
-use extenddb_core::partiql::number::check_literal_numbers;
 use extenddb_core::partiql::operand_types::check_ordering_operands;
 use extenddb_core::partiql::params::check_parameter_values;
 use extenddb_core::partiql::parser::{MAX_STATEMENT_LENGTH, parse_for_execute_statement};
+use extenddb_core::partiql::values::{check_condition_values, check_written_values};
 use extenddb_core::partiql::{Statement, table_name_refusal};
 use extenddb_core::types::AttributeValue;
 
@@ -97,7 +97,7 @@ impl PartiqlExecutor for OperationContext {
             Statement::Select(select) if select.projection_error.is_some() => {
                 check_table_name(&statement)
             }
-            _ => check_statement(&statement, &req.parameters),
+            _ => check_statement(&statement, &req.parameters, &req.statement),
         }
         .map_err(DynamoDbError::ValidationException)?;
         // The statement is authorized against one read of its table, at its
@@ -276,27 +276,34 @@ pub(crate) fn check_parameters(parameters: Option<&Value>) -> Result<(), String>
     check_parameter_values(items)
 }
 
-/// The checks a parsed statement gets before its target is resolved: the
-/// table name rule, a projected call (`COUNT(*)`), number literals against
-/// the item number rules, the operand types of ordering comparisons, then
-/// update paths that overlap or conflict. The first four come in that order
-/// on all three operations (measured 2026-11-02), except that
-/// `ExecuteStatement` reports a projected call once the target is resolved.
-/// Where the service checks overlapping or conflicting paths relative to the
-/// others was not measured.
+/// The checks a parsed statement gets before its target is resolved, in
+/// this order: the table name rule, a projected call (`COUNT(*)`), the
+/// number literals of the condition against the item number rules, the
+/// operand types of ordering comparisons, the values an INSERT or an UPDATE
+/// writes (the same number check, and the calls of a SET value), then update
+/// paths that overlap or conflict. `source` is the statement's text. The
+/// first three come in that order on all three operations (measured
+/// 2026-11-02), except that `ExecuteStatement` reports a projected call once
+/// the target is resolved; the written values come after the operand types
+/// and ahead of overlapping paths (measured 2026-11-06, see `values`).
 ///
 /// # Errors
 ///
 /// Returns the service's message for the first failure.
-pub(crate) fn check_statement(stmt: &Statement, params: &[AttributeValue]) -> Result<(), String> {
+pub(crate) fn check_statement(
+    stmt: &Statement,
+    params: &[AttributeValue],
+    source: &str,
+) -> Result<(), String> {
     check_table_name(stmt)?;
     if let Statement::Select(select) = stmt
         && let Some(message) = &select.projection_error
     {
         return Err(message.clone());
     }
-    check_literal_numbers(stmt).map_err(|e| e.message)?;
+    check_condition_values(stmt)?;
     check_ordering_operands(stmt, params)?;
+    check_written_values(stmt, source)?;
     match stmt {
         Statement::Update(update) => write::check_overlapping_paths(update),
         _ => Ok(()),
@@ -435,27 +442,39 @@ mod tests {
         );
     }
 
+    /// The statement checks of `sql` with the parameters `params`.
+    fn checked(sql: &str, params: &[AttributeValue]) -> Result<(), String> {
+        check_statement(&parse(sql).unwrap(), params, sql)
+    }
+
+    const OPERAND_TYPE: &str = "Incorrect operand type for operator or function; operator or function: <, operand type: \
+         BOOL";
+
     #[test]
     fn statement_checks_run_the_table_name_rule_first() {
         // A number in a condition is refused by the parser; one in a SET
         // value is left to these checks.
-        let stmt = parse("UPDATE \"t\" SET q = 1e126 WHERE pk = 'a'").unwrap();
-        assert_eq!(
-            check_statement(&stmt, &[]),
-            Err(
-                "Table name should be within the length [3, 255] and only contain 'a-z', \
-                 'A-Z', '0-9', '-', '_', '.'."
-                    .to_owned()
-            )
-        );
+        for sql in [
+            "UPDATE \"t\" SET q = 1e126 WHERE pk = 'a'",
+            "UPDATE \"t\" SET q = size(m) WHERE pk = 'a'",
+        ] {
+            assert_eq!(
+                checked(sql, &[]),
+                Err(
+                    "Table name should be within the length [3, 255] and only contain 'a-z', \
+                     'A-Z', '0-9', '-', '_', '.'."
+                        .to_owned()
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
     fn a_projected_call_is_checked_after_the_name_rule_and_before_literals() {
         const PROJECTED_CALL: &str = "Unexpected path component at 1:8:5";
-        let stmt = parse("SELECT COUNT(*) FROM \"t\" WHERE pk = 'a'").unwrap();
         assert_eq!(
-            check_statement(&stmt, &[]),
+            checked("SELECT COUNT(*) FROM \"t\" WHERE pk = 'a'", &[]),
             Err(
                 "Table name should be within the length [3, 255] and only contain 'a-z', \
                  'A-Z', '0-9', '-', '_', '.'."
@@ -466,54 +485,68 @@ mod tests {
             "SELECT COUNT(*) FROM \"tbl\" WHERE pk = 1e126",
             "SELECT COUNT(*) FROM \"tbl\" WHERE pk = 'a' AND v < true",
         ] {
-            let stmt = parse(sql).unwrap();
-            assert_eq!(
-                check_statement(&stmt, &[]),
-                Err(PROJECTED_CALL.to_owned()),
-                "{sql}"
-            );
+            assert_eq!(checked(sql, &[]), Err(PROJECTED_CALL.to_owned()), "{sql}");
         }
     }
 
     #[test]
     fn statement_checks_run_overlapping_update_paths_last() {
-        let stmt = parse("UPDATE \"tbl\" SET q = 1, q = 2 WHERE pk = 'a'").unwrap();
         assert_eq!(
-            check_statement(&stmt, &[]),
+            checked("UPDATE \"tbl\" SET q = 1, q = 2 WHERE pk = 'a'", &[]),
             Err(
                 "Two document paths overlap with each other; must remove or rewrite one of \
                  these paths; path one: [q], path two: [q]"
                     .to_owned()
             )
         );
-        let stmt = parse("UPDATE \"tbl\" SET q = 1e126, q = 2 WHERE pk = 'a'").unwrap();
         assert!(
-            check_statement(&stmt, &[])
+            checked("UPDATE \"tbl\" SET q = 1e126, q = 2 WHERE pk = 'a'", &[])
                 .unwrap_err()
                 .starts_with("Number overflow.")
         );
+        // (measured 2026-11-06, in both orders)
+        for sql in [
+            "UPDATE \"tbl\" SET a = size(m), a = 1 WHERE pk = 'a'",
+            "UPDATE \"tbl\" SET a = 1, a = size(m) WHERE pk = 'a'",
+        ] {
+            assert_eq!(
+                checked(sql, &[]),
+                Err(
+                    "The function is not allowed in an update expression; function: size"
+                        .to_owned()
+                ),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
-    fn statement_checks_run_literals_before_operand_types() {
-        let stmt = parse("UPDATE \"tbl\" SET q = 1e126 WHERE pk = 'a' AND val < ?").unwrap();
+    fn the_written_values_are_checked_after_the_operand_types() {
+        // (measured 2026-11-06, with a literal and with a parameter)
         let params = [AttributeValue::Bool(true)];
-        assert_eq!(
-            check_statement(&stmt, &params),
-            Err(
-                "Number overflow. Attempting to store a number with magnitude larger than \
-                 supported range under root"
-                    .to_owned()
-            )
-        );
-        let stmt = parse("SELECT * FROM \"tbl\" WHERE pk = 1 AND val < ?").unwrap();
-        assert_eq!(
-            check_statement(&stmt, &params),
-            Err(
-                "Incorrect operand type for operator or function; operator or function: <, \
-                 operand type: BOOL"
-                    .to_owned()
-            )
-        );
+        for (sql, params) in [
+            (
+                "UPDATE \"tbl\" SET q = 1e126 WHERE pk = 'a' AND val < ?",
+                &params[..],
+            ),
+            (
+                "UPDATE \"tbl\" SET q = 1e126 WHERE pk = 'a' AND val < true",
+                &[],
+            ),
+            (
+                "UPDATE \"tbl\" SET q = size(m) WHERE pk = 'a' AND val < ?",
+                &params[..],
+            ),
+            (
+                "UPDATE \"tbl\" SET q = upper(m) WHERE pk = 'a' AND val < true",
+                &[],
+            ),
+            (
+                "SELECT * FROM \"tbl\" WHERE pk = 1 AND val < ?",
+                &params[..],
+            ),
+        ] {
+            assert_eq!(checked(sql, params), Err(OPERAND_TYPE.to_owned()), "{sql}");
+        }
     }
 }

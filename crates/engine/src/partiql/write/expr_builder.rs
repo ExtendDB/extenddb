@@ -93,17 +93,37 @@ impl ExprBuilder {
                         )));
                     }
                 }
-                let left = self.operand(left, params)?;
-                let right = self.operand(right, params)?;
+                let left = self.grouped(left, params)?;
+                let right = self.grouped(right, params)?;
                 format!("{left} {symbol} {right}")
             }
             Operand::Function(name, args) => {
                 let mut rendered = Vec::new();
                 for arg in args {
-                    rendered.push(self.operand(arg, params)?);
+                    rendered.push(self.grouped(arg, params)?);
                 }
                 format!("{}({})", name, rendered.join(", "))
             }
+        })
+    }
+
+    /// An operand of an arithmetic operator or an argument of a call, in
+    /// parentheses when it is an arithmetic expression itself: a SET value
+    /// of the classic grammar takes one operator, and parentheses group. The
+    /// service runs a statement with arithmetic in an operand or an argument
+    /// (measured 2026-11-06: `SET a = (a + 1) + 1`, `1 + (a + 1)`, `a - (1 -
+    /// 1)`, `(a + 1) - (a - 1)` and `if_not_exists(q, (a + 1) + 1)` set the
+    /// sums).
+    fn grouped(
+        &mut self,
+        operand: &Operand,
+        params: &[AttributeValue],
+    ) -> Result<String, DynamoDbError> {
+        let text = self.operand(operand, params)?;
+        Ok(if matches!(operand, Operand::Arith(..)) {
+            format!("({text})")
+        } else {
+            text
         })
     }
 

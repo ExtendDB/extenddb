@@ -37,7 +37,7 @@ use update::run_update;
 
 pub(super) use delete::build_delete_parts;
 pub(super) use exists::build_exists_parts;
-pub(super) use insert::{build_insert_parts, insert_refusal};
+pub(super) use insert::{PutParts, build_insert_parts, insert_refusal};
 pub(super) use update::{
     UpdateParts, build_update_parts, check_overlapping_paths, first_overlap,
     update_index_key_refusal, update_refusal,

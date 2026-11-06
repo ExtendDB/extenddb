@@ -1260,3 +1260,57 @@ def test_a_transaction_total_counts_its_index_units(dynamodb_client, gtable):
     assert resp["ConsumedCapacity"] == [
         {"TableName": gtable, "CapacityUnits": 6.0, "WriteCapacityUnits": 6.0}
     ]
+
+
+# --- a member with a call an update cannot make ---------------------------------
+# A SET value that calls a condition function or a function the service does
+# not know fails the request with the member's position, at its place among
+# the members: after the members before it pass their checks, ahead of a
+# missing table of a member before it and of the mix of reads and writes
+# (measured 2026-11-06).
+
+_CALL_NOT_ALLOWED = "The function is not allowed in an update expression; function: size"
+_CALL_SIZE = "UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b'"
+_CALL_UPPER = "UPDATE {t} SET a = upper(m) WHERE pk = '{k}' AND sk = 'b'"
+
+
+def _upper_at(statement):
+    return f"Unrecognized function: upper at 1:{statement.index('upper(') + 1}:5"
+
+
+@pytest.mark.parametrize(
+    "templates, index",
+    [
+        ([_CALL_SIZE], 0),
+        ([_CALL_UPPER], 0),
+        (["UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'", _CALL_SIZE], 1),
+        ([_CALL_UPPER, "UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'"], 0),
+        (["UPDATE \"nosuch_tbl_r3\" SET x = 1 WHERE pk = '{o}' AND sk = 'b'", _CALL_SIZE], 1),
+        ([_SEED_READ, _CALL_UPPER], 1),
+        ([_CALL_SIZE, _SEED_READ], 0),
+        (["UPDATE \"nosuch_tbl_r3\" SET a = upper(m) WHERE pk = '{k}' AND sk = 'b'"], 0),
+        (["UPDATE {t} SET a = size(m) WHERE pk = '{k}'"], 0),
+    ],
+)
+def test_a_member_with_a_call_an_update_cannot_make_fails_the_request(
+    dynamodb_client, gtable, templates, index
+):
+    names = {"k": f"tc-{uuid.uuid4().hex[:6]}", "o": f"tco-{uuid.uuid4().hex[:6]}", "s": "seed"}
+    put(dynamodb_client, gtable, names["k"])
+    put(dynamodb_client, gtable, names["o"])
+    members = _members(gtable, templates, **names)
+    refused = members[index]["Statement"]
+    message = _upper_at(refused) if "upper(" in refused else _CALL_NOT_ALLOWED
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, members)
+    assert _error(excinfo) == ("ValidationException", _positional(index, message))
+    for name in ("k", "o"):
+        assert _gget(dynamodb_client, gtable, key(names[name])) == item(key(names[name]))
+
+
+def test_grouped_arithmetic_runs_in_a_transaction(dynamodb_client, gtable):
+    name = f"tga-{uuid.uuid4().hex[:6]}"
+    put(dynamodb_client, gtable, name)
+    members = _members(gtable, ["UPDATE {t} SET a = (a + 1) + 1 WHERE pk = '{k}' AND sk = 'b'"], k=name)
+    assert _txn(dynamodb_client, members)["Responses"] == []
+    assert _gget(dynamodb_client, gtable, key(name))["a"] == {"N": "3"}

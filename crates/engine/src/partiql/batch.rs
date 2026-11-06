@@ -101,7 +101,7 @@ pub(super) async fn run(
         // statement's own, and the statement counts as neither a read nor a
         // write (measured 2026-11-05).
         let checked = statement.and_then(|stmt| {
-            super::check_statement(&stmt, &req.parameters)?;
+            super::check_statement(&stmt, &req.parameters, &req.statement)?;
             if let Statement::Select(select) = &stmt {
                 super::select::check_projection(select)?;
             }

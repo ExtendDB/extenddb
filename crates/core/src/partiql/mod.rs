@@ -20,6 +20,7 @@ pub mod operand_types;
 pub mod params;
 pub mod parser;
 pub mod plan;
+pub mod values;
 
 pub use ast::Statement;
 pub use from_path::table_name_refusal;

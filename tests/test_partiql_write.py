@@ -24,6 +24,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
+from partiql_gsi_table import get as _gget
+from partiql_gsi_table import gsi_table, item, put
 
 
 @pytest.fixture(scope="session")
@@ -586,3 +588,262 @@ def test_delete_missing_key_with_predicate_returning_all_old_is_empty(dynamodb_c
         "RETURNING ALL OLD *",
     )
     assert resp["Items"] == []
+
+
+# --- calls in a SET value ----------------------------------------------------
+# A SET value may call if_not_exists and list_append, each with two operands
+# and if_not_exists with a path first; set_add and set_delete are the whole
+# value or not a function. Any other call is refused by what it is, after the
+# call's arguments and in the order the values are written, ahead of every
+# check against the table and after the operand types of the condition
+# (measured 2026-11-06 in us-east-1).
+
+NOT_ALLOWED = "The function is not allowed in an update expression; function: "
+
+
+@pytest.fixture(scope="module")
+def gtable(dynamodb_client):
+    """The table with the index `gsi` (see partiql_gsi_table)."""
+    with gsi_table(dynamodb_client, "extenddb-measure-2c-writeg") as name:
+        yield name
+
+
+def _set(table, value, pk, where=""):
+    return f"UPDATE \"{table}\" SET a = {value} WHERE pk = '{pk}' AND sk = 'b'{where}"
+
+
+def _call_at(statement, written, paren=False):
+    """The `line:column:length` of the call written `written` in a statement
+    on one line, or of the parenthesis after its name."""
+    column = statement.index(f"{written}(") + 1
+    if paren:
+        return f"1:{column + len(written)}:1"
+    return f"1:{column}:{len(written)}"
+
+
+def _refusal(client, statement, params=None):
+    kwargs = {} if params is None else {"Parameters": params}
+    with pytest.raises(ClientError) as excinfo:
+        client.execute_statement(Statement=statement, **kwargs)
+    return _error(excinfo)
+
+
+def _unrecognized(written):
+    return lambda s: f"Unrecognized function: {written.lower()} at {_call_at(s, written)}"
+
+
+def _operands(name, count):
+    return (
+        "Incorrect number of operands for operator or function; operator or function: "
+        f"{name}, number of operands: {count}"
+    )
+
+
+SET_CALLS = [
+    ("attribute_exists(m)", NOT_ALLOWED + "attribute_exists"),
+    ("attribute_not_exists(m)", NOT_ALLOWED + "attribute_not_exists"),
+    ("attribute_type(m, 'M')", NOT_ALLOWED + "attribute_type"),
+    ("begins_with(m, 'x')", NOT_ALLOWED + "begins_with"),
+    ("contains(m, 'x')", NOT_ALLOWED + "contains"),
+    ("size(m)", NOT_ALLOWED + "size"),
+    ("SIZE(m)", NOT_ALLOWED + "size"),
+    ("size(m, 1)", NOT_ALLOWED + "size"),
+    ("size()", NOT_ALLOWED + "size"),
+    ("attribute_exists('x')", NOT_ALLOWED + "attribute_exists"),
+    ("size(m) + 1", NOT_ALLOWED + "size"),
+    ("1 + size(m)", NOT_ALLOWED + "size"),
+    ("(size(m))", NOT_ALLOWED + "size"),
+    ("if_not_exists(a, size(m))", NOT_ALLOWED + "size"),
+    ("if_not_exists(size(m))", NOT_ALLOWED + "size"),
+    ("upper(size(m))", NOT_ALLOWED + "size"),
+    ("size(m), b = upper(m)", NOT_ALLOWED + "size"),
+    ("upper(m)", _unrecognized("upper")),
+    ("UPPER(m)", _unrecognized("UPPER")),
+    ("lower(m)", _unrecognized("lower")),
+    ("exists(m)", _unrecognized("exists")),
+    ("char_length(m)", _unrecognized("char_length")),
+    ("substring(m, 1)", _unrecognized("substring")),
+    ("trim(m)", _unrecognized("trim")),
+    ("foo(m)", _unrecognized("foo")),
+    ("upper()", _unrecognized("upper")),
+    ("(upper(m))", _unrecognized("upper")),
+    ("size(upper(m))", _unrecognized("upper")),
+    ("if_not_exists(a, upper(m))", _unrecognized("upper")),
+    ("if_not_exists(upper(m))", _unrecognized("upper")),
+    ("upper(m), b = size(m)", _unrecognized("upper")),
+    ("upper(m), b = lower(m)", _unrecognized("upper")),
+    ("if_not_exists(a, set_add(ss, <<'b'>>))", _unrecognized("set_add")),
+    (
+        "set_add(m)",
+        lambda s: f"SET_ADD must have exactly two arguments at {_call_at(s, 'set_add')}",
+    ),
+    (
+        "set_delete(m)",
+        lambda s: f"SET_DELETE must have exactly two arguments at {_call_at(s, 'set_delete')}",
+    ),
+    (
+        "missing(m)",
+        "Statement wasn't well formed, can't be processed: Unexpected token after expression",
+    ),
+    ("count(m)", lambda s: f"Unsupported token in expression: count at {_call_at(s, 'count')}"),
+    ("COUNT(m)", lambda s: f"Unsupported token in expression: count at {_call_at(s, 'COUNT')}"),
+    ("sum(m)", lambda s: f"Unsupported token in expression: sum at {_call_at(s, 'sum')}"),
+    ("avg(m)", lambda s: f"Unsupported token in expression: avg at {_call_at(s, 'avg')}"),
+    ("min(m)", lambda s: f"Unsupported token in expression: min at {_call_at(s, 'min')}"),
+    ("max(m)", lambda s: f"Unsupported token in expression: max at {_call_at(s, 'max')}"),
+    (
+        "nullif(1, m)",
+        lambda s: f"Unsupported token in expression: UNKNOWN at {_call_at(s, 'nullif')}",
+    ),
+    (
+        "coalesce(m, 1)",
+        lambda s: f"Unsupported token in expression: UNKNOWN at {_call_at(s, 'coalesce', True)}",
+    ),
+    ("if_not_exists(m)", _operands("if_not_exists", 1)),
+    ("if_not_exists(1)", _operands("if_not_exists", 1)),
+    ("if_not_exists(a, 1, 2)", _operands("if_not_exists", 3)),
+    ("if_not_exists()", _operands("if_not_exists", 0)),
+    ("list_append(l)", _operands("list_append", 1)),
+    ("list_append(l, [1], [2])", _operands("list_append", 3)),
+    ("list_append()", _operands("list_append", 0)),
+    (
+        "if_not_exists(1, a)",
+        "Operator or function requires a document path; operator or function: if_not_exists",
+    ),
+    (
+        "if_not_exists(1, 2)",
+        "Operator or function requires a document path; operator or function: if_not_exists",
+    ),
+]
+
+
+@pytest.mark.parametrize("value, message", SET_CALLS, ids=[v for v, _ in SET_CALLS])
+def test_a_set_value_calls_only_the_update_functions(dynamodb_client, gtable, value, message):
+    pk = put(dynamodb_client, gtable, f"call-{uuid.uuid4().hex[:6]}")
+    statement = _set(gtable, value, pk)
+    expected = message(statement) if callable(message) else message
+    assert _refusal(dynamodb_client, statement) == ("ValidationException", expected)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "value, stored",
+    [
+        ("if_not_exists(a, 7)", {"N": "1"}),
+        ("if_not_exists(q, 7)", {"N": "7"}),
+        ("list_append(l, [3])", {"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]}),
+        ("list_append([0], l)", {"L": [{"N": "0"}, {"N": "1"}, {"N": "2"}]}),
+        ("if_not_exists(a, if_not_exists(b, 7))", {"N": "1"}),
+        ("list_append(if_not_exists(l, []), [3])", {"L": [{"N": "1"}, {"N": "2"}, {"N": "3"}]}),
+        ("(a + 1) + 1", {"N": "3"}),
+        ("1 + (a + 1)", {"N": "3"}),
+        ("a - (1 - 1)", {"N": "1"}),
+        ("(a + 1) - (a - 1)", {"N": "2"}),
+        ("((a + 1) + 1) + 1", {"N": "4"}),
+        ("(if_not_exists(a, 0) + 1) + 1", {"N": "3"}),
+        ("if_not_exists(q, (a + 1) + 1)", {"N": "3"}),
+        ("if_not_exists(a, a + 5)", {"N": "1"}),
+        ("if_not_exists(a, 0) + if_not_exists(b, 0)", {"N": "3"}),
+    ],
+)
+def test_the_update_functions_and_grouped_arithmetic_run(dynamodb_client, gtable, value, stored):
+    pk = put(dynamodb_client, gtable, f"run-{uuid.uuid4().hex[:6]}", l={"L": [{"N": "1"}, {"N": "2"}]})
+    assert _exec(dynamodb_client, _set(gtable, value, pk))["Items"] == []
+    assert _gget(dynamodb_client, gtable, pk)["a"] == stored
+
+
+def test_grouped_arithmetic_takes_a_parameter_and_meets_a_missing_attribute(
+    dynamodb_client, gtable
+):
+    pk = put(dynamodb_client, gtable, f"grp-{uuid.uuid4().hex[:6]}")
+    _exec(dynamodb_client, _set(gtable, "(a + ?) + 1", pk), Parameters=[{"N": "5"}])
+    assert _gget(dynamodb_client, gtable, pk)["a"] == {"N": "7"}
+    assert _refusal(dynamodb_client, _set(gtable, "(q + 1) + 1", pk)) == (
+        "ValidationException",
+        "The provided expression refers to an attribute that does not exist in the item",
+    )
+
+
+OPERAND_TYPE = "Incorrect operand type for operator or function; operator or function: <, operand type: BOOL"
+OVERFLOW = (
+    "Number overflow. Attempting to store a number with magnitude larger than supported range "
+    "under root"
+)
+
+
+@pytest.mark.parametrize(
+    "template, message",
+    [
+        ("UPDATE {t} SET b = 1e126, a = size(m) WHERE pk = '{k}' AND sk = 'b'", OVERFLOW),
+        ("UPDATE {t} SET a = size(m), b = 1e126 WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m), a = 1 WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = 1, a = size(m) WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m), b = ? WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET pk = 'z', a = size(m) WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m), pk = 'z' WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET g = 1, a = size(m) WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m) REMOVE sk WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m) WHERE pk = '{k}'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m) WHERE pk = 1 AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET a = size(m) WHERE pk = 'nope-{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        (
+            "UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b' AND pk.c = 1",
+            NOT_ALLOWED + "size",
+        ),
+        (
+            "UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b' RETURNING ALL NEW *",
+            NOT_ALLOWED + "size",
+        ),
+        (
+            "UPDATE \"nosuch_tbl_r3\" SET a = size(m) WHERE pk = '{k}' AND sk = 'b'",
+            NOT_ALLOWED + "size",
+        ),
+        ("UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b' AND x < true", OPERAND_TYPE),
+        ("UPDATE {t} SET b = 1e126 WHERE pk = '{k}' AND sk = 'b' AND x < true", OPERAND_TYPE),
+        (
+            "UPDATE {t} SET a = upper(m) WHERE pk = '{k}' AND sk = 'b' AND lower(x) = 1",
+            lambda s: f"Unrecognized function: lower at {_call_at(s, 'lower')}",
+        ),
+        (
+            "UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b' AND a + 1 = 2",
+            "Unsupported operator in Condition Expression. Operator: +",
+        ),
+        ("UPDATE {t} AS x SET a = size(m) WHERE pk = '{k}' AND sk = 'b'", "Aliasing is not supported"),
+        (
+            "UPDATE \"ab\" SET a = upper(m) WHERE pk = '{k}' AND sk = 'b'",
+            "Table name should be within the length [3, 255] and only contain 'a-z', 'A-Z', "
+            "'0-9', '-', '_', '.'.",
+        ),
+    ],
+)
+def test_a_call_is_refused_in_its_place_among_the_checks(
+    dynamodb_client, gtable, template, message
+):
+    pk = put(dynamodb_client, gtable, f"ord-{uuid.uuid4().hex[:6]}")
+    statement = template.format(t=f'"{gtable}"', k=pk)
+    expected = message(statement) if callable(message) else message
+    assert _refusal(dynamodb_client, statement) == ("ValidationException", expected)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "UPDATE {t}\n  SET a = upper(m)\n  WHERE pk = '{k}' AND sk = 'b'",
+        "FROM {t} WHERE pk = '{k}' AND sk = 'b' SET a = upper(m)",
+        "UPDATE {t} SET x = 1 SET a = upper(m) WHERE pk = '{k}' AND sk = 'b'",
+        "UPDATE {t} SET a = upper(m) REMOVE x WHERE pk = '{k}' AND sk = 'b'",
+        "UPDATE {t} SET ss = set_add(ss, <<'b'>>), a = if_not_exists(a, upper(m)) "
+        "WHERE pk = '{k}' AND sk = 'b'",
+    ],
+    ids=["lines", "from-first", "two-sets", "set-and-remove", "after-set-add"],
+)
+def test_an_unknown_call_is_named_where_it_is_written(dynamodb_client, gtable, template):
+    pk = put(dynamodb_client, gtable, f"pos-{uuid.uuid4().hex[:6]}")
+    statement = template.format(t=f'"{gtable}"', k=pk)
+    line_index = next(i for i, line in enumerate(statement.split("\n")) if "upper(" in line)
+    column = statement.split("\n")[line_index].index("upper(") + 1
+    assert _refusal(dynamodb_client, statement) == (
+        "ValidationException",
+        f"Unrecognized function: upper at {line_index + 1}:{column}:5",
+    )

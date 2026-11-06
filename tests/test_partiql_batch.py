@@ -1032,3 +1032,81 @@ def test_failed_writes_alone_report_no_capacity(dynamodb_client, gtable):
         missing=f"cap-missing-{uuid.uuid4().hex[:6]}",
         missing2=f"cap-missing-{uuid.uuid4().hex[:6]}",
     ) is None
+
+
+# --- a statement with a call an update cannot make -----------------------------
+# A SET value that calls a condition function or a function the service does
+# not know is the statement's own error, without the table, and the other
+# statements run. The statement counts as neither a read nor a write, nor in
+# the check for two statements on one item (measured 2026-11-06).
+
+CALL_NOT_ALLOWED = "The function is not allowed in an update expression; function: "
+INSERT_ONE = "INSERT INTO {t} VALUE {{'pk':'{one}','sk':'b'}}"
+INSERT_TWO = "INSERT INTO {t} VALUE {{'pk':'{two}','sk':'b'}}"
+
+
+def _unrecognized_at(statement, name):
+    return f"Unrecognized function: {name} at 1:{statement.index(name + '(') + 1}:{len(name)}"
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ("size(m)", CALL_NOT_ALLOWED + "size"),
+        ("attribute_exists(m)", CALL_NOT_ALLOWED + "attribute_exists"),
+        ("begins_with(m, 'x')", CALL_NOT_ALLOWED + "begins_with"),
+        ("upper(m)", None),
+        (
+            "if_not_exists(m)",
+            "Incorrect number of operands for operator or function; operator or function: "
+            "if_not_exists, number of operands: 1",
+        ),
+    ],
+)
+def test_a_call_an_update_cannot_make_fails_only_its_statement(
+    dynamodb_client, gtable, value, message
+):
+    names = {n: f"bc-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "one", "two")}
+    put(dynamodb_client, gtable, names["k"])
+    update = _sql(f"UPDATE {{t}} SET a = {value} WHERE pk = '{{k}}' AND sk = 'b'", gtable, **names)
+    statements = [_sql(INSERT_ONE, gtable, **names), update, _sql(INSERT_TWO, gtable, **names)]
+    resp = _batch(dynamodb_client, [{"Statement": s} for s in statements])
+    expected = message or _unrecognized_at(update, "upper")
+    assert resp["Responses"] == [
+        {"TableName": gtable},
+        _validation(expected),
+        {"TableName": gtable},
+    ]
+    for name in ("one", "two"):
+        assert _gget(dynamodb_client, gtable, key(names[name])) is not None
+    assert _gget(dynamodb_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+@pytest.mark.parametrize("value", ["size(m)", "upper(m)"])
+def test_a_call_an_update_cannot_make_counts_as_no_write(dynamodb_client, gtable, value):
+    name = f"bcw-{uuid.uuid4().hex[:6]}"
+    put(dynamodb_client, gtable, name)
+    update = _sql(f"UPDATE {{t}} SET a = {value} WHERE pk = '{{k}}' AND sk = 'b'", gtable, k=name)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    read = {"Statement": _seed_read(gtable), "ConsistentRead": True}
+    resp = _batch(dynamodb_client, [read, {"Statement": update}])
+    assert resp["Responses"][0] == _seed_answer(gtable)
+    assert resp["Responses"][1]["Error"]["Code"] == "ValidationError"
+    resp = _batch(dynamodb_client, [{"Statement": update}, {"Statement": other}])
+    assert resp["Responses"][1] == {"TableName": gtable}
+    assert _gget(dynamodb_client, gtable, key(name))["x"] == {"N": "1"}
+
+
+def test_grouped_arithmetic_runs_in_a_batch(dynamodb_client, gtable):
+    name = f"bga-{uuid.uuid4().hex[:6]}"
+    put(dynamodb_client, gtable, name)
+    two = f"bga2-{uuid.uuid4().hex[:6]}"
+    resp = _batch(
+        dynamodb_client,
+        [
+            {"Statement": _sql("UPDATE {t} SET a = (a + 1) + 1 WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)},
+            {"Statement": _sql(INSERT_TWO, gtable, two=two)},
+        ],
+    )
+    assert resp["Responses"] == [{"TableName": gtable}, {"TableName": gtable}]
+    assert _gget(dynamodb_client, gtable, key(name))["a"] == {"N": "3"}

@@ -151,7 +151,8 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
     super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
     let stmt = parse_for_request(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;
-    super::check_statement(&stmt, &req.parameters).map_err(|message| positional(&message))?;
+    super::check_statement(&stmt, &req.parameters, &req.statement)
+        .map_err(|message| positional(&message))?;
     if let Statement::Select(select) = &stmt {
         super::select::check_projection(select).map_err(|message| positional(&message))?;
     }
