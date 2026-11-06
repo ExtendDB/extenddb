@@ -12,8 +12,11 @@
 //!
 //! These tests drive the ARN directly rather than provisioning a second account,
 //! so they exercise the resolution rule without needing a second set of
-//! credentials.
+//! credentials. Every backup they create is waited to AVAILABLE before it is
+//! described or deleted (`backup_restore::create_available_backup`: a
+//! store-backed ExtendDB creates asynchronously) and deleted at the end.
 
+use crate::backup_restore::create_available_backup;
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType,
@@ -126,14 +129,7 @@ async fn describe_backup_with_own_arn_still_resolves() {
     let table = format!("BackupScopeOwn_{}", ts());
     make_table(&table).await;
 
-    let create = c
-        .create_backup()
-        .table_name(&table)
-        .backup_name("scope-own")
-        .send()
-        .await
-        .unwrap();
-    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    let arn = create_available_backup(c, &table, "scope-own").await;
 
     let resp = c.describe_backup().backup_arn(&arn).send().await.unwrap();
     assert_eq!(
@@ -159,16 +155,12 @@ async fn describe_backup_with_own_nonexistent_arn_is_backup_not_found() {
     let table = format!("BackupScopeMiss_{}", ts());
     make_table(&table).await;
 
-    let create = c
-        .create_backup()
-        .table_name(&table)
-        .backup_name("scope-miss")
-        .send()
-        .await
-        .unwrap();
-    let real = create.backup_details().unwrap().backup_arn().to_string();
+    let real = create_available_backup(c, &table, "scope-miss").await;
     // Same account/region/table prefix, a backup id that was never issued.
-    let missing = format!("{}/00000000000000-deadbeef", real.rsplit_once('/').unwrap().0);
+    let missing = format!(
+        "{}/00000000000000-deadbeef",
+        real.rsplit_once('/').unwrap().0
+    );
 
     let err = c
         .describe_backup()
@@ -194,18 +186,16 @@ async fn describe_backup_after_delete_is_backup_not_found() {
     let table = format!("BackupScopeDel_{}", ts());
     make_table(&table).await;
 
-    let create = c
-        .create_backup()
-        .table_name(&table)
-        .backup_name("scope-del")
-        .send()
-        .await
-        .unwrap();
-    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    let arn = create_available_backup(c, &table, "scope-del").await;
 
     c.delete_backup().backup_arn(&arn).send().await.unwrap();
 
-    let err = c.describe_backup().backup_arn(&arn).send().await.unwrap_err();
+    let err = c
+        .describe_backup()
+        .backup_arn(&arn)
+        .send()
+        .await
+        .unwrap_err();
     assert_eq!(
         err_code(&err),
         Some("BackupNotFoundException"),
@@ -214,6 +204,7 @@ async fn describe_backup_after_delete_is_backup_not_found() {
 
     c.delete_table().table_name(&table).send().await.ok();
 }
+
 #[tokio::test]
 async fn backup_ids_are_not_derived_from_the_timestamp_alone() {
     let c = client();
@@ -222,14 +213,7 @@ async fn backup_ids_are_not_derived_from_the_timestamp_alone() {
 
     let mut arns = Vec::new();
     for i in 0..3 {
-        let create = c
-            .create_backup()
-            .table_name(&table)
-            .backup_name(format!("scope-id-{i}"))
-            .send()
-            .await
-            .unwrap();
-        arns.push(create.backup_details().unwrap().backup_arn().to_string());
+        arns.push(create_available_backup(c, &table, &format!("scope-id-{i}")).await);
     }
 
     for arn in &arns {

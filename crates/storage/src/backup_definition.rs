@@ -334,7 +334,7 @@ const LEGACY_DEFAULT_THROUGHPUT: i64 = 5;
 
 /// A backup as the engine needs it to restore it and to describe it.
 ///
-/// Returned by `BackupEngine::backup_restore_source` for an AVAILABLE backup.
+/// Returned by `LegacyBackupReader::restore_source` for an AVAILABLE backup.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackupRestoreSource {
     pub backup_arn: String,

@@ -26,6 +26,11 @@ extenddb-storage = { workspace = true, features = ["test-util"] }
 # The crate's own tests need `test-hooks` and `test-util`; a dev-dependency on
 # itself turns both features on for test builds only.
 extenddb-storage-postgres = { path = ".", features = ["test-hooks", "test-util"] }
+# The store identity tests run the engine's checks over two engines on one
+# scratch catalog and two filesystem stores.
+extenddb-engine = { workspace = true }
+extenddb-backup-store = { workspace = true }
+tempfile = "3"
 
 [dependencies]
 anyhow = { workspace = true }

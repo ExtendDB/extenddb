@@ -45,7 +45,7 @@ import urllib.parse
 
 import psycopg2
 
-from catalog_checks import expect_exit, finish, healthy, report, run, start, stop
+from catalog_checks import expect_exit, finish, healthy, report, run, start, stop, with_filesystem_store
 
 NAMESPACE = 0x0045_4442  # the advisory key namespace of crates/storage-postgres
 MIGRATION_KEY = 1
@@ -173,6 +173,46 @@ def main(binary: str, admin_url: str, port: int) -> int:
             contains='"extenddb serve"',
         )
         stop(server)
+
+        # The backup commands register as a server does (the session's
+        # application_name) and release the registration when they exit,
+        # whatever the outcome, so a migration right after them finds no
+        # session to wait for. With no store configured the command releases
+        # on its no-store path before it prints; with a filesystem store (a
+        # root under the work directory) it opens the store, runs, and
+        # releases when it closes the catalog, the path a store-backed
+        # deployment takes.
+        backup = [binary, "backup", "--config", config]
+        expect_exit(0, "backup list with no server running", backup + ["list"], env, contains="none (")
+        expect_exit(
+            0,
+            "backup purge's dry run with no server running",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted",
+        )
+        store_config, root = with_filesystem_store(config, work)
+        backup = [binary, "backup", "--config", store_config]
+        expect_exit(
+            0,
+            "backup list with a filesystem store configured",
+            backup + ["list"],
+            env,
+            contains=f"=== backups in the filesystem store {root}",
+        )
+        expect_exit(
+            0,
+            "backup purge's dry run with a filesystem store configured",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted. Run again with --confirm",
+        )
+        expect_exit(
+            0,
+            "migrate --yes right after the backup commands",
+            migrate + ["--yes", "--lock-timeout", "1"],
+            env,
+        )
 
         holder = psycopg2.connect(f"{admin_url.rstrip('/')}/{stem}_catalog")
         with holder.cursor() as cur:
@@ -321,9 +361,9 @@ def through_pooler(
         contains="Ran again 1 baseline",
     )
     report(
-        all(f"Ran again {n} " in output for n in (1, 3, 4, 5, 6))
+        all(f"Ran again {n} " in output for n in (1, 3, 4, 5, 8))
         and "Skipped 2 resource_tag_condition_keys:" in output,
-        "the reconverge through the pooler ran migrations 1, 3, 4, 5 and 6 again and skipped 2",
+        "the reconverge through the pooler ran migrations 1, 3, 4, 5 and 8 again and skipped 2",
         output,
     )
     expect_exit(0, "migrate --forget 3 through the pooler", migrate + ["--forget", "3"], env)

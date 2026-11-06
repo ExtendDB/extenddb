@@ -26,6 +26,11 @@ mod connect;
 mod cql;
 mod guarded;
 mod locks;
+// Frozen once released: neither rustfmt nor a later clippy lint may require
+// an edit that changes its checksum.
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
 pub mod postcheck;
 mod registrar;
 mod registrations;
@@ -52,7 +57,7 @@ pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;
-pub use registrations::{RegistrationTimes, ServingRegistration};
+pub use registrations::{RegistrationTimes, SERVE_COMMAND, ServingRegistration};
 
 use crate::cassandra_util::CassandraSession;
 
@@ -127,13 +132,35 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0005_drop_continuous_backups.cql"
             )],
         },
+        // Breaking: a binary without it neither reads the index nor writes
+        // the job record on the restore registrations it creates, so a
+        // restore it ran would be owned by nobody. Convergent: every
+        // statement is `IF NOT EXISTS`, the backfill writes only a
+        // registration whose job status is unset, which no registration
+        // this release writes is (each is inserted with its job record), and
+        // the catalog id is inserted only when absent; so a second run over
+        // data written since changes nothing but a registration a release
+        // before it wrote, which is the repair `--reconverge` is for.
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
+             stream records with the server's clock (#660)",
+        ),
         MigrationId::WarmThroughput => Migration::Applies {
             kind: Kind::Breaking,
             convergent: true,
             bodies: vec![file_body!(
                 StoreKind::Catalog,
                 "migrations/catalog",
-                "0006_warm_throughput.cql"
+                "0008_warm_throughput.cql"
             )],
         },
     }
@@ -283,12 +310,38 @@ pub async fn migrate_catalog_keyspace(
     release: &str,
     timeout: std::time::Duration,
 ) -> Result<RunReport, MigrationError> {
+    migrate_catalog_keyspace_through(
+        session,
+        keyspace_prefix,
+        release,
+        timeout,
+        MigrationId::LATEST,
+    )
+    .await
+}
+
+/// [`migrate_catalog_keyspace`] stopping after migration `through`: for
+/// tests of a catalog a later migration has not reached.
+///
+/// # Errors
+///
+/// As [`migrate_catalog_keyspace`].
+#[cfg(any(test, feature = "test-util"))]
+pub async fn migrate_catalog_keyspace_through(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    release: &str,
+    timeout: std::time::Duration,
+    through: MigrationId,
+) -> Result<RunReport, MigrationError> {
     let catalog = format!("{keyspace_prefix}_catalog");
     create_lock_table(&session, &catalog).await?;
     let lock = MigrationLock::acquire(session, &catalog, LeaseTimes::DEFAULT, timeout).await?;
     let result = {
         let migrations = CassandraMigrations::locked_catalog_only(&lock, keyspace_prefix);
-        Runner::new(&migrations, release).migrate().await
+        Runner::new(&migrations, release)
+            .migrate_through(through)
+            .await
     };
     lock.release().await;
     result
@@ -680,11 +733,31 @@ pub async fn register_server(
     host: &str,
     release: &str,
 ) -> Result<ServerRegistration, MigrationError> {
-    register_server_timed(
+    register_server_as(session, keyspace_prefix, host, release, SERVE_COMMAND).await
+}
+
+/// [`register_server`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose row carries its name (the registrations
+/// module doc says where) and whose refusal while a migration holds the
+/// lock names the holder without the server's advice to start the server.
+///
+/// # Errors
+///
+/// As [`register_server`].
+pub async fn register_server_as(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
         session,
         keyspace_prefix,
         host,
         release,
+        command,
         RegistrationTimes::DEFAULT,
     )
     .await
@@ -702,6 +775,26 @@ pub async fn register_server_timed(
     release: &str,
     times: RegistrationTimes,
 ) -> Result<ServerRegistration, MigrationError> {
+    register_server_with(
+        session,
+        keyspace_prefix,
+        host,
+        release,
+        SERVE_COMMAND,
+        times,
+    )
+    .await
+}
+
+async fn register_server_with(
+    session: Arc<CassandraSession>,
+    keyspace_prefix: &str,
+    host: &str,
+    release: &str,
+    command: &str,
+    times: RegistrationTimes,
+) -> Result<ServerRegistration, MigrationError> {
+    let release = &registrations::release_cell(release, command);
     let catalog = format!("{keyspace_prefix}_catalog");
     agreement::wait_for_agreement(&session, AGREEMENT_TIMEOUT).await?;
     if !connect::table_exists(&session, &catalog, "extenddb_servers").await? {
@@ -720,9 +813,15 @@ pub async fn register_server_timed(
             .await?;
     let checked = async {
         if let Some(holder) = locks::lock_holder(&session, &catalog).await? {
+            // A command's refusal ends at the holder; the command's caller
+            // adds that it is retried once the migration has finished.
+            let then = if command == SERVE_COMMAND {
+                "; start the server again when it finishes"
+            } else {
+                ""
+            };
             return Err(MigrationError::Locked(format!(
-                "a migration holds the catalog's migration lock (holder {holder}); start the \
-                 server again when it finishes"
+                "a migration holds the catalog's migration lock (holder {holder}){then}"
             )));
         }
         match catalog_status(session.clone(), keyspace_prefix).await? {

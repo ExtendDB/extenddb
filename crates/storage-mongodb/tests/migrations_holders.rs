@@ -16,7 +16,7 @@ use bson::{Document, doc};
 use extenddb_storage::hooks::ServingRegistrar;
 use extenddb_storage::management_store::OpError;
 use extenddb_storage::migrations::{
-    CatalogStatus, HasManagementStore, HeldLock, MigrationBackend, MigrationError,
+    CatalogStatus, HasManagementStore, HeldLock, MigrationBackend, MigrationError, MigrationId,
 };
 use extenddb_storage_mongodb::migrations::{
     MigrationLock, MongoMigrations, MongoTarget, ServingRegistration, Timing, lock,
@@ -113,7 +113,12 @@ async fn migration_2_keeps_the_lock_through_a_scan_longer_than_the_idle_limit() 
     applied.expect("every migration applies");
     // A shorter run would apply without the progress the scan records.
     assert!(took > timing.idle_limit * 4, "the run took {took:?}");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert!(d.catalog_ledger().await.iter().any(|row| row.id == 2));
     d.drop_databases().await;
 }
@@ -151,7 +156,12 @@ async fn the_status_read_under_the_lock_keeps_it_through_a_long_scan() {
         "the status read took {took:?}"
     );
     applied.expect("every migration applies");
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     d.drop_databases().await;
 }
 

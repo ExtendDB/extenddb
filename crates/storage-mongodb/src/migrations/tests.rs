@@ -39,7 +39,7 @@ fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
 }
 
 #[test]
-fn every_body_is_code_and_three_four_and_six_do_not_apply() {
+fn every_body_is_code_and_three_four_and_eight_do_not_apply() {
     for id in MigrationId::ALL {
         for body in migration(id).bodies() {
             assert!(matches!(body.body, Body::Code { .. }), "{id}");

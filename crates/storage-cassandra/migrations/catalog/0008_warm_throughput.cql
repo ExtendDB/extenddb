@@ -1,7 +1,7 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 6, warm_throughput, Cassandra catalog keyspace: a nullable
+-- Migration 8, warm_throughput, Cassandra catalog keyspace: a nullable
 -- warm_throughput text column on tables and on indexes, holding the
 -- WarmThroughput a client set (one JSON record, see
 -- extenddb_core::types::WarmThroughputRecord). Stored and reported only:

@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Golden tests for SQLite migrations 2 to 4 and 6, each run on a released
+//! Golden tests for SQLite migrations 2 to 4, 6 and 8, each run on a released
 //! catalog with the damage or the content its body handles, and migration
 //! 1's accepted and converged pre-release shapes.
 
@@ -628,12 +628,115 @@ async fn migration_4_adds_the_base_key_index_to_index_tables_created_before_v0_1
     golden("0004_index_table_base_key", &text);
 }
 
-/// Migration 6 adds `warm_throughput` to `tables` and `indexes` of a released
+/// Migration 6 on a released catalog holding two restore registrations: one
+/// whose table is ACTIVE (a finished restore) and one whose table is CREATING
+/// (a restore the stop interrupted). The job record is added and backfilled,
+/// the interrupted one RUNNING with the epoch heartbeat and generation 0, the
+/// index and maintenance tables exist, the catalog id is written once, and a
+/// second run changes nothing.
+#[tokio::test]
+async fn migration_6_adds_the_catalog_index_and_backfills_the_registrations() {
+    let db = temp_db("m6");
+    load_dump(&db, DEV_0_1_14).await;
+    // The dump predates `table_restores`; create it as that release did.
+    exec(
+        &db,
+        "CREATE TABLE table_restores (\
+             table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE, \
+             source_backup_arn TEXT NOT NULL, \
+             source_table_arn TEXT, \
+             restore_date_time TEXT NOT NULL); \
+         CREATE TEMP TABLE interrupted AS SELECT * FROM tables; \
+         UPDATE interrupted SET table_id = '4e1c0d2b-7a9f-4c3e-8b6d-2f5a1c9e7d30', \
+             table_name = 'interrupted', table_status = 'CREATING', status_transition_at = NULL; \
+         INSERT INTO tables SELECT * FROM interrupted; \
+         INSERT INTO table_restores (table_id, source_backup_arn, source_table_arn, restore_date_time) \
+         SELECT table_id, 'arn:aws:dynamodb:us-east-1:000000000000:table/cu_orders/backup/01700000000000-0000000a', \
+                'arn:aws:dynamodb:us-east-1:000000000000:table/cu_orders', '2026-01-01T00:00:00.000Z' \
+         FROM tables WHERE table_name IN ('cu_orders', 'interrupted');",
+    )
+    .await;
+    run(&db).await.expect("migrate");
+    let catalog_id = scalar(&db, "SELECT value FROM settings WHERE key = 'catalog_id'")
+        .await
+        .expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(&catalog_id).is_ok(), "{catalog_id}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM backup_index").await, 0);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM backup_maintenance").await,
+        0
+    );
+    let notes = scalar(&db, "SELECT notes FROM extenddb_migrations WHERE id = 6")
+        .await
+        .expect("row");
+    for expected in [
+        "added table_restores.status",
+        "added table_restores.completed_at",
+        "backfilled 2 restore registration(s) as legacy restores, 1 of them RUNNING",
+        "wrote settings.catalog_id",
+    ] {
+        assert!(notes.contains(expected), "{expected} not in {notes}");
+    }
+    let mut text = dump(
+        &db,
+        "SELECT t.table_name, t.table_status, r.status, r.kind, r.owner_generation, \
+         r.heartbeat_at, r.store_kind, r.completed_at = t.creation_date_time \
+         FROM table_restores r JOIN tables t ON t.table_id = r.table_id ORDER BY t.table_name",
+    )
+    .await;
+    text.push_str(
+        &dump(
+            &db,
+            "SELECT name FROM pragma_table_info('table_restores') ORDER BY cid",
+        )
+        .await,
+    );
+    text.push_str(
+        &dump(
+            &db,
+            "SELECT name, type FROM sqlite_master WHERE name LIKE 'backup_%' OR name LIKE \
+             'idx_backup_%' OR name = 'idx_table_restores_status' ORDER BY name",
+        )
+        .await,
+    );
+    text.push_str(&dump(&db, "SELECT notes FROM extenddb_migrations WHERE id = 6").await);
+    golden("0006_backup_catalog_index", &text);
+
+    // A second run (through reconverge, which runs every convergent body
+    // again) adds nothing and keeps the catalog id.
+    reconverge(&db).await.expect("reconverge");
+    assert_eq!(
+        scalar(&db, "SELECT value FROM settings WHERE key = 'catalog_id'")
+            .await
+            .as_deref(),
+        Some(catalog_id.as_str())
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM pragma_table_info('table_restores')"
+        )
+        .await,
+        16
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT status FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+             WHERE t.table_name = 'interrupted'"
+        )
+        .await
+        .as_deref(),
+        Some("RUNNING")
+    );
+}
+
+/// Migration 8 adds `warm_throughput` to `tables` and `indexes` of a released
 /// catalog, leaving every existing row NULL (DescribeTable then reports the
 /// defaults), and running it again changes nothing.
 #[tokio::test]
-async fn migration_6_adds_the_warm_throughput_columns() {
-    let db = temp_db("m6");
+async fn migration_8_adds_the_warm_throughput_columns() {
+    let db = temp_db("m8");
     load_dump(&db, DEV_0_1_14).await;
     let columns = "SELECT COUNT(*) FROM pragma_table_info('tables') WHERE name = 'warm_throughput'";
     assert_eq!(
@@ -643,7 +746,7 @@ async fn migration_6_adds_the_warm_throughput_columns() {
     );
     run(&db).await.expect("migrate");
     let report = reconverge(&db).await.expect("reconverge");
-    assert!(report.applied.iter().any(|s| s.id == 6), "{report:?}");
+    assert!(report.applied.iter().any(|s| s.id == 8), "{report:?}");
     assert_eq!(
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
@@ -675,5 +778,5 @@ async fn migration_6_adds_the_warm_throughput_columns() {
         )
         .await,
     );
-    golden("0006_warm_throughput", &text);
+    golden("0008_warm_throughput", &text);
 }

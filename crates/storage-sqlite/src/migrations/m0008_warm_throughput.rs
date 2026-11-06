@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 6, `warm_throughput`, SQLite: a nullable `warm_throughput`
+//! Migration 8, `warm_throughput`, SQLite: a nullable `warm_throughput`
 //! column on `tables` and on `indexes`.
 //!
 //! The column holds the `WarmThroughput` a client set on a table or a global
@@ -20,10 +20,10 @@ use extenddb_storage::migrations::{CodeBody, Done, MigrationError};
 use super::SqliteStores;
 
 /// This file, whose SHA-256 the checksum test pins.
-pub(crate) const SOURCE: &str = include_str!("m0006_warm_throughput.rs");
+pub(crate) const SOURCE: &str = include_str!("m0008_warm_throughput.rs");
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
-const FINGERPRINT: &str = "0006_warm_throughput/sqlite/1";
+const FINGERPRINT: &str = "0008_warm_throughput/sqlite/1";
 
 /// The catalog tables that get the column.
 const TABLES: [&str; 2] = ["tables", "indexes"];

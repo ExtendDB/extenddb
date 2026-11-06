@@ -23,6 +23,16 @@
 #                      For tests that talk to MongoDB directly (the storage
 #                      crate's snapshot tests). Tear down with
 #                      docker rm -f extenddb-runtests-mongo-<port>.
+#   --backup-store-root DIR
+#                      Configure a filesystem backup store at DIR (created
+#                      0700 if missing; a fresh directory per run, since the
+#                      store's identity file names the catalog that owns it
+#                      and this runner initializes a new catalog each time):
+#                      CreateBackup is then the store-backed job, which the
+#                      backup suites run with
+#                      EXTENDDB_TEST_BACKUP_STORE=filesystem. Without it the
+#                      server has no [backup.store] and CreateBackup is the
+#                      in-catalog create (EXTENDDB_TEST_BACKUP_STORE=none).
 #   --rust-live        Also run the Rust live tests of the storage-mongodb
 #                      crate against this runner's replica set. They are
 #                      `#[ignore]`d, because they need a replica set, and
@@ -60,6 +70,7 @@ OUTPUT_DIR=""
 KEEP=false
 MONGO_ONLY=false
 RUST_LIVE=false
+BACKUP_STORE_ROOT=""
 RUN_TESTS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -70,8 +81,9 @@ while [[ $# -gt 0 ]]; do
         --keep)       KEEP=true; shift ;;
         --mongo-only) MONGO_ONLY=true; KEEP=true; shift ;;
         --rust-live)  RUST_LIVE=true; shift ;;
+        --backup-store-root) BACKUP_STORE_ROOT="$2"; shift 2 ;;
         --)           shift; RUN_TESTS_ARGS=("$@"); break ;;
-        -h|--help)    sed -n '5,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '5,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -253,6 +265,21 @@ level = "info"
 format = "pretty"
 TOML
 
+if [[ -n "$BACKUP_STORE_ROOT" ]]; then
+    # The store's root must be owner-only (the store refuses a wider mode).
+    mkdir -p "$BACKUP_STORE_ROOT"
+    chmod 0700 "$BACKUP_STORE_ROOT"
+    cat >> "$CONFIG" <<TOML
+
+[backup.store]
+kind = "filesystem"
+
+[backup.store.filesystem]
+path = "$BACKUP_STORE_ROOT"
+TOML
+    echo "  backup store: filesystem at $BACKUP_STORE_ROOT"
+fi
+
 # ---------------------------------------------------------------------------
 # Start extenddb server
 # ---------------------------------------------------------------------------
@@ -355,6 +382,21 @@ if $RUST_LIVE; then
         echo "  ✓ MongoDB live Rust tests passed"
     else
         echo "  ✗ MongoDB live Rust tests failed"
+        RC=1
+    fi
+    # The backup engine's live tests: the restore claim, the heartbeat, the
+    # reconciler's listing and FAILED write, the delete and restore orderings
+    # against a replica set. They are the only tests of several of those
+    # conditions, so they run here with the replica set required (a missing
+    # server is a failure, not a skip), one at a time as the tests above.
+    echo ""
+    echo "=== MongoDB backup engine live Rust tests (storage-mongodb, --ignored) ==="
+    if EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --lib -- \
+        --ignored --test-threads=1 backup_engine::live_tests::; then
+        echo "  ✓ MongoDB backup engine live Rust tests passed"
+    else
+        echo "  ✗ MongoDB backup engine live Rust tests failed"
         RC=1
     fi
 fi

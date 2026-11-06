@@ -16,6 +16,49 @@ use crate::helpers;
 
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The columns and indexes migration 6 adds to the catalog keyspace.
+pub const CATALOG_MIGRATION_6: &str =
+    include_str!("../fixtures/0006_backup_catalog_index.expected.json");
+
+/// The definitions a keyspace of `dir` (`catalog` or `account`) holds after
+/// every migration: migration 1's, without `continuous_backups`, which
+/// migration 5 drops, and in the catalog with what migration 6 adds and the
+/// `warm_throughput` column migration 8 adds to `tables` and `indexes`.
+///
+/// # Panics
+///
+/// A committed file cannot be read or is not a definitions file.
+#[must_use]
+pub fn expected_definitions(dir: &str) -> postcheck::Definitions {
+    let path = format!(
+        "{}/migrations/{dir}/0001_baseline.expected.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut expected: postcheck::Definitions =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+    expected
+        .columns
+        .retain(|name, _| !name.starts_with("continuous_backups."));
+    if dir == "catalog" {
+        let added: postcheck::Definitions =
+            serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
+        expected.columns.extend(added.columns);
+        expected.indexes.extend(added.indexes);
+        for table in ["tables", "indexes"] {
+            expected.columns.insert(
+                format!("{table}.warm_throughput"),
+                postcheck::Column {
+                    kind: "regular".to_owned(),
+                    position: -1,
+                    clustering_order: "none".to_owned(),
+                    data_type: "text".to_owned(),
+                },
+            );
+        }
+    }
+    expected
+}
+
 pub async fn session() -> Arc<CassandraSession> {
     Arc::new(
         CassandraEngine::create_session(&helpers::test_config())
@@ -32,34 +75,6 @@ pub fn new_prefix(tag: &str) -> (String, helpers::DropKeyspacesOnDrop) {
         format!("{prefix}_account_111111111111"),
     ]);
     (prefix, drops)
-}
-
-/// The definitions a keyspace of store kind `dir` (`catalog` or `account`)
-/// holds once every migration ran, from migration 1's expected file:
-/// migration 5 drops `continuous_backups`, which migration 1 creates, and
-/// migration 6 adds `warm_throughput` to the catalog's `tables` and
-/// `indexes`.
-pub fn after_every_migration(
-    dir: &str,
-    mut expected: postcheck::Definitions,
-) -> postcheck::Definitions {
-    expected
-        .columns
-        .retain(|name, _| !name.starts_with("continuous_backups."));
-    if dir == "catalog" {
-        for table in ["tables", "indexes"] {
-            expected.columns.insert(
-                format!("{table}.warm_throughput"),
-                postcheck::Column {
-                    kind: "regular".to_owned(),
-                    position: -1,
-                    clustering_order: "none".to_owned(),
-                    data_type: "text".to_owned(),
-                },
-            );
-        }
-    }
-    expected
 }
 
 /// Run `statement`, then wait until every live node agrees on the schema,

@@ -293,17 +293,33 @@ def deployment(tmp_path):
     server.stop()
 
 
+BACKUP_CATALOG_INDEX_COLUMNS = (
+    "status", "kind", "store_kind", "store_root", "store_id", "owner_generation",
+    "heartbeat_at", "spool_host", "file_index", "items_applied", "failure_reason",
+    "completed_at",
+)
+
+
 def _as_released_catalog(sqlite_path: str) -> None:
     """Make a catalog this binary created read as one a release before 1.0
     left: no ledger rows (the runner reads an empty ledger as it reads a
     missing one), a dotted catalog_version, the marker row every released
-    baseline seeded, and none of the columns later migrations add, which
-    migration 1's check of the v1.0 schema refuses. The runner then applies
-    every migration, the condition-key rewrite included, as it does on a
-    released catalog."""
+    baseline seeded, and the baseline's shape for every table migration 1
+    checks: the objects migration 6 (backup_catalog_index) and migration 8
+    (warm_throughput) add are removed, since no release before 1.0 had them
+    and the check after migration 1 refuses a `table_restores` carrying its
+    twelve job columns and a `tables` or `indexes` carrying warm_throughput.
+    The runner then applies every migration, the condition-key rewrite
+    included, as it does on a released catalog."""
     conn = sqlite3.connect(sqlite_path)
     try:
-        # Migration 6 adds warm_throughput to tables and indexes.
+        conn.execute("DROP INDEX IF EXISTS idx_table_restores_status")
+        for column in BACKUP_CATALOG_INDEX_COLUMNS:
+            conn.execute(f"ALTER TABLE table_restores DROP COLUMN {column}")
+        conn.execute("DROP TABLE IF EXISTS backup_index")
+        conn.execute("DROP TABLE IF EXISTS backup_maintenance")
+        conn.execute("DELETE FROM settings WHERE key = 'catalog_id'")
+        # Migration 8 adds warm_throughput to tables and indexes.
         for table in ("tables", "indexes"):
             conn.execute(f"ALTER TABLE {table} DROP COLUMN warm_throughput")
         conn.execute("DELETE FROM extenddb_migrations")
