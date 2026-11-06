@@ -3,12 +3,16 @@
 
 "use strict";
 
-const { spawn } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 const net = require("node:net");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
+
+// The launcher and its platform packages are published together at this
+// version, and the launcher runs only a binary of the same release.
+const LAUNCHER_VERSION = require("./package.json").version;
 
 // AWS's documented example credential: the dev server seeds it as the
 // well-known default signing credential (dev-mode builds only).
@@ -26,29 +30,56 @@ const DEFAULT_DATA_DIR = ".extenddb";
 const DEFAULT_DB_FILE = "data.db";
 
 /**
- * Locate the extenddb dev binary.
+ * Locate the extenddb dev binary, with where it came from and how to replace
+ * it with one of the launcher's release.
  *
  * Order: explicit option, EXTENDDB_BINARY env var, a platform package
  * (optionalDependencies, wired up by the release pipeline), then PATH.
+ *
+ * @returns {{ path: string, source: string, fix: string }}
  */
 function resolveBinary(explicit) {
+  const wanted = `an extenddb ${LAUNCHER_VERSION} dev binary`;
   const candidates = [];
-  if (explicit) candidates.push(explicit);
-  if (process.env.EXTENDDB_BINARY) candidates.push(process.env.EXTENDDB_BINARY);
+  if (explicit) {
+    candidates.push({
+      path: explicit,
+      source: `the "binary" option`,
+      fix: `Pass the "binary" option ${wanted}.`,
+    });
+  }
+  if (process.env.EXTENDDB_BINARY) {
+    candidates.push({
+      path: process.env.EXTENDDB_BINARY,
+      source: "EXTENDDB_BINARY",
+      fix: `Point EXTENDDB_BINARY at ${wanted}, or unset it to use the platform package.`,
+    });
+  }
   try {
     // Platform packages ship the binary as @extenddb/<os>-<cpu>/extenddb.
     const pkg = `@extenddb/${process.platform}-${process.arch}`;
-    candidates.push(
-      require.resolve(`${pkg}/extenddb${process.platform === "win32" ? ".exe" : ""}`)
-    );
+    candidates.push({
+      path: require.resolve(`${pkg}/extenddb${process.platform === "win32" ? ".exe" : ""}`),
+      source: `the ${pkg} platform package`,
+      fix:
+        `Reinstall the launcher so that its platform package is the same release: ` +
+        `npm install @extenddb/dev@${LAUNCHER_VERSION}.`,
+    });
   } catch {
     /* platform package not installed */
   }
   for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
+    if (fs.existsSync(c.path)) return c;
   }
   // Fall back to PATH; spawn() will surface ENOENT with this name.
-  return "extenddb";
+  return {
+    path: "extenddb",
+    source: "PATH",
+    fix:
+      `Install the launcher with its optional dependencies, which carry the platform ` +
+      `binary (npm install @extenddb/dev@${LAUNCHER_VERSION}), or set EXTENDDB_BINARY ` +
+      `to ${wanted}.`,
+  };
 }
 
 /** Pick a free loopback port by binding port 0 and reading it back. */
@@ -113,6 +144,78 @@ function resolveStorage(options) {
   return { sqlitePath: dbPath, description: dbPath };
 }
 
+function binaryNotFound() {
+  return new Error(
+    `could not find or execute the extenddb dev binary (tried the "binary" ` +
+      `option, EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
+      `platform package, then PATH). Note: on musl systems such as Alpine ` +
+      `(node:alpine), the prebuilt glibc binary fails with this same error even ` +
+      `when the file exists. If your platform has no working prebuilt package, ` +
+      `build one with: cargo build --release --no-default-features ` +
+      `--features sqlite,dev-mode -p extenddb, then set EXTENDDB_BINARY to it.`
+  );
+}
+
+/**
+ * Refuse a binary of another release before `serve` runs. The release
+ * pipeline publishes the launcher and its platform packages at one version,
+ * but the "binary" option, EXTENDDB_BINARY and PATH can name any build.
+ * `extenddb version` prints `extenddb <release>` as its first line
+ * (print_version in crates/app/src/lib.rs). It runs with the environment and
+ * working directory `serve` gets, so the check runs the binary `serve` runs.
+ */
+function checkBinaryVersion(binary, env, cwd, timeoutMs) {
+  const shown = binary.source === "PATH" ? "on PATH" : `${binary.path} (from ${binary.source})`;
+  return new Promise((resolve, reject) => {
+    // SIGKILL at the timeout: a binary that ignores SIGTERM must not keep
+    // start() waiting past it.
+    const opts = { env, cwd, timeout: timeoutMs, killSignal: "SIGKILL" };
+    execFile(binary.path, ["version"], opts, (err, stdout, stderr) => {
+      let failure;
+      if (!err) {
+        const found = /^extenddb (\S+)\s*$/m.exec(stdout);
+        if (found && found[1] === LAUNCHER_VERSION) {
+          resolve();
+          return;
+        }
+        if (found) {
+          reject(
+            new Error(
+              `the extenddb binary ${shown} is release ${found[1]}, and this ` +
+                `@extenddb/dev launcher is release ${LAUNCHER_VERSION}: the launcher ` +
+                `runs only a binary of its own release. ${binary.fix}`
+            )
+          );
+          return;
+        }
+        failure = `printed no "extenddb <release>" line`;
+      } else if (err.code === "ENOENT") {
+        reject(binaryNotFound());
+        return;
+      } else if (typeof err.code === "number") {
+        failure = `exited with code ${err.code}`;
+      } else if (err.killed) {
+        failure = `did not finish within ${timeoutMs}ms`;
+      } else if (err.signal) {
+        failure = `was stopped by ${err.signal}`;
+      } else {
+        // Another failure to run the binary (EACCES, say), as `serve` reports it.
+        reject(err);
+        return;
+      }
+      const output = `${stdout}${stderr}`.trim();
+      reject(
+        new Error(
+          `could not read the release of the extenddb binary ${shown}: "extenddb ` +
+            `version" ${failure}. This @extenddb/dev launcher is release ` +
+            `${LAUNCHER_VERSION} and runs only a binary of its own release. ` +
+            `${binary.fix}${output ? `\n${output}` : ""}`
+        )
+      );
+    });
+  });
+}
+
 /**
  * Start an ExtendDB dev server.
  *
@@ -122,8 +225,10 @@ function resolveStorage(options) {
  * @param {string} [options.dbPath]  SQLite file location (file mode only;
  *   default ./.extenddb/data.db).
  * @param {number} [options.port]    Fixed port (default: ephemeral).
- * @param {string} [options.binary]  Path to the extenddb dev binary.
- * @param {number} [options.startupTimeoutMs]  Readiness timeout (default 15000).
+ * @param {string} [options.binary]  Path to the extenddb dev binary, of the
+ *   launcher's own release.
+ * @param {number} [options.startupTimeoutMs]  Readiness timeout, and the
+ *   bound on the binary's version check (default 15000).
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
  */
@@ -140,7 +245,8 @@ async function start(options = {}) {
   // Zero-config: the dev binary needs no init and no config file. Run from a
   // scratch cwd so a stray extenddb.toml in the project cannot leak in.
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-"));
-  const child = spawn(binary, ["serve", "--foreground"], {
+  await checkBinaryVersion(binary, env, cwd, options.startupTimeoutMs ?? 15000);
+  const child = spawn(binary.path, ["serve", "--foreground"], {
     env,
     cwd,
     stdio: ["ignore", "ignore", "pipe"],
@@ -154,17 +260,7 @@ async function start(options = {}) {
   const spawned = new Promise((_, reject) => {
     child.on("error", (err) => {
       if (err.code === "ENOENT") {
-        reject(
-          new Error(
-            `could not find or execute the extenddb dev binary (tried the "binary" ` +
-              `option, EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
-              `platform package, then PATH). Note: on musl systems such as Alpine ` +
-              `(node:alpine), the prebuilt glibc binary fails with this same error even ` +
-              `when the file exists. If your platform has no working prebuilt package, ` +
-              `build one with: cargo build --release --no-default-features ` +
-              `--features sqlite,dev-mode -p extenddb, then set EXTENDDB_BINARY to it.`
-          )
-        );
+        reject(binaryNotFound());
         return;
       }
       reject(err);
