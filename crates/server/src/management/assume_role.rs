@@ -22,7 +22,7 @@ use super::crypto::{
 };
 use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
-use extenddb_auth::policy::document::parse_conditions;
+use extenddb_auth::policy::document::{by_name, parse_conditions};
 
 #[derive(Deserialize)]
 pub struct AssumeRoleRequest {
@@ -658,7 +658,9 @@ fn session_tag_pairs(session_tags: &Value) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     match session_tags {
         Value::Object(obj) => {
-            for (k, v) in obj {
+            // In name order, so the first bad key and the later of two keys
+            // that collide by case are the same on every build.
+            for (k, v) in by_name(obj) {
                 if let Some(s) = scalar_to_string(v) {
                     pairs.push((k.clone(), s));
                 }
@@ -850,7 +852,9 @@ fn validate_trust_condition(cond: &Value) -> Result<(), String> {
     let obj = cond
         .as_object()
         .ok_or_else(|| "Condition must be an object".to_owned())?;
-    for (op_name, keys) in obj {
+    // In name order, so a block with two faults reports the same one on every
+    // build.
+    for (op_name, keys) in by_name(obj) {
         if !is_known_iam_condition_operator(op_name) {
             return Err(format!("invalid Condition operator: {op_name}"));
         }
@@ -1697,6 +1701,45 @@ mod tests {
             assert!(
                 validate_trust_policy(&doc).is_err(),
                 "should reject Sid {sid:?}"
+            );
+        }
+    }
+
+    /// A trust policy `Condition` with two unknown operators reports the one
+    /// whose name sorts first, in either order of the document (#780).
+    /// `cargo test --workspace` builds `serde_json` with `preserve_order`,
+    /// which keeps the written order, so there the test tells the two apart.
+    #[test]
+    fn validate_reports_the_first_bad_operator_in_name_order() {
+        for (first, second) in [("BadA", "BadB"), ("BadB", "BadA")] {
+            let doc: Value = serde_json::from_str(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Principal":{{"AWS":"{CALLER}"}},"Action":"sts:AssumeRole",
+                "Condition":{{"{first}":{{"aws:k":"v"}},"{second}":{{"aws:k":"v"}}}}}}]}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                validate_trust_policy(&doc).unwrap_err(),
+                "invalid Condition operator: BadA",
+                "{first} before {second}"
+            );
+        }
+    }
+
+    /// Object-form session tags are checked in name order: of two keys that
+    /// collide by case, the later in name order is the one reported, in either
+    /// order of the request.
+    #[test]
+    fn session_tag_pairs_are_in_name_order() {
+        for tags in [r#"{"team":"a","Team":"b"}"#, r#"{"Team":"b","team":"a"}"#] {
+            let tags: Value = serde_json::from_str(tags).unwrap();
+            let pairs = session_tag_pairs(&tags);
+            let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["Team", "team"], "{tags}");
+            assert_eq!(
+                super::super::duplicate_tag_key_ci(&pairs).as_deref(),
+                Some("team"),
+                "{tags}"
             );
         }
     }
