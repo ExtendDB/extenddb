@@ -36,19 +36,18 @@ zero-friction local use:
 - **A seeded, well-known credential.** The server seeds AWS's documented
   example key pair (`AKIAIOSFODNN7EXAMPLE` /
   `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) on every startup by default and
-  prints it
-  in the logs; sign requests with it. It is recognised by secret scanners as
-  an example credential, so committing it in test fixtures is safe. To seed
-  one additional key pair, pass `EXTENDDB_DEV_ACCESS_KEY_ID` and
+  prints it in the logs; sign requests with it. It is recognised by secret
+  scanners as an example credential, so committing it in test fixtures is
+  safe. To seed one additional key pair, pass `EXTENDDB_DEV_ACCESS_KEY_ID` and
   `EXTENDDB_DEV_SECRET_ACCESS_KEY` to the container (the key id must start
   with `AKIA`; its secret is never printed). The example pair keeps working
   alongside it, so tools that hardcode it (NoSQL Workbench, the launchers)
   are unaffected by the override, unless you remove the example pair (see
-  below). The standard `AWS_*` variables are ignored
-  by the server, so real or SSO credentials in the environment are never
-  copied into the dev catalog; a startup notice calls out an
-  `AWS_ACCESS_KEY_ID` that would not verify. Authorization is open: whoever
-  holds a seeded credential can do everything.
+  below). The standard `AWS_*` variables are ignored by the server, so real
+  or SSO credentials in the environment are never copied into the dev
+  catalog; a startup notice calls out an `AWS_ACCESS_KEY_ID` that would not
+  verify. Authorization is open: whoever holds a seeded credential can do
+  everything.
 
 Because of that, the server must not be reachable from other machines. The
 image binds `0.0.0.0` **inside** the container (required for port publishing to
@@ -74,17 +73,26 @@ docker run -d -p 127.0.0.1:18080:18080 \
   extenddb/extenddb-dev
 ```
 
-With `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` (or `true`), the
-`EXTENDDB_DEV_*` pair is the only credential the server accepts:
+With `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` (or `true`), the server stops
+accepting the example pair:
 
-- The server refuses to start unless both `EXTENDDB_DEV_*` variables are set,
-  so it never runs with no credential, and it refuses a value other than `1`,
-  `true`, `0` or `false`, so a typo does not leave the example pair active.
-- On a file-backed database, an example key stored by an earlier start is
-  removed, so it stops working. Unset the variable to bring it back on the
-  next start.
+- It does not seed the example pair, and on a file-backed database it deletes
+  the example key from whichever user holds it: the `dev` user an earlier
+  start seeded, or a user you imported it for with `extenddb manage`. Unset
+  the variable to seed it again on the next start.
+- It refuses to start unless both `EXTENDDB_DEV_*` variables are set, so it
+  never runs with no credential to sign with.
+- It refuses to start for a value other than `1`, `true`, `0` or `false`,
+  including an empty value, so a typo or a `-e
+  EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=$VAR` with `VAR` unset does not
+  leave the example pair active.
 - Tools that hardcode the example pair (NoSQL Workbench, the launchers) must
   be pointed at your credential instead.
+
+The switch removes only the example key. Other keys a file-backed database
+holds keep working: an `EXTENDDB_DEV_*` key from an earlier start that you
+have since changed, and keys added with `extenddb manage`. To start with only
+the current `EXTENDDB_DEV_*` pair, recreate the volume.
 
 This narrows who can sign requests; it does not add TLS or permissions. Keep
 the loopback publish.

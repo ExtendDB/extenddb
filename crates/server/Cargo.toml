@@ -52,5 +52,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+# The dev-credential seeding tests run against a SQLite catalog file.
+extenddb-storage-sqlite = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
