@@ -417,7 +417,8 @@ pub(crate) async fn authorize_request(
     } else {
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
-        // request.
+        // request. The pairs are checked in the order `authz_targets` returns
+        // them, and the first denied pair is the one the denial names.
         for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),
