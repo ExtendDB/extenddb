@@ -539,7 +539,22 @@ pub struct StatusFields {
     pub size_bytes: Option<i64>,
     pub item_count: Option<i64>,
     pub failure_reason: Option<String>,
+    /// The manifest's `source_table` object, which the AVAILABLE write of a
+    /// backup row carries so DescribeBackup reports the counts the manifest
+    /// has; a restore job record has no such column and ignores it.
+    pub source_table_details_json: Option<serde_json::Value>,
     pub completed: bool,
+}
+
+/// The column an age in [`BackupCatalog::list_backup_rows_older_than`] is
+/// measured on, against the database's own `now()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StaleClock {
+    /// `heartbeat_at`: the owner's last sign of life.
+    Heartbeat,
+    /// `completed_at`: when the row reached its terminal status. A row with
+    /// `completed_at` unset is never older than any age on this clock.
+    Completed,
 }
 
 /// What a conditional write did.
@@ -735,6 +750,16 @@ pub trait BackupCatalog: Send + Sync {
         store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>>;
 
+    /// The newest AVAILABLE row of `store` (the last in the
+    /// (`created_at`, `backup_arn`) order [`Self::list_backup_rows`] lists
+    /// in), or `None` when the store has none. The store's manifest probe
+    /// reads it each reconciler cycle, so it reads one row and not the
+    /// whole listing.
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        store: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>>;
+
     /// The account's rows, of `table_name` when given, created within
     /// `bounds`, of every status: the caller decides which statuses are
     /// listed ([`BackupStatus::is_listed`]).
@@ -777,6 +802,67 @@ pub trait BackupCatalog: Send + Sync {
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
+    /// Remove a CREATING row whose owner is dead: `heartbeat_at` older than
+    /// `stale_after` on the catalog's clock. `false` when the row is not
+    /// CREATING, is gone, or has a live owner. The maintenance command's
+    /// write for a CREATING row its wait saw no live owner for, after it has
+    /// deleted the row's prefix; the row's own job, were it alive, would
+    /// find its claim lost at its next heartbeat.
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>>;
+
+    /// Take over a CREATING row whose owner is dead, under a fresh
+    /// generation, and return the claim; the reconciler's way onto a row a
+    /// job left behind. Dead is `heartbeat_at` older than `stale_after` on
+    /// the database's clock (on PostgreSQL, once the owner's claim session
+    /// has ended as well: the advisory lock is tried first, so a stopped
+    /// owner whose session lives keeps its row), except on SQLite, where a
+    /// CREATING row whose in-process slot no task holds is dead at once (a
+    /// restart frees every slot, a job that panics drops its slot) and
+    /// `stale_after` is not read.
+    /// `heartbeat_at` is left as the dead owner wrote it, so the stale
+    /// window of the FAILED-prefix duty counts from the owner's last beat
+    /// and not from the takeover. `None` when the row is not CREATING, is
+    /// gone, has a live owner, or is already claimed by another task; the
+    /// old generation's writes through its [`JobClaim`] find
+    /// [`WriteOutcome::NotMatched`] from then on.
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>>;
+
+    /// The rows of `store` with `status` whose `clock` column is older than
+    /// `age` on the database's clock: the maintenance command's test of a
+    /// live owner (a CREATING or FAILED row it does not list under the
+    /// window on [`StaleClock::Heartbeat`] has one), and the reconciler's
+    /// listing for the FAILED-prefix delay (`Failed`,
+    /// [`StaleClock::Heartbeat`]) and the tombstone retention (`Failed` or
+    /// `Deleted`, [`StaleClock::Completed`]). The comparison is the
+    /// backend's, in its own query, so the engine never compares a row's
+    /// timestamp with a clock of its own.
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        status: BackupStatus,
+        store: &'a StoreIdentity,
+        clock: StaleClock,
+        age: Duration,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>>;
+
+    /// Remove the restore registrations a backend keeps beside its rows that
+    /// name a target no longer a CREATING restore target of that backup, and
+    /// return the ARNs of the backups touched. Only Cassandra keeps such a
+    /// map (`active_restores`, maintained by lightweight transactions whose
+    /// removal step can be lost with its owner); every other backend derives
+    /// the in-use check from the target rows themselves and has nothing to
+    /// sweep, which is what the default body says.
+    fn sweep_restore_registrations(&self) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// The name of a CREATING restore target registered from the backup, if
     /// any: the rule under which DeleteBackup and a second restore of the
     /// backup are refused with `BackupInUseException`. Reads the target's
@@ -818,6 +904,12 @@ pub trait BackupCatalog: Send + Sync {
         stale_after: Duration,
     ) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>>;
 
+    /// Every RUNNING restore job record, by status alone, whatever its
+    /// heartbeat says: the maintenance command's wait set, which must see a
+    /// record stamped in the listing's own instant (or ahead of the
+    /// listing's clock) as well as an old one. Not a liveness test.
+    fn list_running_restore_jobs(&self) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>>;
+
     /// RUNNING to FAILED with `reason` on the target's job record, conditional
     /// on RUNNING and on the record still carrying the `owner_generation` and
     /// `heartbeat_at` the reconciler listed (design 4(e)): a heartbeat that
@@ -834,10 +926,69 @@ pub trait BackupCatalog: Send + Sync {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>>;
 
-    /// Whether the catalog-level maintenance claim is held. Jobs check it
-    /// after their own claim and row exist and refuse while it is held; the
-    /// reconciler runs only the duties the holder waits on.
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>>;
+    /// The distinct `store_id`s the catalog's rows record for a root, of
+    /// every status: the store identity check reads them before it knows an
+    /// id. Empty when no row names the root.
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>>;
+
+    /// Take the catalog-level maintenance claim for `holder` (a label naming
+    /// the command and the host it runs on, for the operator who finds it
+    /// held). The claim is one record, `backup_maintenance`, born owned
+    /// with a fresh generation and heartbeated through the handle; a holder
+    /// whose heartbeat is older than `stale_after` on the catalog's clock is
+    /// dead and its claim is taken over. PostgreSQL is the exception to the
+    /// liveness rule on the holder's side: there the holder's session holds
+    /// an advisory lock, a holder whose session ended is dead whatever its
+    /// heartbeat says, and `stale_after` is read by [`check_maintenance_claim`]
+    /// alone; on SQLite a server's startup under the serve lock removes the
+    /// record outright, since no holder can be alive there.
+    ///
+    /// [`check_maintenance_claim`]: BackupCatalog::check_maintenance_claim
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` naming the holder when a live one holds the claim: a
+    /// second maintenance command fails at once.
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>>;
+
+    /// Whether the catalog-level maintenance claim is held by a live holder:
+    /// a record whose heartbeat is younger than `stale_after` on the
+    /// catalog's clock. Jobs check it and refuse while it is held; the
+    /// reconciler runs only the duties the holder waits on. Where in the
+    /// job's order the check runs depends on the job: the in-catalog create
+    /// and restore of this release commit their row inside the backend and
+    /// detach, so the engine checks after every other refusal and before the
+    /// row exists (the engine's backup module states it); the store-backed
+    /// job of a later release owns its row from the engine and checks after
+    /// its own claim and row exist (the design's 5.1 step 2).
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>>;
+}
+
+/// The holder's handle on the catalog-level maintenance claim: the
+/// heartbeat that keeps it, and the release that ends it. Dropping the handle
+/// without `release` leaves the record for the stale rule to expire.
+pub trait MaintenanceClaim: Send + Sync {
+    /// The fencing token the claim was taken with.
+    fn generation(&self) -> u64;
+
+    /// Refresh `heartbeat_at` on the catalog's clock and confirm the claim is
+    /// still this holder's. The caller treats an `Err` as [`Heartbeat::Lost`].
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>>;
+
+    /// Remove the record, conditioned on the generation; a record another
+    /// holder took over is left to it. Idempotent.
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>>;
 }
 
 /// A job's handle on its row: the claim that excludes a second owner and
@@ -850,6 +1001,36 @@ pub trait JobClaim: Send + Sync {
     /// Refresh `heartbeat_at` on the database's clock and confirm the claim
     /// is still held. The caller treats an `Err` as [`Heartbeat::Lost`].
     fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>>;
+
+    /// [`Self::heartbeat`] under `bound`: `None` when the beat did not
+    /// return within it, which the caller treats as a lost claim. The default
+    /// bounds the whole call. A backend whose beat queues behind a lock of
+    /// its own process before it reaches the catalog (SQLite's engine write
+    /// lock, held by a GSI backfill or a large write for as long as it
+    /// takes) measures the bound from the moment the beat holds that lock,
+    /// so a writer holding it past a period delays the beat and does not end
+    /// the job: the queue is this process's, not a sign the claim is lost.
+    fn heartbeat_within(
+        &self,
+        bound: Duration,
+    ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+        Box::pin(async move { tokio::time::timeout(bound, self.heartbeat()).await.ok() })
+    }
+
+    /// Whether [`Self::heartbeat_within`] can wait outside its bound before
+    /// the bound starts (SQLite's beat queues behind the engine write lock
+    /// of its own process, so the wait is this process's and never a sign of
+    /// a takeover). The engine's pre-put check treats a beat in flight as
+    /// confirming the claim for as long as it waits where this is `true`,
+    /// and not at all where it is `false` (the default): there the bound
+    /// covers the whole call, so the check's two-period rule already covers
+    /// a beat in flight, and a process stopped and resumed (mid-beat, or
+    /// between beats, whose missed tick starts a beat at once) would
+    /// otherwise pass the check while that beat runs, though another owner
+    /// may have taken the row over during the stop.
+    fn heartbeat_parks_before_its_bound(&self) -> bool {
+        false
+    }
 
     /// Move the record from `from` to `to`, conditioned on the claim's
     /// generation and on the record being in `from`.

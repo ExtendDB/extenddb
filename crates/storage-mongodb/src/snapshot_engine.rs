@@ -69,8 +69,11 @@
 //!
 //! Memory: a batch is at most `batch_size` documents
 //! (`paging::DEFAULT_FETCH_BATCH`, 1000) and at most the server's 16 MiB
-//! reply limit, whichever is reached first, so unlike the SQL backends'
-//! row-bounded fetches one batch here is bounded in bytes too.
+//! reply limit, whichever is reached first, so one batch here is bounded in
+//! bytes by the server. The stream applies no cut of its own at
+//! `paging::SNAPSHOT_FETCH_BYTES` (64 MiB): the reply limit is already under
+//! that budget, and the byte cut the SQL backends make exists because their
+//! row-bounded fetches have no such limit.
 
 use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;

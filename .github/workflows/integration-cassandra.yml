@@ -176,6 +176,10 @@ jobs:
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
       - name: Run Cassandra pytest suite
+        env:
+          # run-cassandra-tests initializes the server without [backup.store],
+          # and Cassandra takes the in-catalog create with one.
+          EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
 
   cassandra-rust:
@@ -231,6 +235,10 @@ jobs:
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
       - name: Run Cassandra rust integration suite
+        env:
+          # run-cassandra-tests initializes the server without [backup.store]:
+          # the Rust backup tests restore the in-catalog create's backups.
+          EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-cassandra-tests -- --rust-integration
 
   cassandra-production-build:

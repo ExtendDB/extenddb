@@ -269,7 +269,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 6
+  OK: Current: the catalog is at migration 7
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -287,7 +287,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog migration 6) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 7) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1281,7 +1281,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
 
-Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
+Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
 ## 9. Audit logging
 
@@ -1367,7 +1367,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog migration 6 (postgres)
+# catalog migration 7 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
