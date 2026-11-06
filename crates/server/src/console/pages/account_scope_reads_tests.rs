@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests that the handler of a page an IAM-user session may not open
-//! redirects the session before it calls the catalog store.
+//! redirects the session before it calls the catalog store, other than for
+//! the session check.
 //!
 //! The handlers run against a store that holds no data and counts every
-//! call to it. The session lives in the console's in-memory session store,
-//! so a refused request makes no call at all. An admin request and the IAM
-//! user's own user page each make one call, which shows that the store
-//! counts the calls the handlers make.
+//! call to it. Every request first reads the password hash of the session's
+//! principal, to check that the session is still valid. The store answers
+//! that read with the hash the session logged in with, and counts it apart
+//! from the other calls. A refused request makes that one read and no other
+//! call. An admin request and the IAM user's own user page each make one
+//! other call, which shows that the store counts the calls the handlers make.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,8 +26,8 @@ use extenddb_storage::CatalogStore;
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData as RoleSession};
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, AdminStore, GroupDetail, GroupListEntry,
-    ManagementStore, MetricsRow, MetricsStore, OpError, OpResult, RateLimitStore, RoleDetail,
-    RoleListEntry, SettingsStore, UserDetail, UserListEntry,
+    ManagementStore, MetricsRow, MetricsStore, OpError, OpResult, PasswordHashStore,
+    RateLimitStore, RoleDetail, RoleListEntry, SettingsStore, UserDetail, UserListEntry,
 };
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -32,7 +35,7 @@ use time::OffsetDateTime;
 
 use crate::console::ConsoleState;
 use crate::console::pages::{account_detail, group_detail, role_detail, user_detail};
-use crate::console::session::SessionStore;
+use crate::console::session::{CredentialStamp, SessionStore};
 use crate::management::CallerIdentity;
 
 const ACCOUNT: &str = "444455556666";
@@ -43,11 +46,24 @@ const OWN_USER: &str = "bob";
 #[derive(Default)]
 struct CountingStore {
     calls: AtomicUsize,
+    /// Reads of a password hash, which the session check makes on every
+    /// request.
+    hash_reads: AtomicUsize,
 }
 
 impl CountingStore {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn hash_reads(&self) -> usize {
+        self.hash_reads.load(Ordering::SeqCst)
+    }
+
+    /// Count a password hash read and answer it with [`session_hash`].
+    fn hash_read(&self) -> BoxFuture<'_, OpResult<Option<String>>> {
+        self.hash_reads.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(Some(session_hash())) })
     }
 
     /// Count a call and answer it with an error. Each page handler renders
@@ -185,10 +201,26 @@ impl AuthorizationStore for CountingStore {
     }
 }
 
+impl PasswordHashStore for CountingStore {
+    fn get_admin_password_hash(&self, _: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        self.hash_read()
+    }
+
+    fn get_user_password_hash(&self, _: &str, _: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+        self.hash_read()
+    }
+}
+
 impl CatalogStore for CountingStore {
     fn cached_encryption_key(&self) -> Option<String> {
         None
     }
+}
+
+/// The password hash every test session logs in with. It is made at run
+/// time, so that no literal reaches the session stamp.
+fn session_hash() -> String {
+    format!("session-hash-{}", std::process::id())
 }
 
 fn admin() -> CallerIdentity {
@@ -224,8 +256,10 @@ async fn console(identity: CallerIdentity) -> (Arc<ConsoleState>, Arc<CountingSt
         docs_store: None,
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         metrics: Arc::new(MetricsCollector::new()),
+        secure_cookies: false,
     });
-    let (token, _csrf) = state.sessions.create(identity).await;
+    let stamp = CredentialStamp::of(&session_hash());
+    let (token, _csrf) = state.sessions.create(identity, stamp).await;
     let mut headers = HeaderMap::new();
     let cookie = HeaderValue::from_str(&format!("extenddb_session={token}")).expect("cookie");
     headers.insert(COOKIE, cookie);
@@ -245,7 +279,8 @@ async fn open(state: &Arc<ConsoleState>, headers: &HeaderMap, page: Page) -> Res
 }
 
 /// `page` redirects an IAM-user session to the console home page, and its
-/// handler makes no call to the store.
+/// handler makes no call to the store other than the hash read of the
+/// session check.
 async fn assert_refused_before_the_store_is_called(page: Page) {
     let (state, store, headers) = console(iam_user()).await;
 
@@ -261,6 +296,11 @@ async fn assert_refused_before_the_store_is_called(page: Page) {
         store.calls(),
         0,
         "the handler of {page:?} called the store for a refused IAM-user session"
+    );
+    assert_eq!(
+        store.hash_reads(),
+        1,
+        "the request for {page:?} read a password hash other than once, in the session check"
     );
 }
 

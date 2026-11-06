@@ -13,6 +13,7 @@ check prints one line, `ok` or `FAIL` and what was checked, with the
 command's output indented under a FAIL; `finish` prints the count of failed
 checks or `all checks passed` and returns the script's exit code.
 """
+import os
 import signal
 import subprocess
 import time
@@ -125,6 +126,20 @@ def stop(proc: subprocess.Popen) -> None:
             proc.wait()
 
 
+def with_filesystem_store(config: str, work: str) -> tuple[str, str]:
+    """A copy of `config` with a filesystem backup store at `<work>/backups`
+    (created `0700`), for the backup commands' store-configured runs; the
+    copy's path and the root's canonical path, as the commands print it."""
+    root = os.path.realpath(os.path.join(work, "backups"))
+    os.mkdir(root, 0o700)
+    store_config = os.path.join(work, "extenddb-store.toml")
+    with open(config, encoding="utf-8") as f:
+        base = f.read()
+    with open(store_config, "w", encoding="utf-8") as f:
+        f.write(f'{base}\n[backup.store]\nkind = "filesystem"\n\n[backup.store.filesystem]\npath = "{root}"\n')
+    return store_config, root
+
+
 def finish() -> int:
     """Print the outcome of every check reported, and return the exit code."""
     if failures:
@@ -162,7 +177,9 @@ def start_mongo(container: str, port: int, mongod_args: tuple[str, ...] = (), mo
     if started.returncode != 0:
         return report(False, f"start {container}", started.stderr)
     for _ in range(60):
-        if mongosh(container, port, "db.runCommand({ping: 1}).ok")[1].strip().endswith("1"):
+        # The whole output must be the `1`: a refused connection's error
+        # names the port, and a port ending in 1 would pass an `endswith`.
+        if mongosh(container, port, "db.runCommand({ping: 1}).ok")[1].strip() == "1":
             break
         time.sleep(1)
     mongosh(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})")

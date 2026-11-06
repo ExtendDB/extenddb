@@ -7,15 +7,18 @@
 //! An admin session may use the pages of every account. An IAM-user session
 //! may use the pages of its own account only. Every handler under that path
 //! gets its session from [`require_account_session`], which applies the
-//! check before the handler reads anything from the catalog.
+//! check right after the session check of [`require_session`]. The session
+//! check reads the password hash of the session's own principal, and the
+//! handler reads nothing else from the catalog before the account check.
 //!
 //! Inside its own account an IAM-user session may use the pages of its own
 //! user only: the user page and the access key forms, which get their session
 //! from [`require_user_session`]. Every other page and form under the path is
 //! for admins, and its handler redirects an IAM-user session to the console
-//! home page before it reads anything from the catalog. This matches the
-//! management API, which gives an IAM user its own access keys and password
-//! and refuses it every other read and write.
+//! home page before it reads anything from the catalog other than that
+//! session check. This matches the management API, which gives an IAM user
+//! its own access keys and password and refuses it every other read and
+//! write.
 
 use std::sync::Arc;
 

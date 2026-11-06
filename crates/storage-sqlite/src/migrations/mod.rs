@@ -29,6 +29,9 @@ mod m0003_sort_key_definitions;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
 mod postcheck;
 
 use std::time::Duration;
@@ -106,6 +109,19 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
     }
 }
 

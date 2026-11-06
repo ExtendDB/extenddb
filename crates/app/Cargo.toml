@@ -21,6 +21,8 @@ extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-server = { workspace = true }
+extenddb-backup-store = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

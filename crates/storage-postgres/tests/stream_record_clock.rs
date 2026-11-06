@@ -217,12 +217,18 @@ async fn wait_for_lock_waiters(db: &PgPool, own_pid: i32, n: i64) {
 }
 
 /// Stored `(created_at, ApproximateCreationDateTime)` for every record in the
-/// scratch database, in sequence order.
-async fn stored_times(db: &PgPool) -> Vec<(time::OffsetDateTime, i64)> {
+/// scratch database, in sequence order. A write leaves its record in
+/// `stream_pending` until a read or the numbering worker numbers it (#808),
+/// so the records are numbered first, as the worker would.
+async fn stored_times(s: &Scratch) -> Vec<(time::OffsetDateTime, i64)> {
+    s.engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending stream records");
     let rows: Vec<(time::OffsetDateTime, serde_json::Value)> = sqlx::query_as(
         "SELECT created_at, record_data FROM stream_records ORDER BY sequence_number",
     )
-    .fetch_all(db)
+    .fetch_all(&s.db)
     .await
     .expect("read the stream records");
     rows.into_iter()
@@ -328,7 +334,7 @@ async fn created_at_matches_the_record_timestamp_when_the_write_waited() {
         .await
         .expect("the TTL-shaped delete succeeded");
 
-    let times = stored_times(&s.db).await;
+    let times = stored_times(&s).await;
     assert_eq!(times.len(), 3, "seed, late, and remove records: {times:?}");
     for (created_at, approx) in &times {
         assert_eq!(

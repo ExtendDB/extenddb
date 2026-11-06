@@ -467,8 +467,10 @@ if $RUN_PYTEST; then
         echo "  endpoint: $EXTENDDB_TEST_ENDPOINT"
     fi
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
-    # CLI lifecycle tests manage their own server; exclude from main suite
-    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_cli_vector_catalog_migration.py --ignore=tests/test_gsi_async_queue.py)
+    # CLI lifecycle tests manage their own server; exclude from main suite.
+    # tests/test_backup_store_config.py does too: it runs below, in the CLI
+    # lifecycle list on PostgreSQL and in its own step on a SQLite build.
+    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_cli_vector_catalog_migration.py --ignore=tests/test_gsi_async_queue.py --ignore=tests/test_backup_store_config.py)
     # Parallel execution (--parallel): distribute by file so module/class-scoped
     # fixtures stay within a single worker.
     if [[ -n "$PARALLEL" ]] && python3 -c "import xdist" 2>/dev/null; then
@@ -560,7 +562,7 @@ if $RUN_PYTEST \
         && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
-    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py tests/test_cli_vector_catalog_migration.py -v)
+    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py tests/test_cli_vector_catalog_migration.py tests/test_backup_store_config.py -v)
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi
@@ -571,6 +573,37 @@ if $RUN_PYTEST \
         PASS=false
     fi
     echo ""
+fi
+
+# --- Backup store wire tests on a SQLite build (run last — they start/stop their own servers) ---
+# tests/test_backup_store_config.py's SQLite cells: the default root, the
+# S3 store's health against moto (skipped with a reason unless
+# EXTENDDB_TEST_S3_ENDPOINT names a moto endpoint), `backup list` and
+# `backup purge` with their signals and exit codes. Its PostgreSQL cells run
+# in the CLI lifecycle list above. The build decides: the step runs when the
+# binary reports itself a SQLite build.
+if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" ]]; then
+    WIRE_BINARY="${EXTENDDB_BINARY:-target/release/$TARGET}"
+    if [[ ! -x "$WIRE_BINARY" ]]; then
+        WIRE_BINARY="target/debug/$TARGET"
+    fi
+    if [[ -x "$WIRE_BINARY" ]] && "$WIRE_BINARY" version 2>/dev/null | grep -q '(sqlite)'; then
+        WIRE_OUTFILE="discussions/test-backup-store-wire-${HASH}.txt"
+        echo "=== Backup store wire tests (SQLite build) → ${WIRE_OUTFILE} ==="
+        echo "  binary: $WIRE_BINARY"
+        echo "  S3 endpoint: ${EXTENDDB_TEST_S3_ENDPOINT:-none (the S3 cells skip)}"
+        WIRE_ARGS=(python3 -m pytest tests/test_backup_store_config.py -v)
+        if [[ -n "$FILTER" ]]; then
+            WIRE_ARGS+=(-k "$FILTER")
+        fi
+        if EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE"; then
+            echo "  ✓ Backup store wire tests passed"
+        else
+            echo "  ✗ Backup store wire tests failed"
+            PASS=false
+        fi
+        echo ""
+    fi
 fi
 
 # --- Catalog check ---

@@ -16,6 +16,7 @@ extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
@@ -37,6 +38,7 @@ bcrypt = { workspace = true }
 unicode-properties = "0.1.4"
 base64 = { workspace = true }
 time = { workspace = true }
+sha2 = { workspace = true }
 rand = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
@@ -50,3 +52,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
