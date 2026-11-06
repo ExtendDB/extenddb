@@ -2753,7 +2753,7 @@ mod catalog_index {
 
     use super::*;
 
-    fn store() -> StoreIdentity {
+    pub(super) fn store() -> StoreIdentity {
         StoreIdentity {
             store_kind: StoreKind::Filesystem,
             store_root: "/var/lib/extenddb/backups".to_owned(),
@@ -2898,6 +2898,7 @@ mod catalog_index {
             size_bytes: Some(1234),
             item_count: Some(5),
             failure_reason: None,
+            source_table_details_json: None,
             completed: true,
         };
         assert_eq!(
@@ -4819,6 +4820,264 @@ mod catalog_index {
 /// run against this catalog and real filesystem stores: two instances of one
 /// catalog starting against one empty root, and two instances with
 /// host-local roots under one `store_root` label.
+/// The catalog methods the store-backed backup job and the reconciler call:
+/// the takeover of a dead owner's row, the age listings on the database's
+/// clock, the AVAILABLE write's `source_table_details_json`, the claim
+/// session's settings.
+mod backup_job {
+    use std::time::Duration;
+
+    use extenddb_core::backup_format::BackupArn;
+    use extenddb_storage::BackupCatalog;
+    use extenddb_storage::backup_catalog::{
+        BackupRow, BackupStatus, JobStatus, StatusFields, WriteOutcome,
+    };
+
+    use super::catalog_index::row as new_row;
+    use super::*;
+
+    fn arn_of(row: &BackupRow) -> BackupArn {
+        BackupArn::parse(&row.backup_arn).unwrap()
+    }
+
+    async fn stored(s: &Scratch, row: &BackupRow) -> BackupRow {
+        s.engine
+            .read_backup_row(&arn_of(row))
+            .await
+            .expect("read")
+            .expect("the row exists")
+    }
+
+    /// Wait until no session holds the backup's advisory lock (the server
+    /// releases it a moment after the holding connection closes).
+    async fn await_lock_free(s: &Scratch, backup_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while backup_lock_holder(s, backup_id).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the advisory lock outlived its session"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `claim_dead_backup`: refused while the owner's session holds the
+    /// lock, refused while the row's heartbeat is within the stale window
+    /// though the lock is free (an owner that died a moment ago), taken over
+    /// once the heartbeat is older than the window on the database's clock
+    /// (the window is crossed by waiting, not by dating the row), with a
+    /// fresh generation and `heartbeat_at` as the dead owner left it; the
+    /// successor's AVAILABLE write carries the manifest's `source_table`
+    /// into the row; a row that is no longer CREATING is not taken over.
+    #[tokio::test]
+    async fn claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one: no \
+                 PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let window = Duration::from_secs(1);
+        let row = new_row(ACCOUNT, "Music", "nightly");
+        let key = row.key();
+        let owner = s.engine.claim_backup(&row).await.expect("claim");
+        // Alive: its session holds the lock.
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "a row whose owner holds the lock was taken over"
+        );
+        assert_eq!(stored(&s, &row).await.owner_generation, owner.generation());
+        // The owner's session ends (a crash): the lock goes, the heartbeat
+        // stays as written. Within the window the row is not yet dead.
+        drop(owner);
+        await_lock_free(&s, &row.backup_id).await;
+        let left = stored(&s, &row).await;
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "a row whose heartbeat is within the stale window was taken over"
+        );
+        assert_eq!(
+            backup_lock_holder(&s, &row.backup_id).await,
+            None,
+            "a refused takeover left its lock session behind"
+        );
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+        let successor = s
+            .engine
+            .claim_dead_backup(&key, window)
+            .await
+            .expect("takeover")
+            .expect("a stale CREATING row is taken over");
+        assert_ne!(successor.generation(), left.owner_generation);
+        let taken = stored(&s, &row).await;
+        assert_eq!(taken.status, BackupStatus::Creating);
+        assert_eq!(taken.owner_generation, successor.generation());
+        assert_eq!(
+            taken.heartbeat_at, left.heartbeat_at,
+            "the takeover refreshed heartbeat_at"
+        );
+        assert!(
+            backup_lock_holder(&s, &row.backup_id).await.is_some(),
+            "the successor holds the lock"
+        );
+        // A second taker is refused by the lock while the successor lives.
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("second takeover attempt")
+                .is_none()
+        );
+        // The successor's writes go through: the manifest's source table
+        // replaces the row's, the FAILED write's `None` leaves it.
+        let manifest_source = serde_json::json!({"table_name": "Music", "item_count": 42});
+        let fields = StatusFields {
+            size_bytes: Some(10),
+            item_count: Some(42),
+            source_table_details_json: Some(manifest_source.clone()),
+            completed: true,
+            ..StatusFields::default()
+        };
+        assert_eq!(
+            successor
+                .set_status(JobStatus::Creating, JobStatus::Available, &fields)
+                .await
+                .expect("write"),
+            WriteOutcome::Matched
+        );
+        let available = stored(&s, &row).await;
+        assert_eq!(available.status, BackupStatus::Available);
+        assert_eq!(available.source_table_details_json, manifest_source);
+        assert_eq!(available.item_count, 42);
+        drop(successor);
+        await_lock_free(&s, &row.backup_id).await;
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "an AVAILABLE row was taken over"
+        );
+        // A row that is gone.
+        assert!(
+            s.engine
+                .claim_dead_backup(&new_row(ACCOUNT, "Music", "other").key(), window)
+                .await
+                .expect("takeover attempt")
+                .is_none()
+        );
+        s.cleanup().await;
+    }
+
+    /// An owner whose claim session the server ended (`pg_terminate_backend`)
+    /// gets `Unknown` from its next status write, not an error, and its
+    /// re-read shows the row as it is: the fence the job and the reconciler
+    /// act on. Once the heartbeat is stale the row is a successor's.
+    #[tokio::test]
+    async fn a_terminated_claim_session_reports_unknown_and_the_row_is_reread() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_terminated_claim_session_reports_unknown_and_the_row_is_reread: no \
+                 PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let row = new_row(ACCOUNT, "Music", "nightly");
+        let owner = s.engine.claim_backup(&row).await.expect("claim");
+        let pid = backup_lock_holder(&s, &row.backup_id)
+            .await
+            .expect("the claim session holds the lock");
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("terminate");
+        assert!(terminated);
+        await_lock_free(&s, &row.backup_id).await;
+        let outcome = owner
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields {
+                    size_bytes: Some(1),
+                    completed: true,
+                    ..StatusFields::default()
+                },
+            )
+            .await
+            .expect("a lost connection is an outcome, not an error");
+        assert_eq!(outcome, WriteOutcome::Unknown);
+        // The re-read runs on the pool, not the dead session.
+        let read = owner.read().await.expect("re-read");
+        assert_eq!(read.status, JobStatus::Creating);
+        assert_eq!(read.owner_generation, owner.generation());
+        // The heartbeat on the dead session is an error the caller treats as
+        // `Lost`.
+        assert!(owner.heartbeat().await.is_err());
+        s.cleanup().await;
+    }
+
+    /// The claim session asks the server for TCP keepalives
+    /// (`CLAIM_KEEPALIVES`), read back from the session with `SHOW`: idle
+    /// 30 s, then a probe every 10 s, three unanswered, so a vanished host
+    /// loses its lock after about a minute (design 4(e)). The literals, not
+    /// the constant, so a constant at the server's defaults (7200 s idle)
+    /// fails here.
+    #[tokio::test]
+    async fn the_claim_session_sets_tcp_keepalives() {
+        if base_conn().is_none() {
+            eprintln!("SKIP the_claim_session_sets_tcp_keepalives: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let names = [
+            "tcp_keepalives_idle",
+            "tcp_keepalives_interval",
+            "tcp_keepalives_count",
+        ];
+        let values = extenddb_storage_postgres::claim_session_settings(
+            &s.catalog,
+            "backup:keepalive-test",
+            &names,
+        )
+        .await
+        .expect("open a claim session")
+        .expect("the lock is free");
+        assert_eq!(values, ["30", "10", "3"]);
+        assert_eq!(
+            extenddb_storage_postgres::CLAIM_KEEPALIVES,
+            [
+                ("tcp_keepalives_idle", 30),
+                ("tcp_keepalives_interval", 10),
+                ("tcp_keepalives_count", 3),
+            ]
+        );
+        // A pooled connection has the server's defaults, not the claim's.
+        let pooled: String = sqlx::query_scalar("SHOW tcp_keepalives_idle")
+            .fetch_one(&s.catalog)
+            .await
+            .expect("show");
+        assert_ne!(
+            pooled, "30",
+            "the test server's default is the claim's value"
+        );
+        s.cleanup().await;
+    }
+}
+
 mod store_identity {
     use std::sync::Arc;
 

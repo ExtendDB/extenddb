@@ -610,6 +610,7 @@ async fn live_claim_backup_excludes_a_second_owner_and_fences_its_writes() {
         size_bytes: Some(1234),
         item_count: Some(5),
         failure_reason: None,
+        source_table_details_json: None,
         completed: true,
     };
     assert_eq!(
@@ -830,6 +831,145 @@ async fn index_doc(engine: &MongoEngine, row: &BackupRow) -> Document {
         .await
         .expect("read the row")
         .expect("the row exists")
+}
+
+/// `claim_dead_backup`: a CREATING row is refused while its owner's heartbeat
+/// is within the window, and taken over once the window has passed on the
+/// server's clock (no hand-dating: the test waits), under a fresh generation
+/// and with `heartbeat_at` as the dead owner left it; the old claim then
+/// finds its heartbeat lost and its status write unmatched; the successor's
+/// heartbeat makes it a live owner a further taker is refused, and its
+/// AVAILABLE write carries the source table object and stamps
+/// `completed_at`. An AVAILABLE row and a missing row are refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one() {
+    let fx = Fixture::new().await;
+    let window = Duration::from_secs(3);
+    let dead = row(ACCOUNT, "Music", "a");
+    let key = dead.key();
+    let owner = fx.engine.claim_backup(&dead).await.expect("claim");
+    assert_eq!(owner.heartbeat().await.unwrap(), Heartbeat::Confirmed);
+    assert!(
+        fx.engine
+            .claim_dead_backup(&key, STALE_AFTER)
+            .await
+            .unwrap()
+            .is_none(),
+        "a live owner"
+    );
+    assert!(
+        fx.engine
+            .claim_dead_backup(&key, window)
+            .await
+            .unwrap()
+            .is_none(),
+        "a heartbeat within the window"
+    );
+    let before = index_doc(&fx.engine, &dead).await;
+    let heartbeat_before = *before.get_datetime("heartbeat_at").expect("heartbeat_at");
+    tokio::time::sleep(window + Duration::from_millis(300)).await;
+    let successor = fx
+        .engine
+        .claim_dead_backup(&key, window)
+        .await
+        .unwrap()
+        .expect("the window has passed on the server's clock");
+    assert_ne!(successor.generation(), owner.generation());
+    assert_ne!(successor.generation(), UNOWNED_GENERATION);
+    let after = index_doc(&fx.engine, &dead).await;
+    assert_eq!(
+        *after.get_datetime("heartbeat_at").expect("heartbeat_at"),
+        heartbeat_before,
+        "the takeover left the heartbeat as the dead owner wrote it"
+    );
+    assert_eq!(after.get_str("status"), Ok("CREATING"));
+    assert_eq!(
+        after.get_i64("owner_generation").unwrap(),
+        i64::try_from(successor.generation()).unwrap()
+    );
+    assert_eq!(owner.heartbeat().await.unwrap(), Heartbeat::Lost);
+    assert_eq!(
+        owner
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default()
+            )
+            .await
+            .unwrap(),
+        WriteOutcome::NotMatched,
+        "the old generation is fenced"
+    );
+    assert_eq!(successor.heartbeat().await.unwrap(), Heartbeat::Confirmed);
+
+    // A second taker while the row is held: the heartbeat the successor
+    // just refreshed is within the window, so it is refused; another
+    // process's reconciler racing the takeover itself, before any
+    // heartbeat, would take the row again and fence the successor.
+    assert!(
+        fx.engine
+            .claim_dead_backup(&key, window)
+            .await
+            .unwrap()
+            .is_none(),
+        "a heartbeating successor is a live owner"
+    );
+
+    let mut source = dead.source_table_details_json.clone();
+    source["item_count"] = serde_json::json!(4242);
+    let fields = StatusFields {
+        size_bytes: Some(777),
+        item_count: Some(4242),
+        failure_reason: None,
+        source_table_details_json: Some(source.clone()),
+        completed: true,
+    };
+    assert_eq!(
+        successor
+            .set_status(JobStatus::Creating, JobStatus::Available, &fields)
+            .await
+            .unwrap(),
+        WriteOutcome::Matched
+    );
+    let stored = fx
+        .engine
+        .read_backup_row(&arn_of(&dead))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, BackupStatus::Available);
+    assert_eq!(stored.size_bytes, 777);
+    assert_eq!(stored.item_count, 4242);
+    assert_eq!(
+        stored.source_table_details_json, source,
+        "the AVAILABLE write carries the source table object"
+    );
+    assert_eq!(stored.source_table().unwrap().item_count, 4242);
+    assert!(stored.completed_at.is_some());
+    assert_eq!(stored.owner_generation, successor.generation());
+
+    tokio::time::sleep(window + Duration::from_millis(300)).await;
+    assert!(
+        fx.engine
+            .claim_dead_backup(&key, window)
+            .await
+            .unwrap()
+            .is_none(),
+        "an AVAILABLE row with a stale heartbeat is not CREATING"
+    );
+    let missing = row(ACCOUNT, "Music", "none").key();
+    assert!(
+        fx.engine
+            .claim_dead_backup(&missing, window)
+            .await
+            .unwrap()
+            .is_none(),
+        "a missing row"
+    );
+    drop(owner);
+    drop(successor);
+    fx.finish().await;
 }
 
 /// `list_backup_rows_older_than`: the rows of the store with the status

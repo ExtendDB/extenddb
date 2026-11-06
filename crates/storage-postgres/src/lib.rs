@@ -28,7 +28,9 @@ mod password_hash_store;
 mod pg_util;
 mod snapshot_engine;
 #[doc(hidden)]
-pub use snapshot_engine::map_fetch_error;
+pub use snapshot_engine::{
+    MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
+};
 mod stream_engine;
 #[doc(hidden)]
 pub mod stream_records_sql;
@@ -41,8 +43,11 @@ mod vector_search;
 mod worker_store;
 mod workers;
 
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub use backup_engine::RESTORE_LOCK_SEED;
+pub use backup_engine::claim_session_settings;
+#[doc(hidden)]
+pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;
 pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
@@ -294,6 +299,9 @@ pub struct PostgresEngine {
     /// wait; the open needs only a data connection by then, so they delay it
     /// no further.
     pub(crate) snapshot_open_slots: Arc<tokio::sync::Semaphore>,
+    /// The permits `snapshot_open_slots` was built with, for the refusal
+    /// that names the bound.
+    pub(crate) snapshot_slot_limit: usize,
     /// Whether `data_pool` is the catalog pool (no separate data database).
     /// The snapshot open uses one transaction on that layout, and
     /// `DeleteTable` runs its in-use probe and its synchronous drop on the
@@ -424,6 +432,7 @@ impl PostgresEngine {
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
             ))),
+            snapshot_slot_limit: snapshot_slot_count(pool_size),
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),

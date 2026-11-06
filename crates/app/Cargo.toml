@@ -13,6 +13,7 @@ license.workspace = true
 # the thin bin enforces that it is paired with a dev/CI backend.
 dev-mode = ["extenddb-config/dev-mode"]
 mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
+backup-test-hooks = ["extenddb-server/backup-test-hooks"]
 
 [dependencies]
 extenddb-auth = { workspace = true }

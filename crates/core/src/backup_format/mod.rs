@@ -73,7 +73,7 @@ mod golden_tests;
 pub use data_file::{
     CompressedDigest, CompressedHasher, DataFileChecksums, DataFileDecoder, DataFileEncoder,
     DataFileExpectations, GZIP_LEVEL, MAX_LINE_BYTES, decode_data_file, encode_data_file,
-    encode_item_line, encode_item_line_into,
+    encode_item_line, encode_item_line_into, encode_item_line_len_bounded,
 };
 pub use ddb_export::{
     DYNAMODB_JSON_OUTPUT_FORMAT, EXPORT_SUMMARY_VERSION, ExportFileEntry, ExportSummaryManifest,
@@ -81,7 +81,7 @@ pub use ddb_export::{
 };
 pub use documents::{BackupDocuments, ManifestHeader};
 pub use error::{FormatError, JsonError};
-pub use key_order::{KeyOrder, hash_key_text};
+pub use key_order::{KeyOrder, check_key_value, hash_key_text, shown};
 pub use layout::{
     BACKUP_ID_MILLIS_DIGITS, BackupArn, BackupArnError, BackupArnParts, DATA_PREFIX,
     EXTENDDB_MANIFEST_FILE, FILES_MANIFEST_FILE, MANIFEST_CHECKSUM_FILE, MAX_BACKUP_ARN_LEN,
