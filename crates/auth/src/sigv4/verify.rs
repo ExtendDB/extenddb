@@ -108,17 +108,22 @@ pub fn verify_signature(
 
 /// Validate the request timestamp is within ±15 minutes of now.
 ///
-/// Returns `UnrecognizedClientException` if the timestamp is missing or out of range.
+/// Returns `InvalidSignatureException` if the timestamp is out of range.
+/// Returns `IncompleteSignature` if `X-Amz-Date` is missing or not ISO 8601 basic.
 /// Returns `InternalServerError` if the system clock is misconfigured.
 pub fn validate_timestamp(headers: &HeaderMap) -> Result<(), DynamoDbError> {
-    let timestamp = extract_timestamp(headers)?;
-
-    // Parse X-Amz-Date: YYYYMMDDTHHMMSSZ
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .ok_or_else(|| DynamoDbError::InternalServerError("server clock error".to_owned()))?;
+
+    validate_timestamp_at(headers, now)
+}
+
+/// Validate the request timestamp against a specified Unix epoch timestamp (seconds).
+pub(crate) fn validate_timestamp_at(headers: &HeaderMap, now: i64) -> Result<(), DynamoDbError> {
+    let timestamp = extract_timestamp(headers)?;
 
     let request_epoch = parse_iso8601_basic(&timestamp).ok_or_else(|| {
         DynamoDbError::IncompleteSignature(
@@ -126,11 +131,20 @@ pub fn validate_timestamp(headers: &HeaderMap) -> Result<(), DynamoDbError> {
         )
     })?;
 
-    let skew = (now - request_epoch).abs();
-    if skew > MAX_CLOCK_SKEW_SECS {
-        return Err(DynamoDbError::UnrecognizedClientException(
-            "Signature expired: the signature is too old or the request date is too far in the future.".to_owned(),
-        ));
+    if request_epoch < now - MAX_CLOCK_SKEW_SECS {
+        let edge = format_iso8601_basic(now - MAX_CLOCK_SKEW_SECS)?;
+        let now_str = format_iso8601_basic(now)?;
+        return Err(DynamoDbError::InvalidSignatureException(format!(
+            "Signature expired: {timestamp} is now earlier than {edge} ({now_str} - 15 min.)"
+        )));
+    }
+
+    if request_epoch > now + MAX_CLOCK_SKEW_SECS {
+        let edge = format_iso8601_basic(now + MAX_CLOCK_SKEW_SECS)?;
+        let now_str = format_iso8601_basic(now)?;
+        return Err(DynamoDbError::InvalidSignatureException(format!(
+            "Signature not yet current: {timestamp} is still later than {edge} ({now_str} + 15 min.)"
+        )));
     }
 
     Ok(())
@@ -171,6 +185,21 @@ fn parse_iso8601_basic(s: &str) -> Option<i64> {
     let days = era * 146_097 + doe - 719_468;
 
     Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Format Unix epoch seconds to ISO 8601 basic format `YYYYMMDDTHHMMSSZ`.
+fn format_iso8601_basic(epoch: i64) -> Result<String, DynamoDbError> {
+    let dt = time::OffsetDateTime::from_unix_timestamp(epoch)
+        .map_err(|_| DynamoDbError::InternalServerError("timestamp conversion error".to_owned()))?;
+    Ok(format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    ))
 }
 
 /// Constant-time byte comparison to prevent timing attacks, through AWS-LC's
@@ -423,5 +452,72 @@ mod tests {
         headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
         let parsed = sign(&headers, "content-type;host;x-amz-date", SIGNED_BODY);
         verify_signature(&parsed, SECRET, "POST", "/", "", &headers, SIGNED_BODY).unwrap();
+    }
+
+    /// Issue #805: Request timestamp > 15 min in the past returns
+    /// InvalidSignatureException with the expired message naming the times.
+    #[test]
+    fn validate_timestamp_expired_returns_invalid_signature_exception() {
+        let now_epoch = parse_iso8601_basic("20261103T203150Z").unwrap();
+        let headers = make_headers("20261103T201550Z");
+        let err = validate_timestamp_at(&headers, now_epoch);
+        match err {
+            Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                assert_eq!(
+                    msg,
+                    "Signature expired: 20261103T201550Z is now earlier than 20261103T201650Z (20261103T203150Z - 15 min.)"
+                );
+            }
+            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
+        }
+    }
+
+    /// Issue #805: Request timestamp > 15 min in the future returns
+    /// InvalidSignatureException with the not-yet-current message naming the times.
+    #[test]
+    fn validate_timestamp_future_returns_invalid_signature_exception() {
+        let now_epoch = parse_iso8601_basic("20261103T203150Z").unwrap();
+        let headers = make_headers("20261103T204750Z");
+        let err = validate_timestamp_at(&headers, now_epoch);
+        match err {
+            Err(DynamoDbError::InvalidSignatureException(msg)) => {
+                assert_eq!(
+                    msg,
+                    "Signature not yet current: 20261103T204750Z is still later than 20261103T204650Z (20261103T203150Z + 15 min.)"
+                );
+            }
+            other => panic!("Expected InvalidSignatureException, got: {other:?}"),
+        }
+    }
+
+    /// Exact ±15 minute boundary timestamps are accepted.
+    #[test]
+    fn validate_timestamp_at_exact_boundaries_succeeds() {
+        let now_epoch = parse_iso8601_basic("20261103T203150Z").unwrap();
+
+        // Exactly 15 min past (lower boundary)
+        let headers_lower = make_headers("20261103T201650Z");
+        assert!(validate_timestamp_at(&headers_lower, now_epoch).is_ok());
+
+        // Exactly 15 min future (upper boundary)
+        let headers_upper = make_headers("20261103T204650Z");
+        assert!(validate_timestamp_at(&headers_upper, now_epoch).is_ok());
+    }
+
+    /// validate_timestamp uses the real clock and accepts current timestamps.
+    #[test]
+    fn validate_timestamp_live_clock_succeeds_for_now() {
+        let now = time::OffsetDateTime::now_utc();
+        let now_str = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        let headers = make_headers(&now_str);
+        assert!(validate_timestamp(&headers).is_ok());
     }
 }
