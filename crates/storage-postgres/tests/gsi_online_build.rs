@@ -201,7 +201,15 @@ async fn create_table(s: &Scratch) -> TableKeyInfo {
         .expect("read the key info")
 }
 
-/// Add GSI `gidx` keyed on `g` (S) and, when `range`, `r` (N).
+/// Add GSI `gidx` keyed on `g` (S) and, when `range`, `r` (N), and wait for the
+/// backfill to finish.
+///
+/// `UpdateTable` now returns while the index is still `CREATING` and the backfill
+/// runs in a detached task (issue #654). The tests in this file check the state
+/// the backfill leaves behind, so the helper waits for the index to reach
+/// `ACTIVE` before returning, which is the point the old in-request build reached
+/// before `UpdateTable` returned. A test that wants to observe the `CREATING`
+/// phase drives it directly rather than through this helper.
 async fn add_gsi(s: &Scratch, range: bool) {
     let mut defs = vec![serde_json::json!({"AttributeName": "g", "AttributeType": "S"})];
     let mut schema = vec![serde_json::json!({"AttributeName": "g", "KeyType": "HASH"})];
@@ -223,6 +231,11 @@ async fn add_gsi(s: &Scratch, range: bool) {
         .update_table(ACCOUNT, input)
         .await
         .expect("add the GSI");
+    assert_eq!(
+        wait_named_active(&s.db, "gidx").await,
+        "ACTIVE",
+        "the detached GSI backfill did not reach ACTIVE"
+    );
 }
 
 fn item(n: u32, g: Option<&str>, r: Option<u32>) -> Item {
@@ -284,13 +297,30 @@ async fn expected_rows(db: &PgPool, table_id: &str) -> BTreeSet<(String, String,
     rows.into_iter().collect()
 }
 
-/// Wait for the GSI to become ACTIVE. UpdateTable publishes it before returning
-/// unless the build hit a transient failure, in which case the recovery worker
-/// (not running in these tests) would; a short wait tells the two apart.
+/// Wait for the GSI `gidx` to become ACTIVE.
+///
+/// Since issue #654, `UpdateTable` returns while the index is still `CREATING`
+/// and a detached task runs the backfill, which flips the index to `ACTIVE` when
+/// it finishes. A build that hits a transient failure leaves the index
+/// `CREATING` for the recovery worker, which does not run in these tests, so a
+/// bounded wait that never reaches `ACTIVE` tells the two apart.
 async fn wait_active(db: &PgPool) -> String {
+    wait_named_active(db, "gidx").await
+}
+
+/// [`wait_active`] for an index named other than `gidx`.
+async fn wait_named_active(db: &PgPool, index_name: &str) -> String {
     let mut status = String::new();
-    for _ in 0..100 {
-        status = ids(db).await.2;
+    for _ in 0..200 {
+        status = sqlx::query_scalar(
+            "SELECT index_status FROM indexes i JOIN tables t ON t.table_id = i.table_id \
+             WHERE t.table_name = $1 AND i.index_name = $2",
+        )
+        .bind(TABLE)
+        .bind(index_name)
+        .fetch_one(db)
+        .await
+        .expect("look up the index status");
         if status == "ACTIVE" {
             break;
         }
@@ -722,9 +752,10 @@ async fn a_creating_gsi_refuses_a_second_change_and_reads() {
     assert!(
         matches!(
             s.engine.index_info_by_table_id(&table_id, "gidx").await,
-            Err(extenddb_storage::error::StorageError::IndexNotFound(_))
+            Err(extenddb_storage::error::StorageError::Validation(msg))
+                if msg == "Cannot read from backfilling global secondary index: gidx"
         ),
-        "a read of a CREATING index resolves as no such index"
+        "a read of a CREATING index is refused as backfilling"
     );
     sqlx::query("UPDATE indexes SET index_status = 'ACTIVE' WHERE index_id = $1")
         .bind(&index_id)
@@ -753,6 +784,9 @@ async fn a_creating_gsi_refuses_a_second_change_and_reads() {
         .update_table(ACCOUNT, other)
         .await
         .expect("add a second GSI while none builds");
+    // "other" also backfills in a detached task now; wait for it to finish so the
+    // only CREATING index below is the one this test marks by hand.
+    assert_eq!(wait_named_active(&s.db, "other").await, "ACTIVE");
     sqlx::query("UPDATE indexes SET index_status = 'CREATING' WHERE index_id = $1")
         .bind(&index_id)
         .execute(&s.db)

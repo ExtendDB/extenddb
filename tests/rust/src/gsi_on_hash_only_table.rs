@@ -6,11 +6,11 @@
 //! The backfill that copies existing rows into a new index reads the base table
 //! ordered by its key columns. Naming the sort-key columns unconditionally makes
 //! that query fail with `column "sk_s" does not exist` on a hash-only base
-//! table, and because the backfill runs inside the index creation the whole
-//! `UpdateTable` is rolled back and the caller sees `InternalServerError`. A
-//! partition-key-only table is the simplest table DynamoDB allows, so this
-//! covers the add end to end: the call succeeds, the index reaches ACTIVE, and a
-//! row written before the index existed is visible through it afterwards.
+//! table. The failure is not transient, so the build removes the index and it
+//! never reaches ACTIVE. A partition-key-only table is the simplest table
+//! DynamoDB allows, so this covers the add end to end: the call succeeds, the
+//! index reaches ACTIVE, and a row written before the index existed is visible
+//! through it afterwards.
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
@@ -162,7 +162,7 @@ async fn gsi_can_be_added_to_a_table_with_no_sort_key() {
                 err_msg(&e)
             )
         });
-    wait_for_active(c, &table).await;
+    wait_for_index_active(c, &table, "hashOnlyIdx").await;
 
     // The index must exist on the table description, not merely have been
     // accepted by UpdateTable.

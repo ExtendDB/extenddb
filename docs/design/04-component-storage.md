@@ -696,17 +696,24 @@ When `UpdateTable` adds a new GSI to a table with existing data, the PostgreSQL 
    separate databases, so no transaction can tell those writes the index exists.
 3. Scans the base table in keyset pages (256 rows, `FOR SHARE SKIP LOCKED`, skipped rows taken one at a time
    afterwards), writing each item's current state into the index, then deletes index rows whose item is gone.
-4. Sets the status to `ACTIVE`. A build that fails for a transient reason leaves the index `CREATING`, and a
-   background worker finishes it; one that would fail every time removes the index and fails the request.
+4. Sets the status to `ACTIVE`. A build that fails for a transient reason (a conflict, a timeout, a lost
+   connection, an exhausted connection pool) leaves the index `CREATING`, and a background worker finishes it.
+   One that would fail every time is logged at error level and its index removed, so `DescribeTable` no longer
+   lists the index and the `Create` can be sent again. `UpdateTable` has answered before either happens.
 
 Queued GSI updates apply the item's state at apply time rather than the image the row carried, so a queue row
 applied late, twice, or after the backfill wrote a newer state cannot leave the index behind the table. The
 worker reads the base row under `FOR SHARE` for that, so a queued update and a concurrent write to the same item
 now wait for each other where before they did not meet.
 
-`UpdateTable` returns after the build. While a GSI is `CREATING`, a Query or Scan naming it is answered as if the
-table had no such index (the service's response), and a GSI Create, or a Delete of another GSI, on the table is
-refused with LimitExceededException. A Delete of the building GSI and a throughput Update are not refused. DeleteTable stops the propagation queue for the table (a `vector_index_holds` row, which the
+`UpdateTable` returns once step 1 has committed, with the index `CREATING`; steps 2 to 4 run in a task of their
+own. The task first takes one of the server process's GSI build slots (`GSI_BUILD_SLOTS`, four, shared with the
+background worker), waiting for one with no database connection open when all are taken, so a client that adds
+indexes to many tables in a row does not start every build at once. While a GSI is `CREATING`, a Query or Scan
+naming it is refused with ValidationException "Cannot read from backfilling global secondary index: <name>", the
+service's answer in its backfilling phase; DeleteTable is refused with ResourceInUseException; and a GSI Create,
+or a Delete of another GSI, on the table is refused with LimitExceededException. A Delete of the building GSI is not
+refused. A DeleteTable that goes ahead stops the propagation queue for the table (a `vector_index_holds` row, which the
 claim query honours) and deletes its pending rows before it drops any data table, so a worker holding a claimed row
 and waiting on the base table cannot deadlock with the drop.
 

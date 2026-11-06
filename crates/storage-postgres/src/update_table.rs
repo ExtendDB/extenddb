@@ -11,7 +11,7 @@ use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
 
 use crate::PostgresEngine;
 use crate::data::gsi_build::{
-    GsiBuild, build_gsis, drop_gsi_tables, is_transient, remove_failed_build,
+    GsiBuild, build_gsis, drop_gsi_tables, index_still_building, is_transient, remove_failed_build,
 };
 
 /// Give back the build holds a failed `UpdateTable` took.
@@ -792,6 +792,13 @@ impl PostgresEngine {
         // recovery sweep never sees a CREATING row with nobody holding it. It is an
         // efficiency measure only: a second, concurrent build is correct, because a
         // full backfill pass is enough on its own to publish the index.
+        //
+        // That is for a build that gets one of the engine's build slots
+        // (`GSI_BUILD_SLOTS`) here; the request takes one only if it is free, and
+        // never waits. A build that gets none waits for a slot in its task and
+        // takes ownership then, so that while it waits it holds no PostgreSQL
+        // session. Until then its CREATING row has no owner, and a recovery sweep
+        // may take the index and build it instead.
         let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
@@ -803,12 +810,23 @@ impl PostgresEngine {
             .clone()
             .unwrap_or_else(|| base_attr_defs.clone());
         let mut gsi_builds: Vec<GsiBuild> = Vec::new();
+        let build_slot = if created_index_ids.is_empty() {
+            None
+        } else {
+            std::sync::Arc::clone(&self.gsi_build_slots)
+                .try_acquire_owned()
+                .ok()
+        };
         if let Some(updates) = &input.global_secondary_index_updates {
             let creates = updates.iter().filter_map(|u| u.create.as_ref());
             for (create, index_id) in creates.zip(&created_index_ids) {
-                let owner =
-                    crate::data::vector_index::build_ownership(&self.data_pool, index_id).await;
-                if owner.is_none() {
+                let owner = match &build_slot {
+                    Some(_) => {
+                        crate::data::vector_index::build_ownership(&self.data_pool, index_id).await
+                    }
+                    None => None,
+                };
+                if owner.is_none() && build_slot.is_some() {
                     // The build goes ahead without it: a second build of the same index
                     // by the recovery worker is harmless to the index's contents, and
                     // removal of a failed build is conditional on the row still being
@@ -1023,25 +1041,84 @@ impl PostgresEngine {
         // why the wait and the barrier make the backfill see every write that did
         // not see the index.
         //
-        // A build that fails for a passing reason (a conflict, a timeout, a lost
-        // connection) leaves its index CREATING, with its data table, for the
-        // recovery worker to finish, and the request still succeeds, reporting the
-        // index as CREATING: the index exists, writes are maintaining it, and what
-        // is missing is a scan that can be re-run. One that would fail the same way
-        // every time is removed and reported, as before.
+        // The build runs in a task of its own and the request returns without
+        // waiting for it, which is what the service does: UpdateTable answers at
+        // once with the index `CREATING`, the backfill runs in the background, and
+        // DescribeTable reports `ACTIVE` when it has finished. Measured on
+        // 2026-10-30 with 2,000 items: the response came back in under 100 ms with
+        // `IndexStatus: CREATING`, and the index turned `ACTIVE` minutes later.
+        // Awaiting the build here made the response wait for every existing item
+        // to be indexed, which exceeded the SDKs' default read timeout on a
+        // 20,000-item table (#654).
         //
-        // In a task of its own, awaited here, so a client that disconnects cannot
-        // cancel the build halfway: that would leave the barrier's lock request or a
-        // page's row locks to be released whenever the pooled connection is next
+        // Detached rather than awaited also means a client that disconnects cannot
+        // cancel the build halfway: that would leave the barrier's lock request or
+        // a page's row locks to be released whenever the pooled connection is next
         // used.
+        //
+        // What the task leaves behind on failure. A build that fails for a passing
+        // reason (a conflict, a timeout, a lost connection) leaves its index
+        // CREATING, with its data table, and ends; the ownership lock goes with the
+        // task, and the recovery worker (`gsi_build::recovery_worker`) rebuilds the
+        // index on its next pass, as it does after a server restart. One that would
+        // fail the same way every time is removed, as the recovery worker removes
+        // one, so that an index never sits CREATING forever refusing every other
+        // index change on the table; the failure is logged at error level, and the
+        // caller sees the index gone from DescribeTable and can issue the Create
+        // again. The service never reports a failed backfill, so there is no
+        // measured state to copy here.
         if !gsi_builds.is_empty() {
             let catalog = self.pool.clone();
             let data = self.data_pool.clone();
+            let slots = std::sync::Arc::clone(&self.gsi_build_slots);
             let build_table_id = table_id.clone();
             let table_name = input.table_name.clone();
             let base_ks = base_key_schema.clone();
             let attr_defs = effective_attr_defs.clone();
-            let task = tokio::spawn(async move {
+            tokio::spawn(async move {
+                // Held until the task ends, whichever way it ends.
+                let _slot = match build_slot {
+                    Some(slot) => slot,
+                    None => {
+                        // No slot was free when the request ran: wait for one, then
+                        // take ownership. An index someone else owns by then (a
+                        // recovery sweep, here or on a peer) is theirs to build, and
+                        // so is one whose ownership session cannot be opened, which
+                        // the recovery sweep retries.
+                        let Ok(slot) = slots.acquire_owned().await else {
+                            // Only a closed semaphore refuses, and this one is
+                            // never closed.
+                            return;
+                        };
+                        for mut b in std::mem::take(&mut gsi_builds) {
+                            b._owner =
+                                crate::data::vector_index::build_ownership(&data, &b.def.index_id)
+                                    .await;
+                            if b._owner.is_none() {
+                                continue;
+                            }
+                            // Re-read under ownership, as the recovery sweep does
+                            // after its own wait. The index had no owner while this
+                            // task waited, so a sweep may have built, published and
+                            // let go of it by now, or the index may have been
+                            // deleted. A second build would scan the whole table
+                            // again behind a write barrier for nothing.
+                            match index_still_building(&catalog, &b.def.index_id).await {
+                                Ok(true) => gsi_builds.push(b),
+                                Ok(false) => {}
+                                Err(e) => tracing::warn!(
+                                    index_id = %b.def.index_id,
+                                    "could not re-check a CREATING GSI; leaving it to the \
+                                     recovery worker: {e}"
+                                ),
+                            }
+                        }
+                        if gsi_builds.is_empty() {
+                            return;
+                        }
+                        slot
+                    }
+                };
                 let built = build_gsis(
                     &catalog,
                     &data,
@@ -1052,7 +1129,7 @@ impl PostgresEngine {
                 )
                 .await;
                 let Err((first_failed, e)) = built else {
-                    return Ok(());
+                    return;
                 };
                 let unfinished = &gsi_builds[first_failed..];
                 if is_transient(&e) {
@@ -1063,12 +1140,12 @@ impl PostgresEngine {
                             b.index_name,
                         );
                     }
-                    return Ok(());
+                    return;
                 }
-                // A failure that would recur on every attempt: remove the index and
-                // report it, as before. The engine allows one index action per
-                // UpdateTable, so `unfinished` is the one build in practice; the
-                // loop is for the shape of the data, not for a second index.
+                // A failure that would recur on every attempt: remove the index. The
+                // engine allows one index action per UpdateTable, so `unfinished` is
+                // the one build in practice; the loop is for the shape of the data,
+                // not for a second index.
                 for b in unfinished {
                     tracing::error!(
                         "Failed to build GSI '{}' on '{table_name}', removing it: {e}",
@@ -1076,15 +1153,7 @@ impl PostgresEngine {
                     );
                     remove_failed_build(&catalog, &data, &build_table_id, b).await;
                 }
-                Err(e)
             });
-            match task.await {
-                Ok(result) => result?,
-                Err(e) => tracing::error!(
-                    "GSI build task on '{}' ended abnormally; recovery will finish it: {e}",
-                    input.table_name
-                ),
-            }
         }
 
         self.build_table_description(account_id, &input.table_name)

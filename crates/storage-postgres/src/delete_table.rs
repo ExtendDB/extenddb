@@ -85,6 +85,25 @@ impl PostgresEngine {
             });
         }
 
+        // A GSI whose backfill is still running: the service refuses to delete
+        // the table until the index is ACTIVE (measured 2026-10-30, twice on a
+        // table whose index stayed CREATING for 15 minutes, both answers
+        // ResourceInUseException with this text). The row lock above orders
+        // this check against UpdateTable's insert of a CREATING row, which
+        // locks the same table row.
+        //
+        // It comes before the deletion-protection check: on a protected table
+        // with an index being created, the service answers this text, not the
+        // protection ValidationException (measured 2026-10-30, twice before
+        // and twice after `Backfilling` turned true).
+        if index_rows.iter().any(|idx| idx.index_status == "CREATING") {
+            return Err(StorageError::IndexesInUse(
+                "Attempt to change a resource which is still in use: Cannot delete table \
+                 while indexes are being created, updated, or deleted."
+                    .to_owned(),
+            ));
+        }
+
         // REQ: DeletionProtectionEnabled check — real DynamoDB returns ValidationException
         if row.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(row.table_arn.clone()));
