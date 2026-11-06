@@ -276,8 +276,12 @@ impl<'a> TargetContainer<'a> {
                 map.remove(attr_name);
             }
             TargetContainer::List { .. } => {
-                // DELETE removing all elements of a set at a list index does not remove
-                // the list element itself; issue #812 specifies set operations on the element.
+                // Note: Issue #812 explicitly marks the case where DELETE removes ALL members
+                // from a set inside a list element as "not sent" / unmeasured against DynamoDB.
+                // In DynamoDB, attributes holding sets that become empty are removed from maps,
+                // but removing or retaining a list index element (or converting it) when its
+                // inner set empties is an unresolved edge case. For now, we do not alter the
+                // list length; maintainer review / wire measurements are needed for this edge.
             }
         }
     }
