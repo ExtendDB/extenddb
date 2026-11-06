@@ -107,14 +107,14 @@ impl SqliteBootstrapper {
                 ))
             })?;
         }
-        SqlitePoolOptions::new()
+        let options = SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _| {
                 Box::pin(
                     async move { crate::sqlite_util::set_connection_pragmas(conn, true).await },
                 )
-            })
-            .connect(&sqlite_url(&self.path))
+            });
+        crate::file_mode::connect(&self.path, options)
             .await
             .map_err(|e| OpError::Internal(format!("open SQLite database '{}': {e}", self.path)))
     }

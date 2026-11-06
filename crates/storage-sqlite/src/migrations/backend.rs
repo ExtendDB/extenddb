@@ -177,6 +177,10 @@ impl SqliteMigrations {
                 })?;
             }
             super::open::create_private(path)?;
+            // Files an earlier version left wider than 0600 are narrowed
+            // before SQLite opens them, so the sidecars this connection
+            // creates take 0600 from the database file.
+            crate::file_mode::prepare(location).map_err(MigrationError::Store)?;
         }
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(&sqlite_url(location))
             .map_err(|e| MigrationError::store(format!("open SQLite database {location}"), e))?
@@ -251,6 +255,10 @@ impl SqliteMigrations {
                 )));
             }
         };
+        if write && let Err(e) = crate::file_mode::restrict(location) {
+            pool.close().await;
+            return Err(MigrationError::Store(e));
+        }
         let migrations = Self::with_pool(pool, location, file, true);
         // Every run that writes holds the database's lock, so a partial copy
         // beside the database now is a stopped run's, whether or not this
