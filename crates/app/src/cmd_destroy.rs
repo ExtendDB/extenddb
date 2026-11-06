@@ -3,7 +3,10 @@
 
 //! `extenddb destroy` — tear down a extenddb deployment (REQ-CAT-012).
 //!
-//! Reads config, enumerates tables, requires `--yes` to confirm, drops both databases.
+//! Reads config, enumerates tables, requires `--yes` to confirm, drops both
+//! databases. The backup store (`[backup.store]`) is not touched: it is the
+//! copy that survives destroy, and `extenddb backup purge --confirm` is the
+//! command that deletes it.
 
 use clap::Args;
 
@@ -25,7 +28,8 @@ pub struct DestroyArgs {
     #[arg(long)]
     pg_pass: Option<String>,
 
-    /// Confirm destruction (required, no interactive prompt)
+    /// Confirm destruction (required, no interactive prompt). The backup store is left
+    /// untouched; use `extenddb backup purge --confirm` to delete its backups.
     #[arg(long)]
     yes: bool,
 }
@@ -90,6 +94,12 @@ pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
 
     println!();
     println!("WARNING: This will permanently destroy ALL data in both databases.");
+    println!(
+        "The backup store ([backup.store]) is left untouched; `extenddb backup purge --confirm` \
+         deletes its backups. Its extenddb-store.json names this catalog: a catalog re-created \
+         with `init` needs that file removed (or a new root), or the store is reported owned \
+         by another catalog."
+    );
     println!();
 
     if !args.yes {

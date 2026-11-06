@@ -5,22 +5,24 @@
 //!
 //! One implementation for every backend: the id is part of the ARN a client
 //! holds, so a backend that formatted it differently would issue ARNs another
-//! backend's paging cursor could not place.
+//! backend's paging cursor could not place. The implementation itself is in
+//! `extenddb_core::backup_format`, where the off-host backup format uses it
+//! too; the tests here exercise it through this crate's re-exports so the
+//! engine-facing contract is pinned where the engine imports it.
 
 use super::arn::ARN_PARTITION;
 
-/// Digits of the epoch-millisecond prefix. The service zero-pads to 14
-/// (`01489602797149-73d8d5bc`); 13 digits cover today's instants, so the
-/// padding is visible as a leading zero.
-const MILLIS_DIGITS: usize = 14;
+// The id and ARN shape live in `extenddb_core::backup_format::layout`, which
+// the off-host backup format shares; this module adds what needs `rand` or
+// the deployment's partition, and re-exports the rest so the engine and the
+// backends keep one import path.
+pub use extenddb_core::backup_format::{
+    BackupArnError, BackupArnParts, MAX_BACKUP_ARN_LEN, backup_creation_date_time,
+    backup_id_epoch_millis, check_backup_arn, format_backup_id, is_backup_id, parse_backup_arn,
+};
 
 /// A new backup id: 14-digit zero-padded epoch milliseconds, `-`, 8 lowercase
-/// hex digits from a random `u32`.
-///
-/// The random part is part of the identifier, not decoration: a timestamp
-/// alone makes a backup id derivable by anyone who knows roughly when the
-/// backup ran. It also keeps two backups created in the same millisecond
-/// apart.
+/// hex digits from a random `u32` ([`format_backup_id`]).
 ///
 /// Use [`backup_creation_date_time`] on the returned id for the backup's
 /// `BackupCreationDateTime`, so the ARN and the reported time agree and the
@@ -35,173 +37,19 @@ pub fn new_backup_id() -> String {
     format_backup_id(millis, rand::rng().random())
 }
 
-/// Format a backup id from its parts. Exposed for tests and fixtures.
-#[must_use]
-pub fn format_backup_id(epoch_millis: u64, suffix: u32) -> String {
-    format!("{epoch_millis:0MILLIS_DIGITS$}-{suffix:08x}")
-}
-
-/// The epoch milliseconds a backup id (or a whole backup ARN) was minted at,
-/// or `None` if it is not in the shape [`new_backup_id`] produces.
-#[must_use]
-pub fn backup_id_epoch_millis(id_or_arn: &str) -> Option<u64> {
-    let id = id_or_arn.rsplit('/').next()?;
-    let (millis, suffix) = id.split_once('-')?;
-    if millis.len() != MILLIS_DIGITS
-        || !millis.bytes().all(|b| b.is_ascii_digit())
-        || suffix.len() != 8
-        || !suffix
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    millis.parse().ok()
-}
-
-/// `BackupCreationDateTime` (epoch seconds, millisecond precision) for a
-/// backup id from [`new_backup_id`].
-#[must_use]
-#[allow(clippy::cast_precision_loss)] // epoch ms fit f64's 53-bit mantissa
-pub fn backup_creation_date_time(id_or_arn: &str) -> Option<f64> {
-    backup_id_epoch_millis(id_or_arn).map(|ms| ms as f64 / 1000.0)
-}
-
-/// The ARN of a backup: `arn:aws:dynamodb:<region>:<account>:table/<table>/backup/<id>`.
+/// The ARN of a backup in this deployment's partition:
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/backup/<id>`, through
+/// the one formatter (`extenddb_core::backup_format::format_backup_arn`).
+/// Infallible for callers whose components come from the catalog.
 #[must_use]
 pub fn backup_arn(region: &str, account_id: &str, table_name: &str, backup_id: &str) -> String {
-    format!(
-        "arn:{ARN_PARTITION}:dynamodb:{region}:{account_id}:table/{table_name}/backup/{backup_id}"
-    )
-}
-
-/// The parts of a well-formed backup ARN.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackupArnParts<'a> {
-    /// The ARN with surrounding ASCII whitespace removed, as the other fields
-    /// were read from it.
-    pub arn: &'a str,
-    pub partition: &'a str,
-    pub region: &'a str,
-    pub account_id: &'a str,
-    pub table_name: &'a str,
-    pub backup_id: &'a str,
-}
-
-/// Why a string is not a backup ARN. The two classes carry the two texts the
-/// service answers with (measured on DynamoDB). Which text goes with which
-/// input was captured for one input only (a bare 13-digit id is "not
-/// valid"), so the split is the parser's: a string that is not an ARN of the
-/// right shape, is too long, or carries a character no ARN part allows is
-/// `Invalid`; an ARN of the right shape whose backup id is not one is
-/// `Id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupArnError {
-    /// Not `arn:<partition>:dynamodb:<region>:<account>:table/<name>/backup/<id>`
-    /// with a non-empty region, account, and name, over
-    /// [`MAX_BACKUP_ARN_LEN`] bytes, with a control or non-ASCII character, or
-    /// with a region outside `[a-z0-9-]`, a table name outside
-    /// `[a-zA-Z0-9_.-]`, or an account outside `[0-9]`. The service's text:
-    /// `Invalid Request: BackupArn is not valid`.
-    Invalid,
-    /// The backup id is neither [`new_backup_id`]'s shape nor one an earlier
-    /// build issued (13 digits, `-`, 8 hex digits; 13 bare digits). The
-    /// service's text: `Invalid Backup ARN`.
-    Id,
-}
-
-/// The longest `BackupArn` the service model accepts (`BackupArn` shape,
-/// botocore 1.33.13: max 1024).
-pub const MAX_BACKUP_ARN_LEN: usize = 1024;
-
-/// Parse a backup ARN, or `None` if [`check_backup_arn`] refuses it.
-#[must_use]
-pub fn parse_backup_arn(arn: &str) -> Option<BackupArnParts<'_>> {
-    check_backup_arn(arn).ok()
-}
-
-/// Whether every byte is in `allowed` or an ASCII alphanumeric.
-fn ascii_word(s: &str, allowed: &[u8]) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || allowed.contains(&b))
-}
-
-/// Whether `id` is a backup id this codebase ever issued: 14 or 13 digits,
-/// `-`, 8 lowercase hex digits (the 14-digit form is [`new_backup_id`]'s;
-/// the 13-digit form is what every backend issued before the shared id), or
-/// 13 bare digits (epoch milliseconds with no suffix, the form PostgreSQL
-/// issued in v0.1.0 to v0.1.2 and MongoDB before its suffix was added). No
-/// build has put a UUID in a backup ARN, so none is accepted.
-#[must_use]
-pub fn is_backup_id(id: &str) -> bool {
-    let hex = |s: &str, n: usize| {
-        s.len() == n
-            && s.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
-    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
-    match id.split_once('-') {
-        Some((millis, suffix)) => {
-            (digits(millis, MILLIS_DIGITS) || digits(millis, MILLIS_DIGITS - 1)) && hex(suffix, 8)
-        }
-        None => digits(id, MILLIS_DIGITS - 1),
-    }
-}
-
-/// Parse a backup ARN after trimming surrounding ASCII whitespace (the
-/// service resolves an ARN with a trailing newline, measured on DynamoDB;
-/// trimming every surrounding ASCII whitespace character is this parser's
-/// generalisation of that one measurement, and the length limit below is
-/// applied to what remains), refusing one that
-/// is not exactly six colon-separated fields, not `arn:<partition>:dynamodb:...`,
-/// has an empty or malformed region, account, or table name, a resource
-/// other than `table/<name>/backup/<id>`, a control or non-ASCII character,
-/// more than [`MAX_BACKUP_ARN_LEN`] bytes, or an id that is not a backup id
-/// ([`is_backup_id`]). The region is checked for shape only: an ARN in
-/// another region of the caller's account resolves on the service, so the
-/// engine substitutes its own region rather than refuse it.
-///
-/// # Errors
-///
-/// [`BackupArnError`], one class per service text.
-pub fn check_backup_arn(arn: &str) -> Result<BackupArnParts<'_>, BackupArnError> {
-    let arn = arn.trim_matches(|c: char| c.is_ascii_whitespace());
-    if arn.len() > MAX_BACKUP_ARN_LEN || !arn.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(BackupArnError::Invalid);
-    }
-    let fields: Vec<&str> = arn.split(':').collect();
-    let [prefix, partition, service, region, account_id, resource] = fields.as_slice() else {
-        return Err(BackupArnError::Invalid);
-    };
-    if *prefix != "arn"
-        || !ascii_word(partition, b"-")
-        || *service != "dynamodb"
-        || !ascii_word(region, b"-")
-        || region.bytes().any(|b| b.is_ascii_uppercase())
-        || account_id.is_empty()
-        || !account_id.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(BackupArnError::Invalid);
-    }
-    let parts: Vec<&str> = resource.split('/').collect();
-    let ["table", table_name, "backup", backup_id] = parts.as_slice() else {
-        return Err(BackupArnError::Invalid);
-    };
-    if !ascii_word(table_name, b"_.-") || backup_id.is_empty() {
-        return Err(BackupArnError::Invalid);
-    }
-    if !is_backup_id(backup_id) {
-        return Err(BackupArnError::Id);
-    }
-    Ok(BackupArnParts {
-        arn,
-        partition,
+    extenddb_core::backup_format::format_backup_arn(
+        ARN_PARTITION,
         region,
         account_id,
         table_name,
         backup_id,
-    })
+    )
 }
 
 /// Whether `arn` names a backup or a path under one: its resource (the sixth
@@ -363,6 +211,17 @@ mod tests {
             assert_eq!(check_backup_arn(&arn), Err(BackupArnError::Id), "{id}");
             assert!(parse_backup_arn(&arn).is_none(), "{id}");
         }
+    }
+
+    #[test]
+    fn backup_arn_matches_the_typed_form() {
+        use extenddb_core::backup_format::BackupArn;
+        let id = new_backup_id();
+        let arn = backup_arn("us-east-1", "123456789012", "Music", &id);
+        let typed =
+            BackupArn::new(ARN_PARTITION, "us-east-1", "123456789012", "Music", &id).unwrap();
+        assert_eq!(arn, typed.to_arn_string());
+        assert_eq!(BackupArn::parse(&arn).unwrap(), typed);
     }
 
     #[test]

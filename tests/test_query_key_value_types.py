@@ -9,10 +9,11 @@ value: <value>``) or when a key condition value's type is not the key
 attribute's ``AttributeDefinitions`` type (``One or more parameter values were
 invalid: Condition parameter type does not match schema type``). Every expected
 answer below was measured against the service on 2026-10-24 (15:10, 21:00,
-21:06 and 23:42 UTC) and 2026-10-25 (11:31 UTC) on tables with S/S, S/N and
-B/B keys, a GSI and an LSI. A Unicode decimal digit in an N value counts as
-the digit it stands for; a field of the wrong JSON type anywhere in the body
-answers SerializationException ahead of every check.
+21:06 and 23:42 UTC), 2026-10-25 (11:31 UTC) and 2026-11-06 (the begins_with
+rows after b20) on tables with S/S, S/N and B/B keys, a GSI and an LSI. A
+Unicode decimal digit in an N value counts as the digit it stands for; a field
+of the wrong JSON type anywhere in the body answers SerializationException
+ahead of every check.
 The rows also pin where the two checks fall against the other Query checks:
 the numeric check after Limit, the expression parameter mix check and the
 ReturnConsumedCapacity enum, and before the Select enum and the table lookup;
@@ -185,6 +186,10 @@ FILTER_BEGINS_WITH_N = (
     "Invalid FilterExpression: Incorrect operand type for operator or function; "
     "operator or function: begins_with, operand type: N"
 )
+BEGINS_WITH_KCE = (
+    "Invalid KeyConditionExpression: Incorrect operand type for operator or function; "
+    "operator or function: begins_with, operand type: "
+)
 PROJECTION_OVERLAP = (
     "Invalid ProjectionExpression: Two document paths overlap with each other; "
     "must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
@@ -284,6 +289,28 @@ ROWS = [
      V, TYPE_MISMATCH),
     ("b20 N sk begins_with S", "ns",
      kce("pk = :u AND begins_with(sk, :b)", {":u": SX, ":b": {"S": "1"}}), V, TYPE_MISMATCH),
+    # begins_with is refused by the type of its value, on every sort key type,
+    # ahead of the unused value check; an S or B value on a sort key of another
+    # type gets the type mismatch (measured on Amazon DynamoDB in us-east-1 on
+    # 6 Nov 2026).
+    ("q1 S sk begins_with N", "ss",
+     kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}}), V, BEGINS_WITH_KCE + "N"),
+    ("q2 N sk begins_with B", "ns",
+     kce("pk = :u AND begins_with(sk, :b)", {":u": SX, ":b": B_BOB}), V, TYPE_MISMATCH),
+    ("q3 B sk begins_with N", "bb",
+     kce("bpk = :u AND begins_with(bsk, :n)", {":u": B_BOB, ":n": {"N": "1"}}),
+     V, BEGINS_WITH_KCE + "N"),
+    ("q4 N sk begins_with BOOL", "ns",
+     kce("pk = :u AND begins_with(sk, :t)", {":u": SX, ":t": {"BOOL": True}}),
+     V, BEGINS_WITH_KCE + "BOOL"),
+    ("q5 S sk begins_with N with unused value", "ss",
+     kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}, ":x": SX}),
+     V, BEGINS_WITH_KCE + "N"),
+    ("p2 N sk begins_with N", "ns",
+     kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}}), V, BEGINS_WITH_KCE + "N"),
+    ("p4 N sk begins_with N with unused value", "ns",
+     kce("pk = :u AND begins_with(sk, :n)", {":u": SX, ":n": {"N": "1"}, ":x": SX}),
+     V, BEGINS_WITH_KCE + "N"),
     ("b22 pk = N 5 AND N sk = S 5", "ns",
      kce("pk = :u AND sk = :s", {":u": N5, ":s": {"S": "5"}}), V, TYPE_MISMATCH),
     ("b23 N sk = N bob", "ns", kce("pk = :u AND sk = :s", {":u": SX, ":s": NB}), V, NUMERIC + "bob"),

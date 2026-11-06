@@ -17,29 +17,30 @@
 //! pending row reappears and is reprocessed — nothing is lost once enqueued.
 //!
 //! Rows are partitioned by a stable hash of the base table key, and each worker
-//! owns one partition, so all updates to a given base item are applied in `id`
-//! order by a single worker (**per-key FIFO**) while distinct keys propagate
-//! concurrently.
+//! owns one partition, so all rows for a given base item are claimed by a single
+//! worker in `id` order while distinct keys propagate concurrently. Vector rows
+//! apply the images they carry and rely on that order. Secondary index rows do
+//! not: their apply writes the item's state at apply time (`resync_base_key`),
+//! which is what lets the worker pass over an item whose base row a writer is
+//! holding (`PARK_FOR`) and apply the rows behind it first.
 
 use std::sync::Arc;
 
-use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, Projection};
+use extenddb_core::types::{
+    AttributeDefinition, AttributeValue, Item, KeySchemaElement, Projection,
+};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::composite_pk_to_text;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
-use crate::data::{
-    all_sort_key_info, delete_index_row_multi, index_table_name, insert_index_row_multi,
-    item_has_index_keys, project_item_for_index,
-};
-
 /// Number of worker tasks consuming from the persistent queue.
 ///
 /// Fixed invariant: a row's `worker_partition` is `hash(base_key) % NUM_WORKERS`
-/// and worker `i` consumes partition `i`, so all updates for a base item are
-/// applied in `id` order by a single worker (per-key FIFO). Changing this while
+/// and worker `i` consumes partition `i`, so all rows for a base item are
+/// claimed in `id` order by a single worker (see the module doc for what that
+/// does and does not guarantee). Changing this while
 /// the queue is non-empty could split a key's pending rows across workers; a
 /// rolling restart drains in-flight rows first, so changing it between deploys
 /// is safe.
@@ -50,6 +51,101 @@ const NUM_WORKERS: u64 = 4;
 /// holding a long-lived transaction.
 const BATCH_SIZE: usize = 100;
 
+/// How long a worker waits for a writer's row lock before giving the claim back.
+///
+/// The state-based apply of a secondary index row reads the base row `FOR
+/// SHARE`, so a client that holds an item's row open (a slow conditional write,
+/// a long TransactWriteItems) would otherwise hold this worker's whole partition
+/// for as long. The claim rolls back on the timeout and the item is passed over
+/// for [`PARK_FOR`]; nothing is lost.
+///
+/// Set for secondary index rows only. A vector row applies the images it
+/// carries, so rows for one item have to apply in `id` order, and a vector row
+/// waits for the base row as it always has.
+const ROW_LOCK_TIMEOUT: &str = "2s";
+
+/// How long an item whose base row was held is passed over after a lock wait
+/// on it timed out. The claim takes the lowest due id, so without this the held
+/// item's row is claimed again almost at once and every row behind it in the
+/// partition waits for the whole hold. Passed over, the rest of the partition
+/// drains; the item is tried again when this runs out, so it is retried about
+/// every `PARK_FOR` + [`ROW_LOCK_TIMEOUT`], and each retry stalls the partition
+/// for up to [`ROW_LOCK_TIMEOUT`].
+///
+/// The pass-over is by item, not by row: a held item usually has several rows
+/// queued (one per asynchronous index for each write to it), and if each of them
+/// had to time out on its own the partition would never move, since by the time
+/// the second one gave up the first would be due again. A later row for a parked
+/// item is given back as soon as it is claimed, without waiting on the lock: a
+/// claim and a rollback per such row per cycle.
+///
+/// Skipping a row is safe because the apply is state-based: a row writes the
+/// item's state at apply time, not the image it carried, so applying a later
+/// row for another key first changes nothing, and a later row for the same key
+/// writes the same state once the hold ends.
+const PARK_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A base item whose row a writer holds: the data table id and the item's key
+/// attribute values in key schema order.
+type HeldItem = (String, Vec<AttributeValue>);
+
+/// The key values that identify `item` in its table, for [`HeldItem`].
+fn held_item(table_id: &str, item: &Item, base_key_schema: &[KeySchemaElement]) -> HeldItem {
+    let key = base_key_schema
+        .iter()
+        .filter_map(|ks| item.get(&ks.attribute_name).cloned())
+        .collect();
+    (table_id.to_owned(), key)
+}
+
+/// What this worker is passing over because a base row was held: the items, and
+/// the queue rows for them that have been claimed and given back, each with the
+/// time it may be tried again. Per worker, in memory: a restart simply tries
+/// them at once, which is what happens without it.
+#[derive(Default)]
+struct Parked {
+    items: Vec<(HeldItem, std::time::Instant)>,
+    ids: Vec<(i64, std::time::Instant)>,
+}
+
+impl Parked {
+    /// Ids still being passed over; drops the ones whose time is up.
+    fn ids(&mut self) -> Vec<i64> {
+        let now = std::time::Instant::now();
+        self.ids.retain(|(_, until)| *until > now);
+        self.ids.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// When the item is being passed over, until when.
+    fn item_until(&mut self, item: &HeldItem) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        self.items.retain(|(_, until)| *until > now);
+        self.items
+            .iter()
+            .find(|(held, _)| held == item)
+            .map(|(_, until)| *until)
+    }
+
+    /// Pass the item and this row over for `PARK_FOR`, after a lock wait on its
+    /// base row timed out.
+    fn park(&mut self, id: i64, item: HeldItem) {
+        let until = std::time::Instant::now() + PARK_FOR;
+        self.items.push((item, until));
+        self.ids.push((id, until));
+    }
+
+    /// Pass a later row for an item already parked over, until the item is due.
+    fn park_row(&mut self, id: i64, until: std::time::Instant) {
+        self.ids.push((id, until));
+    }
+}
+
+/// Whether a `StorageError` is PostgreSQL's lock_not_available (55P03), the
+/// error `lock_timeout` raises.
+fn is_lock_timeout(err: &StorageError) -> bool {
+    matches!(err, StorageError::Internal(msg) if msg.contains("SQLSTATE 55P03"))
+}
+
 /// Marker for PostgreSQL's "undefined_table" SQLSTATE (42P01) as embedded in
 /// `StorageError` messages by `db_error`. Matching the full `SQLSTATE 42P01`
 /// prefix (rather than the bare code) avoids false positives from item or
@@ -57,7 +153,8 @@ const BATCH_SIZE: usize = 100;
 const PG_UNDEFINED_TABLE: &str = "SQLSTATE 42P01";
 
 /// Stable partition for a base-table key (FNV-1a, mapped to a worker). Routes
-/// all updates for one base item to a single worker for in-order apply. A local
+/// all updates for one base item to a single worker, which claims them in `id`
+/// order. A local
 /// hash (not `std`'s, which is not guaranteed stable across builds) keeps the
 /// mapping fixed for a given key forever.
 fn partition_for(base_pk_text: &str) -> i32 {
@@ -99,7 +196,7 @@ pub(crate) struct GsiIndexDef {
 /// its own propagation delay (encoded in the row's `ready_at`) and propagates
 /// independently — mirroring the per-index queue items of the original
 /// in-memory design. Rows for the same base item share a `worker_partition`
-/// and are applied in `id` order, preserving per-key FIFO.
+/// and are claimed in `id` order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GsiApplyContext {
     pub(crate) base_key_schema: Vec<KeySchemaElement>,
@@ -212,7 +309,9 @@ fn jitter_delay_ms(delay_ms: u64) -> u64 {
 /// smaller jitter could become eligible first and be applied before an earlier
 /// write — leaving the index reflecting a stale value. The clamp guarantees a
 /// row's `ready_at` never precedes that of a lower-`id` row in the same
-/// partition, preserving per-key FIFO convergence while still adding jitter.
+/// partition, so rows for one item are claimed in write order while still adding
+/// jitter. Vector rows, which apply the images they carry, rely on that order;
+/// secondary index rows converge whatever the order (see the module doc).
 /// This matches the original design, where a partition's single consumer slept
 /// sequentially and so could never reorder updates.
 pub(crate) async fn enqueue_gsi_pending(
@@ -234,7 +333,7 @@ pub(crate) async fn enqueue_gsi_pending(
     let context_json =
         serde_json::to_value(context).map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    // Route all updates for a given base item to one worker (per-key FIFO).
+    // Route all updates for a given base item to one worker.
     // The base key is immutable over an item's lifetime; `new_item` carries it
     // for puts/updates, `old_item` for deletes.
     let worker_partition = match new_item.or(old_item) {
@@ -276,13 +375,16 @@ async fn worker(worker_id: u64, q: Arc<GsiQueue>) {
 
     tracing::debug!("GSI worker {worker_id} started");
 
+    let mut parked = Parked::default();
     loop {
-        match process_batch(worker_id, &q).await {
+        match process_batch(worker_id, &q, &mut parked).await {
             Ok(0) => {
                 // Nothing ready in this partition. Sleep until the earliest
                 // not-yet-due row becomes eligible (honoring the propagation
-                // delay to the millisecond) or until a write wakes us.
-                let wait = next_ready_wait(&q.data_pool, worker_id)
+                // delay to the millisecond) or until a write wakes us. Parked
+                // rows are left out, or a partition whose only due row is held
+                // would spin on one millisecond waits until the park expires.
+                let wait = next_ready_wait(&q.data_pool, worker_id, &parked.ids())
                     .await
                     .unwrap_or(MAX_IDLE)
                     .min(MAX_IDLE);
@@ -301,7 +403,11 @@ async fn worker(worker_id: u64, q: Arc<GsiQueue>) {
 /// eligible. `None` when the partition has no pending rows (caller waits its
 /// backstop interval). A row already due maps to a near-zero wait so the loop
 /// re-claims promptly.
-async fn next_ready_wait(pool: &PgPool, worker_id: u64) -> Option<std::time::Duration> {
+async fn next_ready_wait(
+    pool: &PgPool,
+    worker_id: u64,
+    parked: &[i64],
+) -> Option<std::time::Duration> {
     // The ::float8 cast is load-bearing. Since PostgreSQL 14, EXTRACT returns
     // `numeric`, which sqlx refuses to decode into f64. Without the cast this
     // query fails on every partition that has a pending row, and the error was
@@ -318,10 +424,11 @@ async fn next_ready_wait(pool: &PgPool, worker_id: u64) -> Option<std::time::Dur
     // through to the idle backstop, and the hold's release wakes the worker anyway.
     let secs: Option<f64> = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM (MIN(ready_at) - NOW()))::float8 FROM gsi_pending p \
-         WHERE worker_partition = $1 \
+         WHERE worker_partition = $1 AND NOT (id = ANY($2)) \
          AND NOT EXISTS (SELECT 1 FROM vector_index_holds h WHERE h.table_id = p.table_id)",
     )
     .bind(worker_id as i32)
+    .bind(parked)
     .fetch_one(pool)
     .await
     .map_err(|e| tracing::error!("GSI worker {worker_id}: next_ready_wait failed: {e}"))
@@ -340,20 +447,29 @@ async fn next_ready_wait(pool: &PgPool, worker_id: u64) -> Option<std::time::Dur
 /// Returns the number applied.
 ///
 /// Each row is claimed, applied, and deleted inside a **single transaction**:
-///   1. `SELECT ... WHERE worker_partition = $1 AND ready_at <= NOW() ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
+///   1. `SELECT ... WHERE worker_partition = $1 AND ready_at <= NOW() AND NOT (id = ANY($2)) ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`
+///      (`$2` being the rows passed over, see `PARK_FOR`)
 ///   2. apply the snapshotted index updates (savepoint-guarded per index)
 ///   3. `DELETE` the claimed row
 ///   4. `COMMIT`
 ///
 /// A crash or error before the `COMMIT` rolls all of it back — the row stays in
 /// `gsi_pending` and is retried. Each worker owns one partition and processes it
-/// in `id` order, so updates to a given base item apply in order (per-key FIFO);
-/// distinct partitions run concurrently. Only rows whose `ready_at` has elapsed
+/// in `id` order, except that a secondary index row for an item whose base row
+/// is held is passed over for a while (`PARK_FOR`), so a later row can apply
+/// before it. For those rows the order does not matter: the apply writes the
+/// item's state at apply time, whatever the row carried. Distinct partitions run
+/// concurrently. Only rows whose `ready_at` has elapsed
 /// are eligible; the propagation delay is enforced by that timestamp.
-async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageError> {
+async fn process_batch(
+    worker_id: u64,
+    q: &GsiQueue,
+    parked: &mut Parked,
+) -> Result<usize, StorageError> {
     let mut processed = 0usize;
 
     for _ in 0..BATCH_SIZE {
+        let skip = parked.ids();
         let mut tx = q
             .data_pool
             .begin()
@@ -370,7 +486,7 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
         // the workers.
         let row: Option<ClaimedRow> = sqlx::query_as(
             "SELECT id, table_id, old_item, new_item, index_context FROM gsi_pending \
-             WHERE worker_partition = $1 AND ready_at <= NOW() \
+             WHERE worker_partition = $1 AND ready_at <= NOW() AND NOT (id = ANY($2)) \
              AND NOT EXISTS ( \
                  SELECT 1 FROM vector_index_holds h WHERE h.table_id = gsi_pending.table_id \
              ) \
@@ -379,6 +495,7 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
              FOR UPDATE SKIP LOCKED",
         )
         .bind(worker_id as i32)
+        .bind(&skip)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -389,10 +506,61 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
             break;
         };
 
-        apply_claimed_row(
-            worker_id, &mut tx, id, &table_id, old_json, new_json, ctx_json,
+        let (old_item, new_item, context) = decode_row(old_json, new_json, ctx_json)?;
+
+        // Secondary index rows take a bounded wait on the base row and are
+        // passed over by item when it runs out; see `ROW_LOCK_TIMEOUT` and
+        // `PARK_FOR`. Vector rows wait, as they always have.
+        let mut held = None;
+        if let PendingApplyContext::Gsi(c) = &context {
+            if let Some(key_item) = new_item.as_ref().or(old_item.as_ref()) {
+                let item = held_item(&table_id, key_item, &c.base_key_schema);
+                if let Some(until) = parked.item_until(&item) {
+                    // A row for an item already parked: give it back without
+                    // waiting on the lock.
+                    let _ = tx.rollback().await;
+                    parked.park_row(id, until);
+                    continue;
+                }
+                held = Some(item);
+            }
+            // Local to this transaction, so the claim itself (SKIP LOCKED,
+            // never waits) is unaffected.
+            sqlx::query(&format!("SET LOCAL lock_timeout = '{ROW_LOCK_TIMEOUT}'"))
+                .execute(&mut *tx)
+                .await
+                .map_err(crate::data::index::db_error)?;
+        }
+
+        match apply_claimed_row(
+            worker_id,
+            &mut tx,
+            id,
+            &table_id,
+            old_item.as_ref(),
+            new_item.as_ref(),
+            &context,
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(e) if held.is_some() && is_lock_timeout(&e) => {
+                // A writer is holding the base row. Give the claim back and pass
+                // the item over for a while, so the rows behind it are not held
+                // up for the whole hold; see `PARK_FOR`. Only a secondary index
+                // row set the timeout; a vector row that meets one (a server-wide
+                // `lock_timeout`) is an error like any other and is retried.
+                let _ = tx.rollback().await;
+                tracing::debug!(
+                    "GSI worker {worker_id}: base row held by a writer, passing over id={id}"
+                );
+                if let Some(item) = held {
+                    parked.park(id, item);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
 
         sqlx::query("DELETE FROM gsi_pending WHERE id = $1")
             .bind(id)
@@ -410,22 +578,12 @@ async fn process_batch(worker_id: u64, q: &GsiQueue) -> Result<usize, StorageErr
     Ok(processed)
 }
 
-/// Apply the GSI update for one claimed row, within the caller's transaction.
-///
-/// The row's single target index is applied under a `SAVEPOINT`: if the index
-/// table has been dropped (table deleted; SQLSTATE 42P01) the index is skipped
-/// and the row is still consumed. Any other error propagates, rolling back the
-/// whole transaction so the row is retried.
-#[allow(clippy::too_many_arguments)]
-async fn apply_claimed_row(
-    worker_id: u64,
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: i64,
-    table_id: &str,
+/// Decode a claimed row's images and apply context.
+fn decode_row(
     old_json: Option<serde_json::Value>,
     new_json: Option<serde_json::Value>,
     ctx_json: serde_json::Value,
-) -> Result<(), StorageError> {
+) -> Result<(Option<Item>, Option<Item>, PendingApplyContext), StorageError> {
     let old_item: Option<Item> = old_json
         .map(serde_json::from_value)
         .transpose()
@@ -436,7 +594,24 @@ async fn apply_claimed_row(
         .map_err(|e| StorageError::Internal(e.to_string()))?;
     let context: PendingApplyContext =
         serde_json::from_value(ctx_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok((old_item, new_item, context))
+}
 
+/// Apply the GSI update for one claimed row, within the caller's transaction.
+///
+/// The row's single target index is applied under a `SAVEPOINT`: if the index
+/// table has been dropped (table deleted; SQLSTATE 42P01) the index is skipped
+/// and the row is still consumed. Any other error propagates, rolling back the
+/// whole transaction so the row is retried.
+async fn apply_claimed_row(
+    worker_id: u64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+    table_id: &str,
+    old_item: Option<&Item>,
+    new_item: Option<&Item>,
+    context: &PendingApplyContext,
+) -> Result<(), StorageError> {
     // One index per row. Guard the apply with a savepoint so a dropped-index
     // race (42P01) can be recovered and the row still consumed; aborting the
     // subtransaction otherwise poisons the outer transaction and blocks the
@@ -446,26 +621,21 @@ async fn apply_claimed_row(
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-    let applied = match &context {
+    let applied = match context {
         PendingApplyContext::Gsi(c) => {
             apply_index(
                 tx,
+                table_id,
                 &c.index,
-                old_item.as_ref(),
-                new_item.as_ref(),
+                old_item,
+                new_item,
                 &c.base_key_schema,
                 &c.attribute_definitions,
             )
             .await
         }
         PendingApplyContext::Vector(c) => {
-            crate::data::vector_index::apply_claimed_vector_row(
-                tx,
-                c,
-                old_item.as_ref(),
-                new_item.as_ref(),
-            )
-            .await
+            crate::data::vector_index::apply_claimed_vector_row(tx, c, old_item, new_item).await
         }
     };
 
@@ -499,39 +669,22 @@ async fn apply_claimed_row(
 /// Apply a single index's delete-old / insert-new within the transaction.
 async fn apply_index(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: &str,
     idx: &GsiIndexDef,
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), StorageError> {
-    let idx_table = index_table_name(&idx.index_id);
-    let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
-    let base_sks = all_sort_key_info(base_key_schema, attr_defs);
-
-    if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema)
-    {
-        delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks).await?;
-    }
-
-    if let Some(new) = new_item
-        && item_has_index_keys(new, &idx.key_schema)
-    {
-        let projected =
-            project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
-        insert_index_row_multi(
-            tx,
-            &idx_table,
-            new,
-            &projected,
-            &idx.key_schema,
-            base_key_schema,
-            &idx_sks,
-            &base_sks,
-        )
-        .await?;
-    }
-
-    Ok(())
+    // The row says which item changed; what goes into the index is the item's
+    // state now, read under its row lock. Applying the image the row carried
+    // instead is only right if this row is the last word on the item, and three
+    // things break that: an online backfill that already wrote a newer state,
+    // a write that predated the index and told it nothing, and a second server
+    // process whose worker claims a later row for the same item first.
+    let Some(key_item) = new_item.or(old_item) else {
+        return Ok(());
+    };
+    crate::data::gsi_build::resync_base_key(tx, table_id, idx, base_key_schema, attr_defs, key_item)
+        .await
 }

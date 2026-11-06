@@ -108,10 +108,14 @@ impl OperationsEngine for MongoOperationsEngine {
         Ok(())
     }
 
-    fn catalog_version(&self) -> String {
-        // Mongo catalog version — matches the constant enforced by
-        // MongoBootstrapper::expected_catalog_version.
-        "0.0.2".to_owned()
+    fn setting_default(&self, key: &str) -> Option<String> {
+        // The engine reads no index propagation delay.
+        match key {
+            "control_plane_delay_seconds" => {
+                Some(crate::worker_store::DEFAULT_CONTROL_PLANE_DELAY_SECONDS.to_string())
+            }
+            _ => None,
+        }
     }
 
     fn is_sensitive_key(&self, key: &str) -> bool {

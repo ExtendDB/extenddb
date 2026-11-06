@@ -11,7 +11,7 @@ use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
 use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
-    IndexType, KeyType, ProjectionType, QueryInput, QueryOutput, Select, TableKeyInfo,
+    IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
 };
 use extenddb_storage::error::StorageError;
@@ -22,11 +22,15 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_query_exclusive_start_key,
+    validate_query_select_index_support,
 };
 use crate::legacy_filter::{desugar_filter, desugar_key_conditions};
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::{
+    QueryReadShape, page_ends_at_far_end, validate_query_exclusive_start_key,
+    validate_query_start_key_bounds,
+};
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Query` request.
@@ -109,13 +113,9 @@ pub async fn handle_query(
     }
 
     // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    if let Some(ref idx) = index_info {
-        extenddb_core::validation::validate_all_attributes_index_support(
-            input.select,
-            idx.index_type == IndexType::Gsi,
-            idx.projection.projection_type == ProjectionType::All,
-            &idx.index_name,
-        )?;
+    // With an ExclusiveStartKey this runs after the start key checks below.
+    if input.exclusive_start_key.is_none() {
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Limit >= 1 is checked at request time in validate_query_request_body.
@@ -219,50 +219,74 @@ pub async fn handle_query(
         &maps
     };
 
-    // Correct PK/SK assignment when both clauses are equality comparisons.
-    // The parser can't distinguish PK from SK without the key schema.
     let pk_attr = &query_key_info.key_schema[0].attribute_name;
-    key_condition.resolve_pk_sk(pk_attr, &effective_maps.names)?;
-
-    // Validate that the partition key is actually referenced in the condition.
-    let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-    if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Query condition missed key schema element: {pk_attr}"
-        )));
-    }
-
-    // For multi-part key schemas (GSIs with >1 HASH attribute), reclassify
-    // the parsed conditions so all HASH attributes go to pk_path/extra_pk_conditions
-    // and the RANGE condition stays as sk_condition.
-    if extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema) {
-        let hash_elements = extenddb_core::types::hash_key_elements(&query_key_info.key_schema);
-        let hash_attrs: Vec<&str> = hash_elements
-            .iter()
-            .map(|ks| ks.attribute_name.as_str())
-            .collect();
-        key_condition.resolve_multipart(&hash_attrs, &effective_maps.names)?;
-
-        // Validate all HASH attributes are present in the KeyConditionExpression.
-        let provided_count = 1 + key_condition.extra_pk_conditions.len();
-        if provided_count != hash_attrs.len() {
-            // Find the first missing HASH attribute for the error message.
-            let missing = hash_attrs
+    // Assign every clause to its key attribute through the classification
+    // authorization also uses to find dynamodb:LeadingKeys, so both read the
+    // same clause as the partition key. On a multi-attribute key schema (several
+    // HASH or several RANGE attributes) every clause is assigned by name, every
+    // HASH attribute needs an equality and the RANGE conditions must cover a
+    // leading run of the RANGE attributes with equalities before the last one.
+    // On a multi-attribute key schema the service reports a wrong-typed value
+    // after those structural rules and before the non-key rule, so the
+    // classifier runs the type check there.
+    //
+    // On a multi-attribute key schema the classifier refuses a clause on an
+    // attribute outside the key schema (`Query condition missed key schema
+    // element`), so the type check reads only the queried key schema's
+    // definitions there. For an index query the table's list also holds the
+    // base table's key and the other indexes' key attributes. Measured
+    // 2026-10-30 on a GSI with HASH `GSI2PK` and RANGE `GSI2SK`: `GSI2PK = :h
+    // AND PK = :k` answers `Query condition missed key schema element: GSI2SK`
+    // whether `:k` has the table's type for `PK` or not, so the service's type
+    // check does not see an attribute outside the queried key schema.
+    //
+    // On a single-attribute key schema the service reports a wrong-typed value
+    // after the missing-key, filter, projection, unused-value and Select
+    // checks (measured 2026-11-06). The classifier does not run the type check
+    // there, and `validate_key_condition_types` reports the value below. `pk =
+    // :n` on an S key with a second clause on a non-key attribute reports the
+    // type, not a missing key schema element (measured 2026-10-21). This path
+    // has no non-key rule, so that query also reaches the check below.
+    // Legacy `KeyConditions` do not go through the check below, so the
+    // classifier still checks their values, against the table's definitions.
+    let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
+    let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
+        .attribute_definitions
+        .iter()
+        .filter(|def| {
+            query_key_info
+                .key_schema
                 .iter()
-                .find(|attr| {
-                    let pk_name =
-                        resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
-                    if pk_name.as_deref() == Some(*attr) {
-                        return false;
-                    }
-                    !key_condition.extra_pk_conditions.iter().any(|(path, _)| {
-                        resolve_path_attr_name(path, &effective_maps.names).as_deref()
-                            == Some(*attr)
-                    })
-                })
-                .unwrap_or(&hash_attrs[0]);
+                .any(|ks| ks.attribute_name == def.attribute_name)
+        })
+        .cloned()
+        .collect();
+    let type_definitions = if multipart {
+        &key_schema_definitions
+    } else {
+        &query_key_info.attribute_definitions
+    };
+    let check_types_here = multipart || legacy_kc_maps.is_some();
+    key_condition.resolve_key_schema_with(
+        &query_key_info.key_schema,
+        &effective_maps.names,
+        |path, value| {
+            if check_types_here {
+                check_key_value_type(path, value, type_definitions, effective_maps)
+            } else {
+                Ok(())
+            }
+        },
+    )?;
+    refuse_begins_with_on_number(&key_condition, effective_maps)?;
+    // On a single-attribute key schema, validate that the partition key is
+    // actually referenced in the condition. The classifier has already required
+    // an equality on every HASH attribute of a multi-attribute one.
+    if !multipart {
+        let pk_resolved = resolve_path_attr_name(&key_condition.pk_path, &effective_maps.names);
+        if pk_resolved.as_deref() != Some(pk_attr.as_str()) {
             return Err(DynamoDbError::ValidationException(format!(
-                "Query condition missed key schema element: {missing}"
+                "Query condition missed key schema element: {pk_attr}"
             )));
         }
     }
@@ -436,6 +460,17 @@ pub async fn handle_query(
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
+        validate_query_start_key_bounds(
+            start_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )?;
+        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
@@ -471,7 +506,23 @@ pub async fn handle_query(
         },
     )
     .await?;
-    let result = page.post;
+    let mut result = page.post;
+    // A page that ends at the far end of the sort key range carries no key;
+    // the start key check would refuse it.
+    if let Some(ref last_key) = result.last_evaluated_key
+        && page_ends_at_far_end(
+            last_key,
+            &key_condition,
+            effective_maps,
+            QueryReadShape {
+                key_schema: &query_key_info.key_schema,
+                on_index: index_info.is_some(),
+                forward: input.scan_index_forward,
+            },
+        )
+    {
+        result.last_evaluated_key = None;
+    }
 
     // Capacity metering: RCU based on the pre-projection size of the evaluated items.
     let pre_projection_bytes = page.evaluated_bytes;
@@ -534,6 +585,90 @@ fn resolve_path_attr_name(
         }
         _ => None,
     }
+}
+
+/// Refuse a key condition value whose type differs from the attribute
+/// definition of the attribute it names.
+///
+/// Measured on the service 2026-10-21: an S key compared with an N value,
+/// an N sort key compared with an S value in `=`, `>`, `begins_with` or a
+/// BETWEEN bound, and the same on an index, all answer
+/// `One or more parameter values were invalid: Condition parameter type does
+/// not match schema type`, on single-attribute and multi-attribute key
+/// schemas alike. A clause on an attribute without a definition in
+/// `attribute_definitions` is not checked here. On a multi-attribute key
+/// schema the caller passes the queried key schema's definitions only, and the
+/// classifier reports a clause on any other attribute.
+fn check_key_value_type(
+    path: &[PathElement],
+    expr: &extenddb_core::expression::Expr,
+    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use extenddb_core::expression::Expr;
+    use extenddb_core::types::{AttributeValue, ScalarAttributeType};
+
+    let Some(attr) = resolve_path_attr_name(path, &maps.names) else {
+        return Ok(());
+    };
+    let Some(def) = attribute_definitions
+        .iter()
+        .find(|d| d.attribute_name == attr)
+    else {
+        return Ok(());
+    };
+    let Expr::Placeholder(name) = expr else {
+        return Ok(());
+    };
+    let Some(value) = maps.values.get(name) else {
+        return Ok(());
+    };
+    let matches = matches!(
+        (def.attribute_type, value),
+        (ScalarAttributeType::S, AttributeValue::S(_))
+            | (ScalarAttributeType::N, AttributeValue::N(_))
+            | (ScalarAttributeType::B, AttributeValue::B(_))
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(DynamoDbError::ValidationException(
+            "One or more parameter values were invalid: Condition parameter type does not match \
+             schema type"
+                .to_owned(),
+        ))
+    }
+}
+
+/// Refuse a `begins_with` key condition whose value is not an S or a B, with
+/// the value's type in the text: `Invalid KeyConditionExpression: Incorrect
+/// operand type for operator or function; operator or function: begins_with,
+/// operand type: N`.
+///
+/// Measured on the service 2026-11-06: the value's type decides the refusal,
+/// not the sort key's type. An N or a BOOL value is refused on an S, an N and
+/// a B sort key alike. An S or a B value on a sort key of another type gets
+/// the type mismatch from the type check instead. The refusal comes before the
+/// unused-value, projection overlap and Select checks and before a wrong-typed
+/// partition key value. A placeholder that has no value passes here, and the
+/// existing checks report it.
+fn refuse_begins_with_on_number(
+    key_condition: &extenddb_core::expression::KeyCondition,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use extenddb_core::expression::{Expr, SortKeyCondition};
+
+    let Some(SortKeyCondition::BeginsWith { path, prefix }) = &key_condition.sk_condition else {
+        return Ok(());
+    };
+    // The operand check of the filter, applied to the key condition's call.
+    let call = Expr::Function {
+        name: "begins_with".to_owned(),
+        args: vec![Expr::Path(path.clone()), prefix.clone()],
+    };
+    extenddb_core::expression::validate_begins_with_operands(&call, maps).map_err(|e| {
+        crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
+    })
 }
 
 /// Validate that all `#name` references in an expression AST are defined.
@@ -637,3 +772,7 @@ mod empty_key_condition_tests {
         assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "query_begins_with_tests.rs"]
+mod begins_with_tests;

@@ -50,6 +50,26 @@ pub(crate) struct IndexMeta {
     /// Per-GSI propagation delay in milliseconds. `None` means use system
     /// default. `Some(0)` means synchronous.
     pub(super) propagation_delay_ms: Option<i32>,
+    /// The table's attribute definitions, read in the same statement as the index
+    /// rows rather than taken from the cached `TableKeyInfo`.
+    ///
+    /// An UpdateTable that adds a GSI also adds the definitions of its key
+    /// attributes, and the engine drops its cached key info only when the
+    /// UpdateTable returns, which is after the backfill. A write in between that
+    /// used the cached set would build this index's row without the columns of a
+    /// sort key it does not know the type of, and would skip the type check on
+    /// the new key attributes.
+    pub(super) attribute_definitions: Vec<AttributeDefinition>,
+}
+
+/// The table's attribute definitions as of the write's catalog read, falling back
+/// to the cached set when the table has no secondary index to have carried them.
+/// See [`IndexMeta::attribute_definitions`].
+pub(crate) fn fresh_attr_defs<'a>(
+    indexes: &'a [IndexMeta],
+    cached: &'a [AttributeDefinition],
+) -> &'a [AttributeDefinition] {
+    indexes.first().map_or(cached, |i| &i.attribute_definitions)
 }
 
 /// Both index families a write has to maintain, read in one catalog visit.
@@ -58,6 +78,11 @@ pub(crate) struct IndexMeta {
 /// pool, because every write takes this path and most tables have no vector index
 /// at all. Also the single place the two reads are ordered together, so the six
 /// write sites cannot end up disagreeing about which membership they saw.
+///
+/// Also returns the moment of the read, for `gsi_build::fix_up_stale_write`.
+/// Taken after the connection is acquired, not before: time spent waiting for the
+/// catalog pool is time before the read's snapshot, and counting it would send
+/// every write under a saturated pool back to that same pool for a second read.
 pub(crate) async fn fetch_write_path_indexes(
     table_id: &str,
     pool: &sqlx::PgPool,
@@ -65,6 +90,7 @@ pub(crate) async fn fetch_write_path_indexes(
     (
         Vec<IndexMeta>,
         Vec<(extenddb_storage::vector_lifecycle::VectorIndexMeta, String)>,
+        super::gsi_build::WriteStamp,
     ),
     StorageError,
 > {
@@ -72,10 +98,13 @@ pub(crate) async fn fetch_write_path_indexes(
         .acquire()
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
+    let stamp = super::gsi_build::WriteStamp::now();
     let indexes = fetch_indexes_for_table(table_id, &mut *conn).await?;
     let vector_metas =
         crate::data::vector_index::fetch_vector_indexes_for_table(&mut *conn, table_id).await?;
-    Ok((indexes, vector_metas))
+    drop(conn);
+    super::gsi_build::pause_after_index_read().await;
+    Ok((indexes, vector_metas, stamp))
 }
 
 /// Fetch all index metadata for a table from the catalog.
@@ -86,16 +115,34 @@ pub(crate) async fn fetch_indexes_for_table<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let rows: Vec<(String, String, String, serde_json::Value, serde_json::Value, Option<i32>)> = sqlx::query_as(
-        "SELECT index_id, index_name, index_type, key_schema, projection, propagation_delay_ms FROM indexes WHERE table_id = $1",
+    type Row = (
+        String,
+        String,
+        String,
+        serde_json::Value,
+        serde_json::Value,
+        Option<i32>,
+        serde_json::Value,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT i.index_id, i.index_name, i.index_type, i.key_schema, i.projection, \
+                i.propagation_delay_ms, t.attribute_definitions \
+         FROM indexes i JOIN tables t ON t.table_id = i.table_id \
+         WHERE i.table_id = $1",
     )
     .bind(table_id)
     .fetch_all(executor)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+    // Every row carries the same table definitions; parse them once.
+    let attribute_definitions: Vec<AttributeDefinition> = match rows.first() {
+        Some(row) => serde_json::from_value(row.6.clone())
+            .map_err(|e| StorageError::Internal(e.to_string()))?,
+        None => Vec::new(),
+    };
     rows.into_iter()
-        .map(|(id, index_name, idx_type, ks_json, proj_json, delay)| {
+        .map(|(id, index_name, idx_type, ks_json, proj_json, delay, _)| {
             let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
             let projection: Projection = serde_json::from_value(proj_json)
@@ -107,6 +154,7 @@ where
                 key_schema,
                 projection,
                 propagation_delay_ms: delay,
+                attribute_definitions: attribute_definitions.clone(),
             })
         })
         .collect()
@@ -182,31 +230,27 @@ pub(super) fn effective_delay(idx: &IndexMeta, system_default: u64) -> u64 {
 pub(crate) async fn sync_indexes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     base_key_schema: &[KeySchemaElement],
-    attr_defs: &[AttributeDefinition],
     indexes: &[IndexMeta],
     old_item: Option<&Item>,
     new_item: Option<&Item>,
     system_default_delay: u64,
 ) -> Result<(), StorageError> {
-    for idx in indexes {
-        if idx.index_type != "LSI" && effective_delay(idx, system_default_delay) != 0 {
-            continue; // Async — handled after commit. LSIs are always synchronous.
-        }
+    // LSIs first. An LSI exists from CreateTable, so no write ever missed one
+    // and none can vanish under a write: the old image says exactly which row to
+    // remove, and no savepoint is needed.
+    for idx in indexes.iter().filter(|idx| idx.index_type == "LSI") {
+        let attr_defs = &idx.attribute_definitions;
         let idx_table = index_table_name(&idx.index_id);
-        let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
         let base_sks = all_sort_key_info(base_key_schema, attr_defs);
-
-        // Delete old index row if the old item had index keys
         if let Some(old) = old_item
             && item_has_index_keys(old, &idx.key_schema)
         {
             delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks).await?;
         }
-
-        // Insert new index row if the new item has index keys
         if let Some(new) = new_item
-            && item_has_index_keys(new, &idx.key_schema)
+            && super::gsi_build::indexable(new, &idx.key_schema, attr_defs)
         {
+            let idx_sks = all_sort_key_info(&idx.key_schema, attr_defs);
             let projected =
                 project_item_for_index(new, &idx.key_schema, base_key_schema, &idx.projection);
             insert_index_row_multi(
@@ -222,7 +266,94 @@ pub(crate) async fn sync_indexes(
             .await?;
         }
     }
-    Ok(())
+
+    let sync_gsis: Vec<&IndexMeta> = indexes
+        .iter()
+        .filter(|idx| idx.index_type != "LSI" && effective_delay(idx, system_default_delay) == 0)
+        .collect();
+    if sync_gsis.is_empty() {
+        return Ok(());
+    }
+
+    // A GSI is written the way the online backfill and the queue write it: the
+    // item's current state, replacing whatever rows the base key had. A write
+    // that read the catalog before the index existed can leave a row under an
+    // item it deleted or whose key it removed, and a later write that finds no
+    // old image, or one without the key, would otherwise insert next to it.
+    //
+    // Under a savepoint, because an index may be gone by the time this runs
+    // (deleted, or a failed build removed it) and that is the index's problem,
+    // not this write's; the queue tolerates the same race. One savepoint for all
+    // of the write's GSIs rather than one each, which saves two round trips per
+    // index past the first. The price is paid only on the rare path: rolling back
+    // to it undoes every GSI written in that pass, so the pass runs again without
+    // the index that is gone. Each GSI's work is state-based, so redoing it gives
+    // the same rows.
+    let mut gone: Vec<&str> = Vec::new();
+    loop {
+        sqlx::query("SAVEPOINT gsi_sync_apply")
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error)?;
+        let mut failed: Option<(&str, StorageError)> = None;
+        for idx in sync_gsis
+            .iter()
+            .filter(|idx| !gone.contains(&idx.index_id.as_str()))
+        {
+            let attr_defs = &idx.attribute_definitions;
+            let idx_table = index_table_name(&idx.index_id);
+            let base_sks = all_sort_key_info(base_key_schema, attr_defs);
+            let applied = match new_item {
+                Some(new) => super::gsi_build::write_state(
+                    tx,
+                    &idx_table,
+                    &idx.key_schema,
+                    &idx.projection,
+                    base_key_schema,
+                    attr_defs,
+                    &base_sks,
+                    new,
+                )
+                .await
+                .map(|_| ()),
+                None => match old_item {
+                    Some(old) => {
+                        delete_index_row_multi(tx, &idx_table, old, base_key_schema, &base_sks)
+                            .await
+                    }
+                    None => Ok(()),
+                },
+            };
+            if let Err(e) = applied {
+                failed = Some((idx.index_id.as_str(), e));
+                break;
+            }
+        }
+        match failed {
+            None => {
+                // Released rather than left open: PostgreSQL keeps every savepoint
+                // of a transaction until commit, and TransactWriteItems runs this
+                // for each of its items.
+                sqlx::query("RELEASE SAVEPOINT gsi_sync_apply")
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(db_error)?;
+                return Ok(());
+            }
+            Some((index_id, e)) if crate::gsi_queue::is_undefined_table(&e) => {
+                sqlx::query("ROLLBACK TO SAVEPOINT gsi_sync_apply")
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(db_error)?;
+                tracing::debug!(
+                    index_id,
+                    "GSI data table gone during a synchronous write, skipping"
+                );
+                gone.push(index_id);
+            }
+            Some((_, e)) => return Err(e),
+        }
+    }
 }
 
 /// Enqueue async GSI propagation for a write, **one `gsi_pending` row per
@@ -258,7 +389,7 @@ pub(crate) async fn enqueue_async_indexes(
         }
         let context = GsiApplyContext {
             base_key_schema: key_info.key_schema.clone(),
-            attribute_definitions: key_info.attribute_definitions.clone(),
+            attribute_definitions: idx.attribute_definitions.clone(),
             index: GsiIndexDef {
                 index_id: idx.index_id.clone(),
                 key_schema: idx.key_schema.clone(),
@@ -360,7 +491,7 @@ pub(crate) async fn insert_index_row_multi(
     .await
 }
 
-/// Insert rows into one index table in a single multi-row INSERT.
+/// Write rows into one index table in a single multi-row upsert.
 ///
 /// Each row is `(item, projected)`: the item supplies the index and base key
 /// columns, the projection is stored as `item_data`. The one implementation
@@ -404,10 +535,30 @@ pub(crate) async fn insert_index_rows_multi(
             format!("({})", ps.join(", "))
         })
         .collect();
+    // An upsert on the table's primary key, (pk, base_pk, base sort keys). The
+    // online backfill and a write can both reach the same index row; each holds
+    // the base row lock while it writes, so both carry the same values and the
+    // later one may simply win. A restore copies into a table nothing else
+    // writes, so for it this is a plain insert.
+    let mut conflict_cols = vec!["pk".to_owned(), "base_pk".to_owned()];
+    for (i, &(_, sk_type)) in base_sks.iter().enumerate() {
+        conflict_cols.push(if i == 0 {
+            format!("base_{}", sk_column(sk_type))
+        } else {
+            format!("base_{}", sk_column_n(i, sk_type))
+        });
+    }
+    let updates: Vec<String> = cols
+        .iter()
+        .filter(|c| !conflict_cols.contains(c))
+        .map(|c| format!("{c} = EXCLUDED.{c}"))
+        .collect();
     let sql = format!(
-        "INSERT INTO {idx_table} ({}) VALUES {}",
+        "INSERT INTO {idx_table} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}",
         cols.join(", "),
-        tuples.join(", ")
+        tuples.join(", "),
+        conflict_cols.join(", "),
+        updates.join(", ")
     );
 
     let mut query = sqlx::query(&sql);
