@@ -1,5 +1,13 @@
 # The `extenddb-dev` Image
 
+> **Local development and CI only.** The dev image serves plain HTTP, its
+> authorization is open, and by default it accepts AWS's public example
+> credential. Anyone who can reach its port can read, change and delete every
+> table. Always publish it on loopback, `-p 127.0.0.1:18080:18080`; a bare
+> `-p 18080:18080` publishes it on every network the host is on. Never run it
+> on a shared network or keep real data in it. On a shared host or CI runner,
+> also [remove the example credential](#a-shared-host-or-ci-runner).
+
 `extenddb/extenddb-dev` is a single-container, DynamoDB-compatible endpoint over
 SQLite, built for local development and CI. There is no external database, no
 init step, and no certificate to trust:
@@ -27,14 +35,16 @@ zero-friction local use:
 - **Plain HTTP.** No TLS, so SDKs need no custom trust store.
 - **A seeded, well-known credential.** The server seeds AWS's documented
   example key pair (`AKIAIOSFODNN7EXAMPLE` /
-  `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) on every startup and prints it
+  `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) on every startup by default and
+  prints it
   in the logs; sign requests with it. It is recognised by secret scanners as
   an example credential, so committing it in test fixtures is safe. To seed
   one additional key pair, pass `EXTENDDB_DEV_ACCESS_KEY_ID` and
   `EXTENDDB_DEV_SECRET_ACCESS_KEY` to the container (the key id must start
   with `AKIA`; its secret is never printed). The example pair keeps working
   alongside it, so tools that hardcode it (NoSQL Workbench, the launchers)
-  are unaffected by the override. The standard `AWS_*` variables are ignored
+  are unaffected by the override, unless you remove the example pair (see
+  below). The standard `AWS_*` variables are ignored
   by the server, so real or SSO credentials in the environment are never
   copied into the dev catalog; a startup notice calls out an
   `AWS_ACCESS_KEY_ID` that would not verify. Authorization is open: whoever
@@ -45,7 +55,39 @@ image binds `0.0.0.0` **inside** the container (required for port publishing to
 work at all; this is what `EXTENDDB_DEV_ALLOW_ANY_BIND=1` in the image enables),
 and containment moves to the publish flag: always bind the host side to
 loopback, `-p 127.0.0.1:18080:18080`, as every example here does. Do not
-publish this port on a shared or routable interface.
+publish this port on a shared or routable interface. The server cannot see the
+host's port mapping, so whenever it binds a non-loopback address, as it does in
+the image, it prints a warning block at startup with the loopback publish
+command.
+
+### A shared host or CI runner
+
+Where other people or machines can reach the host (a shared build machine, a
+CI runner with a routable address), remove the public example credential and
+use your own:
+
+```bash
+docker run -d -p 127.0.0.1:18080:18080 \
+  -e EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1 \
+  -e EXTENDDB_DEV_ACCESS_KEY_ID=AKIA<your key id> \
+  -e EXTENDDB_DEV_SECRET_ACCESS_KEY=<your secret> \
+  extenddb/extenddb-dev
+```
+
+With `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` (or `true`), the
+`EXTENDDB_DEV_*` pair is the only credential the server accepts:
+
+- The server refuses to start unless both `EXTENDDB_DEV_*` variables are set,
+  so it never runs with no credential, and it refuses a value other than `1`,
+  `true`, `0` or `false`, so a typo does not leave the example pair active.
+- On a file-backed database, an example key stored by an earlier start is
+  removed, so it stops working. Unset the variable to bring it back on the
+  next start.
+- Tools that hardcode the example pair (NoSQL Workbench, the launchers) must
+  be pointed at your credential instead.
+
+This narrows who can sign requests; it does not add TLS or permissions. Keep
+the loopback publish.
 
 ## Storage modes
 
