@@ -1,0 +1,51 @@
+name: Actions pinned
+# Fails when a workflow or composite action under .github uses an action from
+# another repository by a tag, a branch or anything other than a full
+# 40-character commit SHA. By convention the version goes in a trailing
+# comment. Local actions (./...) and docker:// images are not checked.
+#
+# The check reads `uses:` lines with grep. It does not see a step written in
+# YAML flow style ({uses: ...}), a value on the line after `uses:`, a space
+# before the colon, or a quoted key. It lists a YAML alias (`uses: *name`) and
+# a `uses:` line inside a run script as unpinned.
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+# Same grouping as fmt.yml: a new push to a pull request supersedes its
+# in-flight run, and every other run gets a group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pinned:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check that every action reference is a commit SHA
+        run: |
+          set -euo pipefail
+          # Both exclusions match from the `uses:` key after grep's path:line:
+          # prefix, so text in a trailing comment cannot satisfy them. A value
+          # may be quoted.
+          key="^[^:]+:[0-9]+:[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?"
+          unpinned=$(grep -rnE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]' .github \
+              --include='*.yml' --include='*.yaml' \
+            | grep -vE "${key}(\./|docker://)" \
+            | grep -vE "${key}[^[:space:]@\"']+@[0-9a-f]{40}[\"']?([[:space:]]|\$)" || true)
+          if [ -n "$unpinned" ]; then
+            echo "These action references are not pinned to a full commit SHA:"
+            echo "$unpinned"
+            exit 1
+          fi
+          echo "Every action reference under .github is pinned to a commit SHA."
