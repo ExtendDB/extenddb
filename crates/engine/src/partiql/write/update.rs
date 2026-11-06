@@ -117,7 +117,9 @@ pub(crate) struct UpdateParts {
 ///
 /// # Errors
 ///
-/// A fault of reading back the request.
+/// The error a classic request gets for a value of the request that does
+/// not read back (see `from_wire`), or for an update expression its parser
+/// refuses. The statement checks refuse both kinds of statement first.
 pub(crate) fn update_refusal(
     limits: &LimitsConfig,
     parts: &UpdateParts,
@@ -134,7 +136,7 @@ pub(crate) fn update_refusal(
 ///
 /// # Errors
 ///
-/// A fault of reading back the request.
+/// The errors of [`update_refusal`].
 pub(crate) fn update_index_key_refusal(
     limits: &LimitsConfig,
     parts: &UpdateParts,

@@ -110,7 +110,9 @@ pub(crate) async fn build_insert_parts(
 ///
 /// # Errors
 ///
-/// A fault of reading back the item.
+/// The error a classic request gets for a value of the item that does not
+/// read back (see `from_wire`), which the statement checks refuse first, or
+/// a fault when the translated item is not a map.
 pub(crate) fn insert_refusal(
     parts: &PutParts,
     key_info: &TableKeyInfo,
