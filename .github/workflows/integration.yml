@@ -190,6 +190,9 @@ jobs:
           name: schema-postgres
           path: schema-postgres.txt
           if-no-files-found: ignore
+          # Every leg runs the schema check, so a difference fails each
+          # leg and each one uploads this name.
+          overwrite: true
 
       # PgBouncer 1.26.1 in transaction mode in front of the job's server, for
       # the lock script's pass through a connection pooler. It logs every role
@@ -323,6 +326,9 @@ jobs:
           name: schema-sqlite
           path: schema-sqlite.txt
           if-no-files-found: ignore
+          # Every leg runs the schema check, so a difference fails each
+          # leg and each one uploads this name.
+          overwrite: true
 
       - name: Start ExtendDB
         run: |
