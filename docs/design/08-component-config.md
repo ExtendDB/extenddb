@@ -49,7 +49,6 @@ Environment variables use double-underscore (`__`) as a nesting separator, prefi
 | `server.port` | `EXTENDDB__SERVER__PORT` |
 | `server.bind_addr` | `EXTENDDB__SERVER__BIND_ADDR` |
 | `storage.postgres.connection_string` | `EXTENDDB__STORAGE__POSTGRES__CONNECTION_STRING` |
-| `storage.postgres.read_replica_url` | `EXTENDDB__STORAGE__POSTGRES__READ_REPLICA_URL` |
 | `storage.sqlite.path` | `EXTENDDB__STORAGE__SQLITE__PATH` |
 | `auth.provider` | `EXTENDDB__AUTH__PROVIDER` |
 | `auth.encryption_key` | `EXTENDDB__AUTH__ENCRYPTION_KEY` |
@@ -111,10 +110,6 @@ backend = "postgres"     # "postgres" | future: "sqlite", "mysql"
 [storage.postgres]
 connection_string = "postgresql://localhost:5432/extenddb"  # Set credentials via env var in production
 pool_size = 20
-read_replica_url = ""    # Optional: PostgreSQL streaming replica for eventually consistent reads.
-                         # When set, ConsistentRead=false reads route here. When empty, all reads
-                         # use the primary (strongly consistent). Recommended for migration testing.
-read_replica_pool_size = 20  # Pool size for the read replica (defaults to pool_size if unset)
 connection_timeout_secs = 5
 statement_timeout_secs = 30
 
