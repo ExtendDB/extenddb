@@ -187,8 +187,8 @@ fn literal(value: &AttributeValue, path: &mut String) -> Result<(), String> {
     }
 }
 
-/// A number literal against the item number rules (see
-/// `number::check_literal_numbers`).
+/// A number literal against the item number rules (see the `number`
+/// module), named by its `path` inside the value.
 fn number(text: &str, path: &str) -> Result<(), String> {
     match literal_number_refusal(text, path) {
         Some(refusal) => Err(refusal),

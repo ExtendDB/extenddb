@@ -4,7 +4,9 @@
 //! Unit tests for the number rules of a statement's literals and parameters.
 
 use super::*;
+use crate::partiql::ast::Statement;
 use crate::partiql::parse;
+use crate::partiql::values::{check_condition_values, check_written_values};
 
 fn problem(text: &str) -> Option<NumberProblem> {
     check_number(text).err()
@@ -141,11 +143,24 @@ fn parameter_messages_echo_the_text_unless_empty() {
     );
 }
 
+/// The literals of a parsed statement against the rules, by the walks the
+/// server runs: the condition's literals, then the written values.
+fn walks(stmt: &Statement, sql: &str) -> Result<(), String> {
+    check_condition_values(stmt)?;
+    check_written_values(stmt, sql)
+}
+
+/// The refusal of the statement `sql`: the parser's, or else the walks'.
 fn err(sql: &str) -> String {
     match parse(sql) {
         Err(e) => e.message,
-        Ok(stmt) => check_literal_numbers(&stmt).unwrap_err().message,
+        Ok(stmt) => walks(&stmt, sql).unwrap_err(),
     }
+}
+
+/// Whether `sql` parses and its literals pass the walks.
+fn passes(sql: &str) -> bool {
+    parse(sql).is_ok_and(|stmt| walks(&stmt, sql).is_ok())
 }
 
 #[test]
@@ -218,17 +233,16 @@ fn a_literal_in_a_set_add_or_set_delete_bag_names_root() {
             "{sql}"
         );
     }
-    let stmt = parse("UPDATE \"t\" SET ns = set_add(ns, <<1, 9.9E125>>) WHERE pk = 1").unwrap();
-    assert!(check_literal_numbers(&stmt).is_ok());
+    assert!(passes(
+        "UPDATE \"t\" SET ns = set_add(ns, <<1, 9.9E125>>) WHERE pk = 1"
+    ));
 }
 
 #[test]
 fn literals_in_range_pass() {
-    let stmt = parse(
+    assert!(passes(
         "UPDATE \"t\" SET a = 9.9E125, b = [1e-130, {'c': 5}] WHERE pk = 1 AND n BETWEEN 1 AND 2",
-    )
-    .unwrap();
-    assert!(check_literal_numbers(&stmt).is_ok());
+    ));
 }
 
 #[test]
@@ -312,8 +326,7 @@ fn a_zero_with_no_minus_sign_or_written_as_an_integer_is_taken() {
         "INSERT INTO \"t\" VALUE {'pk':'a','x':-0,'y':+0.0}",
         "SELECT * FROM \"t\" WHERE pk = 'a' AND x = -0",
     ] {
-        let stmt = parse(sql).unwrap();
-        assert!(check_literal_numbers(&stmt).is_ok(), "{sql}");
+        assert!(passes(sql), "{sql}");
     }
 }
 

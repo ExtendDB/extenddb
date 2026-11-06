@@ -625,19 +625,22 @@ fn deepest_that_parse() -> Vec<String> {
 
 #[test]
 fn the_deepest_statements_that_parse_are_walked_on_a_small_stack() {
-    use crate::partiql::number::check_literal_numbers;
     use crate::partiql::operand_types::check_ordering_operands;
     use crate::partiql::plan::{
         KeyNames, WhereAnalysis, condition_key_path, keyed_condition, path_tested_against_values,
     };
-    // The checks and the plan walk a statement's tree recursively, and the
-    // parser's bounds keep each walk and the drop of the tree within half
-    // the stack of a server worker thread on a debug build (the most, 750
-    // KB, for the number check of a literal 1000 levels deep, measured
-    // 2026-11-06).
-    let statements: Vec<Statement> = deepest_that_parse()
-        .iter()
-        .map(|sql| parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}")))
+    use crate::partiql::values::{check_condition_values, check_written_values};
+    // The checks the server runs on a parsed statement and the plan walk its
+    // tree recursively, and the parser's bounds keep each walk and the drop
+    // of the tree within half the stack of a server worker thread on a debug
+    // build (the most, 870 KB, for the literal checks of the last
+    // statement's condition, a value 1000 levels deep, measured 2026-11-06).
+    let statements: Vec<(String, Statement)> = deepest_that_parse()
+        .into_iter()
+        .map(|sql| {
+            let statement = parse(&sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            (sql, statement)
+        })
         .collect();
     std::thread::Builder::new()
         .stack_size(1 << 20)
@@ -646,10 +649,11 @@ fn the_deepest_statements_that_parse_are_walked_on_a_small_stack() {
                 partition: "pk",
                 sort: Some("sk"),
             };
-            for statement in statements {
+            for (sql, statement) in statements {
                 let _ = statement.parameter_count();
-                let _ = check_literal_numbers(&statement);
+                let _ = check_condition_values(&statement);
                 let _ = check_ordering_operands(&statement, &[]);
+                let _ = check_written_values(&statement, &sql);
                 let condition = match &statement {
                     Statement::Select(select) => select.where_clause.as_ref(),
                     Statement::Update(update) => update.where_clause.as_ref(),

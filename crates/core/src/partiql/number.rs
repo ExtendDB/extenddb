@@ -31,7 +31,7 @@
 
 use crate::types::AttributeValue;
 
-use super::ast::{Operand, Statement, WhereExpr};
+use super::ast::Operand;
 use super::lexer::{Token, TokenKind};
 use super::parse_error;
 use super::parser::ParseError;
@@ -264,87 +264,20 @@ fn unconvertible_literal() -> ParseError {
     }
 }
 
-/// Check every number literal in a parsed statement against the item number
-/// rules. The message names the position inside the literal value: `root` for
-/// the value itself, `.name` for a map member and `[i]` for a list element
-/// (measured 2026-11-02 for a top-level value, a map member and a list
-/// element). Literals are visited in statement order; members of one map
-/// literal are visited in name order.
-///
-/// # Errors
-///
-/// Returns the message for the first literal that breaks a rule.
-pub fn check_literal_numbers(stmt: &Statement) -> Result<(), ParseError> {
-    match stmt {
-        Statement::Select(select) | Statement::Exists(select) => match &select.where_clause {
-            Some(where_clause) => where_literals(where_clause),
-            None => Ok(()),
-        },
-        Statement::Insert(insert) => {
-            for (_, value) in &insert.value {
-                operand_literals(value)?;
-            }
-            Ok(())
-        }
-        Statement::Update(update) => {
-            for action in &update.sets {
-                operand_literals(&action.value)?;
-            }
-            // The bag of a set_add or set_delete is a value like any other
-            // (measured 2026-11-02).
-            for action in &update.set_members {
-                operand_literals(&action.members)?;
-            }
-            match &update.where_clause {
-                Some(where_clause) => where_literals(where_clause),
-                None => Ok(()),
-            }
-        }
-        Statement::Delete(delete) => where_literals(&delete.where_clause),
-    }
-}
-
-/// The refusal [`check_literal_numbers`] gives a number literal `text` at
-/// `path` inside its value, or `None` when the number passes. The parser uses
-/// it to report such a number ahead of the operator count.
+/// The refusal of a number literal `text` at `path` inside its value (`root`
+/// for the value itself, `root.name` for a map member, `root[i]` for a list
+/// element; measured 2026-11-02 for each), or `None` when the number passes.
+/// The statement walks of `values` report it for each literal they meet, and
+/// the parser uses it to report such a number ahead of the operator count.
 pub(crate) fn literal_number_refusal(text: &str, path: &str) -> Option<String> {
     literal_number(text, path).err().map(|e| e.message)
 }
 
-/// The refusal [`check_literal_numbers`] gives the first number literal in
-/// `operand` that breaks a rule, or `None` when they all pass. The parser
-/// uses it to report a SET value's number ahead of a sign in the clause.
+/// The refusal of the first number literal in `operand` that breaks a rule,
+/// or `None` when they all pass. The parser uses it to report a SET value's
+/// number ahead of a sign in the clause.
 pub(crate) fn operand_number_refusal(operand: &Operand) -> Option<String> {
     operand_literals(operand).err().map(|e| e.message)
-}
-
-fn where_literals(expr: &WhereExpr) -> Result<(), ParseError> {
-    match expr {
-        WhereExpr::Compare(left, _, right)
-        | WhereExpr::BeginsWith(left, right)
-        | WhereExpr::Contains(left, right)
-        | WhereExpr::AttributeType(left, right) => {
-            operand_literals(left)?;
-            operand_literals(right)
-        }
-        WhereExpr::Between(value, low, high) => {
-            operand_literals(value)?;
-            operand_literals(low)?;
-            operand_literals(high)
-        }
-        WhereExpr::In(value, items) => {
-            operand_literals(value)?;
-            items.iter().try_for_each(operand_literals)
-        }
-        WhereExpr::Function(_, args) => args.iter().try_for_each(operand_literals),
-        WhereExpr::IsMissing(..) => Ok(()),
-        WhereExpr::IsType(operand, ..) => operand_literals(operand),
-        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
-            where_literals(left)?;
-            where_literals(right)
-        }
-        WhereExpr::Not(inner) | WhereExpr::ComparedWithBoolean(inner, _) => where_literals(inner),
-    }
 }
 
 fn operand_literals(operand: &Operand) -> Result<(), ParseError> {
