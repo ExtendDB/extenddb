@@ -198,7 +198,7 @@ fn multipart_hash_conditions_are_checked() {
     ]);
     let mut kc = parse("g1 = :a AND g2 = :b AND r > :c");
     let names = HashMap::new();
-    kc.resolve_multipart(&["g1", "g2"], &names)
+    kc.resolve_multipart(&["g1", "g2"], &["r"], &names)
         .expect("resolve");
     assert_eq!(kc.extra_pk_conditions.len(), 1);
     let m = maps(&[], &[("a", s("x")), ("b", s("1")), ("c", s("r"))]);
