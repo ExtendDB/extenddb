@@ -260,7 +260,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
