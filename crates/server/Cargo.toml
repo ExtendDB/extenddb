@@ -56,7 +56,8 @@ libc = { workspace = true }
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
 # The login tests count bcrypt checks with `count_verifications` against an
-# in-memory SQLite catalog.
+# in-memory SQLite catalog, and the dev-credential seeding tests run against a
+# SQLite catalog file.
 extenddb-storage = { workspace = true, features = ["test-util"] }
 extenddb-storage-sqlite = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
