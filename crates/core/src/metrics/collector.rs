@@ -9,6 +9,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::accumulator::Accumulator;
+use super::segments::SegmentStore;
 use super::types::{LatencySegments, MetricName, TimeWindow};
 
 /// Returns `None` for `AllTime` (no cutoff), or `Some(cutoff)` for bounded windows.
@@ -38,21 +39,12 @@ pub(super) struct MetricKey {
 /// metrics endpoint). Individual `record_*` calls take a write lock briefly.
 pub struct MetricsCollector {
     pub(super) data: RwLock<HashMap<MetricKey, Accumulator>>,
-    /// Per-operation latency segment breakdowns for the console deep-dive.
-    pub(super) segments: RwLock<Vec<SegmentPoint>>,
+    /// Per-operation latency segment sums for the console deep-dive, bucketed
+    /// by time so memory is bounded by the number of operations.
+    pub(super) segments: RwLock<SegmentStore>,
     /// Serializes drains, so each one takes and keeps points in record order.
     /// `record` and `prune` never take it.
     pub(super) drain_lock: Mutex<()>,
-}
-
-/// A single latency segment data point with metadata.
-#[derive(Debug, Clone)]
-pub(super) struct SegmentPoint {
-    pub(super) operation: String,
-    #[allow(dead_code)] // TODO(cleanup): used when console adds table-scoped latency breakdown
-    pub(super) table_name: Option<String>,
-    pub(super) segments: LatencySegments,
-    pub(super) timestamp: Instant,
 }
 
 impl MetricsCollector {
@@ -61,7 +53,7 @@ impl MetricsCollector {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
-            segments: RwLock::new(Vec::with_capacity(256)),
+            segments: RwLock::new(SegmentStore::new(Instant::now())),
             drain_lock: Mutex::new(()),
         }
     }
@@ -349,25 +341,27 @@ impl MetricsCollector {
     }
 
     /// Record per-segment latency breakdown for a request.
-    pub fn record_segments(
-        &self,
-        operation: &str,
-        table_name: Option<&str>,
-        segments: LatencySegments,
-    ) {
-        let point = SegmentPoint {
-            operation: operation.to_owned(),
-            table_name: table_name.map(ToOwned::to_owned),
-            segments,
-            timestamp: Instant::now(),
-        };
-        let Ok(mut vec) = self.segments.write() else {
+    ///
+    /// The breakdown is summed into the operation's current time buckets, so
+    /// the memory held does not grow with the request count (issue #397). The
+    /// table is not a dimension here: a per-table breakdown would multiply the
+    /// bound by the table count, and the console reads per-operation averages.
+    pub fn record_segments(&self, operation: &str, segments: &LatencySegments) {
+        // The clock is read under the lock, as in `query_segments`, so a stored
+        // record is never ahead of a query that follows it; otherwise a writer
+        // that crosses a bucket boundary between its clock read and its lock
+        // could overwrite the oldest in-window bucket before a reader with an
+        // earlier clock reads it.
+        let Ok(mut store) = self.segments.write() else {
             return;
         };
-        vec.push(point);
+        store.record(operation, segments, Instant::now());
     }
 
     /// Prune data points older than 1 day.
+    ///
+    /// Segment buckets are overwritten in place as time advances and need no
+    /// pruning.
     pub fn prune(&self) {
         let now = Instant::now();
         let cutoff = now.checked_sub(Duration::from_secs(86400)).unwrap_or(now);
@@ -378,11 +372,6 @@ impl MetricsCollector {
             acc.prune(cutoff);
         }
         map.retain(|_, acc| !acc.is_empty());
-        drop(map);
-        // Prune segment points too.
-        if let Ok(mut segs) = self.segments.write() {
-            segs.retain(|p| p.timestamp >= cutoff);
-        }
     }
 }
 

@@ -6,13 +6,16 @@
 //! Collects `DynamoDB`-style `CloudWatch` metrics per table, per operation, and
 //! per GSI. Metrics are accumulated in memory using an `RwLock`-protected map
 //! of per-key accumulators. A background task prunes data points older than
-//! 1 day every 5 minutes.
+//! 1 day every 5 minutes. Per-operation latency segments are summed into fixed
+//! time buckets at record time (see `segments`), so they hold a bounded amount
+//! of memory and need no pruning.
 //!
 //! REQ-OBS-005: Metrics endpoint.
 
 mod accumulator;
 mod collector;
 mod collector_query;
+mod segments;
 mod types;
 
 pub use collector::MetricsCollector;
