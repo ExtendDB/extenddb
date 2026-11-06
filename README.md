@@ -137,9 +137,10 @@ key_path = "/etc/extenddb/tls/key.pem"
 ## Running in Containers
 
 The production images contain ExtendDB only. The storage backend runs as a separate service. See
-[`docker/README.md`](docker/README.md) for the PostgreSQL image and [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
-external database requirements, hardened local Compose stacks, smoke tests, and explicit init/migrate/serve
-production lifecycle. The SQLite and Cassandra backends have no dedicated container guide yet.
+[`docker/README.md`](docker/README.md) for the PostgreSQL image, [`docker/README-mongodb.md`](docker/README-mongodb.md) for the MongoDB image,
+and [`docker/README-cassandra.md`](docker/README-cassandra.md) for the Cassandra image (published from 1.0): external database requirements,
+hardened local Compose stacks, smoke tests, and explicit init/migrate/serve production lifecycle. The SQLite
+backend has no production container image; [`docs/dev-image.md`](docs/dev-image.md) covers the SQLite development image.
 
 By default `extenddb serve` daemonizes itself, which doesn't play well with container runtimes and process supervisors that expect PID 1 to stay attached. Pass `--foreground` (alias `--no-daemon`) to keep the process in the foreground and stream logs to stderr instead of syslog:
 
@@ -171,11 +172,12 @@ unreachable at startup does stop the server from listening. There is no separate
 ### One instance per database
 
 Run one `extenddb serve` per catalog. On SQLite this is enforced: the server takes an exclusive lock on `<database>.lock`
-next to the database file and a second server on the same file will refuse to start (`init`, `migrate`, and `destroy` take
-the same lock while they run). On PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from
-running, but running more than one against the same catalog is not supported in this release: every instance runs every
-background worker, credential and policy caches are per instance with no cross-instance invalidation (a revoked key
-stays valid on the other instance for up to the cache TTL), and `/health` does not check the database.
+next to the database file and a second server on the same file will refuse to start (`init`, `migrate --yes`,
+`migrate --forget` and `destroy` take the same lock while they run; the `migrate` preview and `verify` take none). On
+PostgreSQL, MongoDB and Cassandra nothing prevents a second ExtendDB instance from running, but running more than one
+against the same catalog is not supported in this release: every instance runs every background worker, credential and
+policy caches are per instance with no cross-instance invalidation (a revoked key stays valid on the other instance for
+up to the cache TTL), and `/health` does not check the database.
 See the [deployment guide](docs/manuals/11-deployment-guide.md#multi-instance-considerations).
 
 To make the generated self-signed certificate valid for the name clients use — an in-cluster service DNS name, for example — pass `--tls-san` to `init` (repeatable):
@@ -281,6 +283,7 @@ docs/
 | [Deployment Guide](docs/manuals/11-deployment-guide.md) | Self-hosted, multi-cloud, air-gapped deployments |
 | [Differences from DynamoDB](docs/differences-from-dynamodb.md) | Behavioral differences and unsupported operations |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and solutions |
+| [Verifying Container Images](docs/verifying-images.md) | Build provenance and SBOM attestations for the published images |
 
 Build PDFs:
 

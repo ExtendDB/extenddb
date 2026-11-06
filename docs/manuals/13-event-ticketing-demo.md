@@ -513,7 +513,7 @@ Verify that extenddb is recording operational metrics:
 # Request counts and latencies (admin credentials required)
 curl -s --cacert ~/.extenddb/tls/cert.pem -u "admin:$EXTENDDB_ADMIN_PASSWORD" https://127.0.0.1:18443/metrics | python3 -m json.tool
 
-# Management console metrics (open in browser)
+# Management console metrics (open in a browser and log in as the admin user)
 echo "Open: https://127.0.0.1:18443/console/metrics"
 ```
 

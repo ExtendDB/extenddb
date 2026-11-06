@@ -14,28 +14,53 @@ use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
+use crate::management::CallerIdentity;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{
+    CsrfOnly, SessionData, identity_label, is_admin, op_error_message, require_csrf,
+    require_session,
+};
 
-/// GET /console/ — dashboard showing account count and quick links.
+/// GET /console/: the dashboard with quick links. An admin session also sees
+/// the deployment's account and admin counts.
 pub async fn dashboard(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
     let session = match require_session(&headers, &state).await {
         Ok(s) => s,
         Err(r) => return r,
     };
 
+    // The counts cover every account, so they are read for admins only.
+    let counts = if is_admin(&session.identity) {
+        Some(
+            state
+                .catalog_store
+                .dashboard_counts()
+                .await
+                .unwrap_or((0, 0)),
+        )
+    } else {
+        None
+    };
+
+    render_dashboard(&session, counts, &state.version_info)
+}
+
+/// The dashboard page for `session`. An admin session sees `counts`, the
+/// deployment's `(account_count, admin_count)`. An IAM-user session sees a
+/// link to its own account and no count, whatever `counts` holds.
+fn render_dashboard(
+    session: &SessionData,
+    counts: Option<(i64, i64)>,
+    version_info: &str,
+) -> Response {
     let nav = html::nav_bar(&identity_label(&session.identity));
 
-    let (account_count, admin_count) = state
-        .catalog_store
-        .dashboard_counts()
-        .await
-        .unwrap_or((0, 0));
-
-    let content = format!(
-        r#"<h1>Dashboard</h1>
-<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem">
-<div class="card">
+    let cards = match &session.identity {
+        CallerIdentity::Admin(_) => {
+            let (account_count, admin_count) = counts.unwrap_or((0, 0));
+            format!(
+                r#"<div class="card">
 <h2 style="margin:0">{account_count}</h2>
 <p>Accounts</p>
 <a href="/console/accounts">View all &rarr;</a>
@@ -43,7 +68,25 @@ pub async fn dashboard(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
 <div class="card">
 <h2 style="margin:0">{admin_count}</h2>
 <p>Admin Users</p>
-</div>
+</div>"#
+            )
+        }
+        CallerIdentity::IamUser { account_id, .. } => {
+            let eid = html::escape(account_id);
+            format!(
+                r#"<div class="card">
+<h2 style="margin:0">{eid}</h2>
+<p>Your Account</p>
+<a href="/console/accounts/{eid}">View &rarr;</a>
+</div>"#
+            )
+        }
+    };
+
+    let content = format!(
+        r#"<h1>Dashboard</h1>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem">
+{cards}
 </div>"#
     );
 
@@ -51,7 +94,7 @@ pub async fn dashboard(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
         "Dashboard",
         &nav,
         &content,
-        Some(&state.version_info),
+        Some(version_info),
         &session.csrf_token,
     ))
     .into_response()
@@ -245,7 +288,7 @@ pub async fn account_detail(
     headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -364,7 +407,7 @@ pub async fn delete_account(
     Path(account_id): Path<String>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -397,3 +440,7 @@ pub async fn delete_account(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "account_pages_tests.rs"]
+mod tests;

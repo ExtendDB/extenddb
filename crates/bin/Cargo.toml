@@ -40,3 +40,9 @@ extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
 extenddb-config = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+extenddb-storage = { workspace = true, features = ["test-util"] }

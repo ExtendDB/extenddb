@@ -265,12 +265,15 @@ You should see all checks pass:
 
 ```
 === extenddb verify ===
+Config:           extenddb.toml
+Catalog database: extenddb_catalog
+
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 7
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
-  OK: Connected to data database 'extenddb_catalog_data'.
+  OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
   Tables: 0
   Indexes: 0
@@ -284,7 +287,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 7) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1267,17 +1270,18 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard:** Overview of accounts and admin users.
+- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own account).
 - **Account management:** Create, view, and delete accounts (admin only).
 - **User management:** Create and delete IAM users, view access keys, policies, tags, and group memberships.
 - **Access key management:** Create and delete access keys. The secret key is shown once at creation time.
 - **Group management:** Create and delete groups, add and remove members.
 - **Role management:** Create and delete roles, view trust policies.
 - **Policy management:** Add and delete inline policies for users, groups, and roles. Includes a JSON editor with a default policy template.
+- **Metrics dashboard:** Operation metrics for every account, with charts (admin only).
 
 Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
 
-Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately.
+Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
 ## 9. Audit logging
 
@@ -1363,7 +1367,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog 0.0.4 (postgres)
+# catalog migration 7 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -1394,9 +1398,9 @@ The `storage.postgres.catalog_pool_size` setting controls the maximum number of 
 
 **When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
 
-**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size`, plus one connection per vector index build running on the server and one while a schema migration runs. The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the default pool sizes already need 60 of it. Ensure `2 * pool_size + catalog_pool_size`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
+**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size + [backup] max_concurrent_jobs`, plus one connection per vector index build running on the server and one while a schema migration runs. The `max_concurrent_jobs` term (default 4) is one dedicated connection per running backup or restore job, outside every pool, which holds the job's session-level advisory lock (its claim). The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the defaults already need 64 of it. Ensure `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
 
-**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 150 connections, so PostgreSQL needs `max_connections` raised to at least 150 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
+**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 154 connections (the default `max_concurrent_jobs` of 4 included), so PostgreSQL needs `max_connections` raised to at least 154 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
 
 ```toml
 [storage.postgres]
@@ -1423,12 +1427,12 @@ ttl_seconds        = 60     # hard TTL — entries older than this are full miss
 soft_ttl_seconds   = 30     # entries older than this serve cached AND trigger
                             #   a background refresh (request does not block)
 negative_ttl_seconds = 5    # how long "not found" results are remembered
-max_entries        = 10000  # per-cache LRU cap
+max_entries        = 10000  # maximum entries per cache
 ```
 
 **Self-induced changes** (admin API and console mutations: `CreateAccessKey`, `PutUserPolicy`, `TagResource`, `CreateTable`, etc.) propagate instantly via write-through invalidation on the local instance.
 
-**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) complete asynchronously; there is a brief (~ms) window between the API responding success and the eviction landing. For hard cutover, prefer single-key invalidations (`DeleteAccessKey`) over cascades.
+**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. If a group change cannot list the group's members, those members' entries wait for `ttl_seconds`.
 
 **Off-instance changes** (multi-node deployments, or direct DB writes outside the management API) take up to `ttl_seconds` to propagate.
 

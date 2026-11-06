@@ -94,7 +94,7 @@ impl PostgresEngine {
         // filled by RestoreTableFromBackup. The service refuses to delete a
         // table it is still creating, and deleting this one would make the
         // restore fail part-way; refuse until the restore finishes. An
-        // abandoned target is removed by the restore sweep, not here.
+        // abandoned target is removed by the reconciler, not here.
         if row.table_status == "CREATING" {
             let restoring: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = $1 \
@@ -129,8 +129,9 @@ impl PostgresEngine {
         // before the next request, causing stale DELETING rows. Synchronous
         // delete avoids this. Mirrors create_table's H-5 fast path.
         let delay_row: (f64,) = sqlx::query_as(
-            "SELECT COALESCE((SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), 0.25)",
+            "SELECT COALESCE((SELECT value::FLOAT8 FROM settings WHERE key = 'control_plane_delay_seconds'), $1)",
         )
+        .bind(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
