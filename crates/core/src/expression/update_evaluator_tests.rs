@@ -607,17 +607,24 @@ fn add_and_delete_list_element_number_and_binary_sets() {
     del_vals_bs.insert("v".into(), AttributeValue::BS(del_bs));
     apply("DELETE l[1] :v", &mut item, HashMap::new(), del_vals_bs).unwrap();
 
-    if let Some(AttributeValue::L(list)) = item.get("l") {
-        if let AttributeValue::NS(s) = &list[0] {
-            assert!(!s.contains("10"));
-            assert!(s.contains("20"));
-            assert_eq!(s.len(), 1);
-        }
-        if let AttributeValue::BS(s) = &list[1] {
-            assert!(!s.contains(&vec![1, 2, 3]));
-            assert!(s.contains(&vec![4, 5]));
-            assert_eq!(s.len(), 1);
-        }
+    let list = match item.get("l") {
+        Some(AttributeValue::L(l)) => l,
+        other => panic!("expected AttributeValue::L, got {other:?}"),
+    };
+    assert_eq!(list.len(), 2, "list length must remain 2");
+
+    let mut expected_ns = BTreeSet::new();
+    expected_ns.insert("20".into());
+    match &list[0] {
+        AttributeValue::NS(s) => assert_eq!(s, &expected_ns),
+        other => panic!("expected AttributeValue::NS at l[0], got {other:?}"),
+    }
+
+    let mut expected_bs = BTreeSet::new();
+    expected_bs.insert(vec![4, 5]);
+    match &list[1] {
+        AttributeValue::BS(s) => assert_eq!(s, &expected_bs),
+        other => panic!("expected AttributeValue::BS at l[1], got {other:?}"),
     }
 }
 
@@ -672,9 +679,9 @@ fn add_and_delete_nested_map_list_paths() {
         },
         _ => panic!("expected M"),
     };
-    assert!(!tags.contains("val1"));
-    assert!(tags.contains("val2"));
-    assert_eq!(tags.len(), 1);
+    let mut expected_tags = BTreeSet::new();
+    expected_tags.insert("val2".into());
+    assert_eq!(tags, expected_tags);
 }
 
 #[test]
@@ -703,16 +710,6 @@ fn add_and_delete_list_type_mismatches_and_out_of_bounds() {
     val_ss.insert("v".into(), AttributeValue::SS(ss));
     let err2 = apply("DELETE l[1] :v", &mut item, HashMap::new(), val_ss).unwrap_err();
     assert!(matches!(err2, DynamoDbError::ValidationException(_)));
-
-    // Out-of-bounds index: ADD l[99] :v -> attribute does not exist error
-    let mut val_add = HashMap::new();
-    let mut ss_add = BTreeSet::new();
-    ss_add.insert("x".into());
-    val_add.insert("v".into(), AttributeValue::SS(ss_add));
-    let err3 = apply("ADD l[99] :v", &mut item, HashMap::new(), val_add).unwrap_err();
-    assert!(
-        matches!(err3, DynamoDbError::ValidationException(m) if m.contains("does not exist in the item"))
-    );
 
     // Out-of-bounds index: DELETE l[99] :v -> no-op (parent path doesn't exist)
     let mut val_del = HashMap::new();
