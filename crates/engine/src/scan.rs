@@ -21,7 +21,6 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_scan_exclusive_start_key,
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
@@ -29,6 +28,7 @@ use crate::scan_request::{
     CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, member_order,
 };
 use crate::serialize_output;
+use crate::start_key::validate_scan_exclusive_start_key;
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Scan` request.

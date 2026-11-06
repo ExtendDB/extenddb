@@ -344,16 +344,19 @@ impl extenddb_storage::management_store::RateLimitStore for PostgresCatalogStore
     fn count_principal_failures(
         &self,
         principal: &str,
+        source_ip: &str,
         window_seconds: i64,
     ) -> BoxFuture<'_, OpResult<i64>> {
         let principal = principal.to_owned();
+        let source_ip = source_ip.to_owned();
         Box::pin(async move {
             let row: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM login_attempts \
-                 WHERE principal = $1 AND success = false \
-                 AND attempted_at > NOW() - make_interval(secs => $2)",
+                 WHERE principal = $1 AND source_ip = $2 AND success = false \
+                 AND attempted_at > NOW() - make_interval(secs => $3)",
             )
             .bind(&principal)
+            .bind(&source_ip)
             .bind(window_seconds)
             .fetch_one(&self.pool)
             .await

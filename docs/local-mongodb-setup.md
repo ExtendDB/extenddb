@@ -29,7 +29,7 @@ sudo apt-get update && sudo apt-get install -y mongodb-org
 
 ```bash
 docker run -d --name extenddb-mongo \
-    -p 27017:27017 \
+    -p 127.0.0.1:27017:27017 \
     mongo:7 --replSet rs0
 ```
 

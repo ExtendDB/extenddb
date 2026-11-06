@@ -8,6 +8,12 @@
 //! `DynamoDB`-format error responses.
 
 mod backup;
+pub use backup::{
+    BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
+    S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool, StoreHealth, StoreHealthReport, StoreIdentityFile,
+    StoreProblem, check_configured_store, maintenance, read_identity_bounded, reconciler,
+    store_identity,
+};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -34,6 +40,7 @@ mod request_limits;
 mod scan;
 pub mod scan_request;
 mod search_vectors;
+mod start_key;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -344,6 +351,9 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The process's job slots and configured backup store, which the backup
+    /// operations read.
+    pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
     pub account_id: Arc<str>,

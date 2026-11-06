@@ -46,6 +46,19 @@ use common::eval_filter;
 /// expressions is what surfaces path-hit / path-miss interactions.
 const NAMES: &[&str] = &["a", "b", "c", "x", "y"];
 
+/// Names of map members, in items and in path elements after the first.
+/// `M`, `L` and `S` are also type tags, the names of the fields a stored
+/// value sits under, and `0` reads as an array index in a MongoDB path, so a
+/// compiled path that drops or misplaces a typed field reaches a different
+/// field for these names.
+const MEMBER_NAMES: &[&str] = &["a", "b", "M", "L", "S", "0"];
+
+/// The longest path a generated condition names.
+const MAX_PATH_LEN: usize = 3;
+
+/// A generated item, keyed by attribute name.
+type Item = BTreeMap<String, AttributeValue>;
+
 /// Constrained string alphabet — short, printable, small alphabet.
 /// Keeps proptest shrinking behavior tractable and matches the kinds of
 /// values real DDB workloads use for status flags, tags, ETags, etc.
@@ -57,12 +70,10 @@ fn arb_short_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..4)
 }
 
-/// Attribute values in the "safe subset" — everything except N/NS.
-/// The pushable expression grammar never references numeric operands, so
-/// items don't need to contain them either. Including L/M would require a
-/// recursive strategy; we keep depth flat for now (paths in the grammar
-/// are single-name only, so nested M/L values wouldn't be reachable
-/// anyway).
+/// Flat attribute values in the "safe subset": everything except N/NS, and
+/// lists of strings only. The pushable expression grammar never references
+/// numeric operands, so items don't need to contain them either.
+/// `arb_value` nests these values in maps and lists.
 fn arb_safe_value() -> impl Strategy<Value = AttributeValue> {
     prop_oneof![
         arb_short_str().prop_map(AttributeValue::S),
@@ -71,11 +82,41 @@ fn arb_safe_value() -> impl Strategy<Value = AttributeValue> {
         Just(AttributeValue::Null),
         proptest::collection::btree_set(arb_short_str(), 0..3).prop_map(AttributeValue::SS),
         proptest::collection::btree_set(arb_short_bytes(), 0..3).prop_map(AttributeValue::BS),
-        // Lists of strings — the compiler's contains-on-list path takes a
-        // scalar and matches any element. Mixed-type lists aren't in the
-        // pushable grammar so we don't generate them.
+        // Lists of strings: the compiler's contains-on-list path takes a
+        // scalar and matches any element. The lists `arb_value` builds may
+        // mix types.
         proptest::collection::vec(arb_short_str().prop_map(AttributeValue::S), 0..3)
             .prop_map(AttributeValue::L),
+    ]
+}
+
+/// A map of up to three members named from `MEMBER_NAMES`, or a list of up
+/// to three elements, holding values drawn from `inner`.
+fn arb_map_or_list(inner: BoxedStrategy<AttributeValue>) -> impl Strategy<Value = AttributeValue> {
+    prop_oneof![
+        proptest::collection::btree_map(
+            select(MEMBER_NAMES).prop_map(String::from),
+            inner.clone(),
+            0..4,
+        )
+        .prop_map(AttributeValue::M),
+        proptest::collection::vec(inner, 0..4).prop_map(AttributeValue::L),
+    ]
+}
+
+/// An attribute value: half of the time a flat value, otherwise a map or
+/// list whose members and elements are flat values or maps and lists of
+/// flat values. The lists in these values may mix types.
+fn arb_value() -> impl Strategy<Value = AttributeValue> {
+    let flat = arb_safe_value().boxed();
+    let member = prop_oneof![
+        1 => flat.clone(),
+        1 => arb_map_or_list(flat.clone()),
+    ]
+    .boxed();
+    prop_oneof![
+        1 => flat,
+        1 => arb_map_or_list(member),
     ]
 }
 
@@ -83,7 +124,7 @@ fn arb_safe_value() -> impl Strategy<Value = AttributeValue> {
 /// how the "path missing" edge cases get exercised.
 fn arb_item() -> impl Strategy<Value = BTreeMap<String, AttributeValue>> {
     proptest::collection::vec(
-        (select(NAMES).prop_map(String::from), arb_safe_value()),
+        (select(NAMES).prop_map(String::from), arb_value()),
         0..NAMES.len(),
     )
     .prop_map(|pairs| {
@@ -99,9 +140,24 @@ fn arb_item() -> impl Strategy<Value = BTreeMap<String, AttributeValue>> {
 // Expression strategies
 // ---------------------------------------------------------------------------
 
-/// A random attribute name from the vocabulary.
+/// A random path: a name from `NAMES`, then up to two elements, each a
+/// member name from `MEMBER_NAMES` or a list index below 3. Most of these
+/// paths are absent from a generated item; `arb_item_and_expr` swaps three
+/// in four of them for paths the item has.
 fn arb_name_expr() -> impl Strategy<Value = Expr> {
-    select(NAMES).prop_map(|n| Expr::Path(vec![PathElement::Attribute(n.to_string())]))
+    let element = prop_oneof![
+        select(MEMBER_NAMES).prop_map(|n| PathElement::Attribute(n.to_string())),
+        (0..3usize).prop_map(PathElement::Index),
+    ];
+    (
+        select(NAMES),
+        proptest::collection::vec(element, 0..MAX_PATH_LEN),
+    )
+        .prop_map(|(first, rest)| {
+            let mut path = vec![PathElement::Attribute(first.to_string())];
+            path.extend(rest);
+            Expr::Path(path)
+        })
 }
 
 /// A random placeholder reference (`:v0`, `:v1`, ...).
@@ -321,6 +377,80 @@ fn arb_expr() -> impl Strategy<Value = (Expr, Vec<AttributeValue>)> {
     ]
 }
 
+/// An item and a condition on it. Three in four paths of the condition, by
+/// their picks, are replaced by paths the item has, so a nested member or
+/// element the condition names is present often enough for a wrong compiled
+/// path to give a different answer; the other paths stay random.
+fn arb_item_and_expr() -> impl Strategy<Value = (Item, (Expr, Vec<AttributeValue>))> {
+    (arb_item(), arb_expr(), any::<[u8; 2]>()).prop_map(|(item, (mut expr, values), picks)| {
+        steer_paths(&mut expr, &item_paths(&item), &mut picks.into_iter());
+        (item, (expr, values))
+    })
+}
+
+/// Every path into `item` of at most `MAX_PATH_LEN` elements: each
+/// top-level name, and below it each member of a map and each element of a
+/// list. A path is listed once per element, so a deeper path, where a
+/// misplaced typed segment shows, is picked more often.
+fn item_paths(item: &Item) -> Vec<Vec<PathElement>> {
+    fn walk(value: &AttributeValue, path: &mut Vec<PathElement>, out: &mut Vec<Vec<PathElement>>) {
+        out.extend(std::iter::repeat_n(path.clone(), path.len()));
+        if path.len() == MAX_PATH_LEN {
+            return;
+        }
+        let children: Vec<(PathElement, &AttributeValue)> = match value {
+            AttributeValue::M(members) => members
+                .iter()
+                .map(|(name, v)| (PathElement::Attribute(name.clone()), v))
+                .collect(),
+            AttributeValue::L(elements) => elements
+                .iter()
+                .enumerate()
+                .map(|(idx, v)| (PathElement::Index(idx), v))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (element, child) in children {
+            path.push(element);
+            walk(child, path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    for (name, value) in item {
+        let mut path = vec![PathElement::Attribute(name.clone())];
+        walk(value, &mut path, &mut out);
+    }
+    out
+}
+
+/// Replace the paths of `expr`, in order: for each pick that is not a
+/// multiple of 4, by `paths[pick / 4]` (modulo its length). A path left
+/// without a pick is kept.
+fn steer_paths(expr: &mut Expr, paths: &[Vec<PathElement>], picks: &mut impl Iterator<Item = u8>) {
+    match expr {
+        Expr::Path(path) => {
+            if let Some(pick) = picks.next()
+                && pick % 4 != 0
+                && !paths.is_empty()
+            {
+                *path = paths[usize::from(pick / 4) % paths.len()].clone();
+            }
+        }
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            steer_paths(left, paths, picks);
+            steer_paths(right, paths, picks);
+        }
+        Expr::Not(inner) => steer_paths(inner, paths, picks),
+        Expr::Function { args, .. } => {
+            for arg in args {
+                steer_paths(arg, paths, picks);
+            }
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Item → BSON conversion for the interpreter side
 // ---------------------------------------------------------------------------
@@ -351,8 +481,7 @@ proptest! {
     /// in-Rust DDB evaluator's pass/fail result.
     #[test]
     fn compiled_filter_matches_ddb_evaluator(
-        item in arb_item(),
-        expr_pair in arb_expr(),
+        (item, expr_pair) in arb_item_and_expr(),
     ) {
         let (expr, values_vec) = expr_pair;
 
@@ -414,8 +543,7 @@ proptest! {
     /// short-circuits without a comparison.
     #[test]
     fn analyzer_yes_implies_filter_parity(
-        item in arb_item(),
-        expr_pair in arb_expr(),
+        (item, expr_pair) in arb_item_and_expr(),
     ) {
         let (expr, values_vec) = expr_pair;
         let mut values = HashMap::new();

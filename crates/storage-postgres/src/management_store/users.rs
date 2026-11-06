@@ -5,6 +5,7 @@
 
 use extenddb_storage::management_store::{OpError, OpResult, UserDetail};
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -114,10 +115,7 @@ impl PostgresCatalogStore {
             .bind(account_id)
             .fetch_all(self.pool())
             .await
-            .map_err(|e| {
-                tracing::error!("list_users: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
+            .map_err(|e| database_error("list_users", &e))?;
         Ok(rows
             .into_iter()
             .map(|(aid, un, arn, pw, ca)| (aid, un, arn, pw.is_some(), ca))
@@ -225,16 +223,11 @@ impl PostgresCatalogStore {
             OpError::Internal("Database error".to_owned())
         })?;
 
-        let Some((hash,)) = row else {
-            return Ok(false);
-        };
-
-        let pw = password.to_owned();
-        Ok(
-            tokio::task::spawn_blocking(move || bcrypt::verify(pw, &hash).unwrap_or(false))
-                .await
-                .unwrap_or(false),
-        )
+        // `None` when the user is absent or has no console password, which
+        // still runs one bcrypt check (see `verify_stored_password`), as a
+        // wrong password does.
+        let hash = row.map(|(hash,)| hash);
+        extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(
