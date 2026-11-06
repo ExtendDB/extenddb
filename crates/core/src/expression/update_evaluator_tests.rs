@@ -496,6 +496,58 @@ fn delete_all_elements_removes_attribute() {
 }
 
 #[test]
+fn add_and_delete_list_element_set() {
+    // Issue #812: ADD and DELETE targeting a set inside a list element (e.g. l[0])
+    let mut item = BTreeMap::new();
+    let mut initial_set = BTreeSet::new();
+    initial_set.insert("a".into());
+    item.insert(
+        "l".into(),
+        AttributeValue::L(vec![AttributeValue::SS(initial_set)]),
+    );
+
+    // ADD l[0] :v with SS: ["b"] adds "b" to the set in l[0]
+    let mut add_set = BTreeSet::new();
+    add_set.insert("b".into());
+    let mut values = HashMap::new();
+    values.insert("v".into(), AttributeValue::SS(add_set));
+    apply("ADD l[0] :v", &mut item, HashMap::new(), values).unwrap();
+
+    let elem = match item.get("l") {
+        Some(AttributeValue::L(list)) => &list[0],
+        _ => panic!("expected list in l"),
+    };
+    match elem {
+        AttributeValue::SS(s) => {
+            assert!(s.contains("a"));
+            assert!(s.contains("b"));
+            assert_eq!(s.len(), 2);
+        }
+        _ => panic!("expected SS in l[0]"),
+    }
+
+    // DELETE l[0] :v with SS: ["a"] removes "a" from the set in l[0]
+    let mut del_set = BTreeSet::new();
+    del_set.insert("a".into());
+    let mut del_values = HashMap::new();
+    del_values.insert("v".into(), AttributeValue::SS(del_set));
+    apply("DELETE l[0] :v", &mut item, HashMap::new(), del_values).unwrap();
+
+    let elem_after = match item.get("l") {
+        Some(AttributeValue::L(list)) => &list[0],
+        _ => panic!("expected list in l"),
+    };
+    match elem_after {
+        AttributeValue::SS(s) => {
+            assert!(!s.contains("a"));
+            assert!(s.contains("b"));
+            assert_eq!(s.len(), 1);
+        }
+        _ => panic!("expected SS in l[0]"),
+    }
+}
+
+#[test]
 fn set_nested_path() {
     let mut inner = BTreeMap::new();
     inner.insert("city".into(), AttributeValue::S("old".into()));

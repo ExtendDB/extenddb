@@ -237,24 +237,68 @@ fn evaluate_set_function(
 /// Apply an ADD action to an item.
 ///
 /// `DynamoDB` ADD semantics:
+/// Target of an ADD or DELETE action.
+enum TargetContainer<'a> {
+    Map {
+        map: &'a mut BTreeMap<String, AttributeValue>,
+        attr_name: String,
+    },
+    List {
+        list: &'a mut Vec<AttributeValue>,
+        index: usize,
+    },
+}
+
+impl<'a> TargetContainer<'a> {
+    fn get(&self) -> Option<&AttributeValue> {
+        match self {
+            TargetContainer::Map { map, attr_name } => map.get(attr_name),
+            TargetContainer::List { list, index } => list.get(*index),
+        }
+    }
+
+    fn insert(&mut self, new_value: AttributeValue) {
+        match self {
+            TargetContainer::Map { map, attr_name } => {
+                map.insert(attr_name.clone(), new_value);
+            }
+            TargetContainer::List { list, index } => {
+                if *index < list.len() {
+                    list[*index] = new_value;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self) {
+        match self {
+            TargetContainer::Map { map, attr_name } => {
+                map.remove(attr_name);
+            }
+            TargetContainer::List { .. } => {
+                // DELETE removing all elements of a set at a list index does not remove
+                // the list element itself; issue #812 specifies set operations on the element.
+            }
+        }
+    }
+}
+
+/// Apply an ADD action to an item.
+///
+/// `DynamoDB` ADD semantics:
 /// - If the attribute doesn't exist and the value is a number, set it.
 /// - If the attribute exists and is a number, add the value to it.
 /// - If the value is a set (SS/NS/BS), union it with the existing set (or create it).
 ///
-/// Supports nested paths (e.g. `ADD myMap.counter :inc`).
+/// Supports nested paths (e.g. `ADD myMap.counter :inc`, `ADD l[0] :v`).
 fn apply_add(
     item: &mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     value: AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let target = navigate_to_parent_map_or_create(item, path, maps)?;
-    let attr_name = resolve_attr_name(
-        path.last()
-            .ok_or_else(|| DynamoDbError::ValidationException("Empty path in ADD".to_owned()))?,
-        maps,
-    )?;
-    let existing = target.get(&attr_name);
+    let mut target = navigate_to_target_or_create(item, path, maps)?;
+    let existing = target.get().cloned();
 
     let new_value = match (&existing, &value) {
         // Number or set: set if missing
@@ -306,7 +350,7 @@ fn apply_add(
         }
     };
 
-    target.insert(attr_name, new_value);
+    target.insert(new_value);
     Ok(())
 }
 
@@ -314,30 +358,25 @@ fn apply_add(
 ///
 /// `DynamoDB` DELETE semantics: removes elements from a set.
 /// The value must be a set of the same type as the existing attribute.
-/// Supports nested paths (e.g. `DELETE myMap.tags :removeTags`).
+/// Supports nested paths (e.g. `DELETE myMap.tags :removeTags`, `DELETE l[0] :v`).
 fn apply_delete(
     item: &mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     value: &AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let Some(target) = navigate_to_parent_map(item, path, maps)? else {
+    let Some(mut target) = navigate_to_target(item, path, maps)? else {
         return Ok(()); // Parent path doesn't exist — no-op
     };
-    let attr_name = resolve_attr_name(
-        path.last()
-            .ok_or_else(|| DynamoDbError::ValidationException("Empty path in DELETE".to_owned()))?,
-        maps,
-    )?;
-    let Some(existing) = target.get(&attr_name) else {
+    let Some(existing) = target.get().cloned() else {
         return Ok(()); // No-op if attribute doesn't exist
     };
 
-    let new_value = match (existing, value) {
+    let new_value = match (&existing, value) {
         (AttributeValue::SS(existing_set), AttributeValue::SS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::SS(remaining)
@@ -345,7 +384,7 @@ fn apply_delete(
         (AttributeValue::NS(existing_set), AttributeValue::NS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::NS(remaining)
@@ -353,7 +392,7 @@ fn apply_delete(
         (AttributeValue::BS(existing_set), AttributeValue::BS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::BS(remaining)
@@ -365,22 +404,38 @@ fn apply_delete(
         }
     };
 
-    target.insert(attr_name, new_value);
+    target.insert(new_value);
     Ok(())
 }
 
-/// Navigate a document path to the parent map of the leaf element, creating
-/// intermediate maps as needed. Used by ADD which must create the path if absent.
-///
-/// For a single-element path, returns the item itself.
-fn navigate_to_parent_map_or_create<'a>(
+/// Navigate a document path to the target container of the leaf element, creating
+/// intermediate maps as needed. Used by ADD which must create map paths if absent.
+fn navigate_to_target_or_create<'a>(
     item: &'a mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     maps: &ExpressionMaps,
-) -> Result<&'a mut BTreeMap<String, AttributeValue>, DynamoDbError> {
-    if path.len() <= 1 {
-        return Ok(item);
+) -> Result<TargetContainer<'a>, DynamoDbError> {
+    let last = path
+        .last()
+        .ok_or_else(|| DynamoDbError::ValidationException("Empty path in ADD".to_owned()))?;
+
+    if path.len() == 1 {
+        match last {
+            PathElement::Attribute(_) => {
+                let attr_name = resolve_attr_name(last, maps)?;
+                return Ok(TargetContainer::Map {
+                    map: item,
+                    attr_name,
+                });
+            }
+            PathElement::Index(_) => {
+                return Err(DynamoDbError::ValidationException(
+                    "Invalid expression: path cannot start with an index".to_owned(),
+                ));
+            }
+        }
     }
+
     let first_name = resolve_attr_name(&path[0], maps)?;
     let mut current = item
         .entry(first_name)
@@ -419,25 +474,57 @@ fn navigate_to_parent_map_or_create<'a>(
             }
         }
     }
-    match current {
-        AttributeValue::M(map) => Ok(map),
+
+    match (last, current) {
+        (PathElement::Attribute(_), AttributeValue::M(map)) => {
+            let attr_name = resolve_attr_name(last, maps)?;
+            Ok(TargetContainer::Map { map, attr_name })
+        }
+        (PathElement::Index(idx), AttributeValue::L(list)) => {
+            if *idx < list.len() {
+                Ok(TargetContainer::List { list, index: *idx })
+            } else {
+                Err(DynamoDbError::ValidationException(
+                    "The provided expression refers to an attribute that does not exist in the item"
+                        .to_owned(),
+                ))
+            }
+        }
         _ => Err(DynamoDbError::ValidationException(
             "The document path provided in the update expression is invalid for update".to_owned(),
         )),
     }
 }
 
-/// Navigate a document path to the parent map of the leaf element without
+/// Navigate a document path to the target container of the leaf element without
 /// creating intermediate maps. Returns `None` if the path doesn't exist.
 /// Used by DELETE which is a no-op when the path is absent.
-fn navigate_to_parent_map<'a>(
+fn navigate_to_target<'a>(
     item: &'a mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     maps: &ExpressionMaps,
-) -> Result<Option<&'a mut BTreeMap<String, AttributeValue>>, DynamoDbError> {
-    if path.len() <= 1 {
-        return Ok(Some(item));
+) -> Result<Option<TargetContainer<'a>>, DynamoDbError> {
+    let last = path
+        .last()
+        .ok_or_else(|| DynamoDbError::ValidationException("Empty path in DELETE".to_owned()))?;
+
+    if path.len() == 1 {
+        match last {
+            PathElement::Attribute(_) => {
+                let attr_name = resolve_attr_name(last, maps)?;
+                return Ok(Some(TargetContainer::Map {
+                    map: item,
+                    attr_name,
+                }));
+            }
+            PathElement::Index(_) => {
+                return Err(DynamoDbError::ValidationException(
+                    "Invalid expression: path cannot start with an index".to_owned(),
+                ));
+            }
+        }
     }
+
     let first_name = resolve_attr_name(&path[0], maps)?;
     let Some(mut current) = item.get_mut(&first_name) else {
         return Ok(None);
@@ -468,8 +555,19 @@ fn navigate_to_parent_map<'a>(
             }
         }
     }
-    match current {
-        AttributeValue::M(map) => Ok(Some(map)),
+
+    match (last, current) {
+        (PathElement::Attribute(_), AttributeValue::M(map)) => {
+            let attr_name = resolve_attr_name(last, maps)?;
+            Ok(Some(TargetContainer::Map { map, attr_name }))
+        }
+        (PathElement::Index(idx), AttributeValue::L(list)) => {
+            if *idx < list.len() {
+                Ok(Some(TargetContainer::List { list, index: *idx }))
+            } else {
+                Ok(None)
+            }
+        }
         _ => Ok(None),
     }
 }
