@@ -227,7 +227,7 @@ An admin session can read and change every account. Every page and form under `/
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions that expire after 8 hours of inactivity, HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
+- **Session management**: Server-side sessions that end 8 hours after login however active they are (the cookie's `Max-Age` is the same 8 hours), HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
 - **Session revocation**: A session is bound to the password hash its admin or IAM user logged in with. Every console request reads that hash from the catalog again. When the principal has been deleted, or its password has been changed, the session is removed and the request is redirected to the login page. This happens at the session's next request on every server that shares the catalog, because no server keeps a copy of the hash between requests. On Cassandra the read and the writes that change the hash use `LOCAL_QUORUM`, so a server in another datacenter sees the change once it has replicated there. If the catalog cannot be read, the request gets HTTP 503 and the session is kept. A refused request does not count as activity, so the 8 hour idle timeout keeps running during a catalog outage.
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)

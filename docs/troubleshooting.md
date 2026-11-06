@@ -854,7 +854,7 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours of inactivity), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions end 8 hours after login, however active they are, and the browser drops the cookie at the same time), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
 **Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
 
