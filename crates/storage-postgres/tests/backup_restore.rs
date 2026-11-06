@@ -33,7 +33,8 @@ use extenddb_core::validation::validate_create_table;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::migrations::Runner;
 use extenddb_storage::{
-    DataEngine, JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides, TableEngine,
+    DataEngine, JobPermit, LegacyBackupReader, ReadOptions, RestoreRequest, RestoreTableOverrides,
+    TableEngine,
 };
 use extenddb_storage_postgres::migrations::{PostgresMigrations, PostgresTarget};
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
@@ -551,7 +552,7 @@ async fn legacy_composite_backup_restores_with_sort_keys() {
             .collect();
         let got = s
             .engine
-            .get_item(&key_info, &key)
+            .get_item(&key_info, &key, ReadOptions::default())
             .await
             .expect("point read");
         assert_eq!(got.as_ref(), Some(&item));

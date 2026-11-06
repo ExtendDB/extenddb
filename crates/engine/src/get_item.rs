@@ -14,6 +14,7 @@ use extenddb_core::expression::Projection;
 use extenddb_core::types::GetItemInput;
 use extenddb_core::types::GetItemOutput;
 use extenddb_core::types::item_size_bytes;
+use extenddb_storage::ReadOptions;
 
 use crate::OperationContext;
 use crate::capacity_helpers;
@@ -132,15 +133,15 @@ pub async fn handle_get_item(
         &key_info.attribute_definitions,
     )?;
 
+    let strongly_consistent = input.consistent_read == Some(true);
     let item = ctx
         .storage
-        .get_item(&key_info, &input.key)
+        .get_item(&key_info, &input.key, ReadOptions::new(strongly_consistent))
         .await
         .map_err(storage_err_to_dynamo)?;
 
     // Capacity metering: full item size pre-projection, rounded up to 4 KB.
     let pre_projection_bytes = item.as_ref().map_or(0, item_size_bytes);
-    let strongly_consistent = input.consistent_read == Some(true);
     let rcu = capacity_helpers::read_capacity_units(pre_projection_bytes, strongly_consistent);
 
     let item = match (projection, item) {

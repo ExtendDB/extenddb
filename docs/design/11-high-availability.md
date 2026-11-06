@@ -263,6 +263,16 @@ The `extenddb.toml` configuration accepts `pool_size` per connection target. The
 
 ## 8. Storage Adapter Interface Changes
 
+Status (2026-10-25): the plumbing in 8.1 and 8.2 landed with a different shape.
+`DataEngine::get_item`, `query` and `scan` take `extenddb_storage::ReadOptions
+{ consistent_read }` as their last parameter, a `#[non_exhaustive]` struct
+with `new` and `Default`, in place of the bare `bool` and the
+`ConsistencyLevel` enum below (ADR-0024). The engine passes the client's value,
+each table's own value on `BatchGetItem`, `false` on a global secondary index
+read (refused before storage when the client asks for `true`), and `true` on
+the export scan. The text below is the proposal as written; 8.2.1 through 8.3
+and Stage 2 onward build on the landed shape.
+
 ### 8.1 ConsistencyLevel Parameter
 
 Add a `ConsistencyLevel` enum to the storage crate. This enum is **internal to the storage adapter** — the engine layer passes a raw `consistent_read: bool` and the storage adapter converts it. This avoids adding a storage-crate type dependency to the engine:
@@ -401,6 +411,10 @@ This avoids adding yet another trait that every storage backend must implement. 
 ## 9. Staged Implementation Plan
 
 ### Stage 1: Consistency Parameter Plumbing (No Behavioral Change)
+
+Status (2026-10-25): done, as `ReadOptions` rather than a bare `bool` and
+without the `ConsistencyLevel` enum (section 8 status note, ADR-0024). All
+four in-tree backends accept the parameter; none routes on it.
 
 **Deliverable:** Add `consistent_read: bool` parameter to `get_item`, `query`, and `scan` in the `DataEngine` trait. Thread it from the engine layer call sites. The PostgreSQL backend accepts the parameter but ignores it (all reads go to the single connection). All existing tests pass unchanged.
 

@@ -16,7 +16,7 @@
 use extenddb_core::expression::{Expr, ExpressionMaps, PathElement};
 use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, TransactWriteOp};
+use extenddb_storage::{DataEngine, ReadOptions, TransactWriteOp};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -86,7 +86,11 @@ async fn cancelled_transaction_keeps_a_committed_item(
     );
 
     let stored = engine
-        .get_item(&table.key_info, &key("aaa-committed"))
+        .get_item(
+            &table.key_info,
+            &key("aaa-committed"),
+            ReadOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -96,7 +100,7 @@ async fn cancelled_transaction_keeps_a_committed_item(
     );
     assert!(
         engine
-            .get_item(&table.key_info, &key("zzz-absent"))
+            .get_item(&table.key_info, &key("zzz-absent"), ReadOptions::default())
             .await
             .unwrap()
             .is_none(),

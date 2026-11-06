@@ -567,7 +567,8 @@ async fn half_the_pool_holds_snapshots(shared: bool) {
     .collect();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        s.engine.get_item(&ki, &key),
+        s.engine
+            .get_item(&ki, &key, extenddb_storage::ReadOptions::default()),
     )
     .await
     .expect("GetItem is not starved by the open snapshots")

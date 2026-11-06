@@ -26,7 +26,7 @@ use extenddb_storage::backup_catalog::{
 use extenddb_storage::error::StorageError;
 use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
 use extenddb_storage::{
-    BackupCatalog, DataEngine, JobPermit, LegacyBackupReader, RestoreRequest,
+    BackupCatalog, DataEngine, JobPermit, LegacyBackupReader, ReadOptions, RestoreRequest,
     RestoreTableOverrides, TableEngine,
 };
 use extenddb_storage_cassandra::CassandraEngine;
@@ -191,7 +191,15 @@ async fn scan_count(engine: &CassandraEngine, key_info: &TableKeyInfo) -> usize 
     let mut start: Option<Item> = None;
     loop {
         let (items, next) = engine
-            .scan(key_info, None, start.as_ref(), None, None, None)
+            .scan(
+                key_info,
+                None,
+                start.as_ref(),
+                None,
+                None,
+                None,
+                ReadOptions::default(),
+            )
             .await
             .expect("scan");
         count += items.len();
@@ -231,6 +239,7 @@ async fn query_index(
                 None,
                 start.as_ref(),
                 Some(index),
+                ReadOptions::default(),
             )
             .await
             .expect("query index");
@@ -466,20 +475,32 @@ async fn test_restore_uses_immutable_snapshot_with_sort_key() {
         .await
         .expect("restored table key info");
     let restored_one = engine
-        .get_item(&restored_key_info, &key("partition", Some("one")))
+        .get_item(
+            &restored_key_info,
+            &key("partition", Some("one")),
+            ReadOptions::default(),
+        )
         .await
         .expect("get first restored item")
         .expect("first restored item exists");
     assert_eq!(restored_one.get("value"), original_one.get("value"));
     let restored_two = engine
-        .get_item(&restored_key_info, &key("partition", Some("two")))
+        .get_item(
+            &restored_key_info,
+            &key("partition", Some("two")),
+            ReadOptions::default(),
+        )
         .await
         .expect("get second restored item")
         .expect("second restored item exists");
     assert_eq!(restored_two.get("value"), original_two.get("value"));
     assert!(
         engine
-            .get_item(&restored_key_info, &key("partition", Some("three")))
+            .get_item(
+                &restored_key_info,
+                &key("partition", Some("three")),
+                ReadOptions::default()
+            )
             .await
             .expect("get post-backup item")
             .is_none()
@@ -596,7 +617,11 @@ async fn test_table_name_filter_spans_table_recreation() {
         .expect("restored table key info");
     assert_eq!(restored_key_info.key_schema.len(), 1);
     let restored = engine
-        .get_item(&restored_key_info, &key("original", None))
+        .get_item(
+            &restored_key_info,
+            &key("original", None),
+            ReadOptions::default(),
+        )
         .await
         .expect("read restored item")
         .expect("restored item exists");

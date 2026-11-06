@@ -12,7 +12,7 @@ use extenddb_core::types::{
     AttributeValue, CreateTableInput, Item, TableKeyInfo, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, TableEngine};
+use extenddb_storage::{DataEngine, ReadOptions, TableEngine};
 use serde_json::json;
 
 use crate::SqliteEngine;
@@ -109,7 +109,10 @@ async fn removal_only_update_on_a_missing_key_writes_nothing() {
         let k = key(expr);
         let (old, new) = update(&engine, &key_info, &k, expr, &maps).await;
         assert_eq!((old, new), (None, None), "{expr}: no image to return");
-        let stored = engine.get_item(&key_info, &k).await.expect("get");
+        let stored = engine
+            .get_item(&key_info, &k, ReadOptions::default())
+            .await
+            .expect("get");
         assert_eq!(stored, None, "{expr}: no item may be created");
     }
 }
@@ -126,7 +129,10 @@ async fn set_add_and_mixed_updates_on_a_missing_key_still_create() {
         assert_eq!(old, None, "{expr}");
         let new = new.expect("created image");
         assert_eq!(new.len(), 2, "{expr}: key plus one attribute, got {new:?}");
-        let stored = engine.get_item(&key_info, &k).await.expect("get");
+        let stored = engine
+            .get_item(&key_info, &k, ReadOptions::default())
+            .await
+            .expect("get");
         assert_eq!(stored, Some(new), "{expr}");
     }
 
@@ -137,7 +143,13 @@ async fn set_add_and_mixed_updates_on_a_missing_key_still_create() {
         .await
         .expect("update");
     assert_eq!(new, Some(k.clone()));
-    assert_eq!(engine.get_item(&key_info, &k).await.expect("get"), Some(k));
+    assert_eq!(
+        engine
+            .get_item(&key_info, &k, ReadOptions::default())
+            .await
+            .expect("get"),
+        Some(k)
+    );
 }
 
 #[tokio::test]
@@ -156,7 +168,13 @@ async fn removal_on_an_existing_item_still_removes() {
     let (old, new) = update(&engine, &key_info, &k, "REMOVE a", &maps).await;
     assert_eq!(old, Some(item));
     assert_eq!(new, Some(k.clone()));
-    assert_eq!(engine.get_item(&key_info, &k).await.expect("get"), Some(k));
+    assert_eq!(
+        engine
+            .get_item(&key_info, &k, ReadOptions::default())
+            .await
+            .expect("get"),
+        Some(k)
+    );
 }
 
 /// UpdateItem carrying the key info cached before an UpdateTable added a GSI,
@@ -224,6 +242,9 @@ async fn a_wrong_typed_literal_for_a_gsi_the_cached_key_info_lacks_names_the_ind
         "One or more parameter values were invalid: Type mismatch for Index Key g \
          Expected: S Actual: N IndexName: gidx"
     );
-    let stored = engine.get_item(&cached, &key).await.expect("get the item");
+    let stored = engine
+        .get_item(&cached, &key, ReadOptions::default())
+        .await
+        .expect("get the item");
     assert!(stored.is_none(), "the refused update wrote nothing");
 }

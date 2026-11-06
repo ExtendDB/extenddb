@@ -5,6 +5,7 @@
 
 use extenddb_core::types::{AttributeValue, ScalarAttributeType};
 use extenddb_storage::DataEngine;
+use extenddb_storage::ReadOptions;
 use std::collections::BTreeMap;
 
 use crate::helpers::{TestTable, setup_engine};
@@ -41,7 +42,7 @@ async fn test_put_and_get_item_pk_only() {
     key.insert("id".to_string(), AttributeValue::S("test-id-1".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get failed")
         .expect("Item should exist");
@@ -90,7 +91,7 @@ async fn test_put_and_get_item_with_string_sk() {
     key.insert("sort".to_string(), AttributeValue::S("sort1".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get failed")
         .expect("Item should exist");
@@ -132,7 +133,7 @@ async fn test_put_and_get_item_with_number_sk() {
     key.insert("sort".to_string(), AttributeValue::N("100".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get failed")
         .expect("Item should exist");
@@ -192,7 +193,7 @@ async fn test_put_and_get_item_with_decimal_sk() {
         key.insert("sort".to_string(), AttributeValue::N((*sk).to_string()));
 
         let retrieved = engine
-            .get_item(&table.key_info, &key)
+            .get_item(&table.key_info, &key, ReadOptions::default())
             .await
             .expect("get_item should succeed")
             .unwrap_or_else(|| panic!("item with decimal sort key {sk} should exist"));
@@ -246,7 +247,7 @@ async fn test_put_and_get_item_with_binary_sk() {
     key.insert("sort".to_string(), AttributeValue::B(vec![1, 2, 3, 4]));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get failed")
         .expect("Item should exist");
@@ -302,7 +303,7 @@ async fn test_put_item_update_existing() {
     );
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get failed")
         .expect("Item should exist");
@@ -328,7 +329,7 @@ async fn test_get_item_not_found() {
     );
 
     let result = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("Get should succeed");
 
@@ -440,7 +441,7 @@ async fn test_put_item_with_sync_gsi() {
     key.insert("id".to_string(), AttributeValue::S("item-1".to_string()));
 
     let retrieved = engine
-        .get_item(&table.key_info, &key)
+        .get_item(&table.key_info, &key, ReadOptions::default())
         .await
         .expect("get_item failed")
         .expect("Item should exist");
@@ -451,7 +452,15 @@ async fn test_put_item_with_sync_gsi() {
     // Verify the index row exists via the public index-scan path (the write
     // is synchronous, so the row must be visible immediately).
     let (index_rows, _) = engine
-        .scan(&table.key_info, None, None, None, None, Some("TestGSI"))
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            Some("TestGSI"),
+            ReadOptions::default(),
+        )
         .await
         .expect("index scan failed");
     assert!(

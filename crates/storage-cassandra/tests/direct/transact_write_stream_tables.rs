@@ -9,7 +9,7 @@ use extenddb_core::types::{
     AttributeValue, Item, ReturnValuesOnConditionCheckFailure, ScalarAttributeType, StreamViewType,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, TransactWriteOp};
+use extenddb_storage::{DataEngine, ReadOptions, TransactWriteOp};
 use extenddb_storage_cassandra::CassandraEngine;
 use extenddb_storage_cassandra::data::index::fetch_indexes_for_table;
 
@@ -108,7 +108,15 @@ async fn test_transact_write_records_one_stream_record_per_mutation_with_a_gsi()
     .await;
 
     let (rows, _) = engine
-        .scan(&table.key_info, None, None, None, None, Some("StatusIndex"))
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            Some("StatusIndex"),
+            ReadOptions::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -221,7 +229,15 @@ async fn test_transact_write_failing_record_statement_prevents_the_index_rows() 
     batch_error(result);
 
     let (rows, _) = engine
-        .scan(&table.key_info, None, None, None, None, Some("StatusIndex"))
+        .scan(
+            &table.key_info,
+            None,
+            None,
+            None,
+            None,
+            Some("StatusIndex"),
+            ReadOptions::default(),
+        )
         .await
         .unwrap();
     assert!(

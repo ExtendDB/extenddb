@@ -8,6 +8,7 @@ use std::sync::Arc;
 use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{AttributeValue, Item};
 use extenddb_storage::DataEngine as _;
+use extenddb_storage::ReadOptions;
 use extenddb_storage::error::StorageError;
 use extenddb_storage_cassandra::data::transaction_ledger::TransactionState;
 use uuid::Uuid;
@@ -556,7 +557,10 @@ async fn test_committing_recovery_repairs_the_index_rows_of_a_row_it_commits() {
     );
     let mut key = Item::new();
     key.insert("id".to_string(), AttributeValue::S("own".to_string()));
-    let got = engine.get_item(&table.key_info, &key).await.unwrap();
+    let got = engine
+        .get_item(&table.key_info, &key, ReadOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         got.and_then(|i| i.get("gpk").cloned()),
         Some(AttributeValue::S("K2".to_string()))
