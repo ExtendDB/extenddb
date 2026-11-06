@@ -245,6 +245,8 @@ The console login form, the management API (HTTP Basic auth) and the `/metrics` 
 
 A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
 
+Every login that the limits admit runs one bcrypt check, or is answered `500` after waiting 10 seconds for a slot, whatever the name. When no admin or IAM user has the name, or the IAM user has no console password, that check runs against a fixed hash, and the login is answered and counted as a wrong password.
+
 The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
 
 Callers that reach ExtendDB from one address share one set of limits. Five failures for a user from any of them refuse that user to all of them, and 20 failures in total refuse every user, until the oldest failure is 15 minutes old. Callers share an address in these cases:
