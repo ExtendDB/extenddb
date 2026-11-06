@@ -22,6 +22,15 @@
 //! A conditional write never has an unknown outcome here (one process, one
 //! file: a statement either ran or errored), so `WriteOutcome::Unknown` is
 //! never returned.
+//!
+//! The maintenance claim is the `backup_maintenance` row, taken under the
+//! engine write lock: refused while a row with a heartbeat younger than the
+//! stale window exists, taken over (replaced) from a dead holder, heartbeated
+//! and released by generation. One process serves a file, so a holder is a
+//! command run while the server is stopped. Such a command passes a zero
+//! stale window, which the dead-owner listings and removals read as "every
+//! owner is dead" and select by status alone ([`zero_window_clause`]), so a
+//! heartbeat stamped ahead of the clock is not read as a live owner.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -31,8 +40,8 @@ use extenddb_core::backup_format::BackupArn;
 use extenddb_storage::JobPermit;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, RestoreJobRow, RestoreKind, RestoreTargetKey, StatusFields, StoreIdentity,
-    StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StaleClock,
+    StatusFields, StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -462,6 +471,49 @@ where
     )
 }
 
+/// The age test of a dead-owner listing or removal, for one bound
+/// parameter (`window` in seconds): `column` older than the window on the
+/// database's clock, or, for a zero window, nothing (the bound is still
+/// consumed). A zero window is `backup purge`'s under the serve lock: one
+/// process has the file, so every owner is dead whatever its heartbeat says,
+/// a heartbeat stamped ahead of the clock (a backward clock step) included,
+/// where `julianday(x) < julianday('now')` would count it live.
+fn zero_window_clause(window: Duration, column: &str) -> String {
+    if window.is_zero() {
+        "? = 0.0".to_owned()
+    } else {
+        format!("julianday({column}) < julianday('now') - ? / 86400.0")
+    }
+}
+
+/// A restore job record as the two listings select it.
+#[allow(clippy::type_complexity)]
+fn restore_job_row(
+    (
+        table_id,
+        account_id,
+        table_name,
+        source_backup_arn,
+        kind,
+        status,
+        owner_generation,
+        heartbeat_at,
+    ): (String, String, String, String, String, String, i64, String),
+) -> Result<RestoreJobRow, StorageError> {
+    Ok(RestoreJobRow {
+        target: RestoreTargetKey {
+            account_id,
+            table_name,
+            table_id,
+        },
+        source_backup_arn,
+        kind: RestoreKind::parse(&kind)?,
+        status: JobStatus::parse(&status)?,
+        owner_generation: u64::try_from(owner_generation).unwrap_or_default(),
+        heartbeat_at: timestamp_epoch_seconds(&heartbeat_at),
+    })
+}
+
 impl SqliteEngine {
     /// Every RUNNING restore job record at startup was owned by the process
     /// that stopped: one process serves a file, so a restart is proof of
@@ -488,6 +540,20 @@ impl SqliteEngine {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(names)
+    }
+
+    /// Remove the maintenance claim, whoever holds it: the server's startup
+    /// step under the serve lock, where one process has the file and so no
+    /// holder can be alive (a `backup purge` that died, or was killed, left
+    /// the row with a heartbeat the jobs' check would otherwise honour for
+    /// the whole stale window). Returns the holder's label when a row was
+    /// removed.
+    pub(crate) async fn clear_maintenance_claim(&self) -> Result<Option<String>, StorageError> {
+        let _writer = self.write_lock.lock().await;
+        sqlx::query_scalar("DELETE FROM backup_maintenance RETURNING holder")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
     }
 }
 
@@ -589,6 +655,26 @@ impl BackupCatalog for SqliteEngine {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)
+        })
+    }
+
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        store: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        Box::pin(async move {
+            let row: Option<RowTuple> = sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index \
+                 WHERE store_kind = ? AND store_root = ? AND store_id = ? \
+                 AND status = 'AVAILABLE' ORDER BY created_at DESC, backup_arn DESC LIMIT 1"
+            ))
+            .bind(store.store_kind.as_str())
+            .bind(&store.store_root)
+            .bind(&store.store_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(row_from_tuple).transpose()
         })
     }
 
@@ -721,6 +807,68 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.write_lock.lock().await;
+            // A zero window selects by status alone (`zero_window_clause`):
+            // the caller holds the serve lock and every owner is dead,
+            // whatever the heartbeat says, a heartbeat ahead of the clock
+            // (a backward clock step) included.
+            let affected = sqlx::query(&format!(
+                "DELETE FROM backup_index WHERE account_id = ? AND backup_id = ? \
+                 AND status = 'CREATING' \
+                 AND {}",
+                zero_window_clause(stale_after, "heartbeat_at")
+            ))
+            .bind(&key.account_id)
+            .bind(&key.backup_id)
+            .bind(stale_after.as_secs_f64())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(affected == 1)
+        })
+    }
+
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        status: BackupStatus,
+        store: &'a StoreIdentity,
+        clock: StaleClock,
+        age: Duration,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        let column = match clock {
+            StaleClock::Heartbeat => "heartbeat_at",
+            StaleClock::Completed => "completed_at",
+        };
+        rows_stream(async move {
+            // On the database's clock, as `remove_dead_creating_backup_row`
+            // measures; `julianday(NULL)` is NULL, so a row with
+            // `completed_at` unset is never older than any age on that clock.
+            // A zero window selects by status alone (`zero_window_clause`).
+            sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index \
+                 WHERE store_kind = ? AND store_root = ? AND store_id = ? AND status = ? \
+                 AND {} \
+                 ORDER BY created_at, backup_arn",
+                zero_window_clause(age, column)
+            ))
+            .bind(store.store_kind.as_str())
+            .bind(&store.store_root)
+            .bind(&store.store_id)
+            .bind(status.as_str())
+            .bind(age.as_secs_f64())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -785,14 +933,70 @@ impl BackupCatalog for SqliteEngine {
             // the copy's own failure path stamp `completed_at`, and a record
             // without one is aged by its heartbeat). The delay is what leaves
             // a task still on its own failure path to finish it. Both ages
-            // are measured on the database's clock (`julianday('now')`). A
-            // RUNNING record whose in-process slot a task holds is then
-            // skipped, however old its heartbeat: one process serves the
-            // file, so the slot is the liveness rule and the heartbeat only
-            // what a restart ages (design 4(e)). A row this build cannot read
-            // (a kind or status no release writes) is logged and skipped, as
-            // ListBackups skips a row it cannot read, so one such row does
-            // not stop the cycle.
+            // are measured on the database's clock (`julianday('now')`); a
+            // zero window selects by status alone (`zero_window_clause`).
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+            )> = sqlx::query_as(&format!(
+                "SELECT r.table_id, t.account_id, t.table_name, r.source_backup_arn, \
+                     r.kind, r.status, r.owner_generation, r.heartbeat_at \
+                     FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                     WHERE (r.status = 'RUNNING' AND {}) \
+                        OR (r.status = 'FAILED' AND t.table_status = 'CREATING' \
+                            AND {}) \
+                     ORDER BY t.account_id, t.table_name",
+                zero_window_clause(stale_after, "r.heartbeat_at"),
+                zero_window_clause(stale_after, "COALESCE(r.completed_at, r.heartbeat_at)"),
+            ))
+            .bind(stale_after.as_secs_f64())
+            .bind(stale_after.as_secs_f64())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            // A RUNNING record whose in-process slot a task holds is skipped,
+            // however old its heartbeat: one process serves the file, so the
+            // slot is the liveness rule and the heartbeat only what a restart
+            // ages (design 4(e)). A row this build cannot read (a kind or
+            // status no release writes) is logged and skipped, as ListBackups
+            // skips a row it cannot read, so one such row does not stop the
+            // cycle.
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| {
+                    let (table_id, account_id, table_name, status) =
+                        (row.0.clone(), row.1.clone(), row.2.clone(), row.5.clone());
+                    if status == JobStatus::Running.as_str()
+                        && self.job_slots.holds(&restore_slot_key(&table_id))
+                    {
+                        return None;
+                    }
+                    match restore_job_row(row) {
+                        Ok(job) => Some(job),
+                        Err(e) => {
+                            tracing::warn!(
+                                "reconciler: restore job record of {table_name} (account \
+                                 {account_id}) skipped: {e}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn list_running_restore_jobs(&self) -> BoxFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            // By status alone: a record stamped in this statement's instant,
+            // or ahead of the database's clock, is RUNNING too.
             #[allow(clippy::type_complexity)]
             let rows: Vec<(
                 String,
@@ -807,61 +1011,12 @@ impl BackupCatalog for SqliteEngine {
                 "SELECT r.table_id, t.account_id, t.table_name, r.source_backup_arn, \
                      r.kind, r.status, r.owner_generation, r.heartbeat_at \
                      FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                     WHERE (r.status = 'RUNNING' \
-                            AND julianday(r.heartbeat_at) < julianday('now') - ?1 / 86400.0) \
-                        OR (r.status = 'FAILED' AND t.table_status = 'CREATING' \
-                            AND julianday(COALESCE(r.completed_at, r.heartbeat_at)) \
-                                < julianday('now') - ?1 / 86400.0) \
-                     ORDER BY t.account_id, t.table_name",
+                     WHERE r.status = 'RUNNING' ORDER BY t.account_id, t.table_name",
             )
-            .bind(stale_after.as_secs_f64())
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-            Ok(rows
-                .into_iter()
-                .filter_map(
-                    |(
-                        table_id,
-                        account_id,
-                        table_name,
-                        source_backup_arn,
-                        kind,
-                        status,
-                        owner_generation,
-                        heartbeat_at,
-                    )| {
-                        let (kind, status) =
-                            match (RestoreKind::parse(&kind), JobStatus::parse(&status)) {
-                                (Ok(kind), Ok(status)) => (kind, status),
-                                (Err(e), _) | (_, Err(e)) => {
-                                    tracing::warn!(
-                                        "reconciler: restore job record of {table_name} (account \
-                                     {account_id}) skipped: {e}"
-                                    );
-                                    return None;
-                                }
-                            };
-                        if status == JobStatus::Running
-                            && self.job_slots.holds(&restore_slot_key(&table_id))
-                        {
-                            return None;
-                        }
-                        Some(RestoreJobRow {
-                            target: RestoreTargetKey {
-                                account_id,
-                                table_name,
-                                table_id,
-                            },
-                            source_backup_arn,
-                            kind,
-                            status,
-                            owner_generation: u64::try_from(owner_generation).unwrap_or_default(),
-                            heartbeat_at: timestamp_epoch_seconds(&heartbeat_at),
-                        })
-                    },
-                )
-                .collect())
+            rows.into_iter().map(restore_job_row).collect()
         })
     }
 
@@ -905,12 +1060,130 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
         Box::pin(async move {
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_maintenance)")
-                .fetch_one(&self.pool)
+            sqlx::query_scalar(
+                "SELECT DISTINCT store_id FROM backup_index \
+                 WHERE store_kind = ? AND store_root = ? ORDER BY store_id",
+            )
+            .bind(store_kind.as_str())
+            .bind(store_root)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn MaintenanceClaim>, StorageError>> {
+        Box::pin(async move {
+            // One process serves a file (the serve lock), so the row is the
+            // claim: taken under the engine write lock, refused while a row
+            // with a live heartbeat exists, taken over from a dead one. An
+            // engine that holds the serve lock (a command that opened the
+            // file as `serve` does) is the only process on the file, so the
+            // holder of any row is dead whatever its heartbeat says, as the
+            // server's startup decides (`clear_maintenance_claim`): the row
+            // is taken over.
+            let _writer = self.write_lock.lock().await;
+            let live: Option<String> = if self.serve_lock.is_some() {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "SELECT holder FROM backup_maintenance \
+                     WHERE julianday(heartbeat_at) >= julianday('now') - ? / 86400.0",
+                )
+                .bind(stale_after.as_secs_f64())
+                .fetch_optional(&self.pool)
                 .await
-                .map_err(db_err)
+                .map_err(db_err)?
+            };
+            if let Some(current) = live {
+                return Err(StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {current}"
+                )));
+            }
+            let generation = new_generation();
+            sqlx::query(&format!(
+                "INSERT OR REPLACE INTO backup_maintenance \
+                 (singleton, holder, owner_generation, claimed_at, heartbeat_at) \
+                 VALUES (1, ?, ?, {NOW}, {NOW})"
+            ))
+            .bind(holder)
+            .bind(generation_column(generation))
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+            Ok(Box::new(SqliteMaintenanceClaim {
+                engine: self.clone(),
+                generation,
+            }) as Box<dyn MaintenanceClaim>)
+        })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        Box::pin(async move {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM backup_maintenance \
+                 WHERE julianday(heartbeat_at) >= julianday('now') - ? / 86400.0)",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+}
+
+/// The holder's handle on the `backup_maintenance` row.
+struct SqliteMaintenanceClaim {
+    engine: SqliteEngine,
+    generation: u64,
+}
+
+impl MaintenanceClaim for SqliteMaintenanceClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.engine.write_lock.lock().await;
+            let affected = sqlx::query(&format!(
+                "UPDATE backup_maintenance SET heartbeat_at = {NOW} WHERE owner_generation = ?"
+            ))
+            .bind(generation_column(self.generation))
+            .execute(&self.engine.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(if affected == 1 {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+        Box::pin(async move {
+            let _writer = self.engine.write_lock.lock().await;
+            sqlx::query("DELETE FROM backup_maintenance WHERE owner_generation = ?")
+                .bind(generation_column(self.generation))
+                .execute(&self.engine.pool)
+                .await
+                .map_err(db_err)?;
+            Ok(())
         })
     }
 }

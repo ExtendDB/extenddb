@@ -8,7 +8,11 @@
 //! `DynamoDB`-format error responses.
 
 mod backup;
-pub use backup::{BackupRuntime, reconciler};
+pub use backup::{
+    BackupRuntime, ConfiguredStore, HeldClaim, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT,
+    STORE_IDENTITY_KEY, Spool, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem,
+    check_configured_store, maintenance, read_identity_bounded, reconciler, store_identity,
+};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;

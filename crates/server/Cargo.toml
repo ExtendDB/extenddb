@@ -16,6 +16,7 @@ extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
@@ -54,3 +55,5 @@ libc = { workspace = true }
 extenddb-cache = { workspace = true, features = ["test-util"] }
 # Self-signed certificates for the TLS listener tests.
 rcgen = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

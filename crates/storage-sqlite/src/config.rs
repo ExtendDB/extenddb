@@ -69,6 +69,10 @@ impl StorageConfig for SqliteConfig {
         &self.path
     }
 
+    fn database_file(&self) -> Option<std::path::PathBuf> {
+        crate::serve_lock::database_file(&self.path).ok().flatten()
+    }
+
     fn max_connections(&self) -> u32 {
         self.pool_size
     }
