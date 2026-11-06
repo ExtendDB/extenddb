@@ -1724,6 +1724,43 @@ def test_a_closing_token_in_an_update_is_an_unexpected_term(dynamodb_client, cta
     assert _message(dynamodb_client, statement) == WF + "Unexpected term"
 
 
+@pytest.mark.parametrize(
+    "item",
+    [
+        "{]",
+        "{)",
+        "{>>",
+        "{,}",
+        "{'pk': 'a', ]",
+        "{'pk': 'a', 'sk': 's',}",
+        "{'pk': 'a', 'sk': 's', }",
+    ],
+)
+def test_a_closing_token_where_an_insert_item_key_starts_is_an_unexpected_term(
+    dynamodb_client, ctable, item
+):
+    # The item map of an INSERT answers as a nested map does (measured
+    # 2026-11-06 in ExecuteStatement, a batch and a transaction).
+    statement = f"INSERT INTO \"{ctable}\" VALUE {item}"
+    assert _message(dynamodb_client, statement) == WF + "Unexpected term"
+    assert dynamodb_client.batch_execute_statement(Statements=[{"Statement": statement}])[
+        "Responses"
+    ][0]["Error"] == {"Code": "ValidationError", "Message": WF + "Unexpected term"}
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[{"Statement": statement}])
+    assert e.value.response["Error"]["Message"] == (
+        "Validation failed in TransactStatements[0]: " + WF + "Unexpected term"
+    )
+
+
+def test_a_name_as_an_insert_item_key_keeps_its_refusal(dynamodb_client, ctable):
+    statement = f"INSERT INTO \"{ctable}\" VALUE {{'pk': 'a', sk: 's'}}"
+    column = statement.index("sk:") + 1
+    assert _message(dynamodb_client, statement) == (
+        f"Tuple keys must be of type String. Actual type: Id under root at 1:{column}:2"
+    )
+
+
 def test_a_value_after_in_and_a_name_as_a_key_keep_their_refusals(dynamodb_client, ctable, pair):
     head = f"SELECT * FROM \"{ctable}\" WHERE pk = '{pair}' AND "
     assert _message(dynamodb_client, head + "a IN 1") == (

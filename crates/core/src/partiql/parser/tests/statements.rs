@@ -79,6 +79,31 @@ fn insert_double_quoted_key_is_rejected() {
 }
 
 #[test]
+fn a_closing_token_where_an_item_key_starts_is_an_unexpected_term() {
+    // (measured 2026-11-06, the same answer as for a nested map's key)
+    for item in [
+        "{]",
+        "{)",
+        "{>>",
+        "{,}",
+        "{'pk': 'a', ]",
+        "{'pk': 'a', 'sk': 's',}",
+        "{'pk': 'a', 'sk': 's', }",
+    ] {
+        assert_eq!(
+            err(&format!("INSERT INTO \"t\" VALUE {item}")),
+            "Statement wasn't well formed, can't be processed: Unexpected term",
+            "{item}"
+        );
+    }
+    // A name as a key keeps its refusal, at the name.
+    assert_eq!(
+        err("INSERT INTO \"t\" VALUE {'pk': 'a', sk: 's'}"),
+        "Tuple keys must be of type String. Actual type: Id under root at 1:35:2"
+    );
+}
+
+#[test]
 fn two_statements_separated_by_semicolon() {
     assert_eq!(
         err("SELECT * FROM \"t\" WHERE pk='a';SELECT * FROM \"t\" WHERE pk='b'"),
