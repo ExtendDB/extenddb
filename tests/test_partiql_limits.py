@@ -488,12 +488,17 @@ SHAPES = list(_shapes("t"))
 
 @pytest.mark.parametrize("shape", SHAPES)
 def test_a_statement_nested_to_the_length_limit_is_refused_and_the_server_keeps_serving(
-    once, table, shape
+    once, endpoint_url, table, shape
 ):
     statement = _shapes(table)[shape]
     assert len(statement) <= MAX_LENGTH
-    with pytest.raises(ClientError):
+    with pytest.raises(ClientError) as e:
         once.execute_statement(Statement=statement)
+    # The service answers some shapes with an internal error; an extenddb
+    # server refuses every one of them as a client error.
+    if endpoint_url:
+        assert e.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400, e.value.response
+        assert e.value.response["Error"]["Code"] == "ValidationException", e.value.response
     assert _items(once, _where(table) + "pk = 'a'") == []
 
 
