@@ -117,7 +117,8 @@ comprehensive	tests/python/test_gsi.py	8	6	3	6
 comprehensive	tests/python/test_item_edge_cases.py	60	39	12	47
 comprehensive	tests/python/test_items.py	61	40	11	46
 comprehensive	tests/python/test_query_scan.py	3	2	1	2
-comprehensive	tests/python/test_query_start_key_partition.py	-	-	-	27
+comprehensive	tests/python/test_query_start_key_index.py	-	-	-	6
+comprehensive	tests/python/test_query_start_key_partition.py	-	-	-	22
 comprehensive	tests/python/test_query_start_key_range.py	-	-	-	40
 comprehensive	tests/python/test_rfc0003_concurrency.py	8	5	4	6
 comprehensive	tests/python/test_scan_edge_cases.py	36	24	8	27
