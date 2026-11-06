@@ -9,6 +9,9 @@ license.workspace = true
 
 [features]
 mongodb-test-hooks = []
+# The backup job's kill-point pauses (`EXTENDDB_BACKUP_PAUSE`), for the
+# binary-level crash tests.
+backup-test-hooks = ["extenddb-engine/backup-test-hooks"]
 
 [dependencies]
 extenddb-cache = { workspace = true }
@@ -16,6 +19,7 @@ extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
@@ -51,9 +55,15 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+# The login tests count bcrypt checks with `count_verifications` against an
+# in-memory SQLite catalog.
+extenddb-storage = { workspace = true, features = ["test-util"] }
 # The bulk authorization tests drive `authorize_request` against a real
 # `AppState`. The server crate is backend-agnostic at runtime (it holds an
 # `Arc<dyn StorageEngine>`), so a concrete backend appears here only as a
 # test dependency; the sqlite in-memory database gives each test an
 # isolated engine with no file on disk, matching the engine crate's tests.
 extenddb-storage-sqlite = { workspace = true, features = ["memory"] }
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

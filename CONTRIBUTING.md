@@ -47,8 +47,9 @@ cargo build --workspace
 # Rust unit tests
 cargo test --workspace
 
-# Integration tests (requires a running extenddb server)
-devtools/run-tests --extenddb --pytest
+# Integration tests (requires a running extenddb server; the variable says
+# where that server writes its backups, see the developer test guide)
+EXTENDDB_TEST_BACKUP_STORE=filesystem devtools/run-tests --extenddb --pytest
 ```
 
 ### Code Style

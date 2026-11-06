@@ -55,7 +55,7 @@ use sqlx::postgres::PgConnectOptions;
 
 pub use backend::{PostgresMigrations, PostgresStores};
 pub use commands::{PostgresCatalogMigrations, resolve};
-pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, ServingRegistration};
+pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, SERVE_APPLICATION, ServingRegistration};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Column, Definitions, Index, compare, describe};
 pub use registrar::ServerRegistration;

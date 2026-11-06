@@ -64,6 +64,56 @@ pub enum MetricName {
     /// whose write committed; replayed rows and condition failures are not
     /// counted (dimensions: table).
     BulkPutItemsWritten,
+    /// Store-backed backup jobs ended, one per job; the operation dimension
+    /// carries the outcome ([`BackupJobOutcome`]: `succeeded`, `failed` or
+    /// `cancelled`). `/metrics` emits it under this name as JSON, as it does
+    /// every metric (the endpoint is not Prometheus exposition format); a
+    /// converter would give it a name like `backup_jobs_total{outcome}`, and
+    /// nothing in the server renders that.
+    BackupJobs,
+    /// Duration of a store-backed backup job in microseconds, from the
+    /// snapshot's open to the end of its last catalog or store call (the
+    /// AVAILABLE write, or the FAILED write and the prefix's deletion);
+    /// recorded for every outcome, with the outcome as the operation
+    /// dimension.
+    BackupJobDuration,
+    /// Bytes a backup job that ended AVAILABLE wrote to the store: every
+    /// data file and document as the store reported it stored; a failed
+    /// job's uploaded and then deleted bytes are not counted.
+    BackupBytesUploaded,
+    /// Seconds between a running backup job's snapshot instant and now
+    /// (gauge), recorded at each confirmed heartbeat.
+    BackupSnapshotAge,
+    /// Store operations a backup job or the backup reconciler saw fail; the
+    /// operation dimension names the store call (`put` by the job's
+    /// uploads, `delete_prefix` by its failure path and the reconciler's
+    /// deleting duties, `get` and `list` by the reconciler's manifest probe
+    /// and deleting duties).
+    BackupStoreErrors,
+}
+
+/// How a store-backed backup job ended, the operation dimension of
+/// [`MetricName::BackupJobs`] and [`MetricName::BackupJobDuration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackupJobOutcome {
+    /// The manifest was written and the row is AVAILABLE.
+    Succeeded,
+    /// The row is FAILED, or the job stopped without a status write of its
+    /// own (its claim lost).
+    Failed,
+    /// The server's shutdown stopped the job; the row is FAILED with reason
+    /// `shutdown`.
+    Cancelled,
+}
+
+impl std::fmt::Display for BackupJobOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        })
+    }
 }
 
 impl std::fmt::Display for MetricName {
@@ -98,6 +148,11 @@ impl std::fmt::Display for MetricName {
             Self::BulkOperationsStarted => f.write_str("BulkOperationsStarted"),
             Self::BulkOperationsFinished => f.write_str("BulkOperationsFinished"),
             Self::BulkPutItemsWritten => f.write_str("BulkPutItemsWritten"),
+            Self::BackupJobs => f.write_str("BackupJobs"),
+            Self::BackupJobDuration => f.write_str("BackupJobDuration"),
+            Self::BackupBytesUploaded => f.write_str("BackupBytesUploaded"),
+            Self::BackupSnapshotAge => f.write_str("BackupSnapshotAge"),
+            Self::BackupStoreErrors => f.write_str("BackupStoreErrors"),
         }
     }
 }
@@ -143,6 +198,9 @@ pub enum QuerySource {
     LoginAttemptCleanup,
     /// Background: the backup reconciler.
     BackupReconciler,
+    /// A store-backed backup job (the worker metrics are recorded once per
+    /// job, at its end).
+    BackupJob,
     /// Background: bulk operation claim loop.
     BulkClaim,
     /// Background: bulk operation retention purge.
@@ -168,6 +226,7 @@ impl std::fmt::Display for QuerySource {
             Self::ControlPlane => f.write_str("ControlPlane"),
             Self::LoginAttemptCleanup => f.write_str("LoginAttemptCleanup"),
             Self::BackupReconciler => f.write_str("BackupReconciler"),
+            Self::BackupJob => f.write_str("BackupJob"),
             Self::BulkClaim => f.write_str("BulkClaim"),
             Self::BulkRetention => f.write_str("BulkRetention"),
             Self::Management => f.write_str("Management"),

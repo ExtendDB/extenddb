@@ -24,6 +24,13 @@
 //!   between the read of a CREATING row and the fence that moves it to
 //!   DELETING, so a test can heartbeat the row in that gap and see the
 //!   fence's own `heartbeat_at = ?` condition leave it alone.
+//! * a lost answer on the maintenance claim's insert, so a test can see the
+//!   re-read settle a claim whose `INSERT ... IF NOT EXISTS` committed;
+//! * a pause between a maintenance claim takeover's read and its write, so
+//!   a test can hold two takers of one stale row there and see one win;
+//! * a pause in `claim_dead_backup` between its `LOCAL_SERIAL` read and its
+//!   takeover LWT, so a test can land the owner's beat in that gap and see
+//!   the LWT's `heartbeat_at = <read>` condition refuse the takeover.
 
 use std::time::Duration;
 
@@ -74,6 +81,9 @@ mod armed {
         pub(super) heartbeat_errors: HashMap<String, usize>,
         pub(super) before_delete_claim: HashMap<String, Arc<Pause>>,
         pub(super) before_abandoned_fence: HashMap<String, Arc<Pause>>,
+        pub(super) lose_maintenance_insert_answer: bool,
+        pub(super) before_maintenance_takeover: Option<Arc<Pause>>,
+        pub(super) before_takeover_write: HashMap<String, Arc<Pause>>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -144,6 +154,20 @@ pub fn pause_before_abandoned_fence(backup_arn: &str) -> std::sync::Arc<Pause> {
     pause
 }
 
+/// Arm a pause in the next `claim_dead_backup` of `backup_arn`, between its
+/// read of the row and its takeover write. The pause is taken once and then
+/// disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_takeover_write(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_takeover_write
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
 /// The period the jobs of `account_id` heartbeat at.
 pub(crate) fn heartbeat_interval(account_id: &str) -> Duration {
     #[cfg(feature = "test-hooks")]
@@ -197,4 +221,60 @@ pub(crate) async fn before_abandoned_fence(backup_arn: &str) {
         pause.hold().await;
     }
     let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause for the takeover of `backup_arn`.
+pub(crate) async fn before_takeover_write(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_takeover_write.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Make the next `maintenance_claim`'s `INSERT ... IF NOT EXISTS` lose its
+/// answer: the statement runs and commits, and the caller sees
+/// `WriteOutcome::Unknown`, as after a write timeout on the Paxos round. The
+/// hook is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn lose_next_maintenance_insert_answer() {
+    armed::with_hooks(|hooks| hooks.lose_maintenance_insert_answer = true);
+}
+
+/// Arm a pause in every `maintenance_claim` takeover, between the read of
+/// the stale row and the `UPDATE ... IF owner_generation = <old>`, so a test
+/// can hold two takers there and release both: each signals `reached` and
+/// waits for one `release`. Disarmed by [`clear_maintenance_takeover_pause`].
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_maintenance_takeover() -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks.before_maintenance_takeover = Some(std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Disarm [`pause_before_maintenance_takeover`].
+#[cfg(feature = "test-hooks")]
+pub fn clear_maintenance_takeover_pause() {
+    armed::with_hooks(|hooks| hooks.before_maintenance_takeover = None);
+}
+
+/// Hold here if a test armed the takeover pause.
+pub(crate) async fn before_maintenance_takeover() {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_maintenance_takeover.clone()) {
+        pause.hold().await;
+    }
+}
+
+/// Whether a test asked for the maintenance claim insert's answer to be
+/// lost ([`lose_next_maintenance_insert_answer`]); disarms the hook.
+pub(crate) fn maintenance_insert_answer_lost() -> bool {
+    #[cfg(feature = "test-hooks")]
+    {
+        armed::with_hooks(|hooks| std::mem::take(&mut hooks.lose_maintenance_insert_answer))
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    false
 }

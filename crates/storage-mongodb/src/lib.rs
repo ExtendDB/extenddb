@@ -134,9 +134,12 @@ fn server_components_factory(
         // Register as the catalog's server, then read the migration lock and
         // the catalog's status, before the engine writes anything: a server
         // that refuses has deleted its registration and written nothing else.
-        let registration = migrations::register_and_check(
+        // Every caller registers, a command too, so a migration does not run
+        // under one; a command's registration carries its own name.
+        let registration = migrations::register_and_check_as(
             &migrations::MongoTarget::new(&connection_string),
             options.release,
+            options.command.unwrap_or(migrations::SERVE_COMMAND),
             migrations::Timing::PRODUCTION,
         )
         .await
@@ -149,6 +152,7 @@ fn server_components_factory(
             max_catalog_connections,
             tx_read_concern,
             Arc::clone(&registration),
+            &options,
         )
         .await;
         if built.is_err() {
@@ -156,6 +160,33 @@ fn server_components_factory(
         }
         built
     })
+}
+
+/// Start the startup key repair, for a server only; returns its task.
+///
+/// An UpdateItem on a build before the fix for issue #436 could create
+/// an item whose document has no key. The repair rewrites any such
+/// document, so that reads return the key and PutItem on it succeeds (see
+/// `data_engine::key_repair`). It runs in the background: the pass costs
+/// time in proportion to the number of affected documents, and the
+/// listener must not wait for it. A key the pass has not reached yet
+/// answers as it did before the repair existed, and each batch is its own
+/// transaction, so running it while another process serves the same data
+/// is safe.
+///
+/// The repair is a server's: a command that opens the catalog beside a
+/// server (`options.beside_server`: `extenddb backup list` and the purge's
+/// dry run), or one that writes beside the live servers with
+/// `options.startup_recovery` off (`purge --confirm`), starts none, as on
+/// PostgreSQL, where such a command runs none of the startup recovery; it
+/// would otherwise start a write pass over the data and exit while the pass
+/// may be mid-batch.
+fn start_key_repair(
+    engine: &Arc<MongoEngine>,
+    options: &extenddb_storage::server_components::ServerComponentsOptions,
+) -> Option<tokio::task::JoinHandle<()>> {
+    (!options.beside_server && options.startup_recovery)
+        .then(|| data_engine::key_repair::spawn_key_repair(engine.clone()))
 }
 
 /// The engine and stores `serve` runs on, built once the server holds its
@@ -167,6 +198,7 @@ async fn build_components(
     max_catalog_connections: Option<u32>,
     tx_read_concern: mongodb::options::ReadConcern,
     registration: Arc<migrations::ServerRegistration>,
+    options: &extenddb_storage::server_components::ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
     // Create MongoEngine
     let engine = MongoEngine::new(connection_string, region, max_connections, tx_read_concern)
@@ -178,16 +210,7 @@ async fn build_components(
 
     let engine = Arc::new(engine);
 
-    // An UpdateItem on a build before the fix for issue #436 could create
-    // an item whose document has no key. Rewrite any such document, so
-    // that reads return the key and PutItem on it succeeds (see
-    // `data_engine::key_repair`). This runs in the background: the pass
-    // costs time in proportion to the number of affected documents, and
-    // the listener must not wait for it. A key the pass has not reached
-    // yet answers as it did before the repair existed, and each batch is
-    // its own transaction, so running this while another process serves
-    // the same data is safe.
-    data_engine::key_repair::spawn_key_repair(engine.clone());
+    start_key_repair(&engine, options);
 
     // Create one shared catalog/management client. MongoDB Client clones
     // share the underlying pool, so max_catalog_connections limits the

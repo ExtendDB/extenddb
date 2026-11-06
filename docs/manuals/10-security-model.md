@@ -401,7 +401,7 @@ An admin session can read and change every account. Every page and form under `/
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions that expire after 8 hours of inactivity, HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
+- **Session management**: Server-side sessions that end 8 hours after login however active they are (the cookie's `Max-Age` is the same 8 hours), HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
 - **Session revocation**: A session is bound to the password hash its admin or IAM user logged in with. Every console request reads that hash from the catalog again. When the principal has been deleted, or its password has been changed, the session is removed and the request is redirected to the login page. This happens at the session's next request on every server that shares the catalog, because no server keeps a copy of the hash between requests. On Cassandra the read and the writes that change the hash use `LOCAL_QUORUM`, so a server in another datacenter sees the change once it has replicated there. If the catalog cannot be read, the request gets HTTP 503 and the session is kept. A refused request does not count as activity, so the 8 hour idle timeout keeps running during a catalog outage.
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
@@ -418,6 +418,8 @@ The console login form, the management API (HTTP Basic auth) and the `/metrics` 
 - **Bounded verification.** At most 4 bcrypt operations (password checks and password hashes) run at once per process. A login that waits more than 10 seconds for a slot is answered `500` and is not counted as a failure, since no password was checked.
 
 A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
+
+Every login that the limits admit runs one bcrypt check, or is answered `500` after waiting 10 seconds for a slot, whatever the name. When no admin or IAM user has the name, or the IAM user has no console password, that check runs against a fixed hash, and the login is answered and counted as a wrong password.
 
 The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
 

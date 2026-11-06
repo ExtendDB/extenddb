@@ -7,10 +7,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Kill-point pauses in the backup job (`EXTENDDB_BACKUP_PAUSE`), for the
+# binary-level crash tests; never enabled in a release build.
+backup-test-hooks = []
+
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -25,6 +31,9 @@ md-5 = "0.10"
 hex = "0.4"
 rand = { workspace = true }
 tokio = { workspace = true }
+# `TaskTracker` for the backup jobs the server drains at shutdown.
+tokio-util = { workspace = true, features = ["rt"] }
+bytes = { workspace = true }
 futures = { workspace = true }
 # The bulk put S3 store: the shared S3 clients and the server's AWS
 # credentials, and the S3 client types the store's calls use.
@@ -51,7 +60,8 @@ extenddb-storage-sqlite = { workspace = true, features = ["memory"] }
 extenddb-storage-postgres = { workspace = true }
 sqlx = { workspace = true }
 # `test-util` gives the write pacer tests a paused clock, so a one-second
-# bucket is measured without a one-second sleep.
+# bucket is measured without a one-second sleep, and `start_paused` to the
+# tests of timers that must not depend on the wall clock.
 tokio = { workspace = true, features = ["test-util"] }
 # The S3 store's fault tests answer canned S3 responses through the SDK's
 # replay HTTP client, and build SDK configurations without reading the

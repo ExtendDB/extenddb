@@ -430,6 +430,14 @@ impl extenddb_storage::BackupCatalog for BulkUnsupportedStorage {
         extenddb_storage::BackupCatalog::list_backup_rows(&*self.inner, status, store)
     }
 
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        store: &'a extenddb_storage::backup_catalog::StoreIdentity,
+    ) -> BoxFuture<'a, Result<Option<extenddb_storage::backup_catalog::BackupRow>, StorageError>>
+    {
+        extenddb_storage::BackupCatalog::newest_available_backup_row(&*self.inner, store)
+    }
+
     fn list_account_backup_rows<'a>(
         &'a self,
         account_id: &'a str,
@@ -476,6 +484,49 @@ impl extenddb_storage::BackupCatalog for BulkUnsupportedStorage {
         extenddb_storage::BackupCatalog::remove_backup_row(&*self.inner, key)
     }
 
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a extenddb_storage::backup_catalog::BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        extenddb_storage::BackupCatalog::remove_dead_creating_backup_row(
+            &*self.inner,
+            key,
+            stale_after,
+        )
+    }
+
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a extenddb_storage::backup_catalog::BackupKey,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn extenddb_storage::JobClaim>>, StorageError>> {
+        extenddb_storage::BackupCatalog::claim_dead_backup(&*self.inner, key, stale_after)
+    }
+
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        status: extenddb_storage::backup_catalog::BackupStatus,
+        store: &'a extenddb_storage::backup_catalog::StoreIdentity,
+        clock: extenddb_storage::backup_catalog::StaleClock,
+        age: Duration,
+    ) -> futures::stream::BoxStream<
+        'a,
+        Result<extenddb_storage::backup_catalog::BackupRow, StorageError>,
+    > {
+        extenddb_storage::BackupCatalog::list_backup_rows_older_than(
+            &*self.inner,
+            status,
+            store,
+            clock,
+            age,
+        )
+    }
+
+    fn sweep_restore_registrations(&self) -> BoxFuture<'_, Result<Vec<String>, StorageError>> {
+        extenddb_storage::BackupCatalog::sweep_restore_registrations(&*self.inner)
+    }
+
     fn backup_in_use<'a>(
         &'a self,
         key: &'a extenddb_storage::backup_catalog::BackupKey,
@@ -498,6 +549,13 @@ impl extenddb_storage::BackupCatalog for BulkUnsupportedStorage {
         extenddb_storage::BackupCatalog::list_dead_restore_jobs(&*self.inner, stale_after)
     }
 
+    fn list_running_restore_jobs(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<extenddb_storage::backup_catalog::RestoreJobRow>, StorageError>>
+    {
+        extenddb_storage::BackupCatalog::list_running_restore_jobs(&*self.inner)
+    }
+
     fn fail_restore_job<'a>(
         &'a self,
         key: &'a extenddb_storage::backup_catalog::RestoreTargetKey,
@@ -514,8 +572,27 @@ impl extenddb_storage::BackupCatalog for BulkUnsupportedStorage {
         )
     }
 
-    fn check_maintenance_claim(&self) -> BoxFuture<'_, Result<bool, StorageError>> {
-        extenddb_storage::BackupCatalog::check_maintenance_claim(&*self.inner)
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: extenddb_storage::backup_catalog::StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, StorageError>> {
+        extenddb_storage::BackupCatalog::read_store_ids(&*self.inner, store_kind, store_root)
+    }
+
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        stale_after: Duration,
+    ) -> BoxFuture<'a, Result<Box<dyn extenddb_storage::MaintenanceClaim>, StorageError>> {
+        extenddb_storage::BackupCatalog::maintenance_claim(&*self.inner, holder, stale_after)
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxFuture<'_, Result<bool, StorageError>> {
+        extenddb_storage::BackupCatalog::check_maintenance_claim(&*self.inner, stale_after)
     }
 }
 

@@ -1278,7 +1278,7 @@ extenddb reproduces DynamoDB error responses exactly. Common errors:
 | PartiQL | ✗ (not planned) |
 | DAX | ✗ (not applicable) |
 | Global Tables | ✗ (future) |
-| On-demand backups (CreateBackup / RestoreTableFromBackup) | ✓ |
+| On-demand backups (CreateBackup / RestoreTableFromBackup) | Partial: CreateBackup ✓ (to the configured filesystem or S3 backup store on PostgreSQL, SQLite and MongoDB; in-catalog without one and on Cassandra); RestoreTableFromBackup ✓ for in-catalog backups only, store-backed backups from a later release (their restore answers a `ValidationException` naming the store this release; the upgrade manual) |
 | Point-in-time recovery | ✗ (`UpdateContinuousBackups` refuses to enable it; see differences-from-dynamodb.md) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 

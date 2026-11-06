@@ -55,12 +55,23 @@
 //! LIMIT n`), which `SQLite` serves from the primary key index. Multi-part
 //! range keys fall back to rowid order and report `key_ordered = false`.
 //!
-//! Memory: one page is `LIMIT paging::DEFAULT_FETCH_BATCH` (1000) rows, all
-//! of them held as item text at once. At the default 400 KB item limit one
-//! row's text can reach 27.7 MB (the measured worst case in #394's line-cap
-//! table), so a page is bounded by rows, not bytes. A byte budget (keyset
-//! paging with a byte cutoff) is required before the stream gets a caller;
-//! the backup design assigns it to the backup job PR.
+//! Memory: a page ends at `paging::fetch_batch()` rows (1000) or after the
+//! row that takes its item text to or past `paging::fetch_bytes()` (64 MiB,
+//! the budget `extenddb_storage::snapshot::paging` states), whichever comes
+//! first, so a page holds at most the budget plus one row of item text. The
+//! cut is applied while the page's rows are pulled from the query one at a
+//! time (`fetch_page`): the pull stops at the cut and the statement is
+//! reset, so the stream reads no row past it and the next page starts after
+//! the last row pulled. The driver's worker thread runs the statement ahead
+//! of the pull and buffers the rows it has read: that run-ahead is bounded by
+//! the pool's `row_buffer_size` (`store.rs`), not by the budget, at five
+//! rows (the four the channel holds and the one the worker holds while its
+//! `send` waits), 160 MiB at the 32 MiB line cap, and is the one term of a
+//! page's memory the budget does not state. A page cut by the budget is short
+//! without being the end of the table; the end is a page under the row bound
+//! that the budget did not cut. The in-memory copy is a different bound: it
+//! holds the whole table decoded, and the slot count, not the budget, bounds
+//! how many copies exist at once.
 
 use extenddb_core::types::{Item, ScalarAttributeType, TableDescription};
 use extenddb_storage::error::StorageError;
@@ -266,9 +277,10 @@ fn keyset_stream(
         buffer: Vec::new().into_iter(),
         done: false,
     };
-    // Read the page size once so a change to the test knob during a stream
-    // cannot end it early or late.
+    // Read the page size and the byte budget once so a change to either
+    // test knob during a stream cannot end it early or late.
     let batch = paging::fetch_batch();
+    let budget = paging::fetch_bytes();
     let limit = i64::try_from(batch).unwrap_or(i64::MAX);
     Box::pin(futures::stream::unfold(
         state,
@@ -282,8 +294,16 @@ fn keyset_stream(
                 }
                 let tx = state.tx.as_mut()?;
                 paging::record_fetch();
-                let page = fetch_page(tx, &state.table, &state.paging, &state.cursor, limit).await;
-                let (items, next_cursor) = match page {
+                let page = fetch_page(
+                    tx,
+                    &state.table,
+                    &state.paging,
+                    &state.cursor,
+                    limit,
+                    budget,
+                )
+                .await;
+                let Page { items, next, cut } = match page {
                     Ok(page) => page,
                     Err(e) => {
                         state.done = true;
@@ -292,10 +312,13 @@ fn keyset_stream(
                         return Some((Err(e), state));
                     }
                 };
-                if let Some(next) = next_cursor {
+                if let Some(next) = next {
                     state.cursor = next;
                 }
-                if items.len() < batch {
+                // A short page shows the end only when the budget did not
+                // cut it: a cut page is short because the pull stopped, not
+                // because the table did.
+                if items.len() < batch && !cut {
                     state.done = true;
                     if let Some(tx) = state.tx.take() {
                         let _ = tx.commit().await;
@@ -308,127 +331,118 @@ fn keyset_stream(
     ))
 }
 
-/// Query one page of up to `limit` rows for the paging mode and cursor.
-async fn query_page(
-    tx: &mut Transaction<'static, Sqlite>,
-    table: &str,
-    paging: &Paging,
-    cursor: &Cursor,
-    limit: i64,
-) -> Result<Vec<sqlx::sqlite::SqliteRow>, StorageError> {
-    match (paging, cursor) {
+/// The SQL of one page for the paging mode and cursor: the key columns and
+/// `item_data`, in key order, after the cursor when there is one, `LIMIT ?`
+/// last.
+fn page_sql(table: &str, paging: &Paging, cursor: &Cursor) -> Result<String, StorageError> {
+    Ok(match (paging, cursor) {
         (Paging::Pk, Cursor::Start) => {
-            sqlx::query(&format!(
-                "SELECT pk, item_data FROM {table} ORDER BY pk LIMIT ?"
-            ))
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+            format!("SELECT pk, item_data FROM {table} ORDER BY pk LIMIT ?")
         }
-        (Paging::Pk, Cursor::Pk(last)) => {
-            sqlx::query(&format!(
-                "SELECT pk, item_data FROM {table} WHERE pk > ? ORDER BY pk LIMIT ?"
-            ))
-            .bind(last)
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+        (Paging::Pk, Cursor::Pk(_)) => {
+            format!("SELECT pk, item_data FROM {table} WHERE pk > ? ORDER BY pk LIMIT ?")
         }
         (Paging::PkSk { sk_col, .. }, Cursor::Start) => {
-            sqlx::query(&format!(
-                "SELECT pk, {sk_col}, item_data FROM {table} ORDER BY pk, {sk_col} LIMIT ?"
-            ))
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+            format!("SELECT pk, {sk_col}, item_data FROM {table} ORDER BY pk, {sk_col} LIMIT ?")
         }
-        (Paging::PkSk { sk_col, .. }, Cursor::PkSkText(pk, sk)) => {
-            sqlx::query(&format!(
+        (Paging::PkSk { sk_col, .. }, Cursor::PkSkText(..) | Cursor::PkSkBlob(..)) => {
+            format!(
                 "SELECT pk, {sk_col}, item_data FROM {table} \
                  WHERE (pk, {sk_col}) > (?, ?) ORDER BY pk, {sk_col} LIMIT ?"
-            ))
-            .bind(pk)
-            .bind(sk)
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
-        }
-        (Paging::PkSk { sk_col, .. }, Cursor::PkSkBlob(pk, sk)) => {
-            sqlx::query(&format!(
-                "SELECT pk, {sk_col}, item_data FROM {table} \
-                 WHERE (pk, {sk_col}) > (?, ?) ORDER BY pk, {sk_col} LIMIT ?"
-            ))
-            .bind(pk)
-            .bind(sk)
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+            )
         }
         (Paging::Rowid, Cursor::Start) => {
-            sqlx::query(&format!(
-                "SELECT rowid, item_data FROM {table} ORDER BY rowid LIMIT ?"
-            ))
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+            format!("SELECT rowid, item_data FROM {table} ORDER BY rowid LIMIT ?")
         }
-        (Paging::Rowid, Cursor::Rowid(last)) => {
-            sqlx::query(&format!(
-                "SELECT rowid, item_data FROM {table} WHERE rowid > ? ORDER BY rowid LIMIT ?"
-            ))
-            .bind(last)
-            .bind(limit)
-            .fetch_all(&mut **tx)
-            .await
+        (Paging::Rowid, Cursor::Rowid(_)) => {
+            format!("SELECT rowid, item_data FROM {table} WHERE rowid > ? ORDER BY rowid LIMIT ?")
         }
         _ => {
             return Err(StorageError::Internal(
                 "snapshot cursor does not match its paging mode".to_owned(),
             ));
         }
-    }
-    .map_err(|e| db_err(&e))
+    })
 }
 
-/// One page: items and the cursor for the next page. Fewer items than
-/// `limit` means the table is exhausted.
+/// The cursor a page's last row leaves for the next page.
+fn cursor_after(row: &sqlx::sqlite::SqliteRow, paging: &Paging) -> Result<Cursor, StorageError> {
+    Ok(match paging {
+        Paging::Pk => Cursor::Pk(row.try_get("pk").map_err(|e| db_err(&e))?),
+        Paging::PkSk { sk_col, sk_type } => {
+            let pk: String = row.try_get("pk").map_err(|e| db_err(&e))?;
+            match sk_type {
+                ScalarAttributeType::B => Cursor::PkSkBlob(
+                    pk,
+                    row.try_get::<Vec<u8>, _>(*sk_col).map_err(|e| db_err(&e))?,
+                ),
+                ScalarAttributeType::S | ScalarAttributeType::N => Cursor::PkSkText(
+                    pk,
+                    row.try_get::<String, _>(*sk_col).map_err(|e| db_err(&e))?,
+                ),
+            }
+        }
+        Paging::Rowid => Cursor::Rowid(row.try_get("rowid").map_err(|e| db_err(&e))?),
+    })
+}
+
+/// One page as [`fetch_page`] returns it.
+struct Page {
+    items: Vec<Item>,
+    /// The cursor for the next page; `None` for an empty page.
+    next: Option<Cursor>,
+    /// Whether the byte budget ended the page before `limit` rows.
+    cut: bool,
+}
+
+/// One page: at most `limit` rows, pulled one at a time from the page query
+/// and stopped after the row that takes the page's item text to or past
+/// `budget` bytes, so a page holds at most the budget plus one row and at
+/// least one row, and the stream pulls no row past the cut (the statement is
+/// reset when the row stream is dropped, with the rows the driver's worker
+/// read ahead, at most the pool's `row_buffer_size` plus the one the worker
+/// holds, five; the next page starts at the cursor the last pulled row
+/// leaves). Fewer rows than `limit`
+/// without a cut means the table is exhausted.
 async fn fetch_page(
     tx: &mut Transaction<'static, Sqlite>,
     table: &str,
     paging: &Paging,
     cursor: &Cursor,
     limit: i64,
-) -> Result<(Vec<Item>, Option<Cursor>), StorageError> {
-    let rows = query_page(tx, table, paging, cursor, limit).await?;
-    let mut items = Vec::with_capacity(rows.len());
+    budget: usize,
+) -> Result<Page, StorageError> {
+    use futures::TryStreamExt as _;
+    let sql = page_sql(table, paging, cursor)?;
+    let query = sqlx::query(&sql);
+    let query = match cursor {
+        Cursor::Start => query,
+        Cursor::Pk(pk) => query.bind(pk),
+        Cursor::PkSkText(pk, sk) => query.bind(pk).bind(sk),
+        Cursor::PkSkBlob(pk, sk) => query.bind(pk).bind(sk.as_slice()),
+        Cursor::Rowid(rowid) => query.bind(rowid),
+    }
+    .bind(limit);
+    let mut rows = query.fetch(&mut **tx);
+    let mut items = Vec::new();
+    let mut bytes = 0usize;
     let mut next = None;
-    for row in &rows {
+    let mut cut = false;
+    while let Some(row) = rows.try_next().await.map_err(|e| db_err(&e))? {
         let data: String = row.try_get("item_data").map_err(|e| db_err(&e))?;
+        bytes += data.len();
         let item: Item = serde_json::from_str(&data)
             .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
         items.push(item);
+        next = Some(cursor_after(&row, paging)?);
+        if bytes >= budget {
+            cut = true;
+            break;
+        }
     }
-    if let Some(last) = rows.last() {
-        next = Some(match paging {
-            Paging::Pk => Cursor::Pk(last.try_get("pk").map_err(|e| db_err(&e))?),
-            Paging::PkSk { sk_col, sk_type } => {
-                let pk: String = last.try_get("pk").map_err(|e| db_err(&e))?;
-                match sk_type {
-                    ScalarAttributeType::B => Cursor::PkSkBlob(
-                        pk,
-                        last.try_get::<Vec<u8>, _>(*sk_col)
-                            .map_err(|e| db_err(&e))?,
-                    ),
-                    ScalarAttributeType::S | ScalarAttributeType::N => Cursor::PkSkText(
-                        pk,
-                        last.try_get::<String, _>(*sk_col).map_err(|e| db_err(&e))?,
-                    ),
-                }
-            }
-            Paging::Rowid => Cursor::Rowid(last.try_get("rowid").map_err(|e| db_err(&e))?),
-        });
-    }
-    Ok((items, next))
+    drop(rows);
+    paging::record_page_bytes(bytes);
+    Ok(Page { items, next, cut })
 }
 
 #[cfg(test)]
@@ -550,6 +564,33 @@ mod tests {
             },
         )
         .await;
+        // The byte budget: pages are cut after the row that reaches it, every
+        // row streams once across cut pages, and the rows past a cut are
+        // never read (the pull stops at the cut), which `rows_past_cut`
+        // reports as zero here.
+        let bounds = snapshot_conformance::run_page_bounds(
+            &hooks,
+            &*engine,
+            ACCOUNT,
+            "snap_bounds",
+            || async {
+                engine
+                    .process_control_plane_transitions()
+                    .await
+                    .expect("pump");
+            },
+        )
+        .await;
+        assert_eq!(
+            bounds.rows_past_cut, 0,
+            "SQLite pulls rows one at a time and stops at the cut: {bounds:?}"
+        );
+        assert_eq!(
+            bounds.pages,
+            (snapshot_conformance::PAGE_BOUNDS_ITEMS as u64)
+                .div_ceil(snapshot_conformance::PAGE_BOUNDS_ROWS as u64),
+            "a page is exactly the budget's rows: {bounds:?}"
+        );
         let pool = engine.pool.clone();
         snapshot_conformance::run_refusals(
             &hooks,

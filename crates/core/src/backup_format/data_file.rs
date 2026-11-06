@@ -137,7 +137,8 @@ pub const MAX_LINE_BYTES: usize = 32 * 1024 * 1024;
 /// the two paths share one encoding by construction. The line is not checked
 /// against [`MAX_LINE_BYTES`]; [`DataFileEncoder::write_item`] does that.
 /// [`encode_item_line_into`] writes the same bytes into a buffer the caller
-/// keeps.
+/// keeps; [`encode_item_line_len_bounded`] measures them against a cap
+/// without a buffer.
 ///
 /// # Errors
 ///
@@ -163,6 +164,65 @@ pub fn encode_item_line_into(item: &Item, line: &mut Vec<u8>) -> Result<(), serd
     serde_json::to_writer(&mut *line, &ItemLineRef { item })?;
     line.push(b'\n');
     Ok(())
+}
+
+/// The length of [`encode_item_line`]'s line for `item` when it is at most
+/// `cap` bytes, measured without a buffer: the line is serialized into a
+/// writer that counts and refuses the write that would take the count past
+/// `cap`, at which `serde_json::to_writer` stops, so an item whose line is
+/// many times the cap costs no memory and no more work than the cap's
+/// worth. The backup job measures an item over the default item limit this
+/// way before the encoder sees it; for a line within the cap the length is
+/// the one `encode_item_line_into` would leave.
+///
+/// # Errors
+///
+/// Returns [`FormatError::LineTooLong`] once the count would pass `cap` and
+/// [`FormatError::Json`] when the item cannot be serialized.
+pub fn encode_item_line_len_bounded(item: &Item, cap: usize) -> Result<usize, FormatError> {
+    let mut counter = LineCounter {
+        written: 0,
+        cap,
+        over: false,
+    };
+    let counted = serde_json::to_writer(&mut counter, &ItemLineRef { item })
+        .map_err(FormatError::from)
+        .and_then(|()| {
+            counter
+                .write_all(b"\n")
+                .map_err(|e| FormatError::Encode(e.to_string()))
+        });
+    if counter.over {
+        return Err(FormatError::LineTooLong { cap });
+    }
+    counted.map(|()| counter.written)
+}
+
+/// The writer behind [`encode_item_line_len_bounded`]: counts the bytes
+/// written and refuses the write that would take the count past `cap`,
+/// setting `over`; no byte past the cap is counted and nothing is kept.
+struct LineCounter {
+    written: usize,
+    cap: usize,
+    over: bool,
+}
+
+impl Write for LineCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.cap - self.written {
+            self.over = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "the line cap",
+            ));
+        }
+        self.written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Lowercase hex encoding of a byte slice.
@@ -1989,6 +2049,65 @@ mod tests {
         assert!(item_size_bytes(&numbers) <= limit);
         let numbers_line = encode_item_line(&numbers).unwrap().len();
         assert!(numbers_line < line, "{numbers_line}");
+    }
+
+    /// The bounded measurement is the line's length up to the cap and
+    /// `LineTooLong` past it, at the byte (the newline counted, as the
+    /// encoder counts it), and it holds no line: the counter refuses the
+    /// write that would pass the cap and counts nothing past it, so a
+    /// 600 KB item of the worst shape (a 40 MB line) is refused with at most
+    /// the cap's worth of bytes counted and no buffer.
+    #[test]
+    fn the_bounded_line_measurement_stops_at_the_cap_without_a_buffer() {
+        let small = item(vec![("pk", AttributeValue::S("p".into()))]);
+        let len = encode_item_line(&small).unwrap().len();
+        assert_eq!(encode_item_line_len_bounded(&small, len).unwrap(), len);
+        assert_eq!(
+            encode_item_line_len_bounded(&small, MAX_LINE_BYTES).unwrap(),
+            len
+        );
+        assert!(matches!(
+            encode_item_line_len_bounded(&small, len - 1),
+            Err(FormatError::LineTooLong { cap }) if cap == len - 1
+        ));
+        // The counter itself: a write that would pass the cap is refused
+        // and leaves the count where it was.
+        let mut counter = LineCounter {
+            written: 0,
+            cap: 10,
+            over: false,
+        };
+        counter.write_all(b"12345").unwrap();
+        counter.write_all(b"67890").unwrap();
+        assert_eq!((counter.written, counter.over), (10, false));
+        assert!(counter.write_all(b"x").is_err());
+        assert_eq!((counter.written, counter.over), (10, true));
+        // The worst shape over the default limit: 3,700 sets of 81 two-digit
+        // values at `E-130`, a 40 MB line for a 600 KB item.
+        let set: BTreeSet<String> = (11..100)
+            .filter(|m| m % 10 != 0)
+            .map(|m| format!("0.{}{m}", "0".repeat(129)))
+            .collect();
+        let mut worst = item(vec![("pk", AttributeValue::S("p".into()))]);
+        worst.insert(
+            "l".to_owned(),
+            AttributeValue::L(vec![AttributeValue::NS(set); 3_700]),
+        );
+        assert!(crate::types::item_size_bytes(&worst) > crate::limits::DEFAULT_MAX_ITEM_SIZE_BYTES);
+        assert!(matches!(
+            encode_item_line_len_bounded(&worst, MAX_LINE_BYTES),
+            Err(FormatError::LineTooLong { cap }) if cap == MAX_LINE_BYTES
+        ));
+        // A cap of 100 bytes stops the serializer after at most 100 bytes
+        // of a 40 MB line.
+        let mut counter = LineCounter {
+            written: 0,
+            cap: 100,
+            over: false,
+        };
+        assert!(serde_json::to_writer(&mut counter, &ItemLineRef { item: &worst }).is_err());
+        assert!(counter.over);
+        assert!(counter.written <= 100, "{}", counter.written);
     }
 
     /// Dropping an encoder that did not finish writes nothing more, whether

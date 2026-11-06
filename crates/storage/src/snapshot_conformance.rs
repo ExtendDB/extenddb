@@ -378,8 +378,36 @@ async fn drain_within<S>(stream: &mut S, stage: &str, into: &mut Vec<Item>)
 where
     S: futures::Stream<Item = Result<Item, StorageError>> + Unpin,
 {
+    drain_at_most(stream, stage, into, usize::MAX).await;
+}
+
+/// [`drain_within`] with a bound on the count: a stream that has yielded
+/// more than `at_most` items is repeating rows (a seek that is inclusive
+/// instead of exclusive yields the row it was seeked past on every page, and
+/// a cursor that never advances yields the first page forever), and the
+/// drain panics at once naming `stage` and the first key yielded twice, so
+/// the check fails in seconds instead of running until another test's wait
+/// on the hooks lock gives out.
+async fn drain_at_most<S>(stream: &mut S, stage: &str, into: &mut Vec<Item>, at_most: usize)
+where
+    S: futures::Stream<Item = Result<Item, StorageError>> + Unpin,
+{
     while let Some(next) = next_within(stream, stage, into.len()).await {
         into.push(next.unwrap_or_else(|e| panic!("{stage}: snapshot stream item: {e}")));
+        if into.len() > at_most {
+            let mut seen = std::collections::HashSet::new();
+            let repeated = into
+                .iter()
+                .map(key_id)
+                .find(|id| !seen.insert(id.clone()))
+                .unwrap_or_else(|| "(no key yielded twice)".to_owned());
+            panic!(
+                "{stage}: the stream yielded {} items of a table of {at_most}; the first key \
+                 yielded twice is {repeated} (the stream repeats rows: an inclusive seek or a \
+                 cursor that does not advance)",
+                into.len()
+            );
+        }
     }
 }
 
@@ -564,6 +592,26 @@ impl PageSize {
 impl Drop for PageSize {
     fn drop(&mut self) {
         paging::set_fetch_batch(0);
+    }
+}
+
+/// Sets the shared snapshot byte budget ([`paging::set_fetch_bytes`]) and
+/// restores the default when dropped, as [`PageSize`] does for the row
+/// bound; hold [`hooks_lock`] while one is alive.
+pub struct ByteBudget(());
+
+impl ByteBudget {
+    /// Set the byte budget to `bytes` until the returned value is dropped.
+    #[must_use]
+    pub fn set(bytes: usize) -> Self {
+        paging::set_fetch_bytes(bytes);
+        Self(())
+    }
+}
+
+impl Drop for ByteBudget {
+    fn drop(&mut self) {
+        paging::set_fetch_bytes(0);
     }
 }
 
@@ -1464,6 +1512,206 @@ async fn key_shapes<E, F, Fut>(
                 );
             }
         }
+    }
+}
+
+/// Items [`run_page_bounds`] fills its table with: more than one row bound's
+/// worth at the budget it sets, and ten past a multiple of the rows a page
+/// keeps, so the last page is one the cut shortens (a backend that ends the
+/// stream on a short page without asking whether the cut shortened it loses
+/// those rows).
+pub const PAGE_BOUNDS_ITEMS: usize = 610;
+
+/// Rows of item text one page of [`run_page_bounds`]'s second pass holds at
+/// the budget it sets: the budget is this many rows' text.
+pub const PAGE_BOUNDS_ROWS: usize = 8;
+
+/// What [`run_page_bounds`] measured, for a backend's own assertions beside
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBounds {
+    /// Bytes of item text of one row of the table (every row is the same
+    /// size).
+    pub row_bytes: usize,
+    /// The byte budget the second pass ran under: [`PAGE_BOUNDS_ROWS`] rows.
+    pub budget: usize,
+    /// Round trips the second pass made.
+    pub pages: u64,
+    /// Rows the backend recorded as read past a cut during the second pass
+    /// ([`paging::rows_past_cut`]; a backend that cuts in its query records
+    /// them, one that cuts while pulling rows records none).
+    pub rows_past_cut: u64,
+}
+
+fn page_bounds_item(i: usize) -> Item {
+    // Fixed-width keys and a fixed padding, so every row's text is the same
+    // length and the budget can be set to a whole number of rows.
+    [
+        ("pk".to_owned(), s(format!("p{i:05}"))),
+        ("sk".to_owned(), n(100_000 + i)),
+        ("v".to_owned(), s("x".repeat(1000))),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Check that the stream pages by bytes: no page holds more than the budget
+/// plus one row, and the cut does not lose rows. `hooks` is the caller's
+/// [`hooks_lock`] guard; `table` must not exist; `pump` runs while the table
+/// becomes `ACTIVE`.
+///
+/// The table is [`PAGE_BOUNDS_ITEMS`] rows of one size. A first pass at a
+/// budget of one byte reads one row per page, which measures the row's text
+/// size as the backend counts it (`row_bytes`) and shows the budget took
+/// effect (as many round trips as rows). The second pass sets the budget to
+/// [`PAGE_BOUNDS_ROWS`] rows and the row bound to its default, and asserts:
+/// every item once (completeness across cut pages, the last one included;
+/// both passes stop and fail as soon as the stream has yielded more items
+/// than the table holds, naming the key yielded twice, so a stream that
+/// repeats rows fails in seconds rather than running until the hooks lock's
+/// wait gives out);
+/// more round trips than the row bound alone would make (the budget, not the
+/// row bound, paged the table: a counter beside the knob, since the stream's
+/// contents alone cannot show the knob took effect); the largest page at least the
+/// budget (a page was cut) and under the budget plus one row (the rule: a
+/// page ends after the row that takes it to or past the budget, so a page
+/// cut one row late shows as exactly the budget plus one row); and, when the
+/// stream is `key_ordered`, ascending order.
+///
+/// # Panics
+///
+/// On any violation, with the figures.
+pub async fn run_page_bounds<E, F, Fut>(
+    hooks: &HooksGuard,
+    engine: &E,
+    account: &str,
+    table: &str,
+    mut pump: F,
+) -> PageBounds
+where
+    E: SnapshotEngine + TableEngine + DataEngine + Send + Sync,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let _ = hooks;
+    engine
+        .create_table(account, table_input(table))
+        .await
+        .expect("create the page-bounds table");
+    wait_active(engine, account, table, &mut pump).await;
+    let ki = key_info(engine, account, table).await;
+    for i in 0..PAGE_BOUNDS_ITEMS {
+        put(engine, &ki, page_bounds_item(i)).await;
+    }
+    let expected: BTreeSet<String> = (0..PAGE_BOUNDS_ITEMS)
+        .map(|i| key_id(&page_bounds_item(i)))
+        .collect();
+
+    // First pass: one row per page.
+    let row_bytes = {
+        let _budget = ByteBudget::set(1);
+        let _rows = PageSize::set(0);
+        paging::reset_page_counters();
+        let fetches_before = paging::fetches();
+        let mut snapshot = engine
+            .open_table_snapshot(account, table)
+            .await
+            .expect("open at a one-byte budget");
+        let mut seen = Vec::new();
+        drain_at_most(
+            &mut snapshot.items,
+            "page bounds, one-byte budget",
+            &mut seen,
+            PAGE_BOUNDS_ITEMS,
+        )
+        .await;
+        drop(snapshot);
+        assert_eq!(seen.len(), PAGE_BOUNDS_ITEMS, "one-byte budget: items read");
+        let fetches = paging::fetches() - fetches_before;
+        assert!(
+            fetches >= PAGE_BOUNDS_ITEMS as u64,
+            "one-byte budget: {fetches} round trips for {PAGE_BOUNDS_ITEMS} rows; the budget \
+             did not cut the pages to one row"
+        );
+        let row_bytes = paging::max_page_bytes();
+        assert!(
+            row_bytes > 1000,
+            "one row of item text measured as {row_bytes} bytes"
+        );
+        row_bytes
+    };
+
+    // Second pass: a budget of a whole number of rows, the row bound at its
+    // default.
+    let budget = row_bytes * PAGE_BOUNDS_ROWS;
+    let _budget = ByteBudget::set(budget);
+    let _rows = PageSize::set(0);
+    paging::reset_page_counters();
+    let fetches_before = paging::fetches();
+    let mut snapshot = engine
+        .open_table_snapshot(account, table)
+        .await
+        .expect("open at the row-multiple budget");
+    let key_ordered = snapshot.key_ordered;
+    let order = extenddb_core::backup_format::KeyOrder::resolve(
+        &snapshot.description.key_schema,
+        &snapshot.description.attribute_definitions,
+    )
+    .expect("the page-bounds table has an orderable key");
+    let mut seen = Vec::new();
+    drain_at_most(
+        &mut snapshot.items,
+        "page bounds, row-multiple budget",
+        &mut seen,
+        PAGE_BOUNDS_ITEMS,
+    )
+    .await;
+    drop(snapshot);
+    let pages = paging::fetches() - fetches_before;
+
+    let mut got = BTreeSet::new();
+    for item in &seen {
+        let id = key_id(item);
+        assert!(got.insert(id.clone()), "page bounds: duplicate item {id}");
+    }
+    assert_eq!(
+        got, expected,
+        "page bounds: the stream did not yield every row exactly once (a cut page lost or \
+         repeated rows)"
+    );
+    let row_bound_pages = PAGE_BOUNDS_ITEMS.div_ceil(paging::fetch_batch()) as u64;
+    assert!(
+        pages > row_bound_pages,
+        "page bounds: {pages} round trips, no more than the row bound alone would make \
+         ({row_bound_pages}); the byte budget did not page the table"
+    );
+    let largest = paging::max_page_bytes();
+    assert!(
+        largest >= budget,
+        "page bounds: the largest page holds {largest} bytes, under the budget of {budget}; no \
+         page was cut by bytes"
+    );
+    assert!(
+        largest < budget + row_bytes,
+        "page bounds: the largest page holds {largest} bytes, the budget plus a row or more \
+         ({budget} + {row_bytes}); a page is cut one row late"
+    );
+    if key_ordered {
+        for pair in seen.windows(2) {
+            assert_eq!(
+                order.compare(&pair[0], &pair[1]).expect("comparable keys"),
+                std::cmp::Ordering::Less,
+                "page bounds: {} is not before {}",
+                key_id(&pair[0]),
+                key_id(&pair[1])
+            );
+        }
+    }
+    PageBounds {
+        row_bytes,
+        budget,
+        pages,
+        rows_past_cut: paging::rows_past_cut(),
     }
 }
 

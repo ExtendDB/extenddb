@@ -329,9 +329,9 @@ journalctl -t extenddb -f
 
 **Fix:** If permission denied, run `extenddb stop` as the same user that started extenddb. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
 
-### `extenddb (pid <pid>) did not exit within 10s after SIGTERM`
+### `extenddb (pid <pid>) did not exit within 76s after SIGTERM`
 
-**Cause:** The server received SIGTERM but did not shut down within the 10-second timeout. It may be stuck draining long-running requests or waiting on a database operation.
+**Cause:** The server received SIGTERM but did not shut down within the 76-second timeout, the sum of its shutdown bounds (5 s to drain connections, 30 s for running backup jobs to end, 36 s to stop its background workers and give up its serving registration, 5 s for its runtime). It may be stuck draining long-running requests or waiting on a database operation.
 
 **Fix:** Send SIGKILL to force termination: `kill -9 <pid>`. Check PostgreSQL for long-running queries that may be blocking shutdown.
 
@@ -943,7 +943,7 @@ The error log line names the exact relations for one leaked table and gives this
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours of inactivity), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions end 8 hours after login, however active they are, and the browser drops the cookie at the same time), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
 **Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
 

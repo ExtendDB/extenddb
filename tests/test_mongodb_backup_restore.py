@@ -26,6 +26,17 @@ def mongodb_container() -> str:
     container = os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()
     if not container:
         pytest.skip("requires devtools/run-mongodb-tests")
+    # These cells read the in-catalog create's documents (`backups`) and
+    # restore its backups at once; on a server with a `[backup.store]`
+    # CreateBackup is the store-backed job (CREATING, then AVAILABLE in the
+    # store) and RestoreTableFromBackup of its backups is refused until the
+    # restore job lands (PR 9a), which brings these cells back there.
+    store = os.environ.get("EXTENDDB_TEST_BACKUP_STORE", "").strip()
+    if store in ("filesystem", "s3"):
+        pytest.skip(
+            f"EXTENDDB_TEST_BACKUP_STORE={store}: these cells read and restore the "
+            "in-catalog create's backups; the store-backed restore is PR 9a's"
+        )
     return container
 
 
