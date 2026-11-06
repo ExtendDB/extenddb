@@ -29,6 +29,7 @@ pub async fn handle_create_table(
         ],
     )?;
 
+    crate::require_stream_enabled_member(&body)?;
     let mut input: CreateTableInput = serde_json::from_value(body).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("validation error detected")

@@ -222,6 +222,55 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
     }
 }
 
+/// The indexes of the data database's `stream_shards`, by name, with their
+/// keys.
+async fn stream_shards_indexes(d: &Deployment) -> BTreeMap<String, Document> {
+    use futures::TryStreamExt;
+    let models: Vec<mongodb::IndexModel> = d
+        .data()
+        .collection::<Document>("stream_shards")
+        .list_indexes()
+        .await
+        .expect("list the stream_shards indexes")
+        .try_collect()
+        .await
+        .expect("read the stream_shards indexes");
+    models
+        .into_iter()
+        .map(|m| (m.options.and_then(|o| o.name).unwrap_or_default(), m.keys))
+        .collect()
+}
+
+/// The `{table_id, shard_id}` index on `stream_shards`, which no release
+/// before 1.0 created: every released data database has only the unique
+/// `shard_id` index, and the `migrate --yes` that adopts it adds the index
+/// with migration 1's data step. A second run applies nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_adds_the_stream_shards_table_index_to_every_released_data_database() {
+    let Some(uri) = server() else { return };
+    for state in STATES {
+        let d = Deployment::new(&uri, "shardindex").await;
+        fixture::load(&d, &fixture::read(state)).await;
+        let before = stream_shards_indexes(&d).await;
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["_id_", "shard_id_1"],
+            "{state}"
+        );
+        d.migrate().await.expect("migrate");
+        let after = stream_shards_indexes(&d).await;
+        assert_eq!(
+            after.get("table_id_1_shard_id_1"),
+            Some(&doc! { "table_id": 1, "shard_id": 1 }),
+            "{state}: {after:?}"
+        );
+        let again = d.migrate().await.expect("second migrate");
+        assert!(again.applied.is_empty(), "{state}: {again:?}");
+        assert_eq!(stream_shards_indexes(&d).await, after, "{state}");
+        d.drop_databases().await;
+    }
+}
+
 /// Migration 2's body on the oldest released catalog: every stored policy
 /// after the upgrade, which the committed golden file pins.
 #[tokio::test(flavor = "multi_thread")]

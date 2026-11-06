@@ -321,6 +321,39 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### Streams: disabling closes the shards, enabling creates a new stream
+
+**What changed.** `UpdateTable` with `StreamEnabled: false` now closes the
+stream's shards (each gets an `EndingSequenceNumber`), and `StreamEnabled: true`
+afterwards creates a new stream with a new ARN and four new shard ids, as on
+DynamoDB. Before this release a disable left the shards open and a re-enable
+kept the same ARN. Each stream's shard ids carry its identity, so the change
+needs no catalog migration of its own. On MongoDB its one new index comes with
+migration 1 (below).
+
+**Servers of the earlier release.** Migrations 1 to 7 are breaking, so a
+server of the earlier release must not run against the migrated catalog (see
+[The Catalog Status](#the-catalog-status)). Such a server does not know closed
+shards. It writes records past a shard's `EndingSequenceNumber`, and it
+re-enables a disabled stream under its old ARN instead of creating a new one.
+A stream that the earlier release disabled keeps its four shards open under
+the new release. The first `UpdateTable` that sets a `StreamSpecification` on
+the table closes them: an enable, or a disable, which the server refuses as
+before.
+
+**MongoDB.** Migration 1 creates the `{table_id: 1, shard_id: 1}` index on the
+data database's `stream_shards`: `extenddb init` runs it on a new deployment,
+and `extenddb migrate --yes` runs it on a 0.1.x deployment.
+A deployment that a build without the index has already migrated gets it from
+`extenddb migrate --yes --reconverge`, which runs migration 1 again.
+
+**Rollback.** Going back to the earlier release means restoring the
+pre-upgrade database as in [Rollback Procedure](#rollback-procedure); the
+earlier release does not read the closed shards' ending numbers or the labelled
+shard ids the new release writes.
+
+---
+
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 
 **What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` checks the source table and then returns `PointInTimeRecoveryUnavailableException`. A table that does not exist is `TableNotFoundException` on all three operations, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.

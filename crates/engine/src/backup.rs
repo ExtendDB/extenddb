@@ -22,7 +22,7 @@ use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     BackupDescription, BackupSummary, BillingMode, CreateTableInput, GlobalSecondaryIndexInfo,
     LocalSecondaryIndexInfo, ProvisionedThroughput, RestoreSummary, SourceTableFeatureDetails,
-    SseDescription, TableDescription, TableStatus,
+    SseDescription, StreamSpecification, TableDescription, TableStatus,
 };
 use extenddb_storage::backup_catalog::{
     BackupKey, BackupRow, BackupStatus, DeleteStart, TimeBounds, is_backup_not_found,
@@ -797,7 +797,23 @@ fn apply_source_to_description(
                         })
                         .collect()
                 }),
-                stream_description: d.stream_specification.clone(),
+                // A backup of a table whose stream was disabled carries the
+                // stored `{StreamEnabled: false}`, and DescribeBackup shows it
+                // as `StreamDescription: {StreamEnabled: false}`, as it did
+                // before the view type was kept in the stored specification;
+                // the service's answer for that backup is not measured. The
+                // view type the backends now keep for the closed stream is
+                // dropped here so the answer stays the one before.
+                stream_description: d.stream_specification.clone().map(|s| {
+                    if s.stream_enabled {
+                        s
+                    } else {
+                        StreamSpecification {
+                            stream_enabled: false,
+                            stream_view_type: None,
+                        }
+                    }
+                }),
                 time_to_live_description: d.time_to_live.clone(),
                 sse_description: SseDescription::from_specification(
                     d.sse_specification.as_ref(),
