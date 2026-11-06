@@ -615,6 +615,15 @@ pub const VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE: &str = "One or more parame
 pub const VECTOR_INDEX_COUNT_LIMIT_CREATE: &str =
     "One or more parameter values were invalid: VectorIndex count exceeds the per-table limit of 5";
 
+/// A second online GSI change while one is still being built.
+///
+/// The service answers an UpdateTable that creates a GSI, or deletes a GSI other
+/// than the one building, while a GSI on the table is `CREATING` with this
+/// LimitExceededException; the same sentence it uses for two index actions in
+/// one request.
+pub const ONLINE_INDEX_LIMIT: &str = "Subscriber limit exceeded: Only 1 online index can be \
+     created or deleted simultaneously per table";
+
 /// Per-table vector index limit exceeded on `UpdateTable`.
 ///
 /// Measured 2026-08-13: reported as a `LimitExceededException`, not a

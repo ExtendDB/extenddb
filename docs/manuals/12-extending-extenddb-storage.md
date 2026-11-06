@@ -40,7 +40,7 @@ A new backend must implement **13 storage traits** plus the `CredentialStore` tr
 7. `AdminStore` — admin user management
 8. `SettingsStore` — runtime settings
 9. `MetricsStore` — historical metrics persistence and query
-10. `RateLimitStore` — login rate limiting and account lockout
+10. `RateLimitStore`: login rate limiting per user and source address
 11. `AuthorizationStore` — policy lookups for authorization decisions
 12. `BackupEngine` — backup and restore operations
 13. `Bootstrapper` — database initialization, destruction, migration, verification
@@ -218,9 +218,12 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 
 | Method | Purpose |
 |--------|---------|
-| `record_login_attempt` | Record a login attempt (success or failure) |
-| `recent_failed_attempts` | Count recent failed attempts for lockout decisions |
+| `count_principal_failures` | Count recent failed attempts for one principal from one source address |
+| `count_ip_failures` | Count recent failed attempts from one source address, over all principals |
+| `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
+
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password`, which bounds concurrent bcrypt work per process. `verify_admin_password` checks an existing admin's hash with `verify_password` and returns `None` without a bcrypt check when no admin has the name. `verify_iam_user_password` passes the user's hash to `verify_stored_password`, or `None` when the account or the user does not exist or the user has no console password; with `None`, the helper checks the password against a fixed hash and refuses it. A login checks the admin first and the IAM user only when no admin has the name, so every login runs one bcrypt check whether or not the name exists. The management API checks through these two methods and runs the fixed-hash check itself for a name without `/`. The console reads the stored hashes through `PasswordHashStore` and passes them to `verify_stored_password` itself, with `None` for a name without `/` and when `get_user_password_hash` returns `None`.
 
 ### AuthorizationStore
 
@@ -399,13 +402,13 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
-3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
+3. **Sequence generation**: stream sequence numbers come from a PostgreSQL sequence (`nextval`), drawn after the write commits. A write stores its record in `stream_pending`, and a numbering step moves a shard's committed records to `stream_records` in the order they were stored, one numbering of a shard at a time; GetRecords and a `LATEST` iterator run one batch of it on their shard before they read. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past. Your backend needs numbers that become visible on each shard in increasing order: once a consumer has read a number, no record with a lower number may appear on that shard later ([RFC-0003](../rfcs/0003-backend-acceptance-criteria.md), criterion 5.2).
 
 4. **CASCADE deletes** — account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
 
 5. **Dual-database architecture** — catalog and data are separate PostgreSQL databases. Your backend might use a single database with keyspace separation, or a different topology entirely.
 
-6. **SQL migrations** — migration files are raw SQL. Your backend needs its own schema initialization mechanism, exposed through `Bootstrapper`.
+6. **SQL migrations**: migration files are raw SQL. Your backend applies the numbered catalog migrations through the shared runner: it implements `CatalogMigrations` (`crates/storage/src/migrations/catalog.rs`), installs it in its `Backend`, and declares a body or a reason for every id. Its `Bootstrapper` keeps database creation and the rows `init` writes after the migrations. [ADR-0023](../adr/0023-catalog-migrations.md) records the design and the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` the procedure.
 
 ## Summary of Traits and Implementations
 
