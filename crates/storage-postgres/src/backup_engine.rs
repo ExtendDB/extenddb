@@ -112,6 +112,14 @@ impl ClaimSession {
         &mut self.conn
     }
 
+    /// End the session, releasing its advisory lock; a close that fails is
+    /// logged (the server reaps the connection either way).
+    pub(crate) async fn close(self) {
+        if let Err(e) = <sqlx::PgConnection as sqlx::Connection>::close(self.conn).await {
+            tracing::warn!("closing a claim session: {e}");
+        }
+    }
+
     /// Run `statement`, bound with the record's key and this generation, on
     /// the claim connection and report whether it refreshed exactly one row.
     pub(crate) async fn confirm(
@@ -182,6 +190,17 @@ pub(crate) fn backup_lock_key(backup_id: &str) -> String {
     format!("backup:{backup_id}")
 }
 
+/// The TCP keepalive settings a claim session asks the server for, as
+/// `(setting, seconds)`: idle 30 s before the first probe, then probes 10 s
+/// apart, three unanswered before the connection is dropped. Public for the
+/// test that reads them back with `SHOW`.
+#[doc(hidden)]
+pub const CLAIM_KEEPALIVES: [(&str, u32); 3] = [
+    ("tcp_keepalives_idle", 30),
+    ("tcp_keepalives_interval", 10),
+    ("tcp_keepalives_count", 3),
+];
+
 /// Take the lock `key` on a new dedicated connection, with a fresh
 /// generation. `Ok(None)`: another session holds it.
 ///
@@ -192,6 +211,18 @@ pub(crate) async fn try_claim(
     pool: &sqlx::PgPool,
     key: &str,
     permit: Option<JobPermit>,
+) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim_with(pool, key, permit, 1, Duration::ZERO).await
+}
+
+/// [`try_claim`] trying the lock up to `tries` times on the one connection,
+/// `pause` apart, before answering `Ok(None)`.
+pub(crate) async fn try_claim_with(
+    pool: &sqlx::PgPool,
+    key: &str,
+    permit: Option<JobPermit>,
+    tries: u32,
+    pause: Duration,
 ) -> Result<Option<ClaimSession>, StorageError> {
     let options = pool.connect_options();
     let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect_with(&options)
@@ -214,17 +245,73 @@ pub(crate) async fn try_claim(
              the server setting: {e}"
         );
     }
-    let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
-        .bind(key)
-        .bind(RESTORE_LOCK_SEED)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+    // The server's TCP keepalive probes toward this process, so the
+    // advisory lock of a claim whose host vanished (no FIN, no RST) is
+    // released about a minute after the loss (30 s idle, then three probes
+    // 10 s apart) instead of after the kernel's default two hours, and the
+    // row's successor can take the lock once the row's heartbeat is stale.
+    // The owner's own liveness check is the heartbeat, not these. Each is a
+    // session setting a managed service may refuse; a refusal is a warning
+    // and the server's defaults stay.
+    for (name, value) in CLAIM_KEEPALIVES {
+        if let Err(e) = sqlx::query(&format!("SET {name} = {value}"))
+            .execute(&mut conn)
+            .await
+        {
+            tracing::warn!(
+                "could not set {name} for the claim session; continuing with the server \
+                 setting: {e}"
+            );
+        }
+    }
+    let mut taken = false;
+    for attempt in 1..=tries.max(1) {
+        taken = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
+            .bind(key)
+            .bind(RESTORE_LOCK_SEED)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+        if taken || attempt == tries {
+            break;
+        }
+        tokio::time::sleep(pause).await;
+    }
     Ok(taken.then(|| ClaimSession {
         conn,
         generation: new_generation(),
         _permit: permit,
     }))
+}
+
+/// Open a claim session on `key` as a job would and read `settings` back
+/// from it with `SHOW`, then end the session: for the test that checks the
+/// session settings [`try_claim`] applies. `None` when another session holds
+/// the lock.
+///
+/// # Errors
+///
+/// The claim's own errors, and `Internal` when a `SHOW` fails.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn claim_session_settings(
+    pool: &sqlx::PgPool,
+    key: &str,
+    settings: &[&str],
+) -> Result<Option<Vec<String>>, StorageError> {
+    let Some(mut session) = try_claim(pool, key, None).await? else {
+        return Ok(None);
+    };
+    let mut values = Vec::with_capacity(settings.len());
+    for name in settings {
+        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            .fetch_one(session.connection())
+            .await
+            .map_err(|e| StorageError::Internal(format!("SHOW {name}: {e}")))?;
+        values.push(value);
+    }
+    session.close().await;
+    Ok(Some(values))
 }
 
 /// Take the restore lock for `table_name` on a new dedicated connection.

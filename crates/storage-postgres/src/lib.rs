@@ -28,7 +28,9 @@ mod password_hash_store;
 mod pg_util;
 mod snapshot_engine;
 #[doc(hidden)]
-pub use snapshot_engine::map_fetch_error;
+pub use snapshot_engine::{
+    MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
+};
 mod stream_engine;
 #[doc(hidden)]
 pub mod stream_records_sql;
@@ -41,8 +43,11 @@ mod vector_search;
 mod worker_store;
 mod workers;
 
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub use backup_engine::RESTORE_LOCK_SEED;
+pub use backup_engine::claim_session_settings;
+#[doc(hidden)]
+pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;
 pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
@@ -294,6 +299,9 @@ pub struct PostgresEngine {
     /// wait; the open needs only a data connection by then, so they delay it
     /// no further.
     pub(crate) snapshot_open_slots: Arc<tokio::sync::Semaphore>,
+    /// The permits `snapshot_open_slots` was built with, for the refusal
+    /// that names the bound.
+    pub(crate) snapshot_slot_limit: usize,
     /// Whether `data_pool` is the catalog pool (no separate data database).
     /// The snapshot open uses one transaction on that layout, and
     /// `DeleteTable` runs its in-use probe and its synchronous drop on the
@@ -424,6 +432,7 @@ impl PostgresEngine {
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
             ))),
+            snapshot_slot_limit: snapshot_slot_count(pool_size),
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),
@@ -700,6 +709,13 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::stream_record_cleanup_worker(storage_for_stream, metrics, token).await;
         });
 
+        // 3b. Stream record numbering worker
+        let storage_for_numbering = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let stream_numbering = tokio::spawn(async move {
+            workers::stream_record_numbering_worker(storage_for_numbering, token).await;
+        });
+
         // 4. Idempotency token cleanup worker
         let storage_for_token = self.engine.clone();
         let metrics = ctx.metrics.clone();
@@ -752,6 +768,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             control_plane,
             table_size,
             stream_cleanup,
+            stream_numbering,
             idempotency_cleanup,
             ttl,
             vector_builds,
@@ -824,9 +841,14 @@ fn server_components_factory(
     );
     let region = region.to_string();
     Box::pin(async move {
-        let registration = migrations::ServerRegistration::register(&connection_string)
-            .await
-            .map_err(BackendError::Catalog)?;
+        // Every caller registers, a command too: a migration must not run
+        // under one. A command's session carries its own name.
+        let registration = migrations::ServerRegistration::register_as(
+            &connection_string,
+            options.command.unwrap_or(migrations::SERVE_APPLICATION),
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
 
         // Build PostgresConfig from extracted values
         let pg_config = PostgresConfig {
@@ -844,23 +866,37 @@ fn server_components_factory(
             })?;
         engine.serving = Some(Arc::new(registration));
 
-        // Rebuild any vector index a crash left CREATING, before serving: an index
-        // in that state is not searchable, and nothing else will repair it.
-        match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
-            Ok(n) if n > 0 => {
-                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+        // The startup recovery is a server's; a command reading beside one,
+        // or one that writes beside the live servers (`backup purge`,
+        // `options.startup_recovery` off), leaves it to the server.
+        let recover = !options.beside_server && options.startup_recovery;
+        if recover {
+            // Rebuild any vector index a crash left CREATING, before serving:
+            // an index in that state is not searchable, and nothing else will
+            // repair it.
+            match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+
+            // Recover control plane transitions (errors are logged, not fatal).
+            // A drop deferred by a session still holding the table wakes the
+            // poller, which `spawn_workers` starts later.
+            workers::recover_control_plane_at_startup(&engine).await;
         }
 
-        // Recover control plane transitions (errors are logged, not fatal).
-        // A drop deferred by a session still holding the table wakes the
-        // poller, which `spawn_workers` starts later.
-        workers::recover_control_plane_at_startup(&engine).await;
-
-        // Start GSI workers
-        let engine = engine.start_gsi_workers();
+        // Start GSI workers: a server's. A command (`backup list`, the
+        // purge's dry run, `purge --confirm`) leaves the queue to the
+        // server that owns the catalog, so the command applies no pending
+        // index write and exits with none half-applied.
+        let engine = if recover {
+            engine.start_gsi_workers()
+        } else {
+            engine
+        };
 
         // Get data database name for logging (before wrapping in Arc)
         let data_db_name = engine
