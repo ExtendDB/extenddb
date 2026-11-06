@@ -389,6 +389,7 @@ impl StreamEngine for CassandraEngine {
             };
 
             Ok(StreamDescription {
+                creation_request_date_time: None,
                 stream_arn: stream_arn_str,
                 stream_label,
                 stream_status,
