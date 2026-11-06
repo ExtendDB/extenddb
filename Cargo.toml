@@ -59,8 +59,9 @@ futures = "0.3"
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "set-header", "timeout"] }
 hyper = { version = "1" }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # URI parsing for the backup store's endpoint check; the same major hyper and
 # the AWS SDK already use.
 http = { version = "1" }
