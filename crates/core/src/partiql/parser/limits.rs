@@ -7,8 +7,10 @@
 //!
 //! The parser recurses once per parenthesized group, literal container and
 //! nested operand (a call's arguments, a reserved word that reads an
-//! expression). Runs of `NOT` and of signs are read in a loop, so they cost no
-//! depth. A statement is first parsed on the calling thread with a small depth
+//! expression, the expression an inner bracket of a path holds). Runs of
+//! `NOT` and of signs are read in a loop, so they cost no depth, and so are
+//! the steps of a path, the brackets of a path in brackets included. A
+//! statement is first parsed on the calling thread with a small depth
 //! budget; one that needs more is parsed again on a thread of its own with a
 //! large stack and the full caps, so the depth an accepted statement may reach
 //! does not depend on the caller's stack. Past a cap the statement is refused
@@ -20,7 +22,10 @@
 //! literal container. The inline budget keeps a parse within 310 KB of the
 //! caller's stack, and the worst parse the caps allow used 12.2 MB on its own
 //! thread. On a release build the same parses used 2.3 KB, 1.8 KB and 0.5 to
-//! 0.7 KB per level, 86 KB of the caller's stack and 3.1 MB at the caps.
+//! 0.7 KB per level, 86 KB of the caller's stack and 3.1 MB at the caps. An
+//! expression in brackets nests as an operand does. The tests parse every
+//! nesting form at the length limit on a thread with half the stack of a
+//! server worker thread (see `nesting_forms` in the tests).
 
 use super::{PResult, ParseError, Parser, Statement};
 
@@ -164,6 +169,11 @@ impl Nesting {
     /// Whether the parse is inside a parenthesized condition.
     pub(super) fn in_group(&self) -> bool {
         self.group > 0
+    }
+
+    /// How many parenthesized groups are open.
+    pub(super) fn groups(&self) -> usize {
+        self.group
     }
 
     fn leave(&mut self, kind: Nest) {

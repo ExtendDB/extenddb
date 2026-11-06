@@ -3,7 +3,7 @@
 
 //! The statements: SELECT, INSERT, UPDATE and DELETE, their targets and their clauses.
 
-use super::{PResult, ParseError, Parser};
+use super::{Brackets, PResult, ParseError, Parser};
 use crate::partiql::ast::{
     DeleteStatement, FromSource, InsertStatement, OrderBy, OrderTerm, Path, Projection, Returning,
     SelectStatement, Statement, UpdateStatement,
@@ -95,7 +95,11 @@ impl Parser {
     /// says `DESC`.
     fn order_term(&mut self) -> PResult<OrderTerm> {
         let at = self.span();
-        let path = self.path()?;
+        // What its brackets hold is not refused (see `Brackets::OrderBy`).
+        let outer = std::mem::replace(&mut self.brackets, Brackets::OrderBy);
+        let path = self.path();
+        self.brackets = outer;
+        let path = path?;
         let descending = self.eat_keyword("DESC");
         if !descending {
             self.eat_keyword("ASC");

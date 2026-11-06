@@ -433,7 +433,10 @@ def _fill(head: str, open_: str, inner: str, close: str = "", tail: str = "") ->
 
 def _shapes(table: str) -> dict[str, str]:
     where = _where(table)
+    keyed = where + "pk = 'a' AND "
     insert = f"INSERT INTO \"{table}\" VALUE {{'pk': 'deep', 'x': "
+    update = f"UPDATE \"{table}\" SET "
+    key = " WHERE pk = 'p'"
     return {
         "groups": _fill(where, "(", "a = 1", ")"),
         "groups after a key": _fill(where + "pk = 'a' AND ", "(", "a = 1", ")"),
@@ -446,6 +449,37 @@ def _shapes(table: str) -> dict[str, str]:
         "and chain": where + " AND ".join(f"a{i} = 1" for i in range(600)),
         "or chain": where + " OR ".join(f"a{i} = 1" for i in range(600)),
         "calls": _fill(f"UPDATE \"{table}\" SET a = ", "f(", "x", ")", " WHERE pk = 'p'"),
+        "brackets": _fill(keyed + "m[", "k[", "k", "]", "] = 1"),
+        "strings in brackets": _fill(keyed + "m[", "'k'[", "'k'", "]", "] = 1"),
+        "paths with dots in brackets": _fill(keyed + "m[", "k.j[", "k", "]", "] = 1"),
+        "dots in brackets": _fill(keyed + "m[k", ".j", "", "", "] = 1"),
+        "brackets left open": _fill(keyed + "m[", "k[", "k", "]", " = 1"),
+        "brackets in a SET target": _fill(update + "m[", "k[", "k", "]", "] = 1" + key),
+        "brackets in a REMOVE target": _fill(f"UPDATE \"{table}\" REMOVE m[", "k[", "k", "]", "]" + key),
+        "brackets in a SET value": _fill(update + "x = m[", "k[", "k", "]", "]" + key),
+        "brackets in the select list": _fill("SELECT m[", "k[", "k", "]", f"] FROM \"{table}\""),
+        "brackets in ORDER BY": _fill(keyed[:-5] + " ORDER BY m[", "k[", "k", "]", "]"),
+        "calls in an inner bracket": _fill(keyed + "m[k[", "f(", "x", ")", "]] = 1"),
+        "groups in an inner bracket": _fill(keyed + "m[k[", "(", "x", ")", "]] = 1"),
+        "lists in an inner bracket": _fill(keyed + "m[k[", "[", "1", "]", "]] = 1"),
+        "calls and brackets in an inner bracket": _fill(keyed + "m[k[", "f(j[", "x", "])", "]] = 1"),
+        "comparisons in inner brackets": _fill(keyed + "m[k[", "j[", "x", "] = 1", "]] = 1"),
+        "a path in groups": _fill(keyed, "(", "a", ")", " = 1"),
+        "a name in parentheses": _fill(keyed + "a = ", "(", "b", ")"),
+        "a string in parentheses": _fill(keyed + "a = ", "(", "'x'", ")"),
+        "a SET value in parentheses": _fill(update + "x = ", "(", "a", ")", key),
+        "an INSERT value in parentheses": _fill(insert, "(", "'v'", ")", "}"),
+        "an IN member in parentheses": _fill(keyed + "a IN (", "(", "1", ")", ")"),
+        "lists in parentheses": _fill(keyed + "a IN (", "(1, ", "1", ")", ")"),
+        "size calls": _fill(keyed, "size(", "a", ")", " = 1"),
+        "calls in a condition function": _fill(keyed + "attribute_exists(", "f(", "a", ")", ")"),
+        "NOTs in a SET value": _fill(update + "x = ", "NOT ", "a", "", key),
+        "arithmetic in parentheses": _fill(update + "x = ", "(", "a", " + 1)", key),
+        "signs before parentheses": _fill(update + "x = ", "-(", "a", ")", key),
+        "CASE words": _fill(keyed + "a = ", "CASE ", "b"),
+        "lists in a condition": _fill(keyed + "a = ", "[", "1", "]"),
+        "lists in an IN list": _fill(keyed + "a IN ", "[", "1", "]"),
+        "comparisons with true": _fill(keyed + "a = 1", " = true", ""),
     }
 
 
@@ -461,3 +495,45 @@ def test_a_statement_nested_to_the_length_limit_is_refused_and_the_server_keeps_
     with pytest.raises(ClientError):
         once.execute_statement(Statement=statement)
     assert _items(once, _where(table) + "pk = 'a'") == []
+
+
+# --- the most deeply nested statements that run ------------------------------
+#
+# Measured 2026-11-06. What the server does with a statement before it runs
+# walks the statement's tree, so these are the deepest trees each bound
+# lets through.
+
+
+def test_a_condition_compared_with_true_299_times_runs(dynamodb_client, table):
+    dynamodb_client.execute_statement(
+        Statement=f"INSERT INTO \"{table}\" VALUE {{'pk': 'trues', 'tr': 1}}"
+    )
+    item = {"pk": {"S": "trues"}, "tr": {"N": "1"}}
+    assert _items(dynamodb_client, _where(table) + "tr = 1" + " = true" * 299) == [item]
+    assert _items(dynamodb_client, _where(table) + "pk = 'trues'" + " = true" * 299) == [item]
+
+
+def test_a_list_literal_of_31_levels_in_a_condition_runs(dynamodb_client, table):
+    statement = _where(table) + "deep31 = " + "[" * 31 + "1" + "]" * 31
+    assert _items(dynamodb_client, statement) == []
+
+
+def test_a_call_in_the_select_list_comes_before_a_literal_1000_levels_deep(
+    dynamodb_client, table
+):
+    statement = (
+        f"SELECT COUNT(*) FROM \"{table}\" WHERE pk = 'a' AND x = "
+        + "[" * 1000
+        + "1"
+        + "]" * 1000
+    )
+    assert _message(dynamodb_client, statement) == "Unexpected path component at 1:8:5"
+    responses = dynamodb_client.batch_execute_statement(
+        Statements=[{"Statement": statement}]
+    )["Responses"]
+    assert responses[0]["Error"]["Message"] == "Unexpected path component at 1:8:5"
+    with pytest.raises(ClientError) as e:
+        dynamodb_client.execute_transaction(TransactStatements=[{"Statement": statement}])
+    assert e.value.response["Error"]["Message"] == (
+        "Validation failed in TransactStatements[0]: Unexpected path component at 1:8:5"
+    )

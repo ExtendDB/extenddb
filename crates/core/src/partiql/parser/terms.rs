@@ -16,7 +16,7 @@
 //! (`SELECT <w> FROM ...`). Where such a form reads to its end, the answer is
 //! not measured and the word keeps the term error of its class.
 
-use super::{PResult, ParseError, Parser};
+use super::{Brackets, PResult, ParseError, Parser};
 use crate::partiql::ast::{Operand, Path, Statement};
 use crate::partiql::lexer::{TokenKind, WordClass, word_class};
 use crate::partiql::parse_error;
@@ -108,6 +108,13 @@ impl Parser {
                     return Err(fallback);
                 }
                 Err(ParseError::well_formed("Expected data manipulation"))
+            }
+            // In brackets EXEC starts its form only before a parenthesis
+            // (measured 2026-11-06: `m[k[EXEC x]]`, `m[k[EXEC]]` and `m[k[a =
+            // EXEC x]]` are "Unexpected term", and `m[k[EXEC(x)]]` is
+            // "Expected RIGHT_BRACKET").
+            "exec" if self.brackets == Brackets::Inner && next != Some(TokenKind::LParen) => {
+                Err(ParseError::well_formed("Unexpected term"))
             }
             "exec" => self.exec_term(),
             "values" if next != Some(TokenKind::LParen) => Err(ParseError::well_formed(
@@ -223,7 +230,8 @@ impl Parser {
     /// whose first step is a name. Anything else there, a reserved word or a
     /// literal included, is "Expected identifier for simple path" (measured
     /// 2026-11-02 for every reserved word as a SET target and as a DELETE
-    /// table).
+    /// table). Its brackets hold what a SET or REMOVE target's may (see
+    /// [`Brackets::Target`]).
     pub(super) fn simple_path(&mut self) -> PResult<Path> {
         let is_name = match &self.peek().kind {
             TokenKind::Ident(w) => word_class(w) == WordClass::Name,
@@ -233,7 +241,10 @@ impl Parser {
         if !is_name {
             return Err(ParseError::well_formed(SIMPLE_PATH));
         }
-        self.path()
+        let outer = std::mem::replace(&mut self.brackets, Brackets::Target);
+        let path = self.path();
+        self.brackets = outer;
+        path
     }
 
     /// A statement that is an expression rather than a query or a write. It

@@ -9,6 +9,44 @@ use crate::partiql::ast::{ArithOp, Operand, Path, PathStep};
 use crate::partiql::lexer::{TokenKind, WordClass, is_function_keyword, word_class};
 use crate::types::AttributeValue;
 
+/// The syntax error of a SET or REMOVE target whose brackets hold a path or
+/// a parameter (measured 2026-11-06).
+const NOT_A_SIMPLE_PATH: &str = "Invalid path component for simple path";
+
+/// How what brackets in a path hold is answered, by where the path is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Brackets {
+    /// In a condition, a value, the select list and the arguments of a call:
+    /// a content that is not a list index or a map member is refused once
+    /// the statement parses, at its first token.
+    Refused,
+    /// In a SET or REMOVE target: as [`Brackets::Refused`], except that
+    /// brackets that hold a path, a parameter or an expression are a syntax
+    /// error (measured 2026-11-06: `SET m[k.j] = 1`, `m[k[0]]`, `m['k'.x]`,
+    /// `m[?]`, `m[[1]]`, `m[{'a': 1}]`, `m[<<1>>]`, `m[*]`, `m[- k]`, `m[NOT
+    /// a]`, `m[f(x)]`, `m[a = 1]` and `m[k + 1]`, and the same REMOVEs; see
+    /// [`Parser::expression_in_a_target_here`]). The error comes once the
+    /// brackets close, ahead of anything after them in the statement
+    /// (measured 2026-11-06: with the SET value missing, with `=` missing,
+    /// with a bracket left open in a later target and with a WHERE that
+    /// ends in `=`), and ahead of a refusal found before the target (an
+    /// alias on the table, a number in an earlier SET value).
+    Target,
+    /// In an ORDER BY term: nothing in brackets is refused, only read as an
+    /// expression (see [`Parser::expression_in_brackets`]), and the engine
+    /// refuses the path for its steps (measured 2026-11-06: `ORDER BY m[?]`,
+    /// `m[1.5]`, `m['']`, `m[-1]`, `m[true]`, `m[MISSING]`, `m[(1)]`, `m[*]`,
+    /// `m[f(x)]`, `m[k + 1]`, `m[[1]]`, `m[<<1>>]`, ``m[`1`]``, `m[{'a':
+    /// 1}]`, `m[k.j]` and `m[k[0]]` get "Argument to ORDER BY must be of
+    /// type VariableReference", and with no WHERE the refusal of that).
+    OrderBy,
+    /// Inside an inner bracket, that is a bracket of a path that is itself
+    /// in brackets: the path in the outer brackets is refused first, so
+    /// what an inner bracket holds is only read, as an expression (see
+    /// [`Parser::expression_in_brackets`]).
+    Inner,
+}
+
 /// A number literal with the signs written before it folded in (see
 /// [`Parser::signed_number`]).
 pub(super) struct SignedNumber {
@@ -84,12 +122,15 @@ impl Parser {
                     _ => return Err(ParseError::well_formed("Invalid path dot component")),
                 }
             } else if self.eat(&TokenKind::LBracket) {
-                let step = self.bracket_step()?;
+                let (step, in_a_target) = self.bracket_step()?;
                 // (measured 2026-11-05: `m['k'`, `m[k`, `m['k' 'j']` and `m[k
                 // j]`; a bracket left open wins over a refusal of what it
                 // holds, as `m[-1` and `m[k.j` show)
                 if !self.eat(&TokenKind::RBracket) {
                     return Err(ParseError::well_formed("Expected RIGHT_BRACKET"));
+                }
+                if !in_a_target && self.brackets == Brackets::Target {
+                    return Err(ParseError::well_formed(NOT_A_SIMPLE_PATH));
                 }
                 path.steps.push(step);
             } else {
@@ -100,55 +141,63 @@ impl Parser {
     }
 
     /// What a pair of brackets after a path holds, with the current token
-    /// after the `[`. A number is a list index. A string, a quoted name or
-    /// a name is a map member, as after a dot (measured 2026-11-05: `m['k']`,
-    /// `m["k"]` and `m[k]` read as `m.k` in a condition, a SET target, a
-    /// REMOVE, a SET value and the select list, and `m['my key']` names a
-    /// member a dot cannot). A reserved word there is a syntax error. Anything
-    /// else parses and is refused once the statement parses, at its first
-    /// token (measured 2026-11-05: `m[?]`, `m[1.5]`, `m[true]`, `m[k.j]`,
-    /// `m['k'.x]` and `m[-1.5]`, at the number); a minus before a whole
-    /// number is refused as an index out of range. The step returned for a
-    /// refused content stands for it and is never used.
-    fn bracket_step(&mut self) -> PResult<PathStep> {
+    /// after the `[`, and whether a SET or REMOVE target may hold it (see
+    /// [`Brackets::Target`]). A number is a list index. A string, a quoted
+    /// name or a name is a map member, as after a dot (measured 2026-11-05:
+    /// `m['k']`, `m["k"]` and `m[k]` read as `m.k` in a condition, a SET
+    /// target, a REMOVE, a SET value and the select list, and `m['my key']`
+    /// names a member a dot cannot). A path is refused at its first token,
+    /// however deep its own brackets nest (see [`Parser::path_in_brackets`]).
+    /// A reserved word there is a syntax error. Anything else parses and is
+    /// refused once the statement parses, at its first token (measured
+    /// 2026-11-05: `m[?]`, `m[1.5]`, `m[true]` and `m[-1.5]`, at the
+    /// number); a minus before a whole number is refused as an index out of
+    /// range, and empty brackets are a syntax error (measured 2026-11-06:
+    /// `m[]` in a condition, a SET target and ORDER BY). The step returned
+    /// for a refused content stands for it and is never used. In an inner
+    /// bracket and in an ORDER BY term the content is only read (see
+    /// [`Brackets`]).
+    fn bracket_step(&mut self) -> PResult<(PathStep, bool)> {
         let at = self.span();
-        let refuse = |p: &mut Self, at: &str| {
-            p.defer(&format!("Unexpected path component at {at}"));
-            Ok(PathStep::Index(0))
-        };
+        if self.path_starts_here() {
+            self.bump();
+            self.path_in_brackets(&at)?;
+            return Ok((PathStep::Index(0), false));
+        }
+        match self.brackets {
+            Brackets::Inner | Brackets::OrderBy => {
+                self.inner_bracket()?;
+                return Ok((PathStep::Index(0), true));
+            }
+            Brackets::Target if self.expression_in_a_target_here() => {
+                self.inner_bracket()?;
+                return Ok((PathStep::Index(0), false));
+            }
+            Brackets::Refused | Brackets::Target => {}
+        }
         match self.peek().kind.clone() {
             TokenKind::Number(n) => {
                 self.bump();
                 match n.parse::<usize>() {
-                    Ok(index) => Ok(PathStep::Index(index)),
-                    Err(_) => refuse(self, &at),
+                    Ok(index) => Ok((PathStep::Index(index), true)),
+                    Err(_) => Ok(self.refuse_bracket(&at)),
                 }
             }
             TokenKind::String(name) | TokenKind::QuotedIdent(name) => {
-                if matches!(self.nth_kind(1), Some(TokenKind::Dot | TokenKind::LBracket)) {
-                    self.bump();
-                    self.path_steps(Path {
-                        root: name,
-                        steps: Vec::new(),
-                    })?;
-                    return refuse(self, &at);
-                }
                 self.bump();
-                self.refuse_empty_component(&name);
-                Ok(PathStep::Attribute(name))
+                if name.is_empty() {
+                    self.defer_bracket("Path component cannot be an empty string");
+                }
+                Ok((PathStep::Attribute(name), true))
             }
             TokenKind::Ident(word) => match word_class(&word) {
                 WordClass::Name => {
-                    if matches!(self.nth_kind(1), Some(TokenKind::Dot | TokenKind::LBracket)) {
-                        self.path()?;
-                        return refuse(self, &at);
-                    }
                     self.bump();
-                    Ok(PathStep::Attribute(word))
+                    Ok((PathStep::Attribute(word), true))
                 }
                 WordClass::Literal => {
                     self.bump();
-                    refuse(self, &at)
+                    Ok(self.refuse_bracket(&at))
                 }
                 WordClass::Operator => Err(ParseError::well_formed("Unexpected operator")),
                 WordClass::Keyword | WordClass::Special => {
@@ -162,23 +211,190 @@ impl Parser {
                     unreachable!("a number follows the minus");
                 };
                 if n.bytes().all(|b| b.is_ascii_digit()) {
-                    self.defer(&format!(
+                    self.defer_bracket(&format!(
                         "List index is not within the allowable range; index: [-{n}] at {at}"
                     ));
-                    Ok(PathStep::Index(0))
+                    Ok((PathStep::Index(0), true))
                 } else {
-                    refuse(self, &at)
+                    Ok(self.refuse_bracket(&at))
                 }
             }
             TokenKind::Param => {
                 self.bump();
                 self.take_param_index();
-                refuse(self, &at)
+                let (step, _) = self.refuse_bracket(&at);
+                Ok((step, false))
             }
+            TokenKind::RBracket => Err(ParseError::well_formed("Unexpected term")),
             _ => Err(ParseError::new(format!(
                 "Unexpected path component at {at}"
             ))),
         }
+    }
+
+    /// Whether what the brackets of a SET or REMOVE target hold, from the
+    /// current token, is an expression the target may not hold (see
+    /// [`Brackets::Target`]): a list, a map, a bag, a wildcard, a sign or an
+    /// operator word before a value, or a name, a string, a number, a
+    /// literal word or a parameter with more of an expression after it
+    /// (measured 2026-11-06: `m['k' + 1]` and `m[1 + 1]`).
+    fn expression_in_a_target_here(&self) -> bool {
+        let closes = matches!(self.nth_kind(1), Some(TokenKind::RBracket));
+        match &self.peek().kind {
+            TokenKind::LBracket | TokenKind::LBrace | TokenKind::LDoubleAngle | TokenKind::Star => {
+                true
+            }
+            TokenKind::Minus => !matches!(self.nth_kind(1), Some(TokenKind::Number(_))),
+            TokenKind::String(_)
+            | TokenKind::QuotedIdent(_)
+            | TokenKind::Number(_)
+            | TokenKind::Param => !closes,
+            TokenKind::Ident(word) => match word_class(word) {
+                WordClass::Operator => true,
+                WordClass::Name | WordClass::Literal => !closes,
+                WordClass::Keyword | WordClass::Special => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Refuse what brackets hold, at the span `at`, once the statement
+    /// parses. The step returned stands for it and is never used.
+    fn refuse_bracket(&mut self, at: &str) -> (PathStep, bool) {
+        self.defer_bracket(&format!("Unexpected path component at {at}"));
+        (PathStep::Index(0), true)
+    }
+
+    /// Keep the refusal of what brackets hold, except in an ORDER BY term
+    /// (see [`Brackets::OrderBy`]).
+    fn defer_bracket(&mut self, refusal: &str) {
+        if self.brackets != Brackets::OrderBy {
+            self.defer(refusal);
+        }
+    }
+
+    /// Whether a path starts at the current token: a name, a string or a
+    /// quoted name with a dot or a bracket after it.
+    fn path_starts_here(&self) -> bool {
+        let first = match &self.peek().kind {
+            TokenKind::String(_) | TokenKind::QuotedIdent(_) => true,
+            TokenKind::Ident(word) => word_class(word) == WordClass::Name,
+            _ => false,
+        };
+        first && matches!(self.nth_kind(1), Some(TokenKind::Dot | TokenKind::LBracket))
+    }
+
+    /// A path in brackets, with its first component read, at the span
+    /// `at`. The service refuses it at that component, whatever follows and
+    /// however deep the brackets of the path nest (measured 2026-11-05 and
+    /// 2026-11-06: `m[k.j]`, `m[k[0]]`, `m['k'.x]`, `m[k.*]`, `m[k['']]`,
+    /// `m[k[-1]]`, `m[k[?]]`, `m[k[1 + 1]]`, `m[''[k]]` and `m[` followed by
+    /// 1, 10, 1000 and 2700 levels of `k[` are refused at the first token in
+    /// the outer brackets, in a condition, a SET value, the select list and
+    /// the arguments of a call). So the refusal is kept first, and the rest
+    /// of the path is read without being built (see
+    /// [`Parser::rest_of_path_in_brackets`]).
+    fn path_in_brackets(&mut self, at: &str) -> PResult<()> {
+        self.refuse_bracket(at);
+        self.rest_of_path_in_brackets()
+    }
+
+    /// The rest of a path in brackets after its first component: its steps,
+    /// and those of the paths its own brackets hold, read in a loop rather
+    /// than by recursion, so that how deep the brackets nest costs no stack.
+    /// `paths` counts the brackets whose path is being read. What an inner
+    /// bracket holds that is not a path, and what follows a path in an inner
+    /// bracket, are read as an expression (see
+    /// [`Parser::expression_in_brackets`]); so is what follows the path
+    /// itself where brackets are only read (see [`Brackets`]).
+    fn rest_of_path_in_brackets(&mut self) -> PResult<()> {
+        let inner = self.brackets != Brackets::Refused;
+        let mut paths = 0usize;
+        loop {
+            if self.eat(&TokenKind::Dot) {
+                // (measured 2026-11-06: `m[k.*]` is refused at the `k`, and
+                // `m[k.select]` is "Invalid path dot component")
+                match &self.peek().kind {
+                    TokenKind::QuotedIdent(_) | TokenKind::Star => {}
+                    TokenKind::Ident(word) if word_class(word) == WordClass::Name => {}
+                    _ => return Err(ParseError::well_formed("Invalid path dot component")),
+                }
+                self.bump();
+            } else if self.eat(&TokenKind::LBracket) {
+                if self.path_starts_here() {
+                    self.bump();
+                    paths += 1;
+                    continue;
+                }
+                self.inner_bracket()?;
+                if !self.eat(&TokenKind::RBracket) {
+                    return Err(ParseError::well_formed("Expected RIGHT_BRACKET"));
+                }
+            } else if paths > 0 || inner {
+                if !matches!(self.peek().kind, TokenKind::RBracket) {
+                    self.expression_in_brackets(true)?;
+                }
+                if paths == 0 {
+                    return Ok(());
+                }
+                if !self.eat(&TokenKind::RBracket) {
+                    return Err(ParseError::well_formed("Expected RIGHT_BRACKET"));
+                }
+                paths -= 1;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    /// What an inner bracket holds that is not a path: a wildcard (measured
+    /// 2026-11-06: `m[k[*]]` is refused at the `k`) or an expression.
+    fn inner_bracket(&mut self) -> PResult<()> {
+        if self.eat(&TokenKind::Star) {
+            return Ok(());
+        }
+        self.expression_in_brackets(false)
+    }
+
+    /// What brackets hold, read as the service reads it, as an expression,
+    /// which may be a condition, where nothing in it is refused: in an inner
+    /// bracket, where the path around it is refused first, in an ORDER BY
+    /// term and in a target that may not hold it (see [`Brackets`]).
+    /// Measured 2026-11-06: in `m[k[...]]`, a call, a list, a bag, a map, a
+    /// sign, `a = 1`, `a AND b`, `NOT a`, `a BETWEEN 1 AND 2`, `a IN [1]`, `a
+    /// IS NULL`, `a LIKE 'x'`, `1 + 1`, `2 * 3`, `'a' || 'b'` and the same
+    /// after a path with steps (`j.x = 1`, `j[0] + 1`, `j.x IS MISSING`) are
+    /// refused at the `k`; `'a' 'b'`, `1 2`, `1, 2`, `j.x y` and `j.x (y)`
+    /// are "Expected RIGHT_BRACKET"; `(`, `)`, `,`, `;`, CASE, FROM, `j.x =`
+    /// and nothing are "Unexpected term". So only a syntax error in the
+    /// expression is an answer: what the expression's walk finds is dropped,
+    /// and the state the parse keeps for the statement is put back.
+    /// `after_path` is set when the expression starts with a path that has
+    /// been read (see [`Parser::condition_after_path`]). The expression
+    /// nests as an operand does.
+    fn expression_in_brackets(&mut self, after_path: bool) -> PResult<()> {
+        let found = std::mem::take(&mut self.found);
+        let in_where = std::mem::replace(&mut self.in_where, true);
+        let brackets = std::mem::replace(&mut self.brackets, Brackets::Inner);
+        let groups = self.bracket_groups.replace(self.nesting.groups());
+        let (operators, refusals) = (self.operators, self.operator_refusals);
+        let (after_not, bare_left) = (self.after_not, self.bare_left);
+        let read = self.nested(Nest::Operand, |p| {
+            if after_path {
+                p.condition_after_path()
+            } else {
+                p.or_expr().map(drop)
+            }
+        });
+        self.found = found;
+        self.in_where = in_where;
+        self.brackets = brackets;
+        self.bracket_groups = groups;
+        self.operators = operators;
+        self.operator_refusals = refusals;
+        self.after_not = after_not;
+        self.bare_left = bare_left;
+        read
     }
 
     // --- operands ---
@@ -206,6 +422,11 @@ impl Parser {
 
     fn operand_unnested(&mut self) -> PResult<Operand> {
         let left = self.operand_atom()?;
+        self.operand_tail(left)
+    }
+
+    /// The arithmetic after `left`, the first term of an operand, if any.
+    pub(super) fn operand_tail(&mut self, left: Operand) -> PResult<Operand> {
         if matches!(self.peek().kind, TokenKind::Plus | TokenKind::Minus) {
             let op = if matches!(self.peek().kind, TokenKind::Plus) {
                 ArithOp::Add

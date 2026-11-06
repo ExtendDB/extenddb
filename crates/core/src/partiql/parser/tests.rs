@@ -24,6 +24,7 @@ fn where_of(sql: &str) -> WhereExpr {
     }
 }
 
+mod brackets;
 mod conditions;
 mod statements;
 mod values;

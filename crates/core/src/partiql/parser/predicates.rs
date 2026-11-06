@@ -19,18 +19,26 @@ impl Parser {
     /// Before anything else a NOT ends the expression at the operand, and
     /// what encloses it reports the NOT (measured 2026-11-02: `a NOT = 1`,
     /// `a NOT IS MISSING` and `a NOT NOT IN [1]` are a token left over after
-    /// the statement, `(a NOT = 1)` a group without its right parenthesis).
+    /// the statement, `(a NOT = 1)` a group without its right parenthesis;
+    /// measured 2026-11-06: in brackets, `m[k[a NOT = 1]]`, `m[k[j.x NOT]]`,
+    /// `m[k[a NOT IS NULL]]`, `SET m[a NOT = 1]` and `ORDER BY m[a NOT = 1]`
+    /// are a bracket without its right bracket, also inside a group,
+    /// `(m[k[a NOT = 1]] = 1)`, and `m[k[(a NOT = 1)]]` is a group without
+    /// its right parenthesis).
     pub(super) fn negated_predicate(&mut self, left: Operand) -> PResult<WhereExpr> {
         let word = match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
             Some(TokenKind::Ident(word)) => word.to_ascii_uppercase(),
             _ => String::new(),
         };
         if !matches!(word.as_str(), "IN" | "BETWEEN" | "LIKE") {
-            return Err(ParseError::well_formed(if self.nesting.in_group() {
+            let reason = if self.bracket_groups == Some(self.nesting.groups()) {
+                "Expected RIGHT_BRACKET"
+            } else if self.nesting.in_group() {
                 "Expected RIGHT_PAREN"
             } else {
                 "Unexpected token after expression"
-            }));
+            };
+            return Err(ParseError::well_formed(reason));
         }
         self.bump();
         self.count_operator();
@@ -163,11 +171,13 @@ impl Parser {
     /// in parentheses or in a bag (measured 2026-11-02: `a IN [1, 2]`, `a IN
     /// (1, 2)` and `a IN <<1, 5>>` run, with and without NOT). A bag there is
     /// not checked as a set literal (measured 2026-11-02: `a IN <<1, 1>>` and
-    /// `a IN <<'x', 1>>` run). Anything else after IN, an empty list and an
-    /// empty bag are refused naming the operands IN takes (measured
-    /// 2026-11-02 with `IN 1`, `IN []` and `IN <<>>`); in parentheses a member
-    /// must follow (measured 2026-11-02: `IN ()` and `IN (1,)` are
-    /// "Unexpected term").
+    /// `a IN <<'x', 1>>` run). A token that closes what encloses the IN is
+    /// "Unexpected term" (measured 2026-11-06: `a IN ]`, `a IN }`, `a IN >>`,
+    /// `(a IN )` and `a IN , b = 1`, in a condition and in brackets).
+    /// Anything else after IN, an empty list and an empty bag are refused
+    /// naming the operands IN takes (measured 2026-11-02 with `IN 1`, `IN []`
+    /// and `IN <<>>`); in parentheses a member must follow (measured
+    /// 2026-11-02: `IN ()` and `IN (1,)` are "Unexpected term").
     pub(super) fn in_list(&mut self, value: Operand) -> PResult<WhereExpr> {
         self.count_operator();
         self.require_rhs()?;
@@ -192,6 +202,7 @@ impl Parser {
                 items
             }
             TokenKind::LDoubleAngle => self.nested(Nest::Literal, Self::in_bag)?,
+            _ if self.at_closing_token() => return Err(self.term_error()),
             _ => return Err(ParseError::new(IN_OPERANDS)),
         };
         if items.is_empty() {

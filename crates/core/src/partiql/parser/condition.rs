@@ -5,10 +5,10 @@
 
 use super::limits::{MAX_OPERATORS, Nest};
 use super::{
-    AND_OR_ARGUMENTS, BARE_OPERAND, GROUPED_OPERAND, NO_COMPARISON, NOT_A_CONDITION, NOT_ARGUMENT,
-    PResult, ParseError, Parser, forms,
+    AND_OR_ARGUMENTS, BARE_OPERAND, Brackets, GROUPED_OPERAND, NO_COMPARISON, NOT_A_CONDITION,
+    NOT_ARGUMENT, PResult, ParseError, Parser, forms,
 };
-use crate::partiql::ast::{CompareOp, Operand, TypeName, WhereExpr};
+use crate::partiql::ast::{CompareOp, Operand, Path, TypeName, WhereExpr};
 use crate::partiql::lexer::{Token, TokenKind};
 
 impl Parser {
@@ -26,7 +26,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn or_expr(&mut self) -> PResult<WhereExpr> {
+    pub(super) fn or_expr(&mut self) -> PResult<WhereExpr> {
         let mut left = self.and_expr()?;
         while self.eat_keyword("OR") {
             self.count_operator();
@@ -60,6 +60,33 @@ impl Parser {
             }
         }
         Ok(left)
+    }
+
+    /// The rest of a condition whose first operand is a path the parser has
+    /// read already, with the current token after the path: the rest of the
+    /// operand, the rest of its predicate, then the ANDs and ORs after them,
+    /// as [`Parser::or_expr`] reads them. Only an expression in brackets
+    /// starts this way (see `Parser::rest_of_path_in_brackets`), and the
+    /// condition is only checked for syntax, so nothing is built.
+    pub(super) fn condition_after_path(&mut self) -> PResult<()> {
+        let start = self.pos;
+        let refused_operators = self.operator_refusals;
+        self.after_not = false;
+        let path = Operand::Path(Path {
+            root: String::new(),
+            steps: Vec::new(),
+        });
+        let left = self.operand_tail(path)?;
+        self.after_operand(left, start, refused_operators)?;
+        while self.eat_keyword("AND") {
+            self.require_rhs()?;
+            self.not_expr()?;
+        }
+        while self.eat_keyword("OR") {
+            self.require_rhs()?;
+            self.and_expr()?;
+        }
+        Ok(())
     }
 
     /// The right argument of an AND or an OR has been read; `bare_left` is
@@ -153,13 +180,19 @@ impl Parser {
                     _ => WhereExpr::AttributeType(a, b),
                 });
             }
+            // In brackets a size call may stand alone as a value, so it is
+            // read as an operand (measured 2026-11-06: `m[k[size(x)]]` is
+            // refused at the `k`).
+            let value_call = lname == "size" && self.brackets == Brackets::Inner;
             if matches!(
                 lname.as_str(),
                 "attribute_exists" | "attribute_not_exists" | "size"
-            ) && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LParen)
-            ) {
+            ) && !value_call
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::LParen)
+                )
+            {
                 self.count_operator();
                 self.bump();
                 let args = self.call_args()?;

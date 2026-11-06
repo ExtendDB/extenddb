@@ -15,6 +15,48 @@ fn empty_in_list_is_rejected() {
 }
 
 #[test]
+fn a_token_that_closes_what_encloses_an_in_list_or_a_map_key_is_an_unexpected_term() {
+    for condition in [
+        "a IN ]",
+        "a IN }",
+        "a IN >>",
+        "(a IN )",
+        "a IN , b = 1",
+        "a = {]",
+        "(a = {)",
+        "a = {,}",
+        "a = {>>",
+        "a = {'a': 1,}",
+    ] {
+        assert_eq!(
+            err(&format!(
+                "SELECT * FROM \"t\" WHERE pk = 'p' AND {condition}"
+            )),
+            wf("Unexpected term"),
+            "{condition}"
+        );
+    }
+    for sql in [
+        "UPDATE \"t\" SET x = {] WHERE pk = 'p'",
+        "UPDATE \"t\" SET x = 1 WHERE pk = 'p' AND a IN }",
+    ] {
+        assert_eq!(err(sql), wf("Unexpected term"), "{sql}");
+    }
+    // A value after IN and a name as a key keep their refusals.
+    let m = err("SELECT * FROM \"t\" WHERE pk = 'p' AND a IN 1");
+    assert!(
+        m.starts_with("IN operator must have a left hand argument"),
+        "{m}"
+    );
+    let sql = "SELECT * FROM \"t\" WHERE pk = 'p' AND a = {b: 1}";
+    let column = sql.find("b:").unwrap() + 1;
+    assert_eq!(
+        err(sql),
+        format!("Tuple keys must be of type String. Actual type: Id under root at 1:{column}:1")
+    );
+}
+
+#[test]
 fn where_with_nothing_after_it_is_an_unexpected_term() {
     for sql in [
         "SELECT * FROM \"t\" WHERE",

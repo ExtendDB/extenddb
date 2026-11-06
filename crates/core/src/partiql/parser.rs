@@ -23,6 +23,7 @@ mod walk;
 
 pub use limits::{MAX_STATEMENT_LENGTH, statement_length_refusal};
 use limits::{Nest, Nesting};
+use operands::Brackets;
 use walk::Findings;
 
 /// A parse failure. `message` is the full `ValidationException` string the
@@ -185,6 +186,8 @@ fn parse_attempt(
         nesting: Nesting::new(inline),
         operators: 0,
         operator_refusals: 0,
+        brackets: Brackets::Refused,
+        bracket_groups: None,
     };
 
     // A number literal that cannot be converted fails the whole statement
@@ -248,6 +251,14 @@ struct Parser {
     /// The operators of the WHERE condition refused so far (see
     /// [`Parser::refuse_condition_operator`]).
     operator_refusals: usize,
+    /// How what brackets in a path hold is answered where the path being
+    /// read is (see [`Brackets`]).
+    brackets: Brackets,
+    /// While an expression in brackets is read, the parenthesized groups
+    /// open when it started: with no more groups open, the brackets are
+    /// what encloses the condition being read (see
+    /// [`Parser::negated_predicate`]).
+    bracket_groups: Option<usize>,
 }
 
 impl Parser {
@@ -357,6 +368,20 @@ impl Parser {
             _ => "Unexpected term",
         };
         ParseError::well_formed(reason)
+    }
+
+    /// Whether the current token closes what encloses it or separates its
+    /// members, so that no term starts there: a right bracket, parenthesis,
+    /// brace or double angle bracket, or a comma.
+    fn at_closing_token(&self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::RBracket
+                | TokenKind::RParen
+                | TokenKind::RBrace
+                | TokenKind::RDoubleAngle
+                | TokenKind::Comma
+        )
     }
 
     /// The service refuses an infix operator with nothing after it before it

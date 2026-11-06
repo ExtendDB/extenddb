@@ -32,6 +32,10 @@ impl Parser {
             loop {
                 let key = match &self.peek().kind {
                     TokenKind::String(s) => s.clone(),
+                    // (measured 2026-11-06: `{]`, `{)`, `{,}`, `{>>` and
+                    // `{'a': 1,}` are "Unexpected term", in a condition, a
+                    // SET value and brackets)
+                    _ if self.at_closing_token() => return Err(self.term_error()),
                     _ => {
                         return Err(ParseError::new(format!(
                             "Tuple keys must be of type String. Actual type: Id under root at {}",
