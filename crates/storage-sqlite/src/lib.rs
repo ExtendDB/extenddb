@@ -45,6 +45,8 @@ mod sqlite_util;
 mod store;
 mod stream;
 #[cfg(test)]
+mod stream_cleanup_tests;
+#[cfg(test)]
 mod stream_tests;
 mod table_engine;
 mod table_helpers;

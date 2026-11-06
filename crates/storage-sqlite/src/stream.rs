@@ -24,7 +24,94 @@ use crate::store::SqliteEngine;
 /// Fixed shards per stream (hash-based partition-key assignment).
 const SHARDS_PER_STREAM: u32 = 4;
 
+/// Most stream records one retention cleanup statement deletes. Each statement
+/// holds the engine write lock for its own duration only, so this bounds how
+/// long a write waits behind the cleanup.
+///
+/// Measured with `stream_cleanup_bench`: release build, file database,
+/// 100,000 expired records with a 500-byte payload each, three rounds per
+/// size, on 16 cores with a one-minute load average of 31.1 at the start of
+/// the run and 27.4 at the end. A 250-record statement held the lock for a
+/// median of 7 to 8 ms and at most 234 to 309 ms, and a pass over the
+/// 100,000 records took 10.5 to 14.8 s. A 500-record statement held it for a
+/// median of 8 to 17 ms and at most 236 to 362 ms; a pass took 7.6 to 8.1 s.
+/// A 1,000-record statement held it for a median of 20 to 22 ms and at most
+/// 265 to 849 ms; a pass took 5.1 to 7.7 s. In the two runs of this shape
+/// that included 250, the holds at 250 and 500 in the same round differed by
+/// at most 11 ms at the median and 119 ms at the longest, less than the spread
+/// between rounds at 500, and 250 made the pass 1.4 to 1.8 times longer. The
+/// longest 500-record hold was 236 to 512 ms across three runs of this shape
+/// and 931 ms in a run of 280,000 records during which the load fell from
+/// 75.4 to 18.2. The single statement this replaces deleted 843 to 9,761
+/// records per second in a soak run, which puts 500 records at 51 to 593 ms
+/// and 1,000 at up to 1.19 s.
+pub(crate) const STREAM_CLEANUP_BATCH_ROWS: u32 = 500;
+
+/// One cleanup batch: the oldest `?2` records created before the cutoff `?1`.
+/// The inner select reads `idx_stream_records_created` in index order, and the
+/// outer delete finds each row by rowid.
+pub(crate) const DELETE_EXPIRED_STREAM_RECORDS_BATCH: &str = "DELETE FROM stream_records \
+     WHERE rowid IN (SELECT rowid FROM stream_records WHERE created_at < ?1 \
+     ORDER BY created_at LIMIT ?2)";
+
 impl SqliteEngine {
+    /// Delete the stream records created before `cutoff`, at most `batch_rows`
+    /// per statement, until a statement deletes fewer than `batch_rows`.
+    /// Returns the records deleted and the statements run.
+    ///
+    /// Each statement takes the engine write lock (D1) for itself and releases
+    /// it before the next one. The lock is a FIFO tokio mutex, so a write that
+    /// queued during a statement runs before the next statement, and waits for
+    /// one batch instead of the whole cleanup.
+    ///
+    /// A statement that fails ends the run with its error. The statements
+    /// before it stay committed, so a warning logs the records they deleted
+    /// before the error is returned.
+    pub(crate) async fn delete_stream_records_before(
+        &self,
+        cutoff: &str,
+        batch_rows: u32,
+    ) -> Result<(u64, u64), StorageError> {
+        let batch_rows = batch_rows.max(1);
+        let mut deleted = 0;
+        let mut statements = 0;
+        loop {
+            let batch = match self.delete_stream_record_batch(cutoff, batch_rows).await {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::warn!(
+                        "Stream record cleanup stopped after deleting {deleted} record(s) \
+                         in {statements} statement(s): {e}"
+                    );
+                    return Err(e);
+                }
+            };
+            deleted += batch;
+            statements += 1;
+            if batch < u64::from(batch_rows) {
+                return Ok((deleted, statements));
+            }
+        }
+    }
+
+    /// Run one cleanup batch under the engine write lock and return the
+    /// records it deleted.
+    pub(crate) async fn delete_stream_record_batch(
+        &self,
+        cutoff: &str,
+        batch_rows: u32,
+    ) -> Result<u64, StorageError> {
+        // D1: every writer holds the engine write lock, here for one batch.
+        let _writer = self.write_lock.lock().await;
+        let result = sqlx::query(DELETE_EXPIRED_STREAM_RECORDS_BATCH)
+            .bind(cutoff)
+            .bind(i64::from(batch_rows))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     /// Initialize stream shards and set `stream_label`, within the caller's
     /// transaction. Returns the assigned stream label.
     pub(crate) async fn init_stream_shards(
@@ -387,17 +474,15 @@ impl StreamEngine for SqliteEngine {
         retention_hours: i64,
     ) -> BoxFuture<'_, Result<u64, StorageError>> {
         Box::pin(async move {
-            // D1: every writer holds the engine write lock.
-            let _writer = self.write_lock.lock().await;
+            // One cutoff for the whole run, so the batches delete exactly the
+            // records that had expired when the run started.
             let cutoff = format_timestamp(
                 time::OffsetDateTime::now_utc() - time::Duration::hours(retention_hours),
             );
-            let result = sqlx::query("DELETE FROM stream_records WHERE created_at < ?")
-                .bind(&cutoff)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            Ok(result.rows_affected())
+            let (deleted, _) = self
+                .delete_stream_records_before(&cutoff, STREAM_CLEANUP_BATCH_ROWS)
+                .await?;
+            Ok(deleted)
         })
     }
 
