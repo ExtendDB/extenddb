@@ -565,14 +565,15 @@ impl PostgresEngine {
         table_id: &str,
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
-        // A GSI still being built is not readable: its table is partial, or not
-        // there yet. The service answers a Query or Scan naming one with "The
-        // table does not have the specified index", the same as for no index at
-        // all, which is what `IndexNotFound` becomes on the wire.
-        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value)> =
+        // A GSI still being built is not readable: its table is partial. The
+        // service refuses a Query or Scan naming one in two ways, by phase; see
+        // `extenddb_storage::gsi_backfill`. The backfill set is read before the
+        // row; see `GsiBackfills::snapshot`.
+        let started = self.gsi_backfills.snapshot();
+        let idx_row: Option<(String, String, serde_json::Value, serde_json::Value, String)> =
             sqlx::query_as(
-                "SELECT index_type, index_id, key_schema, projection FROM indexes \
-             WHERE table_id = $1 AND index_name = $2 AND index_status <> 'CREATING'",
+                "SELECT index_type, index_id, key_schema, projection, index_status \
+                 FROM indexes WHERE table_id = $1 AND index_name = $2",
             )
             .bind(table_id)
             .bind(index_name)
@@ -580,8 +581,14 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (idx_type_str, idx_id, ks_json, proj_json) =
+        let (idx_type_str, idx_id, ks_json, proj_json, status) =
             idx_row.ok_or_else(|| StorageError::IndexNotFound(index_name.to_owned()))?;
+        if status == "CREATING" {
+            return Err(extenddb_storage::gsi_backfill::creating_read_refusal(
+                index_name,
+                started.contains(&idx_id),
+            ));
+        }
 
         let index_type = match idx_type_str.as_str() {
             "GSI" => IndexType::Gsi,

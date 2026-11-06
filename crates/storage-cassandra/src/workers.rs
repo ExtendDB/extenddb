@@ -554,6 +554,7 @@ pub(crate) async fn poll_gsi_backfill_recovery(
                 &engine,
                 account_ks,
                 stale_threshold,
+                None,
                 &shutdown,
                 &mut backfills,
             )
@@ -566,6 +567,32 @@ pub(crate) async fn poll_gsi_backfill_recovery(
     // A backfill stops at its next request once `shutdown` fires; one that
     // has finished its scan completes the activation and the hold's release.
     while backfills.join_next().await.is_some() {}
+}
+
+/// One scan of the recovery worker, limited to the `CREATING` indexes of one
+/// table. Hidden because no deployment path calls it: a direct test drives the
+/// worker's claim with it, and the table filter keeps the scan off the indexes
+/// the tests running beside it stage. The backfills it starts keep running
+/// after it returns, as they do in the worker between two scans.
+#[doc(hidden)]
+pub async fn recover_stale_gsi_backfills_of_table(
+    engine: &Arc<CassandraEngine>,
+    account_ks: &str,
+    table_id: &str,
+    stale_threshold: Duration,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    let mut backfills = tokio::task::JoinSet::new();
+    let result = recover_stale_backfills(
+        engine,
+        account_ks,
+        stale_threshold,
+        Some(table_id),
+        &CancellationToken::new(),
+        &mut backfills,
+    )
+    .await;
+    backfills.detach_all();
+    result
 }
 
 /// The GSI backfill recovery worker `serve` runs, with the stale threshold
@@ -613,6 +640,7 @@ pub async fn recover_stale_gsi_backfills_for_tests(
         engine,
         &engine.account_keyspace(account_id),
         stale_threshold,
+        None,
         &CancellationToken::new(),
         &mut backfills,
     )
@@ -621,14 +649,15 @@ pub async fn recover_stale_gsi_backfills_for_tests(
     pass
 }
 
-/// Rerun the stale backfills of the indexes of tables in `account_ks`, each
-/// in a task of `backfills` that stops once `shutdown` fires. An index of a
-/// table in another account's keyspace is left to the pass over that
-/// keyspace.
+/// Rerun the stale backfills of the indexes of tables in `account_ks`, or of
+/// its table `only_table`, each in a task of `backfills` that stops once
+/// `shutdown` fires. An index of a table in another account's keyspace is
+/// left to the pass over that keyspace.
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
     stale_threshold: Duration,
+    only_table: Option<&str>,
     shutdown: &CancellationToken,
     backfills: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), extenddb_storage::error::StorageError> {
@@ -666,6 +695,9 @@ async fn recover_stale_backfills(
         }
 
         let table_id: String = crate::cassandra_util::get_column(&row, "table_id", "gsi_recovery")?;
+        if only_table.is_some_and(|t| t != table_id) {
+            continue;
+        }
         let index_name: String =
             crate::cassandra_util::get_column(&row, "index_name", "gsi_recovery")?;
         let index_id: String = crate::cassandra_util::get_column(&row, "index_id", "gsi_recovery")?;
@@ -679,7 +711,7 @@ async fn recover_stale_backfills(
             match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
                 &engine.session,
                 &format!(
-                    "SELECT account_id, key_schema, attribute_definitions \
+                    "SELECT account_id, key_schema, attribute_definitions, table_name \
                  FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
                 ),
                 cdrs_tokio::query_values!(table_id.as_str()),
@@ -703,9 +735,10 @@ async fn recover_stale_backfills(
         // The catalog holds the indexes of every account. Another account's
         // index is recovered by the pass over its own keyspace; recovering it
         // here would create its data table in this keyspace and run a
-        // backfill of a base table this keyspace does not hold. It is
-        // skipped before its definition is parsed, so a malformed row is
-        // reported by its owner's pass alone.
+        // backfill of a base table this keyspace does not hold. A claim
+        // written here would also make the owner's pass find the index taken
+        // and skip it. It is skipped before its definition is parsed, so a
+        // malformed row is reported by its owner's pass alone.
         let owner: String =
             crate::cassandra_util::get_column(&base_row, "account_id", "gsi_recovery_base")?;
         if engine.account_keyspace(&owner) != account_ks {
@@ -756,6 +789,14 @@ async fn recover_stale_backfills(
             "gsi_recovery: recovering stale backfill for index '{index_name}' \
              (table_id={table_id}, index_id={index_id})"
         );
+        let base_table_name: String =
+            crate::cassandra_util::get_column(&base_row, "table_name", "gsi_recovery_base")?;
+        let Some(hold) =
+            crate::gsi_backfill_phase::claim(engine, &table_id, &index_name, &base_table_name)
+                .await
+        else {
+            continue;
+        };
 
         // Drop and recreate the data table so we start from a clean slate.
         if let Err(e) = engine.drop_index_data_table(account_ks, &index_id).await {
@@ -805,21 +846,26 @@ async fn recover_stale_backfills(
             // Once `shutdown` fires the backfill stops at its next request
             // and the task writes nothing more: the index stays CREATING
             // under its hold, its heartbeat goes stale, and a later pass runs
-            // the backfill again, as after a crash.
+            // the backfill again, as after a crash. The test-only phase hold
+            // waits under the same token.
             let Some(result) = shutdown
-                .run_until_cancelled(crate::data::ddl::backfill_gsi(
-                    &session,
-                    &account_ks_owned,
-                    &catalog_ks_owned,
-                    &table_id_owned,
-                    &index_id_owned,
-                    &index_name_owned,
-                    &index_key_schema,
-                    &base_attr_defs,
-                    &base_key_schema,
-                    &base_attr_defs,
-                    &projection,
-                ))
+                .run_until_cancelled(async {
+                    tokio::time::sleep(hold).await;
+                    crate::data::ddl::backfill_gsi(
+                        &session,
+                        &account_ks_owned,
+                        &catalog_ks_owned,
+                        &table_id_owned,
+                        &index_id_owned,
+                        &index_name_owned,
+                        &index_key_schema,
+                        &base_attr_defs,
+                        &base_key_schema,
+                        &base_attr_defs,
+                        &projection,
+                    )
+                    .await
+                })
                 .await
             else {
                 tracing::info!(

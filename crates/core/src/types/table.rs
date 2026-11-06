@@ -292,6 +292,21 @@ pub struct GsiDescription {
     pub projection: Projection,
     #[serde(rename = "IndexStatus")]
     pub index_status: String,
+    /// Whether a GSI added by `UpdateTable` is still being populated.
+    ///
+    /// The same three states, in the same order, as
+    /// [`VectorIndexDescription::backfilling`], whose comment carries the
+    /// vector measurement. Measured for a GSI on 2026-10-26 (us-east-1): `false`
+    /// while the index is `CREATING` and its backfill has not started, `true`
+    /// while it runs, absent once the index is `ACTIVE`. ExtendDB reports the
+    /// member only for a GSI that `UpdateTable` added, and `None` serialises as
+    /// an absent member.
+    #[serde(
+        rename = "Backfilling",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub backfilling: Option<bool>,
     #[serde(
         rename = "ProvisionedThroughput",
         skip_serializing_if = "Option::is_none"
@@ -737,7 +752,9 @@ pub const VECTOR_INDEX_SCAN_NOT_SUPPORTED: &str = "Scan operation not supported 
 
 /// Prefix of the Scan refusal while a vector index is still backfilling;
 /// continues with the index name. The service reuses the GSI wording even
-/// though the index is a vector index. Measured 2026-08-20.
+/// though the index is a vector index. Measured 2026-08-20. A GSI that
+/// `UpdateTable` is backfilling refuses both Query and Scan with this sentence
+/// (measured 2026-10-26).
 pub const VECTOR_INDEX_BACKFILLING_SCAN_PREFIX: &str =
     "Cannot read from backfilling global secondary index: ";
 

@@ -31,6 +31,8 @@ mod concurrent_account_creation;
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
+#[path = "direct/gsi_backfilling.rs"]
+mod gsi_backfilling;
 #[path = "direct/index.rs"]
 mod index;
 #[path = "direct/keyspace_migrations.rs"]
