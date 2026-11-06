@@ -316,7 +316,16 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
         for (key, value) in state.settings {
             expected_settings.insert((*key).to_owned(), (*value).to_owned());
         }
-        assert_eq!(settings(&db).await, expected_settings, "{name}: settings");
+        // Migration 6 writes a random catalog id on every catalog.
+        let mut actual_settings = settings(&db).await;
+        let catalog_id = actual_settings
+            .remove("catalog_id")
+            .unwrap_or_else(|| panic!("{name}: no catalog_id"));
+        assert!(
+            uuid::Uuid::parse_str(&catalog_id).is_ok(),
+            "{name}: {catalog_id}"
+        );
+        assert_eq!(actual_settings, expected_settings, "{name}: settings");
 
         // No post-check note: no released state has a pre-release shape.
         let notes = scalar(&db, "SELECT notes FROM extenddb_migrations WHERE id = 1").await;
@@ -390,11 +399,14 @@ async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
 
         next_second().await;
         let report = reconverge(&db).await.expect("reconverge");
-        // Every convergent migration ran again; migration 2, which is not
-        // convergent, is named as skipped.
+        // Every convergent migration that applies on SQLite ran again;
+        // migration 2, which is not convergent, is named as skipped.
         let convergent = MigrationId::ALL
             .into_iter()
-            .filter(|id| super::migration(*id).convergent())
+            .filter(|id| {
+                let m = super::migration(*id);
+                m.convergent() && !m.bodies().is_empty()
+            })
             .count();
         assert_eq!(report.applied.len(), convergent, "{trace}: {report:?}");
         let skipped = format!("Skipped {}:", MigrationId::ResourceTagConditionKeys);
