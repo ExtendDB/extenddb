@@ -69,8 +69,11 @@
 //!
 //! Memory: a batch is at most `batch_size` documents
 //! (`paging::DEFAULT_FETCH_BATCH`, 1000) and at most the server's 16 MiB
-//! reply limit, whichever is reached first, so unlike the SQL backends'
-//! row-bounded fetches one batch here is bounded in bytes too.
+//! reply limit, whichever is reached first, so one batch here is bounded in
+//! bytes by the server. The stream applies no cut of its own at
+//! `paging::SNAPSHOT_FETCH_BYTES` (64 MiB): the reply limit is already under
+//! that budget, and the byte cut the SQL backends make exists because their
+//! row-bounded fetches have no such limit.
 
 use extenddb_core::types::Item;
 use extenddb_storage::error::StorageError;
@@ -470,7 +473,6 @@ mod tests {
             .insert_one(doc! { "_id": "control_plane_delay_seconds", "value": "0" })
             .await
             .expect("setting");
-        let slots = crate::backup_engine::restore_server_slot_count(10);
         let engine = MongoEngine {
             client: client.clone(),
             catalog_db,
@@ -479,9 +481,6 @@ mod tests {
             gsi_cache: Arc::default(),
             tx_read_concern: ReadConcern::majority(),
             backup_liveness: crate::backup_engine::BackupLiveness::default(),
-            restore_server_slot_count: slots,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-            restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
         };
         let worker = tokio::spawn(crate::ttl_worker::gsi_backfill_worker(
             Arc::new(engine.clone()),

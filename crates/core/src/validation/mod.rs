@@ -1,8 +1,13 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod restorable_item;
 pub mod vector_item;
 
+pub use restorable_item::{
+    RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
+    SHOWN_VALUE_BYTES, validate_restorable_item,
+};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,

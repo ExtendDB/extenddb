@@ -519,16 +519,18 @@ class TestStreamAccountScoping:
         assert get_records_error(old_format(missing_shard)) == err
 
         # A token in the current format that names account A's stream ARN.
-        # Authorization pins the stream ARN to account B, and the engine looks
-        # the stream up in account B, where it does not exist, so the request
-        # fails the same way for a real and a made-up shard.
+        # GetShardIterator refuses a StreamArn in another account, so account B
+        # is never issued a token naming A's stream. This one is refused as an
+        # invalid iterator before authorization, the same way for a real and a
+        # made-up shard, and the stream ARN it carries is never rewritten to
+        # account B.
         def current_format(shard_id: str) -> str:
             return base64.b64encode(
                 f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{arn}".encode()
             ).decode()
 
         err = get_records_error(current_format(target_shard))
-        assert err["Code"] == "ResourceNotFoundException", err
+        assert err == {"Code": "ValidationException", "Message": "Invalid ShardIterator"}, err
         assert get_records_error(current_format(missing_shard)) == err
 
         # An iterator that does not decode gets DynamoDB's verbatim answer.
@@ -583,9 +585,9 @@ class TestStreamAccountScoping:
             "unauthenticated /console/metrics-data should redirect to console login"
         )
 
-        # 2. With a valid console session, the route returns metrics JSON
+        # 2. With an admin console session, the route returns metrics JSON
         #    (per-table dimensions), gated by the session cookie rather than
-        #    admin Basic auth.
+        #    admin Basic auth. An IAM-user session gets 403.
         s = requests.Session()
         # The harness sets REQUESTS_CA_BUNDLE/SSL_CERT_FILE, which overrides
         # session.verify; disable env trust and pass verify=False per request so
