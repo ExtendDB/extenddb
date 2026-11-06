@@ -248,7 +248,9 @@ pub async fn handle_query(
     // type, not a missing key schema element (measured 2026-10-21). This path
     // has no non-key rule, so that query also reaches the check below.
     // Legacy `KeyConditions` do not go through the check below, so the
-    // classifier still checks their values, against the table's definitions.
+    // classifier still checks their values: against the key schema's
+    // definitions on a multi-attribute key schema and against the table's on a
+    // single-attribute one.
     let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
     let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
         .attribute_definitions
@@ -447,8 +449,8 @@ pub async fn handle_query(
     // A key condition value whose type is not the key attribute's type is
     // refused after the key schema, filter, projection, unused value and
     // Select checks and before the ExclusiveStartKey check (measured
-    // 2026-10-24). The legacy KeyConditions path makes its own checks when it
-    // desugars.
+    // 2026-10-24). The classifier above checked the values of legacy
+    // `KeyConditions`.
     if legacy_kc_maps.is_none() {
         crate::query_key_values::validate_key_condition_types(
             &key_condition,

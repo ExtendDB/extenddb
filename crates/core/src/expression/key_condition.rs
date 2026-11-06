@@ -381,9 +381,12 @@ impl KeyCondition {
     /// [`Self::resolve_multipart_with`], which classifies every clause by name,
     /// applies the service's rules for such a schema and calls `value_check`
     /// where the service reports a value of the wrong type. On any other key
-    /// schema `value_check` runs on every clause first, which is where the
-    /// service reports it for such a schema (measured 2026-10-21), and then
-    /// [`Self::resolve_pk_sk`] picks the partition key clause.
+    /// schema `value_check` runs on every clause first, and then
+    /// [`Self::resolve_pk_sk`] picks the partition key clause. On a
+    /// single-attribute key schema the service reports a value of the wrong
+    /// type after the missing-key, filter, projection, unused-value and Select
+    /// checks (measured 2026-11-06), so the engine passes a `value_check` that
+    /// checks nothing there unless the request uses legacy `KeyConditions`.
     ///
     /// The engine reads a `Query` key condition through this, and so does
     /// authorization when it finds the partition key value for
