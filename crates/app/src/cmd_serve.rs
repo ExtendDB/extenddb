@@ -123,11 +123,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // cannot enable `dev-mode` (see the compile_error in the bin crate).
     if cfg!(feature = "dev-mode") {
         let host = app_config.server.bind_addr.trim();
-        let loopback = host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false);
+        let loopback = is_loopback_host(host);
         let allow_any_bind = std::env::var("EXTENDDB_DEV_ALLOW_ANY_BIND")
             .is_ok_and(|v| matches!(v.trim(), "1" | "true"));
         if !loopback && !allow_any_bind {
@@ -142,7 +138,9 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                 bind_addr = host,
                 "dev-mode is binding a non-loopback address: plain HTTP with relaxed \
                  authorization. Publish it on loopback only (-p 127.0.0.1:PORT:PORT) and \
-                 never expose it to a shared network."
+                 never expose it to a shared network. On a shared host, also set \
+                 EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1 with your own \
+                 EXTENDDB_DEV_ACCESS_KEY_ID / EXTENDDB_DEV_SECRET_ACCESS_KEY."
             );
         }
     }
@@ -206,7 +204,7 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         print!("{startup_warnings}");
     }
     if cfg!(feature = "dev-mode") {
-        print_dev_mode_banner(&app_config, args.foreground)?;
+        print_dev_mode_banner(&app_config, port, args.foreground)?;
     }
 
     // D-3: A PID file lets `extenddb status` and `extenddb stop` find the
@@ -393,37 +391,39 @@ fn render_startup_warnings(warnings: &[extenddb_storage::config::StartupWarning]
     out
 }
 
+/// True for a bind address that only this host can reach.
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// Print the developer-mode banner lines: the mode notice, the credentials to
-/// sign with, and an advisory when an ambient `AWS_ACCESS_KEY_ID` would not
-/// verify.
+/// sign with, a warning block when the server is not bound to loopback, and an
+/// advisory when an ambient `AWS_ACCESS_KEY_ID` would not verify.
 ///
 /// Resolving here (not just in `serve()`) fails fast on a misconfigured
 /// `EXTENDDB_DEV_*` pair before daemonizing, and gives the invoking user the
 /// credentials without digging through logs. The built-in example pair is
 /// printed in full: it is public AWS documentation, not a secret. An
 /// operator-supplied secret is never printed.
-fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> anyhow::Result<()> {
+fn print_dev_mode_banner(
+    app_config: &config::AppConfig,
+    port: u16,
+    foreground: bool,
+) -> anyhow::Result<()> {
     use extenddb_server::dev_credentials;
 
     let dev_creds = dev_credentials::resolve()?;
-    let mut lines = vec![
-        format!(
-            "  DEVELOPER MODE: plain HTTP on loopback, authorization open \
-             (SigV4 still enforced). Serving storage: {}. Not for production.",
-            config::redact_password(app_config.storage.connection_config()),
-        ),
-        format!(
-            "  Sign requests with: {}",
-            dev_credentials::describe(&dev_creds)
-        ),
-    ];
-    if let Some(ignored) = dev_credentials::ignored_aws_env_key(&dev_creds) {
-        lines.push(format!(
-            "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
-             '{ignored}' will be rejected. Set EXTENDDB_DEV_ACCESS_KEY_ID and \
-             EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
-        ));
-    }
+    let lines = dev_mode_banner_lines(
+        &config::redact_password(app_config.storage.connection_config()),
+        app_config.server.bind_addr.trim(),
+        port,
+        &dev_creds,
+        dev_credentials::ignored_aws_env_key(&dev_creds).as_deref(),
+    );
     // Same stream split as the main banner: stdout for the daemon parent,
     // stderr in foreground mode so supervisors capture one stream.
     for msg in lines {
@@ -436,11 +436,168 @@ fn print_dev_mode_banner(app_config: &config::AppConfig, foreground: bool) -> an
     Ok(())
 }
 
+/// Build the developer-mode banner. Pure, so the wording is unit tested.
+///
+/// A non-loopback bind gets a multi-line warning block rather than one log
+/// line: it is the dev image's normal state (a container must bind 0.0.0.0
+/// for port publishing to work), and whether that is safe depends on the
+/// host's `-p` mapping, which the server cannot see. So the block cannot say
+/// "you are exposed", only what exposure would mean and how to avoid it.
+fn dev_mode_banner_lines(
+    storage: &str,
+    host: &str,
+    port: u16,
+    dev_creds: &[extenddb_server::dev_credentials::DevCredential],
+    ignored_aws_key: Option<&str>,
+) -> Vec<String> {
+    use extenddb_server::dev_credentials;
+
+    let loopback = is_loopback_host(host);
+    let example_active = dev_credentials::example_pair_active(dev_creds);
+    let where_ = if loopback {
+        "on loopback".to_owned()
+    } else {
+        format!("on {host}")
+    };
+    let mut lines = vec![
+        format!(
+            "  DEVELOPER MODE: plain HTTP {where_}, authorization open \
+             (SigV4 still enforced). Serving storage: {storage}. Not for production.",
+        ),
+        format!(
+            "  Sign requests with: {}",
+            dev_credentials::describe(dev_creds)
+        ),
+    ];
+    if !loopback {
+        let credential = if example_active {
+            "the signing credential above is public, so anyone who can reach this port \
+             can read, change and delete every table"
+        } else {
+            "whoever holds the signing credential above can read, change and delete \
+             every table"
+        };
+        lines.extend([
+            String::new(),
+            format!("  WARNING: dev mode is listening on {host}:{port}, not loopback."),
+            format!("  Requests are plain HTTP and authorization is open: {credential}."),
+            format!(
+                "  In a container, publish the port on loopback only: \
+                 -p 127.0.0.1:{port}:{port} (not -p {port}:{port})."
+            ),
+            "  Never expose dev mode to a shared or routable network.".to_owned(),
+        ]);
+        if example_active {
+            lines.push(format!(
+                "  On a shared host or CI runner, set {}=1 with your own \
+                 EXTENDDB_DEV_ACCESS_KEY_ID / EXTENDDB_DEV_SECRET_ACCESS_KEY.",
+                dev_credentials::ENV_DISABLE_EXAMPLE,
+            ));
+        }
+        lines.push(String::new());
+    }
+    if let Some(ignored) = ignored_aws_key {
+        lines.push(format!(
+            "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
+             '{ignored}' will be rejected. Set EXTENDDB_DEV_ACCESS_KEY_ID and \
+             EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ServeArgs, render_startup_warnings};
+    use super::{ServeArgs, dev_mode_banner_lines, is_loopback_host, render_startup_warnings};
     use clap::Parser;
+    use extenddb_server::dev_credentials::{
+        DevCredential, ENV_DISABLE_EXAMPLE, EXAMPLE_ACCESS_KEY_ID, EXAMPLE_SECRET_ACCESS_KEY,
+    };
     use extenddb_storage::config::StartupWarning;
+
+    fn example() -> DevCredential {
+        DevCredential {
+            access_key_id: EXAMPLE_ACCESS_KEY_ID.to_owned(),
+            secret_access_key: EXAMPLE_SECRET_ACCESS_KEY.to_owned(),
+            is_builtin: true,
+        }
+    }
+
+    fn team() -> DevCredential {
+        DevCredential {
+            access_key_id: "AKIADEVTEAMKEY000001".to_owned(),
+            secret_access_key: "team-secret".to_owned(),
+            is_builtin: false,
+        }
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in ["127.0.0.1", "127.1.2.3", "::1", "localhost"] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in ["0.0.0.0", "::", "192.168.1.10", "example.com", ""] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn loopback_dev_banner_has_no_exposure_warning() {
+        let text =
+            dev_mode_banner_lines(":memory:", "127.0.0.1", 18080, &[example()], None).join("\n");
+        assert!(text.contains("plain HTTP on loopback"), "{text}");
+        assert!(!text.contains("WARNING"), "{text}");
+    }
+
+    #[test]
+    fn non_loopback_dev_banner_warns_with_the_publish_command() {
+        let text =
+            dev_mode_banner_lines(":memory:", "0.0.0.0", 18080, &[example()], None).join("\n");
+        // The banner used to say "on loopback" whatever the bind was.
+        assert!(!text.contains("plain HTTP on loopback"), "{text}");
+        assert!(text.contains("plain HTTP on 0.0.0.0"), "{text}");
+        assert!(
+            text.contains("WARNING: dev mode is listening on 0.0.0.0:18080"),
+            "{text}"
+        );
+        assert!(text.contains("credential above is public"), "{text}");
+        assert!(text.contains("-p 127.0.0.1:18080:18080"), "{text}");
+        assert!(text.contains(&format!("{ENV_DISABLE_EXAMPLE}=1")), "{text}");
+    }
+
+    #[test]
+    fn non_loopback_dev_banner_without_the_example_pair_drops_the_public_wording() {
+        let text = dev_mode_banner_lines(":memory:", "0.0.0.0", 9000, &[team()], None).join("\n");
+        assert!(
+            text.contains("WARNING: dev mode is listening on 0.0.0.0:9000"),
+            "{text}"
+        );
+        assert!(text.contains("-p 127.0.0.1:9000:9000"), "{text}");
+        assert!(!text.contains("is public"), "{text}");
+        assert!(!text.contains(EXAMPLE_ACCESS_KEY_ID), "{text}");
+        // The switch is already set; do not tell the operator to set it.
+        assert!(
+            !text.contains(&format!("{ENV_DISABLE_EXAMPLE}=1")),
+            "{text}"
+        );
+        assert!(!text.contains("team-secret"), "{text}");
+    }
+
+    #[test]
+    fn dev_banner_keeps_the_ignored_aws_key_note() {
+        let text = dev_mode_banner_lines(
+            ":memory:",
+            "127.0.0.1",
+            18080,
+            &[example()],
+            Some("ASIAFOREIGNSESSION01"),
+        )
+        .join("\n");
+        assert!(
+            text.contains("'ASIAFOREIGNSESSION01' will be rejected"),
+            "{text}"
+        );
+    }
 
     /// Test wrapper so clap has a top-level `Parser` to drive `ServeArgs`.
     #[derive(Parser)]
