@@ -52,12 +52,14 @@ jobs:
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
         run: cargo build --release --no-default-features --features mongodb-test-hooks
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
       - name: Run MongoDB pytest suite
         env:
           # run-mongodb-tests initializes the server without [backup.store]:
           # CreateBackup is the in-catalog create.
           EXTENDDB_TEST_BACKUP_STORE: none
-        run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
+        run: devtools/run-mongodb-tests -- --pytest --comprehensive --terraform --parallel
 
   # SnapshotEngine consistency check against a disposable replica set. The
   # tests build their own per-test scratch databases (snap<uuid>_cat and

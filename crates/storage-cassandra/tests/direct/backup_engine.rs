@@ -654,6 +654,7 @@ async fn test_restore_reproduces_gsi_and_lsi_contents() {
                     non_key_attributes: Some(vec!["value".to_owned()]),
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             local_secondary_indexes: Some(vec![LsiInput {
                 index_name: "ByLocal".to_owned(),
@@ -1374,6 +1375,7 @@ async fn test_backup_without_definition_restores_as_legacy() {
                     non_key_attributes: None,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             ..Default::default()
         },
@@ -1917,6 +1919,7 @@ async fn test_restore_heartbeat_runs_during_target_ddl() {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         });
         lsis.push(LsiInput {
             index_name: format!("L{i}"),

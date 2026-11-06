@@ -1712,6 +1712,8 @@ fn described(request: &RestoreRequest) -> TableDescription {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: String::new(),
+                    warm_throughput: None,
+                    warm_throughput_record: None,
                 })
                 .collect()
         }),
@@ -1757,6 +1759,7 @@ fn gsi(name: &str, pk: &str, pt: Option<ProvisionedThroughput>) -> GsiInput {
             non_key_attributes: None,
         },
         provisioned_throughput: pt,
+        warm_throughput: None,
     }
 }
 
@@ -2866,11 +2869,13 @@ async fn index_overrides_the_service_refuses_are_refused() {
              BillingMode is PAY_PER_REQUEST",
         ),
         (
-            "a member ExtendDB cannot apply",
+            "a warm throughput on a GSI entry",
             json!({ "GlobalSecondaryIndexOverride": [entry_with(
                 "WarmThroughput", json!({ "ReadUnitsPerSecond": 12000 }),
             )] }),
-            "index gsi1: member WarmThroughput is not supported",
+            // Row S6d, whole: the service's own sentence.
+            "One or more parameter values were invalid: WarmThroughput is not supported on \
+             Global Secondary Indexes via RestoreTableFromBackup",
         ),
         (
             "an LSI member ExtendDB cannot apply",
@@ -9252,6 +9257,8 @@ fn music_table() -> TableDescription {
             index_size_bytes: 0,
             item_count: 0,
             index_arn: String::new(),
+            warm_throughput: None,
+            warm_throughput_record: None,
         }]),
         ..Default::default()
     }

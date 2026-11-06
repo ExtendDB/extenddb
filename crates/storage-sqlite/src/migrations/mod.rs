@@ -32,6 +32,9 @@ mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0008_warm_throughput;
 mod postcheck;
 
 use std::time::Duration;
@@ -122,6 +125,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
             "SQLite runs one writer at a time, so its stream records commit in the order of \
              their sequence numbers",
         ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0008_warm_throughput::WarmThroughput,
+                m0008_warm_throughput::SOURCE,
+            )],
+        },
     }
 }
 

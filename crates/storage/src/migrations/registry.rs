@@ -79,11 +79,16 @@ migration_ids! {
     /// in (#808).
     StreamPending = 7, "stream_pending",
         "add stream_pending, which holds a PostgreSQL stream record until its write commits";
+    /// Adds a nullable `warm_throughput` column to the `tables` and `indexes`
+    /// catalog tables, where the `WarmThroughput` a client set on a table or
+    /// a global secondary index is stored.
+    WarmThroughput = 8, "warm_throughput",
+        "add a nullable warm_throughput column to the tables and indexes catalogs";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 7.
+/// `forget` refuses them. The v1.0 release PR raises it to 8.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

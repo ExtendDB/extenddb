@@ -41,6 +41,7 @@ mod table_helpers;
 pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
+mod warm_throughput;
 mod worker_store;
 pub mod workers;
 

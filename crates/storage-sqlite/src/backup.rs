@@ -306,6 +306,7 @@ impl SqliteEngine {
                     key_schema,
                     projection,
                     provisioned_throughput: throughput_from_catalog(ipt.as_ref()),
+                    warm_throughput: None,
                 });
             }
         }

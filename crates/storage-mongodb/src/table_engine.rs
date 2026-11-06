@@ -224,6 +224,12 @@ impl MongoEngine {
         // table return ResourceNotFound, matching DynamoDB and the postgres
         // backend.
         let delay_secs = self.control_plane_delay_seconds().await;
+        // WarmThroughput as sent, reported back and acted on by nothing.
+        // UPDATING for the same delay the CREATING to ACTIVE flip takes.
+        let (warm_record, warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+            input.warm_throughput.as_ref(),
+            delay_secs,
+        )?;
         let (table_status, status_transition_at): (&str, bson::Bson) = if defer_active {
             // Restore path: enter CREATING with no scheduled transition. The
             // caller flips the table to ACTIVE (or schedules the transition)
@@ -260,6 +266,7 @@ impl MongoEngine {
             "table_class": table_class_bson,
             "sse_specification": sse_spec_bson,
             "on_demand_throughput": on_demand_bson,
+            "warm_throughput": warm_bson,
         };
         if let Some(registration) = restore.as_deref() {
             registration.insert_into(&mut table_doc);
@@ -412,6 +419,11 @@ impl MongoEngine {
 
                 let index_status = if defer_active { "CREATING" } else { "ACTIVE" };
                 let backfill_mode = if defer_active { Some("restore") } else { None };
+                let (gsi_warm_record, gsi_warm_bson) =
+                    crate::warm_throughput::warm_record_bson_for_create(
+                        gsi.warm_throughput.as_ref(),
+                        delay_secs,
+                    )?;
                 let mut index_doc = doc! {
                     "_id": { "table_id": &table_id, "index_name": &gsi.index_name },
                     "index_id": &index_id,
@@ -420,6 +432,7 @@ impl MongoEngine {
                     "projection": projection_bson,
                     "index_status": index_status,
                     "provisioned_throughput": index_pt_bson.unwrap_or(bson::Bson::Null),
+                    "warm_throughput": gsi_warm_bson,
                 };
                 if let Some(mode) = backfill_mode {
                     index_doc.insert("backfill_mode", mode);
@@ -456,6 +469,8 @@ impl MongoEngine {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn_val,
+                    warm_throughput: None,
+                    warm_throughput_record: gsi_warm_record,
                 });
             }
             Some(descs)
@@ -618,6 +633,7 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput: input.on_demand_throughput,
+            warm_throughput_record: warm_record,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.
@@ -940,6 +956,11 @@ impl MongoEngine {
             }
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        self.store_warm_throughput_updates(account_id, &input)
+            .await?;
+
         if clear_provisioned_throughput {
             let table_doc = tables_coll
                 .find_one(doc! {
@@ -1038,6 +1059,10 @@ impl MongoEngine {
                     // Live writes during the backfill window sync through
                     // sync_indexes (upserts) so the eventual state is
                     // convergent regardless of interleaving.
+                    let (_, gsi_warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_seconds().await,
+                    )?;
                     let index_doc = doc! {
                         "_id": { "table_id": &desc.table_id, "index_name": &create.index_name },
                         "index_id": &index_id,
@@ -1046,6 +1071,7 @@ impl MongoEngine {
                         "projection": projection_bson,
                         "index_status": "CREATING",
                         "provisioned_throughput": pt_bson.unwrap_or(bson::Bson::Null),
+                        "warm_throughput": gsi_warm_bson,
                     };
 
                     self.catalog_db
@@ -1643,6 +1669,10 @@ impl MongoEngine {
                         index_size_bytes: 0,
                         item_count: 0,
                         index_arn: idx_arn,
+                        warm_throughput: None,
+                        warm_throughput_record: crate::warm_throughput::warm_record_from_doc(
+                            idx_doc,
+                        ),
                     });
                 }
                 "LSI" => {
@@ -1739,6 +1769,7 @@ impl MongoEngine {
             table_class_summary,
             on_demand_throughput,
             restore_summary,
+            warm_throughput_record: crate::warm_throughput::warm_record_from_doc(doc),
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.

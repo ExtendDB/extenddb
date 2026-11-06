@@ -22,7 +22,8 @@ pub const CATALOG_MIGRATION_6: &str =
 
 /// The definitions a keyspace of `dir` (`catalog` or `account`) holds after
 /// every migration: migration 1's, without `continuous_backups`, which
-/// migration 5 drops, and in the catalog with what migration 6 adds.
+/// migration 5 drops, and in the catalog with what migration 6 adds and the
+/// `warm_throughput` column migration 8 adds to `tables` and `indexes`.
 ///
 /// # Panics
 ///
@@ -43,6 +44,17 @@ pub fn expected_definitions(dir: &str) -> postcheck::Definitions {
             serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
         expected.columns.extend(added.columns);
         expected.indexes.extend(added.indexes);
+        for table in ["tables", "indexes"] {
+            expected.columns.insert(
+                format!("{table}.warm_throughput"),
+                postcheck::Column {
+                    kind: "regular".to_owned(),
+                    position: -1,
+                    clustering_order: "none".to_owned(),
+                    data_type: "text".to_owned(),
+                },
+            );
+        }
     }
     expected
 }

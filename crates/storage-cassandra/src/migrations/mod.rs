@@ -154,6 +154,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "the stream_pending table belongs to the PostgreSQL backend, and Cassandra numbers its \
              stream records with the server's clock (#660)",
         ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0008_warm_throughput.cql"
+            )],
+        },
     }
 }
 

@@ -145,6 +145,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0007_stream_pending.sql"
             )],
         },
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0008_warm_throughput.sql"
+            )],
+        },
     }
 }
 
@@ -168,7 +177,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::SortKeyDefinitions
         | MigrationId::DropContinuousBackups
         | MigrationId::BackupCatalogIndex
-        | MigrationId::StreamPending => RunsIn::Transaction,
+        | MigrationId::StreamPending
+        | MigrationId::WarmThroughput => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }
