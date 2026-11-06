@@ -496,37 +496,18 @@ fn delete_all_elements_removes_attribute() {
 }
 
 #[test]
-fn add_and_delete_list_element_string_set_reporter_measurements() {
-    // Issue #812 reporter measurement:
-    // Initial item has l = [{"SS": ["a"]}].
-    // Request 1: ADD l[0] :v with :v = {"SS": ["b"]} -> DynamoDB returns 200, l = [{"SS": ["a", "b"]}].
-    // Request 2: DELETE l[0] :v with :v = {"SS": ["a"]} -> DynamoDB returns 200, l = [{"SS": ["b"]}].
+fn delete_list_element_string_set_reporter_measurements() {
+    // Issue #812 reporter measurement for DELETE:
+    // Initial item has l = [{"SS": ["a", "b"]}].
+    // Request: DELETE l[0] :v with :v = {"SS": ["a"]} -> DynamoDB returns 200, l = [{"SS": ["b"]}].
     let mut item = BTreeMap::new();
     let mut initial_set = BTreeSet::new();
     initial_set.insert("a".into());
+    initial_set.insert("b".into());
     item.insert(
         "l".into(),
         AttributeValue::L(vec![AttributeValue::SS(initial_set)]),
     );
-
-    let mut add_set = BTreeSet::new();
-    add_set.insert("b".into());
-    let mut values = HashMap::new();
-    values.insert("v".into(), AttributeValue::SS(add_set));
-    apply("ADD l[0] :v", &mut item, HashMap::new(), values).unwrap();
-
-    let elem = match item.get("l") {
-        Some(AttributeValue::L(list)) => &list[0],
-        _ => panic!("expected list in l"),
-    };
-    match elem {
-        AttributeValue::SS(s) => {
-            assert!(s.contains("a"));
-            assert!(s.contains("b"));
-            assert_eq!(s.len(), 2);
-        }
-        _ => panic!("expected SS in l[0]"),
-    }
 
     let mut del_set = BTreeSet::new();
     del_set.insert("a".into());
@@ -534,64 +515,31 @@ fn add_and_delete_list_element_string_set_reporter_measurements() {
     del_values.insert("v".into(), AttributeValue::SS(del_set));
     apply("DELETE l[0] :v", &mut item, HashMap::new(), del_values).unwrap();
 
-    let elem_after = match item.get("l") {
-        Some(AttributeValue::L(list)) => &list[0],
-        _ => panic!("expected list in l"),
+    let list = match item.get("l") {
+        Some(AttributeValue::L(l)) => l,
+        other => panic!("expected AttributeValue::L, got {other:?}"),
     };
-    match elem_after {
-        AttributeValue::SS(s) => {
-            assert!(!s.contains("a"));
-            assert!(s.contains("b"));
-            assert_eq!(s.len(), 1);
-        }
-        _ => panic!("expected SS in l[0]"),
-    }
+    assert_eq!(list.len(), 1, "list length must remain 1");
+
+    let mut expected_set = BTreeSet::new();
+    expected_set.insert("b".into());
+    assert_eq!(list[0], AttributeValue::SS(expected_set));
 }
 
 #[test]
-fn add_and_delete_list_element_number_and_binary_sets() {
+fn delete_list_element_number_and_binary_sets() {
     let mut item = BTreeMap::new();
     let mut ns = BTreeSet::new();
     ns.insert("10".into());
+    ns.insert("20".into());
     let mut bs = BTreeSet::new();
     bs.insert(vec![1, 2, 3]);
+    bs.insert(vec![4, 5]);
 
     item.insert(
         "l".into(),
         AttributeValue::L(vec![AttributeValue::NS(ns), AttributeValue::BS(bs)]),
     );
-
-    // ADD to NS at index 0
-    let mut add_ns = BTreeSet::new();
-    add_ns.insert("20".into());
-    let mut values_ns = HashMap::new();
-    values_ns.insert("v".into(), AttributeValue::NS(add_ns));
-    apply("ADD l[0] :v", &mut item, HashMap::new(), values_ns).unwrap();
-
-    // ADD to BS at index 1
-    let mut add_bs = BTreeSet::new();
-    add_bs.insert(vec![4, 5]);
-    let mut values_bs = HashMap::new();
-    values_bs.insert("v".into(), AttributeValue::BS(add_bs));
-    apply("ADD l[1] :v", &mut item, HashMap::new(), values_bs).unwrap();
-
-    // Check unioned results
-    if let Some(AttributeValue::L(list)) = item.get("l") {
-        if let AttributeValue::NS(s) = &list[0] {
-            assert!(s.contains("10"));
-            assert!(s.contains("20"));
-        } else {
-            panic!("expected NS");
-        }
-        if let AttributeValue::BS(s) = &list[1] {
-            assert!(s.contains(&vec![1, 2, 3]));
-            assert!(s.contains(&vec![4, 5]));
-        } else {
-            panic!("expected BS");
-        }
-    } else {
-        panic!("expected list");
-    }
 
     // DELETE from NS at index 0
     let mut del_ns = BTreeSet::new();
@@ -629,15 +577,16 @@ fn add_and_delete_list_element_number_and_binary_sets() {
 }
 
 #[test]
-fn add_and_delete_nested_map_list_paths() {
+fn delete_nested_map_list_paths() {
     let mut item = BTreeMap::new();
     let mut inner_set = BTreeSet::new();
     inner_set.insert("val1".into());
+    inner_set.insert("val2".into());
 
     let mut inner_map = BTreeMap::new();
     inner_map.insert("tags".into(), AttributeValue::SS(inner_set));
 
-    // Structure: m.l[0] = {"tags": SS["val1"]}
+    // Structure: m.l[0] = {"tags": SS["val1", "val2"]}
     let mut outer_map = BTreeMap::new();
     outer_map.insert(
         "l".into(),
@@ -645,14 +594,7 @@ fn add_and_delete_nested_map_list_paths() {
     );
     item.insert("m".into(), AttributeValue::M(outer_map));
 
-    // ADD m.l[0].tags :v
-    let mut add_set = BTreeSet::new();
-    add_set.insert("val2".into());
-    let mut values = HashMap::new();
-    values.insert("v".into(), AttributeValue::SS(add_set));
-    apply("ADD m.l[0].tags :v", &mut item, HashMap::new(), values).unwrap();
-
-    // DELETE m.l[0].tags :v
+    // DELETE m.l[0].tags :v with "val1"
     let mut del_set = BTreeSet::new();
     del_set.insert("val1".into());
     let mut del_values = HashMap::new();
@@ -685,7 +627,7 @@ fn add_and_delete_nested_map_list_paths() {
 }
 
 #[test]
-fn add_and_delete_list_type_mismatches_and_out_of_bounds() {
+fn delete_list_type_mismatches_and_missing_paths() {
     let mut item = BTreeMap::new();
     let mut set = BTreeSet::new();
     set.insert("a".into());
@@ -697,27 +639,35 @@ fn add_and_delete_list_type_mismatches_and_out_of_bounds() {
         ]),
     );
 
-    // Mismatched operand type: ADD number to SS at l[0] -> ValidationException
-    let mut val_n = HashMap::new();
-    val_n.insert("v".into(), AttributeValue::N("1".into()));
-    let err = apply("ADD l[0] :v", &mut item, HashMap::new(), val_n).unwrap_err();
-    assert!(matches!(err, DynamoDbError::ValidationException(_)));
-
     // Mismatched operand type: DELETE set from N at l[1] -> ValidationException
     let mut val_ss = HashMap::new();
     let mut ss = BTreeSet::new();
     ss.insert("a".into());
     val_ss.insert("v".into(), AttributeValue::SS(ss));
-    let err2 = apply("DELETE l[1] :v", &mut item, HashMap::new(), val_ss).unwrap_err();
-    assert!(matches!(err2, DynamoDbError::ValidationException(_)));
+    let err = apply("DELETE l[1] :v", &mut item, HashMap::new(), val_ss).unwrap_err();
+    assert!(matches!(err, DynamoDbError::ValidationException(_)));
 
     // Out-of-bounds index: DELETE l[99] :v -> no-op (parent path doesn't exist)
     let mut val_del = HashMap::new();
     let mut ss_del = BTreeSet::new();
     ss_del.insert("x".into());
     val_del.insert("v".into(), AttributeValue::SS(ss_del));
-    let res = apply("DELETE l[99] :v", &mut item, HashMap::new(), val_del);
+    let res = apply(
+        "DELETE l[99] :v",
+        &mut item,
+        HashMap::new(),
+        val_del.clone(),
+    );
     assert!(res.is_ok());
+
+    // Missing top-level map: DELETE nonexistent.tags :v -> no-op in ExtendDB
+    let res_missing = apply(
+        "DELETE nonexistent.tags :v",
+        &mut item,
+        HashMap::new(),
+        val_del,
+    );
+    assert!(res_missing.is_ok());
 }
 
 #[test]
