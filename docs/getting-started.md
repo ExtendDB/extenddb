@@ -796,7 +796,7 @@ The management API is available at `/management/*` on the running extenddb serve
 
 Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
 
-**Note:** The `--password` flag is visible in process listings (`ps aux`). For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable instead.
+**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history. For sensitive environments, leave out `--password` and set the `EXTENDDB_PASSWORD` environment variable instead, with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD`, which keeps the password out of shell history. `extenddb manage` reads the password from `EXTENDDB_PASSWORD`. `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have no environment variable.
 
 ### List admin users
 
@@ -928,7 +928,7 @@ Both `--secret-access-key` and `--yes` are required:
     --yes
 ```
 
-> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable for the password.
+> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, set the password with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD` and leave out `--password`. `--secret-access-key` has no environment variable.
 
 Credential import is gated by the `allow_credential_import` runtime setting (default: `true`). To disable:
 
@@ -937,7 +937,7 @@ Credential import is gated by the `allow_credential_import` runtime setting (def
     allow_credential_import false
 ```
 
-Every import is logged to syslog (access key ID, account, user — never the secret).
+Credential import is not audit-logged. See [9. Audit logging](#9-audit-logging).
 
 ### Change IAM user password
 
@@ -1285,17 +1285,30 @@ Sessions end 8 hours after login. Click "Logout" to end a session immediately. D
 
 ## 9. Audit logging
 
-All management and settings operations are logged to syslog at WARN level with structured targets for filtering:
+The server writes audit entries at WARN level to its log: syslog when it runs as a daemon, and stderr with `--foreground`. Two targets cover some management operations and the settings changes made through the management API:
 
-- **Management operations:** `extenddb::audit::manage` — covers admin CRUD, account CRUD, IAM user/group/role/policy CRUD, access key lifecycle, permissions boundaries, assume-role, and credential import.
-- **Settings operations:** `extenddb::audit::settings` — covers `extenddb settings set` changes.
+- `extenddb::audit::manage`: DeleteAdmin, user and role tag changes, and AssumeRole, both granted and refused by the role's trust policy.
+- `extenddb::audit::settings`: each settings change made through the management API (`PUT /management/settings/{key}`).
+
+`extenddb settings set` changes the catalog without the server and prints its `extenddb::audit::settings` entry on its own standard output, so the server writes no audit entry for that change. A running server logs, under no audit target, when it applies a new `log_level`, `sqlx_log_level` or `throttling_enabled` value.
+
+Other management changes are not audit-logged. These include creating admin users, group membership and permissions boundary changes, password changes and credential import. Creating and deleting accounts, IAM users, groups, roles, access keys and policies are not audit-logged either.
+
+Audit entries are WARN events, so the server writes none of them while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off.
 
 Secrets (passwords, secret keys) are never included in audit log entries.
 
 View audit entries:
 
 ```bash
+# Linux
 journalctl -t extenddb | grep 'extenddb::audit'
+
+# macOS
+log show --predicate 'processImagePath ENDSWITH "extenddb"' --last 1d | grep 'extenddb::audit'
+
+# Docker Compose (--foreground)
+docker compose logs extenddb | grep 'extenddb::audit'
 ```
 
 ## 10. External test suites

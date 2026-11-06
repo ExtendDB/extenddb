@@ -313,13 +313,14 @@ Import/export file paths are validated:
 ### Credential Handling
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
-- The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
+- `extenddb manage` reads the password from the `EXTENDDB_PASSWORD` environment variable when `--password` is not given, so the password does not appear in process listings
 - Access key secrets are shown once on creation and cannot be retrieved afterward
 
 ### Logging
 
-- All logging goes to syslog (no log files with sensitive data on disk)
-- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted and denied), and settings changes. Other management changes, such as creating or deleting users, roles, access keys and policies, are not audit-logged
+- The server logs to syslog when it runs as a daemon and to stderr with `--foreground`, and writes no log files of its own
+- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted, and refused by the role's trust policy), and settings changes made through the management API. `extenddb settings set` changes the catalog without the server and prints its entry on its own standard output, so the server writes no audit entry for that change. Other management changes, such as creating or deleting IAM users, roles, access keys and policies, are not audit-logged
+- Audit entries are WARN events, so none are written while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off
 - Cache flushes (`cache invalidate`) are logged at INFO with the admin name, the scope and its selectors, so they are not recorded when the log level (`logging.level`, or the `log_level` setting, which overrides it) is `warn` or `error`
 - Log messages do not contain secret keys, passwords, or item data. Access key IDs can appear, for example in cache flush records
 
