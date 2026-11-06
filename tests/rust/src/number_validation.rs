@@ -1,9 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Number (`N`) attribute validation: whitespace and bare-dot inputs must be
-//! rejected with a ValidationException, matching real DynamoDB. Covers the
-//! parity fix that stopped trimming/accepting malformed numeric values.
+//! Number (`N`) attribute validation: malformed values (whitespace, a bare
+//! dot, an exponent outside i64) and out-of-range magnitudes must be rejected
+//! with a ValidationException, as DynamoDB does.
 
 use crate::test_base::*;
 use std::collections::HashMap;
@@ -62,4 +62,64 @@ async fn put_item_accepts_valid_number() {
     put_with_raw_number(&t.simple_key_string, "42.5")
         .await
         .expect("valid number must be accepted");
+}
+
+// DynamoDB's answers below were measured with PutItem on 2026-10-27, each value
+// twice. It prefixes each message with "1 validation error detected: ", which
+// ExtendDB does not, so the checks match on the message body.
+
+#[tokio::test]
+async fn put_item_exponent_near_i32_limits_is_overflow_or_underflow() {
+    let t = tables().await;
+    for (n, want) in [
+        ("10E2147483647", "Number overflow."),
+        ("12E2147483647", "Number overflow."),
+        ("1E2147483648", "Number overflow."),
+        ("1.5E-2147483648", "Number underflow."),
+        ("1E-2147483649", "Number underflow."),
+    ] {
+        let err = put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .expect_err("out-of-range number must be rejected");
+        assert!(
+            err.starts_with("ValidationException") && err.contains(want),
+            "{n}: got {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn put_item_exponent_outside_i64_is_malformed() {
+    let t = tables().await;
+    let n = "1E9223372036854775808";
+    let err = put_with_raw_number(&t.simple_key_string, n)
+        .await
+        .expect_err("exponent outside i64 must be rejected");
+    assert!(
+        err.starts_with("ValidationException")
+            && err.contains(&format!("cannot be converted to a numeric value: {n}")),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn put_item_zero_with_exponent_outside_i32_is_rejected() {
+    let t = tables().await;
+    for (n, want) in [
+        ("0E2147483648", "Number overflow."),
+        ("0E-9223372036854775808", "Number underflow."),
+    ] {
+        let err = put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .expect_err("zero with an out-of-range exponent must be rejected");
+        assert!(
+            err.starts_with("ValidationException") && err.contains(want),
+            "{n}: got {err}"
+        );
+    }
+    for n in ["0E125", "0.0E126", "0E-130"] {
+        put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .unwrap_or_else(|e| panic!("{n} must be accepted: {e}"));
+    }
 }
