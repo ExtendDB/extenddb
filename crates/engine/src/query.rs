@@ -226,11 +226,9 @@ pub async fn handle_query(
     // HASH or several RANGE attributes) every clause is assigned by name, every
     // HASH attribute needs an equality and the RANGE conditions must cover a
     // leading run of the RANGE attributes with equalities before the last one.
-    // A wrong-typed value is reported where the service reports it: after those
-    // structural rules and before the non-key rule on a multi-attribute key
-    // schema, and ahead of the missing-key check on a single-attribute one
-    // (measured 2026-10-21: `pk = :n` on an S key with a second clause on a
-    // non-key attribute reports the type, not the missing key).
+    // On a multi-attribute key schema the service reports a wrong-typed value
+    // after those structural rules and before the non-key rule, so the
+    // classifier runs the type check there.
     //
     // On a multi-attribute key schema the classifier refuses a clause on an
     // attribute outside the key schema (`Query condition missed key schema
@@ -240,11 +238,17 @@ pub async fn handle_query(
     // 2026-10-30 on a GSI with HASH `GSI2PK` and RANGE `GSI2SK`: `GSI2PK = :h
     // AND PK = :k` answers `Query condition missed key schema element: GSI2SK`
     // whether `:k` has the table's type for `PK` or not, so the service's type
-    // check does not see an attribute outside the queried key schema. The
-    // single-attribute path has no non-key rule yet: a clause on another
-    // attribute reaches storage, which applies it to the first RANGE
-    // attribute, so it keeps checking against the table's definitions, which
-    // refuse a value of the wrong type before storage does.
+    // check does not see an attribute outside the queried key schema.
+    //
+    // On a single-attribute key schema the service reports a wrong-typed value
+    // after the missing-key, filter, projection, unused-value and Select
+    // checks (measured 2026-11-06). The classifier does not run the type check
+    // there, and `validate_key_condition_types` reports the value below. `pk =
+    // :n` on an S key with a second clause on a non-key attribute reports the
+    // type, not a missing key schema element (measured 2026-10-21). This path
+    // has no non-key rule, so that query also reaches the check below.
+    // Legacy `KeyConditions` do not go through the check below, so the
+    // classifier still checks their values, against the table's definitions.
     let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
     let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
         .attribute_definitions
@@ -262,16 +266,19 @@ pub async fn handle_query(
     } else {
         &query_key_info.attribute_definitions
     };
+    let check_types_here = multipart || legacy_kc_maps.is_some();
     key_condition.resolve_key_schema_with(
         &query_key_info.key_schema,
         &effective_maps.names,
-        |path, value| check_key_value_type(path, value, type_definitions, effective_maps),
+        |path, value| {
+            if check_types_here {
+                check_key_value_type(path, value, type_definitions, effective_maps)
+            } else {
+                Ok(())
+            }
+        },
     )?;
-    refuse_begins_with_on_number(
-        &key_condition,
-        &query_key_info.attribute_definitions,
-        effective_maps,
-    )?;
+    refuse_begins_with_on_number(&key_condition, effective_maps)?;
     // On a single-attribute key schema, validate that the partition key is
     // actually referenced in the condition. The classifier has already required
     // an equality on every HASH attribute of a multi-attribute one.
@@ -633,30 +640,35 @@ fn check_key_value_type(
     }
 }
 
-/// Refuse `begins_with` on a number key attribute (measured 2026-10-21:
-/// `Invalid KeyConditionExpression: Incorrect operand type for operator or
-/// function; operator or function: begins_with, operand type: N`).
+/// Refuse a `begins_with` key condition whose value is not an S or a B, with
+/// the value's type in the text: `Invalid KeyConditionExpression: Incorrect
+/// operand type for operator or function; operator or function: begins_with,
+/// operand type: N`.
+///
+/// Measured on the service 2026-11-06: the value's type decides the refusal,
+/// not the sort key's type. An N or a BOOL value is refused on an S, an N and
+/// a B sort key alike. An S or a B value on a sort key of another type gets
+/// the type mismatch from the type check instead. The refusal comes before the
+/// unused-value, projection overlap and Select checks and before a wrong-typed
+/// partition key value. A placeholder that has no value passes here, and the
+/// existing checks report it.
 fn refuse_begins_with_on_number(
     key_condition: &extenddb_core::expression::KeyCondition,
-    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    use extenddb_core::expression::SortKeyCondition;
-    use extenddb_core::types::ScalarAttributeType;
+    use extenddb_core::expression::{Expr, SortKeyCondition};
 
-    if let Some(SortKeyCondition::BeginsWith { path, .. }) = &key_condition.sk_condition
-        && let Some(attr) = resolve_path_attr_name(path, &maps.names)
-        && attribute_definitions
-            .iter()
-            .any(|d| d.attribute_name == attr && d.attribute_type == ScalarAttributeType::N)
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
-             operator or function: begins_with, operand type: N"
-                .to_owned(),
-        ));
-    }
-    Ok(())
+    let Some(SortKeyCondition::BeginsWith { path, prefix }) = &key_condition.sk_condition else {
+        return Ok(());
+    };
+    // The operand check of the filter, applied to the key condition's call.
+    let call = Expr::Function {
+        name: "begins_with".to_owned(),
+        args: vec![Expr::Path(path.clone()), prefix.clone()],
+    };
+    extenddb_core::expression::validate_begins_with_operands(&call, maps).map_err(|e| {
+        crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
+    })
 }
 
 /// Validate that all `#name` references in an expression AST are defined.
@@ -760,3 +772,7 @@ mod empty_key_condition_tests {
         assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "query_begins_with_tests.rs"]
+mod begins_with_tests;
