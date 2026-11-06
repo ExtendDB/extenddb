@@ -9,6 +9,7 @@ runs against ExtendDB and the service with the same assertions."""
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -79,6 +80,20 @@ def test_a_restored_table_reports_the_defaults_and_a_gsi_override_cannot_set_it(
         assert "WarmThroughput" not in desc["SourceTableDetails"]
         for gsi in desc.get("SourceTableFeatureDetails", {}).get("GlobalSecondaryIndexes", []):
             assert "WarmThroughput" not in gsi
+
+        # S6c and S6d restore the backup. Until the restore job lands, a server
+        # with a backup store refuses that restore with ValidationException.
+        # Its message is "is in a backup store; this release restores
+        # in-catalog backups only". So S6c and S6d skip there, and S6b above
+        # runs on every server.
+        if (
+            os.environ.get("EXTENDDB_TEST_BACKUP_STORE", "").strip() in ("filesystem", "s3")
+            and os.environ.get("EXTENDDB_VALIDATION_MODE", "").lower() != "true"
+        ):
+            pytest.skip(
+                "RestoreTableFromBackup of a backup in the configured store is refused "
+                "until the restore job lands (PR 9a)"
+            )
 
         # S6c: no member while CREATING; the defaults once ACTIVE, on the table
         # and the index, although the source had set larger values.
