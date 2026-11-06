@@ -133,16 +133,10 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
                  inside a container, where the published port decides exposure."
             );
         }
-        if !loopback && allow_any_bind {
-            tracing::warn!(
-                bind_addr = host,
-                "dev-mode is binding a non-loopback address: plain HTTP with relaxed \
-                 authorization. Publish it on loopback only (-p 127.0.0.1:PORT:PORT) and \
-                 never expose it to a shared network. On a shared host, also set \
-                 EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1 with your own \
-                 EXTENDDB_DEV_ACCESS_KEY_ID / EXTENDDB_DEV_SECRET_ACCESS_KEY."
-            );
-        }
+        // A permitted non-loopback bind is warned about in the dev-mode banner
+        // (`dev_mode_banner_lines`), which prints to the console. A
+        // `tracing::warn!` here would print nothing: no subscriber is installed
+        // until `serve_inner` runs.
     }
 
     let bind_addr = format!("{}:{}", app_config.server.bind_addr, port);

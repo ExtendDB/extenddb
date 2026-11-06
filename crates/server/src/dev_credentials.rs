@@ -23,9 +23,9 @@
 //!   dev server that is reachable by others (a shared host, a CI runner with a
 //!   routable address): the public key would otherwise open every table to
 //!   anyone who can reach the port. It requires the `EXTENDDB_DEV_*` pair, so
-//!   the server always has a credential to verify, and it removes an example
-//!   key an earlier boot stored in a file-backed catalog, so the key stops
-//!   verifying rather than lingering.
+//!   the server always has a credential to verify, and it removes the example
+//!   key from whichever user an earlier boot or an operator stored it on in a
+//!   file-backed catalog, so the key stops verifying rather than lingering.
 //! * The standard `AWS_*` variables are never read for seeding. Adopting them
 //!   meant a shell holding real long-lived credentials silently copied them
 //!   into the dev catalog, a shell holding SSO session credentials (`ASIA*`)
@@ -102,7 +102,9 @@ pub fn resolve() -> anyhow::Result<Vec<DevCredential>> {
     resolve_from(
         non_empty_env(ENV_ACCESS_KEY_ID),
         non_empty_env(ENV_SECRET_ACCESS_KEY),
-        parse_switch(ENV_DISABLE_EXAMPLE, non_empty_env(ENV_DISABLE_EXAMPLE))?,
+        // Read as-is, not through `non_empty_env`: an empty value is refused
+        // rather than read as unset (see `parse_switch`).
+        parse_switch(ENV_DISABLE_EXAMPLE, std::env::var(ENV_DISABLE_EXAMPLE).ok())?,
     )
 }
 
@@ -110,16 +112,23 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// Parse an on/off switch. Unset or empty is off. An unrecognised value is an
-/// error rather than "off": this switch removes a public credential, so a typo
-/// such as `yes` must not leave the server quietly accepting it.
+/// Parse an on/off switch. Unset is off. An unrecognised value is an error
+/// rather than "off": this switch removes a public credential, so a typo such
+/// as `yes` must not leave the server quietly accepting it. An empty value is
+/// refused for the same reason: `-e NAME=$VAR` with `VAR` unset sets it empty,
+/// and reading that as "off" would leave the public credential active when
+/// the operator asked to remove it.
 fn parse_switch(name: &str, value: Option<String>) -> anyhow::Result<bool> {
     let Some(value) = value else {
         return Ok(false);
     };
     match value.trim() {
         "1" | "true" => Ok(true),
-        "0" | "false" | "" => Ok(false),
+        "0" | "false" => Ok(false),
+        "" => anyhow::bail!(
+            "{name} is set but empty; set it to 1 or true to remove the example \
+             credential, 0 or false to keep it, or unset it."
+        ),
         other => anyhow::bail!("{name} must be 1, true, 0 or false (got '{other}')."),
     }
 }
@@ -286,24 +295,54 @@ pub async fn seed(
         }
     }
 
-    // The example pair is disabled: remove it if an earlier boot stored it in
-    // a file-backed catalog. Seeding only adds keys, so without this the public
-    // key would keep verifying on every restart after the switch was set.
+    // The example pair is disabled: remove it if an earlier boot, or an
+    // operator through the management API, stored it in a file-backed catalog.
+    // Seeding only adds keys, so without this the public key would keep
+    // verifying on every restart after the switch was set.
     if !example_pair_active(credentials) {
-        match catalog_store
-            .delete_access_key(&account_id, "dev", EXAMPLE_ACCESS_KEY_ID)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                "dev credential {EXAMPLE_ACCESS_KEY_ID}: removed from the catalog \
-                 ({ENV_DISABLE_EXAMPLE} is set)"
-            ),
-            Err(OpError::NotFound(_)) => {}
-            Err(e) => anyhow::bail!(
-                "dev mode: failed to remove the example credential \
-                 {EXAMPLE_ACCESS_KEY_ID}: {e:?}"
-            ),
-        }
+        remove_example_key(catalog_store, credential_store).await?;
+    }
+    Ok(())
+}
+
+/// Delete the example access key from whichever user holds it.
+///
+/// The key id is public, so a copy on any user opens the same door: the one
+/// dev mode seeds lives on the `dev` user, but an operator can import the pair
+/// for another user with `extenddb manage`. The owner comes from the
+/// credential store, which looks keys up by id alone. It is the uncached
+/// store: the auth cache is built after seeding, so this lookup leaves nothing
+/// cached behind the delete.
+async fn remove_example_key(
+    catalog_store: &dyn CatalogStore,
+    credential_store: &dyn extenddb_auth::CredentialStore,
+) -> anyhow::Result<()> {
+    let stored = credential_store
+        .lookup_credential(EXAMPLE_ACCESS_KEY_ID)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "dev mode: failed to look up the example credential {EXAMPLE_ACCESS_KEY_ID}: {e:?}"
+            )
+        })?;
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let (account_id, user_name) = (&stored.account_id, &stored.principal_name);
+    match catalog_store
+        .delete_access_key(account_id, user_name, EXAMPLE_ACCESS_KEY_ID)
+        .await
+    {
+        Ok(()) => tracing::info!(
+            "dev credential {EXAMPLE_ACCESS_KEY_ID}: removed from user \
+             {account_id}/{user_name} ({ENV_DISABLE_EXAMPLE} is set)"
+        ),
+        // Deleted between the lookup and the delete: already gone.
+        Err(OpError::NotFound(_)) => {}
+        Err(e) => anyhow::bail!(
+            "dev mode: failed to remove the example credential {EXAMPLE_ACCESS_KEY_ID} \
+             from user {account_id}/{user_name}: {e:?}"
+        ),
     }
     Ok(())
 }
@@ -408,13 +447,25 @@ mod tests {
                 "{on}"
             );
         }
-        for off in ["0", "false", " "] {
+        for off in ["0", "false", " 0 "] {
             assert!(
                 !parse_switch(ENV_DISABLE_EXAMPLE, Some(off.into())).unwrap(),
                 "{off}"
             );
         }
         assert!(!parse_switch(ENV_DISABLE_EXAMPLE, None).unwrap());
+    }
+
+    #[test]
+    fn disable_switch_rejects_an_empty_value() {
+        // `-e NAME=$VAR` with VAR unset: the operator asked for the switch,
+        // so an empty value must not quietly leave the public key active.
+        for empty in ["", " "] {
+            let err = parse_switch(ENV_DISABLE_EXAMPLE, Some(empty.into())).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(ENV_DISABLE_EXAMPLE), "{msg}");
+            assert!(msg.contains("empty"), "{msg}");
+        }
     }
 
     #[test]
@@ -516,3 +567,7 @@ mod tests {
         assert!(text.contains(TEAM_KEY), "{text}");
     }
 }
+
+#[cfg(test)]
+#[path = "dev_credentials_seed_tests.rs"]
+mod seed_tests;
