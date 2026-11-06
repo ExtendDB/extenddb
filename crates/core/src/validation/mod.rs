@@ -3,6 +3,9 @@
 pub mod number;
 pub mod vector_item;
 
+#[cfg(test)]
+mod key_schema_mismatch_tests;
+
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
@@ -1104,7 +1107,9 @@ pub fn validate_put_item(
 
 /// Validate a `GetItem` request.
 ///
-/// Checks table name and key presence/types.
+/// Checks table name and key presence/types. A key element of the wrong type
+/// answers "The provided key element does not match the schema", as on the
+/// service.
 ///
 /// # Errors
 ///
@@ -1116,14 +1121,16 @@ pub fn validate_get_item(
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
-    validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_only(&input.key, key_schema, attr_defs).map_err(remap_key_type_mismatch)?;
     validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
 /// Validate a `DeleteItem` request.
 ///
-/// Checks table name, key presence/types, and `ReturnValues`.
+/// Checks table name, key presence/types, and `ReturnValues`. A key element of
+/// the wrong type answers "The provided key element does not match the
+/// schema", as on the service.
 ///
 /// # Errors
 ///
@@ -1146,14 +1153,16 @@ pub fn validate_delete_item(
         ));
     }
 
-    validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_only(&input.key, key_schema, attr_defs).map_err(remap_key_type_mismatch)?;
     validate_key_sizes(&input.key, key_schema, limits)?;
     Ok(())
 }
 
 /// Validate an `UpdateItem` request.
 ///
-/// Checks table name, key presence/types, and `ReturnValues`.
+/// Checks table name, key presence/types, and `ReturnValues`. A key element of
+/// the wrong type answers "The provided key element does not match the
+/// schema", as on the service.
 /// `UpdateExpression` parsing is handled separately by the expression engine.
 ///
 /// # Errors
@@ -1166,7 +1175,7 @@ pub fn validate_update_item(
     attr_defs: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
     validate_table_name(&input.table_name, limits)?;
-    validate_key_only(&input.key, key_schema, attr_defs)?;
+    validate_key_only(&input.key, key_schema, attr_defs).map_err(remap_key_type_mismatch)?;
     validate_key_sizes(&input.key, key_schema, limits)?;
 
     // Validate number values supplied via ExpressionAttributeValues. Unlike a
@@ -1502,7 +1511,7 @@ pub fn validate_key_only(
 /// Batch-specific key validation: uses `DynamoDB`'s batch error message for type mismatches.
 ///
 /// Real `DynamoDB` returns "The provided key element does not match the schema" for
-/// batch operations, not the single-item "Type mismatch" message.
+/// batch operations, not the `PutItem` "Type mismatch" message.
 ///
 /// # Errors
 ///
@@ -1528,11 +1537,12 @@ pub fn validate_batch_item_keys(
     validate_item_keys(item, key_schema, attr_defs).map_err(remap_key_type_mismatch)
 }
 
-/// Remap key type-mismatch errors to the batch/transaction-specific message.
+/// Remap key type-mismatch errors to "The provided key element does not match
+/// the schema".
 ///
-/// Real `DynamoDB` uses "The provided key element does not match the schema"
-/// for batch and transaction operations, not the single-item "Type mismatch"
-/// message.
+/// Real `DynamoDB` uses that message for a wrong-typed key element on
+/// `GetItem`, `DeleteItem`, `UpdateItem`, `TransactGetItems`, and the batch and
+/// transaction operations. `PutItem` keeps the "Type mismatch" message.
 fn remap_key_type_mismatch(err: DynamoDbError) -> DynamoDbError {
     match &err {
         DynamoDbError::ValidationException(msg) if msg.contains("Type mismatch for key ") => {
