@@ -57,10 +57,18 @@ Writing a catalog migration is contributor work. The procedure, with a worked ex
 
 For releases that include catalog changes. The names below in angle brackets are the ones chosen at `extenddb init`: `<catalog-db>` and `<data-db>` (`--catalog-db`, `--data-db`; defaults `extenddb_catalog` and `extenddb`) and `<owner>`, the application role (`--extenddb-user`, default `extenddb`). `<admin>` is the PostgreSQL role `init` connected as (`--pg-user`).
 
-1. **Stop the server**
+1. **Stop the server, and confirm it is down**
+
+   `extenddb stop` finds the server through the PID file the daemon writes. It stops nothing and exits 1 for a server started with `serve --foreground` (which writes no PID file), when its `--config` path does not name the server's config file, or when it runs as a different user than the one that started the server. Stop the server through whatever runs it: `sudo systemctl stop extenddb` for the Deployment Guide's systemd unit, the container runtime for a container, otherwise `extenddb stop --config extenddb.toml`. Start it again the same way when the procedure is done.
+
+   The exit status of `extenddb stop` does not show whether the server is down, so confirm with `extenddb status` before you back up, migrate or touch a file. The block below runs in a subshell, so it reports and stops without closing your shell when the server still answers. `extenddb status` connects to the port on 127.0.0.1 that the config file resolves to, so for a server whose `bind_addr` is another address, or one on another host, confirm the stop through whatever runs it instead.
 
 ```bash
+(
 extenddb stop --config extenddb.toml
+{ extenddb status --config extenddb.toml || true; } | grep -q 'is not running' \
+  || { echo 'server not confirmed stopped; stop it through whatever runs it' >&2; exit 1; }
+)
 ```
 
 2. **Back up the databases** (PostgreSQL; for SQLite see [SQLite](#sqlite) below, for Cassandra see the [rollback procedure](#rollback-procedure))
@@ -164,7 +172,7 @@ SQLite deployments follow the same sequence, backing up the database files as [S
 
 The upgrade is not reversible in place when it applies a breaking migration, and every migration in this release is breaking (see [The Catalog Status](#the-catalog-status)). If an upgrade fails or must be undone (PostgreSQL; for SQLite see [SQLite](#sqlite) below):
 
-1. Stop the server
+1. Stop the server and confirm it is down, as in step 1 of the General Upgrade Procedure
 2. Restore the catalog from the backup, connected as `<admin>` to the `postgres` database:
 
 ```bash
@@ -213,12 +221,16 @@ The upgrade is not reversible in place: a 0.0.3 PostgreSQL or SQLite binary refu
 #### PostgreSQL
 
 ```bash
+(
 extenddb stop --config extenddb.toml
+{ extenddb status --config extenddb.toml || true; } | grep -q 'is not running' \
+  || { echo 'server not confirmed stopped; stop it through whatever runs it' >&2; exit 1; }
 pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
 export EXTENDDB_PG_PASSWORD='<admin password>'
 extenddb migrate --config extenddb.toml --pg-user <admin>          # exit 3, prints the plan
 extenddb migrate --config extenddb.toml --pg-user <admin> --yes    # applies 003_backup_definitions.sql
 extenddb serve --config extenddb.toml
+)
 ```
 
 The preview reports the version change and the unapplied migration file, `Pending: catalog 0.0.3 -> 0.0.4; data migrations [catalog 003_backup_definitions.sql].`, and exits 3; after `--yes`, a second preview reports everything up to date and exits 0. `migrate` treats any catalog migration file that the catalog's ledger does not record as pending, even when the stored catalog version already matches the binary, and applies it with `--yes`; such files are listed under `data migrations` as `catalog <file>`. <!-- version-literal-ok: names both ends of the upgrade -->
@@ -234,11 +246,15 @@ On its first control-plane pass after the upgrade (at startup), the server remov
 The database is one file plus its `-wal` and `-shm` files beside it. Stop the server before copying them: `migrate --yes` and `serve` take the same exclusive lock on `<database>.lock`, so while a server is up `migrate --yes` waits for up to `--lock-timeout` seconds (60 by default) and then exits 6 (`another extenddb process is already using ...`). `migrate` without `--yes` takes no lock, writes nothing, and runs beside a server. Before its first change `migrate --yes` copies the database to `<database>.pre-migration-<from>-to-<to>-<UTC time>`, readable by its owner only (mode 0600) whatever the database's mode, and prints the copy's path and the database's size before it copies and the time the copy took after. It takes the copy with SQLite's online backup API, which reads the database file and the committed frames of its WAL in one read transaction, so the copy holds every committed write, and its time grows with the database's size. The copy is in rollback-journal mode, so it can be read without a `-shm` file beside it, also from a directory the reader may not write to. A run that stops before it commits anything removes its copy, since the database is unchanged; a run that stops after a step committed keeps its copy and names it in its error. A run that is killed after its copy is complete and before it commits anything leaves the copy; the next run whose own copy has the same bytes removes it once that copy is complete, and names it, also in its error when that run then stops before its first change, unless a `-wal` or `-journal` file beside it shows that a process opened it or the file is a link to the database. Every other copy stays until you remove it. `<database>.lock` stays beside the database after every run and server, also after a refused `serve` or `migrate --yes`. Do not remove it while an ExtendDB process may have it open: a process that then creates and locks a new file of that name does not exclude the process that holds the old one. A stopped server can leave a non-empty `-wal` file, so copy all three.
 
 ```bash
+(
 extenddb stop --config extenddb.toml
+{ extenddb status --config extenddb.toml || true; } | grep -q 'is not running' \
+  || { echo 'server not confirmed stopped; stop it through whatever runs it' >&2; exit 1; }
 mkdir pre-upgrade && cp -p /path/to/extenddb.sqlite* pre-upgrade/
 extenddb migrate --config extenddb.toml          # exit 3, prints the plan
 extenddb migrate --config extenddb.toml --yes
 extenddb serve --config extenddb.toml
+)
 ```
 
 The upgrade rebuilds `backup_items` with a stable restore cursor, copying every row into a new table inside one write transaction; the database is locked for writes until it finishes. From v1.0 migration 1 makes this rebuild on a database whose `backup_items` has no `id` column. The preview lists migration 1 and does not name the rebuild. `--yes` prints the rebuild as a note under migration 1, and `verify` prints the same note from the ledger:
@@ -250,7 +266,7 @@ The upgrade rebuilds `backup_items` with a stable restore cursor, copying every 
 
 The 0.1.x binaries named the rebuild in the preview, as `Pending: catalog 0.0.3 -> 0.0.4; data migrations [rebuild backup_items (80 rows)].`, and logged its start and end at info.
 
-To roll back, stop the server, put the copied files back in place of the current ones (remove the current `-wal` and `-shm` first), and start the previous binary.
+To roll back, stop the server and confirm it is down (step 1 of the General Upgrade Procedure), put the copied files back in place of the current ones (remove the current `-wal` and `-shm` first), and start the previous binary the same way.
 
 On SQLite, `extenddb serve` reads the catalog's migration ledger before it opens the database and refuses a catalog with pending migrations, exiting 3 under `--foreground` with each pending migration and the `extenddb migrate --config <config> --yes` command to run (in daemon mode it exits 1 and writes the refusal to syslog); a dev build applies them at startup instead, taking the same copy.
 
@@ -261,11 +277,15 @@ On startup the SQLite server ages every RUNNING restore record to the epoch, whi
 #### Cassandra
 
 ```bash
+(
 extenddb stop --config extenddb.toml
+{ extenddb status --config extenddb.toml || true; } | grep -q 'is not running' \
+  || { echo 'server not confirmed stopped; stop it through whatever runs it' >&2; exit 1; }
 export EXTENDDB_CASSANDRA_PASSWORD='<password>'
 extenddb migrate --config extenddb.toml --cassandra-user <admin>          # exit 3
 extenddb migrate --config extenddb.toml --cassandra-user <admin> --yes    # applies V005
 extenddb serve --config extenddb.toml
+)
 ```
 
 `<admin>` is the role `init` used (`--cassandra-user`). `EXTENDDB_CASSANDRA_PASSWORD` keeps the password out of process arguments; `--cassandra-pass` still works and wins if both are given. Without a user and password `migrate` connects as the operating-system user with no password, which a cluster using `PasswordAuthenticator` refuses; the error reports a connection timeout.
@@ -294,9 +314,13 @@ Adds vector index metadata:
 Upgrade sequence:
 
 ```bash
+(
 extenddb stop --config extenddb.toml
+{ extenddb status --config extenddb.toml || true; } | grep -q 'is not running' \
+  || { echo 'server not confirmed stopped; stop it through whatever runs it' >&2; exit 1; }
 extenddb migrate --yes --config extenddb.toml
 extenddb serve --config extenddb.toml
+)
 ```
 
 Run `extenddb migrate` without `--yes` first to see what is pending; it reports `catalog 0.0.2 -> 0.0.3` and changes nothing.
