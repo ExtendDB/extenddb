@@ -28,8 +28,11 @@ from warm_throughput_helpers import (  # noqa: F401  (tables is a fixture)
     ON_DEMAND_NEEDS_BILLING,
     ONLY_OPERATION,
     TABLE_CLASS_ONLY,
+    _assert_opened,
+    _assert_opened_status,
     _create,
     _sentence,
+    _update_table,
     _validation,
     _wait_all_active,
     _wait_warm_active,
@@ -164,26 +167,49 @@ class TestWarmThroughputLifecycle:
         _wait_all_active(dynamodb_client, name)
 
         # U1: the same values as current, and nothing else in the request.
-        resp = dynamodb_client.update_table(TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)
-        t = resp["TableDescription"]
+        t, took = _update_table(dynamodb_client, TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)
         assert t["TableStatus"] == "ACTIVE"
-        assert t["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
+        _assert_opened(
+            t["WarmThroughput"], ON_DEMAND_DEFAULTS, ON_DEMAND_DEFAULTS, is_extenddb, took
+        )
         if is_extenddb:
             _wait_warm_active(dynamodb_client, name)
 
         # U2 and S2a: higher values; the response carries the previous pair.
         higher = {"ReadUnitsPerSecond": 24000, "WriteUnitsPerSecond": 8000}
-        t = dynamodb_client.update_table(TableName=name, WarmThroughput=higher)["TableDescription"]
+        t, took = _update_table(dynamodb_client, TableName=name, WarmThroughput=higher)
         assert t["TableStatus"] == "ACTIVE"
-        assert t["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
+        _assert_opened(t["WarmThroughput"], ON_DEMAND_DEFAULTS, higher, is_extenddb, took)
         described = dynamodb_client.describe_table(TableName=name)["Table"]["WarmThroughput"]
         if described["Status"] == "UPDATING":
             assert described == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
             # U3: inside the window the previous values are not a decrease.
-            t = dynamodb_client.update_table(TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)[
-                "TableDescription"
-            ]
-            assert t["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
+            # On ExtendDB the window of U2 lasts EXTENDDB_WINDOW_SECONDS and
+            # can end at any point of this request. If it ends before the
+            # check, the request is a decrease (S2b). If it ends between the
+            # check and the write, the response has the higher pair, UPDATING
+            # or ACTIVE. If it ends after the write, the response has the
+            # previous pair UPDATING, or the higher pair ACTIVE once the
+            # window of U3 ends. U3b checks the settled pair in each case.
+            try:
+                t = dynamodb_client.update_table(
+                    TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS
+                )["TableDescription"]
+            except ClientError as e:
+                if not is_extenddb:
+                    raise
+                err = e.response["Error"]
+                assert err["Code"] == "ValidationException", err
+                assert err["Message"] == _sentence("ReadUnitsPerSecond", "table", DECREASE)
+            else:
+                warm = t["WarmThroughput"]
+                if is_extenddb and warm["ReadUnitsPerSecond"] == higher["ReadUnitsPerSecond"]:
+                    assert warm in (
+                        {**higher, "Status": "UPDATING"},
+                        {**higher, "Status": "ACTIVE"},
+                    )
+                else:
+                    assert warm == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
         # U3b: the table settles at the higher values, whether or not U3 ran.
         if is_extenddb:
             active = _wait_warm_active(dynamodb_client, name)
@@ -194,10 +220,8 @@ class TestWarmThroughputLifecycle:
                 dynamodb_client.update_table(TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)
             _validation(exc, _sentence("ReadUnitsPerSecond", "table", DECREASE))
             # S2c: the same values re-sent report themselves UPDATING.
-            t = dynamodb_client.update_table(TableName=name, WarmThroughput=higher)[
-                "TableDescription"
-            ]
-            assert t["WarmThroughput"] == {**higher, "Status": "UPDATING"}
+            t, took = _update_table(dynamodb_client, TableName=name, WarmThroughput=higher)
+            _assert_opened(t["WarmThroughput"], higher, higher, is_extenddb, took)
             _wait_warm_active(dynamodb_client, name)
 
             # U5: read alone; the write side keeps its value.
@@ -211,16 +235,19 @@ class TestWarmThroughputLifecycle:
 
         # U6: a GSI through GlobalSecondaryIndexUpdates.Update (same values, so
         # the previous and new pairs agree on both targets).
-        resp = dynamodb_client.update_table(
+        t, took = _update_table(
+            dynamodb_client,
             TableName=name,
             GlobalSecondaryIndexUpdates=[
                 {"Update": {"IndexName": "gsi", "WarmThroughput": ON_DEMAND_DEFAULTS}}
             ],
         )
-        gsi = resp["TableDescription"]["GlobalSecondaryIndexes"][0]
+        gsi = t["GlobalSecondaryIndexes"][0]
         assert gsi["IndexStatus"] == "ACTIVE"
-        assert gsi["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "UPDATING"}
-        assert resp["TableDescription"]["TableStatus"] == "ACTIVE"
+        _assert_opened(
+            gsi["WarmThroughput"], ON_DEMAND_DEFAULTS, ON_DEMAND_DEFAULTS, is_extenddb, took
+        )
+        assert t["TableStatus"] == "ACTIVE"
         if is_extenddb:
             active = _wait_warm_active(dynamodb_client, name)
             assert active["GlobalSecondaryIndexes"][0]["WarmThroughput"] == {
@@ -403,7 +430,9 @@ class TestWarmThroughputValidation:
                 )
             _validation(exc, _sentence(member, "index gsi", DECREASE))
 
-    def test_table_warm_throughput_beside_another_change(self, dynamodb_client, tables):
+    def test_table_warm_throughput_beside_another_change(
+        self, dynamodb_client, tables, is_extenddb
+    ):
         """The per-companion rules, measured on an on-demand table with one GSI
         (values otherwise valid): TableClass and DeletionProtection companions
         answer their own "must be the only operation" sentence; a
@@ -435,14 +464,16 @@ class TestWarmThroughputValidation:
                 )
             _validation(exc, expected)
 
-        resp = dynamodb_client.update_table(
+        t, took = _update_table(
+            dynamodb_client,
             TableName=name,
             WarmThroughput=ON_DEMAND_DEFAULTS,
             GlobalSecondaryIndexUpdates=[
                 {"Update": {"IndexName": "gsi", "WarmThroughput": ON_DEMAND_DEFAULTS}}
             ],
         )
-        t = resp["TableDescription"]
         assert t["TableStatus"] == "ACTIVE"
-        assert t["WarmThroughput"]["Status"] == "UPDATING"
-        assert t["GlobalSecondaryIndexes"][0]["WarmThroughput"]["Status"] == "UPDATING"
+        _assert_opened_status(t["WarmThroughput"]["Status"], is_extenddb, took)
+        _assert_opened_status(
+            t["GlobalSecondaryIndexes"][0]["WarmThroughput"]["Status"], is_extenddb, took
+        )

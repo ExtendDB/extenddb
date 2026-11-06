@@ -95,6 +95,38 @@ def _validation(exc_info, expected: str) -> None:
     assert err["Message"] == expected, err["Message"]
 
 
+# devtools/run-tests sets control_plane_delay_seconds to 0.05. On ExtendDB,
+# the UPDATING window that a request opens then lasts 50 milliseconds. If the
+# server takes longer to build its response, the window is over, and the
+# response reports the new pair ACTIVE. A call that returns sooner cannot see
+# the window end.
+EXTENDDB_WINDOW_SECONDS = 0.05
+
+
+def _update_table(client, **kwargs) -> tuple[dict, float]:
+    """UpdateTable: the TableDescription, and the seconds the call took."""
+    start = time.monotonic()
+    resp = client.update_table(**kwargs)
+    return resp["TableDescription"], time.monotonic() - start
+
+
+def _assert_opened(warm: dict, previous: dict, new: dict, is_extenddb: bool, took: float) -> None:
+    """The WarmThroughput of the response to a request that opens a window:
+    the previous pair with UPDATING, as the service answers. On ExtendDB, a
+    call that took at least EXTENDDB_WINDOW_SECONDS can also answer the new
+    pair with ACTIVE."""
+    if is_extenddb and took >= EXTENDDB_WINDOW_SECONDS and warm == {**new, "Status": "ACTIVE"}:
+        return
+    assert warm == {**previous, "Status": "UPDATING"}
+
+
+def _assert_opened_status(status: str, is_extenddb: bool, took: float) -> None:
+    """The Status that `_assert_opened` allows, for a check of the status alone."""
+    if is_extenddb and took >= EXTENDDB_WINDOW_SECONDS and status == "ACTIVE":
+        return
+    assert status == "UPDATING"
+
+
 @pytest.fixture()
 def tables(dynamodb_client):
     """Register created table names for deletion after the test."""

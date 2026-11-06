@@ -28,8 +28,10 @@ from warm_throughput_helpers import (  # noqa: F401  (tables is a fixture)
     ON_DEMAND_NEEDS_BILLING,
     ONLY_OPERATION,
     TABLE_CLASS_ONLY,
+    _assert_opened,
     _create,
     _sentence,
+    _update_table,
     _validation,
     _wait_all_active,
     _wait_warm_active,
@@ -284,14 +286,14 @@ class TestWarmThroughputCreateShapes:
         immediate), so those two statuses are asserted on the service only."""
         name = _on_demand_with_gsi(dynamodb_client, tables)
         sent = {"ReadUnitsPerSecond": 30000, "WriteUnitsPerSecond": 8000}
-        resp = dynamodb_client.update_table(
+        t, took = _update_table(
+            dynamodb_client,
             TableName=name,
             AttributeDefinitions=ATTRS,
             GlobalSecondaryIndexUpdates=[{"Create": {**GSI_TWO, "WarmThroughput": sent}}],
         )
-        t = resp["TableDescription"]
         by_name = {g["IndexName"]: g for g in t["GlobalSecondaryIndexes"]}
-        assert by_name["gsi-two"]["WarmThroughput"] == {**sent, "Status": "UPDATING"}
+        _assert_opened(by_name["gsi-two"]["WarmThroughput"], sent, sent, is_extenddb, took)
         assert by_name["gsi"]["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "ACTIVE"}
         if not is_extenddb:
             assert t["TableStatus"] == "UPDATING"
@@ -365,10 +367,10 @@ class TestWarmThroughputAcrossBillingChanges:
         _wait_all_active(dynamodb_client, name)
         active = _wait_warm_active(dynamodb_client, name, timeout=900)
         assert active["WarmThroughput"] == {**ON_DEMAND_DEFAULTS, "Status": "ACTIVE"}
-        resp = dynamodb_client.update_table(TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)
-        assert resp["TableDescription"]["WarmThroughput"] == {
-            **ON_DEMAND_DEFAULTS, "Status": "UPDATING"
-        }
+        t, took = _update_table(dynamodb_client, TableName=name, WarmThroughput=ON_DEMAND_DEFAULTS)
+        _assert_opened(
+            t["WarmThroughput"], ON_DEMAND_DEFAULTS, ON_DEMAND_DEFAULTS, is_extenddb, took
+        )
 
     def test_never_set_warm_throughput_across_capacity_and_billing_changes(
         self, dynamodb_client, tables, is_extenddb
