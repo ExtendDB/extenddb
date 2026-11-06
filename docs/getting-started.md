@@ -38,7 +38,9 @@ See [Local Development with Docker Compose](local-dev-docker-compose.md).
 
 - **Storage backend** (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
+  - SQLite (embedded; nothing to install)
   - MongoDB 7.0+ with replica set (see `docs/local-mongodb-setup.md`)
+  - Cassandra 4.1+ running locally (see `docs/cassandra-setup.md`)
 - Rust toolchain (1.88+)
 - AWS CLI v2 (for testing)
 - Python 3.10+ with virtual environment (see [Python Environment Setup](../README.md#python-environment-setup) in the README)
@@ -53,14 +55,17 @@ cargo build --release
 # (backends are mutually exclusive; disable the default postgres feature)
 cargo build --release --no-default-features --features mongodb
 
+# Cassandra backend
+cargo build --release --no-default-features --features cassandra
+
 # SQLite backend (developer mode, see "SQLite backend (developer mode)" below)
 cargo build --release --no-default-features --features sqlite
 ```
 
-Each build produces a single-backend binary. The `postgres`, `mongodb`, and
-`sqlite` features are mutually exclusive — a build enabling more than one is
-rejected at compile time — so to run two backends, build one binary per
-backend.
+Each build produces a single-backend binary. The `postgres`, `mongodb`,
+`sqlite`, and `cassandra` features are mutually exclusive — a build enabling
+more than one is rejected at compile time — so to run two backends, build one
+binary per backend.
 
 The binary is at `target/release/extenddb`.
 
@@ -74,11 +79,14 @@ Run `extenddb init` to create the catalog and data databases:
 
 # MongoDB
 ./target/release/extenddb init --backend mongodb
+
+# Cassandra
+./target/release/extenddb init --backend cassandra
 ```
 
 This will:
-- Create the `extenddb_catalog` database (catalog metadata)
-- Create the data database (user item data)
+- Create the `extenddb_catalog` database/keyspace (catalog metadata)
+- Create the data database/keyspace (user item data)
 - Generate an AES-256-GCM encryption key (for access key storage)
 - Create a default account and print the account ID
 - Create an `admin` user and print the credentials once
@@ -168,6 +176,56 @@ EXTENDDB__STORAGE__SQLITE__PATH=/data/other.sqlite ./target/release/extenddb ser
 Use `:memory:` (in the config, the environment variable, or `init
 --sqlite-path`) for an ephemeral database that is discarded on shutdown.
 
+### Cassandra backend
+
+ExtendDB can run against an Apache Cassandra cluster. The Cassandra backend is
+experimental; see [Cassandra setup](cassandra-setup.md) for its current
+limitations and the full walkthrough. Select it at init time with
+`--backend cassandra`:
+
+```bash
+./target/release/extenddb init \
+    --backend cassandra \
+    --cassandra-contact-points 127.0.0.1:9042 \
+    --cassandra-user cassandra \
+    --cassandra-pass cassandra
+```
+
+The node must run `PasswordAuthenticator`. `init` always creates its
+application role with a password, so it fails against a stock node using the
+default `AllowAllAuthenticator` — there is no credential-free path. Pass the
+Cassandra admin credentials with `--cassandra-user` / `--cassandra-pass`; `init`
+uses them to create the keyspaces and the application role. `init` writes a
+`[storage.cassandra]` section to the config, with the application credentials.
+
+```toml
+[storage.cassandra]
+contact_points = ["127.0.0.1:9042"]
+username = <extenddb-user>      # From extenddb init args
+password = <extenddb-pass>      # From extenddb init args
+keyspace_prefix = "extenddb"
+replication_factor = 1           # init always writes 1; edit for production
+datacenter = "datacenter1"       # must be datacenter1 (hardcoded by init)
+max_connections = 10
+```
+
+To override a default, pass the matching flag at init time:
+
+- `--cassandra-contact-points host1:9042,host2:9042` — one or more contact
+  points for a remote or multi-node cluster.
+- `--cassandra-user` and `--cassandra-pass` — the admin credentials `init` uses
+  to create the keyspaces and the application role (required).
+- `--extenddb-user` and `--extenddb-pass` — override the application role's name
+  and password (default `extenddb` / `extenddb-local-dev`).
+- `--keyspace-prefix myapp` — a different keyspace prefix, so one cluster can
+  host more than one deployment.
+
+For a higher replication factor, edit `replication_factor` in the config after
+`init` (there is no init flag for it today). The datacenter must be
+`datacenter1`. For replication strategy, datacenter topology, authentication,
+authorization, and the fact that connections are unencrypted, see
+`docs/cassandra-setup.md`.
+
 ### Generating a self-signed certificate manually
 
 `extenddb init` auto-generates a self-signed TLS certificate at `~/.extenddb/tls/`. If you need a certificate with different SANs (e.g., binding to `0.0.0.0` and connecting via a specific hostname), generate one manually with `openssl`:
@@ -207,12 +265,15 @@ You should see all checks pass:
 
 ```
 === extenddb verify ===
+Config:           extenddb.toml
+Catalog database: extenddb_catalog
+
+--- Checking catalog migrations...
+  OK: Current: the catalog is at migration 7
 --- Checking catalog connection...
   OK: Connected to catalog.
---- Checking catalog version...
-  OK: Catalog version 0.0.4
 --- Checking data database...
-  OK: Connected to data database 'extenddb_catalog_data'.
+  OK: Connected to data database 'extenddb'.
 --- Enumerating tables...
   Tables: 0
   Indexes: 0
@@ -226,7 +287,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog 0.0.4) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 7) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -1209,17 +1270,18 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard:** Overview of accounts and admin users.
+- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own account).
 - **Account management:** Create, view, and delete accounts (admin only).
 - **User management:** Create and delete IAM users, view access keys, policies, tags, and group memberships.
 - **Access key management:** Create and delete access keys. The secret key is shown once at creation time.
 - **Group management:** Create and delete groups, add and remove members.
 - **Role management:** Create and delete roles, view trust policies.
 - **Policy management:** Add and delete inline policies for users, groups, and roles. Includes a JSON editor with a default policy template.
+- **Metrics dashboard:** Operation metrics for every account, with charts (admin only).
 
 Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
 
-Sessions expire after 8 hours of inactivity. Click "Logout" to end a session immediately.
+Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
 ## 9. Audit logging
 
@@ -1305,7 +1367,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog 0.0.4 (postgres)
+# catalog migration 7 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```
@@ -1336,9 +1398,9 @@ The `storage.postgres.catalog_pool_size` setting controls the maximum number of 
 
 **When to increase:** If you see elevated latency under concurrent load, the pool may be saturated. Requests queue at the pool level when all connections are in use. Increase `pool_size` (and `catalog_pool_size` if auth is enabled) to allow more concurrent transactions.
 
-**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size`, plus one connection per vector index build running on the server and one while a schema migration runs. The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the default pool sizes already need 60 of it. Ensure `2 * pool_size + catalog_pool_size`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
+**Relationship to PostgreSQL `max_connections`:** The total connection footprint is `2 * pool_size + catalog_pool_size + [backup] max_concurrent_jobs`, plus one connection per vector index build running on the server and one while a schema migration runs. The `max_concurrent_jobs` term (default 4) is one dedicated connection per running backup or restore job, outside every pool, which holds the job's session-level advisory lock (its claim). The doubled term is the catalog pool and the data pool, both sized by `pool_size`; the third pool is the management pool sized by `catalog_pool_size`. A deployment whose catalog and data share one database is the only shape where the two `pool_size` pools collapse into one, and `extenddb init` does not produce it. Those extra sessions are opened outside both pools on purpose, for two different reasons. A build's ownership lock is session-scoped, so it needs a session that ends when the build does: a pooled connection would return to the pool still holding the lock. The migration lock is transaction-scoped, and needs a pinned connection because its explicit transaction has to retain one PostgreSQL backend until COMMIT, which is what stops a transaction-pooling proxy from letting the lock move between backends. PostgreSQL's default `max_connections` is 100, and the defaults already need 64 of it. Ensure `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus the number of vector index builds you expect to overlap, does not exceed your PostgreSQL `max_connections` setting.
 
-**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 150 connections, so PostgreSQL needs `max_connections` raised to at least 150 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
+**Example:** To support 50 concurrent data operations with auth enabled, set both pools to 50 in `extenddb.toml`. That configuration can open 154 connections (the default `max_concurrent_jobs` of 4 included), so PostgreSQL needs `max_connections` raised to at least 154 plus headroom for overlapping vector index builds. The default of 100 is not enough for it: an operator who sizes for 100 here meets `FATAL: sorry, too many clients already` at exactly the concurrency the setting was chosen to support.
 
 ```toml
 [storage.postgres]
@@ -1365,12 +1427,12 @@ ttl_seconds        = 60     # hard TTL — entries older than this are full miss
 soft_ttl_seconds   = 30     # entries older than this serve cached AND trigger
                             #   a background refresh (request does not block)
 negative_ttl_seconds = 5    # how long "not found" results are remembered
-max_entries        = 10000  # per-cache LRU cap
+max_entries        = 10000  # maximum entries per cache
 ```
 
 **Self-induced changes** (admin API and console mutations: `CreateAccessKey`, `PutUserPolicy`, `TagResource`, `CreateTable`, etc.) propagate instantly via write-through invalidation on the local instance.
 
-**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) complete asynchronously; there is a brief (~ms) window between the API responding success and the eviction landing. For hard cutover, prefer single-key invalidations (`DeleteAccessKey`) over cascades.
+**Fanout invalidations** (`DeleteAccount`, `DeleteRole` session sweep, `DeleteGroup` member fanout) also take effect when the API returns. If a group change cannot list the group's members, those members' entries wait for `ttl_seconds`.
 
 **Off-instance changes** (multi-node deployments, or direct DB writes outside the management API) take up to `ttl_seconds` to propagate.
 

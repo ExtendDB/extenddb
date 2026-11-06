@@ -129,15 +129,21 @@ impl MongoEngine {
             .await
     }
 
-    /// Create a restore target with provenance present in its first catalog
-    /// document, so backup deletion cannot observe an ownerless target.
+    /// Create a restore target with its provenance and its RUNNING job
+    /// record in its first catalog document, so nothing ever observes an
+    /// unregistered or unowned target. When the registration carries a
+    /// session, the document is inserted in that session's transaction and
+    /// the transaction is committed right after the insert, before the
+    /// target's collections and indexes are created; a transaction the
+    /// server aborted for a write conflict is reported as `Transient`, with
+    /// nothing created, so the caller re-runs it.
     pub(crate) async fn create_table_for_restore(
         &self,
         account_id: &str,
         input: CreateTableInput,
-        provenance: &crate::backup_engine::RestoreProvenance<'_>,
+        registration: &mut crate::backup_engine::RestoreRegistration<'_>,
     ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_inner(account_id, input, true, Some(provenance))
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
             .await
     }
 
@@ -146,7 +152,7 @@ impl MongoEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
-        restore: Option<&crate::backup_engine::RestoreProvenance<'_>>,
+        restore: Option<&mut crate::backup_engine::RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
@@ -255,28 +261,83 @@ impl MongoEngine {
             "sse_specification": sse_spec_bson,
             "on_demand_throughput": on_demand_bson,
         };
-        if let Some(provenance) = restore {
-            provenance.insert_into(&mut table_doc);
+        if let Some(registration) = restore.as_deref() {
+            registration.insert_into(&mut table_doc);
         }
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
-        if let Err(e) = tables_coll.insert_one(table_doc).await {
-            if !e.to_string().contains("E11000") {
+        let for_restore = restore.is_some();
+        let mut session = restore.and_then(|registration| registration.session.as_deref_mut());
+        let inserted = match session.as_deref_mut() {
+            Some(session) => tables_coll.insert_one(table_doc).session(session).await,
+            None => tables_coll.insert_one(table_doc).await,
+        };
+        if let Err(e) = inserted {
+            if let Some(session) = session {
+                let _ = session.abort_transaction().await;
+            }
+            if crate::data_engine::is_duplicate_key(&e) {
+                return Err(self
+                    .name_taken_error(&tables_coll, account_id, &input.table_name, for_restore)
+                    .await);
+            }
+            if crate::data_engine::is_transient_write_conflict(&e) {
+                return Err(StorageError::Transient(format!(
+                    "the registration of {} lost a write conflict: {e}",
+                    input.table_name
+                )));
+            }
+            return Err(StorageError::Internal(e.to_string()));
+        }
+        // The registration's first heartbeat on the server's clock: an insert
+        // cannot carry `$$NOW`, so the inserted record holds the process's
+        // clock for the length of this transaction and this pipeline update,
+        // in the same transaction, replaces it before anything commits. Every
+        // heartbeat the reconciler ever reads is therefore on the database's
+        // clock, and a host whose clock is behind the server's by more than
+        // `stale_job_after_secs` cannot make another server list its new
+        // restore dead.
+        if for_restore {
+            let stamped = {
+                let update = tables_coll.update_one(
+                    doc! {
+                        "_id": { "account_id": account_id, "table_name": &input.table_name },
+                        "table_id": &table_id,
+                    },
+                    vec![doc! { "$set": {
+                        crate::backup_catalog::RESTORE_JOB_HEARTBEAT: "$$NOW",
+                    } }],
+                );
+                match session.as_deref_mut() {
+                    Some(session) => update.session(session).await,
+                    None => update.await,
+                }
+            };
+            if let Err(e) = stamped {
+                if let Some(session) = session {
+                    let _ = session.abort_transaction().await;
+                }
+                if crate::data_engine::is_transient_write_conflict(&e) {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} lost a write conflict: {e}",
+                        input.table_name
+                    )));
+                }
                 return Err(StorageError::Internal(e.to_string()));
             }
-            return Err(self
-                .name_taken_error(
-                    &tables_coll,
-                    account_id,
-                    &input.table_name,
-                    restore.is_some(),
-                )
-                .await);
         }
-        // A restore releases its backup claim as soon as the target document,
-        // which carries the provenance, exists.
-        if let Some(inserted) = restore.and_then(|provenance| provenance.inserted) {
-            inserted.notify_one();
+        // The registration's transaction ends here, before any collection is
+        // created, so an aborted one leaves nothing behind.
+        if let Some(session) = session {
+            match self.commit_write_transaction(session, None).await? {
+                crate::data_engine::CommitOutcome::Committed => {}
+                crate::data_engine::CommitOutcome::RerunBody => {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} was aborted at commit",
+                        input.table_name
+                    )));
+                }
+            }
         }
 
         // Create the data collection with appropriate indexes
@@ -1362,6 +1423,20 @@ impl MongoEngine {
         &self,
         doc: &Document,
     ) -> Result<TableDescription, StorageError> {
+        self.doc_to_table_description_in(doc, None).await
+    }
+
+    /// Build the description from a `tables` document. When `session` is a
+    /// snapshot session (see `snapshot_engine`), the index documents are read
+    /// through it so they come from the same snapshot as `doc`. (The body is
+    /// the former `doc_to_table_description`, long before the session
+    /// parameter; splitting it is not part of the snapshot change.)
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn doc_to_table_description_in(
+        &self,
+        doc: &Document,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<TableDescription, StorageError> {
         let id_doc = doc
             .get_document("_id")
             .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
@@ -1466,14 +1541,34 @@ impl MongoEngine {
         // Fetch indexes
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         use futures::TryStreamExt;
-        let index_cursor = indexes_coll
-            .find(doc! { "_id.table_id": &table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let index_docs: Vec<Document> = index_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let index_filter = doc! { "_id.table_id": &table_id };
+        let index_docs: Vec<Document> = match session {
+            Some(session) => {
+                let mut cursor = indexes_coll
+                    .find(index_filter)
+                    .read_concern(mongodb::options::ReadConcern::snapshot())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?;
+                let mut docs = Vec::new();
+                while let Some(d) = cursor
+                    .next(&mut *session)
+                    .await
+                    .transpose()
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?
+                {
+                    docs.push(d);
+                }
+                docs
+            }
+            None => indexes_coll
+                .find(index_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        };
 
         let mut gsis = Vec::new();
         let mut lsis = Vec::new();

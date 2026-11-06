@@ -1,0 +1,4486 @@
+{
+ "databases": {
+  "extenddb_catalog": {
+   "collections": [
+    {
+     "name": "access_keys",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "account_id": {
+         "$numberInt": "1"
+        },
+        "user_name": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "account_id_1_user_name_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca1833a09338997bbc1"
+       },
+       "access_key_id": "AKIAEXTENDDB5M4PDNOX",
+       "account_id": "123456789012",
+       "user_name": "cu-tester",
+       "secret_key_encrypted": {
+        "$binary": {
+         "base64": "nntyZBigJK1x58RbGSI5jQgJtn1tX7EY5t56b2F15pwwoTOFjdLn0Nya6OMOy2rcr5kro1c1wFCF24JpCoZW6bfP8hc=",
+         "subType": "00"
+        }
+       },
+       "is_active": true,
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318049565"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "accounts",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "account_name": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "account_name_1",
+       "unique": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": "3cfa7480-a2b0-4906-a5d3-f4b71f00578b",
+       "account_name": "default",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318047302"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca0833a09338997bbbf"
+       },
+       "account_id": "123456789012",
+       "account_name": "cu-seed",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318048185"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "admin_users",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "admin",
+       "password_hash": "$2b$12$8xouI6YV4yUND7UF/.zHQemMPDUbYjXSeQhwNDa511p5.kb4Ury52",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318047537"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "backups",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "account_id": {
+         "$numberInt": "1"
+        },
+        "table_name": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "account_id_1_table_name_1"
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "continuous_backups",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "iam_groups",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "group_arn": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "group_arn_1",
+       "unique": true
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "iam_permissions_boundaries",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "iam_policies",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca00bdff5a74355460c"
+       },
+       "account_id": "123456789012",
+       "policy_name": "SelfServicePolicy",
+       "principal_name": "cu-tester",
+       "principal_type": "user",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318048531"
+        }
+       },
+       "policy_document": {
+        "Version": "2012-10-17",
+        "Statement": [
+         {
+          "Effect": "Allow",
+          "Action": [
+           "iam:CreateAccessKey",
+           "iam:DeleteAccessKey",
+           "iam:ListAccessKeys",
+           "iam:ChangePassword"
+          ],
+          "Resource": "arn:aws:iam::123456789012:user/cu-tester"
+         }
+        ]
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca00bdff5a743554612"
+       },
+       "account_id": "123456789012",
+       "policy_name": "dynamodb-full",
+       "principal_name": "cu-tester",
+       "principal_type": "user",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318048856"
+        }
+       },
+       "policy_document": {
+        "Version": "2012-10-17",
+        "Statement": [
+         {
+          "Effect": "Allow",
+          "Action": "dynamodb:*",
+          "Resource": "*"
+         }
+        ]
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca10bdff5a743554617"
+       },
+       "account_id": "123456789012",
+       "policy_name": "deny-prod",
+       "principal_name": "cu-tester",
+       "principal_type": "user",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318049231"
+        }
+       },
+       "policy_document": {
+        "Version": "2012-10-17",
+        "Statement": [
+         {
+          "Effect": "Deny",
+          "Action": "dynamodb:DeleteTable",
+          "Resource": "*",
+          "Condition": {
+           "StringEquals": {
+            "dynamodb:ResourceTag/env": "prod"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "name": "iam_roles",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "role_arn": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "role_arn_1",
+       "unique": true
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "iam_sessions",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "access_key_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "access_key_id_1",
+       "unique": true
+      },
+      {
+       "key": {
+        "expires_at": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "expires_at_1",
+       "expireAfterSeconds": {
+        "$numberInt": "0"
+       }
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "iam_users",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "user_arn": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "user_arn_1",
+       "unique": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca0833a09338997bbc0"
+       },
+       "account_id": "123456789012",
+       "user_name": "cu-tester",
+       "user_arn": "arn:aws:iam::123456789012:user/cu-tester",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318048528"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "indexes",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+        "index_name": "by_gpk"
+       },
+       "index_id": "34ff4a88-57e0-4cba-b717-034946600988",
+       "index_type": "GSI",
+       "key_schema": [
+        {
+         "AttributeName": "gpk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "gsk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "projection": {
+        "ProjectionType": "ALL"
+       },
+       "index_status": "ACTIVE",
+       "provisioned_throughput": null
+      },
+      {
+       "_id": {
+        "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+        "index_name": "by_lsk"
+       },
+       "index_id": "ed7f4b33-6603-4360-9e00-50a4b4174133",
+       "index_type": "LSI",
+       "key_schema": [
+        {
+         "AttributeName": "pk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "lsk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "projection": {
+        "ProjectionType": "KEYS_ONLY"
+       },
+       "index_status": "ACTIVE",
+       "provisioned_throughput": null
+      },
+      {
+       "_id": {
+        "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+        "index_name": "by_gpk"
+       },
+       "index_id": "67717d79-ede4-4f85-8eb9-824afbc78d2e",
+       "index_type": "GSI",
+       "key_schema": [
+        {
+         "AttributeName": "gpk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "gsk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "projection": {
+        "ProjectionType": "ALL"
+       },
+       "index_status": "ACTIVE",
+       "provisioned_throughput": null
+      },
+      {
+       "_id": {
+        "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+        "index_name": "by_lsk"
+       },
+       "index_id": "30eb80a0-57fe-48fa-b556-6f937ce19201",
+       "index_type": "LSI",
+       "key_schema": [
+        {
+         "AttributeName": "pk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "lsk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "projection": {
+        "ProjectionType": "KEYS_ONLY"
+       },
+       "index_status": "ACTIVE",
+       "provisioned_throughput": null
+      }
+     ]
+    },
+    {
+     "name": "login_attempts",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "principal": {
+         "$numberInt": "1"
+        },
+        "attempted_at": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "principal_1_attempted_at_1"
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "metrics",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "_id.bucket": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id.bucket_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbde"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "10812"
+       },
+       "count": {
+        "$numberLong": "1"
+       },
+       "min": {
+        "$numberInt": "10812"
+       },
+       "max": {
+        "$numberInt": "10812"
+       },
+       "table_name": "cu_orders",
+       "operation": "UpdateTimeToLive"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbdf"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "ConsumedWriteCapacityUnits",
+       "sum": {
+        "$numberInt": "10"
+       },
+       "count": {
+        "$numberLong": "10"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "table_name": "cu_orders",
+       "operation": "PutItem"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe0"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "StorageQueryCount",
+       "sum": {
+        "$numberInt": "20"
+       },
+       "count": {
+        "$numberLong": "20"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "index_name": "Request",
+       "operation": "Data"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe1"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "2114"
+       },
+       "count": {
+        "$numberLong": "2"
+       },
+       "min": {
+        "$numberInt": "967"
+       },
+       "max": {
+        "$numberInt": "1147"
+       },
+       "table_name": "cu_dotted",
+       "operation": "DescribeTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe2"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "RequestCount",
+       "sum": {
+        "$numberInt": "20"
+       },
+       "count": {
+        "$numberLong": "20"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "operation": "PutItem"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe3"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "RequestCount",
+       "sum": {
+        "$numberInt": "4"
+       },
+       "count": {
+        "$numberLong": "4"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "operation": "DescribeTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe4"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "71677"
+       },
+       "count": {
+        "$numberLong": "1"
+       },
+       "min": {
+        "$numberInt": "71677"
+       },
+       "max": {
+        "$numberInt": "71677"
+       },
+       "table_name": "cu_orders",
+       "operation": "CreateTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe5"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "StorageQueryLatency",
+       "sum": {
+        "$numberInt": "153283"
+       },
+       "count": {
+        "$numberLong": "8"
+       },
+       "min": {
+        "$numberInt": "538"
+       },
+       "max": {
+        "$numberInt": "68203"
+       },
+       "index_name": "Request",
+       "operation": "Catalog"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe6"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "2281"
+       },
+       "count": {
+        "$numberLong": "2"
+       },
+       "min": {
+        "$numberInt": "1087"
+       },
+       "max": {
+        "$numberInt": "1194"
+       },
+       "table_name": "cu_orders",
+       "operation": "DescribeTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe7"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "StorageQueryLatency",
+       "sum": {
+        "$numberInt": "105492"
+       },
+       "count": {
+        "$numberLong": "20"
+       },
+       "min": {
+        "$numberInt": "3473"
+       },
+       "max": {
+        "$numberInt": "13767"
+       },
+       "index_name": "Request",
+       "operation": "Data"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe8"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "RequestCount",
+       "sum": {
+        "$numberInt": "2"
+       },
+       "count": {
+        "$numberLong": "2"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "operation": "CreateTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbe9"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "StorageQueryCount",
+       "sum": {
+        "$numberInt": "8"
+       },
+       "count": {
+        "$numberLong": "8"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "index_name": "Request",
+       "operation": "Catalog"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbea"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "56010"
+       },
+       "count": {
+        "$numberLong": "10"
+       },
+       "min": {
+        "$numberInt": "4405"
+       },
+       "max": {
+        "$numberInt": "7034"
+       },
+       "table_name": "cu_dotted",
+       "operation": "PutItem"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbeb"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "67779"
+       },
+       "count": {
+        "$numberLong": "1"
+       },
+       "min": {
+        "$numberInt": "67779"
+       },
+       "max": {
+        "$numberInt": "67779"
+       },
+       "table_name": "cu_dotted",
+       "operation": "CreateTable"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbec"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "ConsumedWriteCapacityUnits",
+       "sum": {
+        "$numberInt": "10"
+       },
+       "count": {
+        "$numberLong": "10"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "table_name": "cu_dotted",
+       "operation": "PutItem"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbed"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "4350"
+       },
+       "count": {
+        "$numberLong": "1"
+       },
+       "min": {
+        "$numberInt": "4350"
+       },
+       "max": {
+        "$numberInt": "4350"
+       },
+       "table_name": "cu_dotted",
+       "operation": "UpdateTimeToLive"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbee"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "SuccessfulRequestLatency",
+       "sum": {
+        "$numberInt": "52333"
+       },
+       "count": {
+        "$numberLong": "10"
+       },
+       "min": {
+        "$numberInt": "3523"
+       },
+       "max": {
+        "$numberInt": "14448"
+       },
+       "table_name": "cu_orders",
+       "operation": "PutItem"
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca4833a09338997bbef"
+       },
+       "bucket": {
+        "$date": {
+         "$numberLong": "1793318040000"
+        }
+       },
+       "metric": "RequestCount",
+       "sum": {
+        "$numberInt": "2"
+       },
+       "count": {
+        "$numberLong": "2"
+       },
+       "min": {
+        "$numberInt": "1"
+       },
+       "max": {
+        "$numberInt": "1"
+       },
+       "operation": "UpdateTimeToLive"
+      }
+     ]
+    },
+    {
+     "name": "schema_history",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "001_initial",
+       "applied_at": {
+        "$date": {
+         "$numberLong": "1793318047295"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "settings",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "catalog_version",
+       "value": "0.0.2"
+      },
+      {
+       "_id": "data_connection_string",
+       "value": "mongodb://localhost:22414/?replicaSet=rs0"
+      },
+      {
+       "_id": "data_database_name",
+       "value": "extenddb_data"
+      },
+      {
+       "_id": "encryption_key",
+       "value": "csFcLe6avIQnlK3UFdHDRPGop6M/ssPCHhTpuG3gliU="
+      }
+     ]
+    },
+    {
+     "name": "tables",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "table_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "table_id_1",
+       "unique": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "account_id": "123456789012",
+        "table_name": "cu_dotted"
+       },
+       "key_schema": [
+        {
+         "AttributeName": "pk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "sk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "attribute_definitions": [
+        {
+         "AttributeName": "pk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "sk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "gpk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "gsk",
+         "AttributeType": "N"
+        },
+        {
+         "AttributeName": "lsk",
+         "AttributeType": "S"
+        }
+       ],
+       "billing_mode": "PAY_PER_REQUEST",
+       "provisioned_throughput": null,
+       "stream_specification": {
+        "StreamEnabled": true,
+        "StreamViewType": "NEW_AND_OLD_IMAGES"
+       },
+       "table_status": "ACTIVE",
+       "creation_date_time": {
+        "$date": {
+         "$numberLong": "1793318051000"
+        }
+       },
+       "table_size_bytes": {
+        "$numberLong": "0"
+       },
+       "item_count": {
+        "$numberLong": "0"
+       },
+       "table_arn": "arn:aws:dynamodb:us-east-1:123456789012:table/cu_dotted",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "deletion_protection_enabled": false,
+       "ttl_attribute": "exp.at",
+       "stream_label": "2026-10-29T23:54:11",
+       "table_class": null,
+       "sse_specification": null,
+       "on_demand_throughput": null,
+       "ttl_index_ready": true
+      },
+      {
+       "_id": {
+        "account_id": "123456789012",
+        "table_name": "cu_orders"
+       },
+       "key_schema": [
+        {
+         "AttributeName": "pk",
+         "KeyType": "HASH"
+        },
+        {
+         "AttributeName": "sk",
+         "KeyType": "RANGE"
+        }
+       ],
+       "attribute_definitions": [
+        {
+         "AttributeName": "pk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "sk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "gpk",
+         "AttributeType": "S"
+        },
+        {
+         "AttributeName": "gsk",
+         "AttributeType": "N"
+        },
+        {
+         "AttributeName": "lsk",
+         "AttributeType": "S"
+        }
+       ],
+       "billing_mode": "PAY_PER_REQUEST",
+       "provisioned_throughput": null,
+       "stream_specification": {
+        "StreamEnabled": true,
+        "StreamViewType": "NEW_AND_OLD_IMAGES"
+       },
+       "table_status": "ACTIVE",
+       "creation_date_time": {
+        "$date": {
+         "$numberLong": "1793318050000"
+        }
+       },
+       "table_size_bytes": {
+        "$numberLong": "0"
+       },
+       "item_count": {
+        "$numberLong": "0"
+       },
+       "table_arn": "arn:aws:dynamodb:us-east-1:123456789012:table/cu_orders",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "deletion_protection_enabled": false,
+       "ttl_attribute": "expires",
+       "stream_label": "2026-10-29T23:54:10",
+       "table_class": null,
+       "sse_specification": null,
+       "on_demand_throughput": null,
+       "ttl_index_ready": true
+      }
+     ]
+    },
+    {
+     "name": "tags",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": []
+    }
+   ]
+  },
+  "extenddb_data": {
+   "collections": [
+    {
+     "name": "_ddb_30eb80a0-57fe-48fa-b556-6f937ce19201",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_s": {
+         "$numberInt": "1"
+        },
+        "base_pk": {
+         "$numberInt": "1"
+        },
+        "base_sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_s_1_base_pk_1_base_sk_s_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:p0,2:l0,2:p0,3:s09,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l0",
+       "base_sk_s": "s09",
+       "item_data": {
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l3,2:p0,3:s06,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l3",
+       "base_sk_s": "s06",
+       "item_data": {
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l6,2:p0,3:s03,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l6",
+       "base_sk_s": "s03",
+       "item_data": {
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l9,2:p0,3:s00,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l9",
+       "base_sk_s": "s00",
+       "item_data": {
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l2,2:p1,3:s07,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l2",
+       "base_sk_s": "s07",
+       "item_data": {
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l5,2:p1,3:s04,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l5",
+       "base_sk_s": "s04",
+       "item_data": {
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l8,2:p1,3:s01,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l8",
+       "base_sk_s": "s01",
+       "item_data": {
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l1,2:p2,3:s08,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l1",
+       "base_sk_s": "s08",
+       "item_data": {
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l4,2:p2,3:s05,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l4",
+       "base_sk_s": "s05",
+       "item_data": {
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l7,2:p2,3:s02,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l7",
+       "base_sk_s": "s02",
+       "item_data": {
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "_ddb_34ff4a88-57e0-4cba-b717-034946600988",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_n": {
+         "$numberInt": "1"
+        },
+        "base_pk": {
+         "$numberInt": "1"
+        },
+        "base_sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_n_1_base_pk_1_base_sk_s_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:g0,1:0,2:p0,3:s00,",
+       "pk": "g0",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "0"
+       },
+       "base_sk_s": "s00",
+       "item_data": {
+        "body": {
+         "S": "item 0"
+        },
+        "expires": {
+         "N": "4102444800"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "0"
+        },
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:2,2:p2,3:s02,",
+       "pk": "g0",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "2"
+       },
+       "base_sk_s": "s02",
+       "item_data": {
+        "body": {
+         "S": "item 2"
+        },
+        "expires": {
+         "N": "4102444802"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "2"
+        },
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:4,2:p1,3:s04,",
+       "pk": "g0",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "4"
+       },
+       "base_sk_s": "s04",
+       "item_data": {
+        "body": {
+         "S": "item 4"
+        },
+        "expires": {
+         "N": "4102444804"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "4"
+        },
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:6,2:p0,3:s06,",
+       "pk": "g0",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "6"
+       },
+       "base_sk_s": "s06",
+       "item_data": {
+        "body": {
+         "S": "item 6"
+        },
+        "expires": {
+         "N": "4102444806"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "6"
+        },
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:8,2:p2,3:s08,",
+       "pk": "g0",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "8"
+       },
+       "base_sk_s": "s08",
+       "item_data": {
+        "body": {
+         "S": "item 8"
+        },
+        "expires": {
+         "N": "4102444808"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "8"
+        },
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:1,2:p1,3:s01,",
+       "pk": "g1",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "1"
+       },
+       "base_sk_s": "s01",
+       "item_data": {
+        "body": {
+         "S": "item 1"
+        },
+        "expires": {
+         "N": "4102444801"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "1"
+        },
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:3,2:p0,3:s03,",
+       "pk": "g1",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "3"
+       },
+       "base_sk_s": "s03",
+       "item_data": {
+        "body": {
+         "S": "item 3"
+        },
+        "expires": {
+         "N": "4102444803"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "3"
+        },
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:5,2:p2,3:s05,",
+       "pk": "g1",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "5"
+       },
+       "base_sk_s": "s05",
+       "item_data": {
+        "body": {
+         "S": "item 5"
+        },
+        "expires": {
+         "N": "4102444805"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "5"
+        },
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:7,2:p1,3:s07,",
+       "pk": "g1",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "7"
+       },
+       "base_sk_s": "s07",
+       "item_data": {
+        "body": {
+         "S": "item 7"
+        },
+        "expires": {
+         "N": "4102444807"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "7"
+        },
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:9,2:p0,3:s09,",
+       "pk": "g1",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "9"
+       },
+       "base_sk_s": "s09",
+       "item_data": {
+        "body": {
+         "S": "item 9"
+        },
+        "expires": {
+         "N": "4102444809"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "9"
+        },
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "_ddb_67717d79-ede4-4f85-8eb9-824afbc78d2e",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_n": {
+         "$numberInt": "1"
+        },
+        "base_pk": {
+         "$numberInt": "1"
+        },
+        "base_sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_n_1_base_pk_1_base_sk_s_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:g0,1:0,2:p0,3:s00,",
+       "pk": "g0",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "0"
+       },
+       "base_sk_s": "s00",
+       "item_data": {
+        "body": {
+         "S": "item 0"
+        },
+        "exp.at": {
+         "N": "4102444800"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "0"
+        },
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:2,2:p2,3:s02,",
+       "pk": "g0",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "2"
+       },
+       "base_sk_s": "s02",
+       "item_data": {
+        "body": {
+         "S": "item 2"
+        },
+        "exp.at": {
+         "N": "4102444802"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "2"
+        },
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:4,2:p1,3:s04,",
+       "pk": "g0",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "4"
+       },
+       "base_sk_s": "s04",
+       "item_data": {
+        "body": {
+         "S": "item 4"
+        },
+        "exp.at": {
+         "N": "4102444804"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "4"
+        },
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:6,2:p0,3:s06,",
+       "pk": "g0",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "6"
+       },
+       "base_sk_s": "s06",
+       "item_data": {
+        "body": {
+         "S": "item 6"
+        },
+        "exp.at": {
+         "N": "4102444806"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "6"
+        },
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:g0,1:8,2:p2,3:s08,",
+       "pk": "g0",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "8"
+       },
+       "base_sk_s": "s08",
+       "item_data": {
+        "body": {
+         "S": "item 8"
+        },
+        "exp.at": {
+         "N": "4102444808"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "8"
+        },
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:1,2:p1,3:s01,",
+       "pk": "g1",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "1"
+       },
+       "base_sk_s": "s01",
+       "item_data": {
+        "body": {
+         "S": "item 1"
+        },
+        "exp.at": {
+         "N": "4102444801"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "1"
+        },
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:3,2:p0,3:s03,",
+       "pk": "g1",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "3"
+       },
+       "base_sk_s": "s03",
+       "item_data": {
+        "body": {
+         "S": "item 3"
+        },
+        "exp.at": {
+         "N": "4102444803"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "3"
+        },
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:5,2:p2,3:s05,",
+       "pk": "g1",
+       "base_pk": "p2",
+       "sk_n": {
+        "$numberDecimal": "5"
+       },
+       "base_sk_s": "s05",
+       "item_data": {
+        "body": {
+         "S": "item 5"
+        },
+        "exp.at": {
+         "N": "4102444805"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "5"
+        },
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:7,2:p1,3:s07,",
+       "pk": "g1",
+       "base_pk": "p1",
+       "sk_n": {
+        "$numberDecimal": "7"
+       },
+       "base_sk_s": "s07",
+       "item_data": {
+        "body": {
+         "S": "item 7"
+        },
+        "exp.at": {
+         "N": "4102444807"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "7"
+        },
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:g1,1:9,2:p0,3:s09,",
+       "pk": "g1",
+       "base_pk": "p0",
+       "sk_n": {
+        "$numberDecimal": "9"
+       },
+       "base_sk_s": "s09",
+       "item_data": {
+        "body": {
+         "S": "item 9"
+        },
+        "exp.at": {
+         "N": "4102444809"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "9"
+        },
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "_ddb_86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_s_1",
+       "unique": true
+      },
+      {
+       "key": {
+        "item_data.expires.N": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "idx_ttl_expires",
+       "sparse": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:p0,3:s00,",
+       "pk": "p0",
+       "sk_s": "s00",
+       "item_data": {
+        "body": {
+         "S": "item 0"
+        },
+        "expires": {
+         "N": "4102444800"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "0"
+        },
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s03,",
+       "pk": "p0",
+       "sk_s": "s03",
+       "item_data": {
+        "body": {
+         "S": "item 3"
+        },
+        "expires": {
+         "N": "4102444803"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "3"
+        },
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s06,",
+       "pk": "p0",
+       "sk_s": "s06",
+       "item_data": {
+        "body": {
+         "S": "item 6"
+        },
+        "expires": {
+         "N": "4102444806"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "6"
+        },
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s09,",
+       "pk": "p0",
+       "sk_s": "s09",
+       "item_data": {
+        "body": {
+         "S": "item 9"
+        },
+        "expires": {
+         "N": "4102444809"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "9"
+        },
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s01,",
+       "pk": "p1",
+       "sk_s": "s01",
+       "item_data": {
+        "body": {
+         "S": "item 1"
+        },
+        "expires": {
+         "N": "4102444801"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "1"
+        },
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s04,",
+       "pk": "p1",
+       "sk_s": "s04",
+       "item_data": {
+        "body": {
+         "S": "item 4"
+        },
+        "expires": {
+         "N": "4102444804"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "4"
+        },
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s07,",
+       "pk": "p1",
+       "sk_s": "s07",
+       "item_data": {
+        "body": {
+         "S": "item 7"
+        },
+        "expires": {
+         "N": "4102444807"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "7"
+        },
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s02,",
+       "pk": "p2",
+       "sk_s": "s02",
+       "item_data": {
+        "body": {
+         "S": "item 2"
+        },
+        "expires": {
+         "N": "4102444802"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "2"
+        },
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s05,",
+       "pk": "p2",
+       "sk_s": "s05",
+       "item_data": {
+        "body": {
+         "S": "item 5"
+        },
+        "expires": {
+         "N": "4102444805"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "5"
+        },
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s08,",
+       "pk": "p2",
+       "sk_s": "s08",
+       "item_data": {
+        "body": {
+         "S": "item 8"
+        },
+        "expires": {
+         "N": "4102444808"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "8"
+        },
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "_ddb_be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_s_1",
+       "unique": true
+      },
+      {
+       "key": {
+        "item_data.exp.at.N": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "idx_ttl_exp.at",
+       "sparse": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:p0,3:s00,",
+       "pk": "p0",
+       "sk_s": "s00",
+       "item_data": {
+        "body": {
+         "S": "item 0"
+        },
+        "exp.at": {
+         "N": "4102444800"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "0"
+        },
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s03,",
+       "pk": "p0",
+       "sk_s": "s03",
+       "item_data": {
+        "body": {
+         "S": "item 3"
+        },
+        "exp.at": {
+         "N": "4102444803"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "3"
+        },
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s06,",
+       "pk": "p0",
+       "sk_s": "s06",
+       "item_data": {
+        "body": {
+         "S": "item 6"
+        },
+        "exp.at": {
+         "N": "4102444806"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "6"
+        },
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,3:s09,",
+       "pk": "p0",
+       "sk_s": "s09",
+       "item_data": {
+        "body": {
+         "S": "item 9"
+        },
+        "exp.at": {
+         "N": "4102444809"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "9"
+        },
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s01,",
+       "pk": "p1",
+       "sk_s": "s01",
+       "item_data": {
+        "body": {
+         "S": "item 1"
+        },
+        "exp.at": {
+         "N": "4102444801"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "1"
+        },
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s04,",
+       "pk": "p1",
+       "sk_s": "s04",
+       "item_data": {
+        "body": {
+         "S": "item 4"
+        },
+        "exp.at": {
+         "N": "4102444804"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "4"
+        },
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,3:s07,",
+       "pk": "p1",
+       "sk_s": "s07",
+       "item_data": {
+        "body": {
+         "S": "item 7"
+        },
+        "exp.at": {
+         "N": "4102444807"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "7"
+        },
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s02,",
+       "pk": "p2",
+       "sk_s": "s02",
+       "item_data": {
+        "body": {
+         "S": "item 2"
+        },
+        "exp.at": {
+         "N": "4102444802"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "2"
+        },
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s05,",
+       "pk": "p2",
+       "sk_s": "s05",
+       "item_data": {
+        "body": {
+         "S": "item 5"
+        },
+        "exp.at": {
+         "N": "4102444805"
+        },
+        "gpk": {
+         "S": "g1"
+        },
+        "gsk": {
+         "N": "5"
+        },
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,3:s08,",
+       "pk": "p2",
+       "sk_s": "s08",
+       "item_data": {
+        "body": {
+         "S": "item 8"
+        },
+        "exp.at": {
+         "N": "4102444808"
+        },
+        "gpk": {
+         "S": "g0"
+        },
+        "gsk": {
+         "N": "8"
+        },
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "_ddb_ed7f4b33-6603-4360-9e00-50a4b4174133",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "pk": {
+         "$numberInt": "1"
+        },
+        "sk_s": {
+         "$numberInt": "1"
+        },
+        "base_pk": {
+         "$numberInt": "1"
+        },
+        "base_sk_s": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "pk_1_sk_s_1_base_pk_1_base_sk_s_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "2:p0,2:l0,2:p0,3:s09,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l0",
+       "base_sk_s": "s09",
+       "item_data": {
+        "lsk": {
+         "S": "l0"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s09"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l3,2:p0,3:s06,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l3",
+       "base_sk_s": "s06",
+       "item_data": {
+        "lsk": {
+         "S": "l3"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s06"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l6,2:p0,3:s03,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l6",
+       "base_sk_s": "s03",
+       "item_data": {
+        "lsk": {
+         "S": "l6"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s03"
+        }
+       }
+      },
+      {
+       "_id": "2:p0,2:l9,2:p0,3:s00,",
+       "pk": "p0",
+       "base_pk": "p0",
+       "sk_s": "l9",
+       "base_sk_s": "s00",
+       "item_data": {
+        "lsk": {
+         "S": "l9"
+        },
+        "pk": {
+         "S": "p0"
+        },
+        "sk": {
+         "S": "s00"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l2,2:p1,3:s07,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l2",
+       "base_sk_s": "s07",
+       "item_data": {
+        "lsk": {
+         "S": "l2"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s07"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l5,2:p1,3:s04,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l5",
+       "base_sk_s": "s04",
+       "item_data": {
+        "lsk": {
+         "S": "l5"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s04"
+        }
+       }
+      },
+      {
+       "_id": "2:p1,2:l8,2:p1,3:s01,",
+       "pk": "p1",
+       "base_pk": "p1",
+       "sk_s": "l8",
+       "base_sk_s": "s01",
+       "item_data": {
+        "lsk": {
+         "S": "l8"
+        },
+        "pk": {
+         "S": "p1"
+        },
+        "sk": {
+         "S": "s01"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l1,2:p2,3:s08,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l1",
+       "base_sk_s": "s08",
+       "item_data": {
+        "lsk": {
+         "S": "l1"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s08"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l4,2:p2,3:s05,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l4",
+       "base_sk_s": "s05",
+       "item_data": {
+        "lsk": {
+         "S": "l4"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s05"
+        }
+       }
+      },
+      {
+       "_id": "2:p2,2:l7,2:p2,3:s02,",
+       "pk": "p2",
+       "base_pk": "p2",
+       "sk_s": "l7",
+       "base_sk_s": "s02",
+       "item_data": {
+        "lsk": {
+         "S": "l7"
+        },
+        "pk": {
+         "S": "p2"
+        },
+        "sk": {
+         "S": "s02"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "counters",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     ],
+     "documents": [
+      {
+       "_id": "stream_seq:shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "value": {
+        "$numberLong": "7"
+       }
+      },
+      {
+       "_id": "stream_seq:shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000003",
+       "value": {
+        "$numberLong": "3"
+       }
+      },
+      {
+       "_id": "stream_seq:shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "value": {
+        "$numberLong": "7"
+       }
+      },
+      {
+       "_id": "stream_seq:shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000003",
+       "value": {
+        "$numberLong": "3"
+       }
+      }
+     ]
+    },
+    {
+     "name": "idempotency_tokens",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "created_at": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "created_at_1",
+       "expireAfterSeconds": {
+        "$numberInt": "540"
+       }
+      },
+      {
+       "key": {
+        "account_id": {
+         "$numberInt": "1"
+        },
+        "token": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "account_id_1_token_1",
+       "unique": true
+      }
+     ],
+     "documents": []
+    },
+    {
+     "name": "stream_records",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "created_at": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "created_at_1",
+       "expireAfterSeconds": {
+        "$numberInt": "86400"
+       }
+      },
+      {
+       "key": {
+        "shard_id": {
+         "$numberInt": "1"
+        },
+        "sequence_number": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "shard_id_1_sequence_number_1"
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc6"
+       },
+       "sequence_number": "000000000000000000001",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "ec12e427-a414-4144-98aa-51d008085b11",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s00"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 0"
+          },
+          "expires": {
+           "N": "4102444800"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "0"
+          },
+          "lsk": {
+           "S": "l9"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s00"
+          }
+         },
+         "SequenceNumber": "000000000000000000001",
+         "SizeBytes": {
+          "$numberLong": "45"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050617"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc7"
+       },
+       "sequence_number": "000000000000000000001",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000003",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "31d394cc-3ec7-41bc-af56-cef355399242",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s01"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 1"
+          },
+          "expires": {
+           "N": "4102444801"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "1"
+          },
+          "lsk": {
+           "S": "l8"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s01"
+          }
+         },
+         "SequenceNumber": "000000000000000000001",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050624"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc8"
+       },
+       "sequence_number": "000000000000000000002",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "a2d6170a-5215-4ced-8df2-5c3ffd6ffb1e",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s02"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 2"
+          },
+          "expires": {
+           "N": "4102444802"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "2"
+          },
+          "lsk": {
+           "S": "l7"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s02"
+          }
+         },
+         "SequenceNumber": "000000000000000000002",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050629"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc9"
+       },
+       "sequence_number": "000000000000000000003",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "8f1a7f38-8f95-42fe-8df1-3bc0c3a3b47c",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s03"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 3"
+          },
+          "expires": {
+           "N": "4102444803"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "3"
+          },
+          "lsk": {
+           "S": "l6"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s03"
+          }
+         },
+         "SequenceNumber": "000000000000000000003",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050635"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbca"
+       },
+       "sequence_number": "000000000000000000002",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000003",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "3e7b053a-e5df-451f-98c8-12a6984fe88b",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s04"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 4"
+          },
+          "expires": {
+           "N": "4102444804"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "4"
+          },
+          "lsk": {
+           "S": "l5"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s04"
+          }
+         },
+         "SequenceNumber": "000000000000000000002",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050641"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbcb"
+       },
+       "sequence_number": "000000000000000000004",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "f57f29a6-85bb-45cd-880c-f9c871e75cc8",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s05"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 5"
+          },
+          "expires": {
+           "N": "4102444805"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "5"
+          },
+          "lsk": {
+           "S": "l4"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s05"
+          }
+         },
+         "SequenceNumber": "000000000000000000004",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050648"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbcc"
+       },
+       "sequence_number": "000000000000000000005",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "ce0bbc81-4f39-4f0b-b9c8-c0681e358a16",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s06"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 6"
+          },
+          "expires": {
+           "N": "4102444806"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "6"
+          },
+          "lsk": {
+           "S": "l3"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s06"
+          }
+         },
+         "SequenceNumber": "000000000000000000005",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050653"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbcd"
+       },
+       "sequence_number": "000000000000000000003",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000003",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "00200a41-ffb7-4b23-a081-82b56c70d150",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s07"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 7"
+          },
+          "expires": {
+           "N": "4102444807"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "7"
+          },
+          "lsk": {
+           "S": "l2"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s07"
+          }
+         },
+         "SequenceNumber": "000000000000000000003",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050659"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbce"
+       },
+       "sequence_number": "000000000000000000006",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "64bab496-259f-4187-a786-e5bc28ec0a44",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s08"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 8"
+          },
+          "expires": {
+           "N": "4102444808"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "8"
+          },
+          "lsk": {
+           "S": "l1"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s08"
+          }
+         },
+         "SequenceNumber": "000000000000000000006",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050664"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbcf"
+       },
+       "sequence_number": "000000000000000000007",
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "0f77422e-8ece-42cd-a6a2-089ef2abbfa4",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318050"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s09"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 9"
+          },
+          "expires": {
+           "N": "4102444809"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "9"
+          },
+          "lsk": {
+           "S": "l0"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s09"
+          }
+         },
+         "SequenceNumber": "000000000000000000007",
+         "SizeBytes": {
+          "$numberLong": "47"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050669"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd4"
+       },
+       "sequence_number": "000000000000000000001",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "853c9565-26af-4ed8-a06c-b3cef08d18f0",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s00"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 0"
+          },
+          "exp.at": {
+           "N": "4102444800"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "0"
+          },
+          "lsk": {
+           "S": "l9"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s00"
+          }
+         },
+         "SequenceNumber": "000000000000000000001",
+         "SizeBytes": {
+          "$numberLong": "44"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051606"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd5"
+       },
+       "sequence_number": "000000000000000000001",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000003",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "6b6cfed6-4fb3-451d-a3f0-55de06959335",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s01"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 1"
+          },
+          "exp.at": {
+           "N": "4102444801"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "1"
+          },
+          "lsk": {
+           "S": "l8"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s01"
+          }
+         },
+         "SequenceNumber": "000000000000000000001",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051614"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd6"
+       },
+       "sequence_number": "000000000000000000002",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "98f9554d-ea84-493a-8f80-c3873a2e1638",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s02"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 2"
+          },
+          "exp.at": {
+           "N": "4102444802"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "2"
+          },
+          "lsk": {
+           "S": "l7"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s02"
+          }
+         },
+         "SequenceNumber": "000000000000000000002",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051621"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd7"
+       },
+       "sequence_number": "000000000000000000003",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "079ee850-96b2-4419-9765-4ad536ab5bc6",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s03"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 3"
+          },
+          "exp.at": {
+           "N": "4102444803"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "3"
+          },
+          "lsk": {
+           "S": "l6"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s03"
+          }
+         },
+         "SequenceNumber": "000000000000000000003",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051630"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd8"
+       },
+       "sequence_number": "000000000000000000002",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000003",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "07b3d7a0-ae43-4f1d-8471-a99be35ffad1",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s04"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 4"
+          },
+          "exp.at": {
+           "N": "4102444804"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "4"
+          },
+          "lsk": {
+           "S": "l5"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s04"
+          }
+         },
+         "SequenceNumber": "000000000000000000002",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051636"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd9"
+       },
+       "sequence_number": "000000000000000000004",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "07eb68e9-5f4d-4215-b0c0-8c9799eabe9b",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s05"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 5"
+          },
+          "exp.at": {
+           "N": "4102444805"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "5"
+          },
+          "lsk": {
+           "S": "l4"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s05"
+          }
+         },
+         "SequenceNumber": "000000000000000000004",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051645"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbda"
+       },
+       "sequence_number": "000000000000000000005",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "b66e87e6-80d0-4a3b-a3b3-3908a1f48f6c",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s06"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 6"
+          },
+          "exp.at": {
+           "N": "4102444806"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "6"
+          },
+          "lsk": {
+           "S": "l3"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s06"
+          }
+         },
+         "SequenceNumber": "000000000000000000005",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051652"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbdb"
+       },
+       "sequence_number": "000000000000000000003",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000003",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "215f1f12-4308-4670-8699-0775e89a586f",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s07"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 7"
+          },
+          "exp.at": {
+           "N": "4102444807"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "7"
+          },
+          "lsk": {
+           "S": "l2"
+          },
+          "pk": {
+           "S": "p1"
+          },
+          "sk": {
+           "S": "s07"
+          }
+         },
+         "SequenceNumber": "000000000000000000003",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051659"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbdc"
+       },
+       "sequence_number": "000000000000000000006",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "4cf9191e-f8b0-4fc0-a2a0-b7db9478431e",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s08"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 8"
+          },
+          "exp.at": {
+           "N": "4102444808"
+          },
+          "gpk": {
+           "S": "g0"
+          },
+          "gsk": {
+           "N": "8"
+          },
+          "lsk": {
+           "S": "l1"
+          },
+          "pk": {
+           "S": "p2"
+          },
+          "sk": {
+           "S": "s08"
+          }
+         },
+         "SequenceNumber": "000000000000000000006",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051667"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbdd"
+       },
+       "sequence_number": "000000000000000000007",
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "event_name": "INSERT",
+       "record_data": {
+        "eventID": "6cfec9d6-4d4d-433c-a4ae-27b43450f064",
+        "eventName": "INSERT",
+        "eventVersion": "1.1",
+        "eventSource": "aws:dynamodb",
+        "awsRegion": "us-east-1",
+        "dynamodb": {
+         "ApproximateCreationDateTime": {
+          "$numberLong": "1793318051"
+         },
+         "Keys": {
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s09"
+          }
+         },
+         "NewImage": {
+          "body": {
+           "S": "item 9"
+          },
+          "exp.at": {
+           "N": "4102444809"
+          },
+          "gpk": {
+           "S": "g1"
+          },
+          "gsk": {
+           "N": "9"
+          },
+          "lsk": {
+           "S": "l0"
+          },
+          "pk": {
+           "S": "p0"
+          },
+          "sk": {
+           "S": "s09"
+          }
+         },
+         "SequenceNumber": "000000000000000000007",
+         "SizeBytes": {
+          "$numberLong": "46"
+         },
+         "StreamViewType": "NEW_AND_OLD_IMAGES"
+        }
+       },
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051674"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "name": "stream_shards",
+     "options": {},
+     "indexes": [
+      {
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      },
+      {
+       "key": {
+        "shard_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "shard_id_1",
+       "unique": true
+      }
+     ],
+     "documents": [
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc2"
+       },
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000000",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050033"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc3"
+       },
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000001",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050034"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc4"
+       },
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000002",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050037"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca2833a09338997bbc5"
+       },
+       "shard_id": "shardId-86d32a95-5f27-4c2c-9e40-61c0b6acb9fb-000000000003",
+       "table_id": "86d32a95-5f27-4c2c-9e40-61c0b6acb9fb",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318050037"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd0"
+       },
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000000",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051039"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd1"
+       },
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000001",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051041"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd2"
+       },
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000002",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051043"
+        }
+       }
+      },
+      {
+       "_id": {
+        "$oid": "6ae3dca3833a09338997bbd3"
+       },
+       "shard_id": "shardId-be6507b1-cd5b-4663-abdb-d8b7c41c951f-000000000003",
+       "table_id": "be6507b1-cd5b-4663-abdb-d8b7c41c951f",
+       "starting_sequence_number": "000000000000000000000",
+       "created_at": {
+        "$date": {
+         "$numberLong": "1793318051045"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

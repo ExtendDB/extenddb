@@ -179,9 +179,25 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
                 )?;
             }
             other => {
-                let ch = other as char;
-                let near_start = i.saturating_sub(5);
-                let near_end = std::cmp::min(i + 5, input.len());
+                // The byte at `i` can be the first byte of a multi-byte
+                // character, and the five-byte window after it can end inside
+                // one. The token is the whole character, and the end of the
+                // window moves out to a character boundary. Every byte before
+                // the first invalid one is ASCII, so the start is already on a
+                // boundary; it is checked the same way so the slice stays valid
+                // if a token that admits other characters is added.
+                let ch = input
+                    .get(i..)
+                    .and_then(|rest| rest.chars().next())
+                    .unwrap_or(other as char);
+                let mut near_start = i.saturating_sub(5);
+                while !input.is_char_boundary(near_start) {
+                    near_start -= 1;
+                }
+                let mut near_end = std::cmp::min(i + 5, input.len());
+                while !input.is_char_boundary(near_end) {
+                    near_end += 1;
+                }
                 let near = &input[near_start..near_end];
                 return Err(validation_err(&format!(
                     "Syntax error; token: \"{ch}\", near: \"{near}\""
@@ -562,6 +578,54 @@ mod tests {
                 Token::Eq,
                 Token::Placeholder("v".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
+        // Each input has an invalid byte whose five-byte context window ends
+        // inside a two-, three- or four-byte character. In the second and
+        // fourth the invalid byte starts a multi-byte character itself.
+        for input in [
+            "\0\0\u{7}#\u{41f}",
+            "\u{41f}\u{41f}\u{41f}",
+            "a ; \u{1f600}",
+            "\u{65e5}\u{65e5}",
+            "$  \u{65e5}",
+        ] {
+            let err = tokenize_with_limit(input, 4096).unwrap_err();
+            assert!(
+                matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error")),
+                "{input:?}: {err:?}"
+            );
+        }
+
+        // The window ends at the end of the character it would have split.
+        let err = tokenize_with_limit("$  \u{65e5}", 4096).unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg)
+                if msg.contains("token: \"$\", near: \"$  \u{65e5}\"")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_reports_the_whole_invalid_character() {
+        let err = tokenize("a = \u{e9}").unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg)
+                if msg.contains("token: \"\u{e9}\", near: \"a = \u{e9}\"")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_ascii_error_context_is_five_bytes_either_side() {
+        let err = tokenize("attribute_exists(a) $ b").unwrap_err();
+        assert!(
+            matches!(err, DynamoDbError::ValidationException(ref msg)
+                if msg.contains("token: \"$\", near: \"s(a) $ b\"")),
+            "{err:?}"
         );
     }
 
