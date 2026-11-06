@@ -131,7 +131,9 @@ pub(super) async fn run(
 /// malformed statement fails the whole request, its message prefixed
 /// with the statement's position (measured 2026-11-02 on an empty WHERE). A
 /// parameter that cannot be converted is reported without the statement's
-/// position (measured 2026-11-02); the checks on a parsed statement name it.
+/// position (measured 2026-11-02), and so is one the service refuses for its
+/// content, such as an empty set (measured 2026-11-06); the checks on a
+/// parsed statement name it.
 /// A projected call (`COUNT(*)`) is among those checks, so it is refused
 /// ahead of every table lookup (measured 2026-11-02), and so are a
 /// projection list that names an identifier twice or two paths that
@@ -142,13 +144,14 @@ fn parse_member(i: usize, obj: &Value) -> Result<(SingleRequest, Statement), Dyn
             "Validation failed in TransactStatements[{i}]: {message}"
         ))
     };
-    let req = SingleRequest::from_body(obj)?;
-    if super::request_checks::is_blank_statement(&req.statement) {
+    let statement = SingleRequest::without_parameters(obj)?.statement;
+    if super::request_checks::is_blank_statement(&statement) {
         return Err(DynamoDbError::ValidationException(
             super::request_checks::EMPTY_TRANSACTION_STATEMENT.to_owned(),
         ));
     }
     super::check_parameters(obj.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
+    let req = SingleRequest::from_body(obj)?;
     let stmt = parse_for_request(&req.statement, req.parameters.len())
         .map_err(|e| positional(&e.message))?;
     super::check_statement(&stmt, &req.parameters, &req.statement)

@@ -79,14 +79,21 @@ pub(super) async fn run(
     // Check and parse each statement; a failure is deferred to per-statement
     // execution (the batch stays well-formed as long as size/mix/keys are OK).
     // A parameter that cannot be converted fails only its own statement
-    // (measured 2026-11-02).
+    // (measured 2026-11-02), and so does a parameter the service refuses for
+    // its content, after a statement of only whitespace and ahead of a
+    // syntax error (measured 2026-11-06: an empty set, a set with a member
+    // twice, a NULL that is not true, an attribute value with no type or two).
     let mut checked_all = Vec::with_capacity(statements.len());
     for obj in statements {
-        let req = SingleRequest::from_body(obj)?;
+        let parameters = super::check_parameters(obj.get("Parameters"));
+        let req = match &parameters {
+            Ok(()) => SingleRequest::from_body(obj)?,
+            Err(_) => SingleRequest::without_parameters(obj)?,
+        };
         let statement = if super::request_checks::is_blank_statement(&req.statement) {
             Err(super::request_checks::EMPTY_BATCH_STATEMENT.to_owned())
         } else {
-            super::check_parameters(obj.get("Parameters")).and_then(|()| {
+            parameters.and_then(|()| {
                 parse_for_request(&req.statement, req.parameters.len()).map_err(|e| e.message)
             })
         };

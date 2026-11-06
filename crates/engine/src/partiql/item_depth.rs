@@ -374,13 +374,15 @@ impl MemberTarget {
     }
 }
 
-/// Read back a wire-form map the translation built.
+/// Read back a wire-form map the translation built. As `write::from_wire`,
+/// this fails only on a value the statement checks do not know of, and gets
+/// the error a classic request with that value gets.
 fn from_wire<T: serde::de::DeserializeOwned>(
     map: &serde_json::Map<String, Value>,
 ) -> Result<T, DynamoDbError> {
     serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
-        tracing::error!(internal_error = %e, "failed to read a translated PartiQL map");
-        internal("a translated PartiQL map")
+        tracing::warn!(error = %e, "a translated PartiQL map does not read back");
+        crate::deserialize_error(e)
     })
 }
 

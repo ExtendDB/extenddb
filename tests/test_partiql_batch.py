@@ -1110,3 +1110,123 @@ def test_grouped_arithmetic_runs_in_a_batch(dynamodb_client, gtable):
     )
     assert resp["Responses"] == [{"TableName": gtable}, {"TableName": gtable}]
     assert _gget(dynamodb_client, gtable, key(name))["a"] == {"N": "3"}
+
+
+# --- a statement with an empty bag or a parameter refused for its content -----
+# An empty bag, a number set two of whose members have one value, and a
+# parameter the service refuses for its content (an empty set, a set with a
+# member twice) are the statement's own error, without the table, and the
+# other statements run. The statement counts as neither a read nor a write,
+# nor in the check for two statements on one item; a statement of only
+# whitespace is refused ahead of its parameters, and a parameter ahead of a
+# syntax error (measured 2026-11-06).
+
+BAG_EMPTY = "Empty bags are not supported"
+PARAMETER_SS_EMPTY = "One or more parameter values were invalid: An string set  may not be empty"
+NS_EQUAL = (
+    "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates! "
+    "under root"
+)
+
+
+@pytest.fixture(scope="module")
+def raw_client(endpoint_url):
+    """A client that sends values botocore would refuse, as the service gets them."""
+    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    profile = os.environ.get("EXTENDDB_TEST_PROFILE") or None
+    session = boto3.Session(profile_name=profile, region_name=region)
+    kwargs: dict = {"service_name": "dynamodb", "config": Config(parameter_validation=False)}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            kwargs["verify"] = False
+    return session.client(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "template, message",
+    [
+        ("INSERT INTO {t} VALUE {{'pk':'{one}','sk':'b','v':<<>>}}", BAG_EMPTY),
+        ("UPDATE {t} SET v = <<>> WHERE pk = '{k}' AND sk = 'b'", BAG_EMPTY),
+        ("UPDATE {t} SET v = {{'x':<<>>}} WHERE pk = '{k}' AND sk = 'b'", BAG_EMPTY),
+        ("INSERT INTO {t} VALUE {{'pk':'{one}','sk':'b','l':[<<>>]}}", BAG_EMPTY),
+        ("UPDATE {t} SET a = 2 WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", BAG_EMPTY),
+        ("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", BAG_EMPTY),
+        ("INSERT INTO \"nosuch_tbl_r3\" VALUE {{'pk':'{one}','sk':'b','v':<<>>}}", BAG_EMPTY),
+        ("INSERT INTO {t} VALUE {{'sk':'b','v':<<>>}}", BAG_EMPTY),
+        ("UPDATE {t} SET v = <<>> WHERE pk = '{k}'", BAG_EMPTY),
+        ("INSERT INTO {t} VALUE {{'pk':'{one}','sk':'b','v':<<1, 1.0>>}}", NS_EQUAL),
+        ("UPDATE {t} SET v = <<1, 1.0>> WHERE pk = '{k}' AND sk = 'b'", NS_EQUAL),
+    ],
+)
+def test_an_empty_bag_fails_only_its_statement(dynamodb_client, gtable, template, message):
+    names = {n: f"bb-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "one", "two")}
+    put(dynamodb_client, gtable, names["k"])
+    statements = [_sql(template, gtable, **names), _sql(INSERT_TWO, gtable, **names)]
+    resp = _batch(dynamodb_client, [{"Statement": s} for s in statements])
+    assert resp["Responses"] == [_validation(message), {"TableName": gtable}]
+    assert _gget(dynamodb_client, gtable, key(names["two"])) is not None
+    assert _gget(dynamodb_client, gtable, key(names["one"])) is None
+    assert _gget(dynamodb_client, gtable, key(names["k"])) == item(key(names["k"]))
+
+
+def test_an_empty_bag_counts_as_no_read_or_write(dynamodb_client, gtable):
+    name = f"bbw-{uuid.uuid4().hex[:6]}"
+    put(dynamodb_client, gtable, name)
+    bag = _sql("UPDATE {t} SET v = <<>> WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b'", gtable, k=name)
+    read = {"Statement": _seed_read(gtable), "ConsistentRead": True}
+    resp = _batch(dynamodb_client, [read, {"Statement": bag}])
+    assert resp["Responses"] == [_seed_answer(gtable), _validation(BAG_EMPTY)]
+    bag_read = {"Statement": _seed_read(gtable) + " AND v = <<>>", "ConsistentRead": True}
+    resp = _batch(dynamodb_client, [bag_read, {"Statement": other}])
+    assert resp["Responses"] == [_validation(BAG_EMPTY), {"TableName": gtable}]
+    resp = _batch(dynamodb_client, [{"Statement": bag}, {"Statement": other}])
+    assert resp["Responses"] == [_validation(BAG_EMPTY), {"TableName": gtable}]
+    assert _gget(dynamodb_client, gtable, key(name))["x"] == {"N": "1"}
+
+
+def test_a_parameter_refused_for_its_content_fails_only_its_statement(raw_client, gtable):
+    names = {n: f"bp-{n}-{uuid.uuid4().hex[:6]}" for n in ("k", "j", "two")}
+    put(raw_client, gtable, names["k"])
+    put(raw_client, gtable, names["j"])
+    update_k = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    update_j = _sql("UPDATE {t} SET v = ? WHERE pk = '{j}' AND sk = 'b'", gtable, **names)
+    insert = _sql(INSERT_TWO, gtable, **names)
+    empty = [{"SS": []}]
+    resp = _batch(
+        raw_client,
+        [
+            {"Statement": update_k, "Parameters": empty},
+            {"Statement": update_j, "Parameters": [{"NS": ["1", "1.0"]}]},
+            {"Statement": insert},
+        ],
+    )
+    assert resp["Responses"] == [
+        _validation(PARAMETER_SS_EMPTY),
+        _validation("Input collection contains duplicates"),
+        {"TableName": gtable},
+    ]
+    read = {"Statement": _seed_read(gtable), "ConsistentRead": True}
+    resp = _batch(raw_client, [read, {"Statement": update_k, "Parameters": empty}])
+    assert resp["Responses"] == [_seed_answer(gtable), _validation(PARAMETER_SS_EMPTY)]
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    resp = _batch(
+        raw_client,
+        [{"Statement": update_k, "Parameters": empty}, {"Statement": other}],
+    )
+    assert resp["Responses"] == [_validation(PARAMETER_SS_EMPTY), {"TableName": gtable}]
+    resp = _batch(
+        raw_client,
+        [
+            {"Statement": "   ", "Parameters": empty},
+            {"Statement": update_k + " AND", "Parameters": empty},
+        ],
+    )
+    assert resp["Responses"] == [
+        _validation("The statement was empty."),
+        _validation(PARAMETER_SS_EMPTY),
+    ]
+    assert _gget(raw_client, gtable, key(names["k"]))["x"] == {"N": "1"}
+    assert "v" not in _gget(raw_client, gtable, key(names["k"]))
+    assert _gget(raw_client, gtable, key(names["j"])) == item(key(names["j"]))

@@ -1314,3 +1314,127 @@ def test_grouped_arithmetic_runs_in_a_transaction(dynamodb_client, gtable):
     members = _members(gtable, ["UPDATE {t} SET a = (a + 1) + 1 WHERE pk = '{k}' AND sk = 'b'"], k=name)
     assert _txn(dynamodb_client, members)["Responses"] == []
     assert _gget(dynamodb_client, gtable, key(name))["a"] == {"N": "3"}
+
+
+# --- a member with an empty bag or a parameter refused for its content ----------
+# An empty bag and a number set two of whose members have one value fail the
+# request with the member's position, at its place among the members. A
+# parameter the service refuses for its content fails it without a position,
+# when its member is reached (measured 2026-11-06).
+
+_BAG_EMPTY = "Empty bags are not supported"
+_NS_EQUAL = (
+    "One or more parameter values were invalid: Input collection [1, 1.0] contains duplicates! "
+    "under root"
+)
+_PARAMETER_SS_EMPTY = "One or more parameter values were invalid: An string set  may not be empty"
+
+
+@pytest.fixture(scope="module")
+def raw_client(endpoint_url):
+    """A client that sends values botocore would refuse, as the service gets them."""
+    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    profile = os.environ.get("EXTENDDB_TEST_PROFILE") or None
+    session = boto3.Session(profile_name=profile, region_name=region)
+    kwargs: dict = {"service_name": "dynamodb", "config": Config(parameter_validation=False)}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            kwargs["verify"] = False
+    return session.client(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "templates, index, message",
+    [
+        (["INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>}}"], 0, _BAG_EMPTY),
+        (["UPDATE {t} SET v = <<>> WHERE pk = '{k}' AND sk = 'b'"], 0, _BAG_EMPTY),
+        (
+            [
+                "UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'",
+                "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>}}",
+            ],
+            1,
+            _BAG_EMPTY,
+        ),
+        (
+            [
+                "INSERT INTO \"nosuch_tbl_r3\" VALUE {{'pk':'{n}','sk':'b','x':1}}",
+                "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>}}",
+            ],
+            1,
+            _BAG_EMPTY,
+        ),
+        (["INSERT INTO \"nosuch_tbl_r3\" VALUE {{'pk':'{n}','sk':'b','v':<<>>}}"], 0, _BAG_EMPTY),
+        (
+            [
+                "EXISTS(SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<>>)",
+                "UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'",
+            ],
+            0,
+            _BAG_EMPTY,
+        ),
+        (["SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<>>"], 0, _BAG_EMPTY),
+        ([_SEED_READ, "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>}}"], 1, _BAG_EMPTY),
+        (["UPDATE {t} SET v = <<>> WHERE pk = '{k}'"], 0, _BAG_EMPTY),
+        (["INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<1, 1.0>>}}"], 0, _NS_EQUAL),
+    ],
+)
+def test_a_member_with_an_empty_bag_fails_the_request(
+    dynamodb_client, gtable, templates, index, message
+):
+    names = {
+        "k": f"tb-{uuid.uuid4().hex[:6]}",
+        "o": f"tbo-{uuid.uuid4().hex[:6]}",
+        "n": f"tbn-{uuid.uuid4().hex[:6]}",
+        "s": "seed",
+    }
+    put(dynamodb_client, gtable, names["k"])
+    put(dynamodb_client, gtable, names["o"])
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, _members(gtable, templates, **names))
+    assert _error(excinfo) == ("ValidationException", _positional(index, message))
+    for name in ("k", "o"):
+        assert _gget(dynamodb_client, gtable, key(names[name])) == item(key(names[name]))
+    assert _gget(dynamodb_client, gtable, key(names["n"])) is None
+
+
+def test_a_parameter_refused_for_its_content_fails_the_request_without_a_position(
+    raw_client, gtable
+):
+    names = {"k": f"tp-{uuid.uuid4().hex[:6]}", "o": f"tpo-{uuid.uuid4().hex[:6]}"}
+    put(raw_client, gtable, names["k"])
+    put(raw_client, gtable, names["o"])
+    update = _sql("UPDATE {t} SET v = ? WHERE pk = '{k}' AND sk = 'b'", gtable, **names)
+    other = _sql("UPDATE {t} SET x = 1 WHERE pk = '{o}' AND sk = 'b'", gtable, **names)
+    empty = [{"SS": []}]
+    for members, message in [
+        ([{"Statement": update, "Parameters": empty}], _PARAMETER_SS_EMPTY),
+        ([{"Statement": other}, {"Statement": update, "Parameters": empty}], _PARAMETER_SS_EMPTY),
+        (
+            [{"Statement": update, "Parameters": empty}, {"Statement": other + " AND"}],
+            _PARAMETER_SS_EMPTY,
+        ),
+        (
+            [{"Statement": other + " AND"}, {"Statement": update, "Parameters": empty}],
+            _positional(
+                0,
+                "Statement wasn't well formed, can't be processed: Missing right-hand side "
+                "expression of infix operator",
+            ),
+        ),
+        (
+            [{"Statement": update, "Parameters": [{"NULL": False}]}],
+            "One or more parameter values were invalid: Null attribute value types must have the "
+            "value of true",
+        ),
+        (
+            [{"Statement": update, "Parameters": [{}]}],
+            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+        ),
+    ]:
+        with pytest.raises(ClientError) as excinfo:
+            _txn(raw_client, members)
+        assert _error(excinfo) == ("ValidationException", message)
+    for name in ("k", "o"):
+        assert _gget(raw_client, gtable, key(names[name])) == item(key(names[name]))

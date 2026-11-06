@@ -1,14 +1,22 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! PartiQL parameter checks: nesting depth and number conversion.
+//! PartiQL parameter checks: nesting depth, number conversion, and the
+//! values the service refuses for their content.
 //!
 //! The service converts each statement's `Parameters` before it looks at the
 //! statement, and reports the first problem it reaches walking the values in
 //! document order: a map or list nested past the item limit, or an `N` (or
 //! `NS` member) that cannot be converted or breaks a number rule (measured
 //! 2026-11-02). So `[deep, {"N": "abc"}]` is a nesting error and
-//! `[{"N": "abc"}, deep]` a conversion error.
+//! `[{"N": "abc"}, deep]` a conversion error. The same walk meets an empty
+//! set, a set that holds a member twice, a NULL that is not true and an
+//! attribute value with no type or with two, each refused as the attribute
+//! value deserializer refuses it, but a number set whose members have one
+//! value, which is "Input collection contains duplicates" (measured
+//! 2026-11-06: `[{"SS": []}, deep]` and `{"L": [{"SS": []}, deep]}` are
+//! refused for the set, `[deep, {"SS": []}]` and `{"L": [deep, {"SS": []}]}`
+//! for the nesting, and the same with a number past the limits).
 //!
 //! The walk here runs over the parsed request body: parameters and list
 //! elements in request order, the members of a map in the order the parsed
@@ -19,10 +27,21 @@
 //! reported can differ from the service's, which walks the request's order
 //! (measured 2026-11-02).
 
+use std::collections::HashSet;
+
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::number::{check_number, parameter_message};
+use crate::types::AttributeValue;
 use crate::validation::MAX_ITEM_NESTING_DEPTH;
+use crate::validation::number::validate_and_normalize_number;
+
+/// The refusal of a number set parameter two of whose members have one
+/// value, the same at any depth and for members written alike (measured
+/// 2026-11-06: `{"NS": ["1", "1.0"]}`, `{"NS": ["1", "1"]}`, and inside a
+/// map and a list).
+pub const NUMBER_SET_DUPLICATES: &str = "Input collection contains duplicates";
 
 /// The service's nesting-depth message, the same for parameters as for items.
 pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits: \
@@ -33,7 +52,8 @@ pub const NESTING_MESSAGE: &str = "Nesting Levels have exceeded supported limits
 /// # Errors
 ///
 /// Returns the service's message for the first problem: the nesting-depth
-/// message, or the parameter number message for an `N` or `NS` member.
+/// message, the parameter number message for an `N` or `NS` member, or the
+/// refusal of a value for its content (see the module documentation).
 pub fn check_parameter_values(parameters: &[Value]) -> Result<(), String> {
     parameters.iter().try_for_each(|p| check_value(p, 0))
 }
@@ -46,6 +66,9 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
     let Value::Object(members) = value else {
         return Ok(());
     };
+    if members.len() != 1 {
+        return content_refusal(value);
+    }
     for (tag, payload) in members {
         match (tag.as_str(), payload) {
             ("M", Value::Object(entries)) => {
@@ -67,11 +90,47 @@ fn check_value(value: &Value, depth: usize) -> Result<(), String> {
                         check_text(text)?;
                     }
                 }
+                if has_equal_numbers(items) {
+                    return Err(NUMBER_SET_DUPLICATES.to_owned());
+                }
+                content_refusal(value)?;
             }
+            ("SS" | "BS" | "NULL", _) => content_refusal(value)?,
             _ => {}
         }
     }
     Ok(())
+}
+
+/// The refusal the attribute value deserializer gives `value` when the
+/// service refuses it for its content: an empty set, a set that holds a
+/// member twice, a NULL that is not true, an attribute value with no type or
+/// with two. A value of the wrong JSON type is left to the deserializer when
+/// the request is read, which fails the request.
+fn content_refusal(value: &Value) -> Result<(), String> {
+    let Err(e) = AttributeValue::deserialize(value) else {
+        return Ok(());
+    };
+    let message = e.to_string();
+    let content = [
+        "may not be empty",
+        "should not be empty",
+        "contains duplicates",
+        "Null attribute value types must have the value of true",
+        "AttributeValue is empty",
+        "AttributeValue has more than one datatypes set",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker));
+    if content { Err(message) } else { Ok(()) }
+}
+
+/// Whether two members of a number set have one value.
+fn has_equal_numbers(items: &[Value]) -> bool {
+    let mut values = HashSet::with_capacity(items.len());
+    items.iter().filter_map(Value::as_str).any(|text| {
+        !values.insert(validate_and_normalize_number(text).unwrap_or_else(|_| text.to_owned()))
+    })
 }
 
 fn enter(depth: usize) -> Result<usize, String> {
@@ -193,6 +252,99 @@ mod tests {
                 Err(message.to_owned()),
                 "{json}"
             );
+        }
+    }
+
+    #[test]
+    fn a_value_refused_for_its_content_is_met_in_its_place() {
+        let empty_ss = "One or more parameter values were invalid: An string set  may not be empty";
+        for (json, message) in [
+            ("[{\"SS\":[]}]", empty_ss),
+            (
+                "[{\"NS\":[]}]",
+                "One or more parameter values were invalid: An number set  may not be empty",
+            ),
+            (
+                "[{\"BS\":[]}]",
+                "One or more parameter values were invalid: Binary sets should not be empty",
+            ),
+            (
+                "[{\"SS\":[\"a\",\"a\"]}]",
+                "One or more parameter values were invalid: Input collection [a, a] contains \
+                 duplicates.",
+            ),
+            (
+                "[{\"BS\":[\"AQ==\",\"AQ==\"]}]",
+                "One or more parameter values were invalid: Input collection [AQ==, AQ==]of type \
+                 BS contains duplicates.",
+            ),
+            ("[{\"NS\":[\"1\",\"1.0\"]}]", NUMBER_SET_DUPLICATES),
+            ("[{\"NS\":[\"1\",\"1\"]}]", NUMBER_SET_DUPLICATES),
+            ("[{\"NS\":[\"2\",\"1\",\"1.0\"]}]", NUMBER_SET_DUPLICATES),
+            (
+                "[{\"M\":{\"x\":{\"NS\":[\"1\",\"1.0\"]}}}]",
+                NUMBER_SET_DUPLICATES,
+            ),
+            (
+                "[{\"L\":[{\"NS\":[\"1\",\"1.0\"]}]}]",
+                NUMBER_SET_DUPLICATES,
+            ),
+            ("[{\"M\":{\"x\":{\"SS\":[]}}}]", empty_ss),
+            ("[{\"L\":[{\"SS\":[]}]}]", empty_ss),
+            (
+                "[{\"NULL\":false}]",
+                "One or more parameter values were invalid: Null attribute value types must have \
+                 the value of true",
+            ),
+            (
+                "[{}]",
+                "Supplied AttributeValue is empty, must contain exactly one of the supported \
+                 datatypes",
+            ),
+            (
+                "[{\"S\":\"a\",\"N\":\"1\"}]",
+                "Supplied AttributeValue has more than one datatypes set, must contain exactly one \
+                 of the supported datatypes",
+            ),
+            ("[{\"S\":\"a\"},{\"SS\":[]}]", empty_ss),
+        ] {
+            assert_eq!(
+                check_parameter_values(&doc(json)),
+                Err(message.to_owned()),
+                "{json}"
+            );
+        }
+        let deep_list = deep(40, "{\"S\":\"leaf\"}");
+        let empty = "{\"SS\":[]}";
+        let bad = "{\"N\":\"abc\"}";
+        for (json, message) in [
+            (format!("[{empty},{deep_list}]"), empty_ss),
+            (format!("[{deep_list},{empty}]"), NESTING_MESSAGE),
+            (format!("[{{\"L\":[{empty},{deep_list}]}}]"), empty_ss),
+            (
+                format!("[{{\"L\":[{deep_list},{empty}]}}]"),
+                NESTING_MESSAGE,
+            ),
+            (format!("[{empty},{bad}]"), empty_ss),
+            (format!("[{bad},{empty}]"), ABC),
+        ] {
+            assert_eq!(
+                check_parameter_values(&doc(&json)),
+                Err(message.to_owned()),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_json_type_is_left_to_the_request() {
+        for json in [
+            "[{\"BOOL\":\"x\"}]",
+            "[{\"NULL\":\"x\"}]",
+            "[{\"S\":1}]",
+            "[{\"SS\":\"a\"}]",
+        ] {
+            assert_eq!(check_parameter_values(&doc(json)), Ok(()), "{json}");
         }
     }
 

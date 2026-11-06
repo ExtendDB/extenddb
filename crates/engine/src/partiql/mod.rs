@@ -84,8 +84,8 @@ impl PartiqlExecutor for OperationContext {
     async fn execute_statement(&self, body: Value) -> Result<DispatchResult, DynamoDbError> {
         let ctx = &translation_context(self);
         request_checks::check_execute_statement(&body)?;
-        let req = SingleRequest::from_body(&body)?;
         check_parameters(body.get("Parameters")).map_err(DynamoDbError::ValidationException)?;
+        let req = SingleRequest::from_body(&body)?;
         // An EXISTS statement is refused by the parser, in its place among
         // the refusals of a statement that parses (measured 2026-11-02).
         let statement = parse_for_execute_statement(&req.statement, req.parameters.len())
@@ -193,13 +193,26 @@ pub(crate) struct SingleRequest {
 }
 
 impl SingleRequest {
+    /// The request of one statement, its parameters read. Its parameters
+    /// pass [`check_parameters`] first, so a failure here is a parameter of
+    /// the wrong JSON type, which fails the request.
     pub(super) fn from_body(body: &Value) -> Result<Self, DynamoDbError> {
+        let req = Self::without_parameters(body)?;
+        Ok(Self {
+            parameters: parse_parameters(body.get("Parameters"))?,
+            ..req
+        })
+    }
+
+    /// The request of one statement whose parameters are not read, for a
+    /// statement refused before its parameters are.
+    pub(super) fn without_parameters(body: &Value) -> Result<Self, DynamoDbError> {
         let statement = body
             .get("Statement")
             .and_then(Value::as_str)
             .ok_or_else(|| DynamoDbError::ValidationException("Statement is required".to_owned()))?
             .to_owned();
-        let parameters = parse_parameters(body.get("Parameters"))?;
+        let parameters = Vec::new();
         let parameter_numbers = body
             .get("Parameters")
             .and_then(Value::as_array)
@@ -235,7 +248,10 @@ impl SingleRequest {
     }
 }
 
-/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues).
+/// Deserialize a PartiQL `Parameters` array (wire-form AttributeValues). A
+/// value the attribute value deserializer refuses gets the error a classic
+/// request gets for it (see `crate::deserialize_error`); [`check_parameters`]
+/// has already refused the values the service refuses for their content.
 pub(crate) fn parse_parameters(
     value: Option<&Value>,
 ) -> Result<Vec<AttributeValue>, DynamoDbError> {
@@ -247,16 +263,17 @@ pub(crate) fn parse_parameters(
     })?;
     arr.iter()
         .map(|v| {
-            serde_json::from_value::<AttributeValue>(v.clone())
-                .map_err(|e| DynamoDbError::ValidationException(format!("invalid parameter: {e}")))
+            serde_json::from_value::<AttributeValue>(v.clone()).map_err(crate::deserialize_error)
         })
         .collect()
 }
 
-/// Check a statement's `Parameters` (as the request carries them) for nesting
-/// depth and number conversion. The service answers this ahead of the target's
-/// key checks, and in `ExecuteTransaction` without a statement-position prefix
-/// (measured 2026-11-02), so it runs before the statement is parsed.
+/// Check a statement's `Parameters` (as the request carries them): nesting
+/// depth, number conversion, and the values the service refuses for their
+/// content, such as an empty set (see `params::check_parameter_values`). The
+/// service answers this ahead of the target's key checks, and in
+/// `ExecuteTransaction` without a statement-position prefix (measured
+/// 2026-11-02 and 2026-11-06), so it runs before the statement is parsed.
 ///
 /// The walk follows the parsed body: parameters and list elements in request
 /// order, the members of a map in the order the parsed request holds them,
@@ -278,14 +295,16 @@ pub(crate) fn check_parameters(parameters: Option<&Value>) -> Result<(), String>
 
 /// The checks a parsed statement gets before its target is resolved, in
 /// this order: the table name rule, a projected call (`COUNT(*)`), the
-/// number literals of the condition against the item number rules, the
-/// operand types of ordering comparisons, the values an INSERT or an UPDATE
-/// writes (the same number check, and the calls of a SET value), then update
-/// paths that overlap or conflict. `source` is the statement's text. The
-/// first three come in that order on all three operations (measured
-/// 2026-11-02), except that `ExecuteStatement` reports a projected call once
-/// the target is resolved; the written values come after the operand types
-/// and ahead of overlapping paths (measured 2026-11-06, see `values`).
+/// literals of the condition (number literals against the item number
+/// rules, empty bags, number sets with two equal members), the operand types
+/// of ordering comparisons, the values an INSERT or an UPDATE writes (the
+/// same literal checks, and the calls of a SET value), then update paths that
+/// overlap or conflict. `source` is the statement's text. The first three
+/// come in that order on all three operations (measured 2026-11-02), except
+/// that `ExecuteStatement` reports a projected call once the target is
+/// resolved; the condition's literals come ahead of the operand types and
+/// the written values after them, and the written values ahead of
+/// overlapping paths (measured 2026-11-06, see `values`).
 ///
 /// # Errors
 ///
@@ -542,11 +561,32 @@ mod tests {
                 &[],
             ),
             (
+                "UPDATE \"tbl\" SET q = <<>> WHERE pk = 'a' AND val < true",
+                &[],
+            ),
+            (
                 "SELECT * FROM \"tbl\" WHERE pk = 1 AND val < ?",
                 &params[..],
             ),
         ] {
             assert_eq!(checked(sql, params), Err(OPERAND_TYPE.to_owned()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_condition_literals_are_checked_before_the_operand_types() {
+        // (measured 2026-11-06, in both orders)
+        for sql in [
+            "UPDATE \"tbl\" SET a = 1 WHERE pk = 'a' AND v = <<>> AND val < true",
+            "UPDATE \"tbl\" SET a = 1 WHERE pk = 'a' AND val < true AND v = <<>>",
+            "SELECT * FROM \"tbl\" WHERE pk = 'a' AND val < true AND v = <<>>",
+            "UPDATE \"tbl\" SET a = size(m) WHERE pk = 'a' AND v = <<>>",
+        ] {
+            assert_eq!(
+                checked(sql, &[]),
+                Err("Empty bags are not supported".to_owned()),
+                "{sql}"
+            );
         }
     }
 }

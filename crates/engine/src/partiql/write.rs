@@ -361,11 +361,16 @@ fn index_keys(key_info: &TableKeyInfo) -> Vec<IndexKeyRef<'_>> {
         .collect()
 }
 
-/// Read back a map the translation built in wire form.
+/// Read back a map the translation built in wire form. The map holds values
+/// a statement gave, and the statement checks refuse those the attribute
+/// value deserializer refuses (see `values`), so this fails only on a value
+/// they do not know of. It gets the error a classic request with that value
+/// gets (see `crate::deserialize_error`), which is what the statement's
+/// item operation would answer.
 fn from_wire<T: serde::de::DeserializeOwned>(map: &Map<String, Value>) -> Result<T, DynamoDbError> {
     serde_json::from_value(Value::Object(map.clone())).map_err(|e| {
-        tracing::error!(internal_error = %e, "failed to read a translated PartiQL map");
-        internal()
+        tracing::warn!(error = %e, "a translated PartiQL map does not read back");
+        crate::deserialize_error(e)
     })
 }
 

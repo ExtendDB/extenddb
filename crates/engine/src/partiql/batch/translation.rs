@@ -26,8 +26,10 @@
 //!
 //! Every error of a statement's translation, other than a fault of the
 //! server, is that statement's own: the others run (measured 2026-11-06 with
-//! a call an update cannot make, which the statement checks refuse before
-//! the translation).
+//! a call an update cannot make and an empty bag, which the statement checks
+//! refuse before the translation). Reading back a translated request fails
+//! only on a value those checks refuse, so such a failure is an untranslated
+//! statement too.
 
 use serde_json::{Map, Value};
 
@@ -74,8 +76,8 @@ impl Translation {
 ///
 /// # Errors
 ///
-/// A fault of the server: a catalog read that fails, a translated map that
-/// does not read back, or a table without a partition key.
+/// A fault of the server: a catalog read that fails, or a table without a
+/// partition key.
 pub(super) async fn translate_write(
     ctx: &OperationContext,
     stmt: &Statement,

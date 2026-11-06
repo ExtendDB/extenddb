@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
 from partiql_gsi_table import get as _gget
-from partiql_gsi_table import gsi_table, item, put
+from partiql_gsi_table import gsi_table, item, key, put
 
 
 @pytest.fixture(scope="session")
@@ -847,3 +847,199 @@ def test_an_unknown_call_is_named_where_it_is_written(dynamodb_client, gtable, t
         "ValidationException",
         f"Unrecognized function: upper at {line_index + 1}:{column}:5",
     )
+
+
+# --- empty bags and number sets with two equal members --------------------------
+# A bag with no members is refused wherever a statement writes it, inside a
+# map, a list or a call too, and in a condition. A number set two of whose
+# members have one value is refused naming its path. Both are refused ahead
+# of every check against the table, the condition's in its walk and ahead of
+# the operand types, the written values in the order written and after them
+# (measured 2026-11-06 in us-east-1).
+
+EMPTY_BAG = "Empty bags are not supported"
+
+
+@pytest.fixture(scope="module")
+def raw_client(endpoint_url):
+    """A client that sends values botocore would refuse, as the service gets them."""
+    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    profile = os.environ.get("EXTENDDB_TEST_PROFILE") or None
+    session = boto3.Session(profile_name=profile, region_name=region)
+    kwargs: dict = {"service_name": "dynamodb", "config": Config(parameter_validation=False)}
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            kwargs["verify"] = False
+    return session.client(**kwargs)
+
+
+def _duplicates(listed, path="root"):
+    return (
+        f"One or more parameter values were invalid: Input collection [{listed}] contains "
+        f"duplicates! under {path}"
+    )
+
+
+@pytest.mark.parametrize(
+    "template, message",
+    [
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','m':{{'x':<<>>}}}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','l':[<<>>]}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','m':{{'y':[{{'x':<<>>}}]}}}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':<<>>,'sk':'b'}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'sk':'b','v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':1,'sk':'b','v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','g':1,'v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{k}','sk':'b','v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO \"nosuch_tbl_r3\" VALUE {{'pk':'{n}','sk':'b','v':<<>>}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<>>,'n':1e126}}", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','n':1e126,'v':<<>>}}", OVERFLOW),
+        ("UPDATE {t} SET v = <<>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = {{'x':<<>>}} WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = [<<>>] WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = if_not_exists(v, <<>>) WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET l = list_append(l, [<<>>]) WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET ss = set_add(ss, <<>>) WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>> + 1 WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>> WHERE pk = 'nope-{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>> WHERE pk = '{k}'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>> WHERE pk = 1 AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE \"nosuch_tbl_r3\" SET v = <<>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET pk = <<>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>>, pk = 'z' WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = 1, v = <<>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>>, w = ? WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET g = 1, v = <<>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>>, a = size(m) WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET a = size(m), v = <<>> WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET b = 1e126, v = <<>> WHERE pk = '{k}' AND sk = 'b'", OVERFLOW),
+        ("UPDATE {t} SET v = <<>>, b = 1e126 WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET v = <<>> WHERE pk = '{k}' AND sk = 'b' AND x < true", OPERAND_TYPE),
+        ("UPDATE {t} SET a = 2 WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", EMPTY_BAG),
+        ("UPDATE {t} SET a = 2 WHERE pk = '{k}' AND sk = 'b' AND v IN (<<>>, 1)", EMPTY_BAG),
+        ("UPDATE {t} SET a = 2 WHERE pk = '{k}' AND sk = 'b' AND contains(ss, <<>>)", EMPTY_BAG),
+        ("UPDATE {t} SET a = size(m) WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", EMPTY_BAG),
+        ("UPDATE {t} SET b = 1e126 WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", EMPTY_BAG),
+        ("UPDATE {t} SET a = 1 WHERE pk = '{k}' AND sk = 'b' AND v = <<>> AND x < true", EMPTY_BAG),
+        ("UPDATE {t} SET a = 1 WHERE pk = '{k}' AND sk = 'b' AND x < true AND v = <<>>", EMPTY_BAG),
+        (
+            "UPDATE {t} SET a = 1 WHERE pk = '{k}' AND sk = 'b' AND a + 1 = 2 AND v = <<>>",
+            "Unsupported operator in Condition Expression. Operator: +",
+        ),
+        ("DELETE FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", EMPTY_BAG),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<>>", EMPTY_BAG),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND v = <<>>", EMPTY_BAG),
+        ("SELECT * FROM {t} WHERE pk = <<>>", EMPTY_BAG),
+        ("SELECT * FROM {t} WHERE v = <<>>", EMPTY_BAG),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND x < true AND v = <<>>", EMPTY_BAG),
+        ("INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','v':<<1, 1.0>>}}", _duplicates("1, 1.0")),
+        (
+            "INSERT INTO {t} VALUE {{'pk':'{n}','sk':'b','m':{{'v':<<1, 1.0>>}}}}",
+            _duplicates("1, 1.0", "root.v"),
+        ),
+        ("UPDATE {t} SET v = [<<1, 1.0>>] WHERE pk = '{k}' AND sk = 'b'", _duplicates("1, 1.0", "root[0]")),
+        ("UPDATE {t} SET v = <<100, 1e2>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("100, 1E+2")),
+        ("UPDATE {t} SET v = <<0, 0.0>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("0, 0.0")),
+        ("UPDATE {t} SET v = <<-1, -1.0>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("-1, -1.0")),
+        ("UPDATE {t} SET v = <<1.0e1, 10>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("10, 10")),
+        ("UPDATE {t} SET v = <<0.001, 1e-3>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("0.001, 0.001")),
+        ("UPDATE {t} SET v = <<0.0000001, 1e-7>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("1E-7, 1E-7")),
+        ("UPDATE {t} SET v = <<007, 7>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("7, 7")),
+        ("UPDATE {t} SET ss = set_add(ss, <<1, 1.0>>) WHERE pk = '{k}' AND sk = 'b'", _duplicates("1, 1.0")),
+        ("UPDATE {t} SET a = upper(<<1, 1.0>>) WHERE pk = '{k}' AND sk = 'b'", _duplicates("1, 1.0")),
+        ("UPDATE {t} SET v = <<1, 1.0>>, a = size(m) WHERE pk = '{k}' AND sk = 'b'", _duplicates("1, 1.0")),
+        ("UPDATE {t} SET a = size(m), v = <<1, 1.0>> WHERE pk = '{k}' AND sk = 'b'", NOT_ALLOWED + "size"),
+        ("UPDATE {t} SET v = <<1, 1.0>>, w = <<>> WHERE pk = '{k}' AND sk = 'b'", _duplicates("1, 1.0")),
+        ("UPDATE {t} SET w = <<>>, v = <<1, 1.0>> WHERE pk = '{k}' AND sk = 'b'", EMPTY_BAG),
+        ("UPDATE {t} SET a = 2 WHERE pk = '{k}' AND sk = 'b' AND v IN (<<1, 1.0>>)", _duplicates("1, 1.0")),
+        ("SELECT * FROM {t} WHERE pk = '{k}' AND sk = 'b' AND v = <<1, 1.0>>", _duplicates("1, 1.0")),
+    ],
+)
+def test_an_empty_bag_or_a_set_of_equal_numbers_is_refused(
+    dynamodb_client, gtable, template, message
+):
+    pk = put(dynamodb_client, gtable, f"bag-{uuid.uuid4().hex[:6]}", ss={"SS": ["a"]}, l={"L": []})
+    fresh = key(f"bagn-{uuid.uuid4().hex[:6]}")
+    statement = template.format(t=f'"{gtable}"', k=pk, n=fresh)
+    assert _refusal(dynamodb_client, statement) == ("ValidationException", message)
+    assert _gget(dynamodb_client, gtable, pk) == item(pk, ss={"SS": ["a"]}, l={"L": []})
+    assert _gget(dynamodb_client, gtable, fresh) is None
+
+
+SS_EMPTY = "One or more parameter values were invalid: An string set  may not be empty"
+NESTED_PAST = (
+    "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels "
+    "beyond supported limit"
+)
+
+
+def _deep_list(levels=33):
+    value = {"L": [{"N": "1"}]}
+    for _ in range(levels):
+        value = {"L": [value]}
+    return value
+
+
+@pytest.mark.parametrize(
+    "params, message",
+    [
+        ([{"SS": []}], SS_EMPTY),
+        ([{"NS": []}], "One or more parameter values were invalid: An number set  may not be empty"),
+        ([{"BS": []}], "One or more parameter values were invalid: Binary sets should not be empty"),
+        (
+            [{"SS": ["a", "a"]}],
+            "One or more parameter values were invalid: Input collection [a, a] contains duplicates.",
+        ),
+        ([{"NS": ["1", "1.0"]}], "Input collection contains duplicates"),
+        ([{"NS": ["1", "1"]}], "Input collection contains duplicates"),
+        ([{"NS": ["2", "1", "1.0"]}], "Input collection contains duplicates"),
+        ([{"M": {"x": {"NS": ["1", "1.0"]}}}], "Input collection contains duplicates"),
+        ([{"L": [{"NS": ["1", "1.0"]}]}], "Input collection contains duplicates"),
+        ([{"M": {"x": {"SS": []}}}], SS_EMPTY),
+        ([{"L": [{"SS": []}]}], SS_EMPTY),
+        ([{"M": {"x": {"BS": []}}}], "One or more parameter values were invalid: Binary sets should not be empty"),
+        (
+            [{"NULL": False}],
+            "One or more parameter values were invalid: Null attribute value types must have the "
+            "value of true",
+        ),
+        (
+            [{}],
+            "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes",
+        ),
+        (
+            [{"S": "a", "N": "1"}],
+            "Supplied AttributeValue has more than one datatypes set, must contain exactly one of "
+            "the supported datatypes",
+        ),
+        ([{"SS": []}, _deep_list()], SS_EMPTY),
+        ([_deep_list(), {"SS": []}], NESTED_PAST),
+        ([{"L": [{"SS": []}, _deep_list()]}], SS_EMPTY),
+        ([{"L": [_deep_list(), {"SS": []}]}], NESTED_PAST),
+        (
+            [{"N": "1e999999"}, {"SS": []}],
+            "Number overflow. Attempting to store a number with magnitude larger than supported "
+            "range",
+        ),
+        ([{"SS": []}, {"N": "1e999999"}], SS_EMPTY),
+    ],
+)
+def test_a_parameter_refused_for_its_content_is_reported_in_its_place(
+    raw_client, gtable, params, message
+):
+    pk = put(raw_client, gtable, f"par-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = ?, w = ? WHERE pk = '{pk}' AND sk = 'b'"
+    padded = params + [{"N": "1"}] * (2 - len(params))
+    assert _refusal(raw_client, statement, padded) == ("ValidationException", message)
+    assert _gget(raw_client, gtable, pk) == item(pk)
+
+
+def test_a_parameter_refused_for_its_content_is_reported_when_it_is_not_used(
+    raw_client, gtable
+):
+    pk = put(raw_client, gtable, f"parx-{uuid.uuid4().hex[:6]}")
+    statement = f"UPDATE \"{gtable}\" SET v = 1 WHERE pk = '{pk}' AND sk = 'b'"
+    assert _refusal(raw_client, statement, [{"SS": []}]) == ("ValidationException", SS_EMPTY)
+    assert _gget(raw_client, gtable, pk) == item(pk)

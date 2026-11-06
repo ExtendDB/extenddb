@@ -7,30 +7,40 @@
 //! [`check_condition_values`] reads the literals of the WHERE condition and
 //! [`check_written_values`] the values an INSERT or an UPDATE writes. Each
 //! walk reports the first problem it meets in the order the statement is
-//! written: a number literal that breaks an item number rule, and, in a SET
-//! value, a call an update cannot make. The arguments of a call are met
-//! before the call (measured 2026-11-06 in us-east-1: `SET a =
-//! size(upper(m))` is refused for `upper`, `SET a = upper(size(m))` for
-//! `size`, `SET b = 1e126, a = size(m)` for the number and `SET a = size(m),
-//! b = 1e126` for the call).
+//! written: a number literal that breaks an item number rule, an empty bag,
+//! a number set two of whose members have one value, and, in a SET value, a
+//! call an update cannot make. The arguments of a call are met before the
+//! call (measured 2026-11-06 in us-east-1: `SET a = size(upper(m))` is
+//! refused for `upper`, `SET a = upper(size(m))` for `size`, `SET b = 1e126,
+//! a = size(m)` for the number and `SET a = size(m), b = 1e126` for the
+//! call).
 //!
-//! The service reads the written values after the operand types of the
-//! condition's ordering comparisons: `SET b = 1e126 WHERE ... AND x < true`
-//! and `SET a = size(m) WHERE ... AND x < true`, with a literal or a
-//! parameter, are refused for the operand type (measured 2026-11-06). The
+//! The service reads the condition's literals ahead of the operand types of
+//! its ordering comparisons, and the written values after them: `SET a = 1
+//! WHERE ... AND v = <<>> AND x < true` and `... AND x < true AND v = <<>>`
+//! are refused for the bag, and `SET b = 1e126 WHERE ... AND x < true`, with
+//! a literal or a parameter, for the operand type (measured 2026-11-06). The
 //! written values come ahead of overlapping SET paths, of a `?` without a
 //! parameter and of every check against the table (measured 2026-11-06).
 //!
 //! A map literal holds its members in name order, not in the order they are
-//! written, so where two members of one map both have a problem the one
-//! reported can differ from the service's.
+//! written, and a number set its members in text order, so where two
+//! members of one map both have a problem the one reported can differ from
+//! the service's, and the members a number set refusal lists can come in
+//! another order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::ast::{Operand, SetAction, SetMembersAction, Statement, UpdateStatement, WhereExpr};
 use super::lexer::{Token, TokenKind, lex};
 use super::number::literal_number_refusal;
 use crate::types::AttributeValue;
+use crate::validation::number::validate_and_normalize_number;
+
+/// The refusal of a bag literal with no members (measured 2026-11-06 in an
+/// INSERT value, a SET value and a condition, at the top of the value and
+/// inside a map, a list and a call).
+pub const EMPTY_BAG: &str = "Empty bags are not supported";
 
 /// The condition functions. A SET value that calls one is refused naming it
 /// (measured 2026-11-06 for each, with any number of arguments).
@@ -145,11 +155,15 @@ fn literals(operand: &Operand) -> Result<(), String> {
 }
 
 /// One literal value at `path` inside the value it is part of (`root`,
-/// `root.k`, `root[0]`): its numbers, and the values inside it.
+/// `root.k`, `root[0]`): its numbers, its bags, and the values inside it.
 fn literal(value: &AttributeValue, path: &mut String) -> Result<(), String> {
     match value {
         AttributeValue::N(text) => number(text, path),
-        AttributeValue::NS(members) => members.iter().try_for_each(|text| number(text, path)),
+        AttributeValue::NS(members) => {
+            members.iter().try_for_each(|text| number(text, path))?;
+            number_set(members, path)
+        }
+        AttributeValue::SS(members) if members.is_empty() => Err(EMPTY_BAG.to_owned()),
         AttributeValue::L(items) => {
             for (index, item) in items.iter().enumerate() {
                 let len = path.len();
@@ -179,6 +193,80 @@ fn number(text: &str, path: &str) -> Result<(), String> {
     match literal_number_refusal(text, path) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
+    }
+}
+
+/// Refuse a number set two of whose members have one value, listing the
+/// members as decimals (see [`decimal_text`]) and naming the set's path
+/// (measured 2026-11-06: `<<1, 1.0>>` is "One or more parameter values were
+/// invalid: Input collection [1, 1.0] contains duplicates! under root", in
+/// a map member `root.x`, in a list `root[0]`, also in a set_add, in an IN
+/// list and in a call's argument).
+fn number_set(members: &BTreeSet<String>, path: &str) -> Result<(), String> {
+    let mut values = HashSet::with_capacity(members.len());
+    let repeated = members.iter().any(|text| {
+        !values.insert(validate_and_normalize_number(text).unwrap_or_else(|_| text.clone()))
+    });
+    if !repeated {
+        return Ok(());
+    }
+    let listed: Vec<String> = members.iter().map(|text| decimal_text(text)).collect();
+    Err(format!(
+        "One or more parameter values were invalid: Input collection [{}] contains duplicates! \
+         under {path}",
+        listed.join(", ")
+    ))
+}
+
+/// A number literal written as the decimal it reads as: the digits without
+/// leading zeros and the number of digits after the point the literal gives,
+/// in plain notation when the exponent of that decimal is not positive and
+/// its value is at least 1e-6, and otherwise as one digit, the rest of the
+/// digits after a point, and `E` with a signed exponent (measured
+/// 2026-11-06: `1e2` is `1E+2`, `12e3` is `1.2E+4`, `1.0e1` is `10`,
+/// `0.001` and `1e-3` are `0.001`, `0.0000001` and `1e-7` are `1E-7`, `007`
+/// is `7`, `1.50` is `1.50`, `-1e2` is `-1E+2`).
+fn decimal_text(text: &str) -> String {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (
+            &unsigned[..at],
+            unsigned[at + 1..].parse::<i64>().unwrap_or(0),
+        ),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    let digits = match digits.trim_start_matches('0') {
+        "" => "0",
+        significant => significant,
+    };
+    let count = i64::try_from(digits.len()).unwrap_or(i64::MAX);
+    let scale = i64::try_from(fraction.len()).unwrap_or(i64::MAX) - exponent;
+    let adjusted = count - 1 - scale;
+    let body = if scale >= 0 && adjusted >= -6 {
+        let point = usize::try_from(scale).unwrap_or(usize::MAX);
+        if point == 0 {
+            digits.to_owned()
+        } else if digits.len() > point {
+            let (int, frac) = digits.split_at(digits.len() - point);
+            format!("{int}.{frac}")
+        } else {
+            format!("0.{}{digits}", "0".repeat(point - digits.len()))
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        let sign = if adjusted >= 0 { "+" } else { "" };
+        format!("{first}{point}{rest}E{sign}{adjusted}")
+    };
+    if negative && digits != "0" {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 
