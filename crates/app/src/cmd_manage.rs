@@ -9,8 +9,41 @@
 //! Types are in `manage_types.rs`; HTTP transport and dispatch are in
 //! `manage_http.rs`.
 
-use crate::manage_http::{basic_auth, dispatch, resolve_endpoint, resolve_password};
+use crate::manage_http::{basic_auth, dispatch, resolve_endpoint};
 pub use crate::manage_types::ManageArgs;
+
+/// Printed on stderr when the password comes from `--password`.
+const PASSWORD_FLAG_WARNING: &str = "Warning: --password is visible in process listings and \
+                                     shell history. Omit it and set EXTENDDB_PASSWORD instead.";
+
+/// Choose the password from the `--password` value and the `EXTENDDB_PASSWORD`
+/// value. The flag takes precedence when both are set.
+fn choose_password(flag: Option<String>, env: Option<String>) -> anyhow::Result<String> {
+    flag.or(env).ok_or_else(|| {
+        anyhow::anyhow!("No password provided. Use --password VALUE or set EXTENDDB_PASSWORD.")
+    })
+}
+
+/// The warning to print on stderr: `Some` when `--password` was given, `None`
+/// when it was not. The flag takes precedence, so `Some` means the password
+/// came from the flag. The result depends only on `flag_given`, so the printed
+/// text never holds the password.
+fn flag_warning(flag_given: bool) -> Option<&'static str> {
+    flag_given.then_some(PASSWORD_FLAG_WARNING)
+}
+
+/// Resolve the password from the `--password` flag or the `EXTENDDB_PASSWORD`
+/// env var, and warn on stderr when it came from the flag.
+///
+/// Never reads from stdin. Errors if no password source is available.
+fn resolve_password(cli_password: Option<String>) -> anyhow::Result<String> {
+    let warning = flag_warning(cli_password.is_some());
+    let password = choose_password(cli_password, std::env::var("EXTENDDB_PASSWORD").ok())?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    Ok(password)
+}
 
 // Caller (`run_interactive`) requires a Future; removing `async` would need a
 // manual `impl Future` wrapper for no benefit.
@@ -40,5 +73,53 @@ pub async fn run(args: ManageArgs) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("HTTP {status}: {body}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PASSWORD_FLAG_WARNING, choose_password, flag_warning};
+
+    fn value(s: &str) -> Option<String> {
+        Some(s.to_owned())
+    }
+
+    #[test]
+    fn a_password_from_the_flag_is_used() {
+        assert_eq!(
+            choose_password(value("from-flag"), None).unwrap(),
+            "from-flag"
+        );
+    }
+
+    #[test]
+    fn a_password_from_the_variable_is_used() {
+        assert_eq!(
+            choose_password(None, value("from-env")).unwrap(),
+            "from-env"
+        );
+    }
+
+    #[test]
+    fn the_flag_takes_precedence_over_the_variable() {
+        assert_eq!(
+            choose_password(value("from-flag"), value("from-env")).unwrap(),
+            "from-flag"
+        );
+    }
+
+    #[test]
+    fn only_the_flag_gets_the_warning() {
+        assert_eq!(flag_warning(true), Some(PASSWORD_FLAG_WARNING));
+        assert_eq!(flag_warning(false), None);
+    }
+
+    #[test]
+    fn no_flag_and_no_variable_is_an_error() {
+        let err = choose_password(None, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No password provided. Use --password VALUE or set EXTENDDB_PASSWORD."
+        );
     }
 }
