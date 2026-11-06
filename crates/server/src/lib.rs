@@ -11,6 +11,7 @@
 pub(crate) mod authorization;
 pub mod authz_cache;
 pub(crate) mod authz_resource;
+pub mod backup_store;
 pub mod console;
 pub mod dev_credentials;
 mod handler;
@@ -29,7 +30,8 @@ mod throttle_helpers;
 mod workers;
 
 pub use serve::{
-    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, log_to_syslog_raw, serve,
+    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, catalog_refusal,
+    log_to_syslog_raw, serve,
 };
 
 use std::path::PathBuf;
@@ -55,6 +57,8 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Application state shared across all handlers.
 pub struct AppState {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The job slots and configured backup store the backup operations read.
+    pub backup_runtime: Arc<extenddb_engine::BackupRuntime>,
     pub auth: Arc<dyn AuthProvider>,
     pub limits: Arc<LimitsConfig>,
     // Fix #9: Use Arc<str> to avoid per-request cloning
@@ -204,6 +208,7 @@ pub async fn start_server(
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
+            secure_cookies: tls_enabled,
         });
         let console_router = console::router().with_state(console_state);
         app = app
@@ -298,9 +303,39 @@ pub async fn start_server(
     Ok(())
 }
 
-/// GET /health — REQ-OBS-006
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(json!({"status": "healthy"})))
+/// GET /health — REQ-OBS-006.
+///
+/// Always 200 while the server answers: the data plane is up. `status` is
+/// `healthy`, or `degraded` when a component is unhealthy, and `components`
+/// carries each component the server has. Today the one component is
+/// `backup_store`, present when a store is configured: `status` `healthy`,
+/// `checking` (an S3 store's first check has not returned; the server's
+/// `status` stays `healthy`) or `unhealthy`, `kind` (`filesystem` or `s3`)
+/// and, when unhealthy, `reason`, the problem's category in one or two
+/// words. The endpoint is unauthenticated, so the reason carries no id, ARN,
+/// table name or root; the operator's log line does. A store problem never
+/// takes the data plane out of rotation, which is why the HTTP status stays
+/// 200.
+async fn health_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mut components = serde_json::Map::new();
+    let mut status = "healthy";
+    if let Some(store) = state.backup_runtime.store_health() {
+        let mut component = json!({
+            "status": store.status,
+            "kind": store.kind,
+        });
+        if let Some(reason) = store.reason {
+            component["reason"] = serde_json::Value::String(reason.to_owned());
+            status = "degraded";
+        }
+        components.insert("backup_store".to_owned(), component);
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "status": status, "components": components })),
+    )
 }
 
 async fn graceful_shutdown(pid_file: Option<PathBuf>, admission: registration::Admission) {

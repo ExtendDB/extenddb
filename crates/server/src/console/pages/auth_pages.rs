@@ -9,11 +9,12 @@ use axum::Form;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use extenddb_storage::management_store::RateLimitStore;
+use extenddb_storage::management_store::{PasswordHashStore, RateLimitStore};
 use serde::Deserialize;
 
 use crate::console::ConsoleState;
 use crate::console::html;
+use crate::console::session::CredentialStamp;
 use crate::management::CallerIdentity;
 use crate::management::auth::log_password_check_error;
 use crate::rate_limit::{self, LoginAttempt, LoginRefusal};
@@ -47,18 +48,17 @@ pub async fn login_submit(
 
     // Try admin auth first, then IAM user auth. A storage error (including a
     // timed-out wait for a bcrypt slot) is answered 500 and recorded as
-    // nothing: no password was checked.
+    // nothing: no password was checked. A match carries the stamp of the
+    // password hash it was checked against, and the session is bound to it.
     let checked = check_credentials(&form.username, &form.password, &*state.catalog_store).await;
-    let identity =
+    let (identity, stamp) =
         match settle_attempt(attempt, checked, &*state.catalog_store, &state.listen_url).await {
-            Ok(identity) => identity,
+            Ok(login) => login,
             Err(page) => return page,
         };
 
-    let (token, _csrf) = state.sessions.create(identity).await;
-    let cookie = format!(
-        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age=28800"
-    );
+    let (token, _csrf) = state.sessions.create(identity, stamp).await;
+    let cookie = session_cookie(&token, 28800, state.secure_cookies);
 
     (
         StatusCode::SEE_OTHER,
@@ -72,13 +72,22 @@ pub async fn logout(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) 
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove(&token).await;
     }
-    let cookie =
-        "extenddb_session=; Path=/console; HttpOnly; SameSite=Strict; Max-Age=0".to_string();
+    let cookie = session_cookie("", 0, state.secure_cookies);
     (
         StatusCode::SEE_OTHER,
         [("location", "/console/login"), ("set-cookie", &cookie)],
     )
         .into_response()
+}
+
+/// The `Set-Cookie` value for the console session. With `secure`, the cookie
+/// carries `Secure`, so a browser does not attach it to a plain `http://`
+/// request to the host (browsers exempt `localhost` from this rule).
+fn session_cookie(token: &str, max_age_secs: u32, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "extenddb_session={token}; Path=/console; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}{secure}"
+    )
 }
 
 fn login_html(error: Option<&str>, listen_url: &str) -> String {
@@ -119,7 +128,7 @@ IAM users: enter <code>account_id/user_name</code>.
 /// Result of an admin login attempt — three-state to distinguish "not found"
 /// (fall through to IAM) from "wrong password" (reject immediately).
 enum AdminLoginResult {
-    Authenticated(CallerIdentity),
+    Authenticated(CallerIdentity, CredentialStamp),
     WrongPassword,
     NotFound,
 }
@@ -159,16 +168,18 @@ fn refusal_page(refusal: LoginRefusal, listen_url: &str) -> Response {
     }
 }
 
-/// Check the form's credentials, admin first and then IAM user. `Ok(None)`
-/// is a wrong password or an unknown principal; `Err(())` is a storage
-/// error, including a timed-out wait for a bcrypt slot.
+/// Check the form's credentials, admin first and then IAM user. A match
+/// returns the identity with the stamp of the password hash it was checked
+/// against. `Ok(None)` is a wrong password or an unknown principal;
+/// `Err(())` is a storage error, including a timed-out wait for a bcrypt
+/// slot.
 async fn check_credentials(
     username: &str,
     password: &str,
     store: &dyn extenddb_storage::CatalogStore,
-) -> Result<Option<CallerIdentity>, ()> {
+) -> Result<Option<(CallerIdentity, CredentialStamp)>, ()> {
     match try_admin_login(username, password, store).await? {
-        AdminLoginResult::Authenticated(id) => Ok(Some(id)),
+        AdminLoginResult::Authenticated(id, stamp) => Ok(Some((id, stamp))),
         // Admin exists, wrong password: do NOT fall through.
         AdminLoginResult::WrongPassword => Ok(None),
         // Admin not found: try IAM user auth.
@@ -182,12 +193,12 @@ async fn check_credentials(
 /// the attempt releases its reservation.
 async fn settle_attempt(
     attempt: LoginAttempt,
-    checked: Result<Option<CallerIdentity>, ()>,
+    checked: Result<Option<(CallerIdentity, CredentialStamp)>, ()>,
     rate_limiter: &dyn RateLimitStore,
     listen_url: &str,
-) -> Result<CallerIdentity, Response> {
+) -> Result<(CallerIdentity, CredentialStamp), Response> {
     match checked {
-        Ok(Some(identity)) => Ok(identity),
+        Ok(Some(login)) => Ok(login),
         Ok(None) => {
             attempt.record_failure(rate_limiter).await;
             Err(invalid_credentials(listen_url))
@@ -200,60 +211,125 @@ async fn settle_attempt(
 async fn try_admin_login(
     username: &str,
     password: &str,
-    store: &dyn extenddb_storage::management_store::AdminStore,
+    store: &dyn PasswordHashStore,
 ) -> Result<AdminLoginResult, ()> {
-    let result = store
-        .verify_admin_password(username, password)
+    let hash = store
+        .get_admin_password_hash(username)
         .await
         .map_err(|e| log_password_check_error("Console login: DB error during admin auth", &e))?;
-    Ok(match result {
-        Some(true) => AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned())),
-        Some(false) => AdminLoginResult::WrongPassword,
-        None => AdminLoginResult::NotFound,
+    let Some(hash) = hash else {
+        return Ok(AdminLoginResult::NotFound);
+    };
+    Ok(match verify_login(password, Some(hash)).await? {
+        Some(stamp) => {
+            AdminLoginResult::Authenticated(CallerIdentity::Admin(username.to_owned()), stamp)
+        }
+        None => AdminLoginResult::WrongPassword,
     })
 }
 
-/// `Ok(None)` is a wrong password, an unknown user or a name without `/`;
-/// `Err(())` is a storage error, which the caller answers 500 and records as
-/// nothing. A name without `/` names no IAM user. It is checked against a
-/// fixed hash, so that it runs one bcrypt check, as a login for an existing
-/// admin or IAM user does.
+/// `Ok(None)` is a wrong password, an unknown user, a user without a console
+/// password or a name without `/`; `Err(())` is a storage error, which the
+/// caller answers 500 and records as nothing. A name without `/` names no IAM
+/// user. When no stored hash is found, the password is checked against a
+/// fixed hash, so that the login runs one bcrypt check, as a login for an
+/// existing admin or IAM user does.
 async fn try_iam_login(
     username: &str,
     password: &str,
-    store: &dyn extenddb_storage::management_store::ManagementStore,
-) -> Result<Option<CallerIdentity>, ()> {
+    store: &dyn PasswordHashStore,
+) -> Result<Option<(CallerIdentity, CredentialStamp)>, ()> {
     let user = username.split_once('/');
-    let checked = match user {
+    // `None` when the name has no `/`, or when the user does not exist or has
+    // no console password.
+    let hash = match user {
         Some((acct_id, uname)) => {
             store
-                .verify_iam_user_password(acct_id, uname, password)
+                .get_user_password_hash(acct_id, uname)
                 .await
+                .map_err(|e| {
+                    log_password_check_error("Console login: DB error during IAM user auth", &e)
+                })?
         }
-        None => extenddb_storage::password::verify_stored_password(password.to_owned(), None).await,
+        None => None,
     };
-    let ok = checked.map_err(|e| {
-        log_password_check_error("Console login: DB error during IAM user auth", &e)
-    })?;
-    Ok(match user {
-        Some((acct_id, uname)) if ok => Some(CallerIdentity::IamUser {
-            account_id: acct_id.to_owned(),
-            user_name: uname.to_owned(),
-        }),
+    let stamp = verify_login(password, hash).await?;
+    Ok(match (user, stamp) {
+        (Some((acct_id, uname)), Some(stamp)) => {
+            let identity = CallerIdentity::IamUser {
+                account_id: acct_id.to_owned(),
+                user_name: uname.to_owned(),
+            };
+            Some((identity, stamp))
+        }
         _ => None,
     })
 }
 
+/// Verify a login password against the hash read from the catalog. On a
+/// match, returns the stamp of that same hash, which the new session is bound
+/// to. The hash is read once and used for both, so a password change that
+/// lands during the login either fails the login or ends the new session at
+/// its first request.
+///
+/// `hash` is `None` when the login names no principal with a password. The
+/// password is then checked against a fixed hash and refused, so the login
+/// runs the same bcrypt work as a wrong password (see
+/// [`extenddb_storage::password::verify_stored_password`]).
+///
+/// All console login verification goes through this function, and through
+/// the bcrypt slots of [`extenddb_storage::password::verify_password`].
+/// `Ok(None)` is a wrong password or a login without a stored hash.
+/// `Err(())` is a verification that did not run (no bcrypt slot within the
+/// wait, or a failed blocking task); the caller answers 500 and records
+/// nothing.
+async fn verify_login(password: &str, hash: Option<String>) -> Result<Option<CredentialStamp>, ()> {
+    let stamp = hash.as_deref().map(CredentialStamp::of);
+    let matched = extenddb_storage::password::verify_stored_password(password.to_owned(), hash)
+        .await
+        .map_err(|e| log_password_check_error("Console login: password verification failed", &e))?;
+    Ok(stamp.filter(|_| matched))
+}
+
 #[cfg(test)]
 mod tests {
+    use extenddb_storage::management_store::{OpError, OpResult};
     use extenddb_storage::password::VERIFY_OVERLOADED;
+    use futures::future::BoxFuture;
 
     use super::*;
-    use crate::management::auth::tests::FailingAdmins;
     use crate::rate_limit::PRINCIPAL_LIMITED;
     use crate::rate_limit::tests::{MemoryStore, capture_logs, peer};
 
     const LISTEN_URL: &str = "https://127.0.0.1:8443";
+
+    /// A password hash store whose reads fail with `OpError::Internal`
+    /// carrying `message`. Logins read nothing else from it.
+    struct FailingHashes {
+        message: &'static str,
+    }
+
+    impl PasswordHashStore for FailingHashes {
+        fn get_admin_password_hash(&self, _: &str) -> BoxFuture<'_, OpResult<Option<String>>> {
+            let error = OpError::Internal(self.message.to_owned());
+            Box::pin(async move { Err(error) })
+        }
+
+        fn get_user_password_hash(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> BoxFuture<'_, OpResult<Option<String>>> {
+            let error = OpError::Internal(self.message.to_owned());
+            Box::pin(async move { Err(error) })
+        }
+    }
+
+    /// A password made at run time. The store fails before any check, so its
+    /// value does not matter, and no literal reaches the password check.
+    fn any_password() -> String {
+        format!("pw-{}", std::process::id())
+    }
 
     async fn body_text(response: Response) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -280,11 +356,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_error_in_the_admin_check_is_an_error_not_an_unknown_admin() {
-        let admins = FailingAdmins {
+        let hashes = FailingHashes {
             message: "store is down",
         };
+        let password = any_password();
         let (logs, _guard) = capture_logs();
-        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        assert!(try_admin_login("admin", &password, &hashes).await.is_err());
         let text = logs.text();
         assert!(
             text.contains("ERROR") && text.contains("Console login: DB error during admin auth"),
@@ -294,11 +371,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_bcrypt_slot_timeout_is_an_error_and_is_not_logged_as_a_store_error() {
-        let admins = FailingAdmins {
+        let hashes = FailingHashes {
             message: VERIFY_OVERLOADED,
         };
+        let password = any_password();
         let (logs, _guard) = capture_logs();
-        assert!(try_admin_login("admin", "pw", &admins).await.is_err());
+        assert!(try_admin_login("admin", &password, &hashes).await.is_err());
         let text = logs.text();
         assert!(!text.contains("DB error"), "{text}");
     }
@@ -312,9 +390,9 @@ mod tests {
         let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.90"))
             .await
             .unwrap();
-        let page = settle_attempt(attempt, Err(()), &attempts, LISTEN_URL)
-            .await
-            .unwrap_err();
+        let Err(page) = settle_attempt(attempt, Err(()), &attempts, LISTEN_URL).await else {
+            panic!("a storage error was settled as a login");
+        };
         assert_eq!(page.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(attempts.row_count(), 0);
     }
@@ -325,9 +403,9 @@ mod tests {
         let attempt = rate_limit::begin_login(&attempts, "admin", peer("198.51.100.91"))
             .await
             .unwrap();
-        let page = settle_attempt(attempt, Ok(None), &attempts, LISTEN_URL)
-            .await
-            .unwrap_err();
+        let Err(page) = settle_attempt(attempt, Ok(None), &attempts, LISTEN_URL).await else {
+            panic!("a wrong password was settled as a login");
+        };
         assert_eq!(page.status(), StatusCode::OK);
         assert!(body_text(page).await.contains("Invalid credentials"));
         assert_eq!(attempts.rows_for("admin", "198.51.100.91"), 1);
@@ -350,13 +428,74 @@ mod tests {
                 "{}: bcrypt checks and their cost",
                 login.case
             );
-            let identity = checked.unwrap_or_else(|()| panic!("{}: storage error", login.case));
+            let login_result = checked.unwrap_or_else(|()| panic!("{}: storage error", login.case));
             assert_eq!(
-                Outcome::of(identity.as_ref()),
+                Outcome::of(login_result.as_ref().map(|(identity, _)| identity)),
                 login.outcome,
                 "{}",
                 login.case
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_cookie_tests {
+    use super::session_cookie;
+
+    /// The `name=value` pair, which must come first, and the attributes after
+    /// it, sorted, since their order carries no meaning.
+    fn parts(cookie: &str) -> (&str, Vec<&str>) {
+        let mut parts = cookie.split(';').map(str::trim);
+        let pair = parts.next().unwrap_or_default();
+        let mut attributes: Vec<&str> = parts.collect();
+        attributes.sort_unstable();
+        (pair, attributes)
+    }
+
+    #[test]
+    fn a_tls_server_marks_the_session_cookie_secure() {
+        let login = session_cookie("t0k", 28800, true);
+        let (pair, attributes) = parts(&login);
+        assert_eq!(pair, "extenddb_session=t0k");
+        assert_eq!(
+            attributes,
+            [
+                "HttpOnly",
+                "Max-Age=28800",
+                "Path=/console",
+                "SameSite=Strict",
+                "Secure"
+            ]
+        );
+        let logout = session_cookie("", 0, true);
+        let (pair, attributes) = parts(&logout);
+        assert_eq!(pair, "extenddb_session=");
+        assert_eq!(
+            attributes,
+            [
+                "HttpOnly",
+                "Max-Age=0",
+                "Path=/console",
+                "SameSite=Strict",
+                "Secure"
+            ]
+        );
+    }
+
+    /// Dev mode serves plain HTTP, where `Secure` protects nothing, and an
+    /// HTTP client that does not treat the loopback origin as secure, such as
+    /// the Python `requests` client the console tests use, would not send the
+    /// cookie back.
+    #[test]
+    fn a_plain_http_server_leaves_secure_off() {
+        for cookie in [
+            session_cookie("t0k", 28800, false),
+            session_cookie("", 0, false),
+        ] {
+            let (_, attributes) = parts(&cookie);
+            assert!(!attributes.contains(&"Secure"), "{cookie}");
+            assert!(attributes.contains(&"HttpOnly") && attributes.contains(&"SameSite=Strict"));
         }
     }
 }

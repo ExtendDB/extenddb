@@ -197,8 +197,9 @@ impl CassandraCatalogStore {
             "delete_user iam_user_tags",
         )
         .await?;
-        // iam_users last: user is only gone once all dependent rows are cleaned up
-        crate::cassandra_util::apply_lwt(
+        // iam_users last: user is only gone once all dependent rows are cleaned up.
+        // Quorum commit, so the console's quorum session check sees the deletion.
+        crate::cassandra_util::apply_lwt_quorum(
             &session,
             &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
             cdrs_tokio::query_values!(account_id, user_name),
@@ -416,7 +417,8 @@ impl CassandraCatalogStore {
              WHERE account_id = ? AND user_name = ? IF EXISTS"
         );
 
-        crate::cassandra_util::apply_lwt(
+        // Quorum commit, so the console's quorum session check sees the new hash.
+        crate::cassandra_util::apply_lwt_quorum(
             self.session(),
             &update_query,
             cdrs_tokio::query_values!(password_hash, account_id, user_name),
