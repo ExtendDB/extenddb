@@ -291,6 +291,34 @@ fn query_kce_sort_key_before_partition_key() {
 }
 
 #[test]
+fn query_kce_without_a_partition_key_equality_binds_only_a_partition_operand() {
+    // Clauses with no equality parse without a partition key condition, and
+    // an equality on another attribute with a non-equality on the partition
+    // key is no partition key equality either; the engine refuses these
+    // requests by the key schema. Authorization binds the operand of the one
+    // clause that names the partition key, as
+    // `query_non_equality_partition_key_binds_the_operand` does for `pk > :v`,
+    // and never the operand of a clause on another attribute: `sk = :v AND
+    // pk > :s` binds `:s`, not `:v`.
+    for (kce, want) in [
+        ("pk > :v", Some("alice")),
+        ("begins_with(pk, :v)", Some("alice")),
+        ("sk > :v", None),
+        ("pk > :v AND sk > :s", Some("alice")),
+        ("sk > :v AND zz > :s", None),
+        ("sk = :v AND pk > :s", Some("x")),
+    ] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {":v": {"S": "alice"}, ":s": {"S": "x"}},
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, want.map(|v| vec![v.to_owned()]), "{kce}");
+    }
+}
+
+#[test]
 fn query_legacy_key_conditions() {
     let input = json!({
         "TableName": "t",
@@ -769,30 +797,34 @@ fn query_non_equality_on_a_gsi_partition_key_binds_the_index_operand() {
     assert_eq!(r, Some(vec!["galice".to_owned()]));
 }
 
-/// The single-clause shapes of the fix are shapes the engine's own parser
-/// rejects, so the engine never reads a partition value for them and cannot
-/// disagree with the value authorization binds. The two-clause shapes the fix
-/// also binds (`pk > :v AND sk = :s`, `pk > :v AND sk < :s`) parse or not
-/// depending on the sort clause, and the engine refuses them when it resolves
-/// the partition attribute; the wire test
-/// `test_non_equality_partition_with_sort_clause_is_refused` covers that. The
-/// equality shapes the engine accepts keep the value they had, which the
-/// accepted-shape tests above cover.
+/// The shapes of the fix have no equality on the partition key. The engine
+/// refuses them by the key schema before it reads anything, so it never reads
+/// a partition value for them and cannot disagree with the value authorization
+/// binds. The wire test `test_non_equality_partition_with_sort_clause_is_refused`
+/// covers the two-clause shapes. The equality shapes the engine accepts keep the
+/// value they had, which the accepted-shape tests above cover.
 #[test]
-fn the_parser_still_rejects_every_single_clause_shape_whose_operand_is_now_bound() {
+fn the_engine_still_refuses_every_shape_whose_operand_is_now_bound() {
+    let key_schema = main_table().key_schema;
     for kce in [
         "pk > :v",
         "pk < :v",
         "pk <= :v",
         "pk >= :v",
         "begins_with(pk, :v)",
+        "pk > :v AND sk = :s",
+        "pk > :v AND sk < :s",
     ] {
         let tokens = extenddb_core::expression::tokenize(kce).unwrap();
-        let err = extenddb_core::expression::parse_key_condition(&tokens).unwrap_err();
+        let kc = extenddb_core::expression::parse_key_condition(&tokens).unwrap();
+        let err = kc
+            .refuse_without_hash_equality(&key_schema, &HashMap::new())
+            .unwrap_err();
         assert!(
             matches!(
-                err,
-                extenddb_core::error::DynamoDbError::ValidationException(_)
+                &err,
+                extenddb_core::error::DynamoDbError::ValidationException(msg)
+                    if msg == "Query key condition not supported"
             ),
             "{kce}: {err:?}"
         );
