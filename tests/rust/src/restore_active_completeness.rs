@@ -23,12 +23,19 @@
 //! The dataset is sized so the copy takes longer than the transition window on
 //! a loaded server. On very fast or idle hardware, raising `ITEMS` widens the
 //! window.
+//!
+//! On a server with a configured `[backup.store]` (`EXTENDDB_TEST_BACKUP_STORE`
+//! at `filesystem` or `s3`) the restore of a backup this server created is
+//! refused this release (the restore job is PR 9a's), so the race test pins
+//! that refusal in place of the race.
 
+use crate::backup_restore::{
+    backup_store, delete_backup_quietly, wait_for_backup_available, BackupStore,
+};
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex,
-    KeySchemaElement, KeyType, Projection, ProjectionType, PutRequest, ScalarAttributeType,
-    Select, WriteRequest,
+    AttributeDefinition, AttributeValue, BillingMode, GlobalSecondaryIndex, KeySchemaElement,
+    KeyType, Projection, ProjectionType, PutRequest, ScalarAttributeType, Select, WriteRequest,
 };
 use std::time::Duration;
 
@@ -159,20 +166,36 @@ async fn restored_table_has_all_items_when_first_active() {
         .await
         .unwrap();
     let arn = backup.backup_details().unwrap().backup_arn().to_string();
-    // Wait until the backup is AVAILABLE.
-    for _ in 0..240 {
-        let d = c.describe_backup().backup_arn(&arn).send().await.unwrap();
-        if d.backup_description()
-            .and_then(|b| b.backup_details())
-            .map(|b| b.backup_status().as_str() == "AVAILABLE")
-            .unwrap_or(false)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+    wait_for_backup_available(c, &arn).await;
 
     let dst = format!("RestoreRaceDst_{}", ts());
+    // A backup in the configured store is not restored this release (the
+    // restore job is PR 9a's): the race has nothing to observe, and the test
+    // pins the refusal instead.
+    if matches!(backup_store(), BackupStore::Filesystem | BackupStore::S3) {
+        let err = c
+            .restore_table_from_backup()
+            .target_table_name(&dst)
+            .backup_arn(&arn)
+            .send()
+            .await
+            .expect_err("a store-backed backup restored");
+        assert_eq!(err_code(&err), Some("ValidationException"), "{err:?}");
+        let msg = err_msg(&err);
+        assert!(
+            msg.contains("is in a backup store"),
+            "the refusal does not name the store: {msg}"
+        );
+        println!("restore of a store-backed backup refused: {msg}");
+        assert!(
+            c.describe_table().table_name(&dst).send().await.is_err(),
+            "the refused restore created {dst}"
+        );
+        delete_backup_quietly(c, &arn).await;
+        c.delete_table().table_name(&src).send().await.ok();
+        return;
+    }
+    println!("restore of an in-catalog backup: racing the observer");
     // Race an observer against the in-flight restore: the moment it sees
     // ACTIVE, it counts. Returns None if ACTIVE never arrives within the
     // bound, which means the restore itself failed.
@@ -254,6 +277,7 @@ async fn restored_table_has_all_items_when_first_active() {
     // above was still in flight (or just after, if the copy was fast).
     let observed = observer.await.unwrap();
 
+    delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&src).send().await.ok();
     c.delete_table().table_name(&dst).send().await.ok();
 

@@ -30,7 +30,6 @@ async fn engine() -> MongoEngine {
         .expect("set EXTENDDB_TEST_MONGODB_URI to a MongoDB replica set");
     let client = mongodb::Client::with_uri_str(uri).await.expect("client");
     let tag = uuid::Uuid::new_v4().simple().to_string();
-    let slots = crate::backup_engine::restore_server_slot_count(10);
     MongoEngine {
         client: client.clone(),
         catalog_db: client.database(&format!("g{}_cat", &tag[..12])),
@@ -39,9 +38,6 @@ async fn engine() -> MongoEngine {
         gsi_cache: Arc::default(),
         tx_read_concern: mongodb::options::ReadConcern::snapshot(),
         backup_liveness: crate::backup_engine::BackupLiveness::default(),
-        restore_server_slot_count: slots,
-        restore_server_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        restore_account_slots: crate::backup_engine::RestoreAccountSlots::default(),
     }
 }
 

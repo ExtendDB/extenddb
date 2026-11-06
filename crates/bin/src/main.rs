@@ -75,6 +75,8 @@ fn main() -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         git_hash: env!("EXTENDDB_GIT_HASH"),
         build_time: env!("EXTENDDB_BUILD_TIME"),
+        // The MongoDB hooks; the backup jobs' hooks are `extenddb-app`'s
+        // `backup-test-hooks` feature, which `version` reports itself.
         test_hooks_enabled: cfg!(feature = "mongodb-test-hooks"),
     })
 }

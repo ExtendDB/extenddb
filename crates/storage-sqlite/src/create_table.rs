@@ -22,12 +22,17 @@ use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 use crate::sqlite_util::{format_epoch_seconds, format_timestamp, is_unique_violation};
 use crate::store::SqliteEngine;
 
-/// What a restore records about itself when its target is created.
+/// What a restore records about itself when its target is created: the
+/// registration and the restore job record it is born with (`RUNNING`,
+/// `kind = legacy`, the claim's generation, a fresh heartbeat).
 pub(crate) struct RestoreRegistration<'a> {
     pub backup_arn: &'a str,
     pub source_table_arn: &'a str,
     /// Epoch seconds: the source backup's creation time.
     pub restore_date_time: f64,
+    /// The fencing token of the restore's claim; every later write by the
+    /// restore to its record carries it.
+    pub owner_generation: u64,
 }
 
 impl SqliteEngine {
@@ -189,18 +194,10 @@ impl SqliteEngine {
             // predicate as DeleteBackup's, in the same kind of write
             // transaction under the write lock, so two simultaneous restores
             // cannot both pass.
-            let restoring: Option<String> = sqlx::query_scalar(
-                "SELECT t.table_name FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                 WHERE r.source_backup_arn = ? AND t.table_status = 'CREATING' LIMIT 1",
-            )
-            .bind(backup_arn)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if let Some(table) = restoring {
-                return Err(StorageError::BackupInUse(format!(
-                    "Backup is being used to restore table {table}: {backup_arn}"
-                )));
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
+            {
+                return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
             }
         }
 
@@ -262,15 +259,20 @@ impl SqliteEngine {
         }
 
         if let Some(registration) = restore {
-            sqlx::query(
+            sqlx::query(&format!(
                 "INSERT INTO table_restores \
-                 (table_id, source_backup_arn, source_table_arn, restore_date_time) \
-                 VALUES (?, ?, ?, ?)",
-            )
+                 (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                  status, kind, owner_generation, heartbeat_at) \
+                 VALUES (?, ?, ?, ?, 'RUNNING', 'legacy', ?, {})",
+                crate::backup_catalog::NOW
+            ))
             .bind(&table_id)
             .bind(registration.backup_arn)
             .bind(registration.source_table_arn)
             .bind(format_epoch_seconds(registration.restore_date_time))
+            .bind(crate::backup_catalog::generation_column(
+                registration.owner_generation,
+            ))
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;

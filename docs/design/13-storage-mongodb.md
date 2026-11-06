@@ -837,6 +837,13 @@ opens the engine, and refuses a catalog with pending migrations or with a
 breaking migration this binary does not know, as on every backend.
 [ADR-0023](../adr/0023-catalog-migrations.md) records the design.
 
+The factory registers and reads the status before it builds the engine
+or starts the startup key repair, so a server that refuses has written
+nothing but its registration, which it deletes. A command that opens
+the catalog beside a server (`ServerComponentsOptions::beside_server`:
+`extenddb backup list`, the purge's dry run) starts no repair; the
+server does.
+
 ## 6. Crate Structure
 
 ```
