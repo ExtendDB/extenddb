@@ -86,6 +86,82 @@ pub(crate) fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     extenddb_storage::backup_catalog::backup_in_use(table, backup_arn)
 }
 
+/// `insert_backup_row`'s statement, on `executor`: `row` unowned, if no row
+/// with its key or its backup id exists. `Ok(false)`, writing nothing,
+/// otherwise. The legacy reader's `replace_with_index_row` runs it inside
+/// its transaction.
+pub(crate) async fn insert_unowned_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &BackupRow,
+) -> Result<bool, StorageError> {
+    // No conflict target: the primary key (`account_id`, `backup_id`) and
+    // the unique `backup_id` both make it a no-op. No advisory lock: a job
+    // that holds the id's lock and has not inserted its row yet finds this
+    // one and is refused, as it is by any row with the key.
+    let inserted = sqlx::query(
+        "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
+         backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
+         created_at, completed_at, failure_reason, source_table_details_json, \
+         owner_generation, heartbeat_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
+         $13, $14, $15, now()) ON CONFLICT DO NOTHING",
+    )
+    .bind(&row.backup_id)
+    .bind(&row.account_id)
+    .bind(&row.table_name)
+    .bind(&row.backup_arn)
+    .bind(&row.backup_name)
+    .bind(row.status.as_str())
+    .bind(row.store.store_kind.as_str())
+    .bind(&row.store.store_root)
+    .bind(&row.store.store_id)
+    .bind(row.size_bytes)
+    .bind(row.item_count)
+    .bind(row.created_at)
+    .bind(&row.failure_reason)
+    .bind(&row.source_table_details_json)
+    .bind(generation_column(UNOWNED_GENERATION))
+    .execute(executor)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// The account, ARN and store of the `backup_index` row holding
+/// `backup_id`, if one does, on `executor`.
+pub(crate) async fn index_row_holding<'e, E: PgExecutor<'e>>(
+    executor: E,
+    backup_id: &str,
+) -> Result<Option<(String, String, StoreIdentity)>, StorageError> {
+    let found: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT account_id, backup_arn, store_kind, store_root, store_id FROM backup_index \
+         WHERE backup_id = $1",
+    )
+    .bind(backup_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(db_err)?;
+    found
+        .map(|(account_id, backup_arn, kind, store_root, store_id)| {
+            let store_kind = StoreKind::parse(&kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "backup {backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?;
+            Ok((
+                account_id,
+                backup_arn,
+                StoreIdentity {
+                    store_kind,
+                    store_root,
+                    store_id,
+                },
+            ))
+        })
+        .transpose()
+}
+
 fn db_err(e: sqlx::Error) -> StorageError {
     StorageError::Internal(format!("Database error: {e}"))
 }
@@ -546,41 +622,7 @@ impl BackupCatalog for PostgresEngine {
         &'a self,
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        Box::pin(async move {
-            // No conflict target: the primary key (`account_id`,
-            // `backup_id`) and the unique `backup_id` both make it a no-op.
-            // No advisory lock: a job that holds the id's lock and has not
-            // inserted its row yet finds this one and is refused, as it is by
-            // any row with the key.
-            let inserted = sqlx::query(
-                "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
-                 backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
-                 created_at, completed_at, failure_reason, source_table_details_json, \
-                 owner_generation, heartbeat_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
-                 $13, $14, $15, now()) ON CONFLICT DO NOTHING",
-            )
-            .bind(&row.backup_id)
-            .bind(&row.account_id)
-            .bind(&row.table_name)
-            .bind(&row.backup_arn)
-            .bind(&row.backup_name)
-            .bind(row.status.as_str())
-            .bind(row.store.store_kind.as_str())
-            .bind(&row.store.store_root)
-            .bind(&row.store.store_id)
-            .bind(row.size_bytes)
-            .bind(row.item_count)
-            .bind(row.created_at)
-            .bind(&row.failure_reason)
-            .bind(&row.source_table_details_json)
-            .bind(generation_column(UNOWNED_GENERATION))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            Ok(inserted == 1)
-        })
+        Box::pin(insert_unowned_row(&self.pool, row))
     }
 
     fn list_backup_rows<'a>(

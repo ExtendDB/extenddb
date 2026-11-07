@@ -27,7 +27,7 @@
 use extenddb_core::backup_format::SourceTableSchema;
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, CreateTableInput, GsiInput, KeySchemaElement, KeyType,
-    LsiInput, OnDemandThroughput, ProvisionedThroughput, StreamSpecification,
+    LsiInput, OnDemandThroughput, ProvisionedThroughput, SseDescription, StreamSpecification,
     TimeToLiveDescription,
 };
 use serde::{Deserialize, Serialize};
@@ -436,6 +436,95 @@ impl BackupRestoreSource {
         }
         input
     }
+}
+
+/// What a backend can state about the vector indexes of an in-catalog
+/// backup's source table: the three states of a manifest's
+/// `source_table.vector_indexes`, of which `Unknown` has no manifest form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyVectorState {
+    /// The backend has no vector support (MongoDB, Cassandra): `null`.
+    Unsupported,
+    /// The backend supports vector indexes and its record states that the
+    /// table had none: a definition with no `VectorIndexNames`, or on
+    /// PostgreSQL a backup without a definition whose `vector_indexes`
+    /// snapshot is NULL or empty. `[]`.
+    NoneRecorded,
+    /// The backend supports vector indexes and recorded nothing about them:
+    /// a SQLite backup taken before catalog 0.0.4, which has no definition.
+    Unknown,
+}
+
+/// The manifest `source_table` of a copy of an in-catalog backup: the table
+/// the legacy restore of `source` creates, so a restore of the copy creates
+/// the same table (`restore_input_from_manifest` of the result equals
+/// `source.restore_input` for the same overrides, up to the SSE
+/// specification, below).
+///
+/// The keys, the attribute definitions (trimmed to the keys for a backup
+/// with no definition, as the legacy restore trims them), the billing mode,
+/// the throughput (5/5 for a provisioned backup that recorded none), the
+/// secondary indexes (a provisioned GSI that recorded no throughput carries
+/// the table's), the on-demand throughput and the SSE settings are those of
+/// `source.restore_input` with no overrides. `table_class`, `time_to_live`
+/// and `stream_specification` come from the definition, for DescribeBackup;
+/// the SSE specification is recorded as the description DescribeBackup
+/// reports for it ([`SseDescription::from_specification`]). A restore maps
+/// an `ENABLED` description back to `{"Enabled": true, "SSEType": "KMS"}`,
+/// so a `KMSMasterKeyId` the specification carried is not in the copy.
+/// `vector_indexes` is `null` for [`LegacyVectorState::Unsupported`] and `[]`
+/// for [`LegacyVectorState::NoneRecorded`].
+///
+/// # Errors
+///
+/// [`StorageError::Unsupported`] for what
+/// [`BackupRestoreSource::ensure_restorable`] refuses (a multi-part base key,
+/// vector indexes), and for [`LegacyVectorState::Unknown`]: the copy would
+/// have to guess the table's vector indexes.
+pub fn source_table_from_legacy(
+    source: &BackupRestoreSource,
+    vector_state: LegacyVectorState,
+    region: &str,
+    account_id: &str,
+) -> Result<SourceTableSchema, StorageError> {
+    source.ensure_restorable()?;
+    let vector_indexes = match vector_state {
+        LegacyVectorState::Unsupported => None,
+        LegacyVectorState::NoneRecorded => Some(Vec::new()),
+        LegacyVectorState::Unknown => {
+            return Err(StorageError::Unsupported(format!(
+                "backup {} has no recorded table definition (it was taken before catalog \
+                 0.0.4), so its vector indexes cannot be stated",
+                source.backup_arn
+            )));
+        }
+    };
+    let input = source.restore_input(&source.source_table_name, &RestoreTableOverrides::default());
+    let definition = source.definition.as_ref();
+    Ok(SourceTableSchema {
+        table_name: source.source_table_name.clone(),
+        table_id: source.source_table_id.clone(),
+        table_arn: source.source_table_arn.clone(),
+        table_creation_date_time: source.table_creation_date_time,
+        key_schema: input.key_schema,
+        attribute_definitions: input.attribute_definitions,
+        billing_mode: input.billing_mode.unwrap_or(BillingMode::PayPerRequest),
+        provisioned_throughput: input.provisioned_throughput,
+        on_demand_throughput: input.on_demand_throughput,
+        table_class: definition.and_then(|d| d.table_class.clone()),
+        sse_description: SseDescription::from_specification(
+            input.sse_specification.as_ref(),
+            region,
+            account_id,
+        ),
+        global_secondary_indexes: input.global_secondary_indexes.unwrap_or_default(),
+        local_secondary_indexes: input.local_secondary_indexes.unwrap_or_default(),
+        vector_indexes,
+        stream_specification: definition.and_then(|d| d.stream_specification.clone()),
+        time_to_live: definition.and_then(|d| d.time_to_live.clone()),
+        item_count: source.item_count,
+        table_size_bytes: source.table_size_bytes,
+    })
 }
 
 /// What the engine answers a `RestoreTableFromBackup` with, beside the
@@ -1053,5 +1142,351 @@ mod tests {
             t.trim_start_matches("table T"),
             b.trim_start_matches("backup arn")
         );
+    }
+
+    /// Every combination of the definition shapes a legacy backup can carry,
+    /// as a [`BackupRestoreSource`].
+    #[allow(clippy::too_many_lines)]
+    fn legacy_sources() -> Vec<BackupRestoreSource> {
+        let key = |n: &str, t| KeySchemaElement {
+            attribute_name: n.to_owned(),
+            key_type: t,
+        };
+        let attr = |n: &str| AttributeDefinition {
+            attribute_name: n.to_owned(),
+            attribute_type: extenddb_core::types::ScalarAttributeType::S,
+        };
+        let throughput = |r, w| ProvisionedThroughput {
+            read_capacity_units: r,
+            write_capacity_units: w,
+        };
+        let gsi = |t: Option<ProvisionedThroughput>| GsiInput {
+            index_name: "g".to_owned(),
+            key_schema: vec![key("gpk", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::KeysOnly,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: t,
+        };
+        let lsi = || LsiInput {
+            index_name: "l".to_owned(),
+            key_schema: vec![key("pk", KeyType::Hash), key("lsk", KeyType::Range)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+        };
+        let key_schemas = [
+            vec![key("pk", KeyType::Hash)],
+            vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        ];
+        let gsis = [
+            Vec::new(),
+            vec![gsi(Some(throughput(3, 4)))],
+            vec![gsi(None)],
+            vec![gsi(Some(throughput(0, 0)))],
+        ];
+        let sses = [
+            None,
+            Some(serde_json::json!({"Enabled": true, "SSEType": "KMS"})),
+            Some(serde_json::json!({"Enabled": true})),
+            Some(serde_json::json!({"Enabled": false})),
+        ];
+        let ttl = TimeToLiveDescription {
+            time_to_live_status: extenddb_core::types::TimeToLiveStatus::Enabled,
+            attribute_name: Some("ttl".to_owned()),
+        };
+        let stream = StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: Some(extenddb_core::types::StreamViewType::KeysOnly),
+        };
+        let mut sources = Vec::new();
+        for key_schema in &key_schemas {
+            for billing in ["PROVISIONED", "PAY_PER_REQUEST"] {
+                for recorded in [None, Some(throughput(8, 9))] {
+                    let mut attributes: Vec<AttributeDefinition> =
+                        key_schema.iter().map(|k| attr(&k.attribute_name)).collect();
+                    // The index attributes, which a pre-0.0.4 backup recorded
+                    // with its keys and no indexes to name them.
+                    attributes.extend([attr("gpk"), attr("lsk")]);
+                    let base = BackupRestoreSource {
+                        backup_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/src/backup/\
+                                     01757500000123-73d8d5bc"
+                            .to_owned(),
+                        backup_creation_date_time: 1_757_500_000.123,
+                        source_table_name: "src".to_owned(),
+                        source_table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/src"
+                            .to_owned(),
+                        source_table_id: "id".to_owned(),
+                        key_schema: key_schema.clone(),
+                        attribute_definitions: attributes,
+                        billing_mode: billing.to_owned(),
+                        provisioned_throughput: recorded.clone(),
+                        item_count: 12,
+                        table_size_bytes: 345,
+                        table_creation_date_time: 1_757_400_000.0,
+                        definition: None,
+                        legacy_vector_index_count: 0,
+                    };
+                    // A backup taken before catalog 0.0.4: keys, billing and
+                    // the throughput column only.
+                    sources.push(base.clone());
+                    for gsis in &gsis {
+                        for lsis in [Vec::new(), vec![lsi()]] {
+                            for sse in &sses {
+                                for on_demand in [
+                                    None,
+                                    Some(OnDemandThroughput {
+                                        max_read_request_units: Some(10),
+                                        max_write_request_units: None,
+                                    }),
+                                ] {
+                                    for extras in [false, true] {
+                                        let mut source = base.clone();
+                                        source.definition = Some(BackupTableDefinition {
+                                            version: BACKUP_DEFINITION_VERSION,
+                                            billing_mode: billing.to_owned(),
+                                            provisioned_throughput: recorded.clone(),
+                                            global_secondary_indexes: gsis.clone(),
+                                            local_secondary_indexes: lsis.clone(),
+                                            table_class: extras
+                                                .then(|| "STANDARD_INFREQUENT_ACCESS".to_owned()),
+                                            sse_specification: sse.clone(),
+                                            on_demand_throughput: on_demand.clone(),
+                                            vector_index_names: Vec::new(),
+                                            time_to_live: extras.then(|| ttl.clone()),
+                                            stream_specification: extras.then(|| stream.clone()),
+                                        });
+                                        sources.push(source);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sources
+    }
+
+    /// The SSE settings a target created from `input` reports, which is what
+    /// the two paths must agree on: the specification itself differs in
+    /// spelling (`{"Enabled": false}` against none, `{"Enabled": true}`
+    /// against the same with `"SSEType": "KMS"`).
+    fn reported_sse(input: &CreateTableInput) -> Option<SseDescription> {
+        SseDescription::from_specification(
+            input.sse_specification.as_ref(),
+            "us-east-1",
+            "123456789012",
+        )
+    }
+
+    #[test]
+    fn a_copy_of_a_legacy_backup_restores_the_table_its_legacy_restore_creates() {
+        let overrides = [
+            RestoreTableOverrides::default(),
+            RestoreTableOverrides {
+                billing_mode: Some(BillingMode::PayPerRequest),
+                ..Default::default()
+            },
+            RestoreTableOverrides {
+                sse_specification: Some(serde_json::json!({"Enabled": true, "SSEType": "KMS"})),
+                ..Default::default()
+            },
+            RestoreTableOverrides {
+                sse_specification: Some(serde_json::json!({"Enabled": false})),
+                ..Default::default()
+            },
+        ];
+        let sources = legacy_sources();
+        assert!(sources.len() > 1000, "{} shapes", sources.len());
+        let mut checked = 0;
+        for source in &sources {
+            for state in [
+                LegacyVectorState::Unsupported,
+                LegacyVectorState::NoneRecorded,
+            ] {
+                let table =
+                    source_table_from_legacy(source, state, "us-east-1", "123456789012").unwrap();
+                // The manifest member survives its own serialization, as the
+                // manifest writer and parser carry it.
+                let json = serde_json::to_value(&table).unwrap();
+                let back: SourceTableSchema = serde_json::from_value(json).unwrap();
+                assert_eq!(back, table);
+                assert_eq!(
+                    table.vector_indexes,
+                    (state == LegacyVectorState::NoneRecorded).then(Vec::new)
+                );
+                for o in &overrides {
+                    let legacy = source.restore_input("dst", o);
+                    let mut copy = restore_input_from_manifest(&table, "dst", o);
+                    // Without an SSE override, the copy restores the one
+                    // specification an ENABLED description maps back to.
+                    assert!(
+                        o.sse_specification.is_some()
+                            || copy.sse_specification.is_none()
+                            || copy.sse_specification
+                                == Some(serde_json::json!({"Enabled": true, "SSEType": "KMS"})),
+                        "{:?}",
+                        copy.sse_specification
+                    );
+                    assert_eq!(
+                        reported_sse(&copy),
+                        reported_sse(&legacy),
+                        "{source:?} {o:?}"
+                    );
+                    copy.sse_specification.clone_from(&legacy.sse_specification);
+                    assert_eq!(copy, legacy, "{source:?} {o:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, sources.len() * 2 * overrides.len());
+    }
+
+    #[test]
+    fn a_copy_records_the_described_features_and_the_legacy_identity() {
+        let source = legacy_sources()
+            .into_iter()
+            .find(|s| {
+                s.definition.as_ref().is_some_and(|d| {
+                    d.table_class.is_some()
+                        && d.sse_specification.is_some()
+                        && d.billing_mode == "PROVISIONED"
+                        && d.provisioned_throughput.is_some()
+                        && d.global_secondary_indexes
+                            .first()
+                            .is_some_and(|g| g.provisioned_throughput.is_none())
+                })
+            })
+            .unwrap();
+        let table = source_table_from_legacy(
+            &source,
+            LegacyVectorState::NoneRecorded,
+            "us-east-1",
+            "123456789012",
+        )
+        .unwrap();
+        let definition = source.definition.clone().unwrap();
+        assert_eq!(table.table_name, "src");
+        assert_eq!(table.table_id, "id");
+        assert_eq!(table.table_arn, source.source_table_arn);
+        assert!((table.table_creation_date_time - 1_757_400_000.0).abs() < f64::EPSILON);
+        assert_eq!(table.item_count, 12);
+        assert_eq!(table.table_size_bytes, 345);
+        assert_eq!(table.table_class, definition.table_class);
+        assert_eq!(table.time_to_live, definition.time_to_live);
+        assert_eq!(table.stream_specification, definition.stream_specification);
+        assert_eq!(
+            table.sse_description.map(|d| d.status),
+            Some("ENABLED".to_owned())
+        );
+        // The provisioned GSI with no throughput carries the table's, as the
+        // legacy restore creates it.
+        let gsi_throughput = table.global_secondary_indexes[0]
+            .provisioned_throughput
+            .clone()
+            .map(|t| (t.read_capacity_units, t.write_capacity_units));
+        assert_eq!(gsi_throughput, Some((8, 9)));
+
+        // A backup with no definition records its keys and nothing more.
+        let mut bare = source.clone();
+        bare.definition = None;
+        let table = source_table_from_legacy(
+            &bare,
+            LegacyVectorState::Unsupported,
+            "us-east-1",
+            "123456789012",
+        )
+        .unwrap();
+        assert_eq!(
+            table
+                .attribute_definitions
+                .iter()
+                .map(|a| a.attribute_name.as_str())
+                .collect::<Vec<_>>(),
+            table
+                .key_schema
+                .iter()
+                .map(|k| k.attribute_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(table.global_secondary_indexes.is_empty());
+        assert!(table.table_class.is_none());
+        assert!(table.time_to_live.is_none());
+        assert!(table.stream_specification.is_none());
+        assert!(table.vector_indexes.is_none());
+    }
+
+    #[test]
+    fn a_copy_drops_a_kms_key_id_and_nothing_else() {
+        let mut def = sample();
+        def.sse_specification = Some(serde_json::json!({
+            "Enabled": true, "SSEType": "KMS", "KMSMasterKeyId": "alias/k"
+        }));
+        let source = source(Some(def));
+        let table = source_table_from_legacy(
+            &source,
+            LegacyVectorState::NoneRecorded,
+            "us-east-1",
+            "123456789012",
+        )
+        .unwrap();
+        let none = RestoreTableOverrides::default();
+        let legacy = source.restore_input("dst", &none);
+        let mut copy = restore_input_from_manifest(&table, "dst", &none);
+        assert_eq!(
+            legacy.sse_specification.as_ref().unwrap()["KMSMasterKeyId"],
+            "alias/k"
+        );
+        assert_eq!(
+            copy.sse_specification,
+            Some(serde_json::json!({"Enabled": true, "SSEType": "KMS"}))
+        );
+        copy.sse_specification.clone_from(&legacy.sse_specification);
+        assert_eq!(copy, legacy);
+    }
+
+    #[test]
+    fn a_copy_refuses_what_the_legacy_restore_refuses_and_an_unknown_vector_state() {
+        let state = LegacyVectorState::NoneRecorded;
+        let copy = |s: &BackupRestoreSource, state| {
+            source_table_from_legacy(s, state, "us-east-1", "123456789012")
+        };
+        // No definition and nothing recorded about vector indexes.
+        assert!(matches!(
+            copy(&source(None), LegacyVectorState::Unknown),
+            Err(StorageError::Unsupported(m))
+                if m.contains("no recorded table definition") && m.contains("vector indexes")
+        ));
+        // A definition with no vector index names copies in a state the
+        // backend can state; `Unknown` is refused even with a definition.
+        assert!(copy(&source(Some(sample())), state).is_ok());
+        assert!(matches!(
+            copy(&source(Some(sample())), LegacyVectorState::Unknown),
+            Err(StorageError::Unsupported(_))
+        ));
+        let mut def = sample();
+        def.vector_index_names.push("v".to_owned());
+        assert!(matches!(
+            copy(&source(Some(def)), state),
+            Err(StorageError::Unsupported(m)) if m.contains("1 vector index")
+        ));
+        let mut counted = source(None);
+        counted.legacy_vector_index_count = 2;
+        assert!(matches!(
+            copy(&counted, state),
+            Err(StorageError::Unsupported(m)) if m.contains("2 vector index")
+        ));
+        let mut multi = source(None);
+        multi.key_schema.push(KeySchemaElement {
+            attribute_name: "pk2".to_owned(),
+            key_type: KeyType::Hash,
+        });
+        assert!(matches!(
+            copy(&multi, state),
+            Err(StorageError::Unsupported(m)) if m.contains("multi-part key")
+        ));
     }
 }

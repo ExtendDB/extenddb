@@ -130,6 +130,14 @@ impl SnapshotDescriptor {
     /// MongoDB: a session with snapshot read concern; the marker is the
     /// cluster time `<seconds>:<increment>`.
     pub const KIND_MONGODB_SNAPSHOT_READ_CONCERN: &'static str = "mongodb_snapshot_read_concern";
+    /// A copy of an in-catalog backup, written by `extenddb backup
+    /// migrate-legacy`; the marker is empty. The items are those the
+    /// in-catalog backup stored when it was taken, so the snapshot is the
+    /// one its legacy create took. For this kind `source_backend` and
+    /// `source_extenddb_version` name the backend and the release that
+    /// wrote the copy, not the release that took the in-catalog backup,
+    /// whose version was never recorded.
+    pub const KIND_LEGACY_IN_CATALOG: &'static str = "legacy_in_catalog";
 }
 
 /// Order of items within and across a backup's data files.
@@ -1456,8 +1464,10 @@ pub fn check_format_version(found: u32) -> Result<(), FormatError> {
 /// only copy of the alphabet: the engine's `validate_name_member`
 /// (`BackupName` on `CreateBackup`) and `validate_index_name` spell it again,
 /// and the engine counts the bounds in characters where this counts bytes
-/// (the same for this ASCII alphabet).
-fn is_valid_backup_name(name: &str) -> bool {
+/// (the same for this ASCII alphabet). `extenddb backup migrate-legacy`
+/// checks an in-catalog backup's name with it before it writes the copy.
+#[must_use]
+pub fn is_valid_backup_name(name: &str) -> bool {
     (3..=255).contains(&name.len()) && crate::validation::validate_table_name_chars(name).is_ok()
 }
 
@@ -1851,6 +1861,29 @@ mod tests {
         let bytes = manifest.to_json_bytes().unwrap();
         let parsed = ExtenddbManifest::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn a_manifest_of_the_legacy_in_catalog_kind_parses_and_round_trips() {
+        assert_eq!(
+            SnapshotDescriptor::KIND_LEGACY_IN_CATALOG,
+            "legacy_in_catalog"
+        );
+        let mut manifest = sample_manifest();
+        manifest.snapshot = SnapshotDescriptor {
+            kind: SnapshotDescriptor::KIND_LEGACY_IN_CATALOG.to_owned(),
+            marker: String::new(),
+        };
+        let bytes = manifest.to_json_bytes().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains(r#""snapshot":{"kind":"legacy_in_catalog","marker":""}"#),
+            "the kind is written as named: {text}"
+        );
+        let parsed = ExtenddbManifest::from_json_bytes(&bytes).unwrap();
+        assert_eq!(parsed, manifest);
+        assert_eq!(parsed.snapshot.kind, "legacy_in_catalog");
+        assert_eq!(parsed.snapshot.marker, "");
     }
 
     #[test]

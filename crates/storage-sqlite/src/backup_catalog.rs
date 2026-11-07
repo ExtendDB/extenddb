@@ -444,6 +444,83 @@ pub(crate) fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     extenddb_storage::backup_catalog::backup_in_use(table, backup_arn)
 }
 
+/// `insert_backup_row`'s statement, in the caller's write transaction:
+/// `row` unowned, if no row with its key or its backup id exists.
+/// `Ok(false)`, writing nothing, otherwise. The legacy reader's
+/// `replace_with_index_row` runs it in its own transaction.
+pub(crate) async fn insert_unowned_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row: &BackupRow,
+) -> Result<bool, StorageError> {
+    let source_table = serde_json::to_string(&row.source_table_details_json)
+        .map_err(|e| StorageError::Internal(format!("source table details: {e}")))?;
+    // `ON CONFLICT DO NOTHING` covers the primary key (`account_id`,
+    // `backup_id`) and the unique `backup_id`, and no other constraint: a
+    // NOT NULL or CHECK violation is an error.
+    let inserted = sqlx::query(&format!(
+        "INSERT INTO backup_index (backup_id, account_id, table_name, \
+         backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
+         item_count, created_at, completed_at, failure_reason, \
+         source_table_details_json, owner_generation, heartbeat_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {NOW}, ?, ?, ?, {NOW}) \
+         ON CONFLICT DO NOTHING"
+    ))
+    .bind(&row.backup_id)
+    .bind(&row.account_id)
+    .bind(&row.table_name)
+    .bind(&row.backup_arn)
+    .bind(&row.backup_name)
+    .bind(row.status.as_str())
+    .bind(row.store.store_kind.as_str())
+    .bind(&row.store.store_root)
+    .bind(&row.store.store_id)
+    .bind(row.size_bytes)
+    .bind(row.item_count)
+    .bind(format_epoch_seconds(row.created_at))
+    .bind(&row.failure_reason)
+    .bind(&source_table)
+    .bind(generation_column(UNOWNED_GENERATION))
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// The account, ARN and store of the `backup_index` row holding
+/// `backup_id`, if one does, in the caller's transaction.
+pub(crate) async fn index_row_holding(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    backup_id: &str,
+) -> Result<Option<(String, String, StoreIdentity)>, StorageError> {
+    let found: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT account_id, backup_arn, store_kind, store_root, store_id FROM backup_index \
+         WHERE backup_id = ?",
+    )
+    .bind(backup_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    found
+        .map(|(account_id, backup_arn, kind, store_root, store_id)| {
+            let store_kind = StoreKind::parse(&kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "backup {backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?;
+            Ok((
+                account_id,
+                backup_arn,
+                StoreIdentity {
+                    store_kind,
+                    store_root,
+                    store_id,
+                },
+            ))
+        })
+        .transpose()
+}
+
 fn db_err(e: sqlx::Error) -> StorageError {
     StorageError::Internal(format!("Database error: {e}"))
 }
@@ -834,46 +911,15 @@ impl BackupCatalog for SqliteEngine {
             // No slot: an unowned row has no job. A job that holds the id's
             // slot and has not inserted its row yet finds this one and is
             // refused, as it is by any row with the key.
-            let source_table = serde_json::to_string(&row.source_table_details_json)
-                .map_err(|e| StorageError::Internal(format!("source table details: {e}")))?;
             let _writer = self.write_lock.lock().await;
             let mut tx = self
                 .pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(db_err)?;
-            // `ON CONFLICT DO NOTHING` covers the primary key (`account_id`,
-            // `backup_id`) and the unique `backup_id`, and no other
-            // constraint: a NOT NULL or CHECK violation is an error.
-            let inserted = sqlx::query(&format!(
-                "INSERT INTO backup_index (backup_id, account_id, table_name, \
-                 backup_arn, backup_name, status, store_kind, store_root, store_id, size_bytes, \
-                 item_count, created_at, completed_at, failure_reason, \
-                 source_table_details_json, owner_generation, heartbeat_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {NOW}, ?, ?, ?, {NOW}) \
-                 ON CONFLICT DO NOTHING"
-            ))
-            .bind(&row.backup_id)
-            .bind(&row.account_id)
-            .bind(&row.table_name)
-            .bind(&row.backup_arn)
-            .bind(&row.backup_name)
-            .bind(row.status.as_str())
-            .bind(row.store.store_kind.as_str())
-            .bind(&row.store.store_root)
-            .bind(&row.store.store_id)
-            .bind(row.size_bytes)
-            .bind(row.item_count)
-            .bind(format_epoch_seconds(row.created_at))
-            .bind(&row.failure_reason)
-            .bind(&source_table)
-            .bind(generation_column(UNOWNED_GENERATION))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
+            let inserted = insert_unowned_row(&mut tx, row).await?;
             tx.commit().await.map_err(db_err)?;
-            Ok(inserted == 1)
+            Ok(inserted)
         })
     }
 
@@ -1625,6 +1671,25 @@ struct SqliteMaintenanceClaim {
     generation: u64,
 }
 
+impl SqliteMaintenanceClaim {
+    /// The heartbeat's `UPDATE`, with the engine write lock held.
+    async fn beat_under_the_lock(&self) -> Result<Heartbeat, StorageError> {
+        let affected = sqlx::query(&format!(
+            "UPDATE backup_maintenance SET heartbeat_at = {NOW} WHERE owner_generation = ?"
+        ))
+        .bind(generation_column(self.generation))
+        .execute(&self.engine.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(if affected == 1 {
+            Heartbeat::Confirmed
+        } else {
+            Heartbeat::Lost
+        })
+    }
+}
+
 impl MaintenanceClaim for SqliteMaintenanceClaim {
     fn generation(&self) -> u64 {
         self.generation
@@ -1633,20 +1698,28 @@ impl MaintenanceClaim for SqliteMaintenanceClaim {
     fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
         Box::pin(async move {
             let _writer = self.engine.write_lock.lock().await;
-            let affected = sqlx::query(&format!(
-                "UPDATE backup_maintenance SET heartbeat_at = {NOW} WHERE owner_generation = ?"
-            ))
-            .bind(generation_column(self.generation))
-            .execute(&self.engine.pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            Ok(if affected == 1 {
-                Heartbeat::Confirmed
-            } else {
-                Heartbeat::Lost
-            })
+            self.beat_under_the_lock().await
         })
+    }
+
+    /// The bound starts once the beat holds the engine write lock, as the
+    /// job claim's does: a writer of this process holding the lock past a
+    /// period (the replacement of a large in-catalog backup) delays the
+    /// beat and does not lose the claim.
+    fn heartbeat_within(
+        &self,
+        bound: Duration,
+    ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+        Box::pin(async move {
+            let _writer = self.engine.write_lock.lock().await;
+            tokio::time::timeout(bound, self.beat_under_the_lock())
+                .await
+                .ok()
+        })
+    }
+
+    fn heartbeat_parks_before_its_bound(&self) -> bool {
+        true
     }
 
     fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
