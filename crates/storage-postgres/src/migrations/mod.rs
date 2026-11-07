@@ -145,6 +145,19 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0007_stream_pending.sql"
             )],
         },
+        MigrationId::RestoreProgress => Migration::Applies {
+            // A new table is additive by CONTRIBUTING's step 4, but declaring
+            // `Kind::Additive` needs the old-binary job, which does not exist
+            // yet (the paragraph after step 4; `refuse_additive` in
+            // `crates/bin` pins it).
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0008_restore_progress.sql"
+            )],
+        },
     }
 }
 
@@ -168,7 +181,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::SortKeyDefinitions
         | MigrationId::DropContinuousBackups
         | MigrationId::BackupCatalogIndex
-        | MigrationId::StreamPending => RunsIn::Transaction,
+        | MigrationId::StreamPending
+        | MigrationId::RestoreProgress => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }
