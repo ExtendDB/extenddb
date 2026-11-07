@@ -1685,12 +1685,15 @@ name = "extenddb-auth"
 version = "0.1.14"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
  "aws-lc-rs",
+ "aws-sigv4",
  "axum",
  "extenddb-cache",
  "extenddb-core",
  "futures",
  "hex",
+ "proptest",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
