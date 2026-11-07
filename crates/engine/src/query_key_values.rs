@@ -98,15 +98,21 @@ pub(crate) fn shape_fault_first<T: DeserializeOwned>(
     check: DynamoDbError,
 ) -> DynamoDbError {
     match serde_json::from_value::<T>(body.clone()) {
-        Err(e) => match crate::deserialize_error(e) {
-            DynamoDbError::SerializationException(msg) if msg.contains(UNKNOWN_TYPE_DESCRIPTOR) => {
-                check
-            }
-            shape @ DynamoDbError::SerializationException(_) => shape,
-            _ => check,
-        },
+        Err(e) => {
+            let fault = crate::deserialize_error(e);
+            if is_shape_fault(&fault) { fault } else { check }
+        }
         Ok(_) => check,
     }
+}
+
+/// Whether `fault`, from [`crate::deserialize_error`], is a fault in the shape
+/// of the body (a field of the wrong JSON type), which the service reports
+/// ahead of every check, rather than an attribute value the deserializer
+/// refuses with a `ValidationException` or an unknown type descriptor; see
+/// [`shape_fault_first`].
+pub(crate) fn is_shape_fault(fault: &DynamoDbError) -> bool {
+    matches!(fault, DynamoDbError::SerializationException(msg) if !msg.contains(UNKNOWN_TYPE_DESCRIPTOR))
 }
 
 /// The deserializer's text for an AttributeValue whose type descriptor is not
@@ -205,7 +211,8 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
 }
 
 /// The type descriptors an AttributeValue may carry.
-const TYPE_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+pub(crate) const TYPE_DESCRIPTORS: &[&str] =
+    &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
 
 /// The legacy condition maps of `Scan` whose `AttributeValueList` entries
 /// [`has_unreadable_attribute_value`] reads.
@@ -315,7 +322,7 @@ pub fn validate_expression_attribute_value_numbers(
 
 /// Every number inside one attribute value (`N`, `NS` members, and the values
 /// nested in `L` and `M`), with Unicode decimal digits folded for the check.
-fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
+pub(crate) fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
     match value {
         AttributeValue::N(n) => validate_number_text(n),
         AttributeValue::NS(set) => set.iter().try_for_each(|n| validate_number_text(n)),
@@ -327,7 +334,7 @@ fn validate_value_numbers(value: &AttributeValue) -> Result<(), DynamoDbError> {
 
 /// One number text against the number rules, with the service's `Query`
 /// message for an empty value and the original text echoed for a malformed one.
-fn validate_number_text(text: &str) -> Result<(), DynamoDbError> {
+pub(crate) fn validate_number_text(text: &str) -> Result<(), DynamoDbError> {
     let folded = crate::decimal_digits::fold_decimal_digits(text);
     match extenddb_core::validation::number::validate_and_normalize_number(&folded) {
         Ok(_) => Ok(()),
