@@ -350,6 +350,8 @@ jobs:
         if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
