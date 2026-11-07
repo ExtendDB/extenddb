@@ -30,8 +30,9 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     # With the backup store and job suites it ends with (3 min 3 s of it), the
     # job took 39 min 49 s on #740's CI, at the old 40-minute bound. With the
-    # PartiQL wire tests it took 48 min 4 s on #411's CI, before #740.
-    timeout-minutes: 60
+    # PartiQL wire tests it took 48 min 4 s on #411's CI, before #740. A run
+    # with both should take about 50 min; 70 leaves room for a slow runner.
+    timeout-minutes: 70
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -527,7 +528,10 @@ jobs:
 
   run-rust-integration:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    # The job took 33 min 21 s on #740's merge queue run and 29 min 39 s on
+    # #411's CI, before #740. A run with both should take about 36 min; 50
+    # leaves room for a slow runner.
+    timeout-minutes: 50
     services:
       postgres:
         image: pgvector/pgvector:pg16
