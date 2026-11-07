@@ -118,9 +118,11 @@ impl MongoEngine {
     ///
     /// Placing the counter increment inside the session also serializes
     /// concurrent writers on the same shard: two writes racing to
-    /// $inc the same counter under snapshot isolation will conflict at
-    /// commit time, so the loser retries — the transaction retry loop
-    /// upstream in the caller (see D-C3 followup) handles this.
+    /// $inc the same counter under snapshot isolation conflict, MongoDB
+    /// aborts the loser with `WriteConflict`, and this function reports
+    /// that as `StorageError::Transient` so that the caller's transaction
+    /// retry loop re-runs the write with backoff. Any other driver error is
+    /// `StorageError::Internal`.
     pub(crate) async fn next_sequence_number_in_session(
         &self,
         shard_id: &str,
@@ -140,7 +142,7 @@ impl MongoEngine {
             .with_options(opts)
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(crate::write_conflict::transaction_error)?
             .ok_or_else(|| {
                 StorageError::Internal("Failed to generate sequence number".to_owned())
             })?;
@@ -165,7 +167,7 @@ impl MongoEngine {
             .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(crate::write_conflict::transaction_error)?
             .ok_or_else(|| StorageError::Internal(format!("Table {table_name} not found")))?;
         let table_id = table_doc.get_str("table_id").unwrap_or_default();
 
@@ -176,12 +178,12 @@ impl MongoEngine {
             .with_options(opts)
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
         let shard_docs: Vec<Document> = cursor
             .stream(&mut *session)
             .try_collect()
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
 
         if shard_docs.is_empty() {
             return Err(StorageError::Internal(format!(

@@ -348,7 +348,7 @@ impl MongoEngine {
         if let Some(session) = session {
             match self.commit_write_transaction(session, None).await? {
                 crate::data_engine::CommitOutcome::Committed => {}
-                crate::data_engine::CommitOutcome::RerunBody => {
+                crate::data_engine::CommitOutcome::RerunBody(_) => {
                     return Err(StorageError::Transient(format!(
                         "the registration of {} was aborted at commit",
                         input.table_name

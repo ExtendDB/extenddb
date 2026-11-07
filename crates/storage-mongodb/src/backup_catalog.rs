@@ -654,9 +654,9 @@ impl MongoEngine {
             match body {
                 Ok(outcome) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
