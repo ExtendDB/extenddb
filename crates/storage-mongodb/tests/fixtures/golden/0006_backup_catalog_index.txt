@@ -1,0 +1,38 @@
+{
+  "registrations": [
+    {
+      "table": "golden6_done",
+      "table_status": "ACTIVE",
+      "status": "DONE",
+      "kind": "legacy",
+      "owner_generation": 0,
+      "heartbeat_at": 0,
+      "completed_at_creation": true,
+      "earlier_fields": []
+    },
+    {
+      "table": "golden6_handed",
+      "table_status": "CREATING",
+      "status": "DONE",
+      "kind": "legacy",
+      "owner_generation": 0,
+      "heartbeat_at": 0,
+      "completed_at_creation": true,
+      "earlier_fields": []
+    },
+    {
+      "table": "golden6_interrupted",
+      "table_status": "CREATING",
+      "status": "RUNNING",
+      "kind": "legacy",
+      "owner_generation": 0,
+      "heartbeat_at": 0,
+      "completed_at_creation": null,
+      "earlier_fields": []
+    }
+  ],
+  "notes": [
+    "backfilled 3 restore registration(s) as legacy restores, 1 of them RUNNING with a dead owner for the reconciler to remove",
+    "wrote settings.catalog_id"
+  ]
+}

@@ -2,6 +2,8 @@
 table access_keys
 table accounts
 table admin_users
+table backup_index_by_status
+table backup_maintenance
 table backups_by_account
 table backups_by_arn
 table backups_by_table
@@ -36,6 +38,17 @@ column accounts.created_at: timestamp regular
 column admin_users.admin_name: text partition_key 0
 column admin_users.created_at: timestamp regular
 column admin_users.password_hash: text regular
+column backup_index_by_status.store_root: text partition_key 0
+column backup_index_by_status.backup_status: text partition_key 1
+column backup_index_by_status.backup_arn: text clustering 0 asc
+column backup_index_by_status.account_id: text regular
+column backup_index_by_status.store_id: text regular
+column backup_index_by_status.store_kind: text regular
+column backup_maintenance.claim: text partition_key 0
+column backup_maintenance.claimed_at: timestamp regular
+column backup_maintenance.heartbeat_at: timestamp regular
+column backup_maintenance.holder: text regular
+column backup_maintenance.owner_generation: bigint regular
 column backups_by_account.account_id: text partition_key 0
 column backups_by_account.created_at: timestamp clustering 0 desc
 column backups_by_account.backup_arn: text clustering 1 asc
@@ -48,16 +61,25 @@ column backups_by_arn.account_id: text partition_key 0
 column backups_by_arn.backup_arn: text partition_key 1
 column backups_by_arn.active_restores: map<text, text> regular
 column backups_by_arn.attribute_definitions: text regular
+column backups_by_arn.backup_id: text regular
 column backups_by_arn.backup_name: text regular
 column backups_by_arn.backup_size_bytes: bigint regular
 column backups_by_arn.backup_status: text regular
 column backups_by_arn.backup_type: text regular
 column backups_by_arn.billing_mode: text regular
+column backups_by_arn.completed_at: timestamp regular
 column backups_by_arn.created_at: timestamp regular
 column backups_by_arn.definition: text regular
+column backups_by_arn.failure_reason: text regular
+column backups_by_arn.heartbeat_at: timestamp regular
 column backups_by_arn.item_count: bigint regular
 column backups_by_arn.key_schema: text regular
+column backups_by_arn.owner_generation: bigint regular
 column backups_by_arn.provisioned_throughput: text regular
+column backups_by_arn.source_table_details_json: text regular
+column backups_by_arn.store_id: text regular
+column backups_by_arn.store_kind: text regular
+column backups_by_arn.store_root: text regular
 column backups_by_arn.stream_specification: text regular
 column backups_by_arn.table_arn: text regular
 column backups_by_arn.table_created_at: timestamp regular
@@ -172,11 +194,23 @@ column tables.item_count: bigint regular
 column tables.key_schema: text regular
 column tables.on_demand_throughput: text regular
 column tables.provisioned_throughput: text regular
+column tables.restore_completed_at: timestamp regular
 column tables.restore_date_time: timestamp regular
+column tables.restore_failure_reason: text regular
+column tables.restore_file_index: int regular
 column tables.restore_heartbeat: timestamp regular
+column tables.restore_heartbeat_at: timestamp regular
+column tables.restore_items_applied: bigint regular
+column tables.restore_kind: text regular
 column tables.restore_owner: uuid regular
+column tables.restore_owner_generation: bigint regular
 column tables.restore_source_backup_arn: text regular
 column tables.restore_source_table_arn: text regular
+column tables.restore_spool_host: text regular
+column tables.restore_status: text regular
+column tables.restore_store_id: text regular
+column tables.restore_store_kind: text regular
+column tables.restore_store_root: text regular
 column tables.sse_specification: text regular
 column tables.status_transition_at: timestamp regular
 column tables.stream_label: text regular
