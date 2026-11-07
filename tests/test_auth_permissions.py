@@ -1356,6 +1356,14 @@ class TestBackupAuthorization:
             backup_arn = admin_client.create_backup(
                 TableName=table, BackupName="authz",
             )["BackupDetails"]["BackupArn"]
+            # A store-backed backup is CREATING until its job ends; a restore
+            # of a CREATING backup is BackupInUse, so the cells wait here.
+            deadline = time.monotonic() + 120
+            while admin_client.describe_backup(
+                BackupArn=backup_arn
+            )["BackupDescription"]["BackupDetails"]["BackupStatus"] == "CREATING":
+                assert time.monotonic() < deadline, f"backup {backup_arn} still CREATING"
+                time.sleep(0.2)
             yield admin_client, table, backup_arn
         finally:
             for t in self.created:
@@ -1446,14 +1454,6 @@ class TestBackupAuthorization:
         """RestoreTableFromBackup on the backup plus the seven item
         actions on the target, each required; RestoreTableFromBackup on the
         target is neither required nor evaluated."""
-        if os.environ.get("EXTENDDB_TEST_BACKUP_STORE", "").strip() in ("filesystem", "s3"):
-            # The denials hold on any server; the restores that must run are
-            # of a backup in the configured store, which RestoreTableFromBackup
-            # refuses until the restore job lands (PR 9a).
-            pytest.skip(
-                "RestoreTableFromBackup of a backup in the configured store is refused "
-                "until the restore job lands (PR 9a)"
-            )
         admin_client, table, backup_arn = source_backup
         user = f"u-{uuid.uuid4().hex[:8]}"
         ak, sk = self._user_with_key(user)

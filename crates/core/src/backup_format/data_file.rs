@@ -965,6 +965,14 @@ impl<R: Read> DataFileDecoder<R> {
         self.reader.get_ref().get_ref().hasher.is_some()
     }
 
+    /// The uncompressed bytes decoded so far: every line consumed, its
+    /// newline included. The difference across one [`Self::next_item`] is
+    /// that item's line length, the unit a reader bounds its memory in.
+    #[must_use]
+    pub fn bytes_decoded(&self) -> u64 {
+        self.bytes_decoded
+    }
+
     /// The error for a failed read: [`FormatError::CompressedSizeMismatch`]
     /// when the source ran past its recorded size, otherwise
     /// [`FormatError::Decode`].

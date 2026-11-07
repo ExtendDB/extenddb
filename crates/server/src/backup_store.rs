@@ -974,6 +974,37 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
             unused()
         }
+        fn claim_restore<'a>(
+            &'a self,
+            _account_id: &'a str,
+            _input: extenddb_core::types::CreateTableInput,
+            _registration: &'a extenddb_storage::backup_catalog::RestoreRegistrationRow,
+        ) -> BoxedFuture<
+            'a,
+            Result<(extenddb_core::types::TableDescription, Box<dyn JobClaim>), StorageError>,
+        > {
+            unused()
+        }
+        fn claim_restore_dead<'a>(
+            &'a self,
+            _key: &'a RestoreTargetKey,
+            _stale_after: std::time::Duration,
+            _spool_host: Option<&'a str>,
+        ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+            unused()
+        }
+        fn read_restore_job<'a>(
+            &'a self,
+            _key: &'a RestoreTargetKey,
+        ) -> BoxedFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+            unused()
+        }
+        fn list_restore_jobs<'a>(
+            &'a self,
+            _status: Option<extenddb_storage::backup_catalog::JobStatus>,
+        ) -> BoxedFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+            unused()
+        }
         fn list_backup_rows<'a>(
             &'a self,
             _status: Option<BackupStatus>,

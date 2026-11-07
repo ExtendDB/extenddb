@@ -6,8 +6,9 @@
 Every backend; hash-only keys and composite keys with S, N, and B sort keys,
 plus secondary indexes and provisioned throughput. A restore must reach ACTIVE
 with the source's key schema, attribute definitions, and exactly the source's
-items, attribute for attribute. (Multi-part base keys are a preview that
-restore refuses; that refusal is tested at the storage level.) Comparing whole items rather than counts is what catches a
+items, attribute for attribute. (Multi-part base keys are a preview: a
+store-backed backup of such a table restores through the store, an in-catalog
+one is refused, and the refusal is tested at the storage level.) Comparing whole items rather than counts is what catches a
 backend that restores the right number of rows under the wrong keys.
 
 Readiness assessment P0-2: on PostgreSQL every table with a sort key backed up
@@ -44,28 +45,14 @@ RESTORE_TIMEOUT_S = 1800.0
 
 # Where the server under test writes its backups: `filesystem` or `s3` (a
 # configured `[backup.store]`, under which CreateBackup is asynchronous and
-# backs up vector tables) or `none` (the in-catalog create). The CI jobs set
-# it beside EXTENDDB_TEST_ENDPOINT; the one test whose expected outcome
-# depends on it fails when it is unset rather than accept either outcome.
+# backs up vector tables, and RestoreTableFromBackup runs the restore job
+# from the store) or `none` (the in-catalog create). The CI jobs set it
+# beside EXTENDDB_TEST_ENDPOINT; the one test whose expected outcome depends
+# on it fails when it is unset rather than accept either outcome. Every cell
+# that restores a backup it created waits for AVAILABLE first
+# (`_create_backup`), on either path.
 BACKUP_STORE = os.environ.get("EXTENDDB_TEST_BACKUP_STORE", "").strip() or None
 BACKUP_STORE_VALUES = ("filesystem", "s3", "none")
-
-# RestoreTableFromBackup of a backup written to a configured store answers
-# ValidationException ("is in a backup store; this release restores
-# in-catalog backups only") until the restore job of PR 9a lands. The cells
-# that restore a backup this server created skip on such a server and come
-# back with PR 9a; the in-catalog create's backups (`none`, and the service)
-# restore as before. The marker is gated on the target as well as the
-# variable, so a stale `EXTENDDB_TEST_BACKUP_STORE=filesystem` in the
-# environment of a real-DynamoDB run (which does not require the variable)
-# cannot skip the 24 cells against the service.
-restores_a_backup_of_this_server = pytest.mark.skipif(
-    BACKUP_STORE in ("filesystem", "s3") and not _is_real_dynamodb(),
-    reason=(
-        f"EXTENDDB_TEST_BACKUP_STORE={BACKUP_STORE}: RestoreTableFromBackup of a backup "
-        "in the configured store is refused until the restore job lands (PR 9a)"
-    ),
-)
 
 
 @pytest.fixture(scope="session")
@@ -428,13 +415,11 @@ def _round_trip(client, sort_kind: str | None, hash_kind: str = "S") -> None:
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 @pytest.mark.parametrize("hash_kind", ["S", "N", "B"])
 def test_restore_hash_only_table(dynamodb_client, hash_kind):
     _round_trip(dynamodb_client, None, hash_kind)
 
 
-@restores_a_backup_of_this_server
 @pytest.mark.parametrize("sort_kind", ["S", "N", "B"])
 def test_restore_composite_key_table(dynamodb_client, sort_kind):
     _round_trip(dynamodb_client, sort_kind)
@@ -451,7 +436,6 @@ def _index_by_name(indexes: list[dict]) -> dict:
     return {i["IndexName"]: i for i in indexes}
 
 
-@restores_a_backup_of_this_server
 def test_restore_preserves_indexes_and_provisioned_throughput(dynamodb_client):
     """GSIs and LSIs, their key schemas, projections, and throughput, the
     table's provisioned throughput, and every index's contents come back."""
@@ -639,7 +623,6 @@ def test_restore_preserves_indexes_and_provisioned_throughput(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 def test_restore_normalizes_stale_throughput_after_on_demand_switch(dynamodb_client):
     """A backup taken after an on-demand switch does not restore stale capacity."""
     client = dynamodb_client
@@ -714,7 +697,6 @@ def test_restore_normalizes_stale_throughput_after_on_demand_switch(dynamodb_cli
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 def test_restore_override_pay_per_request_to_provisioned(dynamodb_client):
     client = dynamodb_client
     source = f"restore-override-ppr-{uuid.uuid4().hex[:10]}"
@@ -753,7 +735,6 @@ def test_restore_override_pay_per_request_to_provisioned(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 def test_restore_override_provisioned_to_pay_per_request(dynamodb_client):
     client = dynamodb_client
     source = f"restore-override-prov-{uuid.uuid4().hex[:10]}"
@@ -788,7 +769,6 @@ def test_restore_override_provisioned_to_pay_per_request(dynamodb_client):
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 def test_provisioned_restore_override_requiring_gsi_override_leaves_no_target(
     dynamodb_client,
 ):
@@ -1031,7 +1011,6 @@ def large_backup(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
-@restores_a_backup_of_this_server
 def test_restore_response_arrives_before_its_copy_finishes(dynamodb_client, large_backup):
     """The CREATING response reaches a client with a 10 s read timeout and no
     retries before the copy finishes, and the table then reaches ACTIVE with
@@ -1094,7 +1073,6 @@ def _table_appears(client, name: str, timeout: float) -> bool:
             time.sleep(_poll_interval() * 5)
 
 
-@restores_a_backup_of_this_server
 def test_restore_survives_a_client_that_disconnects_before_the_response(
     dynamodb_client, large_backup
 ):
@@ -1150,7 +1128,6 @@ def test_restore_survives_a_client_that_disconnects_before_the_response(
         _cleanup(dynamodb_client, None, target)
 
 
-@restores_a_backup_of_this_server
 def test_first_read_after_active_succeeds(dynamodb_client, large_backup):
     """A read on the restore target while it is CREATING is
     ResourceNotFoundException, and the first read after DescribeTable reports
@@ -1207,7 +1184,6 @@ def test_first_read_after_active_succeeds(dynamodb_client, large_backup):
         _cleanup(client, None, target)
 
 
-@restores_a_backup_of_this_server
 def test_create_backup_of_a_creating_table_is_table_not_found(dynamodb_client, large_backup):
     """CreateBackup on a table that is still CREATING is
     TableNotFoundException "Table not found: <name>" (measured on DynamoDB),
@@ -1237,7 +1213,6 @@ def test_create_backup_of_a_creating_table_is_table_not_found(dynamodb_client, l
         _cleanup(client, None, target)
 
 
-@restores_a_backup_of_this_server
 def test_restore_into_a_creating_target_and_a_second_restore_of_its_backup_are_refused(
     dynamodb_client, large_backup
 ):
@@ -1280,7 +1255,6 @@ def test_restore_into_a_creating_target_and_a_second_restore_of_its_backup_are_r
         _cleanup(client, None, target, other)
 
 
-@restores_a_backup_of_this_server
 def test_target_and_backup_are_held_while_the_copy_runs(dynamodb_client, large_backup):
     """DeleteTable of a CREATING restore target is ResourceInUseException, and
     (ExtendDB) DeleteBackup of its source is BackupInUseException.
@@ -1731,7 +1705,6 @@ def test_backup_arn_shape_and_account_are_checked(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
-@restores_a_backup_of_this_server
 def test_empty_index_overrides_restore_no_indexes_and_sse_override_is_applied(dynamodb_client):
     client = dynamodb_client
     source = f"restore-noop-{uuid.uuid4().hex[:10]}"
@@ -1782,7 +1755,6 @@ def test_empty_index_overrides_restore_no_indexes_and_sse_override_is_applied(dy
         _cleanup(client, backup_arn, plain, restored, source)
 
 
-@restores_a_backup_of_this_server
 @pytest.mark.parametrize("billing", ["PROVISIONED", "PAY_PER_REQUEST"])
 def test_index_overrides_listing_the_backups_indexes_restore_them(dynamodb_client, billing):
     """GlobalSecondaryIndexOverride and LocalSecondaryIndexOverride built from
@@ -1953,7 +1925,6 @@ def test_index_overrides_listing_the_backups_indexes_restore_them(dynamodb_clien
         _cleanup(client, backup_arn, changed, restored, source)
 
 
-@restores_a_backup_of_this_server
 def test_on_demand_throughput_override_is_applied(dynamodb_client):
     """OnDemandThroughputOverride is the restored table's on-demand
     throughput, equal to the backup's or changed (measured on DynamoDB).
@@ -2009,7 +1980,7 @@ def test_on_demand_throughput_override_is_applied(dynamodb_client):
 
 
 @extenddb_only
-def test_create_backup_of_a_vector_table_is_refused(dynamodb_client, backup_store_component):
+def test_vector_table_backup_refused_in_catalog_and_restored_from_store(dynamodb_client, backup_store_component):
     """CreateBackup of a table with vector indexes: the outcome of the
     server's configured path, read from EXTENDDB_TEST_BACKUP_STORE and
     checked against the server's `/health` (`backup_store_component`).
@@ -2019,17 +1990,18 @@ def test_create_backup_of_a_vector_table_is_refused(dynamodb_client, backup_stor
     created. `filesystem` or `s3`: the store-backed create backs the table
     up (the manifest records its vector indexes): CreateBackup answers
     CREATING, DescribeBackup reaches AVAILABLE with the table's features,
-    ListBackups lists it, and RestoreTableFromBackup of it answers the
-    ValidationException naming the store, which PR 9a's restore job
-    replaces with the restore (its refusal then narrows to a target without
-    vector support). The test fails rather than accept either outcome when
-    the variable is unset (the fixture fails first), and prints which branch
-    ran.
+    ListBackups lists it, and RestoreTableFromBackup of it restores the
+    table with its vector index: the response is CREATING with a
+    RestoreSummary, the target reaches ACTIVE, DescribeTable shows the
+    vector index ACTIVE, and SearchVectors on it answers the item. The test
+    fails rather than accept either outcome when the variable is unset (the
+    fixture fails first), and prints which branch ran.
     """
     from test_vector_index_query_scan import _error_message, _signed_post
 
     client = dynamodb_client
     name = f"restore-vec-{uuid.uuid4().hex[:10]}"
+    restored = f"{name}-r"
     resp = _signed_post(
         "CreateTable",
         {
@@ -2106,21 +2078,39 @@ def test_create_backup_of_a_vector_table_is_refused(dynamodb_client, backup_stor
         assert [g["IndexName"] for g in gsis] == ["by-g"], desc["SourceTableFeatureDetails"]
         listed = client.list_backups(TableName=name)["BackupSummaries"]
         assert [b["BackupArn"] for b in listed] == [backup_arn], listed
-        # Until PR 9a's restore job, the restore of a backup in the store is
-        # refused; PR 9a replaces this assertion with the round trip.
-        with pytest.raises(ClientError) as exc_info:
-            client.restore_table_from_backup(TargetTableName=f"{name}-r", BackupArn=backup_arn)
-        error = exc_info.value.response["Error"]
-        assert error["Code"] == "ValidationException", error
-        assert error["Message"] == (
-            f"Backup {backup_arn} is in a backup store; this release restores in-catalog "
-            "backups only"
-        ), error
+        # The round trip: the restore runs from the store and the target
+        # comes back with its vector index.
+        resp = client.restore_table_from_backup(TargetTableName=restored, BackupArn=backup_arn)
+        table = resp["TableDescription"]
+        assert table["TableStatus"] == "CREATING", table
+        assert table["RestoreSummary"]["SourceBackupArn"] == backup_arn, table
+        assert table["RestoreSummary"]["RestoreInProgress"] is True, table
+        wait_for_active(client, restored, timeout=RESTORE_TIMEOUT_S)
+        desc = _signed_post("DescribeTable", {"TableName": restored}).json()["Table"]
+        assert "RestoreSummary" not in desc, desc
+        indexes = desc.get("VectorIndexes") or []
+        assert [v["IndexName"] for v in indexes] == ["vidx"], desc
+        assert indexes[0]["IndexStatus"] == "ACTIVE", indexes
+        assert indexes[0]["Dimensions"] == 4, indexes
+        assert [g["IndexName"] for g in desc["GlobalSecondaryIndexes"]] == ["by-g"], desc
+        search = _signed_post(
+            "SearchVectors",
+            {
+                "TableName": restored,
+                "IndexName": "vidx",
+                "SearchVector": [{"N": "0.1"}] * 4,
+                "TopK": 1,
+            },
+        )
+        assert search.status_code == 200, search.text
+        results = search.json()["SearchResults"]
+        assert [r["Item"]["pk"] for r in results] == [{"S": "a"}], results
+        got = client.get_item(TableName=restored, Key={"pk": {"S": "a"}}, ConsistentRead=True)
+        assert got["Item"]["g"] == {"S": "g1"}, got
     finally:
-        _cleanup(client, backup_arn, name)
+        _cleanup(client, backup_arn, name, restored)
 
 
-@restores_a_backup_of_this_server
 def test_update_table_on_a_restored_table_reports_no_restore_summary(dynamodb_client):
     """Once a restored table is ACTIVE, no description-returning response
     carries RestoreSummary: UpdateTable's no more than DescribeTable's.
@@ -2153,7 +2143,6 @@ def test_update_table_on_a_restored_table_reports_no_restore_summary(dynamodb_cl
         _cleanup(client, backup_arn, restored, source)
 
 
-@restores_a_backup_of_this_server
 @extenddb_only
 def test_a_provisioned_gsi_without_throughput_restores_with_the_table_throughput(
     dynamodb_client,
@@ -2522,7 +2511,6 @@ def test_create_backup_accepts_the_table_arn(dynamodb_client):
         _cleanup(client, backup_arn, source)
 
 
-@restores_a_backup_of_this_server
 def test_table_class_is_not_restored(dynamodb_client):
     """A STANDARD_INFREQUENT_ACCESS source restores as STANDARD (measured on
     DynamoDB); DescribeBackup still reports nothing of the

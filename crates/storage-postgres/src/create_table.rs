@@ -7,13 +7,14 @@ use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
+use extenddb_storage::backup_catalog::RestoreRegistrationRow;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
 use crate::PostgresEngine;
 
-/// What a restore target records about where it came from, written in the
-/// same catalog transaction that creates it.
+/// What a legacy restore target records about where it came from, written
+/// in the same catalog transaction that creates it.
 pub(crate) struct RestoreRegistration<'a> {
     pub(crate) backup_arn: &'a str,
     /// Reported as `RestoreSummary.SourceTableArn`.
@@ -24,6 +25,18 @@ pub(crate) struct RestoreRegistration<'a> {
     /// The job claim's fencing token, written on the job record (RUNNING,
     /// `kind = legacy`) with the target.
     pub(crate) owner_generation: u64,
+}
+
+/// Which backup a restore target is registered from, and so which row its
+/// registration locks: a legacy restore locks the `backups` row of the
+/// in-catalog backup, a store-backed one the `backup_index` row (the lock
+/// DeleteBackup's `start_backup_delete` takes). The two paths keep their own
+/// locks: a legacy and a store-backed restore are of two different backups
+/// and never meet, and a DeleteBackup of a `backup_index` row meets only
+/// store-backed registrations.
+pub(crate) enum RestoreSource<'a> {
+    Legacy(&'a RestoreRegistration<'a>),
+    Manifest(&'a RestoreRegistrationRow),
 }
 
 impl PostgresEngine {
@@ -54,7 +67,7 @@ impl PostgresEngine {
         &self,
         account_id: &str,
         input: CreateTableInput,
-        registration: &RestoreRegistration<'_>,
+        registration: RestoreSource<'_>,
     ) -> Result<TableDescription, StorageError> {
         self.create_table_impl_inner(account_id, input, true, Some(registration))
             .await
@@ -107,7 +120,7 @@ impl PostgresEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
-        restore: Option<&RestoreRegistration<'_>>,
+        restore: Option<RestoreSource<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         let table_id = uuid::Uuid::new_v4().to_string();
@@ -149,32 +162,67 @@ impl PostgresEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
-            // FOR UPDATE, not FOR SHARE: two restores of one backup must not
-            // both pass the CREATING-target check below, so they serialize on
-            // the backup row (DeleteBackup locks it the same way).
-            let available: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
-                 AND backup_status = 'AVAILABLE' FOR UPDATE",
-            )
-            .bind(backup_arn)
-            .bind(account_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if available.is_none() {
-                return Err(StorageError::Validation(format!(
-                    "Backup not found: {backup_arn}"
-                )));
+        match &restore {
+            Some(RestoreSource::Legacy(RestoreRegistration { backup_arn, .. })) => {
+                // FOR UPDATE, not FOR SHARE: two restores of one backup must not
+                // both pass the CREATING-target check below, so they serialize on
+                // the backup row (DeleteBackup locks it the same way).
+                let available: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                     AND backup_status = 'AVAILABLE' FOR UPDATE",
+                )
+                .bind(backup_arn)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if available.is_none() {
+                    return Err(StorageError::Validation(format!(
+                        "Backup not found: {backup_arn}"
+                    )));
+                }
+                // One restore of a backup at a time, as the service: while a
+                // target restored from it is CREATING the backup is in use. Same
+                // predicate as DeleteBackup's.
+                if let Some(table) =
+                    crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
+                {
+                    return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
+                }
             }
-            // One restore of a backup at a time, as the service: while a
-            // target restored from it is CREATING the backup is in use. Same
-            // predicate as DeleteBackup's.
-            if let Some(table) =
-                crate::backup_catalog::creating_restore_target(&mut *tx, backup_arn).await?
-            {
-                return Err(crate::backup_catalog::backup_in_use(&table, backup_arn));
+            Some(RestoreSource::Manifest(registration)) => {
+                // The `backup_index` row FOR UPDATE: the lock
+                // `start_backup_delete` takes before its own in-use check, so
+                // a DeleteBackup and this registration order wholly one
+                // before the other, and two registrations of one backup
+                // serialize on the row before the CREATING-target check.
+                let status: Option<String> = sqlx::query_scalar(
+                    "SELECT status FROM backup_index WHERE account_id = $1 AND backup_id = $2 \
+                     FOR UPDATE",
+                )
+                .bind(account_id)
+                .bind(&registration.backup.backup_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if status.as_deref() != Some("AVAILABLE") {
+                    return Err(extenddb_storage::backup_catalog::backup_not_found(
+                        &registration.backup.backup_arn,
+                    ));
+                }
+                if let Some(table) = crate::backup_catalog::creating_restore_target(
+                    &mut *tx,
+                    &registration.backup.backup_arn,
+                )
+                .await?
+                {
+                    return Err(crate::backup_catalog::backup_in_use(
+                        &table,
+                        &registration.backup.backup_arn,
+                    ));
+                }
             }
+            None => {}
         }
 
         // Insert table metadata, returning creation timestamp and actual status.
@@ -236,24 +284,53 @@ impl PostgresEngine {
             Err(e) => return Err(StorageError::Internal(e.to_string())),
         };
 
-        if let Some(r) = restore {
-            // The job record: RUNNING under the claim's generation, with a
-            // heartbeat on the catalog's clock, so no CREATING target ever
-            // exists without an owned record.
-            sqlx::query(
-                "INSERT INTO table_restores \
-                 (table_id, source_backup_arn, source_table_arn, restore_date_time, \
-                  status, kind, owner_generation, heartbeat_at) \
-                 VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'legacy', $5, now())",
-            )
-            .bind(&table_id)
-            .bind(r.backup_arn)
-            .bind(r.source_table_arn)
-            .bind(r.restore_date_time)
-            .bind(crate::backup_engine::generation_column(r.owner_generation))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        // The job record: RUNNING under the claim's generation, with a
+        // heartbeat on the catalog's clock, so no CREATING target ever
+        // exists without an owned record. `now()` is this transaction's
+        // start, not the insert's instant: a registration that waited on the
+        // `backup_index` row's lock above commits a heartbeat that old, and
+        // the data DDL after the commit adds to the age the engine's first
+        // beat (sent before the registration's reply) then refreshes.
+        match &restore {
+            Some(RestoreSource::Legacy(r)) => {
+                sqlx::query(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, owner_generation, heartbeat_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'legacy', $5, now())",
+                )
+                .bind(&table_id)
+                .bind(r.backup_arn)
+                .bind(r.source_table_arn)
+                .bind(r.restore_date_time)
+                .bind(crate::backup_engine::generation_column(r.owner_generation))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            Some(RestoreSource::Manifest(r)) => {
+                sqlx::query(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, store_kind, store_root, store_id, spool_host, \
+                      owner_generation, heartbeat_at) \
+                     VALUES ($1, $2, $3, to_timestamp($4), 'RUNNING', 'manifest', $5, $6, $7, \
+                      $8, $9, now())",
+                )
+                .bind(&table_id)
+                .bind(&r.backup.backup_arn)
+                .bind(&r.source_table_arn)
+                .bind(r.restore_date_time)
+                .bind(r.store.store_kind.as_str())
+                .bind(&r.store.store_root)
+                .bind(&r.store.store_id)
+                .bind(r.spool_host.as_deref())
+                .bind(crate::backup_engine::generation_column(r.owner_generation))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            None => {}
         }
 
         // Insert GSI metadata
