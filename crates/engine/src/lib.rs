@@ -442,8 +442,9 @@ impl OperationContext {
 
 /// Dispatch an operation by name.
 ///
-/// `raw_body` is the request text `body` was parsed from; `Scan` reads the
-/// member order of its `ExclusiveStartKey` from it.
+/// `raw_body` is the request text `body` was parsed from. `Scan` reads the
+/// member order of its `ExpressionAttributeValues`, `ExclusiveStartKey` and
+/// `ScanFilter` from it.
 ///
 /// Returns the JSON response body and sideband metrics for the metrics collector.
 pub async fn dispatch(
