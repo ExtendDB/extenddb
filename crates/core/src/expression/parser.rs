@@ -133,18 +133,15 @@ fn parse_primary(
         return Ok(expr);
     }
 
-    // Try function call: ident followed by '('
-    if let Token::Ident(name) = &tokens[*pos] {
-        let fn_name_lower = name.to_ascii_lowercase();
-        if is_function_name(&fn_name_lower)
-            && *pos + 1 < tokens.len()
-            && tokens[*pos + 1] == Token::LParen
-        {
-            return parse_function_call(tokens, pos);
-        }
-    }
-
-    // Operand — then check for comparator, BETWEEN, or IN
+    // Operand (a path, a placeholder, or a function call), then a comparator,
+    // BETWEEN, or IN. A function call with nothing after it is the condition
+    // itself. This pass checks grammar only: whether that function may stand
+    // alone, whether its name exists, and how many operands it takes are
+    // checked afterwards by `validate_condition_semantics`, over the whole
+    // parsed tree. Amazon DynamoDB reports every syntax error before any
+    // semantic error, so `foo(pk) AND` is reported as the syntax error at the
+    // end, not as the unknown function name that comes first in the text.
+    // Deferring the semantic checks here gives the same precedence.
     let left = parse_operand(tokens, pos)?;
 
     if *pos < tokens.len() {
@@ -188,6 +185,10 @@ fn parse_primary(
         }
     }
 
+    if matches!(left, Expr::Function { .. }) {
+        return Ok(left);
+    }
+
     // Bare operand is not a valid condition on its own
     Err(validation_err(
         "Invalid ConditionExpression: expected comparison operator or function call",
@@ -207,12 +208,8 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
             *pos += 1;
             Ok(expr)
         }
-        Token::Ident(name) => {
-            // size(path) is a function that returns a value, usable as an operand
-            if name.eq_ignore_ascii_case("size")
-                && *pos + 1 < tokens.len()
-                && tokens[*pos + 1] == Token::LParen
-            {
+        Token::Ident(_) => {
+            if *pos + 1 < tokens.len() && tokens[*pos + 1] == Token::LParen {
                 return parse_function_call(tokens, pos);
             }
             let elements = parser_common::parse_path(tokens, pos)?;
@@ -230,7 +227,7 @@ fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbErro
 
 fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, DynamoDbError> {
     let name = match &tokens[*pos] {
-        Token::Ident(n) => n.to_ascii_lowercase(),
+        Token::Ident(n) => n.clone(),
         _ => {
             return Err(validation_err(
                 "Invalid ConditionExpression: expected function name",
@@ -241,13 +238,22 @@ fn parse_function_call(tokens: &[Token], pos: &mut usize) -> Result<Expr, Dynamo
 
     parser_common::expect_token(tokens, pos, &Token::LParen, "(", "ConditionExpression")?;
 
-    let mut args = Vec::new();
-    if *pos < tokens.len() && tokens[*pos] != Token::RParen {
+    // The grammar requires at least one operand between the parentheses. A
+    // call with an empty operand list, `foo()` or `attribute_exists()`, is a
+    // grammar error on the service, reported at the `)` with the text below,
+    // before the function name or its operand count is looked at (measured
+    // 2026-10-14 and again 2026-10-23, where `attribute_exists()` and `foo()`
+    // both answered this text; `begins_with(pk)` with one operand is instead
+    // the semantic operand-count error from `validate_condition_semantics`).
+    if *pos < tokens.len() && tokens[*pos] == Token::RParen {
+        return Err(validation_err(
+            "Invalid ConditionExpression: Syntax error; token: \")\", near: \"()\"",
+        ));
+    }
+    let mut args = vec![parse_operand(tokens, pos)?];
+    while *pos < tokens.len() && tokens[*pos] == Token::Comma {
+        *pos += 1;
         args.push(parse_operand(tokens, pos)?);
-        while *pos < tokens.len() && tokens[*pos] == Token::Comma {
-            *pos += 1;
-            args.push(parse_operand(tokens, pos)?);
-        }
     }
 
     parser_common::expect_token(tokens, pos, &Token::RParen, ")", "ConditionExpression")?;
@@ -265,13 +271,6 @@ fn try_comparator(token: &Token) -> Option<CompareOp> {
         Token::Ge => Some(CompareOp::Ge),
         _ => None,
     }
-}
-
-fn is_function_name(name: &str) -> bool {
-    matches!(
-        name,
-        "attribute_exists" | "attribute_not_exists" | "attribute_type" | "begins_with" | "contains"
-    )
 }
 
 fn validation_err(msg: &str) -> DynamoDbError {
