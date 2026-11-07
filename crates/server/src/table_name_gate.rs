@@ -32,9 +32,13 @@
 //! - `ListStreams` has its own validator: `TableName must be at least 3
 //!   characters long and at most 255 characters long`, measured for a U+0000
 //!   name, and on 2026-11-04 for a table ARN and for `abc:def`; applied to
-//!   any other character outside the pattern (derived). Its
+//!   any other character outside the pattern (derived). The gate also gives
+//!   it for a name of 1, 2 or more than 255 characters, which the engine does
+//!   not check (measured 2026-11-07 with 1, 2 and 256; 3 and 255 pass). Its
 //!   `ExclusiveStartStreamArn` takes the stream ARN rules of `arn_gate`
-//!   (measured 2026-11-06). U+0000 in the start ARN's account, region or
+//!   (measured 2026-11-06), after `TableName`: with both bad the service
+//!   answers the `TableName` sentence in either member order (measured
+//!   2026-11-07). U+0000 in the start ARN's account, region or
 //!   partition is accepted by the service and by storage, which binds only
 //!   the table segment and the label.
 //! - A `RequestItems` key outside the pattern: `at 'requestItems'` with the
@@ -74,8 +78,13 @@ const LIST_STREAMS_NAME: &str =
 
 /// Refuse a table name outside the service's character pattern, in any field
 /// the operation carries one, before the name is used in any lookup. A
-/// missing, non-string or empty name passes.
-pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
+/// missing, non-string or empty name passes. `account_id` is the caller's
+/// account, which the control-plane ARN rules compare with the ARN's.
+pub(crate) fn check_table_name_chars(
+    operation: &str,
+    input: &Value,
+    account_id: &str,
+) -> Result<(), DynamoDbError> {
     match operation {
         "BatchGetItem" | "BatchWriteItem" => check_request_items_keys(operation, input),
         "TransactGetItems" => check_transact_items(input, &["Get"]),
@@ -117,7 +126,10 @@ pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(
         ),
         "ListStreams" => {
             match input.get("TableName").and_then(Value::as_str) {
-                Some(name) if !name.is_empty() && !in_pattern(name) => {
+                Some(name)
+                    if !name.is_empty()
+                        && (!in_pattern(name) || !(3..=255).contains(&name.len())) =>
+                {
                     return Err(DynamoDbError::ValidationException(
                         LIST_STREAMS_NAME.to_owned(),
                     ));
@@ -129,7 +141,7 @@ pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(
             with_str(input, "ExclusiveStartStreamArn", arn_gate::check_stream_arn)
         }
         "Query" | "Scan" => {
-            check_name(input.get("TableName"), "tableName", operation)?;
+            check_name(input.get("TableName"), "tableName", operation, account_id)?;
             match input.get("IndexName").and_then(Value::as_str) {
                 // Pattern only: the length clauses for an index name are unmeasured.
                 Some(index) if !index.is_empty() && !in_pattern(index) => {
@@ -138,7 +150,7 @@ pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(
                 _ => Ok(()),
             }
         }
-        _ => check_name(input.get("TableName"), "tableName", operation),
+        _ => check_name(input.get("TableName"), "tableName", operation, account_id),
     }
 }
 
@@ -167,12 +179,17 @@ fn one_error(value: &str, location: &str, constraint: &str) -> DynamoDbError {
 /// A table name field: a bare name outside the pattern is refused with the
 /// pattern clause (and the length clause when that fails too); an `arn:` value
 /// goes through the ARN rules.
-fn check_name(value: Option<&Value>, location: &str, operation: &str) -> Result<(), DynamoDbError> {
+fn check_name(
+    value: Option<&Value>,
+    location: &str,
+    operation: &str,
+    account_id: &str,
+) -> Result<(), DynamoDbError> {
     let Some(name) = value.and_then(Value::as_str) else {
         return Ok(());
     };
     if name.starts_with("arn:") {
-        return arn_gate::check_table_name_arn(operation, name);
+        return arn_gate::check_table_name_arn(operation, name, account_id);
     }
     if name.is_empty() || in_pattern(name) {
         return Ok(());
@@ -307,7 +324,7 @@ mod tests {
     const PAT: &str = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+";
 
     fn message(operation: &str, input: Value) -> Option<String> {
-        match check_table_name_chars(operation, &input) {
+        match check_table_name_chars(operation, &input, "123456789012") {
             Ok(()) => None,
             Err(DynamoDbError::ValidationException(m)) => Some(m),
             Err(other) => panic!("unexpected error {other:?}"),
@@ -493,6 +510,43 @@ mod tests {
         }
         assert!(message("ListStreams", json!({ "TableName": "t367name" })).is_none());
         assert!(message("ListStreams", json!({})).is_none());
+    }
+
+    /// Measured 2026-11-07: 1, 2 and 256 characters get the sentence, alone
+    /// and beside a bad `ExclusiveStartStreamArn`, in either member order; 3
+    /// and 255 characters pass.
+    #[test]
+    fn list_streams_refuses_a_name_of_a_bad_length_before_the_start_arn() {
+        let start = "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/stream/2026\u{0}";
+        for name in [
+            "a".to_owned(),
+            "ab".to_owned(),
+            "a".repeat(256),
+            NUL.to_owned(),
+        ] {
+            for input in [
+                json!({ "TableName": name }),
+                json!({ "TableName": name, "ExclusiveStartStreamArn": start }),
+                json!({ "ExclusiveStartStreamArn": start, "TableName": name }),
+            ] {
+                assert_eq!(
+                    message("ListStreams", input).as_deref(),
+                    Some(LIST_STREAMS_NAME),
+                    "{name:?}"
+                );
+            }
+        }
+        for name in ["abc".to_owned(), "a".repeat(255)] {
+            assert!(message("ListStreams", json!({ "TableName": name })).is_none());
+            assert_eq!(
+                message(
+                    "ListStreams",
+                    json!({ "TableName": name, "ExclusiveStartStreamArn": start })
+                )
+                .as_deref(),
+                Some("Invalid StreamArn")
+            );
+        }
     }
 
     #[test]

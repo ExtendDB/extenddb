@@ -114,7 +114,7 @@ pub(crate) async fn authorize_request(
     // here, before the key info and resource tag lookups below and before the
     // developer-mode return, the cross-account refusal and the ARN shape
     // checks (see `table_name_gate`).
-    crate::table_name_gate::check_table_name_chars(operation, input)?;
+    crate::table_name_gate::check_table_name_chars(operation, input, account_id)?;
 
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();

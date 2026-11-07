@@ -15,11 +15,13 @@ caller's on either target.
 
 The account segment rows (`TestAccountSegment...`) and the `ListStreams`
 `ExclusiveStartStreamArn` rows were measured against the service on
-2026-11-06 (us-east-1). An account segment with U+0000, a letter, 11 or 13
-digits gets the answer for an account that does not exist in every ARN field
-the cross-account check reads, and in `TableName` of the control-plane
-operations; the item operations, the transaction members and `BatchGetItem`
-refuse it as a validation error.
+2026-11-06 (us-east-1), and the `TestArnCheckOrder` and
+`TestListStreamsTableName` rows on 2026-11-07. An account segment with
+U+0000, a letter, 11 or 13 digits gets the answer for an account that does
+not exist in every ARN field the cross-account check reads, and in
+`TableName` of the control-plane operations whatever the ARN's shape; the
+item operations, the transaction members and `BatchGetItem` refuse it as a
+validation error after the shape, vendor, region and table segment checks.
 """
 
 import time
@@ -103,12 +105,11 @@ class TestArnInTableName:
         with pytest.raises(ClientError) as exc:
             raw_client.get_item(TableName=arn, Key={"pk": {"S": "a"}})
         _at_table_name(exc.value, arn, FRAME)
-        # DescribeTable answers AccessDeniedException on the service (measured
-        # 2026-10-24) and the engine's own ValidationException on ExtendDB;
-        # neither is a 500, and the row is not asserted beyond that.
+        # DescribeTable answers the empty account segment first, as another
+        # account (measured 2026-10-24 and 2026-11-07; see TestArnCheckOrder).
         with pytest.raises(ClientError) as exc:
             raw_client.describe_table(TableName=arn)
-        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        _assert_denied(exc.value)
 
     def test_bad_account_and_region_segments_name_their_constraint(self, raw_client, arns):
         acct = arns["account"]
@@ -228,6 +229,47 @@ def _raises(call) -> ClientError:
     return exc.value
 
 
+def _arn(caller, account, resource, service="dynamodb", region=None):
+    region = caller["region"] if region is None else region
+    return f"arn:{caller['partition']}:{service}:{region}:{account}:{resource}"
+
+
+def _control_plane_reads(client, arn):
+    return [
+        lambda: client.describe_table(TableName=arn),
+        lambda: client.describe_time_to_live(TableName=arn),
+        lambda: client.describe_continuous_backups(TableName=arn),
+        lambda: client.list_backups(TableName=arn),
+    ]
+
+
+def _control_plane_calls(client, arn, create=True):
+    """Every control-plane operation the gate answers, with `TableName` set to
+    `arn`. Only ARNs the service refuses are sent."""
+    calls = _control_plane_reads(client, arn) + [
+        lambda: client.update_table(TableName=arn, BillingMode="PAY_PER_REQUEST"),
+        lambda: client.update_time_to_live(
+            TableName=arn,
+            TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
+        ),
+        lambda: client.update_continuous_backups(
+            TableName=arn,
+            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
+        ),
+        lambda: client.create_backup(TableName=arn, BackupName="b830"),
+    ]
+    if create:
+        calls.append(
+            lambda: client.create_table(
+                TableName=arn,
+                BillingMode="PAY_PER_REQUEST",
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+            )
+        )
+    return calls
+
+
 class TestAccountSegmentInArnFields:
     """The fields the cross-account check reads. On PostgreSQL an account with
     U+0000 answered 500 `Internal error during authorization` before the
@@ -280,29 +322,7 @@ class TestAccountSegmentInTableName:
     def test_control_plane_operations_answer_as_for_an_unknown_account(
         self, raw_client, caller, account
     ):
-        arn = _table_arn(caller, account)
-        for call in [
-            lambda: raw_client.describe_table(TableName=arn),
-            lambda: raw_client.update_table(TableName=arn, BillingMode="PAY_PER_REQUEST"),
-            lambda: raw_client.describe_time_to_live(TableName=arn),
-            lambda: raw_client.update_time_to_live(
-                TableName=arn,
-                TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"},
-            ),
-            lambda: raw_client.describe_continuous_backups(TableName=arn),
-            lambda: raw_client.update_continuous_backups(
-                TableName=arn,
-                PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
-            ),
-            lambda: raw_client.create_backup(TableName=arn, BackupName="b830"),
-            lambda: raw_client.list_backups(TableName=arn),
-            lambda: raw_client.create_table(
-                TableName=arn,
-                BillingMode="PAY_PER_REQUEST",
-                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
-            ),
-        ]:
+        for call in _control_plane_calls(raw_client, _table_arn(caller, account)):
             _assert_denied(_raises(call))
 
     @pytest.mark.parametrize("account", BAD_ACCOUNTS, ids=BAD_IDS)
@@ -380,6 +400,126 @@ class TestAccountSegmentInTableName:
             )
 
 
+R_NUL = "us-ea" + NUL + "st-1"
+SHAPES = {
+    "tbl": ("tbl", "dynamodb"),
+    "slash": ("table/t830name/", "dynamodb"),
+    "streamab": ("table/t830name/stream/a/b", "dynamodb"),
+    "index": ("table/t830name/index/gsi1", "dynamodb"),
+    "stream": (f"table/t830name/stream/{LABEL}", "dynamodb"),
+    "s3t": ("t", "s3"),
+    "s3table": ("table/t830name", "s3"),
+}
+
+
+class TestArnCheckOrder:
+    """The order in which the service checks a `TableName` ARN, measured
+    2026-11-07. The control-plane operations answer an account that is not
+    the caller's before anything else. The item operations check the shape,
+    the vendor, the region, the table segment and the account, in that order.
+    On PostgreSQL the control-plane rows with U+0000 in the account of a shape
+    `arn::parse` rejects answered 500 `Internal server error` before the gate
+    answered them itself."""
+
+    @pytest.mark.parametrize(
+        "account,shape",
+        [
+            (BAD_ACCOUNTS[0], "tbl"),
+            (BAD_ACCOUNTS[0], "slash"),
+            (BAD_ACCOUNTS[0], "streamab"),
+            (BAD_ACCOUNTS[0], "s3t"),
+            (BAD_ACCOUNTS[0], "index"),
+            (BAD_ACCOUNTS[1], "tbl"),
+            (BAD_ACCOUNTS[1], "s3table"),
+            (BAD_ACCOUNTS[2], "slash"),
+            (BAD_ACCOUNTS[3], "s3t"),
+            (FOREIGN, "tbl"),
+            (FOREIGN, "index"),
+            (FOREIGN, "s3table"),
+        ],
+        ids=lambda v: {BAD_ACCOUNTS[i]: BAD_IDS[i] for i in range(4)}.get(v, v),
+    )
+    def test_control_plane_answers_another_account_before_the_shape(
+        self, raw_client, caller, account, shape
+    ):
+        resource, service = SHAPES[shape]
+        arn = _arn(caller, account, resource, service)
+        # CreateTable with a well-formed account is not sent to the service.
+        for call in _control_plane_calls(raw_client, arn, create=account != FOREIGN):
+            _assert_denied(_raises(call))
+
+    def test_control_plane_empty_account_is_another_account(self, raw_client):
+        for arn in ["arn:aws:s3:::t830" + NUL + "name", "arn:aws:dynamodb:us-east-1::table/t830name"]:
+            for call in _control_plane_reads(raw_client, arn)[:3]:
+                _assert_denied(_raises(call))
+
+    def test_control_plane_in_the_callers_account(self, raw_client, caller):
+        own = caller["account"]
+        for arn in [
+            _arn(caller, own, "tbl"),
+            _arn(caller, own, "table/t830name/"),
+            _arn(caller, own, "table/t830name/index/gsi1"),
+            _arn(caller, own, "t", "s3"),
+            _arn(caller, own, "tbl", region=R_NUL),
+        ]:
+            for call in _control_plane_reads(raw_client, arn):
+                _at_table_name(_raises(call), arn, FRAME)
+        for arn in [
+            _arn(caller, own, "table/t830name", "s3"),
+            _arn(caller, own, "table/t830name", "s3", region=R_NUL),
+        ]:
+            for call in _control_plane_reads(raw_client, arn):
+                assert_validation(
+                    _raises(call), f"1 validation error detected: Invalid vendor code in '{arn}'"
+                )
+
+    def test_item_operations_check_the_shape_vendor_region_and_table_segment_first(
+        self, raw_client, caller
+    ):
+        own = caller["account"]
+        cases = [
+            (_arn(caller, BAD_ACCOUNTS[0], "tbl"), FRAME),
+            (_arn(caller, BAD_ACCOUNTS[2], "table/t830name/"), FRAME),
+            (_arn(caller, BAD_ACCOUNTS[3], "table/t830name/index/gsi1"), FRAME),
+            (_arn(caller, BAD_ACCOUNTS[1], SHAPES["stream"][0]), FRAME),
+            (_arn(caller, BAD_ACCOUNTS[0], "t", "s3"), FRAME),
+            (_arn(caller, own, "tbl", region=R_NUL), FRAME),
+            (_arn(caller, BAD_ACCOUNTS[1], "table/t830name", "s3"), "Invalid vendor code"),
+            (_arn(caller, own, "table/t830name", "s3"), "Invalid vendor code"),
+            (_arn(caller, BAD_ACCOUNTS[0], "table/t830name", region=R_NUL), "Invalid AWS region"),
+            (_arn(caller, BAD_ACCOUNTS[0], "table/t830" + NUL + "name"), TABLE_OF_ARN),
+            (_arn(caller, BAD_ACCOUNTS[2], "table/t830" + NUL + "name"), TABLE_OF_ARN),
+            (_arn(caller, "", "table/t830name"), "Invalid subscriber ID"),
+        ]
+        key = {"pk": {"S": "a"}}
+        for arn, constraint in cases:
+            _at_table_name(_raises(lambda: raw_client.get_item(TableName=arn, Key=key)), arn, constraint)
+            assert_validation(
+                _raises(
+                    lambda: raw_client.transact_get_items(
+                        TransactItems=[{"Get": {"TableName": arn, "Key": key}}]
+                    )
+                ),
+                f"1 validation error detected: Value '{arn}' at "
+                f"'transactItems.1.member.get.tableName' failed to satisfy constraint: {constraint}",
+            )
+
+    def test_empty_account_in_batch_keys(self, raw_client, caller):
+        arn = _arn(caller, "", "table/t830name")
+        key = {"pk": {"S": "a"}}
+        exc = _raises(lambda: raw_client.batch_get_item(RequestItems={arn: {"Keys": [key]}}))
+        assert exc.response["Error"]["Code"] == "ValidationException", exc.response["Error"]
+        assert exc.response["Error"]["Message"].endswith(
+            f"' at 'requestItems' failed to satisfy constraint: {MAP_KEYS_ARN}"
+        ), exc.response["Error"]["Message"]
+        # BatchWriteItem answered `Access is denied` three times and the
+        # map-key constraint once (2026-11-07); only a 400 is asserted.
+        exc = _raises(
+            lambda: raw_client.batch_write_item(RequestItems={arn: [{"PutRequest": {"Item": key}}]})
+        )
+        assert exc.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
 def _list_streams(client, **params):
     """ListStreams, sent again after a ThrottlingException (the service's rate
     for this operation is low)."""
@@ -419,3 +559,33 @@ class TestListStreamsExclusiveStartStreamArn:
             resp = _list_streams(raw_streams_client, ExclusiveStartStreamArn=start, Limit=1)
             assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
             assert "Streams" in resp
+
+
+LIST_STREAMS_NAME = "TableName must be at least 3 characters long and at most 255 characters long"
+
+
+class TestListStreamsTableName:
+    """`ListStreams` answers its `TableName` sentence for a name of a bad
+    length and before a bad `ExclusiveStartStreamArn`, in either member order
+    (measured 2026-11-07)."""
+
+    def test_a_bad_table_name_is_answered_before_a_bad_start_arn(self, raw_streams_client, caller):
+        start = f"{_table_arn(caller, caller['account'], table=caller['name'])}/stream/2026{NUL}"
+        for name in ["t830" + NUL + "name", "a b", "ab", "a" * 256]:
+            for params in [
+                {"TableName": name, "ExclusiveStartStreamArn": start},
+                {"ExclusiveStartStreamArn": start, "TableName": name},
+            ]:
+                with pytest.raises(ClientError) as exc:
+                    _list_streams(raw_streams_client, **params)
+                assert_validation(exc.value, LIST_STREAMS_NAME)
+
+    def test_table_name_length(self, raw_streams_client):
+        for name in ["a", "ab", "a" * 256]:
+            with pytest.raises(ClientError) as exc:
+                _list_streams(raw_streams_client, TableName=name)
+            assert_validation(exc.value, LIST_STREAMS_NAME)
+        for name in ["abc", "a" * 255]:
+            resp = _list_streams(raw_streams_client, TableName=name)
+            assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+            assert resp["Streams"] == []
