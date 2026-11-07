@@ -343,10 +343,10 @@ impl SqliteEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
+        let row: Option<(String, String, String, String, Option<String>, String)> = sqlx::query_as(
             "SELECT key_schema, attribute_definitions, table_status, table_id, \
-             stream_specification \
-             FROM tables WHERE account_id = ? AND table_name = ?",
+                 stream_specification, creation_date_time \
+                 FROM tables WHERE account_id = ? AND table_name = ?",
         )
         .bind(account_id)
         .bind(table_name)
@@ -354,7 +354,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        let (ks_str, ad_str, status, table_id, stream_spec_str) =
+        let (ks_str, ad_str, status, table_id, stream_spec_str, created_str) =
             row.ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
 
         match status.as_str() {
@@ -388,6 +388,13 @@ impl SqliteEngine {
         // decide whether any maintenance is needed without a query, and so the
         // engine can validate vector attributes on writes.
         let vector_indexes = self.fetch_vector_index_key_info(&table_id).await?;
+        // CreateTable writes the column as RFC 3339 with up to nanosecond
+        // digits (the schema default, milliseconds, only fills a row written
+        // without one). The transaction handlers order tables by this value as
+        // epoch seconds in an f64, which resolves about 0.24 microseconds.
+        let creation_date_time = crate::sqlite_util::parse_timestamp(&created_str)
+            .map(|dt| dt.unix_timestamp_nanos() as f64 / 1e9)
+            .unwrap_or(0.0);
 
         let key_info = TableKeyInfo {
             table_name: table_name.to_owned(),
@@ -404,6 +411,7 @@ impl SqliteEngine {
             // new core field should break this site and force a decision about
             // whether the write path needs it, rather than silently defaulting.
             vector_indexes,
+            creation_date_time,
         };
         // Catalog metadata that cannot describe its own sort key would make the
         // keyed read paths fall back to a partition-only lookup and return the
