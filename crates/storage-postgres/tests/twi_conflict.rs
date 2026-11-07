@@ -1275,7 +1275,7 @@ async fn a_cancelled_token_is_used_for_ten_minutes_from_its_last_cancellation() 
     s.cleanup().await;
 }
 
-/// Rounds of the two tests below. Most rounds send the second request while
+/// Rounds of the four tests below. Most rounds send the second request while
 /// the first is still running.
 const RACE_ROUNDS: usize = 20;
 
@@ -1313,21 +1313,21 @@ async fn counter(db: &PgPool, table: &str) -> i64 {
     n.parse().expect("n is an integer")
 }
 
-/// Send `ops` with `key` twice at the same moment, released by a barrier, and
-/// return both answers. Bounded, so a send that never finishes fails the test
-/// instead of hanging it.
+/// Send `ops` twice at the same moment, once with each of `keys`, released by
+/// a barrier, and return both answers. Bounded, so a send that never finishes
+/// fails the test instead of hanging it.
 async fn send_twice_at_once(
     engine: &PostgresEngine,
     ops: &[TransactWriteOp<'_>],
-    key: IdempotencyKey<'_>,
+    keys: [IdempotencyKey<'_>; 2],
 ) -> [Result<(), StorageError>; 2] {
     let barrier = &tokio::sync::Barrier::new(2);
-    let send = move || async move {
+    let send = move |key| async move {
         barrier.wait().await;
         engine.transact_write_items(ops, Some(key)).await
     };
     let (first, second) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(send(), send())
+        tokio::join!(send(keys[0]), send(keys[1]))
     })
     .await
     .expect("both sends finished");
@@ -1388,7 +1388,7 @@ async fn two_sends_of_one_request_with_one_token_apply_it_once() {
             fingerprint: "fp-increment",
         };
         let before = counter(&s.db, &table).await;
-        let answers = send_twice_at_once(&s.engine, &ops, key).await;
+        let answers = send_twice_at_once(&s.engine, &ops, [key; 2]).await;
         let grew = counter(&s.db, &table).await - before;
         if grew != 1 || !applied_by_one(&answers) {
             failed.push(format!(
@@ -1477,7 +1477,141 @@ async fn two_sends_that_run_a_cancelled_request_again_apply_it_once() {
         ))
         .await;
         let before = counter(&s.db, &table).await;
-        let answers = send_twice_at_once(&s.engine, &ops, key).await;
+        let answers = send_twice_at_once(&s.engine, &ops, [key; 2]).await;
+        let grew = counter(&s.db, &table).await - before;
+        if grew != 1 || !applied_by_one(&answers) {
+            failed.push(format!(
+                "round {round}: n grew by {grew}, answers {answers:?}"
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {RACE_ROUNDS} rounds:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_requests_with_one_token_at_once_apply_only_one() {
+    // Two different requests with one fresh token at the same moment. They
+    // send the same update with two fingerprints, so a second apply shows in
+    // `n`. Here the second send's token insert waits on the first send's
+    // token row, and its select reads with a snapshot from before the first
+    // send's commit, which holds no row. The statement runs again and reads
+    // the first request's row, so the second send answers the mismatch and
+    // applies nothing.
+    let test = "two_requests_with_one_token_at_once_apply_only_one";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let plain = ExpressionMaps::default();
+    let key_info = seeded_table(&s, &plain).await;
+    seed_counter(&s, &key_info).await;
+    let table = data_table(&s.db).await;
+    let (actions, maps) = increment();
+    let cnt = key("cnt");
+    let ops = [TransactWriteOp::Update {
+        key_info: &key_info,
+        key: &cnt,
+        actions: &actions,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+
+    let mut failed = Vec::new();
+    for round in 0..RACE_ROUNDS {
+        let token = format!("twi-two-requests-race-{round}");
+        let keys = ["fp-a", "fp-b"].map(|fingerprint| IdempotencyKey {
+            account_id: ACCOUNT,
+            token: &token,
+            fingerprint,
+        });
+        let before = counter(&s.db, &table).await;
+        let answers = send_twice_at_once(&s.engine, &ops, keys).await;
+        let grew = counter(&s.db, &table).await - before;
+        let applied = answers.iter().filter(|a| a.is_ok()).count();
+        let refused = answers
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Err(StorageError::IdempotentMismatch | StorageError::TransactionInProgress)
+                )
+            })
+            .count();
+        if grew != 1 || applied != 1 || refused != 1 {
+            failed.push(format!(
+                "round {round}: n grew by {grew}, answers {answers:?}"
+            ));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {RACE_ROUNDS} rounds:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+
+    s.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_sends_that_take_an_old_token_row_apply_it_once() {
+    // The next request with a token whose row is more than 10 minutes old
+    // takes the row. Here another request stored the token 11 minutes ago,
+    // and one request is then sent twice at the same moment. The second
+    // send's token insert waits on the row the first send takes, and its
+    // select reads with a snapshot from before the first send's commit,
+    // which holds the old row. The 10-minute filter drops that row. The
+    // statement runs again and reads the first send's row, so the second send
+    // answers the replay.
+    let test = "two_sends_that_take_an_old_token_row_apply_it_once";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch().await;
+    let plain = ExpressionMaps::default();
+    let key_info = seeded_table(&s, &plain).await;
+    seed_counter(&s, &key_info).await;
+    let table = data_table(&s.db).await;
+    let (actions, maps) = increment();
+    let cnt = key("cnt");
+    let ops = [TransactWriteOp::Update {
+        key_info: &key_info,
+        key: &cnt,
+        actions: &actions,
+        condition: None,
+        maps: &maps,
+        return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+        stream: None,
+    }];
+
+    let mut failed = Vec::new();
+    for round in 0..RACE_ROUNDS {
+        let token = format!("twi-takeover-race-{round}");
+        let key = IdempotencyKey {
+            account_id: ACCOUNT,
+            token: &token,
+            fingerprint: "fp-increment",
+        };
+        sqlx::query(
+            "INSERT INTO idempotency_tokens (account_id, token, fingerprint, created_at) \
+             VALUES ($1, $2, 'fp-other', NOW() - INTERVAL '11 minutes')",
+        )
+        .bind(ACCOUNT)
+        .bind(&token)
+        .execute(&s.db)
+        .await
+        .expect("store the other request's token row");
+        let before = counter(&s.db, &table).await;
+        let answers = send_twice_at_once(&s.engine, &ops, [key; 2]).await;
         let grew = counter(&s.db, &table).await - before;
         if grew != 1 || !applied_by_one(&answers) {
             failed.push(format!(
