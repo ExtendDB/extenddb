@@ -113,6 +113,7 @@ pub fn apply_update_validated(
         }
     }
     apply_update(actions, item, maps)?;
+    super::update_nesting::validate_written_nesting_depth(actions, item, maps)?;
     crate::validation::validate_vector_write_changed(
         item,
         &before,
