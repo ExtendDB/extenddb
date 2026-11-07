@@ -9,7 +9,7 @@ License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, 
 by AWS engineers. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
 protocol: any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
-- **Language:** Rust (edition 2024, MSRV 1.88+)
+- **Language:** Rust (edition 2024, MSRV 1.91.1+)
 - **Storage backends:** PostgreSQL 14+ (default), SQLite (bundled, no server or client install required; feature flag `sqlite`, also `sqlite-memory` for dev and CI), MongoDB 7.0+ (feature flag `mongodb`), Cassandra 4.1+ (experimental; feature flag `cassandra`). One backend per binary, selected by mutually exclusive Cargo features.
 - **Architecture:** Async (tokio), trait-based storage abstraction
 - **Authentication:** Mandatory SigV4 with built-in IAM (users, groups, roles, policies)
@@ -97,7 +97,7 @@ extenddb (bin)
 
 ### Prerequisites
 
-- Rust 1.88+ (`rustup update`)
+- Rust 1.91.1+ (`rustup update`)
 - Storage backend (one of):
   - PostgreSQL 14+ running locally (see `docs/local-postgres-setup.md`)
   - SQLite (embedded; nothing to install)
@@ -415,7 +415,7 @@ python3 docs/build-docs.py
 ## Code Style and Conventions
 
 - **Rust edition:** 2024
-- **MSRV:** 1.88
+- **MSRV:** 1.91.1
 - **Async:** tokio, no `#[async_trait]` (use RPITIT)
 - **Error handling:** `thiserror` for library errors, `anyhow` for application errors
 - **Serialization:** `serde` + `serde_json`
