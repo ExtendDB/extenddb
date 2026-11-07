@@ -389,7 +389,9 @@ impl KeyCondition {
     /// authorization when it finds the partition key value for
     /// `dynamodb:LeadingKeys`, so both read the same clause as the partition
     /// key. On a multi-attribute key schema `pk_path` then names the first
-    /// HASH attribute.
+    /// HASH attribute. Both parse with [`parse_key_condition_with_maps`],
+    /// which refuses a second condition on one key attribute before this runs,
+    /// so a duplicate is reported ahead of `value_check`.
     ///
     /// # Errors
     ///
@@ -462,6 +464,75 @@ impl KeyCondition {
     }
 }
 
+/// The service's message when a `KeyConditionExpression` carries more than one
+/// condition on the same key attribute. Measured 2026-10-24 (us-east-1).
+const ONE_CONDITION_PER_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key";
+
+/// Refuse a key condition with more than one condition on one key attribute.
+///
+/// Two clauses name the same attribute when their paths resolve to the same
+/// name through `names`, whether each is written as a plain name or as a
+/// `#name` reference. Two clauses on one `#name` reference name the same
+/// attribute whether or not `names` defines it. DynamoDB allows one condition
+/// per key attribute, on the partition key and on the sort key alike, whatever
+/// the operators are (measured 2026-10-24).
+///
+/// The service resolves every `#name` and `:value` reference before it looks
+/// for a duplicate (measured 2026-10-31), so when a duplicate is found an
+/// undefined `#name` in any clause is reported first, then an undefined
+/// `:value`, each with the service's text. A key condition without a duplicate
+/// passes, and the checks that follow report its undefined references.
+fn reject_duplicate_key_attrs<V>(
+    clauses: &[RawClause],
+    names: &std::collections::HashMap<String, String>,
+    values: &std::collections::HashMap<String, V>,
+) -> Result<(), DynamoDbError> {
+    let mut seen: Vec<&str> = Vec::with_capacity(clauses.len());
+    let mut duplicated = false;
+    for clause in clauses {
+        let Some(PathElement::Attribute(name)) = raw_clause_path(clause).first() else {
+            continue;
+        };
+        // An undefined reference keeps its `#`, which no plain name carries.
+        let attr = match name.strip_prefix('#') {
+            Some(reference) => names.get(reference).map_or(name.as_str(), String::as_str),
+            None => name.as_str(),
+        };
+        if seen.contains(&attr) {
+            duplicated = true;
+            break;
+        }
+        seen.push(attr);
+    }
+    if !duplicated {
+        return Ok(());
+    }
+    for clause in clauses {
+        if let Some(PathElement::Attribute(name)) = raw_clause_path(clause).first()
+            && let Some(reference) = name.strip_prefix('#')
+            && !names.contains_key(reference)
+        {
+            return Err(validation_err(&format!(
+                "Invalid KeyConditionExpression: An expression attribute name used in the \
+                 document path is not defined; attribute name: #{reference}"
+            )));
+        }
+    }
+    for clause in clauses {
+        for value in raw_clause_values(clause) {
+            if let Expr::Placeholder(placeholder) = value
+                && !values.contains_key(placeholder)
+            {
+                return Err(validation_err(&format!(
+                    "Invalid KeyConditionExpression: An expression attribute value used in \
+                     expression is not defined; attribute value: :{placeholder}"
+                )));
+            }
+        }
+    }
+    Err(validation_err(ONE_CONDITION_PER_KEY_ERR))
+}
+
 /// Resolve a path's top-level attribute name, handling `#name` references.
 fn resolve_path_attr(
     path: &[PathElement],
@@ -526,12 +597,49 @@ impl SortKeyCondition {
 /// Supports multi-part keys: up to 8 AND-ed clauses (4 HASH + 4 RANGE).
 /// Rejects OR, NOT, and unsupported functions.
 ///
+/// This does not look for a second condition on one key attribute, which
+/// needs the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`. A request's key condition is parsed with
+/// [`parse_key_condition_with_maps`].
+///
 /// # Errors
 ///
 /// Returns `ValidationException` for syntax errors or unsupported constructs.
 pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbError> {
-    let mut clauses = parse_clauses(tokens)?;
+    classify_clauses(parse_clauses(tokens)?)
+}
 
+/// [`parse_key_condition`] with the request's `ExpressionAttributeNames`
+/// (`names`, keyed without the leading `#`) and `ExpressionAttributeValues`
+/// (`values`, keyed without the leading `:`; only which placeholders are
+/// defined is read).
+///
+/// After the parser's own checks, and before any clause is read as the
+/// partition or the sort key condition, this refuses a key condition with more
+/// than one condition on one key attribute, written with plain names or
+/// through `#name` references. When there is such a duplicate, an undefined
+/// `#name` and then an undefined `:value` are reported ahead of it, as the
+/// service reports them. The engine reads a `Query` key condition through
+/// this, and authorization runs the same check through
+/// [`key_condition_clause_operands`].
+///
+/// # Errors
+///
+/// As [`parse_key_condition`], plus `ValidationException` for a second
+/// condition on one key attribute.
+pub fn parse_key_condition_with_maps<V>(
+    tokens: &[Token],
+    names: &std::collections::HashMap<String, String>,
+    values: &std::collections::HashMap<String, V>,
+) -> Result<KeyCondition, DynamoDbError> {
+    let clauses = parse_clauses(tokens)?;
+    reject_duplicate_key_attrs(&clauses, names, values)?;
+    classify_clauses(clauses)
+}
+
+/// Read the parsed clauses as a partition key condition and sort key
+/// conditions.
+fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError> {
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
@@ -548,14 +656,24 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
 /// it cannot read. A `BETWEEN` clause carries two operands and is left out,
 /// since it names no single value for the attribute.
 ///
+/// `names` and `values` are the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`, as [`parse_key_condition_with_maps`] takes
+/// them.
+///
 /// # Errors
 ///
-/// Returns `ValidationException` for the same syntax errors and unsupported
-/// constructs [`parse_key_condition`] rejects before it classifies clauses.
-pub fn key_condition_clause_operands(
+/// Returns `ValidationException` for the same errors
+/// [`parse_key_condition_with_maps`] returns before it classifies clauses,
+/// including a second condition on one key attribute, so a key condition the
+/// engine refuses for that names no operand here.
+pub fn key_condition_clause_operands<V>(
     tokens: &[Token],
+    names: &std::collections::HashMap<String, String>,
+    values: &std::collections::HashMap<String, V>,
 ) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
-    Ok(parse_clauses(tokens)?
+    let clauses = parse_clauses(tokens)?;
+    reject_duplicate_key_attrs(&clauses, names, values)?;
+    Ok(clauses
         .into_iter()
         .filter_map(|clause| match clause {
             RawClause::Eq(path, value) => Some(KeyClauseOperand {
@@ -642,6 +760,15 @@ fn raw_clause_path(clause: &RawClause) -> &[PathElement] {
         | RawClause::Compare(path, _, _)
         | RawClause::Between(path, _, _)
         | RawClause::BeginsWith(path, _) => path,
+    }
+}
+
+/// The value operands of a raw clause, in the order they are written.
+fn raw_clause_values(clause: &RawClause) -> Vec<&Expr> {
+    match clause {
+        RawClause::Eq(_, value) | RawClause::Compare(_, _, value) => vec![value],
+        RawClause::Between(_, low, high) => vec![low, high],
+        RawClause::BeginsWith(_, prefix) => vec![prefix],
     }
 }
 
@@ -998,6 +1125,7 @@ fn validation_err(msg: &str) -> DynamoDbError {
 mod tests {
     use super::*;
     use crate::expression::tokenize;
+    use crate::types::AttributeValue;
     use std::collections::HashMap;
 
     #[test]
@@ -1355,17 +1483,14 @@ mod tests {
                 "pk < :v AND sk > :s",
                 &[("pk", "v", false), ("sk", "s", false)],
             ),
-            (
-                "pk = :u AND pk > :v",
-                &[("pk", "u", true), ("pk", "v", false)],
-            ),
             // BETWEEN names two operands, so it contributes none.
             ("pk BETWEEN :lo AND :hi", &[]),
             ("pk = :v AND sk BETWEEN :lo AND :hi", &[("pk", "v", true)]),
         ];
         for (expr, want) in cases {
             let tokens = tokenize(expr).unwrap();
-            let got = key_condition_clause_operands(&tokens).unwrap();
+            let got =
+                key_condition_clause_operands(&tokens, &HashMap::new(), &values_of(expr)).unwrap();
             let got: Vec<(String, String, bool)> = got
                 .into_iter()
                 .map(|clause| {
@@ -1404,7 +1529,7 @@ mod tests {
                 continue;
             };
             assert!(
-                key_condition_clause_operands(&tokens).is_err(),
+                key_condition_clause_operands(&tokens, &HashMap::new(), &no_values()).is_err(),
                 "expr {expr} should be rejected"
             );
         }
@@ -1901,5 +2026,298 @@ mod tests {
 
         kc.resolve_key_schema(&schema, &HashMap::new()).unwrap();
         assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
+    }
+
+    const UNDEFINED_NAME_U: &str = "Invalid KeyConditionExpression: An expression attribute \
+                                    name used in the document path is not defined; attribute \
+                                    name: #u";
+    const TYPE_ERR: &str = "One or more parameter values were invalid: Condition parameter \
+                            type does not match schema type";
+
+    /// No `ExpressionAttributeValues`.
+    fn no_values() -> HashMap<String, AttributeValue> {
+        HashMap::new()
+    }
+
+    /// `ExpressionAttributeValues` that define every placeholder of `expr`,
+    /// keyed without the leading `:`.
+    fn values_of(expr: &str) -> HashMap<String, AttributeValue> {
+        tokenize(expr)
+            .unwrap()
+            .into_iter()
+            .filter_map(|token| match token {
+                Token::Placeholder(name) => Some((name, AttributeValue::S("v".to_owned()))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `ExpressionAttributeNames` from `(reference, attribute)` pairs, keyed
+    /// without the leading `#`.
+    fn names_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(reference, attr)| ((*reference).to_owned(), (*attr).to_owned()))
+            .collect()
+    }
+
+    /// Parse `expr` as the engine parses a request's key condition, with every
+    /// placeholder defined.
+    fn parse_request(
+        expr: &str,
+        names: &HashMap<String, String>,
+    ) -> Result<KeyCondition, DynamoDbError> {
+        let tokens = tokenize(expr).unwrap();
+        parse_key_condition_with_maps(&tokens, names, &values_of(expr))
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(
+        result: Result<T, DynamoDbError>,
+        want: &str,
+        expr: &str,
+    ) {
+        match result {
+            Err(DynamoDbError::ValidationException(msg)) => assert_eq!(msg, want, "expr {expr}"),
+            other => panic!("expr {expr}: got {other:?}"),
+        }
+    }
+
+    /// A second condition on a key attribute, written with plain names or
+    /// through a `#name` reference, is refused before the clauses are handed
+    /// to authorization, so the LeadingKeys path reads no partition operand
+    /// from such a request.
+    #[test]
+    fn clause_operands_reject_duplicate_key_attribute() {
+        let names = names_of(&[("p", "pk"), ("s", "sk")]);
+        for expr in [
+            "pk = :a AND pk = :b",
+            "#p = :a AND pk = :b",
+            "pk = :u AND pk > :v",
+            "#p = :u AND pk > :v",
+            "pk > :v AND sk = :s AND sk = :t",
+            "pk > :v AND #s = :s AND sk = :t",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            assert_refused(
+                key_condition_clause_operands(&tokens, &names, &values_of(expr)),
+                ONE_CONDITION_PER_KEY_ERR,
+                expr,
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_condition_on_one_key_attribute_rejected() {
+        // Measured 2026-10-24 (us-east-1): every one of these shapes answers
+        // the one-condition-per-key message, whatever the operators are and
+        // whichever key attribute is named twice.
+        for expr in [
+            "pk = :a AND pk = :b",
+            "pk = :a AND pk = :a",
+            "pk = :a AND pk = :b AND sk = :c",
+            "pk = :a AND pk > :b",
+            "pk > :b AND pk = :a",
+            ":a = pk AND pk = :b",
+            "(pk = :a) AND (pk = :b)",
+            "pk = :a AND sk = :b AND sk = :c",
+            "pk = :a AND sk = :b AND sk = :b",
+            "pk = :a AND sk BETWEEN :b AND :c AND sk = :b",
+            "pk = :a AND sk BETWEEN :b AND :c AND begins_with(sk, :b)",
+            "pk = :a AND begins_with(sk, :b) AND sk = :c",
+            "pk = :a AND sk > :b AND sk < :c",
+            "pk = :a AND begins_with(sk, :b) AND begins_with(sk, :c)",
+            "pk = :a AND pk = :b AND sk = :b AND sk = :c",
+            "sk = :b AND sk = :c",
+        ] {
+            assert_refused(
+                parse_request(expr, &HashMap::new()),
+                ONE_CONDITION_PER_KEY_ERR,
+                expr,
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_condition_through_name_reference_rejected() {
+        // `#p` and `pk` name the same attribute once `#p` is resolved, on a
+        // single-attribute key schema and a multi-attribute one alike.
+        let names = names_of(&[("p", "pk"), ("hh", "h")]);
+        for expr in ["#p = :a AND pk = :b", "#hh = :x AND h = :y AND a = :z"] {
+            assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
+        }
+    }
+
+    #[test]
+    fn duplicate_condition_through_two_name_references_rejected() {
+        let names = names_of(&[("p", "pk"), ("q", "pk")]);
+        let expr = "#p = :a AND #q = :b";
+        assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
+    }
+
+    #[test]
+    fn duplicate_condition_on_sort_key_through_name_reference_rejected() {
+        let names = names_of(&[("s", "sk")]);
+        let expr = "pk = :a AND #s = :b AND sk = :c";
+        assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
+    }
+
+    /// With a duplicate present, an undefined `#name` anywhere in the
+    /// expression is reported first. Measured 2026-10-24 for
+    /// `#u = :a AND #u = :b` and 2026-10-31 for the next three; the
+    /// multi-attribute form is not measured.
+    #[test]
+    fn undefined_name_reported_ahead_of_duplicate() {
+        for expr in [
+            "#u = :a AND #u = :b",
+            "#u = :a AND #u > :b",
+            "#u = :a AND sk = :b AND sk = :c",
+            "pk = :a AND pk = :b AND #u = :c",
+            "h = :a AND h = :b AND #u = :c",
+        ] {
+            assert_refused(parse_request(expr, &HashMap::new()), UNDEFINED_NAME_U, expr);
+        }
+        // Without a duplicate the parse passes, and `resolve_pk_sk` reports
+        // the name.
+        let mut kc = parse_request("#u = :a AND sk = :b", &HashMap::new()).unwrap();
+        assert_refused(
+            kc.resolve_pk_sk("pk", &HashMap::new()),
+            UNDEFINED_NAME_U,
+            "#u = :a AND sk = :b",
+        );
+    }
+
+    /// With a duplicate present, an undefined `:value` is reported ahead of it
+    /// (measured 2026-10-31: `pk = :a AND pk = :b` without
+    /// `ExpressionAttributeValues` answers the undefined-value message for
+    /// `:a`). Which of an undefined name and an undefined value the service
+    /// reports first is not measured; the name is checked first here.
+    #[test]
+    fn undefined_value_reported_ahead_of_duplicate() {
+        let undefined = |value: &str| {
+            format!(
+                "Invalid KeyConditionExpression: An expression attribute value used in \
+                 expression is not defined; attribute value: :{value}"
+            )
+        };
+        let tokens = tokenize("pk = :a AND pk = :b").unwrap();
+        assert_refused(
+            parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()),
+            &undefined("a"),
+            "pk = :a AND pk = :b",
+        );
+        let tokens = tokenize("pk = :a AND pk = :missing").unwrap();
+        assert_refused(
+            parse_key_condition_with_maps(&tokens, &HashMap::new(), &values_of("pk = :a")),
+            &undefined("missing"),
+            "pk = :a AND pk = :missing",
+        );
+        let tokens = tokenize("pk = :a AND pk = :b AND #u = :c").unwrap();
+        assert_refused(
+            parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()),
+            UNDEFINED_NAME_U,
+            "pk = :a AND pk = :b AND #u = :c",
+        );
+        // Without a duplicate the parse does not read the values.
+        let tokens = tokenize("pk = :a AND sk = :b").unwrap();
+        assert!(parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()).is_ok());
+    }
+
+    /// The duplicate is reported by the parse, so it comes ahead of the key
+    /// value type check that `resolve_key_schema_with` runs and of the engine's
+    /// unused-value check, whichever way it is spelled (measured 2026-10-31:
+    /// `pk = :a AND pk = :n`, `#p = :a AND pk = :n` and
+    /// `pk = :a AND #s = :b AND sk = :n` with `:n` a number on an S key, and
+    /// `pk = :a AND pk = :b` with an unused `:z`, answer the
+    /// one-condition-per-key message; `pk = :n` alone answers the type).
+    #[test]
+    fn duplicate_reported_ahead_of_type_and_unused_value_checks() {
+        let schema = [key("pk", KeyType::Hash), key("sk", KeyType::Range)];
+        let names = names_of(&[("p", "pk"), ("s", "sk")]);
+        let values: HashMap<String, AttributeValue> = [
+            ("a", AttributeValue::S("alice".to_owned())),
+            ("b", AttributeValue::S("bob".to_owned())),
+            ("n", AttributeValue::N("1".to_owned())),
+            ("z", AttributeValue::S("zed".to_owned())),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        for expr in [
+            "pk = :a AND pk = :n",
+            "#p = :a AND pk = :n",
+            "pk = :a AND #s = :b AND sk = :n",
+            "pk = :a AND pk = :b",
+        ] {
+            let tokens = tokenize(expr).unwrap();
+            assert_refused(
+                parse_key_condition_with_maps(&tokens, &names, &values),
+                ONE_CONDITION_PER_KEY_ERR,
+                expr,
+            );
+        }
+        let tokens = tokenize("pk = :n").unwrap();
+        let mut kc = parse_key_condition_with_maps(&tokens, &names, &values).unwrap();
+        assert_refused(
+            kc.resolve_key_schema_with(&schema, &names, |_, value| match value {
+                Expr::Placeholder(name) if name == "n" => Err(validation_err(TYPE_ERR)),
+                _ => Ok(()),
+            }),
+            TYPE_ERR,
+            "pk = :n",
+        );
+    }
+
+    #[test]
+    fn nested_path_reported_ahead_of_duplicate() {
+        // Measured 2026-10-24: both of these answer their own message, not the
+        // one-condition-per-key message.
+        assert_refused(
+            parse_request("pk = :a AND pk.foo = :b", &HashMap::new()),
+            NESTED_KEY_ERR,
+            "pk = :a AND pk.foo = :b",
+        );
+        assert_refused(
+            parse_request("((pk = :a)) AND (pk = :b)", &HashMap::new()),
+            "Invalid KeyConditionExpression: The expression has redundant parentheses;",
+            "((pk = :a)) AND (pk = :b)",
+        );
+    }
+
+    #[test]
+    fn distinct_key_attributes_accepted_after_duplicate_check() {
+        // One condition per key attribute passes the check and resolves under
+        // the key schema the engine reads it with: the check is per attribute
+        // name, not per clause count.
+        let names = names_of(&[("p", "pk"), ("s", "sk")]);
+        let pk_sk = [key("pk", KeyType::Hash), key("sk", KeyType::Range)];
+        let two_hash = [
+            key("pk1", KeyType::Hash),
+            key("pk2", KeyType::Hash),
+            key("sk", KeyType::Range),
+        ];
+        let two_by_two = [
+            key("pk1", KeyType::Hash),
+            key("pk2", KeyType::Hash),
+            key("sk1", KeyType::Range),
+            key("sk2", KeyType::Range),
+        ];
+        for (schema, expr) in [
+            (&pk_sk[..], "pk = :a"),
+            (&pk_sk[..], "pk = :a AND sk = :b"),
+            (&pk_sk[..], "sk = :b AND pk = :a"),
+            (&pk_sk[..], "pk = :a AND sk BETWEEN :b AND :c"),
+            (&pk_sk[..], "pk = :a AND begins_with(sk, :b)"),
+            (&pk_sk[..], "#p = :a AND #s = :b"),
+            (&two_hash[..], "pk1 = :a AND pk2 = :b AND sk = :c"),
+            (
+                &two_by_two[..],
+                "pk1 = :a AND pk2 = :b AND sk1 = :c AND sk2 = :d",
+            ),
+        ] {
+            let mut kc = parse_request(expr, &names)
+                .unwrap_or_else(|err| panic!("expr {expr} should parse: {err:?}"));
+            kc.resolve_key_schema(schema, &names)
+                .unwrap_or_else(|err| panic!("expr {expr} should resolve: {err:?}"));
+        }
     }
 }

@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_with_depth_limit, parse_key_condition_with_maps, parse_projection,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -237,14 +238,19 @@ pub fn parse_projection_expr(
 
 /// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
 ///
+/// `maps` holds the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`, which the parse reads to refuse a second
+/// condition on one key attribute.
+///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for a second condition on one key attribute.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
@@ -257,7 +263,7 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        parse_key_condition_with_maps(&tokens, &maps.names, &maps.values)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
@@ -406,5 +412,112 @@ mod tests {
                 if msg.contains("Expression size has exceeded the maximum allowed size")),
             "got {err:?}"
         );
+    }
+
+    /// A key condition request and the message it answers: the expression,
+    /// its `#`-prefixed names, its `:`-prefixed values (`None` for no
+    /// `ExpressionAttributeValues`) and the expected message.
+    type KceCase = (
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+        Option<Vec<(&'static str, AttributeValue)>>,
+        &'static str,
+    );
+
+    /// Parse `expr` as `Query` does, with `#`-prefixed `names` and
+    /// `:`-prefixed `values` as a request carries them.
+    fn parse_kce(
+        expr: &str,
+        names: &[(&str, &str)],
+        values: Option<&[(&str, AttributeValue)]>,
+    ) -> Result<KeyCondition, DynamoDbError> {
+        let names: HashMap<String, String> = names
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let values: Option<HashMap<String, AttributeValue>> = values.map(|vs| {
+            vs.iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        });
+        let maps = build_expression_maps(Some(&names), values.as_ref());
+        parse_key_condition_expr(expr, &maps, &LimitsConfig::default())
+    }
+
+    /// The order of the one-condition-per-key check through the engine's
+    /// entry point, on the requests measured 2026-10-31 (table `pk` S HASH,
+    /// `sk` S RANGE). The key value type check and the unused-value check
+    /// run after this parse.
+    #[test]
+    fn key_condition_duplicate_check_order_matches_the_service() {
+        const ONE_PER_KEY: &str = "Invalid KeyConditionExpression: KeyConditionExpressions \
+                                   must only contain one condition per key";
+        const UNDEFINED_U: &str = "Invalid KeyConditionExpression: An expression attribute \
+                                   name used in the document path is not defined; attribute \
+                                   name: #u";
+        const UNDEFINED_A: &str = "Invalid KeyConditionExpression: An expression attribute \
+                                   value used in expression is not defined; attribute value: :a";
+        let s = |v: &str| AttributeValue::S(v.to_owned());
+        let n = AttributeValue::N("1".to_owned());
+        let abc = [(":a", s("alice")), (":b", s("bob")), (":c", s("carol"))];
+        let cases: Vec<KceCase> = vec![
+            (
+                "pk = :a AND pk = :b",
+                vec![],
+                Some(abc[..2].to_vec()),
+                ONE_PER_KEY,
+            ),
+            (
+                "#p = :a AND pk = :n",
+                vec![("#p", "pk")],
+                Some(vec![(":a", s("alice")), (":n", n.clone())]),
+                ONE_PER_KEY,
+            ),
+            (
+                "pk = :a AND #s = :b AND sk = :n",
+                vec![("#s", "sk")],
+                Some(vec![
+                    (":a", s("alice")),
+                    (":b", s("bob")),
+                    (":n", n.clone()),
+                ]),
+                ONE_PER_KEY,
+            ),
+            (
+                "#u = :a AND sk = :b AND sk = :c",
+                vec![],
+                Some(abc.to_vec()),
+                UNDEFINED_U,
+            ),
+            (
+                "pk = :a AND pk = :b AND #u = :c",
+                vec![],
+                Some(abc.to_vec()),
+                UNDEFINED_U,
+            ),
+            ("pk = :a AND pk = :b", vec![], None, UNDEFINED_A),
+            (
+                "pk = :a AND pk = :b",
+                vec![],
+                Some(vec![(":a", s("alice")), (":b", s("bob")), (":z", s("zed"))]),
+                ONE_PER_KEY,
+            ),
+            (
+                "#u = :a AND #u > :b",
+                vec![],
+                Some(abc[..2].to_vec()),
+                UNDEFINED_U,
+            ),
+        ];
+        for (expr, names, values, want) in cases {
+            let got = parse_kce(expr, &names, values.as_deref());
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "expr {expr}: got {got:?}"
+            );
+        }
+        // Without a duplicate the parse leaves the value to the later checks.
+        let got = parse_kce("pk = :n", &[], Some(&[(":n", n)]));
+        assert!(got.is_ok(), "pk = :n: got {got:?}");
     }
 }
