@@ -138,8 +138,10 @@ pub enum Caller {
     /// run): as `Command`, and no check of the store runs, so a root is left
     /// as it is found (neither the default directory nor an identity file is
     /// created; a default root that does not exist yet leaves the store
-    /// unconfigured, logged); the store is returned `checking` and the
-    /// command reads what it needs itself.
+    /// unconfigured, logged, as [`NotConfigured::DefaultRootMissing`] or,
+    /// when the catalog holds rows for it, as
+    /// [`NotConfigured::DefaultRootMissingWithRows`]); the store is
+    /// returned `checking` and the command reads what it needs itself.
     ReadOnlyCommand,
 }
 
@@ -151,9 +153,19 @@ pub enum NotConfigured {
     Absent,
     /// `kind = "disabled"`.
     Disabled,
-    /// A read-only command found that the default root does not exist yet:
-    /// no server has run with this database file.
+    /// A read-only command found that the default root does not exist yet,
+    /// and the catalog holds no rows for it: no server has run with this
+    /// database file.
     DefaultRootMissing(PathBuf),
+    /// A read-only command found the default root missing while the catalog
+    /// holds rows for it: moved away, or a symbolic link to a volume that
+    /// is gone. `label` is the root as the rows record it (the link's
+    /// target, for a link), `store_ids` the ids they carry.
+    DefaultRootMissingWithRows {
+        root: PathBuf,
+        label: String,
+        store_ids: Vec<String>,
+    },
     /// The defaulted root could not be created, opened, validated or checked
     /// while the catalog has no rows for it (module doc): the warning path.
     DefaultRootUnusable {
@@ -180,6 +192,18 @@ impl std::fmt::Display for NotConfigured {
                 "the default root {} does not exist yet: no server has run with this database \
                  file, so there are no store-backed backups to list, purge or sync",
                 root.display()
+            ),
+            Self::DefaultRootMissingWithRows {
+                root,
+                label,
+                store_ids,
+            } => write!(
+                f,
+                "the default root {} is missing while the catalog holds rows for {label} (store \
+                 id {}): a volume that is not mounted, a directory moved away, or a link to a \
+                 volume that is gone; put the root back before listing, purging or syncing it",
+                root.display(),
+                store_ids.join(", ")
             ),
             Self::DefaultRootUnusable { root, problem } => write!(
                 f,
@@ -335,6 +359,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         && let Some(fs) = &config.filesystem
         && !fs.path.exists()
     {
+        if let Some((label, store_ids)) = missing_root_with_rows(catalog, &fs.path).await? {
+            let why = NotConfigured::DefaultRootMissingWithRows {
+                root: fs.path.clone(),
+                label,
+                store_ids,
+            };
+            tracing::warn!("backup store: {why}");
+            return Ok(StoreSetup::without_store(runtime, why));
+        }
         tracing::info!(
             "backup store: the default root {} does not exist yet (no server has run with this \
              database file); there are no store-backed backups to list",
@@ -768,6 +801,63 @@ fn banner_target(config: &extenddb_backup_store::BackupStoreConfig) -> String {
     }
 }
 
+/// The label of a defaulted filesystem root that does not exist, and the
+/// store ids the catalog records for it, when it records any. The labels
+/// tried: the path as configured, its canonical parent joined with its name
+/// (the spelling a server's rows record), and for a dangling symbolic link
+/// its target the same two ways (rows recorded through the link carry the
+/// target's canonical directory). One level of link is followed.
+async fn missing_root_with_rows<C: BackupCatalog + ?Sized>(
+    catalog: &C,
+    path: &Path,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Ok(target) = std::fs::read_link(path) {
+        paths.push(match path.parent() {
+            Some(parent) if target.is_relative() => parent.join(target),
+            _ => target,
+        });
+    }
+    let mut labels: Vec<String> = Vec::new();
+    for path in &paths {
+        for label in [Some(path.clone()), canonical_ancestor(path)]
+            .into_iter()
+            .flatten()
+        {
+            let label = label.display().to_string();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    for label in labels {
+        let ids = catalog
+            .read_store_ids(StoreKind::Filesystem, &label)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the catalog's rows for the default root could not be read: {e}")
+            })?;
+        if !ids.is_empty() {
+            return Ok(Some((label, ids)));
+        }
+    }
+    Ok(None)
+}
+
+/// `path` with its longest existing ancestor canonicalized and the rest of
+/// its components joined back on; `None` when no ancestor resolves.
+fn canonical_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            return Some(rest.iter().rev().fold(canonical, |p, c| p.join(c)));
+        }
+        rest.push(current.file_name()?.to_owned());
+        current = current.parent()?;
+    }
+}
+
 /// A path for an operator's line: quoted when it is empty or begins or ends
 /// with whitespace, so the line shows where it ends.
 fn shown_path(path: &Path) -> String {
@@ -1016,7 +1106,7 @@ mod tests {
     use extenddb_storage::BoxedFuture;
     use extenddb_storage::backup_catalog::{
         BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim, MaintenanceClaim, RestoreJobRow,
-        RestoreTargetKey, StoreIdentity, TimeBounds,
+        RestoreTargetKey, StoreIdentity, StoreRootCount, TimeBounds,
     };
     use extenddb_storage::error::StorageError;
     use futures::stream::BoxStream;
@@ -1142,6 +1232,8 @@ mod tests {
         fn remove_backup_row<'a>(
             &'a self,
             _key: &'a BackupKey,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
         ) -> BoxedFuture<'a, Result<bool, StorageError>> {
             unused()
         }
@@ -1209,6 +1301,28 @@ mod tests {
             }
             let ids = self.ids.clone();
             Box::pin(async move { Ok(ids) })
+        }
+        fn list_backup_rows_by_root<'a>(
+            &'a self,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
+            _status: Option<BackupStatus>,
+        ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+            Box::pin(futures::stream::once(unused()))
+        }
+        fn rewrite_store<'a>(
+            &'a self,
+            _from_kind: StoreKind,
+            _from_root: &'a str,
+            _keys: &'a [BackupKey],
+            _to: &'a StoreIdentity,
+        ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+            unused()
+        }
+        fn summarize_store_roots(
+            &self,
+        ) -> BoxedFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+            unused()
         }
         fn maintenance_claim<'a>(
             &'a self,
@@ -1640,6 +1754,17 @@ mod tests {
             missing
                 .to_string()
                 .contains("/srv/db/backups does not exist yet")
+        );
+        let with_rows = NotConfigured::DefaultRootMissingWithRows {
+            root: PathBuf::from("/srv/db/backups"),
+            label: "/mnt/vol/backups".to_owned(),
+            store_ids: vec!["store-1".to_owned()],
+        }
+        .to_string();
+        assert!(
+            with_rows.contains("/srv/db/backups is missing while the catalog holds rows for /mnt/vol/backups (store id store-1)")
+                && !with_rows.contains("no server has run"),
+            "{with_rows}"
         );
         let unusable = NotConfigured::DefaultRootUnusable {
             root: "/srv/db/backups".to_owned(),

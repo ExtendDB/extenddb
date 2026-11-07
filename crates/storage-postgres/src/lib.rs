@@ -43,6 +43,8 @@ mod vector_search;
 mod worker_store;
 mod workers;
 
+#[doc(hidden)]
+pub use backup_catalog::{REWRITE_ATTEMPTS, REWRITE_LOCK_TIMEOUT, REWRITE_STATEMENT_TIMEOUT};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use backup_engine::claim_session_settings;

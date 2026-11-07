@@ -23,8 +23,10 @@
 //! the detached task ([`start`]) whose answer it awaits for at most
 //! [`RESTORE_REGISTRATION_TIMEOUT`]; past that it answers
 //! `InternalServerError` while the task goes on (the target then appears
-//! through DescribeTable). The task registers the target and its RUNNING
-//! record in one write (`claim_restore`, under the backup row's lock), sends
+//! through DescribeTable). The task reads the maintenance claim (held, the
+//! request is refused with `LimitExceededException` and nothing is
+//! registered, so no record lands while a command holds the claim), then
+//! registers the target and its RUNNING record in one write (`claim_restore`, under the backup row's lock), sends
 //! the job's first beat through the claim (the registration's own
 //! `heartbeat_at` stamp can be old: the design's 4(e) states each backend's
 //! clock, PostgreSQL's `now()` being the transaction's start, so a
@@ -145,8 +147,9 @@ pub const RESTORE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub const TARGET_NOT_EMPTY: &str = "target_not_empty";
 
 /// The reason the reconciler writes on a RUNNING record whose store is not
-/// the configured one.
-pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; configure that store in [backup.store] and restore again";
+/// the configured one. `--move-store` re-points the backup's rows, not the
+/// record, so the restore is run again after the move.
+pub const OTHER_STORE: &str = "the restore reads a store other than the configured one; configure that store in [backup.store], or copy its tree under the configured root and move the backup's rows to the configured store with `extenddb backup sync --move-store <root>`, and restore again";
 
 /// What the request resolved before it spawned the task.
 pub(crate) struct RestoreRequestParts {
@@ -451,6 +454,27 @@ pub(crate) async fn start<S>(
         spool_host: spool_host.clone(),
         owner_generation: UNOWNED_GENERATION,
     };
+    // The maintenance claim immediately before the registration: the
+    // request's check ran before the manifest reads and the permit, and a
+    // command that took the claim since gets no record of this restore. A
+    // claim taken in the gap between this read and the registration is met
+    // by the check after it, below, and by the command's wait.
+    let refused = match storage
+        .check_maintenance_claim(env.settings.stale_job_after)
+        .await
+    {
+        Ok(false) => None,
+        Ok(true) => Some(maintenance_held()),
+        Err(e) => Some(storage_err_to_dynamo(e)),
+    };
+    if let Some(error) = refused {
+        drop(permit);
+        if let Some(registration) = registration {
+            registration.finish(Err(error.clone()));
+        }
+        let _ = reply.send(Err(error));
+        return;
+    }
     let registered = storage
         .claim_restore(&account_id, input, &registration_row)
         .await;

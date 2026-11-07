@@ -24,7 +24,7 @@
 
 use bytes::Bytes;
 use extenddb_backup_store::{BackupStore, ByteStream, StoreError, byte_stream_from};
-use extenddb_backup_store::{MIN_PART_SIZE_BYTES, ObjectMeta};
+use extenddb_backup_store::{MIN_PART_SIZE_BYTES, ObjectMeta, PrefixDeletion};
 use futures::TryStreamExt;
 
 /// Part size every conformance run uses: the smallest S3 accepts, so the
@@ -268,6 +268,47 @@ mod suite {
             0,
             "a prefix that matches nothing deletes nothing"
         );
+    }
+
+    /// `delete_prefix_before` with its deadline passed removes nothing and
+    /// says it did not finish, a prefix that names one object included;
+    /// with a deadline ahead it deletes the prefix as `delete_prefix` does.
+    pub async fn delete_prefix_before_honours_its_deadline(store: &dyn BackupStore) {
+        for key in ["dl/a/1", "dl/a/2", "dl/b/3", "keepdl/4"] {
+            store.put(key, chunked_body(vec![9])).await.unwrap();
+        }
+        let passed = tokio::time::Instant::now();
+        let done = store.delete_prefix_before("dl", passed).await.unwrap();
+        assert_eq!(
+            done,
+            PrefixDeletion {
+                deleted: 0,
+                finished: false
+            },
+            "a deadline already passed starts no removal"
+        );
+        assert_eq!(list_keys(store, "dl").await.len(), 3);
+        let done = store.delete_prefix_before("dl/a/1", passed).await.unwrap();
+        assert_eq!(
+            done,
+            PrefixDeletion {
+                deleted: 0,
+                finished: false
+            },
+            "a prefix that names one object, past its deadline"
+        );
+        assert_eq!(list_keys(store, "dl").await.len(), 3);
+        let ahead = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let done = store.delete_prefix_before("dl", ahead).await.unwrap();
+        assert_eq!(
+            done,
+            PrefixDeletion {
+                deleted: 3,
+                finished: true
+            }
+        );
+        assert!(list_keys(store, "dl").await.is_empty());
+        assert_eq!(list_keys(store, "keepdl").await, vec!["keepdl/4"]);
     }
 
     pub async fn missing_object_is_not_found(store: &dyn BackupStore) {
@@ -658,6 +699,12 @@ mod filesystem {
     }
 
     #[tokio::test]
+    async fn delete_prefix_before_honours_its_deadline() {
+        let (_dir, store) = fs_store().await;
+        suite::delete_prefix_before_honours_its_deadline(&store).await;
+    }
+
+    #[tokio::test]
     async fn missing_object_is_not_found() {
         let (_dir, store) = fs_store().await;
         suite::missing_object_is_not_found(&store).await;
@@ -929,6 +976,42 @@ mod filesystem {
                 "{cell}: the dropped delete_prefix went on and removed {key}"
             );
         }
+    }
+
+    /// A walk held past its deadline right before a removal (the hook, as a
+    /// process paused there would be) removes the entry in flight and no
+    /// other, and says it did not finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_prefix_before_stops_at_its_deadline() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(600);
+        let (dir, mut store) = fs_store().await;
+        store.set_removal_hook(std::sync::Arc::new(move |removals| {
+            if removals == 1 {
+                std::thread::sleep(HOLD);
+            }
+        }));
+        let prefix = dir.path().join("held");
+        private_dir(&prefix);
+        for f in 0..6 {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(prefix.join(format!("f{f}")))
+                .expect("create an object");
+        }
+        let deadline = tokio::time::Instant::now() + HOLD / 2;
+        let done = store.delete_prefix_before("held", deadline).await.unwrap();
+        assert_eq!(
+            done,
+            PrefixDeletion {
+                deleted: 2,
+                finished: false
+            },
+            "the removal before the hold and the one in flight at the deadline"
+        );
+        assert_eq!(std::fs::read_dir(&prefix).unwrap().count(), 4);
     }
 
     /// `validate` beside a `delete_prefix("")`, which removes temporaries
@@ -2799,6 +2882,262 @@ mod s3 {
     async fn delete_prefix_removes_and_counts() {
         let Some(store) = store().await else { return };
         suite::delete_prefix_removes_and_counts(&store).await;
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_before_honours_its_deadline() {
+        let Some(store) = store().await else { return };
+        suite::delete_prefix_before_honours_its_deadline(&store).await;
+    }
+
+    /// Holds the first request of one operation of the deletion on the
+    /// sending thread past the caller's deadline, as a process paused
+    /// between the deadline's check and the request would: `ListObjectsV2`
+    /// (mode 1), `DeleteObjects` (mode 2) or `AbortMultipartUpload` (mode
+    /// 3), once armed. Counts the `ListObjectsV2`, `DeleteObjects`,
+    /// `ListMultipartUploads` and `AbortMultipartUpload` requests sent.
+    #[derive(Debug, Default)]
+    struct HoldOneDeletionRequest {
+        mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        lists: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        upload_lists: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        aborts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// How long [`HoldOneDeletionRequest`] holds its request.
+    const DELETION_HOLD: std::time::Duration = std::time::Duration::from_millis(600);
+
+    impl aws_sdk_s3::config::Intercept for HoldOneDeletionRequest {
+        fn name(&self) -> &'static str {
+            "HoldOneDeletionRequest"
+        }
+
+        fn read_before_execution(
+            &self,
+            context: &aws_sdk_s3::config::interceptors::BeforeSerializationInterceptorContextRef<
+                '_,
+            >,
+            _cfg: &mut aws_sdk_s3::config::ConfigBag,
+        ) -> Result<(), aws_sdk_s3::error::BoxError> {
+            use std::sync::atomic::Ordering;
+            let input = context.input();
+            let is_list = input
+                .downcast_ref::<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Input>()
+                .is_some();
+            let is_delete = input
+                .downcast_ref::<aws_sdk_s3::operation::delete_objects::DeleteObjectsInput>()
+                .is_some();
+            let is_upload_list = input
+                .downcast_ref::<
+                    aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsInput,
+                >()
+                .is_some();
+            let is_abort = input
+                .downcast_ref::<
+                    aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadInput,
+                >()
+                .is_some();
+            if is_delete {
+                self.deletes.fetch_add(1, Ordering::SeqCst);
+            }
+            if is_list {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+            }
+            if is_upload_list {
+                self.upload_lists.fetch_add(1, Ordering::SeqCst);
+            }
+            if is_abort {
+                self.aborts.fetch_add(1, Ordering::SeqCst);
+            }
+            let held = match self.mode.load(Ordering::SeqCst) {
+                1 => is_list,
+                2 => is_delete,
+                3 => is_abort,
+                _ => false,
+            };
+            if held && self.mode.swap(0, Ordering::SeqCst) != 0 {
+                std::thread::sleep(DELETION_HOLD);
+            }
+            Ok(())
+        }
+    }
+
+    /// A deletion whose process is held past its deadline right after a
+    /// check sends the one request that check admitted and no other: held
+    /// at its first `ListObjectsV2`, it deletes nothing; held at its first
+    /// `DeleteObjects`, that batch (two keys, the page size) is deleted and
+    /// no further listing or batch is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_prefix_before_sends_no_request_after_its_deadline() {
+        use std::sync::atomic::Ordering;
+        let Some(endpoint) = endpoint_or_skip() else {
+            return;
+        };
+        let config = test_config(endpoint, test_bucket(), unique_prefix());
+        let hold = HoldOneDeletionRequest::default();
+        let (mode, lists, deletes) = (hold.mode.clone(), hold.lists.clone(), hold.deletes.clone());
+        let mut store = S3Store::open_with_interceptor(&config, hold)
+            .await
+            .expect("S3Store::open_with_interceptor");
+        store.set_page_size(2);
+        ensure_bucket(&config).await;
+        for (cell, armed, deleted) in [
+            ("held at its first ListObjectsV2", 1u8, 0u64),
+            ("held at its first DeleteObjects", 2, 2),
+        ] {
+            let prefix = format!("held{armed}");
+            for n in 0..5 {
+                store
+                    .put(&format!("{prefix}/{n}"), chunked_body(vec![7]))
+                    .await
+                    .unwrap();
+            }
+            deletes.store(0, Ordering::SeqCst);
+            lists.store(0, Ordering::SeqCst);
+            mode.store(armed, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + DELETION_HOLD / 2;
+            let done = store.delete_prefix_before(&prefix, deadline).await.unwrap();
+            assert_eq!(
+                done,
+                PrefixDeletion {
+                    deleted,
+                    finished: false
+                },
+                "{cell}"
+            );
+            assert_eq!(
+                deletes.load(Ordering::SeqCst),
+                usize::try_from(deleted / 2).unwrap(),
+                "{cell}: the DeleteObjects requests sent"
+            );
+            assert_eq!(
+                lists.load(Ordering::SeqCst),
+                1,
+                "{cell}: the ListObjectsV2 requests sent"
+            );
+            assert_eq!(
+                list_keys(&store, &prefix).await.len(),
+                usize::try_from(5 - deleted).unwrap(),
+                "{cell}: the objects left"
+            );
+            store.delete_prefix(&prefix).await.unwrap();
+        }
+    }
+
+    /// The multipart half of the deadline. Held at the last `DeleteObjects`
+    /// of a single page past its deadline, with an upload open under the
+    /// prefix: the page is deleted, no `ListMultipartUploads` is sent, the
+    /// upload stays open and the deletion answers unfinished. Held at its
+    /// first `AbortMultipartUpload` past the deadline, with two uploads open
+    /// and no object: that abort is sent, the second upload is not, and the
+    /// deletion answers unfinished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_prefix_before_aborts_no_upload_after_its_deadline() {
+        use std::sync::atomic::Ordering;
+        let Some(endpoint) = endpoint_or_skip() else {
+            return;
+        };
+        let config = test_config(endpoint, test_bucket(), unique_prefix());
+        let hold = HoldOneDeletionRequest::default();
+        let (mode, upload_lists, aborts) = (
+            hold.mode.clone(),
+            hold.upload_lists.clone(),
+            hold.aborts.clone(),
+        );
+        let store = S3Store::open_with_interceptor(&config, hold)
+            .await
+            .expect("S3Store::open_with_interceptor");
+        ensure_bucket(&config).await;
+        let client = raw_client(&config).await;
+        let open_uploads = |prefix: String| {
+            let client = client.clone();
+            let bucket = config.bucket.clone();
+            async move {
+                client
+                    .list_multipart_uploads()
+                    .bucket(bucket)
+                    .prefix(prefix)
+                    .send()
+                    .await
+                    .expect("list_multipart_uploads")
+                    .uploads()
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.key().unwrap_or_default().to_owned(),
+                            u.upload_id().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        for (cell, armed, objects, uploads, deleted, aborted) in [
+            (
+                "held at its last DeleteObjects",
+                2u8,
+                3u64,
+                1usize,
+                3u64,
+                0usize,
+            ),
+            ("held at its first AbortMultipartUpload", 3, 0, 2, 0, 1),
+        ] {
+            let prefix = format!("mp{armed}");
+            for n in 0..objects {
+                store
+                    .put(&format!("{prefix}/{n}"), chunked_body(vec![7]))
+                    .await
+                    .unwrap();
+            }
+            let bucket_prefix = format!("{}{prefix}/", config.prefix);
+            for n in 0..uploads {
+                client
+                    .create_multipart_upload()
+                    .bucket(&config.bucket)
+                    .key(format!("{bucket_prefix}up{n}"))
+                    .send()
+                    .await
+                    .expect("create an upload");
+            }
+            assert_eq!(open_uploads(bucket_prefix.clone()).await.len(), uploads);
+            upload_lists.store(0, Ordering::SeqCst);
+            aborts.store(0, Ordering::SeqCst);
+            mode.store(armed, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + DELETION_HOLD / 2;
+            let done = store.delete_prefix_before(&prefix, deadline).await.unwrap();
+            assert_eq!(
+                done,
+                PrefixDeletion {
+                    deleted,
+                    finished: false
+                },
+                "{cell}"
+            );
+            assert_eq!(
+                upload_lists.load(Ordering::SeqCst),
+                usize::from(armed == 3),
+                "{cell}: the ListMultipartUploads requests sent"
+            );
+            assert_eq!(
+                aborts.load(Ordering::SeqCst),
+                aborted,
+                "{cell}: the AbortMultipartUpload requests sent"
+            );
+            let left = open_uploads(bucket_prefix).await;
+            assert_eq!(left.len(), uploads - aborted, "{cell}: the uploads left");
+            for (key, id) in left {
+                client
+                    .abort_multipart_upload()
+                    .bucket(&config.bucket)
+                    .key(key)
+                    .upload_id(id)
+                    .send()
+                    .await
+                    .expect("abort a left upload");
+            }
+            store.delete_prefix(&prefix).await.unwrap();
+        }
     }
 
     #[tokio::test]

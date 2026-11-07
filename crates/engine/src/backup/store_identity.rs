@@ -203,6 +203,17 @@ pub enum StoreProblem {
 }
 
 impl StoreProblem {
+    /// The row ids an identity mismatch is about (`IdMismatch`'s row ids,
+    /// `MultipleRowIds`' ids); empty for every other problem.
+    #[must_use]
+    pub fn mismatch_row_ids(&self) -> &[String] {
+        match self {
+            Self::IdMismatch { row_ids, .. } => row_ids,
+            Self::MultipleRowIds(ids) => ids,
+            _ => &[],
+        }
+    }
+
     /// The problem's category, one or two words, for an API refusal.
     #[must_use]
     pub fn category(&self) -> &'static str {

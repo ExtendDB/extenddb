@@ -222,14 +222,21 @@ pub struct Wait {
     pub poll: Duration,
 }
 
-/// Wait until no CREATING or FAILED backup row of `identity` has a live
-/// owner and no restore job is RUNNING, re-reading every `wait.poll`, for
-/// at most `wait.limit`; the claim lost, a catalog read failing, or a
+/// Wait until no CREATING or FAILED backup row of any of `identities` has a
+/// live owner and no restore job is RUNNING, re-reading every `wait.poll`,
+/// for at most `wait.limit`; the claim lost, a catalog read failing, or a
 /// signal ends it early. The jobs found running are reported through
-/// `announce` the first time they are seen.
+/// `announce` the first time they are seen. Purge and `backup sync`'s
+/// `--adopt-store` and `--prune-missing` pass the configured store;
+/// `--move-store` and `--forget-store` add every store id the catalog
+/// records for the old root (`read_store_ids`), so a CreateBackup of a
+/// server still configured with that root is waited on too; an empty slice
+/// waits on the RUNNING restores alone (`--forget-backup` with no store
+/// configured, or with a store whose identity the command could not read:
+/// an unhealthy store, or a root with no identity file).
 pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
     storage: &S,
-    identity: &StoreIdentity,
+    identities: &[StoreIdentity],
     claim: &HeldClaim,
     wait: Wait,
     interrupt: &mut Interrupt,
@@ -244,7 +251,7 @@ pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
         if let Some(signal) = interrupt.signalled() {
             return WaitOutcome::Interrupted(signal);
         }
-        let remaining = match busy_jobs(storage, identity, wait.owner_window).await {
+        let remaining = match busy_jobs(storage, identities, wait.owner_window).await {
             Ok(remaining) => remaining,
             Err(e) => return WaitOutcome::CatalogError(e),
         };
@@ -275,34 +282,36 @@ pub async fn wait_for_quiet<S: BackupCatalog + ?Sized>(
 /// (`list_running_restore_jobs`), with no age.
 async fn busy_jobs<S: BackupCatalog + ?Sized>(
     storage: &S,
-    identity: &StoreIdentity,
+    identities: &[StoreIdentity],
     owner_window: Duration,
 ) -> Result<Vec<String>, String> {
     let mut busy = Vec::new();
-    for status in [BackupStatus::Creating, BackupStatus::Failed] {
-        let rows: Vec<BackupRow> = storage
-            .list_backup_rows(Some(status), identity)
-            .try_collect()
-            .await
-            .map_err(|e| format!("cannot list the catalog's backup rows: {e}"))?;
-        let dead: Vec<BackupRow> = storage
-            .list_backup_rows_older_than(status, identity, StaleClock::Heartbeat, owner_window)
-            .try_collect()
-            .await
-            .map_err(|e| format!("cannot list the catalog's backup rows by age: {e}"))?;
-        for row in rows {
-            if dead.iter().any(|d| d.backup_arn == row.backup_arn) {
-                continue;
+    for identity in identities {
+        for status in [BackupStatus::Creating, BackupStatus::Failed] {
+            let rows: Vec<BackupRow> = storage
+                .list_backup_rows(Some(status), identity)
+                .try_collect()
+                .await
+                .map_err(|e| format!("cannot list the catalog's backup rows: {e}"))?;
+            let dead: Vec<BackupRow> = storage
+                .list_backup_rows_older_than(status, identity, StaleClock::Heartbeat, owner_window)
+                .try_collect()
+                .await
+                .map_err(|e| format!("cannot list the catalog's backup rows by age: {e}"))?;
+            for row in rows {
+                if dead.iter().any(|d| d.backup_arn == row.backup_arn) {
+                    continue;
+                }
+                busy.push(format!(
+                    "{} {} has a live owner (heartbeat within stale_job_after_secs)",
+                    if status == BackupStatus::Creating {
+                        "CreateBackup"
+                    } else {
+                        "the FAILED backup"
+                    },
+                    row.backup_arn
+                ));
             }
-            busy.push(format!(
-                "{} {} has a live owner (heartbeat within stale_job_after_secs)",
-                if status == BackupStatus::Creating {
-                    "CreateBackup"
-                } else {
-                    "the FAILED backup"
-                },
-                row.backup_arn
-            ));
         }
     }
     // Every RUNNING restore job, by status alone: a record stamped in the
@@ -446,7 +455,7 @@ pub async fn purge_row<S: BackupCatalog + ?Sized>(
             .map_err(|e| format!("cannot mark the row DELETED: {e}"))?;
     }
     if storage
-        .remove_backup_row(&key)
+        .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
         .await
         .map_err(|e| format!("cannot remove the row: {e}"))?
     {

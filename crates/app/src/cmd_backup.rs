@@ -169,6 +169,37 @@
 //! A row `--prune-missing` leaves because its manifest is back or another
 //! writer moved it is reported, and the exit stays 0.
 //!
+//! Every sync that listed the root to its end then reports the rows of the
+//! stores other than the configured one: per store (kind, root, id) the
+//! rows per status and each CREATING and DELETING row by ARN, which no
+//! sync changes (`extenddb_engine::store_maintenance`'s module doc states
+//! all three options below). `--move-store <old root>` re-points the rows
+//! of a root whose tree was copied under the configured root: it needs the
+//! configured store healthy, refuses the configured root itself and a root
+//! with no rows (printing the stores the catalog knows), takes the claim
+//! (on SQLite too) and waits for the jobs of the configured store and of
+//! every store id of the old root, checks every row against the copy and
+//! names each that stops the move, moves none while any does, and then
+//! syncs the configured root; it exits 1 when a row stops it, is left
+//! under the old root, or lands there during that sync (the closing report
+//! of other stores names it). `--forget-store <root>` and `--forget-backup
+//! <arn>` (repeatable, in order, up to the first refusal) remove rows
+//! outright, delete no object (but for a DELETING row of the configured
+//! store, whose deletion is finished first when the store's check passed),
+//! and run on a store in any state and with no store configured, under the
+//! claim on every backend. They open the store writing nothing to it
+//! ([`Mode::Forget`]). They exit 1 for a row they leave (a restore reading
+//! it, a live owner, another spelling of the ARN, an in-catalog backup, a
+//! DELETING row of an unhealthy configured store, a row of a configured
+//! root that has no identity file under its rows, or on SQLite of the
+//! default root found missing with rows for it). After `--forget-backup`
+//! the configured store's check runs once and its outcome is printed: a
+//! store left unhealthy by the removed row's missing manifest reads
+//! healthy, or names the next row whose manifest is gone. The three
+//! options conflict with each other, with `--adopt-store` and with
+//! `--prune-missing`. Each row they change is logged under
+//! `extenddb::audit`.
+//!
 //! Every `backup` command refuses an in-memory SQLite database (a
 //! `[storage.sqlite] path` naming no file) before it opens the catalog: it
 //! would open a new, empty catalog that ends with the command. A server on
@@ -183,6 +214,7 @@ use extenddb_engine::maintenance::{
     Interrupt, RemoveTarget, Stop, Wait, WaitOutcome, purge_rows, remove_target, wait_for_quiet,
 };
 use extenddb_engine::{BackupRuntime, ConfiguredStore, HeldClaim, StoreHealth, StoreProblem};
+use extenddb_server::backup_store::NotConfigured;
 use extenddb_storage::StorageEngine;
 use extenddb_storage::backup_catalog::{
     BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL, JobStatus, StoreIdentity,
@@ -235,9 +267,9 @@ enum BackupCommand {
     /// Give a catalog row to every backup of the configured backup store that has none: each
     /// prefix with a verified manifest (its sidecar matching, every data file present at its
     /// size, its ARN naming the prefix's account, table and backup id) gets an AVAILABLE row.
-    /// Reports the prefixes it skips and the AVAILABLE rows whose manifest is gone. Refuses on
-    /// an unhealthy store. Beside servers (PostgreSQL, MongoDB, Cassandra) it takes the
-    /// maintenance claim; on SQLite it needs the server stopped.
+    /// Reports the prefixes it skips, the AVAILABLE rows whose manifest is gone and the rows of
+    /// other stores. Refuses on an unhealthy store. Beside servers (PostgreSQL, MongoDB,
+    /// Cassandra) it takes the maintenance claim; on SQLite it needs the server stopped.
     Sync {
         /// Make this catalog the owner of a store root whose extenddb-store.json names another
         /// catalog, then sync. Stop every server of the catalog the file names first. Takes the
@@ -249,6 +281,43 @@ enum BackupCommand {
         /// of the same path). Takes the maintenance claim first and waits for running jobs.
         #[arg(long)]
         prune_missing: bool,
+        /// Move the rows of OLD_ROOT (its label as the catalog stores it, as backup list and
+        /// the report of other stores print it) to the configured store, after the old root's
+        /// tree was copied under the configured root. Reconfigure every server first. Checks
+        /// each row against the copy and moves none while any row stops the move (all are
+        /// named); then syncs. Takes the maintenance claim and waits for running jobs.
+        #[arg(
+            long,
+            value_name = "OLD_ROOT",
+            conflicts_with_all = ["adopt_store", "prune_missing", "forget_store", "forget_backup"]
+        )]
+        move_store: Option<String>,
+        /// Remove every catalog row of ROOT, a root other than the configured one, outright:
+        /// no tombstone is left and no object is deleted, so a later sync where the bytes are
+        /// adopts them again. Runs on a store in any state and with no store configured. Takes
+        /// the maintenance claim and waits for running jobs, as purge does; a row whose job
+        /// writes a heartbeat after the wait is left and named.
+        #[arg(
+            long,
+            value_name = "ROOT",
+            conflicts_with_all = ["adopt_store", "prune_missing", "forget_backup"]
+        )]
+        forget_store: Option<String>,
+        /// Remove the catalog row of the backup ARN outright, of any status and any store: no
+        /// tombstone is left and no object is deleted, except that a DELETING row of the
+        /// configured store has its deletion finished first. Repeat the option for more
+        /// backups; they are removed in order, up to the first that is refused. Runs on a store
+        /// in any state and with no store configured, and runs the store's check afterwards
+        /// unless the root had no extenddb-store.json. Takes the maintenance claim and waits for
+        /// running jobs, as purge does; a row whose job writes a heartbeat after the wait is
+        /// left and named.
+        #[arg(
+            long,
+            value_name = "ARN",
+            action = clap::ArgAction::Append,
+            conflicts_with_all = ["adopt_store", "prune_missing"]
+        )]
+        forget_backup: Vec<String>,
     },
 }
 
@@ -316,21 +385,67 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
         catalog.close().await;
         return done;
     }
+    // The forget options run with no store configured too: the catalog is
+    // kept open without one.
+    let forgetting = matches!(
+        &args.command,
+        BackupCommand::Sync { forget_store, forget_backup, .. }
+            if forget_store.is_some() || !forget_backup.is_empty()
+    );
     let (command, mode) = match args.command {
         BackupCommand::List { .. } => (LIST, Mode::Read),
         BackupCommand::Purge { confirm: false } => (PURGE, Mode::Read),
         BackupCommand::Purge { confirm: true } => (PURGE, Mode::Write),
+        BackupCommand::Sync { .. } if forgetting => (SYNC, Mode::Forget),
         BackupCommand::Sync { .. } => (SYNC, Mode::Sync),
         BackupCommand::RemoveTarget { .. } => unreachable!("handled above"),
     };
-    let opening = open(&app_config, &args.config, release, command, mode).await?;
+    let opening = open(
+        &app_config,
+        &args.config,
+        release,
+        command,
+        mode,
+        forgetting,
+    )
+    .await?;
     if let Some(signal) = interrupt.signalled() {
-        if let Opening::Store(opened) = opening {
-            opened.close().await;
+        match opening {
+            Opening::Store(opened) => opened.close().await,
+            Opening::CatalogOnly(catalog, _) => catalog.close().await,
+            Opening::NoStore(_) => {}
         }
         anyhow::bail!("{signal} received while opening the catalog; nothing was changed");
     }
     match (args.command, opening) {
+        (
+            BackupCommand::Sync {
+                forget_store,
+                forget_backup,
+                ..
+            },
+            opening,
+        ) if forgetting => {
+            let (catalog, store) = match opening {
+                Opening::Store(opened) => {
+                    let Opened { catalog, identity } = opened;
+                    (catalog, Ok(identity))
+                }
+                Opening::CatalogOnly(catalog, why) => (catalog, Err(why)),
+                Opening::NoStore(why) => anyhow::bail!("{why}"),
+            };
+            let done = forget(
+                &catalog,
+                store.as_ref(),
+                &app_config,
+                forget_store.as_deref(),
+                &forget_backup,
+                interrupt,
+            )
+            .await;
+            catalog.close().await;
+            done
+        }
         (BackupCommand::List { failed }, Opening::Store(opened)) => {
             let done = list(&opened, failed).await;
             opened.close().await;
@@ -372,21 +487,39 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
             BackupCommand::Sync {
                 adopt_store,
                 prune_missing,
+                move_store,
+                ..
             },
             Opening::Store(opened),
         ) => {
-            let done = sync(&opened, &app_config, adopt_store, prune_missing, interrupt).await;
+            let done = sync(
+                &opened,
+                &app_config,
+                SyncOptions {
+                    adopt_store,
+                    prune_missing,
+                    move_store: move_store.as_deref(),
+                },
+                interrupt,
+            )
+            .await;
             opened.close().await;
             done
         }
         (BackupCommand::Sync { .. }, Opening::NoStore(reason)) => anyhow::bail!("{reason}"),
+        (_, Opening::CatalogOnly(catalog, reason)) => {
+            catalog.close().await;
+            anyhow::bail!("{reason}")
+        }
     }
 }
 
-/// What `open` found: the configured store, or why there is none.
+/// What `open` found: the configured store, or why there is none (with the
+/// catalog still open when the caller asked to keep it).
 enum Opening {
     Store(Opened),
     NoStore(String),
+    CatalogOnly(Catalog, NotConfigured),
 }
 
 /// How a command opens the catalog.
@@ -411,6 +544,14 @@ enum Mode {
     /// (`remove-target`): the store is described as `Read` leaves it, so
     /// neither the default root nor an identity file is created.
     WriteCatalogOnly,
+    /// As `Write`, for `backup sync --forget-store` and `--forget-backup`,
+    /// which write nothing to the root: the store is described as `Read`
+    /// leaves it (no default root created, no `validate` and its probe
+    /// file), the identity file is read and never written, and when it
+    /// agrees with the rows the check that writes nothing
+    /// (`check_configured_store_read_only`) runs once and is recorded, so
+    /// a DELETING row of a healthy store can have its deletion finished.
+    Forget,
 }
 
 /// The open catalog: the storage engine, the backup runtime (with the
@@ -443,10 +584,7 @@ async fn open_catalog(
     release: &'static str,
     command: &'static str,
     mode: Mode,
-) -> anyhow::Result<(
-    Catalog,
-    Option<extenddb_server::backup_store::NotConfigured>,
-)> {
+) -> anyhow::Result<(Catalog, Option<NotConfigured>)> {
     let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
     options.release = release;
     options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
@@ -492,7 +630,7 @@ async fn open_catalog(
         &backend,
         &*storage,
         match mode {
-            Mode::Read | Mode::WriteCatalogOnly => {
+            Mode::Read | Mode::WriteCatalogOnly | Mode::Forget => {
                 extenddb_server::backup_store::Caller::ReadOnlyCommand
             }
             Mode::Write => extenddb_server::backup_store::Caller::Command,
@@ -557,6 +695,7 @@ async fn open(
     release: &'static str,
     command: &'static str,
     mode: Mode,
+    keep_without_store: bool,
 ) -> anyhow::Result<Opening> {
     let (catalog, not_configured) =
         open_catalog(app_config, config_path, release, command, mode).await?;
@@ -565,6 +704,9 @@ async fn open(
         // absent or disabled, the default root not yet created, or the
         // default root failed its check with no rows for it.
         let why = not_configured.expect("a runtime without a store carries the reason");
+        if keep_without_store {
+            return Ok(Opening::CatalogOnly(catalog, why));
+        }
         catalog.close().await;
         return Ok(Opening::NoStore(why.to_string()));
     };
@@ -580,6 +722,32 @@ async fn open(
         (Mode::Read | Mode::WriteCatalogOnly, _) => {
             match extenddb_engine::read_identity_bounded(store, &**storage).await {
                 Ok(Some(identity)) => Identity::Known(identity),
+                Ok(None) => Identity::Empty,
+                Err(problem) => Identity::Problem(problem),
+            }
+        }
+        (Mode::Forget, _) => {
+            match extenddb_engine::read_identity_bounded(store, &**storage).await {
+                Ok(Some(identity)) => {
+                    let check = extenddb_engine::check_configured_store_read_only(
+                        store,
+                        &**storage,
+                        Some(&identity),
+                    )
+                    .await;
+                    // A file gone since the read leaves the store checking:
+                    // not healthy, so nothing is deleted.
+                    match check {
+                        Ok(Some(checked)) => {
+                            store.record_check(Ok(checked));
+                        }
+                        Ok(None) => {}
+                        Err(problem) => {
+                            store.record_check(Err(problem));
+                        }
+                    }
+                    Identity::Known(identity)
+                }
                 Ok(None) => Identity::Empty,
                 Err(problem) => Identity::Problem(problem),
             }
@@ -846,7 +1014,7 @@ async fn purge(
     // live owner is told apart by is zero. On the other backends purge runs
     // beside live servers, whose jobs heartbeat within `stale_after`.
     let owner_window = if opened.catalog.backend == "sqlite" {
-        resolve_dead_owners(opened).await;
+        resolve_dead_owners(&opened.catalog).await;
         Duration::ZERO
     } else {
         stale_after
@@ -857,7 +1025,7 @@ async fn purge(
     let started = Instant::now();
     let outcome = wait_for_quiet(
         storage,
-        identity,
+        std::slice::from_ref(identity),
         &claim,
         Wait {
             owner_window,
@@ -1019,13 +1187,26 @@ async fn signal_name() -> &'static str {
 /// command's own claim would read as held only within one instant of its
 /// heartbeat). What was resolved is printed; a failure is printed and the
 /// wait decides.
-async fn resolve_dead_owners(opened: &Opened) {
+async fn resolve_dead_owners(catalog: &Catalog) -> Vec<String> {
+    resolve_dead_owners_with(
+        catalog,
+        extenddb_engine::reconciler::ReconcilerState::for_maintenance_holder(),
+    )
+    .await
+}
+
+/// [`resolve_dead_owners`] with the cycle's `state`; returns the ARNs of
+/// the DELETING rows whose deletion the cycle finished.
+async fn resolve_dead_owners_with(
+    catalog: &Catalog,
+    mut state: extenddb_engine::reconciler::ReconcilerState,
+) -> Vec<String> {
     match extenddb_engine::reconciler::cycle(
-        &opened.catalog.storage,
-        &opened.catalog.runtime,
+        &catalog.storage,
+        &catalog.runtime,
         Duration::ZERO,
-        &opened.catalog.backend,
-        &mut extenddb_engine::reconciler::ReconcilerState::for_maintenance_holder(),
+        &catalog.backend,
+        &mut state,
     )
     .await
     {
@@ -1065,8 +1246,12 @@ async fn resolve_dead_owners(opened: &Opened) {
                      command's write"
                 );
             }
+            report.deletions_finished
         }
-        Err(e) => println!("could not resolve the jobs the stopped server left: {e}"),
+        Err(e) => {
+            println!("could not resolve the jobs the stopped server left: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -1132,15 +1317,29 @@ async fn remove_restore_target(
     Ok(())
 }
 
-/// `backup sync [--adopt-store] [--prune-missing]` (module doc).
+/// The options `sync` was given (`--forget-store` and `--forget-backup`
+/// are [`forget`]'s).
+#[derive(Clone, Copy)]
+struct SyncOptions<'a> {
+    adopt_store: bool,
+    prune_missing: bool,
+    move_store: Option<&'a str>,
+}
+
+/// `backup sync [--adopt-store] [--prune-missing] [--move-store <old root>]`
+/// (module doc).
 #[allow(clippy::too_many_lines)]
 async fn sync(
     opened: &Opened,
     app_config: &config::AppConfig,
-    adopt_store: bool,
-    prune_missing: bool,
+    options: SyncOptions<'_>,
     mut interrupt: Interrupt,
 ) -> anyhow::Result<()> {
+    let SyncOptions {
+        adopt_store,
+        prune_missing,
+        move_store,
+    } = options;
     let storage = &*opened.catalog.storage;
     let configured = opened.store();
     println!("=== extenddb backup sync ===");
@@ -1185,9 +1384,10 @@ async fn sync(
         }
         Identity::Problem(problem) => anyhow::bail!(
             "the {} backup store {} is unhealthy: {problem}; sync changes no row while the store \
-             is unhealthy",
+             is unhealthy{}",
             configured.kind,
-            configured.root
+            configured.root,
+            manifest_missing_hint(problem)
         ),
         Identity::Empty => anyhow::bail!(
             "the {} backup store {} has no {}: its check did not run",
@@ -1197,53 +1397,69 @@ async fn sync(
         ),
     };
 
+    // The old root `--move-store` names: refused before the claim when it is
+    // the configured root or has no rows.
+    let moving = match move_store {
+        Some(root) => {
+            match extenddb_engine::store_maintenance::locate_root(
+                storage,
+                root,
+                Some(&configured.root),
+            )
+            .await
+            {
+                Ok(located) => Some(located),
+                Err(refusal) => return Err(root_refusal("--move-store", root, refusal)),
+            }
+        }
+        None => None,
+    };
+
     // On SQLite the command holds the serve lock, which already excludes
     // every server and every other command. Elsewhere every sync takes the
     // maintenance claim, so no purge removes a row between this sync's row
     // read and its insert and then deletes the bytes it adopted; plain sync
     // waits for no job, since its insert-if-absent orders it against a
-    // CreateBackup. The options wait for running jobs as purge does.
+    // CreateBackup. The options wait for running jobs as purge does,
+    // `--move-store` for those of the old root's store ids too.
     let sqlite = opened.catalog.backend == "sqlite";
-    let waits = adopt_store || prune_missing;
+    let waits = adopt_store || prune_missing || moving.is_some();
     let mut claim = None;
     if !sqlite || waits {
         let backup = &app_config.backup;
         let stale_after = Duration::from_secs(backup.stale_job_after_secs);
-        let holder = format!(
-            "extenddb backup sync on {} (pid {})",
-            extenddb_server::backup_store::hostname(),
-            std::process::id()
-        );
-        let taken = storage
-            .maintenance_claim(&holder, stale_after)
-            .await
-            .map_err(|e| match e {
-                StorageError::AlreadyExists(m) => anyhow::anyhow!(
-                    "{m}; one maintenance command runs at a time, and a claim whose holder died \
-                     expires after stale_job_after_secs ({} s)",
-                    backup.stale_job_after_secs
-                ),
-                other => anyhow::anyhow!("cannot take the maintenance claim: {other}"),
-            })?;
-        println!("Took the maintenance claim as {holder:?}.");
-        let held = HeldClaim::start(taken, JOB_HEARTBEAT_INTERVAL);
-        if waits
-            && let Err(refusal) = wait_for_jobs(
-                opened,
-                configured,
-                known.as_ref(),
+        let held = take_claim(storage, app_config).await?;
+        if waits {
+            let mut identities = match &known {
+                Some(identity) => vec![identity.clone()],
+                None => match adopt_wait_identity(configured).await {
+                    Ok(identity) => vec![identity],
+                    Err(refusal) => {
+                        release(held).await;
+                        return Err(refusal);
+                    }
+                },
+            };
+            if let Some(located) = &moving {
+                identities.extend(located.identities());
+            }
+            if let Err(refusal) = wait_for_jobs(
+                &opened.catalog,
+                &identities,
                 &held,
                 &mut interrupt,
                 stale_after,
+                false,
             )
             .await
-        {
-            release(held).await;
-            return Err(refusal);
+            {
+                release(held).await;
+                return Err(refusal);
+            }
         }
         claim = Some(held);
     } else {
-        resolve_dead_owners(opened).await;
+        let _ = resolve_dead_owners(&opened.catalog).await;
     }
 
     let done = sync_held(
@@ -1252,6 +1468,7 @@ async fn sync(
         known,
         adopting,
         prune_missing,
+        moving.as_ref(),
         claim.as_ref(),
         &interrupt,
     )
@@ -1262,59 +1479,131 @@ async fn sync(
     done
 }
 
-/// The wait `--adopt-store` and `--prune-missing` run under the claim, as
-/// purge's: on SQLite after the dead-owner resolutions with a zero window.
-/// The refusal is the command's error, the claim still held.
+/// Take the maintenance claim for `backup sync` and start its heartbeat.
+async fn take_claim(
+    storage: &dyn StorageEngine,
+    app_config: &config::AppConfig,
+) -> anyhow::Result<HeldClaim> {
+    let backup = &app_config.backup;
+    let stale_after = Duration::from_secs(backup.stale_job_after_secs);
+    let holder = format!(
+        "extenddb backup sync on {} (pid {})",
+        extenddb_server::backup_store::hostname(),
+        std::process::id()
+    );
+    let taken = storage
+        .maintenance_claim(&holder, stale_after)
+        .await
+        .map_err(|e| match e {
+            StorageError::AlreadyExists(m) => anyhow::anyhow!(
+                "{m}; one maintenance command runs at a time, and a claim whose holder died \
+                 expires after stale_job_after_secs ({} s)",
+                backup.stale_job_after_secs
+            ),
+            other => anyhow::anyhow!("cannot take the maintenance claim: {other}"),
+        })?;
+    println!("Took the maintenance claim as {holder:?}.");
+    Ok(HeldClaim::start(taken, JOB_HEARTBEAT_INTERVAL))
+}
+
+/// The command's error for a root `--move-store` or `--forget-store`
+/// (`option`) refused, the known stores printed first when the root has no
+/// rows.
+fn root_refusal(
+    option: &str,
+    root: &str,
+    refusal: extenddb_engine::store_maintenance::RootRefusal,
+) -> anyhow::Error {
+    use extenddb_engine::store_maintenance::RootRefusal;
+    match refusal {
+        RootRefusal::ConfiguredRoot if option == "--move-store" => anyhow::anyhow!(
+            "{option} {root}: that is the configured store's root, so nothing would move. Give \
+             the root the rows were written under, as backup list printed it before the \
+             configuration changed or as backup sync's report of other stores prints it"
+        ),
+        RootRefusal::ConfiguredRoot => anyhow::anyhow!(
+            "{option} {root}: that is the configured store's root, which {option} refuses so \
+             the store in use cannot lose its rows by a slip; extenddb backup purge deletes the \
+             configured store's backups, and backup sync --prune-missing removes its AVAILABLE \
+             rows whose manifest is gone"
+        ),
+        RootRefusal::NoRows(known) => {
+            println!();
+            println!("--- The stores the catalog holds backup rows for:");
+            for line in known_store_lines(&known) {
+                println!("{line}");
+            }
+            anyhow::anyhow!(
+                "{option} {root}: the catalog has no backup row under that root (a root matches \
+                 as the catalog stores it, byte for byte: a trailing / or an S3 root's \
+                 ?endpoint= suffix makes another root); the roots it holds rows for are listed \
+                 above"
+            )
+        }
+        RootRefusal::Catalog(e) => anyhow::anyhow!("the catalog could not be read: {e}"),
+    }
+}
+
+/// The identity `--adopt-store`'s wait reads rows of: the root's file id,
+/// before the adoption as after it.
+async fn adopt_wait_identity(configured: &ConfiguredStore) -> anyhow::Result<StoreIdentity> {
+    let file = tokio::time::timeout(
+        configured.check_timeout(),
+        extenddb_engine::store_identity::read_identity_file(&*configured.store),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the store's {} could not be read within {} s",
+            extenddb_engine::STORE_IDENTITY_KEY,
+            configured.check_timeout().as_secs()
+        )
+    })?
+    .map_err(|e| anyhow::anyhow!("{e}"))?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "the root's {} is gone; run the command again",
+            extenddb_engine::STORE_IDENTITY_KEY
+        )
+    })?;
+    Ok(StoreIdentity {
+        store_kind: configured.kind,
+        store_root: configured.root.clone(),
+        store_id: file.store_id,
+    })
+}
+
+/// The wait the options run under the claim, as purge's, over the rows of
+/// `identities` and every RUNNING restore: on SQLite after the dead-owner
+/// resolutions with a zero window, whose cycle runs the store's check
+/// unless `writes_nothing` (the forget options, which record their own
+/// check that writes nothing). Returns the DELETING rows whose deletion
+/// that cycle finished. The refusal is the command's error, the claim
+/// still held.
 async fn wait_for_jobs(
-    opened: &Opened,
-    configured: &ConfiguredStore,
-    known: Option<&StoreIdentity>,
+    catalog: &Catalog,
+    identities: &[StoreIdentity],
     claim: &HeldClaim,
     interrupt: &mut Interrupt,
     stale_after: Duration,
-) -> anyhow::Result<()> {
-    let storage = &*opened.catalog.storage;
-    // The identity the wait reads rows of: the file's id, before the
-    // adoption as after it.
-    let wait_identity = match known {
-        Some(identity) => identity.clone(),
-        None => {
-            let file = tokio::time::timeout(
-                configured.check_timeout(),
-                extenddb_engine::store_identity::read_identity_file(&*configured.store),
+    writes_nothing: bool,
+) -> anyhow::Result<Vec<String>> {
+    let storage = &*catalog.storage;
+    let mut finished = Vec::new();
+    if catalog.backend == "sqlite" {
+        let state = if writes_nothing {
+            extenddb_engine::reconciler::ReconcilerState::for_maintenance_holder_without_store_check(
             )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "the store's {} could not be read within {} s",
-                    extenddb_engine::STORE_IDENTITY_KEY,
-                    configured.check_timeout().as_secs()
-                )
-            })?
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the root's {} is gone; run the command again",
-                    extenddb_engine::STORE_IDENTITY_KEY
-                )
-            })?;
-            StoreIdentity {
-                store_kind: configured.kind,
-                store_root: configured.root.clone(),
-                store_id: file.store_id,
-            }
-        }
-    };
-    let owner_window = if opened.catalog.backend == "sqlite" {
-        resolve_dead_owners(opened).await;
-        Duration::ZERO
-    } else {
-        stale_after
-    };
+        } else {
+            extenddb_engine::reconciler::ReconcilerState::for_maintenance_holder()
+        };
+        finished = resolve_dead_owners_with(catalog, state).await;
+    }
+    let owner_window = owner_window(&catalog.backend, stale_after);
     let started = Instant::now();
     let outcome = wait_for_quiet(
         storage,
-        &wait_identity,
+        identities,
         claim,
         Wait {
             owner_window,
@@ -1331,7 +1620,7 @@ async fn wait_for_jobs(
     )
     .await;
     match outcome {
-        WaitOutcome::Quiet => Ok(()),
+        WaitOutcome::Quiet => Ok(finished),
         WaitOutcome::Busy(remaining) => Err(anyhow::anyhow!(
             "jobs were still running after waiting {} s (2 * stale_job_after_secs): {}. The \
              maintenance claim is released; retry once they finish",
@@ -1352,16 +1641,17 @@ async fn wait_for_jobs(
     }
 }
 
-/// The adoption, the sync and the prune, with the claim held (on
+/// The adoption, the move, the sync and the prune, with the claim held (on
 /// PostgreSQL, MongoDB and Cassandra) or under the serve lock (SQLite); the
 /// caller releases the claim.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn sync_held(
     opened: &Opened,
     app_config: &config::AppConfig,
     known: Option<StoreIdentity>,
     adopting: bool,
     prune_missing: bool,
+    moving: Option<&extenddb_engine::store_maintenance::LocatedRoot>,
     claim: Option<&HeldClaim>,
     interrupt: &Interrupt,
 ) -> anyhow::Result<()> {
@@ -1452,6 +1742,38 @@ async fn sync_held(
                 .map(|signal| format!("{signal} received"))
         })
     };
+    if let Some(located) = moving {
+        let owner_window = owner_window(
+            &opened.catalog.backend,
+            Duration::from_secs(app_config.backup.stale_job_after_secs),
+        );
+        let report = extenddb_engine::store_maintenance::move_store(
+            storage,
+            extenddb_engine::store_maintenance::MoveTarget {
+                configured,
+                identity: &identity,
+                from_kind: located.kind,
+                from_root: &located.root,
+                owner_window,
+                stop: &stop,
+            },
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "--move-store: the catalog's rows could not be read: {e}; no row changed"
+            )
+        })?;
+        for line in move_report_lines(&report, located) {
+            println!("{line}");
+        }
+        move_outcome(&report)?;
+        println!();
+        println!(
+            "Every row of {} names the configured store now; syncing it.",
+            located.root
+        );
+    }
     let report = extenddb_engine::sync::sync(
         storage,
         extenddb_engine::sync::SyncTarget {
@@ -1484,6 +1806,46 @@ async fn sync_held(
             report.adopted.len()
         );
     }
+    // The rows of the other stores, read once the listing has ended.
+    let others = extenddb_engine::store_maintenance::other_stores(storage, &identity).await;
+    println!();
+    let others_error = match &others {
+        Ok(others) => {
+            for line in other_stores_lines(others) {
+                println!("{line}");
+            }
+            None
+        }
+        Err(e) => {
+            println!("--- Rows of other stores: not read ({e})");
+            Some(e.to_string())
+        }
+    };
+    // After a move, a row of the old root in that report landed during the
+    // move's sync (a CreateBackup of a server still configured with the old
+    // root whose insert came after the move's re-list): named, and the
+    // command exits 1.
+    let landed = match (moving, &others) {
+        (Some(located), Ok(others)) if old_root_listed(others, located) => {
+            let rows = named_rows_of_root(storage, located).await;
+            println!();
+            println!("--- Rows that landed under the old root during the move:");
+            match &rows {
+                Ok(rows) if rows.is_empty() => println!("  (none listed now)"),
+                Ok(rows) => {
+                    for row in rows {
+                        println!(
+                            "  {} ({}, account {})",
+                            row.backup_arn, row.status, row.account_id
+                        );
+                    }
+                }
+                Err(e) => println!("  (not read: {e})"),
+            }
+            Some(rows.map_or(0, |rows| rows.len()))
+        }
+        _ => None,
+    };
 
     let mut pruned = 0usize;
     let mut prune_left = 0usize;
@@ -1560,7 +1922,103 @@ async fn sync_held(
             }
         );
     }
+    others_outcome(others_error.as_deref())?;
+    if let (Some(n), Some(located)) = (landed, moving) {
+        anyhow::bail!(
+            "a row landed under the old root during the move ({n} listed above): a CreateBackup \
+             of a server still configured with {}. Reconfigure every server to the new root, \
+             then, once the row's job has ended, copy its prefix under the new root (or remove \
+             the row with --forget-backup) and run --move-store {} again",
+            located.root,
+            located.root
+        );
+    }
     complete_run(&report)
+}
+
+/// Whether the report of other stores lists a row of `located`'s root (an
+/// entry count with no row behind it is not one).
+fn old_root_listed(
+    others: &[extenddb_engine::store_maintenance::OtherStore],
+    located: &extenddb_engine::store_maintenance::LocatedRoot,
+) -> bool {
+    others.iter().any(|other| {
+        other.store.store_kind == located.kind
+            && other.store.store_root == located.root
+            && !other.counts.is_empty()
+    })
+}
+
+/// The rows of the old root, named for the operator.
+async fn named_rows_of_root(
+    storage: &dyn StorageEngine,
+    located: &extenddb_engine::store_maintenance::LocatedRoot,
+) -> Result<Vec<extenddb_engine::store_maintenance::NamedRow>, StorageError> {
+    storage
+        .list_backup_rows_by_root(located.kind, &located.root, None)
+        .map_ok(|row| extenddb_engine::store_maintenance::NamedRow {
+            status: row.status,
+            backup_arn: row.backup_arn,
+            account_id: row.account_id,
+        })
+        .try_collect()
+        .await
+}
+
+/// The exit of a sync whose report of other stores failed (`error`, its
+/// read's error): 1, since the report is part of the run.
+fn others_outcome(error: Option<&str>) -> anyhow::Result<()> {
+    match error {
+        Some(e) => {
+            anyhow::bail!("the rows of other stores could not be read: {e}; run the command again")
+        }
+        None => Ok(()),
+    }
+}
+
+/// The tail of plain sync's refusal on an unhealthy store: for a missing
+/// manifest, the `--forget-backup` command for that backup.
+fn manifest_missing_hint(problem: &StoreProblem) -> String {
+    match problem {
+        StoreProblem::ManifestMissing { backup_arn } => format!(
+            "; check first that the root is the one that holds the backups (a volume mounted, \
+             a root shared by every server): an unmounted volume shows this too. When that \
+             backup is gone for good, remove its row with extenddb backup sync --forget-backup \
+             {backup_arn}, which runs on an unhealthy store and prints the store's check \
+             afterwards"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The window the options tell a live owner apart by: `stale_after` beside
+/// servers; zero on SQLite, where the command holds the serve lock and no
+/// job of another process can be alive.
+fn owner_window(backend: &str, stale_after: Duration) -> Duration {
+    if backend == "sqlite" {
+        Duration::ZERO
+    } else {
+        stale_after
+    }
+}
+
+/// The stores the forget options wait on: the configured store when its
+/// identity is known, otherwise every store id the catalog records for the
+/// configured root (`configured_ids`), and every store id it records for
+/// `--forget-store`'s root.
+fn forget_wait_identities(
+    known: Option<&StoreIdentity>,
+    configured_ids: &[StoreIdentity],
+    located: Option<&extenddb_engine::store_maintenance::LocatedRoot>,
+) -> Vec<StoreIdentity> {
+    let mut identities: Vec<StoreIdentity> = match known {
+        Some(known) => vec![known.clone()],
+        None => configured_ids.to_vec(),
+    };
+    if let Some(located) = located {
+        identities.extend(located.identities());
+    }
+    identities
 }
 
 /// The adopting sync's last read of `extenddb-store.json` (`file`, `None`
@@ -1665,6 +2123,702 @@ fn print_sync_report(
     }
 }
 
+/// The counts of one store as a line's tail: `3 AVAILABLE, 1 DELETING`.
+fn counts_text(counts: &[(BackupStatus, u64)]) -> String {
+    counts
+        .iter()
+        .map(|(status, n)| format!("{n} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The other-stores section of a sync's report: per store its counts per
+/// status (on Cassandra, the status entries no row stands behind as such)
+/// and its CREATING and DELETING rows, then the two options that act on
+/// them.
+fn other_stores_lines(others: &[extenddb_engine::store_maintenance::OtherStore]) -> Vec<String> {
+    let mut lines = vec![
+        "--- Rows of other stores (left as they are; sync reads and changes none of them):"
+            .to_owned(),
+    ];
+    if others.is_empty() {
+        lines.push("  (none)".to_owned());
+        return lines;
+    }
+    for other in others {
+        let mut tail = counts_text(&other.counts);
+        if !other.entries.is_empty() {
+            if !tail.is_empty() {
+                tail.push_str("; ");
+            }
+            tail.push_str(&format!(
+                "{} (status entries with no row of that status behind them, which readers skip; \
+                 with no row of the root left, --forget-store <root> removes them)",
+                counts_text(&other.entries)
+            ));
+        }
+        lines.push(format!(
+            "  {} {} (store id {}): {tail}",
+            other.store.store_kind, other.store.store_root, other.store.store_id
+        ));
+        for row in &other.unresolved {
+            lines.push(format!(
+                "    {} {} (account {})",
+                row.status, row.backup_arn, row.account_id
+            ));
+        }
+    }
+    lines.push(
+        "  (to keep a root's backups, copy its tree under the configured root and run \
+         extenddb backup sync --move-store <root>; to drop its rows, extenddb backup sync \
+         --forget-store <root>)"
+            .to_owned(),
+    );
+    lines
+}
+
+/// The stores the catalog holds rows for, one line each, for a root that
+/// has none.
+fn known_store_lines(counts: &[extenddb_storage::backup_catalog::StoreRootCount]) -> Vec<String> {
+    let stores = extenddb_engine::store_maintenance::group_counts(counts, None);
+    if stores.is_empty() {
+        return vec!["  (none)".to_owned()];
+    }
+    stores
+        .iter()
+        .map(|other| {
+            format!(
+                "  {} {} (store id {}): {}",
+                other.store.store_kind,
+                other.store.store_root,
+                other.store.store_id,
+                counts_text(&other.counts)
+            )
+        })
+        .collect()
+}
+
+/// The report of `--move-store`.
+fn move_report_lines(
+    report: &extenddb_engine::store_maintenance::MoveReport,
+    located: &extenddb_engine::store_maintenance::LocatedRoot,
+) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "--- --move-store {} ({}): {} row(s) under the old root, checked against the copy \
+             under the configured root (the copy must be complete before the move)",
+            located.root, located.kind, report.rows
+        ),
+    ];
+    let mut section = |title: &str, items: Vec<String>| {
+        lines.push(format!("--- {title}:"));
+        if items.is_empty() {
+            lines.push("  (none)".to_owned());
+        }
+        lines.extend(items.into_iter().map(|item| format!("  {item}")));
+    };
+    section(
+        "Resolved (CREATING rows whose owner is dead, against the configured store)",
+        report
+            .resolved
+            .iter()
+            .map(|(arn, status)| format!("{arn}: now {status}"))
+            .collect(),
+    );
+    section(
+        "Finished (DELETING rows, their objects deleted under the configured root)",
+        report
+            .finished
+            .iter()
+            .map(|arn| format!("{arn}: now DELETED"))
+            .collect(),
+    );
+    section(
+        "Stopping the move (no row is moved while any is listed here)",
+        report
+            .stopping
+            .iter()
+            .map(|(row, why)| {
+                format!(
+                    "{} ({}, account {}): {why}",
+                    row.backup_arn, row.status, row.account_id
+                )
+            })
+            .collect(),
+    );
+    section(
+        "Moved (each row now names the configured store)",
+        report.moved.clone(),
+    );
+    if !report.gone.is_empty() {
+        section(
+            "Gone during the move (removed by another writer; nothing moved)",
+            report.gone.clone(),
+        );
+    }
+    section(
+        "Left under the old root",
+        report
+            .left
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} ({}, account {})",
+                    row.backup_arn, row.status, row.account_id
+                )
+            })
+            .collect(),
+    );
+    lines.push(String::new());
+    lines.push(format!(
+        "=== extenddb backup sync --move-store {}: {} row(s) moved, {} resolved, {} \
+         deletion(s) finished, {} row(s) stopping the move, {} gone during the move, {} left \
+         under the old root ===",
+        if report.complete() {
+            "complete"
+        } else {
+            "stopped"
+        },
+        report.moved.len(),
+        report.resolved.len(),
+        report.finished.len(),
+        report.stopping.len(),
+        report.gone.len(),
+        report.left.len()
+    ));
+    lines
+}
+
+/// The exit of `--move-store`: `Ok` when every row of the old root was
+/// moved (the sync of the configured root follows), otherwise why not.
+fn move_outcome(report: &extenddb_engine::store_maintenance::MoveReport) -> anyhow::Result<()> {
+    if !report.stopping.is_empty() {
+        anyhow::bail!(
+            "--move-store moved no row: {} row(s) stop the move (see above). Resolve each and \
+             run the command again; the CREATING rows resolved and the deletions finished are \
+             kept",
+            report.stopping.len()
+        );
+    }
+    if let Some(reason) = &report.stopped {
+        anyhow::bail!("--move-store stopped before the rewrite: {reason}; no row was moved");
+    }
+    if let Some(e) = &report.rewrite_error {
+        anyhow::bail!(
+            "--move-store's rewrite failed: {e}; {} row(s) were moved, and the rows left under \
+             the old root are listed above: run the command again for them",
+            report.moved.len()
+        );
+    }
+    if let Some(e) = &report.relist_error {
+        anyhow::bail!(
+            "{e}; the rewrite counted {} row(s). Run extenddb backup sync, which lists any row \
+             still under the old root in its report of other stores and syncs the configured \
+             root; run --move-store again only if that report shows rows of the old root (with \
+             none, it refuses the root as having no rows)",
+            report.rewritten
+        );
+    }
+    if !report.left.is_empty() {
+        anyhow::bail!(
+            "{} row(s) are still under the old root (see above): a CreateBackup of a server \
+             still configured with that root, or a row another writer changed during the move. \
+             Reconfigure every server to the new root, copy each such row's prefix under the new \
+             root (or remove the row with --forget-backup), and run the command again",
+            report.left.len()
+        );
+    }
+    Ok(())
+}
+
+/// The report of `--forget-store`.
+fn forget_store_lines(
+    report: &extenddb_engine::store_maintenance::ForgetStoreReport,
+    located: &extenddb_engine::store_maintenance::LocatedRoot,
+) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "--- --forget-store {} ({}): rows removed outright; no object is deleted:",
+            located.root, located.kind
+        ),
+    ];
+    if report.rows.is_empty() {
+        lines.push("  (none)".to_owned());
+    }
+    for (row, outcome) in &report.rows {
+        lines.push(format!(
+            "  {} ({}, account {}): {outcome}",
+            row.backup_arn, row.status, row.account_id
+        ));
+    }
+    let swept = report.entries_swept.unwrap_or_default();
+    if swept.removed > 0 {
+        lines.push(format!(
+            "  ({} status entry(ies) of the root with no row of the root behind them removed: \
+             entries a deleter wrote after a move of its row, and the earlier-status entries of \
+             rows removed above)",
+            swept.removed
+        ));
+    }
+    if swept.repaired > 0 {
+        lines.push(format!(
+            "  ({} status entry(ies) of rows left under the root repaired: each was under an \
+             earlier status than its row's, from a status change whose entry batch failed or \
+             whose writer stopped before it, and is now under the row's status)",
+            swept.repaired
+        ));
+    }
+    if !report.entries_left.is_empty() {
+        lines.push(format!(
+            "  (the catalog still records store id(s) {} for the root: status entries written \
+             after the root was listed, by a writer still configured with it; plain sync's \
+             report of other stores shows them, and running the command again removes their \
+             rows)",
+            report.entries_left.join(", ")
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "=== extenddb backup sync --forget-store {}: {} row(s) removed, {} left ===",
+        if report.complete() {
+            "complete"
+        } else if report.stopped.is_some() {
+            "stopped"
+        } else {
+            "incomplete"
+        },
+        report.removed(),
+        report
+            .rows_left
+            .map_or_else(|| "an unknown number".to_owned(), |n| n.to_string())
+    ));
+    lines
+}
+
+/// The exit of `--forget-store`.
+fn forget_store_outcome(
+    report: &extenddb_engine::store_maintenance::ForgetStoreReport,
+) -> anyhow::Result<()> {
+    if let Some(reason) = &report.stopped {
+        anyhow::bail!(
+            "--forget-store stopped before the remaining rows: {reason}; run the command again \
+             for the rest"
+        );
+    }
+    if let Some(e) = &report.recheck_error {
+        anyhow::bail!("{e}; run the command again to see what is left");
+    }
+    if !report.complete() {
+        anyhow::bail!(
+            "{} row(s) of the root are left (see above, each with why); run the command again \
+             once their jobs have ended, and for a row in use once its restore has ended or its \
+             target is removed with extenddb backup remove-target --account <id> <table>",
+            report.rows_left.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// The report of `--forget-backup`.
+fn forget_backups_lines(
+    report: &extenddb_engine::store_maintenance::ForgetBackupsReport,
+    asked: &[String],
+) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        "--- --forget-backup (rows removed outright; no object is deleted, but a DELETING row \
+         of the configured store has its deletion finished first):"
+            .to_owned(),
+    ];
+    for (arn, outcome) in &report.done {
+        lines.push(format!("  {arn}: {outcome}"));
+    }
+    for arn in asked.iter().skip(report.done.len()) {
+        lines.push(format!("  {arn}: not reached"));
+    }
+    let removed = report
+        .done
+        .iter()
+        .filter(|(_, o)| {
+            matches!(
+                o,
+                extenddb_engine::store_maintenance::ForgetBackup::Row(_, forgotten)
+                    if forgotten.is_removed()
+            )
+        })
+        .count();
+    lines.push(String::new());
+    lines.push(format!(
+        "=== extenddb backup sync --forget-backup {}: {removed} row(s) removed, {} not ===",
+        if report.complete(asked.len()) {
+            "complete"
+        } else {
+            "stopped"
+        },
+        asked.len() - report.done.iter().filter(|(_, o)| o.is_done()).count()
+    ));
+    lines
+}
+
+/// The exit of `--forget-backup`.
+fn forget_backups_outcome(
+    report: &extenddb_engine::store_maintenance::ForgetBackupsReport,
+    asked: usize,
+) -> anyhow::Result<()> {
+    if let Some(reason) = &report.stopped {
+        anyhow::bail!(
+            "--forget-backup stopped before the remaining ARNs: {reason}; run the command again \
+             for them"
+        );
+    }
+    if !report.complete(asked) {
+        let (arn, outcome) = report
+            .done
+            .last()
+            .expect("an incomplete run without a stop ends at a refused ARN");
+        anyhow::bail!(
+            "--forget-backup did not remove the row of {arn} ({outcome}); the ARNs after it were \
+             not reached"
+        );
+    }
+    Ok(())
+}
+
+/// `backup sync --forget-store <root>` and `--forget-backup <arn>` (module
+/// doc): on a store in any state, or with none configured (`identity` is
+/// then why), under the maintenance claim on every backend.
+#[allow(clippy::too_many_lines)]
+async fn forget(
+    catalog: &Catalog,
+    identity: Result<&Identity, &NotConfigured>,
+    app_config: &config::AppConfig,
+    forget_store: Option<&str>,
+    forget_backup: &[String],
+    mut interrupt: Interrupt,
+) -> anyhow::Result<()> {
+    let storage = &*catalog.storage;
+    let configured = catalog.runtime.configured_store();
+    // The defaulted root missing (moved away, or a link to a volume that is
+    // gone) while the catalog holds rows for it: its rows are refused as an
+    // unmounted root's, and the header says so.
+    let unmounted = match identity {
+        Err(NotConfigured::DefaultRootMissingWithRows {
+            label, store_ids, ..
+        }) => Some((label.clone(), store_ids.clone())),
+        _ => None,
+    };
+    println!("=== extenddb backup sync ===");
+    let check_note = if forget_store.is_none() {
+        "the removals read no store; the check after them does"
+    } else {
+        "the removals read no store"
+    };
+    let known = match (configured, identity) {
+        (Some(store), Ok(Identity::Known(identity))) => {
+            match store.health() {
+                StoreHealth::Unhealthy(problem) => println!(
+                    "Store:  {} {} (unhealthy: {problem}; {check_note})",
+                    store.kind, store.root
+                ),
+                _ => println!(
+                    "Store:  {} {} (store id {})",
+                    store.kind, store.root, identity.store_id
+                ),
+            }
+            Some(identity.clone())
+        }
+        (Some(store), Ok(Identity::Problem(problem))) => {
+            println!(
+                "Store:  {} {} (unhealthy: {problem}; {check_note})",
+                store.kind, store.root
+            );
+            None
+        }
+        (Some(store), Ok(Identity::Empty)) => {
+            println!(
+                "Store:  {} {} (no {})",
+                store.kind,
+                store.root,
+                extenddb_engine::STORE_IDENTITY_KEY
+            );
+            None
+        }
+        (_, Err(_)) | (None, Ok(_)) => {
+            match &unmounted {
+                Some((root, ids)) => println!(
+                    "Store:  none (the default root {root} is missing while the catalog holds \
+                     rows for it, store id {}: a volume that is not mounted, or a directory moved \
+                     away; this command refuses its rows and reads no store)",
+                    ids.join(", ")
+                ),
+                None => println!(
+                    "Store:  none ({}; the removals read no store)",
+                    identity
+                        .err()
+                        .map_or_else(|| "not configured".to_owned(), ToString::to_string)
+                ),
+            }
+            None
+        }
+    };
+    // Every ARN's form before the claim: a typo costs no wait.
+    let refused = extenddb_engine::store_maintenance::check_arns(forget_backup);
+    if !refused.is_empty() {
+        println!();
+        println!("--- --forget-backup: ARNs refused before any change:");
+        for (arn, why) in &refused {
+            println!("  {arn:?}: {why}");
+        }
+        anyhow::bail!(
+            "--forget-backup: {} ARN(s) given are not backup ARNs (see above); nothing was \
+             changed",
+            refused.len()
+        );
+    }
+    let located = match forget_store {
+        Some(root) => match extenddb_engine::store_maintenance::locate_root(
+            storage,
+            root,
+            configured
+                .map(|store| store.root.as_str())
+                .or_else(|| unmounted.as_ref().map(|(root, _)| root.as_str())),
+        )
+        .await
+        {
+            Ok(located) => Some(located),
+            Err(refusal) => return Err(root_refusal("--forget-store", root, refusal)),
+        },
+        None => None,
+    };
+
+    // The configured root's store ids when its identity is not known, so
+    // the wait covers its rows too.
+    let configured_ids = match (configured, &known) {
+        (Some(store), None) => storage
+            .read_store_ids(store.kind, &store.root)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|store_id| StoreIdentity {
+                store_kind: store.kind,
+                store_root: store.root.clone(),
+                store_id,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let stale_after = Duration::from_secs(app_config.backup.stale_job_after_secs);
+    let claim = take_claim(storage, app_config).await?;
+    let claimed_at = tokio::time::Instant::now();
+    let identities = forget_wait_identities(known.as_ref(), &configured_ids, located.as_ref());
+    let deletions_finished = match wait_for_jobs(
+        catalog,
+        &identities,
+        &claim,
+        &mut interrupt,
+        stale_after,
+        true,
+    )
+    .await
+    {
+        Ok(finished) => finished,
+        Err(refusal) => {
+            release(claim).await;
+            return Err(refusal);
+        }
+    };
+    let stop = || {
+        claim.lost().or_else(|| {
+            interrupt
+                .signalled()
+                .map(|signal| format!("{signal} received"))
+        })
+    };
+    let on_wait = |remaining: Duration| {
+        println!(
+            "Waiting {} s before the first removal of a FAILED or DELETED row (or the \
+             finished deletion of a DELETING one): a deletion a server's reconciler started before the claim was taken runs at most {} s, and its \
+             last store call at most {} s more.",
+            remaining.as_secs().max(1),
+            extenddb_engine::reconciler::DUTY_DELETION_BOUND.as_secs(),
+            extenddb_engine::S3_CHECK_TIMEOUT.as_secs()
+        );
+    };
+    // The configured store's identity when its check passed (recorded at
+    // the opening, writing nothing): a DELETING row of it has its deletion
+    // finished before its removal.
+    let healthy = configured.and_then(|store| store.identity().filter(|_| store.is_healthy()));
+    let run = extenddb_engine::store_maintenance::ForgetRun {
+        owner_window: owner_window(&catalog.backend, stale_after),
+        removals_from: removals_from(&catalog.backend, claimed_at),
+        on_wait: &on_wait,
+        stop: &stop,
+        configured: configured.map(
+            |store| extenddb_engine::store_maintenance::ForgetConfigured {
+                store,
+                healthy: healthy.as_ref(),
+                mismatch_row_ids: match identity {
+                    Ok(Identity::Problem(problem)) => problem.mismatch_row_ids(),
+                    _ => &[],
+                },
+                file_missing_with_rows: matches!(
+                    identity,
+                    Ok(Identity::Problem(StoreProblem::FileMissingWithRows(_)))
+                ),
+            },
+        ),
+        unmounted_root: unmounted.as_ref().map(|(root, _)| root.as_str()),
+        deletions_finished: &deletions_finished,
+    };
+    let outcome = match &located {
+        Some(located) => {
+            let report = extenddb_engine::store_maintenance::forget_store(
+                storage,
+                located.kind,
+                &located.root,
+                run,
+            )
+            .await;
+            match report {
+                Ok(report) => {
+                    for line in forget_store_lines(&report, located) {
+                        println!("{line}");
+                    }
+                    forget_store_outcome(&report)
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "--forget-store: the root's rows could not be read: {e}; no row was removed"
+                )),
+            }
+        }
+        None => {
+            let report = extenddb_engine::store_maintenance::forget_backups(
+                storage,
+                forget_backup,
+                &app_config.server.region,
+                run,
+            )
+            .await;
+            for line in forget_backups_lines(&report, forget_backup) {
+                println!("{line}");
+            }
+            forget_backups_outcome(&report, forget_backup.len())
+        }
+    };
+    release(claim).await;
+
+    // The store's check once more, as the next server check runs it but
+    // writing nothing: a removed row may have been what kept the store
+    // unhealthy.
+    if let Some(store) = configured
+        && forget_store.is_none()
+    {
+        println!();
+        match forget_check(identity) {
+            ForgetCheck::Skip => {
+                let fresh = matches!(identity, Ok(Identity::Empty));
+                for line in skipped_check_lines(&store.root, fresh) {
+                    println!("{line}");
+                }
+            }
+            ForgetCheck::Run(known) => {
+                let check = extenddb_engine::check_configured_store_read_only(
+                    store,
+                    storage,
+                    known.as_ref(),
+                )
+                .await;
+                for line in store_check_lines(&check) {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// The instant before which a forget option removes no FAILED or DELETED
+/// row: `FORGET_WAIT` after the claim was taken, beside servers; none on
+/// SQLite, whose serve lock excludes every server.
+fn removals_from(backend: &str, claimed_at: tokio::time::Instant) -> Option<tokio::time::Instant> {
+    (backend != "sqlite").then(|| claimed_at + extenddb_engine::store_maintenance::FORGET_WAIT)
+}
+
+/// Whether the store's check runs after `--forget-backup`, and against
+/// which identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForgetCheck {
+    /// The opening found no identity file under the root (with rows for
+    /// it: an unmounted volume, say, whose rows the command refused; or
+    /// none: a fresh root): the check is not run, so nothing is written to
+    /// such a root.
+    Skip,
+    /// The read-only check, against the id the opening read when it read
+    /// one.
+    Run(Option<StoreIdentity>),
+}
+
+/// The check after `--forget-backup` for the store as the opening found
+/// it.
+fn forget_check(identity: Result<&Identity, &NotConfigured>) -> ForgetCheck {
+    match identity {
+        Ok(Identity::Known(identity)) => ForgetCheck::Run(Some(identity.clone())),
+        Ok(Identity::Empty | Identity::Problem(StoreProblem::FileMissingWithRows(_))) => {
+            ForgetCheck::Skip
+        }
+        Ok(Identity::Problem(_)) | Err(_) => ForgetCheck::Run(None),
+    }
+}
+
+/// What `--forget-backup` prints when the opening found no identity file:
+/// at a fresh root (`fresh`: no rows for it either), or at a root with rows
+/// for it.
+fn skipped_check_lines(root: &str, fresh: bool) -> Vec<String> {
+    let key = extenddb_engine::STORE_IDENTITY_KEY;
+    let opening = format!(
+        "The configured store's check was not run: the root {root} had no {key} when the command \
+         opened it, and this command writes nothing to a root."
+    );
+    if fresh {
+        return vec![format!(
+            "{opening} The root is fresh (the catalog has no rows for it either): a server's \
+             first check creates its {key}."
+        )];
+    }
+    vec![format!(
+        "{opening} A server's check creates the file at a root the catalog has no rows for and \
+         reports the store healthy, so mount the volume (or point [backup.store] at the root \
+         that holds the backups) before the root's last row is gone."
+    )]
+}
+
+/// The store's check after `--forget-backup`.
+fn store_check_lines(check: &Result<Option<StoreIdentity>, StoreProblem>) -> Vec<String> {
+    match check {
+        Ok(Some(identity)) => vec![format!(
+            "The configured store's check passes (store id {}); each server finds it so at its \
+             next reconciler cycle.",
+            identity.store_id
+        )],
+        Ok(None) => vec![format!(
+            "The configured store's root has no {} and the catalog no rows for it; the check \
+             writes nothing, and a server's next check creates the file.",
+            extenddb_engine::STORE_IDENTITY_KEY
+        )],
+        Err(problem @ StoreProblem::ManifestMissing { backup_arn }) => vec![
+            format!("The configured store's check fails: {problem}."),
+            format!(
+                "  If that backup is gone for good too, run extenddb backup sync \
+                 --forget-backup {backup_arn}; then backup sync --prune-missing removes the \
+                 remaining rows whose manifest is gone."
+            ),
+        ],
+        Err(problem) => vec![format!("The configured store's check fails: {problem}.")],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1672,6 +2826,12 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use extenddb_engine::StoreProblem;
+    use extenddb_engine::store_maintenance::{
+        ForgetBackup, ForgetBackupsReport, ForgetStoreReport, Forgotten, LocatedRoot, MoveReport,
+        NamedRow, OtherStore,
+    };
+    use extenddb_storage::backup_catalog::{BackupStatus, StoreIdentity, StoreKind};
     use extenddb_storage::hooks::{Reregistration, ServingRegistrar};
 
     use super::{
@@ -1823,5 +2983,543 @@ mod tests {
         );
 
         release_registration(None).await;
+    }
+
+    /// `backup sync`'s options as clap parses them: the three store options
+    /// conflict with each other, with `--adopt-store` and with
+    /// `--prune-missing`; `--forget-backup` repeats, its ARNs in order.
+    #[test]
+    fn the_store_options_conflict_and_forget_backup_repeats() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: super::BackupCommand,
+        }
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("backup").chain(args.iter().copied()))
+                .map(|cli| cli.command)
+        };
+        for refused in [
+            &["sync", "--move-store", "/a", "--prune-missing"][..],
+            &["sync", "--move-store", "/a", "--adopt-store"],
+            &["sync", "--move-store", "/a", "--forget-store", "/b"],
+            &["sync", "--move-store", "/a", "--forget-backup", "x"],
+            &["sync", "--forget-store", "/b", "--forget-backup", "x"],
+            &["sync", "--forget-store", "/b", "--prune-missing"],
+            &["sync", "--forget-store", "/b", "--adopt-store"],
+            &["sync", "--forget-backup", "x", "--prune-missing"],
+            &["sync", "--forget-backup", "x", "--adopt-store"],
+        ] {
+            let Err(e) = parse(refused) else {
+                panic!("{refused:?} parsed");
+            };
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{refused:?}"
+            );
+        }
+        match parse(&["sync", "--forget-backup", "a", "--forget-backup", "b"]).unwrap() {
+            super::BackupCommand::Sync {
+                forget_backup,
+                move_store: None,
+                forget_store: None,
+                adopt_store: false,
+                prune_missing: false,
+            } => assert_eq!(forget_backup, ["a", "b"]),
+            _ => panic!("not a sync"),
+        }
+        match parse(&["sync", "--move-store", "s3://b/p?endpoint=http://h:1"]).unwrap() {
+            super::BackupCommand::Sync {
+                move_store: Some(root),
+                ..
+            } => assert_eq!(root, "s3://b/p?endpoint=http://h:1"),
+            _ => panic!("not a move"),
+        }
+    }
+
+    fn named(status: BackupStatus, arn: &str) -> NamedRow {
+        NamedRow {
+            status,
+            backup_arn: arn.to_owned(),
+            account_id: "123456789012".to_owned(),
+        }
+    }
+
+    fn old_root() -> LocatedRoot {
+        LocatedRoot {
+            kind: StoreKind::Filesystem,
+            root: "/srv/old".to_owned(),
+            store_ids: vec!["store-0".to_owned()],
+        }
+    }
+
+    /// The other-stores section: `(none)` without any; otherwise a line per
+    /// store with its counts, its CREATING and DELETING rows below it, and
+    /// the line naming the two options.
+    #[test]
+    fn the_other_stores_section_counts_names_and_points_to_the_options() {
+        assert_eq!(
+            super::other_stores_lines(&[]),
+            [
+                "--- Rows of other stores (left as they are; sync reads and changes none of them):",
+                "  (none)",
+            ]
+        );
+        let lines = super::other_stores_lines(&[OtherStore {
+            store: StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/old".to_owned(),
+                store_id: "store-0".to_owned(),
+            },
+            counts: vec![(BackupStatus::Available, 3), (BackupStatus::Deleting, 1)],
+            unresolved: vec![named(BackupStatus::Deleting, "arn:d")],
+            entries: Vec::new(),
+        }]);
+        assert_eq!(
+            lines[1],
+            "  filesystem /srv/old (store id store-0): 3 AVAILABLE, 1 DELETING"
+        );
+        assert_eq!(lines[2], "    DELETING arn:d (account 123456789012)");
+        assert!(
+            lines[3].contains("--move-store <root>") && lines[3].contains("--forget-store <root>"),
+            "{}",
+            lines[3]
+        );
+        assert_eq!(lines.len(), 4);
+    }
+
+    /// The move exits 0 only when every row moved; a stopping row, a stop,
+    /// a failed rewrite and a row left each exit 1 with their own sentence,
+    /// and the summary line says which.
+    #[test]
+    fn the_move_exits_1_unless_every_row_moved() {
+        let moved = MoveReport {
+            rows: 2,
+            moved: vec!["arn:1".to_owned(), "arn:2".to_owned()],
+            rewritten: 2,
+            ..MoveReport::default()
+        };
+        super::move_outcome(&moved).unwrap();
+        let summary = super::move_report_lines(&moved, &old_root());
+        assert_eq!(
+            summary.last().unwrap(),
+            "=== extenddb backup sync --move-store complete: 2 row(s) moved, 0 resolved, 0 \
+             deletion(s) finished, 0 row(s) stopping the move, 0 gone during the move, 0 left \
+             under the old root ==="
+        );
+        let gone = MoveReport {
+            rows: 3,
+            moved: vec!["arn:1".to_owned(), "arn:2".to_owned()],
+            gone: vec!["arn:3".to_owned()],
+            rewritten: 3,
+            ..MoveReport::default()
+        };
+        assert!(
+            super::move_report_lines(&gone, &old_root())
+                .last()
+                .unwrap()
+                .contains(
+                    "2 row(s) moved, 0 resolved, 0 deletion(s) finished, 0 row(s) stopping \
+                           the move, 1 gone during the move, 0 left under the old root"
+                ),
+            "the summary line counts the rows gone during the move"
+        );
+        let stopping = MoveReport {
+            stopping: vec![(named(BackupStatus::Available, "arn:1"), "why".to_owned())],
+            ..MoveReport::default()
+        };
+        let err = super::move_outcome(&stopping).unwrap_err().to_string();
+        assert!(
+            err.starts_with("--move-store moved no row: 1 row(s) stop the move"),
+            "{err}"
+        );
+        assert!(
+            super::move_report_lines(&stopping, &old_root())
+                .contains(&"  arn:1 (AVAILABLE, account 123456789012): why".to_owned())
+        );
+        for (report, says) in [
+            (
+                MoveReport {
+                    stopped: Some("SIGINT received".to_owned()),
+                    ..MoveReport::default()
+                },
+                "stopped before the rewrite: SIGINT received",
+            ),
+            (
+                MoveReport {
+                    rewrite_error: Some("lost".to_owned()),
+                    ..MoveReport::default()
+                },
+                "rewrite failed: lost",
+            ),
+            (
+                MoveReport {
+                    left: vec![named(BackupStatus::Creating, "arn:3")],
+                    ..MoveReport::default()
+                },
+                "1 row(s) are still under the old root",
+            ),
+        ] {
+            let err = super::move_outcome(&report).unwrap_err().to_string();
+            assert!(err.contains(says), "{err}");
+            assert!(
+                super::move_report_lines(&report, &old_root())
+                    .last()
+                    .unwrap()
+                    .starts_with("=== extenddb backup sync --move-store stopped:")
+            );
+        }
+    }
+
+    /// `--forget-store` exits 0 once the root lists no row, entries left
+    /// behind (Cassandra) reported with the exit kept; a row left, a stop
+    /// and a failed re-read exit 1.
+    #[test]
+    fn forget_store_exits_1_while_a_row_of_the_root_is_left() {
+        let done = ForgetStoreReport {
+            rows: vec![(
+                named(BackupStatus::Failed, "arn:1"),
+                Forgotten::Removed(BackupStatus::Failed),
+            )],
+            rows_left: Some(0),
+            entries_left: vec!["store-0".to_owned()],
+            ..ForgetStoreReport::default()
+        };
+        super::forget_store_outcome(&done).unwrap();
+        let lines = super::forget_store_lines(&done, &old_root());
+        assert!(
+            lines.iter().any(|l| l.contains("store id(s) store-0")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "=== extenddb backup sync --forget-store complete: 1 row(s) removed, 0 left ==="
+        );
+        let left = ForgetStoreReport {
+            rows: vec![(
+                named(BackupStatus::Creating, "arn:2"),
+                Forgotten::LiveOwner(BackupStatus::Creating),
+            )],
+            rows_left: Some(1),
+            ..ForgetStoreReport::default()
+        };
+        let err = super::forget_store_outcome(&left).unwrap_err().to_string();
+        assert!(err.starts_with("1 row(s) of the root are left"), "{err}");
+        assert!(
+            err.contains("extenddb backup remove-target --account"),
+            "{err}"
+        );
+        assert_eq!(
+            super::forget_store_lines(&left, &old_root())
+                .last()
+                .unwrap(),
+            "=== extenddb backup sync --forget-store incomplete: 0 row(s) removed, 1 left ==="
+        );
+        let swept = ForgetStoreReport {
+            rows_left: Some(0),
+            entries_swept: Some(extenddb_storage::backup_catalog::StatusEntrySweep {
+                removed: 2,
+                repaired: 1,
+            }),
+            ..ForgetStoreReport::default()
+        };
+        let lines = super::forget_store_lines(&swept, &old_root());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("  (2 status entry(ies) of the root"))
+                && lines
+                    .iter()
+                    .any(|l| l.starts_with("  (1 status entry(ies) of rows left")),
+            "{lines:?}"
+        );
+        let stopped = ForgetStoreReport {
+            stopped: Some("SIGTERM received".to_owned()),
+            ..ForgetStoreReport::default()
+        };
+        assert!(super::forget_store_outcome(&stopped).is_err());
+        let unread = ForgetStoreReport {
+            recheck_error: Some("the root's rows could not be read: down".to_owned()),
+            ..ForgetStoreReport::default()
+        };
+        assert!(super::forget_store_outcome(&unread).is_err());
+    }
+
+    /// `--forget-backup` exits 0 when every ARN's row is gone, and 1 naming
+    /// the ARN it stopped at (a legacy ARN included); the ARNs after it are
+    /// listed as not reached.
+    #[test]
+    fn forget_backup_exits_1_naming_the_arn_it_stopped_at() {
+        let asked = ["arn:1".to_owned(), "arn:2".to_owned(), "arn:3".to_owned()];
+        let removed = |arn: &str| {
+            (
+                arn.to_owned(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available),
+                ),
+            )
+        };
+        let all = ForgetBackupsReport {
+            done: asked.iter().map(|a| removed(a)).collect(),
+            stopped: None,
+        };
+        super::forget_backups_outcome(&all, 3).unwrap();
+        // An ARN no row carries counts as done: a run given again after a
+        // stop goes past the ARNs it removed.
+        let again = ForgetBackupsReport {
+            done: vec![
+                ("arn:1".to_owned(), ForgetBackup::NoRow),
+                removed("arn:2"),
+                removed("arn:3"),
+            ],
+            stopped: None,
+        };
+        super::forget_backups_outcome(&again, 3).unwrap();
+        let lines = super::forget_backups_lines(&again, &asked);
+        assert!(
+            lines.contains(&"  arn:1: no row carries this ARN; nothing to remove".to_owned()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "=== extenddb backup sync --forget-backup complete: 2 row(s) removed, 0 not ==="
+        );
+        let refused = ForgetBackupsReport {
+            done: vec![removed("arn:1"), ("arn:2".to_owned(), ForgetBackup::Legacy)],
+            stopped: None,
+        };
+        let err = super::forget_backups_outcome(&refused, 3)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(
+                "--forget-backup did not remove the row of arn:2 (an in-catalog backup"
+            ),
+            "{err}"
+        );
+        let lines = super::forget_backups_lines(&refused, &asked);
+        assert!(
+            lines.contains(&"  arn:3: not reached".to_owned()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "=== extenddb backup sync --forget-backup stopped: 1 row(s) removed, 2 not ==="
+        );
+    }
+
+    /// The store's check after `--forget-backup`: passing, or the problem;
+    /// a manifest still missing names the next ARN to forget.
+    #[test]
+    fn the_check_after_forget_backup_names_the_next_backup_to_forget() {
+        let ok = super::store_check_lines(&Ok(Some(StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/r".to_owned(),
+            store_id: "store-1".to_owned(),
+        })));
+        assert!(ok[0].starts_with("The configured store's check passes (store id store-1)"));
+        let empty = super::store_check_lines(&Ok(None));
+        assert!(
+            empty[0].contains("the check writes nothing, and a server's next check creates"),
+            "{empty:?}"
+        );
+        let missing = super::store_check_lines(&Err(StoreProblem::ManifestMissing {
+            backup_arn: "arn:next".to_owned(),
+        }));
+        assert!(
+            missing[1].contains("--forget-backup arn:next"),
+            "{missing:?}"
+        );
+    }
+
+    /// The check after `--forget-backup` runs against the id the opening
+    /// read, without one when the opening read none, and not at all when
+    /// the opening found no identity file (`Empty`, which the forget
+    /// options' opening reads for a fresh root since it writes nothing, or
+    /// `FileMissingWithRows`); the line printed then says to mount the
+    /// volume before the root's last row is gone.
+    #[test]
+    fn the_check_after_forget_backup_runs_only_where_the_opening_found_a_file() {
+        use super::{ForgetCheck, Identity, forget_check};
+        let identity = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/r".to_owned(),
+            store_id: "store-1".to_owned(),
+        };
+        assert_eq!(
+            forget_check(Ok(&Identity::Known(identity.clone()))),
+            ForgetCheck::Run(Some(identity))
+        );
+        assert_eq!(forget_check(Ok(&Identity::Empty)), ForgetCheck::Skip);
+        assert_eq!(
+            forget_check(Ok(&Identity::Problem(StoreProblem::FileMissingWithRows(
+                vec!["store-1".to_owned()]
+            )))),
+            ForgetCheck::Skip
+        );
+        assert_eq!(
+            forget_check(Ok(&Identity::Problem(StoreProblem::ManifestMissing {
+                backup_arn: "arn:gone".to_owned()
+            }))),
+            ForgetCheck::Run(None)
+        );
+        assert_eq!(
+            forget_check(Err(&super::NotConfigured::Absent)),
+            ForgetCheck::Run(None)
+        );
+        let skipped = &super::skipped_check_lines("/mnt/b", false)[0];
+        assert!(skipped.contains("/mnt/b had no"), "{skipped}");
+        assert!(
+            skipped.contains("before the root's last row is gone")
+                && !skipped.contains("each server's next check reports the store"),
+            "{skipped}"
+        );
+        let fresh = &super::skipped_check_lines("/mnt/c", true)[0];
+        assert!(
+            fresh.contains("/mnt/c had no")
+                && fresh.contains("The root is fresh")
+                && !fresh.contains("mount the volume"),
+            "{fresh}"
+        );
+    }
+
+    /// After a move, a row of the old root in the closing report of other
+    /// stores makes the command exit 1; counts of status entries with no
+    /// row behind them, or rows of another root, do not.
+    #[test]
+    fn a_row_of_the_old_root_in_the_closing_report_is_one_that_landed() {
+        let root = old_root();
+        let other = |root: &str, counts: Vec<(BackupStatus, u64)>, entries| OtherStore {
+            store: StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: root.to_owned(),
+                store_id: "store-0".to_owned(),
+            },
+            counts,
+            unresolved: Vec::new(),
+            entries,
+        };
+        assert!(super::old_root_listed(
+            &[other(
+                "/srv/old",
+                vec![(BackupStatus::Creating, 1)],
+                Vec::new()
+            )],
+            &root
+        ));
+        assert!(!super::old_root_listed(
+            &[other(
+                "/srv/old",
+                Vec::new(),
+                vec![(BackupStatus::Deleting, 1)]
+            )],
+            &root
+        ));
+        assert!(!super::old_root_listed(
+            &[other(
+                "/srv/elsewhere",
+                vec![(BackupStatus::Available, 2)],
+                Vec::new()
+            )],
+            &root
+        ));
+        let lines = super::other_stores_lines(&[other(
+            "/srv/old",
+            vec![(BackupStatus::Available, 1)],
+            vec![(BackupStatus::Deleting, 1)],
+        )]);
+        assert_eq!(
+            lines[1],
+            "  filesystem /srv/old (store id store-0): 1 AVAILABLE; 1 DELETING (status entries \
+             with no row of that status behind them, which readers skip; with no row of the \
+             root left, --forget-store <root> removes them)"
+        );
+    }
+
+    /// The decisions the options take from the backend and the located
+    /// root: the owner window (zero on SQLite under the serve lock), the
+    /// wait before the first FAILED or DELETED removal (none on SQLite), and
+    /// the stores the forget options wait on (the configured store's and
+    /// the root's ids).
+    #[test]
+    fn the_options_take_the_window_the_wait_and_the_stores_from_the_backend() {
+        let stale = std::time::Duration::from_secs(300);
+        assert_eq!(
+            super::owner_window("sqlite", stale),
+            std::time::Duration::ZERO
+        );
+        for backend in ["postgres", "mongodb", "cassandra"] {
+            assert_eq!(super::owner_window(backend, stale), stale, "{backend}");
+        }
+        let now = tokio::time::Instant::now();
+        assert_eq!(super::removals_from("sqlite", now), None);
+        assert_eq!(
+            super::removals_from("postgres", now),
+            Some(now + extenddb_engine::store_maintenance::FORGET_WAIT)
+        );
+        let configured = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/new".to_owned(),
+            store_id: "store-1".to_owned(),
+        };
+        let root = old_root();
+        assert_eq!(
+            super::forget_wait_identities(Some(&configured), &[], Some(&root)),
+            [configured.clone(), root.identities()[0].clone()]
+        );
+        assert_eq!(
+            super::forget_wait_identities(None, &[], Some(&root)),
+            root.identities()
+        );
+        assert_eq!(
+            super::forget_wait_identities(Some(&configured), &[], None),
+            [configured]
+        );
+        assert!(super::forget_wait_identities(None, &[], None).is_empty());
+        let ids = [
+            StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/new".to_owned(),
+                store_id: "store-1".to_owned(),
+            },
+            StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/new".to_owned(),
+                store_id: "store-2".to_owned(),
+            },
+        ];
+        assert_eq!(
+            super::forget_wait_identities(None, &ids, Some(&root)),
+            [ids[0].clone(), ids[1].clone(), root.identities()[0].clone()],
+            "the configured root's ids when its identity is not known"
+        );
+        assert_eq!(
+            super::forget_wait_identities(Some(&ids[0]), &ids, None),
+            [ids[0].clone()]
+        );
+    }
+
+    /// A sync whose report of other stores failed exits 1; plain sync's
+    /// refusal on a missing manifest names the backup's own
+    /// `--forget-backup` command.
+    #[test]
+    fn a_failed_report_of_other_stores_exits_1_and_the_refusal_names_the_arn() {
+        super::others_outcome(None).unwrap();
+        let err = super::others_outcome(Some("down")).unwrap_err().to_string();
+        assert!(
+            err.starts_with("the rows of other stores could not be read: down"),
+            "{err}"
+        );
+        let hint = super::manifest_missing_hint(&StoreProblem::ManifestMissing {
+            backup_arn: "arn:aws:dynamodb:us-east-1:1:table/T/backup/01".to_owned(),
+        });
+        assert!(
+            hint.contains("--forget-backup arn:aws:dynamodb:us-east-1:1:table/T/backup/01,"),
+            "{hint}"
+        );
+        assert!(super::manifest_missing_hint(&StoreProblem::Transport("x".to_owned())).is_empty());
     }
 }

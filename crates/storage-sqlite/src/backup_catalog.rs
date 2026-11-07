@@ -54,7 +54,7 @@ use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
     JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
+    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -898,6 +898,29 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        // `=` on TEXT compares bytes (the BINARY collation the columns
+        // carry), so a root matches as stored.
+        rows_stream(async move {
+            sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index \
+                 WHERE store_kind = ?1 AND store_root = ?2 \
+                 AND (?3 IS NULL OR status = ?3) ORDER BY created_at, backup_arn"
+            ))
+            .bind(store_kind.as_str())
+            .bind(store_root)
+            .bind(status.map(BackupStatus::as_str))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+        })
+    }
+
     fn newest_available_backup_row<'a>(
         &'a self,
         store: &'a StoreIdentity,
@@ -984,6 +1007,48 @@ impl BackupCatalog for SqliteEngine {
         })
     }
 
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            if keys.is_empty() {
+                return Ok(0);
+            }
+            // One transaction under the writer lock: every key or none.
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
+            let mut rewritten = 0;
+            for key in keys {
+                rewritten += sqlx::query(
+                    "UPDATE backup_index SET store_kind = ?, store_root = ?, store_id = ? \
+                     WHERE account_id = ? AND backup_id = ? AND store_kind = ? \
+                     AND store_root = ? AND status <> 'CREATING'",
+                )
+                .bind(to.store_kind.as_str())
+                .bind(&to.store_root)
+                .bind(&to.store_id)
+                .bind(&key.account_id)
+                .bind(&key.backup_id)
+                .bind(from_kind.as_str())
+                .bind(from_root)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+            }
+            tx.commit().await.map_err(db_err)?;
+            Ok(rewritten)
+        })
+    }
+
     fn set_backup_deleted<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -1007,15 +1072,19 @@ impl BackupCatalog for SqliteEngine {
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let _writer = self.write_lock.lock().await;
             let affected = sqlx::query(
                 "DELETE FROM backup_index WHERE account_id = ? AND backup_id = ? \
-                 AND status IN ('DELETED', 'FAILED')",
+                 AND status IN ('DELETED', 'FAILED') AND store_kind = ? AND store_root = ?",
             )
             .bind(&key.account_id)
             .bind(&key.backup_id)
+            .bind(store_kind.as_str())
+            .bind(store_root)
             .execute(&self.pool)
             .await
             .map_err(db_err)?
@@ -1460,6 +1529,26 @@ impl BackupCatalog for SqliteEngine {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)
+        })
+    }
+
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        Box::pin(async move {
+            let grouped: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+                "SELECT store_kind, store_root, store_id, status, count(*) FROM backup_index \
+                 GROUP BY store_kind, store_root, store_id, status",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            let mut counts = grouped
+                .into_iter()
+                .map(|(kind, root, id, status, rows)| {
+                    StoreRootCount::from_columns(&kind, root, id, &status, rows)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            StoreRootCount::sort(&mut counts);
+            Ok(counts)
         })
     }
 

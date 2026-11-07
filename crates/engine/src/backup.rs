@@ -41,7 +41,8 @@ pub use maintenance::HeldClaim;
 pub use restore::{OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, TARGET_NOT_EMPTY};
 pub use runtime::{
     BackupRuntime, ConfiguredStore, JobSettings, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT, Spool,
-    StoreFence, StoreHealth, StoreHealthReport, check_configured_store, read_identity_bounded,
+    StoreFence, StoreHealth, StoreHealthReport, check_configured_store,
+    check_configured_store_read_only, read_identity_bounded,
 };
 pub use store_identity::{STORE_IDENTITY_KEY, StoreIdentityFile, StoreProblem};
 
@@ -555,12 +556,23 @@ where
 /// engine has no point between the row and the copy to check at, and the
 /// store-backed create checks here too rather than after its insert, since
 /// a row written FAILED for the refusal carried the insert's heartbeat and
-/// `backup purge`'s wait counted it as a live job for the stale window. A
-/// claim taken between this check and the row's insert is therefore not
-/// seen by the job; the in-catalog create that slips through writes no
-/// object of the store the command deletes from, and a restore or a
-/// store-backed create that slips through is a RUNNING record or a CREATING
-/// row the command's wait lists, so the window costs nothing.
+/// `backup purge`'s wait counted it as a live job for the stale window. The
+/// store-backed create reads the claim again immediately before its
+/// `claim_backup`, and the store-backed restore immediately before its
+/// registration (and once more after it), so a claim a command took while
+/// the request opened the table or read the manifest refuses the job with
+/// no row. What remains is the window from that last read to the insert,
+/// however long the insert takes: a claim taken in it is not seen by the
+/// job, and its CREATING row or RUNNING record lands under the claim. One
+/// that lands during the command's wait is listed by it, and one that lands
+/// before `--move-store`'s rewrite stays under the old root, which the
+/// move's re-list reports (the rewrite skips CREATING rows). A CreateBackup
+/// whose insert lands after the move's re-list, during its sync of the
+/// configured root, is reported by the sync's closing report of other
+/// stores if it lands before that report (and the command exits 1), and
+/// only by a later plain sync otherwise. The in-catalog
+/// create, which commits its row inside the backend, writes no object of
+/// the store a command deletes from.
 async fn refuse_while_maintenance_held<S: BackupCatalog + ?Sized>(
     storage: &S,
     runtime: &BackupRuntime,
@@ -1986,6 +1998,7 @@ pub mod reconciler;
 mod restore;
 mod runtime;
 pub mod store_identity;
+pub mod store_maintenance;
 pub mod sync;
 #[cfg(test)]
 mod tests;
