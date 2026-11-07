@@ -69,6 +69,17 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
+/// What one [`BackupStore::delete_prefix_before`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixDeletion {
+    /// The objects removed, counted as [`BackupStore::delete_prefix`]
+    /// counts them.
+    pub deleted: u64,
+    /// Whether the deletion ran to its end; `false` when it stopped at the
+    /// deadline, with the rest of the prefix left.
+    pub finished: bool,
+}
+
 /// A destination for backup objects.
 ///
 /// Implementations must be safe to share across tasks; the engine holds one
@@ -188,6 +199,44 @@ pub trait BackupStore: Send + Sync {
     /// entry removal (its walk runs on the blocking pool and checks a flag
     /// the dropped future sets).
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>>;
+
+    /// [`BackupStore::delete_prefix`] that starts no removal at or after
+    /// `deadline`: the filesystem store's walk checks the deadline beside its
+    /// cancel flag before each removal, the S3 store before each
+    /// `ListObjectsV2`, `DeleteObjects`, `ListMultipartUploads` and
+    /// `AbortMultipartUpload`. A call that reaches the deadline returns what
+    /// it removed so far with [`PrefixDeletion::finished`] false; what
+    /// remains is the step in flight at the deadline (one removal on a
+    /// filesystem root, one request on S3, up to 1,000 keys for a
+    /// `DeleteObjects`). The check reads the clock in the process, so it
+    /// bounds a process that keeps running; one paused between a check and
+    /// the step it admits (a stopped process, a frozen VM) runs that step
+    /// when it resumes. The caller still bounds the call with a timeout for
+    /// a step that never answers.
+    ///
+    /// The default checks the deadline once and then runs `delete_prefix`
+    /// whole: for a store whose deletion is one step (an in-memory test
+    /// store), the same rule.
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        Box::pin(async move {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(PrefixDeletion {
+                    deleted: 0,
+                    finished: false,
+                });
+            }
+            self.delete_prefix(prefix)
+                .await
+                .map(|deleted| PrefixDeletion {
+                    deleted,
+                    finished: true,
+                })
+        })
+    }
 
     /// Startup validation. The filesystem store applies the owner-only rule
     /// to the root and the ancestor rule to the directories above it (the

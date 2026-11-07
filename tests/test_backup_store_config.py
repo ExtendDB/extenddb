@@ -1534,6 +1534,16 @@ class TestSqlite:
             # it: exit 6, the code `migrate` uses for a locked catalog.
             assert res.returncode == 6, res.stdout + res.stderr
             assert "another extenddb process" in (res.stdout + res.stderr), res.stdout + res.stderr
+            # So is every option of `backup sync` that moves or removes rows,
+            # with or without a store to read.
+            for args in (
+                ("sync", "--move-store", "/srv/elsewhere"),
+                ("sync", "--forget-store", "/srv/elsewhere"),
+                ("sync", "--forget-backup", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+            ):
+                res = d.run("backup", *args)
+                assert res.returncode == 6, (args, res.stdout + res.stderr)
+                assert "another extenddb process" in (res.stdout + res.stderr), (args, res.stdout + res.stderr)
             assert server.proc.poll() is None, "the server kept running"
         finally:
             server.stop()

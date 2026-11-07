@@ -84,6 +84,16 @@
 //! them. A later sync where the bytes are adopts them again. Without
 //! `--prune-missing` such rows stay AVAILABLE.
 //!
+//! [`sync`] neither lists nor changes the rows of the other stores (another
+//! kind or root, or the configured root under another store id): a prefix
+//! whose backup id such a row holds meets it at the read under the ARN's
+//! spellings or at the insert, and is skipped naming that row's status,
+//! kind, root and store id. The command reports
+//! those rows as a whole once a listing has reached its end
+//! ([`super::store_maintenance::other_stores`]: the rows per status of
+//! each other store, and each CREATING and DELETING row by ARN), with the
+//! two options that act on them, `--move-store` and `--forget-store`.
+//!
 //! The command takes the maintenance claim for every sync on PostgreSQL,
 //! MongoDB and Cassandra, where it runs beside servers (design 4(f)), and
 //! runs under the serve lock on SQLite; so no purge runs between its row
