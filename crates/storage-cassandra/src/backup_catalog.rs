@@ -73,11 +73,12 @@ use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::backup_format::BackupArn;
+use extenddb_core::types::CreateTableInput;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StaleClock,
-    StatusFields, StoreIdentity, StoreKind, TimeBounds, WriteOutcome, billing_mode_name,
-    new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
+    TimeBounds, WriteOutcome, billing_mode_name, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -173,7 +174,7 @@ fn outcome_unknown(error: &DriverError) -> bool {
 }
 
 /// Run a conditional write and report what it did.
-async fn conditional_write(
+pub(crate) async fn conditional_write(
     session: &CassandraSession,
     query: &str,
     values: QueryValues,
@@ -572,6 +573,80 @@ impl CassandraEngine {
         Ok(arns)
     }
 
+    /// Re-apply the target's `active_restores[table_id] = table_name` entry
+    /// on the backup's row when it is absent, under the takeover of a dead
+    /// manifest record (the trait doc of `claim_restore_dead`): one serial
+    /// read of the map, then a lightweight transaction on the entry
+    /// conditioned on the backup still AVAILABLE. A backup no longer
+    /// AVAILABLE (a delete won while nothing held it) keeps no entry: the
+    /// resumed load fails on the missing prefix and the target is removed.
+    async fn reapply_restore_registration(
+        &self,
+        key: &RestoreTargetKey,
+        backup_arn: &str,
+    ) -> Result<(), StorageError> {
+        use cdrs_tokio::types::AsRust;
+        use cdrs_tokio::types::map::Map;
+        let catalog = self.catalog_keyspace();
+        let rows = crate::cassandra_util::query_rows_serial::<StorageError>(
+            &self.session,
+            &format!(
+                "SELECT active_restores FROM {catalog}.backups_by_arn \
+                 WHERE account_id = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(key.account_id.as_str(), backup_arn),
+            "restore registration",
+        )
+        .await?;
+        let Some(row) = rows.first() else {
+            return Ok(());
+        };
+        let map: Option<Map> = row.get_by_name("active_restores").ok().flatten();
+        let entries: std::collections::HashMap<String, String> = match map {
+            Some(map) => map
+                .as_rust()
+                .map_err(|e| StorageError::Internal(format!("Parse active_restores: {e}")))?
+                .unwrap_or_default(),
+            None => std::collections::HashMap::new(),
+        };
+        if entries.contains_key(&key.table_id) {
+            return Ok(());
+        }
+        let applied = conditional_write(
+            &self.session,
+            &format!(
+                "UPDATE {catalog}.backups_by_arn SET active_restores[?] = ? \
+                 WHERE account_id = ? AND backup_arn = ? IF backup_status = 'AVAILABLE'"
+            ),
+            QueryValues::SimpleValues(vec![
+                Value::from(key.table_id.as_str()),
+                Value::from(key.table_name.as_str()),
+                Value::from(key.account_id.as_str()),
+                Value::from(backup_arn),
+            ]),
+        )
+        .await?;
+        match applied {
+            WriteOutcome::Matched => tracing::warn!(
+                "restore of table {}: the backup {backup_arn} did not list the target as in \
+                 use (its owner died between the target's creation and the registration); the \
+                 entry was re-applied by the takeover",
+                key.table_name
+            ),
+            WriteOutcome::NotMatched => tracing::warn!(
+                "restore of table {}: the backup {backup_arn} is no longer AVAILABLE and does \
+                 not list the target; the resumed load fails on the missing prefix",
+                key.table_name
+            ),
+            WriteOutcome::Unknown => tracing::warn!(
+                "restore of table {}: re-applying the backup's in-use entry had no known \
+                 outcome; the registration sweep removes a stale one",
+                key.table_name
+            ),
+        }
+        Ok(())
+    }
+
     /// The `tables` row of a restore target, read at quorum.
     async fn restore_target_row(
         &self,
@@ -628,6 +703,187 @@ impl RestoreTargetRow {
         self.table_status.as_deref() == Some("DELETING")
             && self.source_backup_arn.is_some()
             && self.job_status.as_deref() == Some("FAILED")
+    }
+}
+
+/// The `tables` columns one restore job record fills, in the order
+/// [`restore_job_row_from`] reads them.
+const RESTORE_JOB_COLUMNS: &str = "account_id, table_name, table_id, table_status, \
+     restore_source_backup_arn, restore_kind, restore_status, restore_owner_generation, \
+     restore_heartbeat_at, restore_store_kind, restore_store_root, restore_store_id, \
+     restore_spool_host, restore_file_index, restore_items_applied, restore_failure_reason, \
+     restore_completed_at";
+
+/// One [`RestoreJobRow`] from a `tables` row that holds a restore record
+/// (every member [`RESTORE_JOB_COLUMNS`] selects): the store the restore
+/// reads, the claimant's spool, the recorded progress, the failure reason
+/// and the completion time, beyond the six the reconciler's legacy and dead
+/// arms read.
+fn restore_job_row_from(row: &Row) -> Result<RestoreJobRow, StorageError> {
+    let column = |name: &str| -> Result<String, StorageError> {
+        crate::cassandra_util::get_column(row, name, "restore job")
+    };
+    let optional = |name: &str| -> Option<String> { row.get_by_name(name).ok().flatten() };
+    let store = optional("restore_store_kind")
+        .as_deref()
+        .and_then(StoreKind::parse)
+        .map(|store_kind| StoreIdentity {
+            store_kind,
+            store_root: optional("restore_store_root").unwrap_or_default(),
+            store_id: optional("restore_store_id").unwrap_or_default(),
+        });
+    let generation: Option<i64> = row.get_by_name("restore_owner_generation").ok().flatten();
+    let heartbeat_at: Option<i64> = row.get_by_name("restore_heartbeat_at").ok().flatten();
+    let completed_at: Option<i64> = row.get_by_name("restore_completed_at").ok().flatten();
+    let file_index: Option<i32> = row.get_by_name("restore_file_index").ok().flatten();
+    let items_applied: Option<i64> = row.get_by_name("restore_items_applied").ok().flatten();
+    Ok(RestoreJobRow {
+        target: RestoreTargetKey {
+            account_id: column("account_id")?,
+            table_name: column("table_name")?,
+            table_id: column("table_id")?,
+        },
+        source_backup_arn: column("restore_source_backup_arn")?,
+        kind: RestoreKind::parse(&column("restore_kind")?)?,
+        status: JobStatus::parse(&column("restore_status")?)?,
+        owner_generation: generation_from_column(generation),
+        heartbeat_at: heartbeat_at.map_or(0.0, millis_to_seconds),
+        store,
+        spool_host: optional("restore_spool_host"),
+        file_index: file_index.and_then(|i| u32::try_from(i).ok()),
+        items_applied: items_applied.and_then(|i| u64::try_from(i).ok()),
+        failure_reason: optional("restore_failure_reason"),
+        completed_at: completed_at.map(millis_to_seconds),
+    })
+}
+
+/// A store-backed restore job's handle on its target's `tables` row. Unlike
+/// the legacy copy's self-managed [`crate::backup_engine::JobHeartbeat`],
+/// the engine drives this claim's heartbeat and status writes; every write
+/// is a lightweight transaction conditioned on the restore generation and on
+/// the record being RUNNING, and leaves `table_status` to
+/// [`CassandraEngine::activate_restore_target_row`] (the ACTIVE flip) and to
+/// `remove_restore_target` (the CREATING to DELETING step of a removal).
+struct CassandraRestoreClaim {
+    engine: CassandraEngine,
+    key: RestoreTargetKey,
+    generation: u64,
+}
+
+impl JobClaim for CassandraRestoreClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let query = format!(
+                "UPDATE {}.tables SET restore_heartbeat_at = toTimestamp(now()) \
+                 WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND restore_owner_generation = ? AND restore_status = 'RUNNING'",
+                self.engine.catalog_keyspace()
+            );
+            let result = crate::cassandra_util::query_lwt(
+                &self.engine.session,
+                &query,
+                cdrs_tokio::query_values!(
+                    self.key.account_id.as_str(),
+                    self.key.table_name.as_str(),
+                    self.key.table_id.as_str(),
+                    generation_column(self.generation)
+                ),
+            )
+            .await?;
+            Ok(if crate::cassandra_util::lwt_applied(&result)? {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn set_status<'a>(
+        &'a self,
+        from: JobStatus,
+        to: JobStatus,
+        fields: &'a StatusFields,
+    ) -> BoxFuture<'a, Result<WriteOutcome, StorageError>> {
+        Box::pin(async move {
+            // The record only; `table_status` is left to the ACTIVE flip and
+            // to the removal's CREATING to DELETING step (4(e)'s two-write
+            // rule). A restore record has no size/item/source-table columns,
+            // so those `StatusFields` are ignored.
+            let mut assignments = vec!["restore_status = ?".to_owned()];
+            let mut values = vec![Value::from(to.as_str())];
+            if let Some(reason) = fields.failure_reason.as_deref() {
+                assignments.push("restore_failure_reason = ?".to_owned());
+                values.push(Value::from(reason));
+            }
+            if fields.completed {
+                assignments.push("restore_completed_at = toTimestamp(now())".to_owned());
+            }
+            values.extend([
+                Value::from(self.key.account_id.as_str()),
+                Value::from(self.key.table_name.as_str()),
+                Value::from(self.key.table_id.as_str()),
+                Value::from(generation_column(self.generation)),
+                Value::from(from.as_str()),
+            ]);
+            let query = format!(
+                "UPDATE {}.tables SET {} WHERE account_id = ? AND table_name = ? \
+                 IF table_id = ? AND restore_owner_generation = ? AND restore_status = ?",
+                self.engine.catalog_keyspace(),
+                assignments.join(", ")
+            );
+            conditional_write(
+                &self.engine.session,
+                &query,
+                QueryValues::SimpleValues(values),
+            )
+            .await
+        })
+    }
+
+    fn read(&self) -> BoxFuture<'_, Result<JobRow, StorageError>> {
+        Box::pin(async move {
+            let query = format!(
+                "SELECT restore_status, restore_owner_generation, restore_heartbeat_at, \
+                 restore_failure_reason FROM {}.tables WHERE account_id = ? AND table_name = ?",
+                self.engine.catalog_keyspace()
+            );
+            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                &self.engine.session,
+                &query,
+                cdrs_tokio::query_values!(
+                    self.key.account_id.as_str(),
+                    self.key.table_name.as_str()
+                ),
+                "restore job row",
+            )
+            .await?;
+            let row = rows.first().ok_or_else(|| {
+                StorageError::TableNotFound(format!(
+                    "restore target {} has no job record",
+                    self.key.table_name
+                ))
+            })?;
+            let status: Option<String> = row.get_by_name("restore_status").ok().flatten();
+            let status = status.ok_or_else(|| {
+                StorageError::TableNotFound(format!(
+                    "restore target {} has no job record",
+                    self.key.table_name
+                ))
+            })?;
+            let generation: Option<i64> =
+                row.get_by_name("restore_owner_generation").ok().flatten();
+            let heartbeat_at: Option<i64> = row.get_by_name("restore_heartbeat_at").ok().flatten();
+            Ok(JobRow {
+                status: JobStatus::parse(&status)?,
+                owner_generation: generation_from_column(generation),
+                heartbeat_at: heartbeat_at.map_or(0.0, millis_to_seconds),
+                failure_reason: row.get_by_name("restore_failure_reason").ok().flatten(),
+            })
+        })
     }
 }
 
@@ -1361,7 +1617,22 @@ impl BackupCatalog for CassandraEngine {
             else {
                 return Ok(None);
             };
-            self.creating_restore_target(&stored).await
+            // The backup's `active_restores` map names the targets whose
+            // registration committed its second write. A store-backed
+            // registration creates the target row (`tables` with
+            // `restore_source_backup_arn`, CREATING) before it writes that
+            // map entry, so a second restore's in-use check in that window
+            // would miss the first and fall through to its own override
+            // validation (`ValidationException` naming the override's index
+            // where the other backends answer `BackupInUseException`). Read
+            // the target rows too: a
+            // CREATING restore target of this backup is in use whether or not
+            // its `active_restores` entry has landed yet.
+            if let Some(target) = self.creating_restore_target(&stored).await? {
+                return Ok(Some(target));
+            }
+            self.creating_restore_target_of_backup(&key.account_id, &key.backup_arn)
+                .await
         })
     }
 
@@ -1436,13 +1707,11 @@ impl BackupCatalog for CassandraEngine {
             // window, every RUNNING record the scans saw is listed). A range
             // scan has no Paxos read (a serial level resolves to a local
             // quorum there), so it stays at quorum.
-            let columns = "account_id, table_name, table_id, table_status, \
-                           restore_source_backup_arn, restore_kind, restore_status, \
-                           restore_owner_generation, restore_heartbeat_at, restore_completed_at";
             let mut scanned = Vec::new();
             for status in ["RUNNING", "FAILED"] {
                 let query = format!(
-                    "SELECT {columns} FROM {}.tables WHERE restore_status = ? ALLOW FILTERING",
+                    "SELECT {RESTORE_JOB_COLUMNS} FROM {}.tables WHERE restore_status = ? \
+                     ALLOW FILTERING",
                     self.catalog_keyspace()
                 );
                 let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
@@ -1464,15 +1733,16 @@ impl BackupCatalog for CassandraEngine {
                         row.get_by_name("restore_heartbeat_at").ok().flatten();
                     let completed_at: Option<i64> =
                         row.get_by_name("restore_completed_at").ok().flatten();
-                    let column = |name: &str| -> Result<String, StorageError> {
-                        crate::cassandra_util::get_column(&row, name, "dead restore jobs")
-                    };
                     // A RUNNING record always carries a heartbeat (the insert
                     // or the backfill wrote it); one without is as dead as the
                     // epoch.
                     let age_of = if status == "FAILED" {
                         let target = RestoreTargetRow {
-                            table_id: column("table_id")?,
+                            table_id: crate::cassandra_util::get_column(
+                                &row,
+                                "table_id",
+                                "dead restore jobs",
+                            )?,
                             table_status: row.get_by_name("table_status").ok().flatten(),
                             source_backup_arn: row
                                 .get_by_name("restore_source_backup_arn")
@@ -1490,34 +1760,27 @@ impl BackupCatalog for CassandraEngine {
                     if age_of.is_some_and(|at| at >= cutoff) {
                         continue;
                     }
-                    let generation: Option<i64> =
-                        row.get_by_name("restore_owner_generation").ok().flatten();
-                    // A row this build cannot read (a kind no release writes)
-                    // is logged and skipped, as ListBackups skips a row it
-                    // cannot read, so one such row does not stop the cycle.
-                    let kind = match RestoreKind::parse(&column("restore_kind")?) {
-                        Ok(kind) => kind,
+                    // A row this build cannot read (a kind or status no
+                    // release writes) is logged and skipped, as ListBackups
+                    // skips a row it cannot read, so one such row does not
+                    // stop the cycle.
+                    match restore_job_row_from(&row) {
+                        Ok(job) => dead.push(job),
                         Err(e) => {
                             tracing::warn!(
                                 "reconciler: restore job record of {} (account {}) skipped: {e}",
-                                column("table_name").unwrap_or_default(),
-                                column("account_id").unwrap_or_default()
+                                row.get_by_name("table_name")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(String::new),
+                                row.get_by_name("account_id")
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(String::new)
                             );
                             continue;
                         }
-                    };
-                    dead.push(RestoreJobRow {
-                        target: RestoreTargetKey {
-                            account_id: column("account_id")?,
-                            table_name: column("table_name")?,
-                            table_id: column("table_id")?,
-                        },
-                        source_backup_arn: column("restore_source_backup_arn")?,
-                        kind,
-                        status: JobStatus::parse(status)?,
-                        owner_generation: generation_from_column(generation),
-                        heartbeat_at: heartbeat_at.map_or(0.0, millis_to_seconds),
-                    });
+                    }
                 }
             }
             Ok(dead)
@@ -1531,9 +1794,8 @@ impl BackupCatalog for CassandraEngine {
             // ahead of the coordinator's clock (skew between coordinators),
             // is listed too.
             let query = format!(
-                "SELECT account_id, table_name, table_id, restore_source_backup_arn, \
-                 restore_kind, restore_owner_generation, restore_heartbeat_at \
-                 FROM {}.tables WHERE restore_status = 'RUNNING' ALLOW FILTERING",
+                "SELECT {RESTORE_JOB_COLUMNS} FROM {}.tables WHERE restore_status = 'RUNNING' \
+                 ALLOW FILTERING",
                 self.catalog_keyspace()
             );
             let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
@@ -1543,30 +1805,220 @@ impl BackupCatalog for CassandraEngine {
                 "running restore jobs",
             )
             .await?;
-            let mut running = Vec::with_capacity(rows.len());
-            for row in rows {
-                let column = |name: &str| -> Result<String, StorageError> {
-                    crate::cassandra_util::get_column(&row, name, "running restore jobs")
-                };
-                let kind = column("restore_kind")?;
-                let generation: Option<i64> =
-                    row.get_by_name("restore_owner_generation").ok().flatten();
-                let heartbeat_at: Option<i64> =
-                    row.get_by_name("restore_heartbeat_at").ok().flatten();
-                running.push(RestoreJobRow {
-                    target: RestoreTargetKey {
-                        account_id: column("account_id")?,
-                        table_name: column("table_name")?,
-                        table_id: column("table_id")?,
-                    },
-                    source_backup_arn: column("restore_source_backup_arn")?,
-                    kind: RestoreKind::parse(&kind)?,
-                    status: JobStatus::Running,
-                    owner_generation: generation_from_column(generation),
-                    heartbeat_at: heartbeat_at.map_or(0.0, millis_to_seconds),
-                });
+            rows.iter().map(restore_job_row_from).collect()
+        })
+    }
+
+    fn claim_restore<'a>(
+        &'a self,
+        account_id: &'a str,
+        input: CreateTableInput,
+        registration: &'a RestoreRegistrationRow,
+    ) -> BoxFuture<'a, Result<RestoreRegistered, StorageError>> {
+        Box::pin(async move {
+            Self::validate_account_id(account_id)?;
+            let (description, generation) = self
+                .register_manifest_restore_target(account_id, input, registration)
+                .await?;
+            let key = RestoreTargetKey {
+                account_id: account_id.to_owned(),
+                table_name: description.table_name.clone(),
+                table_id: description.table_id.clone(),
+            };
+            Ok((
+                description,
+                Box::new(CassandraRestoreClaim {
+                    engine: self.clone(),
+                    key,
+                    generation,
+                }) as Box<dyn JobClaim>,
+            ))
+        })
+    }
+
+    fn claim_restore_dead<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+        stale_after: Duration,
+        spool_host: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        Box::pin(async move {
+            // The record is read at LOCAL_SERIAL, so a heartbeat an LWT just
+            // wrote is seen; dead is `restore_heartbeat_at` older than the
+            // window on the coordinator's clock. The takeover is conditioned
+            // on the generation, RUNNING, the manifest kind and the heartbeat
+            // as read: a beat landing between the read and the write (the
+            // owner alive after all), another taker's generation, or a record
+            // that left RUNNING leaves the row and answers `None`. The write
+            // sets the generation, the claimant's `spool_host` (`None` clears
+            // it) and `restore_heartbeat_at` to the coordinator's clock, so a
+            // second taker's read finds the record live at once (the trait
+            // doc says why a restore record is refreshed where a backup row
+            // is not). A legacy record is not a manifest restore's to take.
+            let catalog = self.catalog_keyspace();
+            let read = format!(
+                "SELECT table_id, restore_status, restore_kind, restore_owner_generation, \
+                 restore_heartbeat_at, restore_source_backup_arn FROM {catalog}.tables \
+                 WHERE account_id = ? AND table_name = ?"
+            );
+            let rows = crate::cassandra_util::query_rows_serial::<StorageError>(
+                &self.session,
+                &read,
+                cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
+                "dead restore job",
+            )
+            .await?;
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            let table_id: Option<String> = row.get_by_name("table_id").ok().flatten();
+            if table_id.as_deref() != Some(key.table_id.as_str()) {
+                return Ok(None);
             }
-            Ok(running)
+            let status: Option<String> = row.get_by_name("restore_status").ok().flatten();
+            if status.as_deref() != Some(JobStatus::Running.as_str()) {
+                return Ok(None);
+            }
+            let owner_generation: Option<i64> =
+                row.get_by_name("restore_owner_generation").ok().flatten();
+            let heartbeat_at: Option<i64> = row.get_by_name("restore_heartbeat_at").ok().flatten();
+            let source_backup_arn: Option<String> =
+                row.get_by_name("restore_source_backup_arn").ok().flatten();
+            let now = coordinator_now_millis(self).await?;
+            let stale_ms = i64::try_from(stale_after.as_millis()).unwrap_or(i64::MAX);
+            if heartbeat_at.is_some_and(|at| at >= now.saturating_sub(stale_ms)) {
+                return Ok(None);
+            }
+            // A test may interpose a beat here, between the read and the
+            // write, to prove the heartbeat condition refuses the takeover.
+            crate::test_hooks::before_restore_takeover(&key.table_id).await;
+            let generation = new_generation();
+            let take_over = format!(
+                "UPDATE {catalog}.tables SET restore_owner_generation = ?, \
+                 restore_spool_host = ?, restore_heartbeat_at = toTimestamp(now()) \
+                 WHERE account_id = ? AND table_name = ? \
+                 IF restore_owner_generation = ? AND restore_status = 'RUNNING' \
+                 AND restore_kind = 'manifest' AND restore_heartbeat_at = ?"
+            );
+            let taken = conditional_write(
+                &self.session,
+                &take_over,
+                QueryValues::SimpleValues(vec![
+                    Value::from(generation_column(generation)),
+                    match spool_host {
+                        Some(host) => Value::from(host),
+                        None => Value::from(Option::<String>::None),
+                    },
+                    Value::from(key.account_id.as_str()),
+                    Value::from(key.table_name.as_str()),
+                    Value::from(owner_generation),
+                    Value::from(heartbeat_at),
+                ]),
+            )
+            .await?;
+            let claimed = match taken {
+                WriteOutcome::Matched => true,
+                WriteOutcome::NotMatched => false,
+                // A takeover whose answer was lost may have committed: a
+                // record carrying this call's generation is this call's claim.
+                WriteOutcome::Unknown => {
+                    let rows = crate::cassandra_util::query_rows_serial::<StorageError>(
+                        &self.session,
+                        &format!(
+                            "SELECT restore_owner_generation FROM {catalog}.tables \
+                             WHERE account_id = ? AND table_name = ?"
+                        ),
+                        cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
+                        "dead restore job",
+                    )
+                    .await?;
+                    let current: Option<i64> = rows
+                        .first()
+                        .and_then(|r| r.get_by_name("restore_owner_generation").ok().flatten());
+                    current == Some(generation_column(generation))
+                }
+            };
+            if !claimed {
+                return Ok(None);
+            }
+            // The backup's `active_restores` entry for the target, re-applied
+            // when it is absent: the registration writes the target's row and
+            // its DDL first and the entry second, so an owner that died
+            // between the two left a resumable record whose backup nothing
+            // held in use. Without the entry `start_backup_delete` would
+            // succeed under the resumed load.
+            if let Some(backup_arn) = source_backup_arn {
+                self.reapply_restore_registration(key, &backup_arn).await?;
+            }
+            Ok(Some(Box::new(CassandraRestoreClaim {
+                engine: self.clone(),
+                key: key.clone(),
+                generation,
+            }) as Box<dyn JobClaim>))
+        })
+    }
+
+    fn read_restore_job<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            let query = format!(
+                "SELECT {RESTORE_JOB_COLUMNS} FROM {}.tables \
+                 WHERE account_id = ? AND table_name = ?",
+                self.catalog_keyspace()
+            );
+            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                &self.session,
+                &query,
+                cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
+                "restore job",
+            )
+            .await?;
+            let Some(row) = rows.first() else {
+                return Ok(None);
+            };
+            // No record, or a table re-created under the name with another id,
+            // is not this target's job.
+            let table_id: Option<String> = row.get_by_name("table_id").ok().flatten();
+            let status: Option<String> = row.get_by_name("restore_status").ok().flatten();
+            if table_id.as_deref() != Some(key.table_id.as_str()) || status.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(restore_job_row_from(row)?))
+        })
+    }
+
+    fn list_restore_jobs<'a>(
+        &'a self,
+        status: Option<JobStatus>,
+    ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            // CQL filters one equality per scan, so a status filter is one
+            // scan and "every record" is a scan per restore status.
+            let statuses = match status {
+                Some(status) => vec![status],
+                None => vec![JobStatus::Running, JobStatus::Done, JobStatus::Failed],
+            };
+            let mut jobs = Vec::new();
+            for status in statuses {
+                let query = format!(
+                    "SELECT {RESTORE_JOB_COLUMNS} FROM {}.tables WHERE restore_status = ? \
+                     ALLOW FILTERING",
+                    self.catalog_keyspace()
+                );
+                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                    &self.session,
+                    &query,
+                    cdrs_tokio::query_values!(status.as_str()),
+                    "restore jobs",
+                )
+                .await?;
+                for row in rows {
+                    jobs.push(restore_job_row_from(&row)?);
+                }
+            }
+            Ok(jobs)
         })
     }
 
