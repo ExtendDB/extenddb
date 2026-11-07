@@ -450,6 +450,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start a two-node cluster
         run: |
           docker network create cassandra-two-nodes
