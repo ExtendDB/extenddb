@@ -77,10 +77,18 @@
 //!   either format stay readable, listable, restorable and deletable.
 //!
 //! The spool. Restores from an S3 store download to `spool_path`, created
-//! `0700` with files `0600`. On file-backed SQLite it defaults to
+//! `0700` with files `0600`: one entry `restore-<table id>/` per running
+//! restore, holding the manifest, its sidecar and each data file with a
+//! `.verified` marker once its digests matched, so the spool costs the
+//! compressed size of the backups being restored at once; the job removes
+//! its entry when it ends, a server stopped by SIGTERM keeps it for the
+//! resume, and the reconciler removes entries of restores no longer RUNNING
+//! with this host's `spool_host`. On file-backed SQLite it defaults to
 //! `backup-spool/` beside the database file; on every other backend an S3
 //! store needs `spool_path` and startup refuses without it (a filesystem
-//! store needs no spool: files are verified in place). A `spool_path` that
+//! store needs no spool: files are hashed in place and read again for the
+//! load, so a filesystem store's `get` errors, which are local I/O errors,
+//! are not retried as an S3 store's transport errors are). A `spool_path` that
 //! contains or is contained in a filesystem store root is refused (the store
 //! would list and delete it, and a sync would read its first component as an
 //! account id), and so is one that is or contains the database file's

@@ -10,9 +10,10 @@ license.workspace = true
 
 [features]
 # Enables deterministic coordination hooks used only by the MongoDB integration
-# test binary (the mongodb-test-hooks server build). Production builds do not
-# compile these hooks.
-test-hooks = []
+# test binary (the mongodb-test-hooks server build), and the restore pause
+# point of `extenddb-storage` the kill-point harness drives. Production builds
+# do not compile these hooks.
+test-hooks = ["extenddb-storage/test-hooks"]
 # Compiles the snapshot page-size setter, the open pause and the shared
 # snapshot conformance check the crate's snapshot tests use. Separate from
 # `test-hooks` so the crate's own tests build the production commit and

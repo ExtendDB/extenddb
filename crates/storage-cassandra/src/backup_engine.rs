@@ -80,11 +80,13 @@ use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, DeleteTableInput,
-    GsiInput, KeySchemaElement, LsiInput, ProvisionedThroughput, SourceTableDetails,
-    TableDescription, TableKeyInfo,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, CreateTableInput,
+    DeleteTableInput, GsiInput, KeySchemaElement, LsiInput, ProvisionedThroughput,
+    SourceTableDetails, TableDescription, TableKeyInfo,
 };
-use extenddb_storage::backup_catalog::{AbandonedLegacyBackup, new_generation};
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, RestoreRegistrationRow, new_generation,
+};
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, throughput_from_catalog,
 };
@@ -106,8 +108,9 @@ use crate::delete_table::DeleteTableCaller;
 const BACKUP_ITEMS_PER_BUCKET: i64 = 64;
 const BACKUP_SCAN_PAGE_SIZE: i64 = 1_000;
 
-/// Items of one bucket a restore copy writes concurrently.
-const RESTORE_WRITE_CONCURRENCY: usize = 8;
+/// Items of one bucket a restore copy writes concurrently. Shared by the
+/// legacy copy and the store-backed `bulk_load`.
+pub(crate) const RESTORE_WRITE_CONCURRENCY: usize = 8;
 
 /// Heartbeats that error in a row after which a job stops: three beats could
 /// not confirm the claim, so the row may already be another owner's. One
@@ -533,6 +536,26 @@ impl CassandraEngine {
         Ok(backup)
     }
 
+    /// The AVAILABLE catalog-index backup (`store_kind` set) `backup_arn`
+    /// names; an in-catalog row is "not found" here, the mirror of
+    /// [`Self::load_available_backup`]. A store-backed restore reads this
+    /// row, not the legacy one.
+    async fn load_available_index_backup(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> Result<StoredBackup, StorageError> {
+        let backup = self
+            .load_stored_backup(account_id, backup_arn)
+            .await?
+            .filter(|backup| !backup.is_in_catalog())
+            .ok_or_else(|| backup_not_found(backup_arn))?;
+        if backup.backup_status != "AVAILABLE" {
+            return Err(backup_not_found(backup_arn));
+        }
+        Ok(backup)
+    }
+
     /// Delete a backup's `backup_items` buckets: the `bucket_count(item_count)`
     /// the row accounts for, then every further bucket until an empty one.
     /// The create writes buckets in order and publishes `item_count` last, so
@@ -745,6 +768,24 @@ impl CassandraEngine {
         self.ensure_backup_not_restoring(&backup).await
     }
 
+    /// [`Self::registration_refusal`] for a store-backed (index) backup: it
+    /// re-reads the catalog-index row rather than the in-catalog one.
+    async fn registration_refusal_index(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> Result<(), StorageError> {
+        let backup = self
+            .load_stored_backup(account_id, backup_arn)
+            .await?
+            .filter(|backup| !backup.is_in_catalog())
+            .ok_or_else(|| backup_not_found(backup_arn))?;
+        if backup.backup_status != "AVAILABLE" {
+            return Err(backup_not_found(backup_arn));
+        }
+        self.ensure_backup_not_restoring(&backup).await
+    }
+
     async fn unregister_restore(
         &self,
         account_id: &str,
@@ -830,6 +871,39 @@ impl CassandraEngine {
             (Some("CREATING"), Some(source)) => Some(source),
             _ => None,
         })
+    }
+
+    /// The name of a CREATING restore target whose `restore_source_backup_arn`
+    /// is `backup_arn`, read from the `tables` rows directly rather than from
+    /// the backup's `active_restores` map: a store-backed registration writes
+    /// the target row before the map entry, so this catches an in-flight
+    /// registration the map does not yet name (the in-use check would
+    /// otherwise miss it and a second restore's own override validation
+    /// would answer first). A table
+    /// scan filtered on the two columns; the in-use check is a control-plane
+    /// path (DeleteBackup, a restore's registration), not a hot path.
+    pub(crate) async fn creating_restore_target_of_backup(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let query = format!(
+            "SELECT table_name FROM {}.tables \
+             WHERE account_id = ? AND restore_source_backup_arn = ? AND table_status = 'CREATING' \
+             ALLOW FILTERING",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, backup_arn),
+            "restore target of backup",
+        )
+        .await?;
+        Ok(rows.first().and_then(|row| {
+            let name: Option<String> = row.get_by_name("table_name").ok().flatten();
+            name
+        }))
     }
 
     /// The name of a CREATING restore target registered on `backup` and still
@@ -945,6 +1019,30 @@ impl CassandraEngine {
         item_count: i64,
         table_size_bytes: i64,
     ) -> Result<bool, StorageError> {
+        self.activate_restore_target_row(
+            &job.account_id,
+            &job.target_name,
+            &job.table_id,
+            job.generation,
+            item_count,
+            table_size_bytes,
+        )
+        .await
+    }
+
+    /// The ACTIVE flip's lightweight transaction, by the target's address and
+    /// the claim's generation. Shared by the legacy copy
+    /// ([`Self::activate_restore_target`]) and the store-backed
+    /// [`extenddb_storage::restore_engine::RestoreEngine::finish_restore`].
+    pub(crate) async fn activate_restore_target_row(
+        &self,
+        account_id: &str,
+        target_name: &str,
+        table_id: &str,
+        generation: u64,
+        item_count: i64,
+        table_size_bytes: i64,
+    ) -> Result<bool, StorageError> {
         let query = format!(
             "UPDATE {}.tables SET table_status = 'ACTIVE', status_transition_at = NULL, \
              item_count = ?, table_size_bytes = ?, restore_status = 'DONE', \
@@ -960,10 +1058,10 @@ impl CassandraEngine {
             cdrs_tokio::query_values!(
                 item_count,
                 table_size_bytes,
-                job.account_id.as_str(),
-                job.target_name.as_str(),
-                job.table_id.as_str(),
-                crate::backup_catalog::generation_column(job.generation)
+                account_id,
+                target_name,
+                table_id,
+                crate::backup_catalog::generation_column(generation)
             ),
         )
         .await?;
@@ -1323,6 +1421,9 @@ impl CassandraEngine {
             source_table_arn,
             restore_date_time_ms,
             owner_generation: generation,
+            kind: extenddb_storage::backup_catalog::RestoreKind::Legacy,
+            store: None,
+            spool_host: None,
         };
         let table_id = columns.table_id.clone();
 
@@ -1400,6 +1501,218 @@ impl CassandraEngine {
             generation,
         };
         Ok((description, job, heartbeat))
+    }
+
+    /// Claim the target a registration created for its own removal: CREATING
+    /// to DELETING and the record FAILED with `reason`, one lightweight
+    /// transaction conditioned on the table id, on CREATING, on the
+    /// registrant's generation and on RUNNING (the write
+    /// [`Self::abandon_restore_target`] makes). `false` when the record is no
+    /// longer this registration's: the registration ran no heartbeat during
+    /// the target's DDL, a reconciler whose stale window the DDL outlasted
+    /// took the record over, and the target is the successor's to load, so
+    /// the registrant removes nothing. The state a crash between the claim
+    /// and the drop leaves (DELETING with its registration and a FAILED
+    /// record) is the one `remove_restore_target` and the FAILED-target duty
+    /// resume from.
+    async fn claim_registered_target_for_removal(
+        &self,
+        account_id: &str,
+        target_name: &str,
+        table_id: &str,
+        generation: u64,
+        reason: &str,
+    ) -> Result<bool, StorageError> {
+        let query = format!(
+            "UPDATE {}.tables SET table_status = 'DELETING', restore_status = 'FAILED', \
+             restore_failure_reason = ?, restore_completed_at = toTimestamp(now()) \
+             WHERE account_id = ? AND table_name = ? \
+             IF table_id = ? AND table_status = 'CREATING' AND restore_owner_generation = ? \
+             AND restore_status = 'RUNNING'",
+            self.catalog_keyspace()
+        );
+        let result = crate::cassandra_util::query_lwt(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(
+                reason,
+                account_id,
+                target_name,
+                table_id,
+                crate::backup_catalog::generation_column(generation)
+            ),
+        )
+        .await?;
+        crate::cassandra_util::lwt_applied(&result)
+    }
+
+    /// The error of a registration whose record another generation took over
+    /// while its target's DDL ran: the target is left to the record's owner.
+    fn registration_claim_lost(target_name: &str, backup_arn: &str) -> StorageError {
+        StorageError::Internal(format!(
+            "restore of table {target_name} from {backup_arn}: the registration lost its \
+             record to a takeover during the target's creation (the record is not RUNNING \
+             under the registration's generation); the target is left to the record's owner, \
+             which finishes the restore"
+        ))
+    }
+
+    /// Register a store-backed (manifest) restore target and return the
+    /// CREATING description and the claim's generation. The manifest analogue
+    /// of [`Self::register_restore_target`]: it reads the catalog-index backup
+    /// row (`store_kind` set) rather than the in-catalog one, writes the job
+    /// record with `restore_kind = 'manifest'` and the store columns, and
+    /// starts no self-managed heartbeat (the engine heartbeats through the
+    /// claim). The ordering against DeleteBackup is the same `active_restores`
+    /// lightweight transaction on the backup's partition, which
+    /// [`crate::backup_catalog`]'s `start_backup_delete` conflicts with. Two
+    /// concurrent registrations of one backup are ordered by that transaction
+    /// too: the in-use pre-read (`ensure_backup_not_restoring`) is not atomic
+    /// with it, so both may pass the pre-read and create their targets, but
+    /// its `active_restores = null` condition admits one; the other finds the
+    /// registered target in its re-read, is `BackupInUse` naming it, and
+    /// removes its own target, so one target is left. With no heartbeat
+    /// during the DDL, a registration whose DDL outlasts the stale window can
+    /// lose its record to a reconciler's takeover; its removal of the target
+    /// on a refusal is therefore conditioned on its own generation
+    /// ([`Self::claim_registered_target_for_removal`]) and removes nothing
+    /// then, answering the lost claim instead of the refusal.
+    pub(crate) async fn register_manifest_restore_target(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistrationRow,
+    ) -> Result<(TableDescription, u64), StorageError> {
+        let backup_arn = registration.backup.backup_arn.clone();
+        // The name is checked first (unfenced), so a restore into a CREATING
+        // restore target's name is refused as the name (TableBeingRestored),
+        // not as the backup, as on the other backends and the legacy path.
+        if let Some(source_backup_arn) = self
+            .creating_restore_target_under_name(account_id, &input.table_name)
+            .await?
+        {
+            return Err(StorageError::TableBeingRestored {
+                table_name: input.table_name.clone(),
+                backup_arn: source_backup_arn,
+            });
+        }
+        let backup = self
+            .load_available_index_backup(account_id, &backup_arn)
+            .await?;
+        self.ensure_backup_not_restoring(&backup).await?;
+
+        let target_name = input.table_name.clone();
+        // The claim is the row itself: a fresh generation, written by the
+        // IF NOT EXISTS insert, fences every later write of this restore.
+        let generation = new_generation();
+        #[allow(clippy::cast_possible_truncation)]
+        let restore_date_time_ms = (registration.restore_date_time * 1_000.0).round() as i64;
+        let columns = RestoreTargetColumns {
+            table_id: uuid::Uuid::new_v4().to_string(),
+            source_backup_arn: backup_arn.clone(),
+            source_table_arn: registration.source_table_arn.clone(),
+            restore_date_time_ms,
+            owner_generation: generation,
+            kind: extenddb_storage::backup_catalog::RestoreKind::Manifest,
+            store: Some(registration.store.clone()),
+            spool_host: registration.spool_host.clone(),
+        };
+        let table_id = columns.table_id.clone();
+
+        // Step 1: the target row (IF NOT EXISTS reserves the name), its
+        // indexes and its data tables, exactly as `input` describes.
+        let description = match self
+            .create_table_for_restore_manifest(account_id, input, &columns)
+            .await
+        {
+            Ok(description) => description,
+            Err(StorageError::TableAlreadyExists(name)) => {
+                return Err(StorageError::TableAlreadyExists(name));
+            }
+            Err(error) => {
+                if let Err(cleanup) = self
+                    .drop_restore_target(account_id, &target_name, &table_id, &backup_arn)
+                    .await
+                {
+                    tracing::warn!(
+                        "Restore of table {target_name}: removing the partly created \
+                         target failed ({cleanup}); the reconciler removes it"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        // Step 2: register on the backup, fenced on AVAILABLE and on no other
+        // registration. A refusal caused only by stale registrations is
+        // retried once they are cleared, a bounded number of times. A test
+        // may hold here, between the target's creation and the fence, to
+        // move the backup to DELETING.
+        crate::test_hooks::before_restore_registration(&backup_arn).await;
+        let mut registered = Ok(false);
+        for _ in 0..REGISTRATION_ATTEMPTS {
+            registered = self
+                .register_restore(account_id, &backup_arn, &table_id, &target_name)
+                .await;
+            match registered {
+                Ok(true) => break,
+                Ok(false) => {
+                    if let Err(refusal) = self
+                        .registration_refusal_index(account_id, &backup_arn)
+                        .await
+                    {
+                        registered = Err(refusal);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !matches!(registered, Ok(true)) {
+            // The removal is fenced on this registration's generation: a
+            // record a reconciler took over during the DDL is the
+            // successor's, and so is the target.
+            let refusal = registration_exhausted(registered, &backup_arn);
+            let owned = match self
+                .claim_registered_target_for_removal(
+                    account_id,
+                    &target_name,
+                    &table_id,
+                    generation,
+                    &format!("the registration was refused: {refusal}"),
+                )
+                .await
+            {
+                Ok(owned) => owned,
+                Err(error) => {
+                    tracing::warn!(
+                        "Restore of table {target_name}: claiming the unregistered target \
+                         for removal failed ({error}); the reconciler removes it"
+                    );
+                    return Err(refusal);
+                }
+            };
+            if !owned {
+                tracing::warn!(
+                    "Restore of table {target_name} from {backup_arn}: the registration's \
+                     record was taken over during the target's creation; the target is left \
+                     to its new owner"
+                );
+                return Err(Self::registration_claim_lost(&target_name, &backup_arn));
+            }
+            if let Err(cleanup) = self
+                .drop_restore_target(account_id, &target_name, &table_id, &backup_arn)
+                .await
+            {
+                tracing::warn!(
+                    "Restore of table {target_name}: removing the unregistered target \
+                     failed ({cleanup}); the reconciler removes it"
+                );
+            }
+            return Err(refusal);
+        }
+
+        Ok((description, generation))
     }
 }
 

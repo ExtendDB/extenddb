@@ -23,6 +23,7 @@ pub mod migrations;
 mod operations;
 mod password_hash_store;
 pub mod pushdown;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
 mod table_engine;

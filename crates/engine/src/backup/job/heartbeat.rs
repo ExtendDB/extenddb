@@ -14,15 +14,27 @@
 //! old (one for the timer to fire, one for the beat to return, the bound
 //! the timer itself enforces), or a beat is in flight (the last paragraph),
 //! and no loss has been raised. The claim's
-//! insert stands for the first confirmed beat: the check measures from the
-//! instant the job took before `claim_backup`, so the maintenance check
-//! that runs between the insert and the handle's start (one catalog query
-//! with no bound of its own) counts against the two periods, and a job
-//! whose first put comes within two periods of the insert needs no beat of
-//! its own; `stale_job_after_secs` is at least three periods, so a row that
-//! passes the check by the two-period rule is never one a reconciler may
-//! take over. The third clause applies only on SQLite, where no reconciler
-//! takes over a row whose job runs in its process (the last paragraph).
+//! insert stands for the first confirmed beat, and the two jobs hand its
+//! instant in by their own convention: the backup job takes it before
+//! `claim_backup` (the row's `heartbeat_at` is stamped inside the insert, so
+//! the instant is at or before the beat and the maintenance check that runs
+//! between the insert and the handle's start, one catalog query with no
+//! bound of its own, counts against the two periods); the restore job takes
+//! it after its first beat returned confirmed, a beat it sends itself right
+//! after `claim_restore` returned (the record's `heartbeat_at` as the
+//! registration stamped it can be old: on PostgreSQL `now()` is the
+//! transaction's start, so a registration stalled on a lock commits a stale
+//! beat; the first beat refreshes it on the catalog's clock), and after
+//! `claim_restore_dead` returned for a resume (the takeover stamped
+//! `heartbeat_at` inside that write). Either way the instant is at or after
+//! the beat it stands for, by a write's own duration, and a slow
+//! registration does not end the job at its first check. A job
+//! whose first write comes within two periods of its instant needs no beat
+//! of its own; `stale_job_after_secs` is at least three periods, so a row
+//! that passes the check by the two-period rule is never one a reconciler
+//! may take over. The third clause applies only on SQLite, where no
+//! reconciler takes over a row whose job runs in its process (the last
+//! paragraph).
 //!
 //! A process stopped and resumed (SIGSTOP, a paused VM) meets the same
 //! rule. On PostgreSQL its claim session keeps the advisory lock while it
@@ -35,18 +47,21 @@
 //! outlives its one-period bound, or when a put comes before the next beat
 //! and finds the last confirmed beat more than two periods old. In that
 //! case its claim closes, the lock is freed and the reconciler resolves the
-//! row (AVAILABLE from a complete manifest, FAILED otherwise). On MongoDB
-//! and Cassandra the row may have been taken over during the stop: a put in
+//! row (AVAILABLE from a complete manifest, FAILED otherwise) or resumes a
+//! store-backed restore from its last committed batch. On MongoDB and
+//! Cassandra the row may have been taken over during the stop: a put in
 //! flight at the stop may still land (the reconciler's FAILED-prefix retry
 //! deletes it), and the job's next beat and status write match no row.
 //!
 //! The one-period bound is the backend's to place
 //! ([`JobClaim::heartbeat_within`]): on SQLite the beat is an `UPDATE`
 //! under the engine write lock, and the bound starts once the beat holds
-//! that lock, so a writer holding it past a period (a GSI backfill) delays
-//! the beat and does not end the job. The re-check before the manifest
-//! ([`HeartbeatHandle::recheck`]) is the same call, and a confirmation it
-//! gets counts as a beat for the pre-put check.
+//! that lock, so a writer holding it past a period (a restore's write
+//! batches, item writes, a GSI backfill, the TTL sweep, a table's drop)
+//! delays the beat and does not end the job; the SQLite restore engine's
+//! module doc gives the batch times the bench record measured. The re-check
+//! before the manifest ([`HeartbeatHandle::recheck`]) is the same call, and
+//! a confirmation it gets counts as a beat for the pre-put check.
 //!
 //! The pre-put check has a third clause for the same case: a beat that is
 //! in flight and has not failed confirms the claim, however old the last
@@ -144,17 +159,27 @@ fn beat_failure(outcome: Option<Result<Heartbeat, StorageError>>, bound: Duratio
     }
 }
 
+/// What a confirmed beat records, if anything: a backup job records the
+/// snapshot's age, a restore job records nothing per beat.
+pub(crate) enum HeartbeatMetric {
+    /// `BackupSnapshotAge`, seconds since `created_at`, into `metrics`.
+    BackupSnapshotAge {
+        metrics: Arc<MetricsCollector>,
+        created_at: f64,
+    },
+    /// No per-beat metric.
+    None,
+}
+
 impl HeartbeatHandle {
     /// Start the timer on `claim`, beating every `period` from one period
-    /// after now; `claimed_at`, the instant of the claim's insert, stands
-    /// for the first confirmed beat. With `metrics`, each confirmed beat
-    /// records the snapshot's age (`BackupSnapshotAge`), seconds since
-    /// `created_at`.
+    /// after now; `claimed_at`, the instant of the claim's insert as the
+    /// job's convention takes it (module doc), stands for the first
+    /// confirmed beat. Each confirmed beat records `metric`.
     pub(crate) fn start(
         claim: Arc<dyn JobClaim>,
         period: Duration,
-        metrics: Option<Arc<MetricsCollector>>,
-        created_at: f64,
+        metric: HeartbeatMetric,
         claimed_at: Instant,
     ) -> Self {
         let (tx, last_confirmed) = watch::channel(claimed_at);
@@ -181,13 +206,21 @@ impl HeartbeatHandle {
                     };
                     if let Some(Ok(Heartbeat::Confirmed)) = outcome {
                         let _ = confirmed.send(Instant::now());
-                        if let Some(metrics) = &metrics {
-                            metrics.record_backup_snapshot_age(seconds_since(created_at));
+                        if let HeartbeatMetric::BackupSnapshotAge {
+                            metrics,
+                            created_at,
+                        } = &metric
+                        {
+                            metrics.record_backup_snapshot_age(seconds_since(*created_at));
                         }
                         continue;
                     }
-                    *reason.lock().unwrap_or_else(PoisonError::into_inner) =
-                        Some(beat_failure(outcome, period));
+                    let why = beat_failure(outcome, period);
+                    *reason.lock().unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
+                    tracing::warn!(
+                        "the job's heartbeat raised the loss of its claim; the job stops at its \
+                         next check: {why}"
+                    );
                     lost.cancel();
                     return;
                 }
@@ -220,15 +253,39 @@ impl HeartbeatHandle {
             .unwrap_or_else(|| "the claim is lost".to_owned())
     }
 
+    /// Why the pre-put check failed, for the job's stop line: the timer's
+    /// own reason when it raised the loss ([`Self::reason`]), else the
+    /// second clause, that no beat confirmed the claim within two periods,
+    /// naming `step`, what the job was about to do ("to load X", "for the
+    /// DONE write").
+    pub(crate) fn why_not_confirmed(&self, step: &str) -> String {
+        if self.lost.is_cancelled() {
+            self.reason()
+        } else {
+            format!("no heartbeat confirmed the claim recently enough {step}")
+        }
+    }
+
     /// The pre-put check (module doc): no loss raised, and either the last
     /// confirmed beat at most two periods old or, on SQLite only, a beat in
     /// flight (parked on the write lock behind a long writer). The second
     /// clause is what catches a timer task that stopped running without
     /// raising the loss; the third never outlives its beat.
     pub(crate) fn confirms_the_claim(&self) -> bool {
-        !self.lost.is_cancelled()
-            && (self.last_confirmed.borrow().elapsed() <= 2 * self.period
-                || in_flight_confirms(&self.in_flight, self.parks))
+        self.claim_check().confirms_the_claim()
+    }
+
+    /// The pre-put check as a value a blocking thread can hold (the
+    /// restore's decoder checks it at every chunk boundary): the same three
+    /// clauses read from the same watch, token and flag.
+    pub(crate) fn claim_check(&self) -> ClaimCheck {
+        ClaimCheck {
+            last_confirmed: self.last_confirmed.clone(),
+            lost: self.lost.clone(),
+            in_flight: Arc::clone(&self.in_flight),
+            parks: self.parks,
+            period: self.period,
+        }
     }
 
     /// One beat outside the timer, under the period's bound (the claim
@@ -248,10 +305,38 @@ impl HeartbeatHandle {
     }
 
     /// End the timer without raising the loss: a timer task that stopped
-    /// running, for the test of the pre-put check's second clause.
-    #[cfg(test)]
+    /// running, for the test of the pre-put check's second clause and for
+    /// the restore's fenced-out kill point, which lets a reconciler take the
+    /// record over while the job pauses.
     pub(crate) fn stop_timer(&self) {
         self.timer.abort();
+    }
+
+    /// A handle that ends the timer as [`Self::stop_timer`] does, for a test
+    /// that holds no reference to the job's handle.
+    #[cfg(test)]
+    pub(crate) fn timer_abort_handle(&self) -> tokio::task::AbortHandle {
+        self.timer.abort_handle()
+    }
+}
+
+/// [`HeartbeatHandle::confirms_the_claim`] detached from the handle.
+#[derive(Clone)]
+pub(crate) struct ClaimCheck {
+    last_confirmed: watch::Receiver<Instant>,
+    lost: CancellationToken,
+    in_flight: Arc<Mutex<bool>>,
+    parks: bool,
+    period: Duration,
+}
+
+impl ClaimCheck {
+    /// No loss raised, and either the last confirmed beat at most two
+    /// periods old or, on SQLite only, a beat in flight (module doc).
+    pub(crate) fn confirms_the_claim(&self) -> bool {
+        !self.lost.is_cancelled()
+            && (self.last_confirmed.borrow().elapsed() <= 2 * self.period
+                || in_flight_confirms(&self.in_flight, self.parks))
     }
 }
 
