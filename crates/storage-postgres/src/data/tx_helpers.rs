@@ -428,10 +428,13 @@ pub(super) async fn write_stream_record_in_tx(
 /// on it. A committed row of this request then answers as a replay, the
 /// answer the first send got.
 ///
-/// The second statement reads the locked row because the transaction runs at
-/// READ COMMITTED and `NOW()` is the same in both statements. If it still
-/// returns no row, or this request's `cancelled:` row, the check answers
-/// `Err(TransactionInProgress)` and does not run the request.
+/// The second statement reads the locked row when the transaction runs at
+/// READ COMMITTED and `NOW()` is the same in both statements.
+/// `transact_write_items_impl` opens the transaction with `begin()`, which
+/// takes the default isolation level of the role or the database, so the
+/// check also tests the second result. If it still returns no row, or this
+/// request's `cancelled:` row, the check answers `Err(TransactionInProgress)`
+/// and does not run the request.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
