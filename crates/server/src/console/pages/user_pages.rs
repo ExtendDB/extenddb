@@ -379,6 +379,13 @@ pub async fn delete_user(
                 .auth_cache
                 .invalidate_user_tags(&account_id, &user_name)
                 .await;
+            // The creation time is an input to the user's aws:userid. A user
+            // created again under this name must not get the deleted user's
+            // (#787), as in management::iam_user::delete_user.
+            state
+                .auth_cache
+                .invalidate_user_created_at(&account_id, &user_name)
+                .await;
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }
         Err(e) => {
