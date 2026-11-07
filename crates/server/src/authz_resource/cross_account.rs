@@ -33,6 +33,10 @@
 //! in more than one account, the caller's included, is refused with
 //! [`MIXED_ACCOUNTS`] whichever accounts they are.
 //!
+//! An account segment that is not 12 ASCII digits gets the answers for an
+//! account that does not exist, without a catalog lookup (measured
+//! 2026-11-06; see [`account_in_catalog`]).
+//!
 //! An account exists here when this deployment's catalog holds it. Fields the
 //! service reads as a name rather than an ARN (`ListStreams` `TableName`,
 //! `RestoreTableToPointInTime` `SourceTableName`, the `ImportTable` table name,
@@ -198,7 +202,17 @@ pub(crate) fn refusal(
 /// True when this deployment's catalog holds `account`. A deployment without
 /// a catalog store knows no other account. A lookup failure fails the request
 /// (it is refused either way) with the authorization layer's internal error.
+///
+/// An account segment that is not 12 ASCII digits is not looked up: the
+/// management API creates no such account, and on PostgreSQL one that carries
+/// U+0000 cannot be bound. The service answers it as an account that does not
+/// exist (measured 2026-11-06 with `1234` and U+0000, `12345678901x`, 11 and
+/// 13 digits, in `TableArn`, `SourceTableArn`, `ResourceArn`, `StreamArn`,
+/// `BackupArn` and the control-plane `TableName`).
 async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, DynamoDbError> {
+    if !extenddb_core::arn::is_account_id(account) {
+        return Ok(false);
+    }
     let Some(store) = state.catalog_store.as_ref() else {
         return Ok(false);
     };

@@ -11,7 +11,7 @@
 //! |---|---|
 //! | a table ARN whose table segment fails the pattern | `Table name of ARN must satisfy regular expression pattern: ...` |
 //! | a dynamodb ARN with a bad region segment | `Invalid AWS region` |
-//! | a dynamodb ARN with a bad account segment | `Invalid subscriber ID` |
+//! | a dynamodb ARN with a bad account segment (a character that is not a digit, or not 12 digits) | `Invalid subscriber ID` |
 //! | anything else that is not a plain table ARN (another service, an index or stream suffix, too few fields) | the `Valid ARN format is ...` frame |
 //!
 //! `DescribeTable` with an ARN of another service is `AccessDeniedException`
@@ -19,9 +19,17 @@
 //! applied to it there. The frame for a well-formed index or stream ARN in
 //! `TableName` is derived from the measured index ARN with a bad segment.
 //!
+//! The table above is measured with the item operations. The control-plane
+//! operations in [`CONTROL_PLANE`] answer the region and account faults
+//! differently (measured 2026-11-06): a bad region segment is `1 validation
+//! error detected: Invalid AWS region in '<arn>'`, with no location, and a bad
+//! account segment gets the answer for an account that does not exist, which
+//! `authz_resource::cross_account` gives, so the gate passes it on.
+//!
 //! The other ARN-bearing fields: `SourceTableArn` (`RestoreTableToPointInTime`)
 //! and `TableArn` (`ExportTableToPointInTime`) with a bad table segment,
-//! `StreamArn` (`DescribeStream`, `GetShardIterator`) and a tag operation's
+//! `StreamArn` (`DescribeStream`, `GetShardIterator`), `ListStreams`'
+//! `ExclusiveStartStreamArn` and a tag operation's
 //! stream `ResourceArn` with a bad table segment or U+0000 in the label,
 //! `BackupArn` (`DescribeBackup`, `DeleteBackup`, `RestoreTableFromBackup`)
 //! with a bad table segment, and a tag operation's table `ResourceArn` with a
@@ -31,6 +39,23 @@ use extenddb_core::arn::{SubResource, fields, parse};
 use extenddb_core::error::DynamoDbError;
 
 pub(crate) const PATTERN: &str = "[a-zA-Z0-9_.-]+";
+
+/// The operations whose `TableName` region and account faults get the
+/// control-plane answers (see the module docs). Measured 2026-11-06 for each,
+/// except `DeleteTable`, which was not sent and takes `UpdateTable`'s answers,
+/// and the region fault of `CreateBackup`, which was not sent.
+pub(crate) const CONTROL_PLANE: &[&str] = &[
+    "CreateTable",
+    "DescribeTable",
+    "UpdateTable",
+    "DeleteTable",
+    "DescribeTimeToLive",
+    "UpdateTimeToLive",
+    "DescribeContinuousBackups",
+    "UpdateContinuousBackups",
+    "CreateBackup",
+    "ListBackups",
+];
 
 const FRAME: &str = "Valid ARN format is \
     'arn:<awsPartition>:<vendor>:<region>:<subscriber>:resourceType/resourceName', \
@@ -69,7 +94,8 @@ pub(crate) enum ArnFault {
     TableSegment,
     /// A dynamodb ARN whose region segment carries a character outside `[a-z0-9-]`.
     Region,
-    /// A dynamodb ARN whose account segment carries a character that is not a digit.
+    /// An account segment that carries a character that is not a digit, or,
+    /// in a dynamodb ARN, a non-empty one that is not 12 digits.
     Account,
     /// Not a plain table ARN of this service: too few fields, another service,
     /// an index or stream or backup suffix, or a shape `arn::parse` rejects.
@@ -89,7 +115,14 @@ pub(crate) fn table_arn_fault(arn: &str) -> Option<ArnFault> {
     {
         return Some(ArnFault::Region);
     }
-    if !f.account.chars().all(|c| c.is_ascii_digit()) {
+    // 11 and 13 digits are measured (2026-11-06) in a dynamodb ARN only; an
+    // empty account and another service's ARN keep the digit rule.
+    let bad_account = if f.service == "dynamodb" && !f.account.is_empty() {
+        !extenddb_core::arn::is_account_id(f.account)
+    } else {
+        !f.account.chars().all(|c| c.is_ascii_digit())
+    };
+    if bad_account {
         return Some(ArnFault::Account);
     }
     if f.service != "dynamodb" {
@@ -128,6 +161,18 @@ pub(crate) fn check_table_name_arn(operation: &str, arn: &str) -> Result<(), Dyn
     {
         return Ok(());
     }
+    if CONTROL_PLANE.contains(&operation) {
+        match fault {
+            // The cross-account layer answers it without a catalog lookup.
+            ArnFault::Account => return Ok(()),
+            ArnFault::Region => {
+                return Err(validation(format!(
+                    "1 validation error detected: Invalid AWS region in '{arn}'"
+                )));
+            }
+            ArnFault::TableSegment | ArnFault::NotPlainTable => {}
+        }
+    }
     Err(one_error(arn, "tableName", arn_constraint(fault)))
 }
 
@@ -160,7 +205,8 @@ pub(crate) fn check_table_arn_field(operation: &str, arn: &str) -> Result<(), Dy
 
 /// A stream ARN whose table segment fails the pattern or whose label carries
 /// U+0000: `Invalid StreamArn` (measured for `DescribeStream`,
-/// `GetShardIterator` and `TagResource`).
+/// `GetShardIterator` and `TagResource`, and on 2026-11-06 for the
+/// `ListStreams` `ExclusiveStartStreamArn`, with and without `TableName`).
 pub(crate) fn check_stream_arn(arn: &str) -> Result<(), DynamoDbError> {
     match parse(arn) {
         Some(res)
@@ -246,6 +292,61 @@ mod tests {
                 .unwrap()
                 .ends_with("failed to satisfy constraint: Invalid subscriber ID")
         );
+    }
+
+    #[test]
+    fn an_account_segment_of_eleven_or_thirteen_digits_is_an_account_fault() {
+        for account in ["12345678901", "1234567890123", "12345678901x"] {
+            let arn = format!("arn:aws:dynamodb:us-east-1:{account}:table/t367name");
+            for op in ["GetItem", "PutItem", "UpdateItem", "Query", "Scan"] {
+                assert!(
+                    message(check_table_name_arn(op, &arn))
+                        .unwrap()
+                        .ends_with("failed to satisfy constraint: Invalid subscriber ID"),
+                    "{op} {arn}"
+                );
+            }
+            let m = message(check_transact_member_arn(
+                &arn,
+                "transactItems.1.member.get.tableName",
+            ))
+            .unwrap();
+            assert!(m.ends_with("constraint: Invalid subscriber ID"), "{m}");
+        }
+        // Another service's ARN keeps the digit rule and the frame.
+        let s3 = "arn:aws:s3:us-east-1:1234567890123:t367name";
+        assert!(
+            message(check_table_name_arn("PutItem", s3))
+                .unwrap()
+                .ends_with(FRAME)
+        );
+        assert!(check_table_name_arn("PutItem", &table("t367name")).is_ok());
+    }
+
+    #[test]
+    fn control_plane_operations_pass_account_faults_on_and_word_region_faults_alone() {
+        let region = format!("arn:aws:dynamodb:us-ea\u{0}st-1:{ACCT}:table/t367name");
+        for op in CONTROL_PLANE {
+            for account in ["1234\u{0}", "12345678901x", "12345678901", "1234567890123"] {
+                let arn = format!("arn:aws:dynamodb:us-east-1:{account}:table/t367name");
+                assert!(check_table_name_arn(op, &arn).is_ok(), "{op} {arn:?}");
+            }
+            assert_eq!(
+                message(check_table_name_arn(op, &region)).unwrap(),
+                format!("1 validation error detected: Invalid AWS region in '{region}'"),
+                "{op}"
+            );
+            // The table segment and the frame are the item operations' answers.
+            let bad = table("t367\u{0}name");
+            assert!(
+                message(check_table_name_arn(op, &bad))
+                    .unwrap()
+                    .contains("Table name of ARN must satisfy"),
+                "{op}"
+            );
+        }
+        let account = "arn:aws:dynamodb:us-east-1:1234\u{0}:table/t367name";
+        assert!(check_table_name_arn("PutItem", account).is_err());
     }
 
     #[test]

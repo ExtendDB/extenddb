@@ -32,7 +32,11 @@
 //! - `ListStreams` has its own validator: `TableName must be at least 3
 //!   characters long and at most 255 characters long`, measured for a U+0000
 //!   name, and on 2026-11-04 for a table ARN and for `abc:def`; applied to
-//!   any other character outside the pattern (derived).
+//!   any other character outside the pattern (derived). Its
+//!   `ExclusiveStartStreamArn` takes the stream ARN rules of `arn_gate`
+//!   (measured 2026-11-06). U+0000 in the start ARN's account, region or
+//!   partition is accepted by the service and by storage, which binds only
+//!   the table segment and the label.
 //! - A `RequestItems` key outside the pattern: `at 'requestItems'` with the
 //!   map-key constraint list. The service renders its own dump of the whole
 //!   map inside `Value '...'`; the first offending key the parsed map yields
@@ -73,7 +77,7 @@ const LIST_STREAMS_NAME: &str =
 /// missing, non-string or empty name passes.
 pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
     match operation {
-        "BatchGetItem" | "BatchWriteItem" => check_request_items_keys(input),
+        "BatchGetItem" | "BatchWriteItem" => check_request_items_keys(operation, input),
         "TransactGetItems" => check_transact_items(input, &["Get"]),
         "TransactWriteItems" => {
             check_transact_items(input, &["Put", "Delete", "Update", "ConditionCheck"])
@@ -111,12 +115,19 @@ pub(crate) fn check_table_name_chars(operation: &str, input: &Value) -> Result<(
             input.get("ExclusiveStartTableName"),
             "exclusiveStartTableName",
         ),
-        "ListStreams" => match input.get("TableName").and_then(Value::as_str) {
-            Some(name) if !name.is_empty() && !in_pattern(name) => Err(
-                DynamoDbError::ValidationException(LIST_STREAMS_NAME.to_owned()),
-            ),
-            _ => Ok(()),
-        },
+        "ListStreams" => {
+            match input.get("TableName").and_then(Value::as_str) {
+                Some(name) if !name.is_empty() && !in_pattern(name) => {
+                    return Err(DynamoDbError::ValidationException(
+                        LIST_STREAMS_NAME.to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            // Storage binds the start ARN's table segment and label; the
+            // service refuses U+0000 in either (measured 2026-11-06).
+            with_str(input, "ExclusiveStartStreamArn", arn_gate::check_stream_arn)
+        }
         "Query" | "Scan" => {
             check_name(input.get("TableName"), "tableName", operation)?;
             match input.get("IndexName").and_then(Value::as_str) {
@@ -211,7 +222,15 @@ fn bare_name_error(name: &str, location: &str) -> DynamoDbError {
 /// A `RequestItems` key outside the pattern, or an ARN key that the ARN rules
 /// refuse. The sentence from `at 'requestItems'` onward is the service's; the
 /// offending key alone is rendered where the service renders the whole map.
-fn check_request_items_keys(input: &Value) -> Result<(), DynamoDbError> {
+///
+/// `BatchWriteItem` refuses a key for its account segment only when the
+/// segment carries U+0000; any other bad account segment is passed on to the
+/// cross-account answer for an account that does not exist, `Access is
+/// denied`. Measured 2026-11-06: a letter and 13 digits got `Access is denied`
+/// on every request, and U+0000 and 11 digits got either that or the map-key
+/// constraint from one request to the next. `BatchGetItem` refused all four
+/// here on every request.
+fn check_request_items_keys(operation: &str, input: &Value) -> Result<(), DynamoDbError> {
     let Some(map) = input.get("RequestItems").and_then(Value::as_object) else {
         return Ok(());
     };
@@ -220,7 +239,14 @@ fn check_request_items_keys(input: &Value) -> Result<(), DynamoDbError> {
             continue;
         }
         if key.starts_with("arn:") {
-            if arn_gate::table_arn_fault(key).is_some() {
+            let refused = match arn_gate::table_arn_fault(key) {
+                None => false,
+                Some(arn_gate::ArnFault::Account) if operation == "BatchWriteItem" => {
+                    extenddb_core::arn::fields(key).is_some_and(|f| f.account.contains('\u{0}'))
+                }
+                Some(_) => true,
+            };
+            if refused {
                 return Err(one_error(key, "requestItems", arn_gate::MAP_KEYS_ARN));
             }
         } else if !in_pattern(key) {
@@ -510,6 +536,68 @@ mod tests {
             );
             assert!(message(op, json!({ "ResourceArn": format!("{ARN}/index/i") })).is_none());
             assert!(message(op, json!({})).is_none());
+        }
+    }
+
+    #[test]
+    fn list_streams_checks_the_exclusive_start_stream_arn() {
+        let own = "arn:aws:dynamodb:us-east-1:123456789012:table/t367name";
+        for start in [
+            format!("{own}/stream/2026\u{0}"),
+            format!("{ARN}/stream/2026-11-06T00:00:00.000"),
+        ] {
+            for input in [
+                json!({ "ExclusiveStartStreamArn": start }),
+                json!({ "TableName": "t367name", "ExclusiveStartStreamArn": start }),
+            ] {
+                assert_eq!(
+                    message("ListStreams", input).as_deref(),
+                    Some("Invalid StreamArn"),
+                    "{start:?}"
+                );
+            }
+        }
+        for start in [
+            "arn:aws:dynamodb:us-east-1:1234\u{0}:table/t367name/stream/2026-11-06T00:00:00.000",
+            "arn:aws:dynamodb:us-ea\u{0}st-1:123456789012:table/t367name/stream/2026",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/t367name/stream/2026",
+        ] {
+            assert!(
+                message("ListStreams", json!({ "ExclusiveStartStreamArn": start })).is_none(),
+                "{start:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_write_passes_an_account_segment_without_nul_on() {
+        let key = |account: &str| format!("arn:aws:dynamodb:us-east-1:{account}:table/t367name");
+        for account in ["12345678901x", "12345678901", "1234567890123"] {
+            let k = key(account);
+            assert!(
+                message(
+                    "BatchWriteItem",
+                    json!({ "RequestItems": { k.as_str(): [] } })
+                )
+                .is_none(),
+                "{k}"
+            );
+            assert_eq!(
+                message(
+                    "BatchGetItem",
+                    json!({ "RequestItems": { k.as_str(): {} } })
+                )
+                .unwrap(),
+                one(&k, "requestItems", arn_gate::MAP_KEYS_ARN)
+            );
+        }
+        let k = key("1234\u{0}");
+        for op in ["BatchWriteItem", "BatchGetItem"] {
+            assert_eq!(
+                message(op, json!({ "RequestItems": { k.as_str(): [] } })).unwrap(),
+                one(&k, "requestItems", arn_gate::MAP_KEYS_ARN),
+                "{op}"
+            );
         }
     }
 

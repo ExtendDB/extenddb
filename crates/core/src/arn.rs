@@ -49,6 +49,12 @@ pub struct TableResource {
     pub sub: Option<SubResource>,
 }
 
+/// True when `account` is an account id: exactly 12 ASCII digits.
+#[must_use]
+pub fn is_account_id(account: &str) -> bool {
+    account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Split a string into the five ARN fields after the `arn:` prefix.
 ///
 /// The resource field keeps every `:` and `/` it contains, so a stream ARN's
@@ -146,6 +152,22 @@ mod tests {
         assert_eq!(f.region, "us-east-1");
         assert_eq!(f.account, "1");
         assert_eq!(f.resource, "table/T");
+    }
+
+    #[test]
+    fn an_account_id_is_twelve_ascii_digits() {
+        assert!(is_account_id("123456789012"));
+        for account in [
+            "",
+            "12345678901",
+            "1234567890123",
+            "12345678901x",
+            "1234\u{0}",
+            "12345678901\u{0}",
+            "\u{661}1234567890",
+        ] {
+            assert!(!is_account_id(account), "{account:?}");
+        }
     }
 
     #[test]
