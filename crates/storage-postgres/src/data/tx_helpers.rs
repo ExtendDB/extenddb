@@ -427,6 +427,11 @@ pub(super) async fn write_stream_record_in_tx(
 /// cannot change between the two statements and the second one does not wait
 /// on it. A committed row of this request then answers as a replay, the
 /// answer the first send got.
+///
+/// The second statement reads the locked row because the transaction runs at
+/// READ COMMITTED and `NOW()` is the same in both statements. If it still
+/// returns no row, or this request's `cancelled:` row, the check answers
+/// `Err(TransactionInProgress)` and does not run the request.
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
@@ -434,13 +439,11 @@ pub(super) async fn check_idempotency_token_in_tx(
     fingerprint: &str,
 ) -> Result<(), StorageError> {
     let mut row = run_token_statement(tx, account_id, token, fingerprint).await?;
-    let stale_read = match &row {
-        None => true,
-        Some((stored, false)) => StoredToken::of(stored, fingerprint) == StoredToken::Rerun,
-        Some((_, true)) => false,
-    };
-    if stale_read {
+    if stale_read(row.as_ref(), fingerprint) {
         row = run_token_statement(tx, account_id, token, fingerprint).await?;
+        if stale_read(row.as_ref(), fingerprint) {
+            return Err(StorageError::TransactionInProgress);
+        }
     }
 
     match row {
@@ -449,6 +452,17 @@ pub(super) async fn check_idempotency_token_in_tx(
             StoredToken::Replay => Err(StorageError::IdempotentReplay),
             StoredToken::Rerun | StoredToken::Mismatch => Err(StorageError::IdempotentMismatch),
         },
+    }
+}
+
+/// A result of [`run_token_statement`] that a snapshot from before another
+/// send's commit gives: no row, or this request's `cancelled:` row that the
+/// statement did not take.
+fn stale_read(row: Option<&(String, bool)>, fingerprint: &str) -> bool {
+    match row {
+        None => true,
+        Some((stored, false)) => StoredToken::of(stored, fingerprint) == StoredToken::Rerun,
+        Some((_, true)) => false,
     }
 }
 
