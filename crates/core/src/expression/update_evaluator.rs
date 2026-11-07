@@ -248,7 +248,7 @@ fn apply_add(
     value: AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let target = navigate_to_parent_map_or_create(item, path, maps)?;
+    let target = navigate_to_existing_parent_map(item, path, maps)?;
     let attr_name = resolve_attr_name(
         path.last()
             .ok_or_else(|| DynamoDbError::ValidationException("Empty path in ADD".to_owned()))?,
@@ -369,61 +369,43 @@ fn apply_delete(
     Ok(())
 }
 
-/// Navigate a document path to the parent map of the leaf element, creating
-/// intermediate maps as needed. Used by ADD which must create the path if absent.
+/// Navigate a document path to the parent map of the leaf element for ADD.
+/// Every element above the leaf must exist with the container type the next
+/// element needs: ADD creates no missing map (measured 2026-10-26).
 ///
 /// For a single-element path, returns the item itself.
-fn navigate_to_parent_map_or_create<'a>(
+fn navigate_to_existing_parent_map<'a>(
     item: &'a mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     maps: &ExpressionMaps,
 ) -> Result<&'a mut BTreeMap<String, AttributeValue>, DynamoDbError> {
+    let invalid = || {
+        DynamoDbError::ValidationException(
+            "The document path provided in the update expression is invalid for update".to_owned(),
+        )
+    };
     if path.len() <= 1 {
         return Ok(item);
     }
-    let first_name = resolve_attr_name(&path[0], maps)?;
     let mut current = item
-        .entry(first_name)
-        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
+        .get_mut(&resolve_attr_name(&path[0], maps)?)
+        .ok_or_else(invalid)?;
     for element in &path[1..path.len() - 1] {
-        match element {
-            PathElement::Attribute(_) => {
-                let name = resolve_attr_name(element, maps)?;
-                if let AttributeValue::M(map) = current {
-                    current = map
-                        .entry(name)
-                        .or_insert_with(|| AttributeValue::M(BTreeMap::new()));
-                } else {
-                    return Err(DynamoDbError::ValidationException(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_owned(),
-                    ));
-                }
+        current = match (element, current) {
+            (PathElement::Attribute(_), AttributeValue::M(map)) => map
+                .get_mut(&resolve_attr_name(element, maps)?)
+                .ok_or_else(invalid)?,
+            (PathElement::Index(idx), AttributeValue::L(list)) => {
+                list.get_mut(*idx).ok_or_else(invalid)?
             }
-            PathElement::Index(idx) => {
-                if let AttributeValue::L(list) = current {
-                    if *idx < list.len() {
-                        current = &mut list[*idx];
-                    } else {
-                        return Err(DynamoDbError::ValidationException(
-                            "The provided expression refers to an attribute that does not exist in the item"
-                                .to_owned(),
-                        ));
-                    }
-                } else {
-                    return Err(DynamoDbError::ValidationException(
-                        "The document path provided in the update expression is invalid for update"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
+            _ => return Err(invalid()),
+        };
     }
-    match current {
-        AttributeValue::M(map) => Ok(map),
-        _ => Err(DynamoDbError::ValidationException(
-            "The document path provided in the update expression is invalid for update".to_owned(),
-        )),
+    // A list element as the leaf is not supported here: `ADD l[0] :n` is
+    // refused for every parent, the service's answer when the parent is a map.
+    match (path.last(), current) {
+        (Some(PathElement::Attribute(_)), AttributeValue::M(map)) => Ok(map),
+        _ => Err(invalid()),
     }
 }
 
@@ -640,3 +622,7 @@ fn resolve_path_to_value<'a>(
 #[cfg(test)]
 #[path = "update_evaluator_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "update_add_parent_tests.rs"]
+mod add_parent_tests;
