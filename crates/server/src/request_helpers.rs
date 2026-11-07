@@ -295,10 +295,12 @@ pub(crate) async fn authorize_request(
     // the set of keys that table receives; transaction operations authorize
     // once per item with that item's key. Each target carries the
     // `dynamodb:LeadingKeys` value(s) the service evaluates, extracted per the
-    // table's key schema. The resource ARN per target is unchanged: each is
-    // still that table's ARN. (Measured against live DynamoDB 2026-10-20.)
-    // Targets with the same (action, table, LeadingKeys) are evaluated once,
-    // since the decision depends only on those three for a given identity.
+    // table's key schema, and the `dynamodb:Attributes` names of that table's
+    // part of the batch or of that item (see `request_attributes`). The
+    // resource ARN per target is unchanged: each is still that table's ARN.
+    // (Measured against live DynamoDB 2026-10-20 and 2026-10-31.) Targets with
+    // the same (action, table, LeadingKeys, Attributes) are evaluated once,
+    // since the decision depends only on those four for a given identity.
     if let Some(tables) = crate::leading_keys::batch_transact_tables(operation, input) {
         // A request outside the operation's count limits is refused before any
         // key info is read or any policy is evaluated, with the engine's own
@@ -325,9 +327,13 @@ pub(crate) async fn authorize_request(
             let ki = key_info_for_authz(state.storage.table_key_info(account_id, &table).await)?;
             authorized_key_info.insert(table, ki);
         }
-        let targets =
-            crate::leading_keys::batch_transact_targets(operation, input, &authorized_key_info)
-                .unwrap_or_default();
+        let targets = crate::leading_keys::batch_transact_targets(
+            operation,
+            input,
+            &authorized_key_info,
+            &state.limits,
+        )
+        .unwrap_or_default();
 
         if targets.is_empty() {
             // Malformed body (the count checks above have already refused an
@@ -357,6 +363,7 @@ pub(crate) async fn authorize_request(
                 );
                 let params = extenddb_auth::policy::context::RequestParams {
                     leading_keys: target.leading_keys,
+                    attributes: target.attributes,
                     ..base_params(request_tags.clone(), request_tag_keys.clone())
                 };
                 authorization::check_authorization(
@@ -391,7 +398,12 @@ pub(crate) async fn authorize_request(
                 key_info.as_ref(),
                 state.limits.max_expression_tokens,
             ),
-            attributes: extract_attributes(input),
+            attributes: crate::request_attributes::single_table_attributes(
+                operation,
+                input,
+                key_info.as_ref(),
+                &state.limits,
+            ),
             select: input
                 .get("Select")
                 .and_then(|v| v.as_str())
@@ -433,36 +445,10 @@ pub(crate) async fn authorize_request(
     Ok(authorized_key_info)
 }
 
-/// Extract attribute names from the request for `dynamodb:Attributes`.
-///
-/// Collects attribute names from `ProjectionExpression` (comma-separated list
-/// of top-level names). Resolves `ExpressionAttributeNames` placeholders
-/// (e.g. `#n` → `name`) when present.
-/// Returns `None` when no projection is specified.
-pub(crate) fn extract_attributes(input: &Value) -> Option<Vec<String>> {
-    let proj = input.get("ProjectionExpression")?.as_str()?;
-    let ean = input
-        .get("ExpressionAttributeNames")
-        .and_then(|v| v.as_object());
-    let names: Vec<String> = proj
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            ean.and_then(|m| m.get(s))
-                .and_then(|v| v.as_str())
-                .unwrap_or(s)
-                .to_owned()
-        })
-        .collect();
-    if names.is_empty() { None } else { Some(names) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use extenddb_core::types::TableKeyInfo;
-    use serde_json::json;
 
     fn sample_key_info() -> TableKeyInfo {
         TableKeyInfo {
@@ -531,46 +517,6 @@ mod tests {
             matches!(engine, DynamoDbError::ResourceInUseException(_)),
             "the engine maps TableNotActive to ResourceInUseException, got: {engine:?}"
         );
-    }
-
-    #[test]
-    fn extract_attributes_resolves_expression_attribute_names() {
-        let input = json!({
-            "ProjectionExpression": "#n, #v",
-            "ExpressionAttributeNames": {
-                "#n": "name",
-                "#v": "value"
-            }
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "value".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_mixed_placeholders_and_literals() {
-        let input = json!({
-            "ProjectionExpression": "#n, age",
-            "ExpressionAttributeNames": {
-                "#n": "name"
-            }
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "age".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_no_expression_attribute_names() {
-        let input = json!({
-            "ProjectionExpression": "name, age"
-        });
-        let result = extract_attributes(&input);
-        assert_eq!(result, Some(vec!["name".to_owned(), "age".to_owned()]));
-    }
-
-    #[test]
-    fn extract_attributes_no_projection() {
-        let input = json!({"TableName": "test"});
-        assert_eq!(extract_attributes(&input), None);
     }
 
     #[test]
