@@ -33,8 +33,10 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
-# `TaskTracker` for the backup jobs the server drains at shutdown.
-tokio-util = { workspace = true, features = ["rt"] }
+# `TaskTracker` for the backup jobs the server drains at shutdown;
+# `StreamReader` and `SyncIoBridge` for the restore's in-place decode of a
+# store object on the blocking pool.
+tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 

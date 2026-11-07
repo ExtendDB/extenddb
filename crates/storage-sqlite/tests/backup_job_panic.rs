@@ -286,7 +286,7 @@ async fn a_job_task_that_panics_leaves_a_row_the_next_cycle_resolves_without_a_r
     // One reconciler cycle in the same process: the slot no task holds makes
     // the row dead at once, and without a manifest it is FAILED.
     let mut state = ReconcilerState::with_shutdown(shutdown.child_token());
-    let report = reconciler::cycle(&*storage, &runtime, stale_job_after, "sqlite", &mut state)
+    let report = reconciler::cycle(&storage, &runtime, stale_job_after, "sqlite", &mut state)
         .await
         .expect("a reconciler cycle");
     assert_eq!(report.store_healthy, Some(true), "{report:?}");
@@ -327,7 +327,7 @@ async fn a_job_task_that_panics_leaves_a_row_the_next_cycle_resolves_without_a_r
         Ok(answer) => panic!("DescribeBackup of the FAILED row answered {}", answer.body),
     }
     // A second cycle has nothing left to resolve.
-    let report = reconciler::cycle(&*storage, &runtime, stale_job_after, "sqlite", &mut state)
+    let report = reconciler::cycle(&storage, &runtime, stale_job_after, "sqlite", &mut state)
         .await
         .expect("a second cycle");
     assert!(report.creating_resolved.is_empty(), "{report:?}");
