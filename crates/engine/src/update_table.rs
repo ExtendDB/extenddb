@@ -10,6 +10,31 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// `validate_index_name` with the pattern clause located at the update's
+/// member path, as the service reports it (measured 2026-10-24). The length
+/// clauses keep the bare `indexName` location, which is not measured for
+/// UpdateTable.
+fn validate_update_index_name(
+    name: &str,
+    position: usize,
+    action: &str,
+) -> Result<(), DynamoDbError> {
+    match extenddb_core::validation::validate_index_name(name) {
+        Err(DynamoDbError::ValidationException(m))
+            if m.contains("' at 'indexName' ") && m.contains("regular expression pattern") =>
+        {
+            Err(DynamoDbError::ValidationException(m.replace(
+                "' at 'indexName' ",
+                &format!(
+                    "' at 'globalSecondaryIndexUpdates.{}.member.{action}.indexName' ",
+                    position + 1
+                ),
+            )))
+        }
+        other => other,
+    }
+}
+
 /// Handle `UpdateTable` — modify billing mode, throughput, deletion protection,
 /// or GSI configuration.
 ///
@@ -209,7 +234,7 @@ pub async fn handle_update_table(
 /// (when given) a throughput of at least 1 unit each.
 fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
     if let Some(updates) = &input.global_secondary_index_updates {
-        for update in updates {
+        for (position, update) in updates.iter().enumerate() {
             if update.create.is_some() && update.delete.is_some() {
                 return Err(DynamoDbError::ValidationException(
                     "One or more parameter values were invalid: Only one of Create or Delete can be specified per GlobalSecondaryIndexUpdate".to_owned(),
@@ -227,9 +252,11 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                     "One or more parameter values were invalid: GlobalSecondaryIndexUpdate must contain Create, Update, or Delete".to_owned(),
                 ));
             }
-            // M3: Validate index names the same way CreateTable does.
+            // Index names are validated the way CreateTable does, except that the
+            // pattern clause carries the member's path (measured 2026-10-24:
+            // `globalSecondaryIndexUpdates.<n>.member.create.indexName`, 1-based).
             if let Some(create) = &update.create {
-                extenddb_core::validation::validate_index_name(&create.index_name)?;
+                validate_update_index_name(&create.index_name, position, "create")?;
                 extenddb_core::validation::validate_index_throughput_minimum(
                     &create.index_name,
                     create.provisioned_throughput.as_ref(),
@@ -260,7 +287,7 @@ fn validate_gsi_updates(input: &UpdateTableInput) -> Result<(), DynamoDbError> {
                 }
             }
             if let Some(delete) = &update.delete {
-                extenddb_core::validation::validate_index_name(&delete.index_name)?;
+                validate_update_index_name(&delete.index_name, position, "delete")?;
             }
         }
     }
@@ -377,6 +404,58 @@ mod tests {
         }
         let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
         validate_gsi_updates(&input(ok)).unwrap();
+    }
+
+    #[test]
+    fn an_index_name_outside_the_pattern_is_reported_at_its_member_path() {
+        let input = |updates: Value| -> UpdateTableInput {
+            serde_json::from_value(serde_json::json!({
+                "TableName": "t",
+                "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
+                "GlobalSecondaryIndexUpdates": updates,
+            }))
+            .unwrap()
+        };
+        let create = |name: &str| {
+            serde_json::json!({ "Create": {
+                "IndexName": name,
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+            }})
+        };
+        let cases = [
+            (
+                serde_json::json!([create("g\u{0}2")]),
+                "globalSecondaryIndexUpdates.1.member.create.indexName",
+            ),
+            (
+                serde_json::json!([
+                    { "Delete": { "IndexName": "gix" } },
+                    { "Delete": { "IndexName": "g\u{0}2" } },
+                ]),
+                "globalSecondaryIndexUpdates.2.member.delete.indexName",
+            ),
+        ];
+        for (updates, path) in cases {
+            match validate_gsi_updates(&input(updates)).unwrap_err() {
+                DynamoDbError::ValidationException(m) => assert_eq!(
+                    m,
+                    format!(
+                        "1 validation error detected: Value 'g\u{0}2' at '{path}' failed to \
+                         satisfy constraint: Member must satisfy regular expression pattern: \
+                         [a-zA-Z0-9_.-]+"
+                    )
+                ),
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        // A length fault keeps the bare location, which is not measured here.
+        match validate_gsi_updates(&input(serde_json::json!([create("ab")]))).unwrap_err() {
+            DynamoDbError::ValidationException(m) => {
+                assert!(m.contains("' at 'indexName' "), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
