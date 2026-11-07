@@ -8,9 +8,9 @@ use std::cmp::Ordering;
 use extenddb_core::expression::{CompareOp, ExpressionMaps, SortKeyCondition};
 use extenddb_core::types::ScalarAttributeType;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk};
+use extenddb_storage::util::{SortKeyValue, parse_sk, string_prefix_upper_bound};
 
-use super::query::{binary_upper_bound, string_upper_bound};
+use super::query::binary_upper_bound;
 use super::resolve_expr_to_av;
 
 /// One side of a sort key range: the CQL operator and the bound value.
@@ -66,10 +66,10 @@ impl SkRange {
             SortKeyCondition::BeginsWith { prefix, .. } => {
                 let prefix_av = resolve_expr_to_av(prefix, expression_maps)?;
                 let prefix_sk = parse_sk(&prefix_av, sk_type)?;
-                // Exclusive upper bound by type; None when the prefix is empty
-                // or all 0xFF (no finite upper bound).
+                // Exclusive upper bound by type; None when the prefix is empty,
+                // all U+10FFFF or all 0xFF (no finite upper bound).
                 let upper_sk_opt = match &prefix_sk {
-                    SortKeyValue::S(s) => Some(SortKeyValue::S(string_upper_bound(s))),
+                    SortKeyValue::S(s) => string_prefix_upper_bound(s).map(SortKeyValue::S),
                     SortKeyValue::B(b) => binary_upper_bound(b).map(SortKeyValue::B),
                     SortKeyValue::N(_) => {
                         return Err(StorageError::Validation(
@@ -262,10 +262,56 @@ mod tests {
     }
 
     #[test]
+    fn begins_with_range_admits_every_key_with_the_prefix_and_no_other() {
+        // Sort keys measured on the service on 2026-10-25: begins_with(sk, p)
+        // returns exactly the keys that start with p, in UTF-8 byte order.
+        let keys = [
+            "a",
+            "ab",
+            "a\u{D7FF}",
+            "a\u{E000}",
+            "a\u{FFFF}",
+            "a\u{10000}",
+            "a\u{10FFFF}",
+            "a\u{10FFFF}b",
+            "a\u{10FFFF}\u{10FFFF}",
+            "b",
+            "\u{10FFFF}",
+            "\u{10FFFF}x",
+            "\u{10FFFF}\u{10FFFF}",
+            "z",
+        ];
+        for prefix in [
+            "a",
+            "a\u{10FFFF}",
+            "a\u{10FFFF}\u{10FFFF}",
+            "a\u{D7FF}",
+            "\u{10FFFF}",
+        ] {
+            let range = SkRange {
+                lower: Some((">=", s(prefix))),
+                upper: string_prefix_upper_bound(prefix).map(|u| ("<", SortKeyValue::S(u))),
+            };
+            for key in keys {
+                assert_eq!(
+                    range.contains(&s(key)),
+                    key.starts_with(prefix),
+                    "prefix {} key {}",
+                    prefix.escape_unicode(),
+                    key.escape_unicode()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn begins_with_in_reverse_replaces_the_exclusive_upper_bound() {
         let mut range = SkRange {
             lower: Some((">=", s("ab"))),
-            upper: Some(("<", SortKeyValue::S(string_upper_bound("ab")))),
+            upper: Some((
+                "<",
+                SortKeyValue::S(string_prefix_upper_bound("ab").unwrap()),
+            )),
         };
         range.advance_past(s("abz"), false);
         assert_eq!(
@@ -370,17 +416,23 @@ mod tests {
             ),
             (" AND sk >= ? AND sk <= ?".to_owned(), strs(&["aa", "m"]))
         );
-        // begins_with on a string: inclusive prefix, exclusive prefix plus U+10FFFF.
+        // begins_with on a string: inclusive prefix, exclusive next prefix.
         assert_eq!(
             range(
                 "pk = :p AND begins_with(sk, :v)",
                 &[(":v", s_av("ab"))],
                 ScalarAttributeType::S
             ),
-            (
-                " AND sk >= ? AND sk < ?".to_owned(),
-                strs(&["ab", "ab\u{10FFFF}"])
-            )
+            (" AND sk >= ? AND sk < ?".to_owned(), strs(&["ab", "ac"]))
+        );
+        // A prefix of U+10FFFF alone has no finite upper bound.
+        assert_eq!(
+            range(
+                "pk = :p AND begins_with(sk, :v)",
+                &[(":v", s_av("\u{10FFFF}"))],
+                ScalarAttributeType::S
+            ),
+            (" AND sk >= ?".to_owned(), strs(&["\u{10FFFF}"]))
         );
         // begins_with on binary: the last byte below 0xFF is incremented and the
         // rest dropped; an all-0xFF prefix has no finite upper bound.

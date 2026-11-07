@@ -6,16 +6,17 @@
 //!
 //! Sort-key comparisons bind through [`super::sk_bound`], so `N` keys are
 //! compared as their order-preserving TEXT encoding (D2): `>`, `<`, `BETWEEN`
-//! all remain numerically correct. `begins_with` applies only to `S` (string
-//! prefix via the maximal code point `char(1114111)`) and `B` (byte-range via
-//! an incremented upper bound); DynamoDB rejects `begins_with` on `N`.
+//! all remain numerically correct. `begins_with` applies only to `S` and `B`,
+//! each read as a range up to the next prefix (see
+//! [`string_prefix_upper_bound`] and [`binary_prefix_upper_bound`]); DynamoDB
+//! rejects `begins_with` on `N`.
 
 use extenddb_core::expression::{self, CompareOp, Expr, ExpressionMaps, SortKeyCondition};
 use extenddb_core::types::{
     AttributeValue, Item, KeySchemaElement, ScalarAttributeType, extract_key,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{SortKeyValue, parse_sk};
+use extenddb_storage::util::{SortKeyValue, parse_sk, string_prefix_upper_bound};
 
 use super::BoundValue;
 
@@ -103,12 +104,15 @@ pub(super) fn build_sk_sql_and_binds(
                     // rows.
                     None => Ok((format!(" AND {sk_col} >= ?"), vec![SortKeyValue::B(b)])),
                 },
-                // For strings the SQL upper bound is `? || char(1114111)`,
-                // so the same prefix is bound twice.
-                SortKeyValue::S(s) => Ok((
-                    format!(" AND {sk_col} >= ? AND {sk_col} < (? || char(1114111))"),
-                    vec![SortKeyValue::S(s.clone()), SortKeyValue::S(s)],
-                )),
+                // The exclusive upper bound is the next prefix in code point
+                // order; a prefix of only U+10FFFF has none.
+                SortKeyValue::S(s) => match string_prefix_upper_bound(&s) {
+                    Some(upper) => Ok((
+                        format!(" AND {sk_col} >= ? AND {sk_col} < ?"),
+                        vec![SortKeyValue::S(s), SortKeyValue::S(upper)],
+                    )),
+                    None => Ok((format!(" AND {sk_col} >= ?"), vec![SortKeyValue::S(s)])),
+                },
                 SortKeyValue::N(_) => Err(StorageError::Validation(
                     "begins_with is not supported on numeric sort keys".to_owned(),
                 )),
