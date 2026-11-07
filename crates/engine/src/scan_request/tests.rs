@@ -3,10 +3,8 @@
 
 //! The expected texts below were measured against the service on 2026-10-25
 //! (us-east-1, each request twice), except where a test says otherwise: the
-//! `Segment` and `TotalSegments` range texts are the previous release's (the
-//! service aggregates range faults into one message with a different form, a
-//! separate issue), and the deserializer test pins this module's hand-off, not
-//! a service text.
+//! deserializer test pins this module's hand-off, not a service text. The
+//! range constraint rows are in `range_tests`.
 
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
@@ -126,117 +124,71 @@ fn nested_numbers_and_the_other_number_faults_are_reported_with_the_service_text
 }
 
 #[test]
-fn limit_segment_and_total_segments_ranges_come_first() {
+fn range_faults_come_first() {
+    const SEGMENT_LOW: &str = "1 validation error detected: Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0";
     let base = bad_number();
-    assert_eq!(
-        check(&with(base.clone(), "Limit", json!(0))).as_deref(),
-        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
-    );
-    assert_eq!(
-        check(&with(base.clone(), "Limit", json!(-1))).as_deref(),
-        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
-    );
-    // The int32 minimum itself gets the capitalised form; below it the service
-    // saturates the value and uses the older form (measured 2026-10-25).
-    assert_eq!(
-        check(&with(base.clone(), "Limit", json!(-2_147_483_648_i64))).as_deref(),
-        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
-    );
-    assert_eq!(
-        check(&with(base.clone(), "Limit", json!(-2_147_483_649_i64))).as_deref(),
-        Some(
-            "1 validation error detected: Value '-2147483648' at 'limit' failed to satisfy constraint: Member must have value greater than or equal to 1"
-        )
-    );
-    // Each segment field is range checked when present, with or without the
-    // other one (the service's position; the texts are the previous release's).
-    for (field, value, text) in [
-        (
-            "Segment",
-            -1,
-            "1 validation error detected: Value '-1' at 'segment' failed to satisfy constraint: Member must have value greater than or equal to 0",
-        ),
-        (
-            "Segment",
-            1_000_000,
-            "1 validation error detected: Value '1000000' at 'segment' failed to satisfy constraint: Member must have value less than or equal to 999999",
-        ),
-        (
-            "TotalSegments",
-            0,
-            "The parameter TotalSegments should be greater than or equal to 1",
-        ),
-        (
-            "TotalSegments",
-            1_000_001,
-            "1 validation error detected: Value '1000001' at 'totalSegments' failed to satisfy constraint: Member must have value less than or equal to 1000000",
-        ),
-    ] {
+    for limit in [0, -1] {
         assert_eq!(
-            check(&with(base.clone(), field, json!(value))).as_deref(),
-            Some(text),
-            "{field} {value}"
-        );
-        let partner = if field == "Segment" {
-            ("TotalSegments", 2)
-        } else {
-            ("Segment", 0)
-        };
-        let paired = with(
-            with(base.clone(), field, json!(value)),
-            partner.0,
-            json!(partner.1),
-        );
-        assert_eq!(
-            check(&paired).as_deref(),
-            Some(text),
-            "{field} {value} with {}",
-            partner.0
+            check(&with(base.clone(), "Limit", json!(limit))).as_deref(),
+            Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
         );
     }
-    // Several range faults: the first in the order Limit, Segment,
-    // TotalSegments is reported.
-    let three = with(
-        with(
-            with(json!({"TableName": "t"}), "Limit", json!(0)),
-            "Segment",
-            json!(-1),
-        ),
-        "TotalSegments",
-        json!(1_000_001),
-    );
-    assert_eq!(
-        check(&three).as_deref(),
-        Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
-    );
-    let two = with(
-        with(json!({"TableName": "t"}), "Segment", json!(-1)),
-        "TotalSegments",
-        json!(1_000_001),
-    );
-    assert!(check(&two).is_some_and(|m| m.contains("at 'segment'")));
-    // Values at the bounds pass.
-    assert!(
-        check(
-            &json!({"TableName": "t", "Limit": 1, "Segment": 999_999, "TotalSegments": 1_000_000})
-        )
-        .is_none()
-    );
     // A range fault beats the parameter mix and the ReturnConsumedCapacity enum.
+    let scan_filter =
+        json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}});
     let mix = with(
         with(base.clone(), "Segment", json!(-1)),
         "ScanFilter",
-        json!({"a": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}}),
+        scan_filter.clone(),
     );
-    assert!(check(&mix).is_some_and(|m| m.contains("at 'segment'")));
+    assert_eq!(check(&mix).as_deref(), Some(SEGMENT_LOW));
     let rcc = with(
-        with(base, "Limit", json!(0)),
+        with(base.clone(), "Segment", json!(-1)),
+        "ReturnConsumedCapacity",
+        json!("NOPE"),
+    );
+    assert_eq!(check(&rcc).as_deref(), Some(SEGMENT_LOW));
+    let rcc = with(
+        with(base.clone(), "Limit", json!(0)),
         "ReturnConsumedCapacity",
         json!("NOPE"),
     );
     assert_eq!(
         check(&rcc).as_deref(),
         Some(&*format!("1 validation error detected: {LIMIT_RANGE}"))
+    );
+    // Every range fault is reported, ahead of the mix, both enums and the number.
+    let all = with(
+        with(
+            with(with(base.clone(), "Limit", json!(0)), "Segment", json!(-1)),
+            "TotalSegments",
+            json!(0),
+        ),
+        "ScanFilter",
+        scan_filter.clone(),
+    );
+    assert_eq!(
+        check(&all).as_deref(),
+        Some(
+            "3 validation errors detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1; Value at 'Segment' failed to satisfy constraint: Member must have value greater than or equal to 0; Value at 'TotalSegments' failed to satisfy constraint: Member must have value greater than or equal to 1"
+        )
+    );
+    let mut two = with(with(base, "Limit", json!(0)), "Segment", json!(1_000_000));
+    two["ScanFilter"] = scan_filter;
+    two["ReturnConsumedCapacity"] = json!("NOPE");
+    two["Select"] = json!("NOPE");
+    assert_eq!(
+        check(&two).as_deref(),
+        Some(
+            "2 validation errors detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1; Value at 'Segment' failed to satisfy constraint: Member must have value less than or equal to 999999"
+        )
+    );
+    // Values at the bounds pass.
+    assert!(
+        check(
+            &json!({"TableName": "t", "Limit": 1, "Segment": 999_999, "TotalSegments": 1_000_000})
+        )
+        .is_none()
     );
 }
 

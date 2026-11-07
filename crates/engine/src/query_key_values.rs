@@ -119,6 +119,16 @@ fn query_request_checks(body: &Value) -> Result<(), DynamoDbError> {
     if let Some(limit) = body.get("Limit").and_then(Value::as_i64)
         && limit < 1
     {
+        // Beside a value that is not one AttributeValue the service answers
+        // its older form, with the value echoed (measured 2026-10-25 12:56 UTC
+        // on Query and Scan, and 2026-10-31 for the key and the lists).
+        if has_unreadable_attribute_value(body, QUERY_CONDITIONS) {
+            return Err(DynamoDbError::ValidationException(format!(
+                "1 validation error detected: Value '{}' at 'limit' failed to satisfy constraint: \
+                 Member must have value greater than or equal to 1",
+                limit.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+            )));
+        }
         return Err(DynamoDbError::ValidationException(
             LIMIT_BELOW_ONE.to_owned(),
         ));
@@ -191,6 +201,87 @@ pub(crate) fn non_empty(body: &Value, field: &str) -> bool {
         Some(Value::Object(map)) => !map.is_empty(),
         Some(Value::Array(items)) => !items.is_empty(),
         _ => false,
+    }
+}
+
+/// The type descriptors an AttributeValue may carry.
+const TYPE_DESCRIPTORS: &[&str] = &["S", "N", "B", "SS", "NS", "BS", "M", "L", "NULL", "BOOL"];
+
+/// The legacy condition maps of `Scan` whose `AttributeValueList` entries
+/// [`has_unreadable_attribute_value`] reads.
+pub(crate) const SCAN_CONDITIONS: &[&str] = &["ScanFilter"];
+
+/// The legacy condition maps of `Query` whose `AttributeValueList` entries
+/// [`has_unreadable_attribute_value`] reads.
+pub(crate) const QUERY_CONDITIONS: &[&str] = &["KeyConditions", "QueryFilter"];
+
+/// Whether the request holds an object that is not one AttributeValue: empty,
+/// with a type descriptor the service does not have (a lower-case `s`
+/// included), or with more than one, at the top or as a member of an `L` or
+/// `M` at any depth. The values read are the `ExpressionAttributeValues`
+/// entries, the `ExclusiveStartKey` values and the `AttributeValueList`
+/// entries of the `conditions` maps. Beside such a value the service reports a
+/// range fault in its older form, and beside a readable value, of the wrong
+/// type for a key or not, the newer form.
+///
+/// Measured on 2026-10-25 at 12:56 UTC: `Limit: 0` beside an entry `{}`,
+/// `{"X": "1"}` or `{"S": "x", "N": "1"}` answers `Value '0' at 'limit'` on
+/// Query and Scan, and beside an empty or duplicate `NS` the newer form. On
+/// 2026-10-30 at 12:40 UTC on Scan and 2026-10-31 at 12:36 UTC on Query:
+/// beside an entry `{"L": [{}]}`, `{"M": {"k": {"X": "1"}}}` or `{"s": "x"}`,
+/// the older form. On 2026-10-31 between 23:54 and 23:56 UTC: beside `{}` or
+/// `{"X": "1"}` as an `ExclusiveStartKey` value or a `ScanFilter`
+/// `AttributeValueList` entry on Scan, and `{}` as an `ExclusiveStartKey`
+/// value or a `KeyConditions` or `QueryFilter` `AttributeValueList` entry on
+/// Query, the older form, for a `Segment` fault too; beside `{"N": "1"}` as
+/// the value of an `S` key, `{"N": "1"}` in a `ScanFilter` list and `{"S":
+/// "p0"}` in a `KeyConditions` list, the newer form. An `L` or `M` member of
+/// an `ExclusiveStartKey` value or of a list entry is read as one of an
+/// `ExpressionAttributeValues` entry is; that is not measured.
+///
+/// A value that is not an object is a shape fault, reported ahead of the
+/// checks.
+pub(crate) fn has_unreadable_attribute_value(body: &Value, conditions: &[&str]) -> bool {
+    let in_map = |field: &str| {
+        body.get(field)
+            .and_then(Value::as_object)
+            .is_some_and(|values| values.values().any(is_unreadable_attribute_value))
+    };
+    let in_lists = |field: &&str| {
+        body.get(*field)
+            .and_then(Value::as_object)
+            .is_some_and(|conditions| {
+                conditions.values().any(|condition| {
+                    condition
+                        .get("AttributeValueList")
+                        .and_then(Value::as_array)
+                        .is_some_and(|list| list.iter().any(is_unreadable_attribute_value))
+                })
+            })
+    };
+    in_map("ExpressionAttributeValues")
+        || in_map("ExclusiveStartKey")
+        || conditions.iter().any(in_lists)
+}
+
+/// Whether `entry` is an object that is not one AttributeValue, or an `L` or
+/// `M` with such a member; see [`has_unreadable_attribute_value`].
+fn is_unreadable_attribute_value(entry: &Value) -> bool {
+    let Some(descriptors) = entry.as_object() else {
+        return false;
+    };
+    let mut fields = descriptors.iter();
+    match (fields.next(), fields.next()) {
+        (Some((descriptor, value)), None) => match descriptor.as_str() {
+            "L" => value
+                .as_array()
+                .is_some_and(|members| members.iter().any(is_unreadable_attribute_value)),
+            "M" => value
+                .as_object()
+                .is_some_and(|members| members.values().any(is_unreadable_attribute_value)),
+            descriptor => !TYPE_DESCRIPTORS.contains(&descriptor),
+        },
+        _ => true,
     }
 }
 
