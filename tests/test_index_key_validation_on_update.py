@@ -6,19 +6,29 @@ rules:
 - An UpdateItem whose statement leaves a secondary-index key empty (empty
   string or empty binary) or wrong-typed is refused with ValidationException.
   The empty case carries the update-expression wording; the type case carries
-  the Type mismatch wording naming the index. The type case is reported ahead
-  of a ConditionExpression; the empty case after the condition passes.
+  the Type mismatch wording naming the index. A literal is checked on the
+  statement, the type first and then an empty value, ahead of a
+  ConditionExpression and of an action that cannot apply; list_append and
+  arithmetic count as literals of their result type. A value written from an
+  attribute reference or from if_not_exists is checked after the condition
+  passes, the empty case included.
 - In TransactWriteItems a wrong-typed index key on a Put item or on the
   post-update item of an Update cancels the transaction with a positional
   ValidationError reason. An index key left empty aborts the whole transaction
   with a top-level ValidationException and no CancellationReasons. On a Put
   member both are reported ahead of the member's condition; on an Update
-  member the type case is reported ahead of the condition and the empty case
-  after it.
-- Across members: a wrong-typed index key on any member wins (the transaction
-  is cancelled, None in the other positions); otherwise an empty index key on
-  any member wins over failed conditions and unapplicable statements on the
-  others.
+  member a literal of either kind is reported ahead of the condition and a
+  value written from the item after it.
+- Across members: a wrong-typed index key supplied in the request (a Put
+  item's attribute, an Update's literal operand) or a Put item's empty index
+  key decides, the first such fault in request order (a wrong type cancels the
+  transaction with None in the other positions); otherwise an Update's empty
+  literal on any member wins over failed conditions, unapplicable statements
+  and computed wrong types on the others; otherwise each member reports its
+  own outcome, an empty value an Update wrote from the item aborting the
+  request, and a wrong type an Update computes from the stored item is a
+  ValidationError at that member beside them. The member orders of each case
+  are in tests/test_transact_index_key_cross_member.py.
 - if_not_exists(k, :empty) is judged on what the statement writes: accepted
   when k is present, refused when k is absent.
 - Nothing is written in any refused case.
@@ -334,9 +344,10 @@ class TestTransactPutIndexKey:
 class TestOrderAgainstTheCondition:
     """Where the index-key checks sit relative to a ConditionExpression, as measured.
 
-    A wrong-typed index key is reported ahead of the condition. A failed
-    condition is reported ahead of an empty index key and ahead of a statement
-    that cannot be applied (arithmetic on a missing attribute).
+    A wrong-typed index-key literal is reported ahead of the condition, and so
+    is an empty index-key literal (measured 2026-10-31). A failed condition is
+    reported ahead of a statement that cannot be applied (arithmetic on a
+    missing attribute).
     """
 
     def test_update_item_type_mismatch_beats_a_failing_condition(self, dynamodb_client, indexed_table):
@@ -354,7 +365,7 @@ class TestOrderAgainstTheCondition:
             attr="bidx", expected="B", actual="N", index="bidx-index"
         )
 
-    def test_update_item_failing_condition_beats_an_empty_key(self, dynamodb_client, indexed_table):
+    def test_update_item_empty_literal_beats_a_failing_condition(self, dynamodb_client, indexed_table):
         key = _seed(dynamodb_client, indexed_table, "o-empty")
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client.update_item(
@@ -364,7 +375,9 @@ class TestOrderAgainstTheCondition:
                 ConditionExpression="attribute_not_exists(pk)",
                 ExpressionAttributeValues={":v": {"S": ""}},
             )
-        assert _err(exc_info)["Code"] == "ConditionalCheckFailedException"
+        assert _err(exc_info)["Code"] == "ValidationException"
+        assert _err(exc_info)["Message"] == EMPTY_UPDATE_WORDING.format(kind="string")
+        assert "sidx" not in _item(dynamodb_client, indexed_table, key)
 
     def test_update_item_failing_condition_beats_a_statement_that_cannot_apply(self, dynamodb_client, indexed_table):
         key = _key("o-apply-missing")
@@ -401,7 +414,7 @@ class TestOrderAgainstTheCondition:
             attr="bidx", expected="B", actual="N", index="bidx-index"
         )
 
-    def test_transact_update_failing_condition_beats_an_empty_key(self, dynamodb_client, indexed_table):
+    def test_transact_update_empty_literal_beats_its_failing_condition(self, dynamodb_client, indexed_table):
         key = _seed(dynamodb_client, indexed_table, "xo-empty")
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client.transact_write_items(
@@ -417,9 +430,10 @@ class TestOrderAgainstTheCondition:
                     }
                 ]
             )
-        resp = exc_info.value.response
-        assert resp["Error"]["Code"] == "TransactionCanceledException"
-        assert [r["Code"] for r in resp["CancellationReasons"]] == ["ConditionalCheckFailed"]
+        assert _err(exc_info)["Code"] == "ValidationException"
+        assert _err(exc_info)["Message"] == EMPTY_UPDATE_WORDING.format(kind="string")
+        assert "CancellationReasons" not in exc_info.value.response
+        assert "sidx" not in _item(dynamodb_client, indexed_table, key)
 
     def test_transact_update_failing_condition_beats_a_statement_that_cannot_apply(self, dynamodb_client, indexed_table):
         with pytest.raises(ClientError) as exc_info:
@@ -650,16 +664,19 @@ class TestCrossMemberPrecedence:
             attr="bidx", expected="B", actual="N", index="bidx-index"
         )
 
-    def test_an_empty_key_whose_own_condition_fails_is_a_plain_cancellation(self, dynamodb_client, indexed_table):
-        _seed(dynamodb_client, indexed_table, "cc-a")
+    def test_an_empty_literal_beats_its_own_failing_condition_beside_a_plain_member(
+        self, dynamodb_client, indexed_table
+    ):
+        a = _seed(dynamodb_client, indexed_table, "cc-a")
         _seed(dynamodb_client, indexed_table, "cc-b")
         empty_failing = _upd(indexed_table, "cc-a", "SET sidx = :v", {":v": {"S": ""}}, "attribute_not_exists(pk)")
         plain = _upd(indexed_table, "cc-b", "SET v = :v", {":v": {"N": "2"}})
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client.transact_write_items(TransactItems=[empty_failing, plain])
-        resp = exc_info.value.response
-        assert resp["Error"]["Code"] == "TransactionCanceledException"
-        assert [r["Code"] for r in resp["CancellationReasons"]] == ["ConditionalCheckFailed", "None"]
+        assert _err(exc_info)["Code"] == "ValidationException"
+        assert _err(exc_info)["Message"] == EMPTY_UPDATE_WORDING.format(kind="string")
+        assert "CancellationReasons" not in exc_info.value.response
+        assert "sidx" not in _item(dynamodb_client, indexed_table, a)
         assert _item(dynamodb_client, indexed_table, _key("cc-b"))["v"] == {"N": "1"}
 
 
@@ -813,7 +830,7 @@ class TestLiteralVersusComputedIndexKeyValues:
         assert _err(exc_info)["Code"] == "ValidationException"
         assert _err(exc_info)["Message"] == TYPE_WORDING.format(attr="bidx", expected="B", actual="N", index="bidx-index")
 
-    def test_an_empty_literal_does_not_beat_an_action_that_cannot_apply(self, dynamodb_client, indexed_table):
+    def test_an_empty_literal_beats_an_action_that_cannot_apply(self, dynamodb_client, indexed_table):
         with pytest.raises(ClientError) as exc_info:
             dynamodb_client.update_item(
                 TableName=indexed_table, Key=_key("lc-empty-apply"),
@@ -821,7 +838,8 @@ class TestLiteralVersusComputedIndexKeyValues:
                 ExpressionAttributeValues={":one": {"N": "1"}, ":e": {"S": ""}},
             )
         assert _err(exc_info)["Code"] == "ValidationException"
-        assert _err(exc_info)["Message"] == "The provided expression refers to an attribute that does not exist in the item"
+        assert _err(exc_info)["Message"] == EMPTY_UPDATE_WORDING.format(kind="string")
+        assert _item(dynamodb_client, indexed_table, _key("lc-empty-apply")) is None
 
     def test_transacted_computed_value_is_a_cancellation_with_the_computed_wording(self, dynamodb_client, indexed_table):
         key = _key("lc-txn-ref")

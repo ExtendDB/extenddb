@@ -41,6 +41,12 @@ pub enum StorageError {
     IdempotentReplay,
     #[error("Idempotent parameter mismatch")]
     IdempotentMismatch,
+    /// Another send of the same `TransactWriteItems` request holds the
+    /// `ClientRequestToken` and has not finished. Maps to
+    /// `TransactionInProgressException`, which the service answers in this
+    /// case (measured 2026-11-05: two sends of one request at once).
+    #[error("Transaction from previous request is still in progress")]
+    TransactionInProgress,
     /// A single-item write raced an in-flight `TransactWriteItems` on
     /// the same item, and the backend was unable to serialize the two.
     /// Maps to `DynamoDbError::TransactionConflictException` at the

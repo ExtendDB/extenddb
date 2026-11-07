@@ -15,9 +15,9 @@ use extenddb_core::types::{
     AttributeValue, Item, StreamEventName, StreamRecord, StreamRecordData, StreamViewType,
     TableKeyInfo, item_size_bytes,
 };
-use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{pk_to_text, sk_column, sk_info};
+use extenddb_storage::{StoredToken, StreamCapture, cancelled_token_fingerprint};
 
 use super::{
     bind_sk_execute, bind_sk_fetch_optional, bind_sk_only_execute, data_table_name, json_to_item,
@@ -279,7 +279,9 @@ pub(super) async fn write_stream_record_in_tx(
 
 /// Check (and record) an idempotency token within a transaction. Tokens are
 /// valid for 10 minutes; the cutoff is computed in Rust as RFC 3339 so it
-/// compares correctly against the stored RFC 3339 `created_at`.
+/// compares correctly against the stored RFC 3339 `created_at`. A token the
+/// same request left cancelled is taken again for this run; see
+/// [`StoredToken::of`].
 pub(super) async fn check_idempotency_token_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: &str,
@@ -299,11 +301,11 @@ pub(super) async fn check_idempotency_token_in_tx(
     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
     if let Some((stored_fp,)) = existing {
-        return if stored_fp == fingerprint {
-            Err(StorageError::IdempotentReplay)
-        } else {
-            Err(StorageError::IdempotentMismatch)
-        };
+        match StoredToken::of(&stored_fp, fingerprint) {
+            StoredToken::Replay => return Err(StorageError::IdempotentReplay),
+            StoredToken::Mismatch => return Err(StorageError::IdempotentMismatch),
+            StoredToken::Rerun => {}
+        }
     }
 
     let now = format_timestamp(time::OffsetDateTime::now_utc());
@@ -318,6 +320,38 @@ pub(super) async fn check_idempotency_token_in_tx(
     .bind(fingerprint)
     .bind(&now)
     .execute(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+/// Keep a token used after its request was cancelled past the request-level
+/// key checks, once the request's transaction has rolled back: store it with
+/// [`cancelled_token_fingerprint`] and the time now, so the token stays used
+/// for 10 minutes from the last cancellation (measured 2026-11-05). A row
+/// another request stored less than 10 minutes ago is kept. Runs under the
+/// engine write lock, after the rollback released the database.
+pub(super) async fn record_cancelled_token(
+    pool: &sqlx::SqlitePool,
+    account_id: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), StorageError> {
+    let now = time::OffsetDateTime::now_utc();
+    let cutoff = format_timestamp(now - time::Duration::minutes(10));
+    sqlx::query(
+        "INSERT INTO idempotency_tokens (account_id, token, fingerprint, created_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT (account_id, token) DO UPDATE SET fingerprint = excluded.fingerprint, \
+         created_at = excluded.created_at WHERE idempotency_tokens.created_at <= ? \
+         OR idempotency_tokens.fingerprint = excluded.fingerprint",
+    )
+    .bind(account_id)
+    .bind(token)
+    .bind(cancelled_token_fingerprint(fingerprint))
+    .bind(format_timestamp(now))
+    .bind(&cutoff)
+    .execute(pool)
     .await
     .map_err(|e| StorageError::Internal(e.to_string()))?;
     Ok(())
@@ -380,6 +414,94 @@ mod idempotency_tests {
         // Regression: a DIFFERENT account reusing the same token value must be
         // independent — not a replay and not a mismatch.
         check(&pool, "acctB", "tok", "fpX").await.unwrap();
+    }
+
+    /// Set the stored `created_at` of `(account, token)` to `minutes` ago.
+    async fn age(pool: &SqlitePool, account: &str, token: &str, minutes: i64) {
+        let then = crate::sqlite_util::format_timestamp(
+            time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes),
+        );
+        sqlx::query(
+            "UPDATE idempotency_tokens SET created_at = ? WHERE account_id = ? AND token = ?",
+        )
+        .bind(then)
+        .bind(account)
+        .bind(token)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn stored(pool: &SqlitePool, account: &str, token: &str) -> (String, String) {
+        sqlx::query_as(
+            "SELECT fingerprint, created_at FROM idempotency_tokens \
+             WHERE account_id = ? AND token = ?",
+        )
+        .bind(account)
+        .bind(token)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The service keeps a cancelled token used 9 minutes after the
+    /// cancellation and treats it as new 11 minutes after it (measured
+    /// 2026-11-05, Q1b and Q1a).
+    #[tokio::test]
+    async fn a_cancelled_token_is_used_for_ten_minutes() {
+        let pool = pool_with_schema().await;
+        super::record_cancelled_token(&pool, "acct", "tok", "fpX")
+            .await
+            .unwrap();
+        age(&pool, "acct", "tok", 9).await;
+        assert!(matches!(
+            check(&pool, "acct", "tok", "fpY").await,
+            Err(StorageError::IdempotentMismatch)
+        ));
+        age(&pool, "acct", "tok", 11).await;
+        check(&pool, "acct", "tok", "fpY").await.unwrap();
+        assert_eq!(stored(&pool, "acct", "tok").await.0, "fpY");
+    }
+
+    /// A cancellation of the same request sent again starts the window again
+    /// (measured 2026-11-05, Q1c: used 5 minutes after the second
+    /// cancellation, 11 minutes after the first).
+    #[tokio::test]
+    async fn a_cancelled_rerun_starts_the_window_again() {
+        let pool = pool_with_schema().await;
+        super::record_cancelled_token(&pool, "acct", "tok", "fpX")
+            .await
+            .unwrap();
+        age(&pool, "acct", "tok", 6).await;
+        let (_, aged) = stored(&pool, "acct", "tok").await;
+        super::record_cancelled_token(&pool, "acct", "tok", "fpX")
+            .await
+            .unwrap();
+        let (fingerprint, renewed) = stored(&pool, "acct", "tok").await;
+        assert_eq!(fingerprint, "cancelled:fpX");
+        assert!(renewed > aged, "{renewed} is not later than {aged}");
+        age(&pool, "acct", "tok", 5).await;
+        assert!(matches!(
+            check(&pool, "acct", "tok", "fpY").await,
+            Err(StorageError::IdempotentMismatch)
+        ));
+    }
+
+    /// A token another request stored less than 10 minutes ago stays; one
+    /// stored longer ago is replaced.
+    #[tokio::test]
+    async fn a_cancellation_keeps_another_requests_live_token() {
+        let pool = pool_with_schema().await;
+        check(&pool, "acct", "tok", "fpY").await.unwrap();
+        super::record_cancelled_token(&pool, "acct", "tok", "fpX")
+            .await
+            .unwrap();
+        assert_eq!(stored(&pool, "acct", "tok").await.0, "fpY");
+        age(&pool, "acct", "tok", 11).await;
+        super::record_cancelled_token(&pool, "acct", "tok", "fpX")
+            .await
+            .unwrap();
+        assert_eq!(stored(&pool, "acct", "tok").await.0, "cancelled:fpX");
     }
 }
 

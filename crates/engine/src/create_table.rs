@@ -218,6 +218,9 @@ pub fn storage_err_to_dynamo(e: extenddb_storage::error::StorageError) -> Dynamo
             // TransactionConflictException here — never InternalServerError.
             DynamoDbError::TransactionConflictException(msg)
         }
+        StorageError::TransactionInProgress => DynamoDbError::TransactionInProgressException(
+            "Transaction from previous request is still in progress".to_owned(),
+        ),
         StorageError::Internal(msg) => {
             // Log the raw message for debugging but do not expose storage
             // backend details (e.g. PostgreSQL error text) to the client.

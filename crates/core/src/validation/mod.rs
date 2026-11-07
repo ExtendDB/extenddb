@@ -1804,12 +1804,15 @@ fn ordered_indexes<'b, 'a>(indexes: &'b [IndexKeyRef<'a>]) -> Vec<&'b IndexKeyRe
     ordered
 }
 
-/// The type an update operand produces when it is built from literals alone,
-/// `None` when any part of it reads the item (an attribute path, or a
-/// function whose result depends on one such as `if_not_exists`).
+/// The type an update operand produces that is known from the statement
+/// alone, `None` when only the item can tell (an attribute path, or
+/// `if_not_exists`, whose result is the stored value when the path exists).
 ///
-/// `list_append` of two literals is a list; arithmetic on two literals is a
-/// number. Anything else that is literal-only is a placeholder.
+/// A placeholder has its value's type. `list_append` always yields a list
+/// and arithmetic always a number, whatever their operands read, and the
+/// service checks both on the statement like a placeholder (measured
+/// 2026-10-31: `SET sidx = list_append(l, :l)` and `SET sidx = n + :one` on a
+/// string key are type faults ahead of the condition).
 fn literal_operand_type(
     expr: &crate::expression::Expr,
     maps: &crate::expression::ExpressionMaps,
@@ -1817,30 +1820,23 @@ fn literal_operand_type(
     use crate::expression::Expr;
     match expr {
         Expr::Placeholder(name) => maps.values.get(name).map(attribute_value_type_tag),
-        Expr::Function { name, args } if name.eq_ignore_ascii_case("list_append") => {
-            let all_literal = args.iter().all(|a| literal_operand_type(a, maps).is_some());
-            all_literal.then_some("L")
-        }
-        Expr::Arithmetic { left, right, .. } => {
-            let both = literal_operand_type(left, maps).is_some()
-                && literal_operand_type(right, maps).is_some();
-            both.then_some("N")
-        }
+        Expr::Function { name, .. } if name.eq_ignore_ascii_case("list_append") => Some("L"),
+        Expr::Arithmetic { .. } => Some("N"),
         _ => None,
     }
 }
 
 /// Validate, before a condition is evaluated or a statement applied, that every
 /// `SET`, `ADD` or `DELETE` action whose target is a secondary-index key
-/// attribute and whose operand is built from literals alone carries a value of
-/// the key's declared type.
+/// attribute and whose operand's type the statement fixes (a placeholder,
+/// `list_append`, arithmetic) carries a value of the key's declared type.
 ///
 /// `DynamoDB` runs this check on the statement text ahead of the condition and
 /// ahead of applying the statement, so it is reported even when the condition
 /// would fail or another action in the statement could not be applied. A value
-/// that depends on the existing item (an attribute reference, the fallback of
-/// `if_not_exists`) is not checked here; the storage layer checks the written
-/// item afterwards and reports it with the computed-value wording.
+/// written from an attribute reference or from `if_not_exists` is not checked
+/// here; the storage layer checks the written item afterwards and reports it
+/// with the computed-value wording.
 ///
 /// `ADD` of a number onto a number key keeps the key's type and passes. `ADD`
 /// or `DELETE` of a set onto any index key, and `ADD` of a number onto a
@@ -1925,6 +1921,62 @@ pub fn validate_index_key_literal_operands(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate, before a condition is evaluated or a statement applied, that no
+/// `SET` action assigns an empty string or empty binary placeholder to a
+/// secondary-index key attribute.
+///
+/// `DynamoDB` checks an empty literal on the statement, after the literal type
+/// check of [`validate_index_key_literal_operands`] and ahead of the
+/// condition, of an action that cannot apply and of a wrong type computed
+/// from the item (measured 2026-10-31, `UpdateItem` and `TransactWriteItems`).
+/// An empty value written from the item or from the fallback of
+/// `if_not_exists` is not checked here; it is found on the written item after
+/// the condition. Actions are checked in statement order.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update-expression
+/// empty-key wording, naming the empty value's kind (string or binary).
+pub fn validate_index_key_empty_literals(
+    actions: &[crate::expression::UpdateAction],
+    indexes: &[IndexKeyRef<'_>],
+    maps: &crate::expression::ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    use crate::expression::{Expr, PathElement, UpdateAction};
+    for action in actions {
+        let UpdateAction::Set { path, value } = action else {
+            continue;
+        };
+        // Only a top-level attribute can be an index key.
+        let [PathElement::Attribute(raw)] = path.as_slice() else {
+            continue;
+        };
+        let Expr::Placeholder(name) = value else {
+            continue;
+        };
+        let attr: &str = match raw.strip_prefix('#') {
+            Some(alias) => maps.resolve_name(alias)?,
+            None => raw.as_str(),
+        };
+        let keys_an_index = indexes
+            .iter()
+            .any(|idx| idx.key_schema.iter().any(|ks| ks.attribute_name == attr));
+        if !keys_an_index {
+            continue;
+        }
+        let kind = match maps.values.get(name) {
+            Some(AttributeValue::S(s)) if s.is_empty() => "string",
+            Some(AttributeValue::B(b)) if b.is_empty() => "binary",
+            _ => continue,
+        };
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values are not valid. The update expression attempted to update a secondary index key to a value that is not supported. \
+             The AttributeValue for a key attribute cannot contain an empty {kind} value."
+        )));
     }
     Ok(())
 }
@@ -4818,5 +4870,177 @@ mod update_size_tests {
             legacy_update_statement_size(&finished, &actions, &maps).unwrap(),
             8
         );
+    }
+}
+
+#[cfg(test)]
+mod index_key_literal_tests {
+    use std::collections::HashMap;
+
+    use super::{
+        IndexKeyRef, validate_index_key_empty_literals, validate_index_key_literal_operands,
+    };
+    use crate::expression::{ExpressionMaps, UpdateAction, parse_update, tokenize};
+    use crate::types::{
+        AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType,
+    };
+
+    /// The measured table: GSI `gsi_s` on `sidx` (S), GSI `gsi_b` on `bidx` (B).
+    fn table() -> (
+        Vec<KeySchemaElement>,
+        Vec<KeySchemaElement>,
+        Vec<AttributeDefinition>,
+    ) {
+        let hash = |a: &str| KeySchemaElement {
+            attribute_name: a.to_owned(),
+            key_type: KeyType::Hash,
+        };
+        let def = |a: &str, t| AttributeDefinition {
+            attribute_name: a.to_owned(),
+            attribute_type: t,
+        };
+        (
+            vec![hash("sidx")],
+            vec![hash("bidx")],
+            vec![
+                def("pk", ScalarAttributeType::S),
+                def("sidx", ScalarAttributeType::S),
+                def("bidx", ScalarAttributeType::B),
+            ],
+        )
+    }
+
+    fn build(expr: &str, values: &[(&str, AttributeValue)]) -> (Vec<UpdateAction>, ExpressionMaps) {
+        let actions = parse_update(&tokenize(expr).unwrap()).unwrap();
+        let map: HashMap<String, AttributeValue> = values
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        (actions, ExpressionMaps::new(HashMap::new(), map))
+    }
+
+    /// The literal type check on `expr`: `Ok(())` or the error message.
+    fn type_check(expr: &str, values: &[(&str, AttributeValue)]) -> Result<(), String> {
+        let (gsi_s, gsi_b, defs) = table();
+        let refs = [
+            IndexKeyRef {
+                index_name: "gsi_s",
+                key_schema: &gsi_s,
+            },
+            IndexKeyRef {
+                index_name: "gsi_b",
+                key_schema: &gsi_b,
+            },
+        ];
+        let (actions, maps) = build(expr, values);
+        validate_index_key_literal_operands(&actions, &refs, &defs, &maps)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The empty literal check on `expr`: `Ok(())` or the error message.
+    fn empty_check(expr: &str, values: &[(&str, AttributeValue)]) -> Result<(), String> {
+        let (gsi_s, gsi_b, _) = table();
+        let refs = [
+            IndexKeyRef {
+                index_name: "gsi_s",
+                key_schema: &gsi_s,
+            },
+            IndexKeyRef {
+                index_name: "gsi_b",
+                key_schema: &gsi_b,
+            },
+        ];
+        let (actions, maps) = build(expr, values);
+        validate_index_key_empty_literals(&actions, &refs, &maps).map_err(|e| e.to_string())
+    }
+
+    fn list() -> AttributeValue {
+        AttributeValue::L(vec![AttributeValue::S("y".to_owned())])
+    }
+
+    fn one() -> AttributeValue {
+        AttributeValue::N("1".to_owned())
+    }
+
+    const TYPE_L: &str = "One or more parameter values were invalid: Type mismatch for Index Key sidx Expected: S Actual: L IndexName: gsi_s";
+    const TYPE_N: &str = "One or more parameter values were invalid: Type mismatch for Index Key sidx Expected: S Actual: N IndexName: gsi_s";
+
+    #[test]
+    fn list_append_is_a_list_whatever_its_operands_read() {
+        for expr in [
+            "SET sidx = list_append(:l, :l)",
+            "SET sidx = list_append(l, :l)",
+        ] {
+            let err = type_check(expr, &[("l", list())]).unwrap_err();
+            assert!(err.ends_with(TYPE_L), "{expr}: {err}");
+        }
+    }
+
+    #[test]
+    fn arithmetic_is_a_number_whatever_its_operands_read() {
+        for expr in [
+            "SET sidx = :one + :one",
+            "SET sidx = n + :one",
+            "SET sidx = n - m",
+        ] {
+            let err = type_check(expr, &[("one", one())]).unwrap_err();
+            assert!(err.ends_with(TYPE_N), "{expr}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_value_read_from_the_item_is_left_to_the_written_item() {
+        for expr in [
+            "SET sidx = n",
+            "SET sidx = if_not_exists(n, :s)",
+            "SET sidx = if_not_exists(nope, :one)",
+        ] {
+            let values = [("one", one()), ("s", AttributeValue::S("x".to_owned()))];
+            assert_eq!(type_check(expr, &values), Ok(()), "{expr}");
+        }
+    }
+
+    #[test]
+    fn an_empty_literal_on_an_index_key_is_refused_with_its_kind() {
+        let empty_s = ("e", AttributeValue::S(String::new()));
+        let empty_b = ("eb", AttributeValue::B(Vec::new()));
+        let string = empty_check("SET sidx = :e", std::slice::from_ref(&empty_s)).unwrap_err();
+        assert!(
+            string.ends_with("cannot contain an empty string value."),
+            "{string}"
+        );
+        let binary =
+            empty_check("SET sidx = n, bidx = :eb", std::slice::from_ref(&empty_b)).unwrap_err();
+        assert!(
+            binary.ends_with("cannot contain an empty binary value."),
+            "{binary}"
+        );
+        // Two empty literals of different kinds in one statement: the service
+        // answered the binary one in one run and the string one in another
+        // (measured 2026-11-01), so either answer passes.
+        let either = empty_check("SET bidx = :eb, sidx = :e", &[empty_s, empty_b]).unwrap_err();
+        assert!(
+            either.ends_with("cannot contain an empty binary value.")
+                || either.ends_with("cannot contain an empty string value."),
+            "{either}"
+        );
+    }
+
+    #[test]
+    fn only_a_literal_on_an_index_key_is_an_empty_literal() {
+        let empty_s = ("e", AttributeValue::S(String::new()));
+        for expr in [
+            "SET v = :e",
+            "SET sidx = e",
+            "SET sidx = if_not_exists(nope, :e)",
+            "SET m.sidx = :e",
+            "REMOVE sidx",
+        ] {
+            assert_eq!(
+                empty_check(expr, std::slice::from_ref(&empty_s)),
+                Ok(()),
+                "{expr}"
+            );
+        }
     }
 }
