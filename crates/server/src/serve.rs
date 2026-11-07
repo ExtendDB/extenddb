@@ -683,7 +683,8 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         backup_runtime
             .with_metrics(metrics.clone())
             .with_shutdown(shutdown.child_token())
-            .with_source(&backend_name, build.version),
+            .with_source(&backend_name, build.version)
+            .with_limits(Arc::clone(&limits)),
     );
     let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {

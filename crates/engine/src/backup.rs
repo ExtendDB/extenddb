@@ -29,14 +29,16 @@ use extenddb_storage::backup_catalog::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupCatalog, BackupRestoreSource, LegacyBackupReader, MetadataEngine, RestoreRequest,
-    RestoreTableOverrides, SnapshotEngine, TableEngine,
+    BackupCatalog, BackupRestoreSource, DataEngine, LegacyBackupReader, MetadataEngine,
+    RestoreEngine, RestoreRequest, RestoreSource, RestoreTableOverrides, SnapshotEngine,
+    TableEngine,
 };
 use futures::TryStreamExt;
 use serde_json::{Value, json};
 
 pub use job::KillPoint;
 pub use maintenance::HeldClaim;
+pub use restore::{OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, TARGET_NOT_EMPTY};
 pub use runtime::{
     BackupRuntime, ConfiguredStore, JobSettings, LOCAL_CHECK_TIMEOUT, S3_CHECK_TIMEOUT, Spool,
     StoreHealth, StoreHealthReport, check_configured_store, read_identity_bounded,
@@ -1505,13 +1507,21 @@ async fn restore_table_from_backup_detached<S, F, Fut>(
     after: F,
 ) -> Result<Value, DynamoDbError>
 where
-    S: BackupCatalog + LegacyBackupReader + TableEngine + ?Sized + Send + Sync + 'static,
+    S: BackupCatalog
+        + LegacyBackupReader
+        + TableEngine
+        + DataEngine
+        + RestoreEngine
+        + ?Sized
+        + Send
+        + Sync
+        + 'static,
     F: FnOnce(Arc<str>, String) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
     tokio::spawn(async move {
         let (target_table_name, response) =
-            restore_table_from_backup(&*storage, &runtime, &account_id, &region, &limits, &body)
+            restore_table_from_backup(&storage, &runtime, &account_id, &region, &limits, &body)
                 .await?;
         after(account_id, target_table_name).await;
         Ok(response)
@@ -1546,15 +1556,20 @@ where
 /// rest of its checks ([`check_catalog_row_for_restore`]: a backup in use is
 /// `BackupInUseException`, a row of another store a `ValidationException`,
 /// a row of the configured store while it is unhealthy one naming the
-/// store's kind, and an AVAILABLE row of the healthy store the
-/// `ValidationException` naming the store, since this release restores
-/// in-catalog backups only); (6) refuse what no
-/// backend restores faithfully (multi-part key, vector indexes); (7) check
-/// the throughput override against the backup's billing mode, build the
-/// target's `CreateTableInput`, and apply the index and on-demand throughput
-/// overrides to it, refusing what the service refuses ([`overrides`]);
-/// (8) validate that input as CreateTable does; (9) refuse while a
-/// maintenance command holds the catalog's claim
+/// store's kind), and an AVAILABLE row of the healthy configured store is
+/// restored from the store by the restore job ([`restore::request`]: the
+/// permit (when none is freed within the runtime's wait,
+/// `LimitExceededException`), the manifest and its checks, the vector
+/// refusal of a target without vector support, the overrides, the detached
+/// registration whose answer the request awaits; the maintenance claim is
+/// checked by the job once its record exists, the design's 5.3 step 4); the
+/// steps below are the legacy path's: (6) refuse what no backend restores
+/// faithfully from an in-catalog backup (multi-part key, vector indexes);
+/// (7) check the throughput override against the backup's billing mode,
+/// build the target's `CreateTableInput`, and apply the index and on-demand
+/// throughput overrides to it, refusing what the service refuses
+/// ([`overrides`]); (8) validate that input as CreateTable does; (9) refuse
+/// while a maintenance command holds the catalog's claim
 /// ([`refuse_while_maintenance_held`]), then take the job permit, last among
 /// the checks (`LimitExceededException` for either; the permit when none is
 /// freed within the runtime's wait), and ask the backend to create and
@@ -1562,14 +1577,25 @@ where
 /// `TableAlreadyExistsException`, a name being restored into
 /// `TableInUseException` (the backend checks the name again, fenced, under
 /// the registration), a backup being restored from `BackupInUseException`.
-async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + TableEngine + ?Sized>(
-    storage: &S,
+async fn restore_table_from_backup<S>(
+    storage: &Arc<S>,
     runtime: &BackupRuntime,
     account_id: &str,
     region: &str,
     limits: &LimitsConfig,
     body: &Value,
-) -> Result<(String, Value), DynamoDbError> {
+) -> Result<(String, Value), DynamoDbError>
+where
+    S: BackupCatalog
+        + LegacyBackupReader
+        + TableEngine
+        + DataEngine
+        + RestoreEngine
+        + ?Sized
+        + Send
+        + Sync
+        + 'static,
+{
     // 1. The overrides, parsed and shape-checked: no storage I/O, so a
     // malformed request is refused before a missing backup can take
     // precedence over the request's own error.
@@ -1585,10 +1611,11 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
     let target_table_name = required_str(body, "TargetTableName", "targetTableName")?;
     extenddb_core::validation::validate_table_name(target_table_name, limits)?;
 
-    // 4. The catalog index first, then, with no row, the legacy reader under
-    // the ARN spelling that resolves; the restore is registered against that
+    // 4. The catalog index first: a row of the healthy configured store is
+    // restored from the store. With no row, the legacy reader under the ARN
+    // spelling that resolves; the restore is registered against that
     // spelling, the one the backend stored.
-    if let Some((arn, row)) = read_catalog_row(storage, &backup_arn)
+    if let Some((arn, row)) = read_catalog_row(&**storage, &backup_arn)
         .await
         .map_err(storage_err_to_dynamo)?
     {
@@ -1597,10 +1624,23 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
         // before the backup's in-use rule (measured on DynamoDB: an in-use
         // backup into an existing table is TableAlreadyExistsException, a
         // backup into its own CREATING target TableInUseException, not
-        // BackupInUseException).
-        check_restore_target_name(storage, account_id, target_table_name).await?;
-        check_catalog_row_for_restore(storage, runtime, &arn, &row).await?;
+        // BackupInUseException) and before the manifest is read.
+        check_restore_target_name(&**storage, account_id, target_table_name).await?;
+        let store = check_catalog_row_for_restore(&**storage, runtime, &arn, &row).await?;
+        return restore::request(
+            storage,
+            runtime,
+            store,
+            account_id,
+            limits,
+            target_table_name,
+            &arn,
+            &overrides,
+            &index_overrides,
+        )
+        .await;
     }
+    let storage = &**storage;
     let (backup_arn, source) =
         resolve_backup(&backup_arn, by!(storage, account_id, restore_source))
             .await
@@ -1641,7 +1681,7 @@ async fn restore_table_from_backup<S: BackupCatalog + LegacyBackupReader + Table
         // 10.
         .map_err(restore_storage_err_to_dynamo)?;
 
-    let response = restore_response(desc, &source, on_demand)?;
+    let response = restore_response(desc, &RestoreSource::from(&source), on_demand)?;
     Ok((target_table_name.to_owned(), response))
 }
 
@@ -1667,15 +1707,15 @@ fn check_catalog_row_status(arn: &BackupArn, row: &BackupRow) -> Result<(), Dyna
 /// store other than the configured one is a `ValidationException` naming no
 /// root, and a row of the configured store while that store is unhealthy or
 /// its first check pending is a `ValidationException` naming the store's
-/// kind ([`BackupRuntime::require_healthy_store`]). An AVAILABLE row of a
-/// healthy configured store is a backup in a store, whose restore this
-/// release does not run.
-async fn check_catalog_row_for_restore<S: BackupCatalog + ?Sized>(
+/// kind ([`BackupRuntime::require_healthy_store`]). An AVAILABLE row of the
+/// healthy configured store passes, and that store is returned: the restore
+/// reads the backup from it ([`restore::request`]).
+async fn check_catalog_row_for_restore<'r, S: BackupCatalog + ?Sized>(
     storage: &S,
-    runtime: &BackupRuntime,
+    runtime: &'r BackupRuntime,
     arn: &BackupArn,
     row: &BackupRow,
-) -> Result<(), DynamoDbError> {
+) -> Result<&'r Arc<ConfiguredStore>, DynamoDbError> {
     let arn_text = arn.to_arn_string();
     if let Some(table) = storage
         .backup_in_use(&BackupKey::from_arn(arn))
@@ -1687,10 +1727,7 @@ async fn check_catalog_row_for_restore<S: BackupCatalog + ?Sized>(
     if !runtime.is_configured_store(&row.store) {
         return Err(backup_in_another_store(&arn_text));
     }
-    runtime.require_healthy_store()?;
-    Err(DynamoDbError::ValidationException(format!(
-        "Backup {arn_text} is in a backup store; this release restores in-catalog backups only"
-    )))
+    runtime.require_healthy_store()
 }
 
 /// Step 5 of a restore, the target name under the account, read through
@@ -1735,7 +1772,9 @@ async fn check_restore_target_name<S: TableEngine + ?Sized>(
     }
 }
 
-/// The RestoreTableFromBackup response body for the backend's description.
+/// The RestoreTableFromBackup response body for the backend's description,
+/// on both paths (`source` is the legacy reader's source or the manifest's
+/// three members).
 ///
 /// The service returns the target CREATING with `RestoreSummary`
 /// { `SourceBackupArn`, `SourceTableArn`, `RestoreDateTime` = the backup's
@@ -1746,7 +1785,7 @@ async fn check_restore_target_name<S: TableEngine + ?Sized>(
 /// ground-truth runs of 2026-08-24).
 fn restore_response(
     mut desc: TableDescription,
-    source: &BackupRestoreSource,
+    source: &RestoreSource,
     on_demand: bool,
 ) -> Result<Value, DynamoDbError> {
     desc.table_status = TableStatus::Creating;
@@ -1769,9 +1808,9 @@ fn restore_response(
     }
 
     // The readiness invariant is applied on every path that hands a
-    // description to a client. A restored table has no vector indexes (the
-    // restore refuses them), so this holds trivially, but the invariant claims
-    // to cover every such path.
+    // description to a client: a legacy restore's target has no vector
+    // indexes (the reader refuses them); a store-backed restore's may, and
+    // the backend reports them as its CreateTable does.
     desc.validate_vector_index_readiness()?;
     // Same rules as every other path that emits a table description; the
     // target is CREATING, so the summary set above is kept.
@@ -1868,6 +1907,7 @@ pub mod maintenance;
 mod overrides;
 mod pitr;
 pub mod reconciler;
+mod restore;
 mod runtime;
 pub mod store_identity;
 #[cfg(test)]

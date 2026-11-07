@@ -25,12 +25,35 @@ store's root:
   named by its whole key, and the wire's reason for its value, in the log
   line and in `backup list --failed`.
 
+The store-backed RestoreTableFromBackup job, on both deployments:
+
+- a data file tampered with under the root fails the restore before any item
+  is loaded, the target gone and the log naming the file;
+- SIGTERM mid-restore leaves the record RUNNING and the restarted server
+  resumes it (PostgreSQL after the stale window, SQLite at once);
+- an S3 store (moto) cut mid-download leaves the record RUNNING and the
+  restore completes once the store answers;
+- an unordered backup holding one key in two files, and a key-ordered file
+  leaving its `key_range` (both hand-built under the root), fail the restore
+  with the target gone;
+- a table keyed on two HASH attributes (the `allow_multipart_table_keys`
+  preview, enabled on the cell's own deployment) backs up and restores with
+  the source's item set, key schema and attribute definitions;
+- (SQLite) a RUNNING restore record with no recorded progress whose target
+  holds more items than the backup, the state a catalog restored from a dump
+  leaves when it names a restore that finished and was written to since,
+  seeded at the catalog, is FAILED `target_not_empty`
+  by the restarted server's reconciler, the target left CREATING and
+  `DeleteTable`, `DeleteBackup` and a second restore refused, and `extenddb
+  backup remove-target` removes the target and its record, after which
+  `DescribeTable` is `ResourceNotFoundException` and `DeleteBackup` succeeds.
+
 The binary at `EXTENDDB_BINARY` decides which deployment runs: a SQLite build,
 a PostgreSQL build (with `EXTENDDB_TEST_PG_CONNECTION_STRING`) or a MongoDB
 build (with `EXTENDDB_TEST_MONGODB_URI`, a replica set of this suite's own: the
 catalog's database names are fixed, so each test destroys the previous test's
-catalog and initializes its own). Excluded from the backend-agnostic suite; run
-by name.
+catalog and initializes its own); the restore cells run on the SQLite and
+PostgreSQL deployments. Excluded from the backend-agnostic suite; run by name.
 """
 
 from __future__ import annotations
@@ -57,13 +80,18 @@ from test_backup_store_config import (
     EXTENDDB_BINARY,
     _append,
     _client,
+    _Forwarder,
+    _free_port,
+    _moto_or_skip,
     _pg_build,
     _provision,
+    _s3_env,
     _Server,
     _sqlite_build,
     _SqliteDeployment,
     _wait_backup_available,
     _wait_health,
+    moto_bucket,  # noqa: F401 - the fixture of the store-outage cell
 )
 
 ACCOUNT = "123456789012"
@@ -85,15 +113,19 @@ LIMIT_TEXT = (
 
 
 class _Deployment:
-    """A deployment with a filesystem store, its config and its root."""
+    """A deployment with a filesystem store, its config, its root and its
+    catalog (`catalog`: the SQLite database file, or the PostgreSQL catalog
+    database's connection string), where a cell edits a `backup_index` row
+    it rewrote the prefix of."""
 
-    def __init__(self, backend: str, config: str, port: int, root: str, cert: str, cwd: str):
+    def __init__(self, backend: str, config: str, port: int, root: str, cert: str, cwd: str, catalog: str = ""):
         self.backend = backend
         self.config = config
         self.port = port
         self.root = root
         self.cert = cert
         self.cwd = cwd
+        self.catalog = catalog
 
     def run(self, *args):
         import subprocess
@@ -159,6 +191,7 @@ def deployment(request, tmp_path) -> _Deployment:
         root = os.path.join(base, "backups")
         store = ""
         backend = "sqlite"
+        catalog = d.db_path
     elif _pg_build():
         cli_env = request.getfixturevalue("cli_env")
         result = lh._run_extenddb(
@@ -173,6 +206,7 @@ def deployment(request, tmp_path) -> _Deployment:
         os.mkdir(root, 0o700)
         store = f'[backup.store]\nkind = "filesystem"\n[backup.store.filesystem]\npath = "{root}"\n'
         backend = "postgres"
+        catalog = cli_env["conn_string"]
     elif _mongodb_build():
         uri = os.environ.get("EXTENDDB_TEST_MONGODB_URI")
         if not uri:
@@ -183,6 +217,8 @@ def deployment(request, tmp_path) -> _Deployment:
         os.mkdir(root, 0o700)
         store = f'[backup.store]\nkind = "filesystem"\n[backup.store.filesystem]\npath = "{root}"\n'
         backend = "mongodb"
+        # The restore cells that edit the catalog run on SQLite and PostgreSQL.
+        catalog = ""
     else:
         pytest.skip("EXTENDDB_BINARY is neither a SQLite, a PostgreSQL nor a MongoDB build")
     os.mkdir(os.path.join(base, ACCOUNT))
@@ -192,7 +228,7 @@ def deployment(request, tmp_path) -> _Deployment:
         + store
         + f'[import]\npaths = ["{base}"]\n',
     )
-    return _Deployment(backend, config, port, root, cert, base)
+    return _Deployment(backend, config, port, root, cert, base, catalog)
 
 
 def _started(d: _Deployment, log_path: str) -> tuple[_Server, object, dict]:
@@ -658,5 +694,850 @@ def test_an_item_over_max_item_size_bytes_fails_the_backup_without_naming_618(de
         # The first backup, taken under the default limit, is untouched.
         listed = [b["BackupName"] for b in ddb.list_backups(TableName=name)["BackupSummaries"]]
         assert listed == ["under-default"], listed
+    finally:
+        server.stop()
+
+
+# --- the restore job ---------------------------------------------------------------
+
+# Items of this count and padding make a backup of two data files (the knob's
+# floor is 32 MiB of uncompressed lines) whose restore runs for long enough,
+# on a PostgreSQL build of this host, that a SIGTERM sent right after the
+# restore's response finds the job inside its download or its first file's
+# load. The cells check the precondition they rely on (the target still
+# CREATING when the signal is sent) rather than assume it.
+RESTORE_ITEMS = int(os.environ.get("EXTENDDB_TEST_RESTORE_ITEMS", "10000"))
+RESTORE_PAD = 4000
+
+
+# The `[backup]` keys the restore cells add to the deployment's: data files
+# close at the knob's floor, so RESTORE_ITEMS padded items make two of them.
+RESTORE_BACKUP_SETTINGS = "data_file_target_bytes = 33554432\n"
+
+
+def _add_backup_settings(d: _Deployment, extra: str) -> None:
+    """Add `extra` to the deployment's `[backup]` table before the server
+    starts (TOML refuses a second `[backup]` header)."""
+    with open(d.config) as f:
+        text = f.read()
+    head = "[backup]\nreconcile_interval_secs = 1\n"
+    assert text.count(head) == 1, text
+    with open(d.config, "w") as f:
+        f.write(text.replace(head, head + extra))
+
+
+def _load_padded(d: _Deployment, creds: dict, name: str, n: int, pad: int) -> None:
+    """`_load` with items of `pad` bytes of padding and a `g` the GSI keys
+    on, from 8 threads with one client each."""
+    local = threading.local()
+
+    def write(start: int) -> None:
+        if not hasattr(local, "client"):
+            local.client = _client(d.port, creds)
+        requests_ = [
+            {
+                "PutRequest": {
+                    "Item": {
+                        "pk": {"S": f"p{i % 500:04d}"},
+                        "sk": {"N": str(i)},
+                        "g": {"S": f"g{i % 50}"},
+                        "pad": {"S": "x" * pad},
+                    }
+                }
+            }
+            for i in range(start, min(start + 25, n))
+        ]
+        pending = {name: requests_}
+        while pending:
+            pending = local.client.batch_write_item(RequestItems=pending).get("UnprocessedItems") or {}
+            if pending:
+                time.sleep(0.05)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write, range(0, n, 25)))
+
+
+def _count(ddb, name: str) -> int:
+    total, start = 0, None
+    while True:
+        kwargs = {"TableName": name, "Select": "COUNT", "ConsistentRead": True}
+        if start:
+            kwargs["ExclusiveStartKey"] = start
+        resp = ddb.scan(**kwargs)
+        total += resp["Count"]
+        start = resp.get("LastEvaluatedKey")
+        if not start:
+            return total
+
+
+def _wait_table_gone(ddb, name: str, timeout: float = 120.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = ddb.describe_table(TableName=name)["Table"]["TableStatus"]
+        except ClientError as e:
+            assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
+            return
+        assert status == "CREATING", f"{name} is {status}, it was never writable"
+        time.sleep(0.2)
+    raise AssertionError(f"{name} still exists after {timeout} s")
+
+
+def _backed_up_table(d: _Deployment, ddb, creds: dict, prefix: str) -> tuple[str, str]:
+    """A composite-key table with a GSI holding RESTORE_ITEMS padded items,
+    backed up to AVAILABLE in two data files; the name and the ARN."""
+    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    _create_composite_table(ddb, name, gsi=True)
+    _load_padded(d, creds, name, RESTORE_ITEMS, RESTORE_PAD)
+    arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
+    _wait_backup_available(ddb, arn, timeout=180)
+    files = sorted(os.listdir(os.path.join(_prefix(d, name, arn), "data")))
+    assert len(files) >= 2, f"the backup has one data file ({files}); raise EXTENDDB_TEST_RESTORE_ITEMS"
+    return name, arn
+
+
+
+
+def _restore_cell(d: _Deployment) -> None:
+    """The store-backed restore cells run on the SQLite and PostgreSQL
+    deployments; on MongoDB the store-backed restore is covered by
+    tests/test_mongodb_backup_restore.py and the crate's live tests."""
+    if d.backend == "mongodb":
+        pytest.skip("the restore cells run on the SQLite and PostgreSQL deployments")
+
+def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_path):
+    """A byte of the backup's second data file flipped under the root: the
+    restore request is accepted (CREATING with a RestoreSummary), the target
+    is removed once the job fails, and the server log names the file. That
+    the job verified every file before it loaded any is pinned by the FAILED
+    reason's text: "does not match the manifest" is the hashing pass's, which
+    runs over every file before the first `bulk_load`; a mismatch found while
+    a file is loaded reads "data file <key>: data file sha256 checksum
+    mismatch" or, when the flipped byte sits in the gzip trailer so the
+    decoder's own CRC fires first, "data file <key>: data file decode error:
+    corrupt gzip stream does not have a matching checksum" instead. A
+    CREATING target answers no read whatever the job did, so the GetItem
+    probe below only confirms the target never became readable. The backup
+    itself stays AVAILABLE."""
+    d = deployment
+    _restore_cell(d)
+    _add_backup_settings(d, RESTORE_BACKUP_SETTINGS)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _backed_up_table(d, ddb, creds, "tamper")
+        path = os.path.join(_prefix(d, name, arn), "data", "000002.json.gz")
+        with open(path, "r+b") as f:
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)
+            f.seek(-1, os.SEEK_END)
+            f.write(bytes([last[0] ^ 0xFF]))
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
+        readable = []
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            try:
+                got = ddb.get_item(TableName=target, Key={"pk": {"S": "p0000"}, "sk": {"N": "0"}}, ConsistentRead=True)
+                if "Item" in got:
+                    readable.append(got["Item"])
+            except ClientError:
+                pass
+            try:
+                ddb.describe_table(TableName=target)
+            except ClientError as e:
+                assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError(f"{target} was not removed within 120 s")
+        assert readable == [], f"an item of the failed restore was readable: {readable[:1]}"
+        log = server.log_text()
+        failed = [line for line in log.splitlines() if "FAILED (data file data/000002.json.gz does not match the manifest" in line]
+        assert len(failed) == 1, log[-4000:]
+        assert "the target was removed" in failed[0], failed[0]
+        assert ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] == "AVAILABLE"
+    finally:
+        server.stop()
+
+
+def test_sigterm_leaves_the_restore_running_and_it_finishes_after_restart(deployment, tmp_path):
+    """SIGTERM while the restore runs: the server drains, the job stops at
+    its next file or chunk with no status write, the record stays RUNNING
+    (the target CREATING with its RestoreSummary across the restart), and the
+    restarted server's reconciler resumes it: on PostgreSQL once the dead
+    owner's heartbeat is older than `stale_job_after_secs` (45 s, the floor,
+    on the database's clock); on SQLite at the first cycle, since the restart
+    frees the record's slot and ages every RUNNING record. The target reaches
+    ACTIVE with every item and the GSI answers."""
+    d = deployment
+    _restore_cell(d)
+    _add_backup_settings(d, RESTORE_BACKUP_SETTINGS + "stale_job_after_secs = 45\n")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _backed_up_table(d, ddb, creds, "sigterm")
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        status = ddb.describe_table(TableName=target)["Table"]["TableStatus"]
+        assert status == "CREATING", (
+            f"the restore finished ({status}) before the signal was sent; raise EXTENDDB_TEST_RESTORE_ITEMS"
+        )
+        server.proc.terminate()
+        code = server.wait_exit(timeout=60)
+        assert code == 0, server.log_text()[-4000:]
+        log = server.log_text()
+        assert "stopped by the server's shutdown; the record stays RUNNING" in log, log[-4000:]
+        assert ": FAILED (" not in log, log[-4000:]
+    finally:
+        server.stop()
+    stopped_at = time.monotonic()
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        table = ddb.describe_table(TableName=target)["Table"]
+        if d.backend == "postgres":
+            # PostgreSQL resumes only once the dead owner's heartbeat is
+            # stale (45 s), so right after the restart the target is still
+            # CREATING, carries its RestoreSummary, and a retry into the name
+            # is refused as a restore in progress. On SQLite the restart frees
+            # the record's slot and the first reconciler cycle resumes at
+            # once, so the target may already be ACTIVE here; the
+            # resume-timing assertion below pins the at-once behaviour.
+            assert table["TableStatus"] == "CREATING", table
+            assert table["RestoreSummary"]["SourceBackupArn"] == arn, table
+            with pytest.raises(ClientError) as refused:
+                ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)
+            assert refused.value.response["Error"]["Code"] == "TableInUseException", refused.value.response
+        _wait_active(ddb, target, timeout=240)
+        resumed_after = time.monotonic() - stopped_at
+        if d.backend == "postgres":
+            assert resumed_after >= 45 - 5, f"the resume waited for the stale window ({resumed_after:.1f} s)"
+        else:
+            assert resumed_after < 45 - 5, f"the restart's slot rule resumes at once ({resumed_after:.1f} s)"
+        assert _count(ddb, target) == RESTORE_ITEMS
+        by_g = ddb.query(
+            TableName=target,
+            IndexName="by-g",
+            KeyConditionExpression="g = :g",
+            ExpressionAttributeValues={":g": {"S": "g7"}},
+            Select="COUNT",
+        )["Count"]
+        assert by_g == RESTORE_ITEMS // 50, by_g
+        log = server.log_text()
+        assert "taken over by this instance and resumed" in log, log[-4000:]
+        assert ": ACTIVE, " in log, log[-4000:]
+    finally:
+        server.stop()
+
+
+def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes(request, tmp_path, moto_bucket):
+    """An S3 store (moto) reached through a TCP forwarder, with a spool: the
+    forwarder is cut right after the restore's response, so the job's data
+    file downloads fail as transport errors; the record stays RUNNING (the
+    target CREATING) while the job retries with backoff; once the forwarder
+    is back the download completes and the target reaches ACTIVE with every
+    item, the spool entry removed. On PostgreSQL the spool is `spool_path`;
+    on SQLite the defaulted `backup-spool/` beside the database file."""
+    moto_host, moto_port = _moto_or_skip()
+    bucket = moto_bucket
+    base = os.path.realpath(str(tmp_path))
+    port = _free_port()
+    store = (
+        '[backup.store]\nkind = "s3"\n[backup.store.s3]\n'
+        f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{port}"\n'
+        'force_path_style = true\nregion = "us-east-1"\n'
+    )
+    if _sqlite_build():
+        sd = _SqliteDeployment(str(tmp_path))
+        spool = os.path.join(base, "backup-spool")
+        _append(sd.config, "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n" + RESTORE_BACKUP_SETTINGS + store)
+        d = _Deployment("sqlite", sd.config, sd.port, "", sd.cert, base)
+    elif _pg_build():
+        cli_env = request.getfixturevalue("cli_env")
+        result = lh._run_extenddb(
+            "init", *lh._init_args(cli_env), config=cli_env["config_path"],
+            env_override={"EXTENDDB_ADMIN_PASSWORD": ADMIN_PASSWORD},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        lh._patch_config_port(cli_env["config_path"], cli_env["port"])
+        spool = os.path.join(base, "spool")
+        _append(
+            cli_env["config_path"],
+            "[backup]\nreconcile_interval_secs = 1\nmax_concurrent_jobs = 1\n"
+            + RESTORE_BACKUP_SETTINGS
+            + f'spool_path = "{spool}"\n'
+            + store,
+        )
+        d = _Deployment("postgres", cli_env["config_path"], cli_env["port"], "", os.path.join(cli_env["tls_dir"], "cert.pem"), base)
+    else:
+        pytest.skip("EXTENDDB_BINARY is neither a SQLite nor a PostgreSQL build")
+    forwarder = _Forwarder(port, (moto_host, moto_port))
+    server = _Server(d.config, str(tmp_path / "serve.log"), env=_s3_env())
+    try:
+        _wait_health(
+            d.port,
+            lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy",
+            timeout=60,
+            server=server,
+        )
+        creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
+        ddb = _client(d.port, creds)
+        name = f"outage-{uuid.uuid4().hex[:8]}"
+        _create_composite_table(ddb, name, gsi=True)
+        _load_padded(d, creds, name, RESTORE_ITEMS, RESTORE_PAD)
+        arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, arn, timeout=180)
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        # The cut: every data file get fails until the forwarder is back.
+        forwarder.stop()
+        cut_at = time.monotonic()
+        while time.monotonic() - cut_at < 8:
+            table = ddb.describe_table(TableName=target)["Table"]
+            assert table["TableStatus"] == "CREATING", table
+            assert table["RestoreSummary"]["RestoreInProgress"] is True, table
+            time.sleep(0.5)
+        log = server.log_text()
+        retried = [line for line in log.splitlines() if "retried in" in line and "data/" in line]
+        assert retried, "no download attempt was retried during the cut:\n" + log[-4000:]
+        forwarder = _Forwarder(port, (moto_host, moto_port))
+        _wait_active(ddb, target, timeout=240)
+        assert _count(ddb, target) == RESTORE_ITEMS
+        entries = [e for e in os.listdir(spool) if e.startswith("restore-")]
+        assert entries == [], f"the spool entry stays: {entries}"
+        log = server.log_text()
+        assert ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
+    finally:
+        server.stop()
+        forwarder.stop()
+
+
+# --- `backup remove-target`: the target_not_empty state ------------------------------
+
+
+def _seed_target_not_empty(d: _Deployment, target: str) -> str:
+    """Put a finished restore (table ACTIVE, record DONE) back into the state
+    a catalog restored from a dump leaves when it names a restore that
+    finished and was written to since: the target CREATING with its items
+    (one more than the backup holds, written after the restore) and a RUNNING
+    manifest record with no progress, which the restarted server's reconciler
+    ages, takes over, and fails `target_not_empty` since the target holds
+    more items than the backup's total (a count at or below the total is a
+    first data file applied in part and is resumed). No kill produces the
+    state on any backend; the catalog is edited with the server stopped.
+    Returns the target's table id."""
+    try:
+        import pysqlite3 as sqlite3
+    except ImportError:
+        import sqlite3
+    conn = sqlite3.connect(d.catalog, timeout=10)
+    try:
+        row = conn.execute(
+            "SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?", (ACCOUNT, target)
+        ).fetchone()
+        assert row, f"no catalog row for {target}"
+        table_id = row[0]
+        n = conn.execute(
+            "UPDATE tables SET table_status = 'CREATING' WHERE table_id = ?", (table_id,)
+        ).rowcount
+        assert n == 1, n
+        n = conn.execute(
+            "UPDATE table_restores SET status = 'RUNNING', file_index = NULL, items_applied = NULL, "
+            "failure_reason = NULL, completed_at = NULL, heartbeat_at = '1970-01-01T00:00:00.000Z' "
+            "WHERE table_id = ? AND kind = 'manifest' AND status = 'DONE'",
+            (table_id,),
+        ).rowcount
+        assert n == 1, n
+        conn.commit()
+    finally:
+        conn.close()
+    return table_id
+
+
+def test_remove_target_removes_a_target_not_empty_restore(deployment, tmp_path):
+    """The operator's remedy for a resume that found no progress and more
+    items than the backup holds. A backup restored to ACTIVE, with one item
+    written to the target since, is seeded back into the `target_not_empty`
+    state (`_seed_target_not_empty`: the shape a catalog restored from a dump
+    leaves; a catalog edit is the one way to produce it). The restarted server's
+    reconciler fails the record `target_not_empty` and leaves the target
+    CREATING, which `DeleteTable` refuses (`ResourceInUseException`) and
+    which keeps the backup in use (`BackupInUseException` to `DeleteBackup`
+    and to a second restore). `extenddb backup remove-target`, run with the
+    server stopped (on SQLite it takes the serve lock), removes the target
+    and its record and prints what it did; the restarted server then answers
+    `ResourceNotFoundException` for the target, `DeleteBackup` succeeds, and
+    a new restore into the name runs to ACTIVE with every item."""
+    d = deployment
+    _restore_cell(d)
+    if d.backend != "sqlite":
+        pytest.skip("the seeded target_not_empty state is built on the SQLite catalog (the PostgreSQL command runs beside a live server and is the engine tests')")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "rmt")
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+        # Written to since: one item the backup does not hold, so the seeded
+        # record's target holds more than the backup's total.
+        ddb.put_item(TableName=target, Item=_hand_item(HAND_BUILT_ITEMS))
+        assert _count(ddb, target) == HAND_BUILT_ITEMS + 1
+    finally:
+        server.stop()
+    table_id = _seed_target_not_empty(d, target)
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        deadline = time.monotonic() + 60
+        while "target_not_empty" not in server.log_text():
+            assert time.monotonic() < deadline, server.log_text()[-4000:]
+            time.sleep(0.2)
+        log = server.log_text()
+        failed = [line for line in log.splitlines() if "target_not_empty" in line]
+        assert any(target in line for line in failed), failed
+        assert ddb.describe_table(TableName=target)["Table"]["TableStatus"] == "CREATING"
+        with pytest.raises(ClientError) as refused:
+            ddb.delete_table(TableName=target)
+        assert refused.value.response["Error"]["Code"] == "ResourceInUseException", refused.value.response
+        with pytest.raises(ClientError) as refused:
+            ddb.delete_backup(BackupArn=arn)
+        assert refused.value.response["Error"]["Code"] == "BackupInUseException", refused.value.response
+        with pytest.raises(ClientError) as refused:
+            ddb.restore_table_from_backup(TargetTableName=f"{name}-again", BackupArn=arn)
+        assert refused.value.response["Error"]["Code"] == "BackupInUseException", refused.value.response
+        # The reconciler's next cycles leave it: the FAILED-target duty skips
+        # this reason, and the target is still CREATING after two more cycles.
+        time.sleep(2.5)
+        assert ddb.describe_table(TableName=target)["Table"]["TableStatus"] == "CREATING"
+    finally:
+        server.stop()
+
+    res = d.run("backup", "remove-target", "--account", ACCOUNT, target)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "=== extenddb backup remove-target ===" in res.stdout, res.stdout + res.stderr
+    assert 'Taking the maintenance claim as "extenddb backup remove-target on ' in res.stdout, res.stdout
+    assert (
+        f"removed the restore target {target} (account {ACCOUNT}, table id {table_id}) and its record: "
+        f"its store-backed restore from {arn} was FAILED (target_not_empty)"
+    ) in res.stdout, res.stdout + res.stderr
+    assert "The maintenance claim is released." in res.stdout, res.stdout
+    # A second run finds no record for the name and refuses, exit 1.
+    res = d.run("backup", "remove-target", "--account", ACCOUNT, target)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert f"{target} (account {ACCOUNT}) is not a restore target: no restore record names it" in res.stderr, (
+        res.stdout + res.stderr
+    )
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve3.log"))
+    try:
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_table(TableName=target)
+        assert gone.value.response["Error"]["Code"] == "ResourceNotFoundException", gone.value.response
+        # The name is free and the backup no longer in use: a new restore runs.
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+        ddb.delete_table(TableName=target)
+        _wait_table_gone_any_status(ddb, target)
+        ddb.delete_backup(BackupArn=arn)
+        _wait_backup_gone(ddb, arn)
+        log = server.log_text()
+        assert "target_not_empty" not in log, log[-4000:]
+    finally:
+        server.stop()
+
+
+def _seed_running_with_progress(d: _Deployment, target: str) -> None:
+    """Put a finished restore (table ACTIVE, record DONE) back into the state
+    a server killed after the restore's first data file committed leaves
+    (the `restore_after_file_commit` kill point): the target CREATING with
+    its items and a RUNNING manifest record whose progress names the file
+    and its item count. Edited at the catalog with the server stopped, as
+    `_seed_target_not_empty` does."""
+    try:
+        import pysqlite3 as sqlite3
+    except ImportError:
+        import sqlite3
+    conn = sqlite3.connect(d.catalog, timeout=10)
+    try:
+        row = conn.execute(
+            "SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?", (ACCOUNT, target)
+        ).fetchone()
+        assert row, f"no catalog row for {target}"
+        table_id = row[0]
+        n = conn.execute(
+            "UPDATE tables SET table_status = 'CREATING' WHERE table_id = ?", (table_id,)
+        ).rowcount
+        assert n == 1, n
+        n = conn.execute(
+            "UPDATE table_restores SET status = 'RUNNING', file_index = 0, items_applied = ?, "
+            "failure_reason = NULL, completed_at = NULL "
+            "WHERE table_id = ? AND kind = 'manifest' AND status = 'DONE'",
+            (HAND_BUILT_ITEMS, table_id),
+        ).rowcount
+        assert n == 1, n
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_purge_fails_a_killed_servers_store_backed_restore_rather_than_resuming_it(deployment, tmp_path):
+    """`backup purge --confirm` under the SQLite serve lock, after a server
+    that was running a store-backed restore stopped (the record RUNNING with
+    recorded progress, `_seed_running_with_progress`): the command's own
+    reconciler cycle holds the maintenance claim, so it fails the record and
+    removes its target, as it does a legacy restore, and resumes nothing (no
+    `taken over by this instance` line, no restore job in the command). The
+    restarted server finds no target and no backup."""
+    d = deployment
+    _restore_cell(d)
+    if d.backend != "sqlite":
+        pytest.skip("the purge's own reconciler cycle runs under the SQLite serve lock only")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "prg")
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+    finally:
+        server.stop()
+    _seed_running_with_progress(d, target)
+
+    res = d.run("backup", "purge", "--confirm")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "taken over by this instance" not in out, out
+    assert "resumed by this instance" not in out, out
+    assert "a maintenance claim is held; it is failed rather than resumed" in out, out
+    assert "Waiting for running jobs" not in out, out
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_table(TableName=target)
+        assert gone.value.response["Error"]["Code"] == "ResourceNotFoundException", gone.value.response
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_backup(BackupArn=arn)
+        assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", gone.value.response
+        log = server.log_text()
+        assert "taken over by this instance" not in log, log[-4000:]
+    finally:
+        server.stop()
+
+
+def _wait_table_gone_any_status(ddb, name: str, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            ddb.describe_table(TableName=name)
+        except ClientError as e:
+            assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"{name} still exists after {timeout} s")
+
+
+# --- hand-built prefixes: the format's rules met at the server's boundary ----------
+
+HAND_BUILT_ITEMS = 12
+
+
+def _hand_item(i: int) -> dict:
+    """Item `i` of a hand-built data file, in the shape `_create_composite_table`
+    keys on (`pk` S, `sk` N) with the GSI's `g`."""
+    return {"pk": {"S": f"p{i % 4:04d}"}, "sk": {"N": str(i)}, "g": {"S": f"g{i % 3}"}, "v": {"S": f"value {i}"}}
+
+
+def _gzip_lines(rows: list[dict]) -> tuple[bytes, int]:
+    """The data file of `rows`: one `{"Item": ..}` line each, gzipped; the
+    compressed bytes and the uncompressed length."""
+    import gzip
+    import io
+
+    lines = b"".join(json.dumps({"Item": r}, separators=(",", ":")).encode() + b"\n" for r in rows)
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
+        gz.write(lines)
+    return buffer.getvalue(), len(lines)
+
+
+def _write_manifest(prefix: str, manifest: dict) -> None:
+    """Write the manifest and its sha256 sidecar under `prefix`, the files
+    private as the store writes them, and the two DynamoDB export manifests
+    for the manifest's data files, so the prefix stays a whole backup in the
+    format's sense (one `md5Checksum` and one `itemCount` per file, agreeing
+    with the extenddb manifest by construction)."""
+    import hashlib
+
+    text = json.dumps(manifest, separators=(",", ":")).encode()
+    path = os.path.join(prefix, "extenddb-manifest.json")
+    with open(path, "wb") as f:
+        f.write(text)
+    os.chmod(path, 0o600)
+    sidecar = os.path.join(prefix, "extenddb-manifest.sha256")
+    with open(sidecar, "w") as f:
+        f.write(f"{hashlib.sha256(text).hexdigest()}  extenddb-manifest.json\n")
+    os.chmod(sidecar, 0o600)
+    summary_path = os.path.join(prefix, "manifest-summary.json")
+    with open(summary_path) as f:
+        summary = json.load(f)
+    s3_prefix = summary["s3Prefix"]
+    files_path = os.path.join(prefix, "manifest-files.json")
+    with open(files_path, "w") as f:
+        for entry in manifest["data_files"]:
+            line = {
+                "itemCount": entry["item_count"],
+                "md5Checksum": entry["md5"],
+                "dataFileS3Key": f"{s3_prefix}/{entry['key']}" if s3_prefix else entry["key"],
+            }
+            f.write(json.dumps(line, separators=(",", ":")) + "\n")
+    os.chmod(files_path, 0o600)
+    summary["itemCount"] = sum(entry["item_count"] for entry in manifest["data_files"])
+    summary["billedSizeBytes"] = manifest["backup_size_bytes"]
+    with open(summary_path, "w") as f:
+        f.write(json.dumps(summary, separators=(",", ":")))
+    os.chmod(summary_path, 0o600)
+
+
+def _write_data_files(prefix: str, files: list[list[dict]]) -> list[dict]:
+    """Replace the data files under `prefix` with one file per list of rows
+    (unordered: no `key_range`); the manifest entries."""
+    import base64
+    import hashlib
+    import shutil
+
+    data_dir = os.path.join(prefix, "data")
+    shutil.rmtree(data_dir)
+    os.mkdir(data_dir, 0o700)
+    entries = []
+    for index, rows in enumerate(files, start=1):
+        compressed, uncompressed = _gzip_lines(rows)
+        key = f"data/{index:06d}.json.gz"
+        path = os.path.join(prefix, key)
+        with open(path, "wb") as f:
+            f.write(compressed)
+        os.chmod(path, 0o600)
+        entries.append({
+            "key": key, "item_count": len(rows),
+            "sha256": hashlib.sha256(compressed).hexdigest(),
+            "md5": base64.b64encode(hashlib.md5(compressed).digest()).decode(),
+            "bytes": len(compressed), "uncompressed_bytes": uncompressed, "key_range": None,
+        })
+    return entries
+
+
+def _update_row(d: _Deployment, arn: str, size_bytes: int, item_count: int) -> None:
+    """Set the `backup_index` row's `size_bytes` and `item_count` to the
+    rewritten prefix's, as `backup sync` would record them."""
+    backup_id = arn.rsplit("/", 1)[1]
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            n = conn.execute(
+                "UPDATE backup_index SET size_bytes = ?, item_count = ? WHERE account_id = ? AND backup_id = ?",
+                (size_bytes, item_count, ACCOUNT, backup_id),
+            ).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        import psycopg2
+
+        conn = psycopg2.connect(d.catalog)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE backup_index SET size_bytes = %s, item_count = %s WHERE account_id = %s AND backup_id = %s",
+                    (size_bytes, item_count, ACCOUNT, backup_id),
+                )
+                n = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    assert n == 1, f"{n} backup_index rows match {arn}"
+
+
+def _small_backed_up_table(ddb, prefix: str) -> tuple[str, str]:
+    """A composite-key table with a GSI holding HAND_BUILT_ITEMS items,
+    backed up to AVAILABLE; the name and the ARN."""
+    name = f"{prefix}-{uuid.uuid4().hex[:8]}"
+    _create_composite_table(ddb, name, gsi=True)
+    pending = {name: [{"PutRequest": {"Item": _hand_item(i)}} for i in range(HAND_BUILT_ITEMS)]}
+    while pending:
+        pending = ddb.batch_write_item(RequestItems=pending).get("UnprocessedItems") or {}
+    arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
+    _wait_backup_available(ddb, arn, timeout=60)
+    return name, arn
+
+
+def _restore_fails(server: _Server, ddb, target: str, arn: str, *needles: str) -> str:
+    """The restore of `arn` into `target` is accepted CREATING and the target
+    is gone once the job fails, no item of it ever readable; the server log's
+    FAILED line, which must carry every needle. The job logs the line right
+    after it removes the target, so the log is polled for a moment."""
+    resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+    assert resp["TableStatus"] == "CREATING", resp
+    assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
+    _wait_table_gone(ddb, target)
+    deadline = time.monotonic() + 15
+    while True:
+        failed = [line for line in server.log_text().splitlines() if ": FAILED (" in line and f" into {target} " in line]
+        if failed or time.monotonic() > deadline:
+            break
+        time.sleep(0.25)
+    assert len(failed) == 1, server.log_text()[-4000:]
+    for needle in needles:
+        assert needle in failed[0], failed[0]
+    assert "the target was removed" in failed[0], failed[0]
+    assert ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] == "AVAILABLE"
+    return failed[0]
+
+
+DUPLICATE_KEY_TEXT = "holds a primary key the target already has (the backup holds a key twice)"
+
+
+def test_an_unordered_backup_holding_one_key_in_two_files_fails_the_restore(deployment, tmp_path):
+    """The backup's prefix rewritten under the root as an unordered backup of
+    two data files that share item 0's key (the manifest and its sidecar
+    rewritten, the row's size and count updated): the restore is accepted,
+    the job fails the second file on the duplicate, the target is gone and
+    the log names the reason. On PostgreSQL and SQLite, the two deployments
+    here, the detector is the base row's plain INSERT and the reason is its
+    text (`DUPLICATE_KEY_TEXT`); the engine's final count against the
+    manifest's total ("the manifest lists") is the detector on a backend
+    whose write is an upsert (Cassandra, through the matrix). A backend with
+    neither would restore 12 of 13 items."""
+    d = deployment
+    _restore_cell(d)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "dup")
+        prefix = _prefix(d, name, arn)
+        with open(os.path.join(prefix, "extenddb-manifest.json")) as f:
+            manifest = json.load(f)
+        rows = [_hand_item(i) for i in range(HAND_BUILT_ITEMS)]
+        entries = _write_data_files(prefix, [rows[:6], rows[6:] + [rows[0]]])
+        manifest["item_order"] = "unordered"
+        manifest["data_files"] = entries
+        manifest["backup_size_bytes"] = sum(e["bytes"] for e in entries)
+        manifest["source_table"]["item_count"] = HAND_BUILT_ITEMS + 1
+        _write_manifest(prefix, manifest)
+        _update_row(d, arn, manifest["backup_size_bytes"], HAND_BUILT_ITEMS + 1)
+        line = _restore_fails(server, ddb, f"{name}-r", arn, "data/000002.json.gz", DUPLICATE_KEY_TEXT)
+        assert "the manifest lists" not in line, line
+    finally:
+        server.stop()
+
+
+def test_a_key_ordered_file_leaving_its_key_range_fails_the_restore(deployment, tmp_path):
+    """The backup's manifest rewritten so its first data file's `key_range`
+    ends at its first item: the reader's key-range check ends the file's
+    stream at the second item, the restore is FAILED naming the file and the
+    rule, and the target is gone."""
+    d = deployment
+    _restore_cell(d)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "range")
+        prefix = _prefix(d, name, arn)
+        with open(os.path.join(prefix, "extenddb-manifest.json")) as f:
+            manifest = json.load(f)
+        assert manifest["item_order"] == "key_ordered", manifest["item_order"]
+        first = manifest["data_files"][0]
+        assert first["item_count"] >= 2, first
+        first["key_range"]["last"] = first["key_range"]["first"]
+        _write_manifest(prefix, manifest)
+        _restore_fails(server, ddb, f"{name}-r", arn, "data/000001.json.gz", "key_range")
+    finally:
+        server.stop()
+
+
+# --- the multi-part-key preview ------------------------------------------------------
+
+MULTIPART_ITEMS = 60
+
+
+def _scan_items(ddb, name: str) -> list[dict]:
+    items: list[dict] = []
+    kwargs: dict = {"TableName": name, "ConsistentRead": True}
+    while True:
+        resp = ddb.scan(**kwargs)
+        items += resp["Items"]
+        if "LastEvaluatedKey" not in resp:
+            return items
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+
+def _canonical(item: dict) -> str:
+    return json.dumps(item, sort_keys=True, separators=(",", ":"))
+
+
+def test_a_multi_part_key_table_restores_with_the_sources_item_set(deployment, tmp_path):
+    """A table keyed on two HASH attributes (`[limits]
+    allow_multipart_table_keys = true` on this cell's deployment, so a
+    server that refuses the second HASH key fails the cell rather than
+    skipping it) backs up to the store as an `unordered` backup and
+    restores: the restored table's `Scan` holds what the source's held,
+    with the source's key schema and attribute definitions. The comparison
+    is with the source's `Scan`, not with the items written: the preview's
+    item paths address such a table by its first HASH attribute on every
+    backend (on SQLite the source keeps one item per `h1` value; on
+    PostgreSQL a GetItem by the whole key finds nothing on the source
+    either), and that is the preview's behaviour, not the restore's; for the
+    same reason the cell makes no GetItem by the whole key."""
+    d = deployment
+    _restore_cell(d)
+    d.set_limit("allow_multipart_table_keys", "true")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name = f"mpk-{uuid.uuid4().hex[:8]}"
+        key_schema = [
+            {"AttributeName": "h1", "KeyType": "HASH"},
+            {"AttributeName": "h2", "KeyType": "HASH"},
+        ]
+        attr_defs = [
+            {"AttributeName": "h1", "AttributeType": "S"},
+            {"AttributeName": "h2", "AttributeType": "N"},
+        ]
+        ddb.create_table(TableName=name, KeySchema=key_schema, AttributeDefinitions=attr_defs, BillingMode="PAY_PER_REQUEST")
+        _wait_active(ddb, name)
+        for i in range(MULTIPART_ITEMS):
+            ddb.put_item(
+                TableName=name,
+                Item={"h1": {"S": f"tenant-{i % 5}"}, "h2": {"N": str(i)}, "v": {"S": f"value-{i}"}, "n": {"N": str(i * 1.5)}},
+            )
+        expected = sorted(_canonical(i) for i in _scan_items(ddb, name))
+        assert expected, "the source holds no item"
+        print(f"branch: the source holds {len(expected)} of {MULTIPART_ITEMS} items written ({d.backend})")
+        arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, arn, timeout=60)
+        with open(os.path.join(_prefix(d, name, arn), "extenddb-manifest.json")) as f:
+            manifest = json.load(f)
+        assert manifest["item_order"] == "unordered", manifest["item_order"]
+        assert manifest["source_table"]["key_schema"] == key_schema, manifest["source_table"]["key_schema"]
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
+        _wait_active(ddb, target, timeout=120)
+        table = ddb.describe_table(TableName=target)["Table"]
+        assert table["KeySchema"] == key_schema, table["KeySchema"]
+        assert sorted(table["AttributeDefinitions"], key=lambda a: a["AttributeName"]) == attr_defs, table["AttributeDefinitions"]
+        assert "RestoreSummary" not in table, table
+        got = sorted(_canonical(i) for i in _scan_items(ddb, target))
+        assert got == expected, f"{len(got)} restored items against {len(expected)} in the source"
+        log = server.log_text()
+        assert f" into {target} " in log and ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
