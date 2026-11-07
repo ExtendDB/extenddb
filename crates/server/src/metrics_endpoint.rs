@@ -378,6 +378,9 @@ mod tests {
             MetricName::BackupBytesUploaded,
             MetricName::BackupSnapshotAge,
             MetricName::BackupStoreErrors,
+            MetricName::RestoreJobs,
+            MetricName::RestoreJobDuration,
+            MetricName::RestoreBytesDownloaded,
         ];
         let rows: Vec<MetricsRow> = names
             .iter()

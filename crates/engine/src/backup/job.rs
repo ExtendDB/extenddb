@@ -62,6 +62,8 @@
 //!
 //! Kill points ([`kill_point`]) pause the job for the binary-level crash
 //! tests under the `backup-test-hooks` feature and are no-ops without it.
+//! The restore job ([`super::restore`]) shares this module's environment
+//! ([`JobEnv`]), its kill points, its heartbeat and its status writes.
 
 pub(crate) mod failure;
 pub(crate) mod heartbeat;
@@ -91,19 +93,24 @@ use extenddb_storage::{
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings};
+use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool};
 use super::{create_backup_storage_err_to_dynamo, storage_err_to_dynamo};
 use failure::{FailurePath, Written};
-use heartbeat::HeartbeatHandle;
+use heartbeat::{HeartbeatHandle, HeartbeatMetric};
 use writer::{DataFiles, Pipeline, Stop};
+
+/// The reason a restore record carries when the maintenance claim was held
+/// as the job started (the design's 5.3 step 4; the backup job checks the
+/// claim before its row exists and writes no such row).
+pub(crate) const MAINTENANCE: &str = "maintenance";
 
 /// The reason a row carries when the server's shutdown stopped the job.
 pub(crate) const SHUTDOWN: &str = "shutdown";
 
 /// What the runtime hands a job: the store as the runtime holds it (its
 /// health and identity, read before every put), its identity as the row
-/// records it and its manifest names, the settings, the collector, the
-/// shutdown token and the source names.
+/// records it and its manifest names, the restore spool, the settings, the
+/// collector, the shutdown token and the source names.
 #[derive(Clone)]
 pub(crate) struct JobEnv {
     pub configured: Arc<ConfiguredStore>,
@@ -111,6 +118,9 @@ pub(crate) struct JobEnv {
     pub identity: StoreIdentity,
     pub bucket: String,
     pub key_prefix: String,
+    /// The restore spool of an S3 store; `None` for a filesystem store,
+    /// whose files a restore reads in place.
+    pub spool: Option<Spool>,
     pub settings: JobSettings,
     pub metrics: Option<Arc<MetricsCollector>>,
     pub shutdown: CancellationToken,
@@ -137,6 +147,7 @@ impl JobEnv {
             identity,
             bucket: store.bucket.clone(),
             key_prefix: store.key_prefix.clone(),
+            spool: store.spool.clone(),
             settings: runtime.job_settings(),
             metrics: runtime.metrics().cloned(),
             shutdown: runtime.shutdown(),
@@ -363,7 +374,7 @@ async fn fail_without_store_access(claim: &dyn JobClaim, arn: &BackupArn, reason
         completed: true,
         ..StatusFields::default()
     };
-    match failure::write_status(claim, JobStatus::Failed, &fields).await {
+    match failure::write_status(claim, JobStatus::Creating, JobStatus::Failed, &fields).await {
         Written::Matched => {}
         Written::NotMatched(why) | Written::Error(why) => tracing::error!(
             "backup {}: the row could not be marked FAILED ({reason}): {why}",
@@ -394,8 +405,13 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
     let heartbeat = HeartbeatHandle::start(
         Arc::clone(&claim),
         env.settings.heartbeat_interval,
-        env.metrics.clone(),
-        created_at,
+        match env.metrics.clone() {
+            Some(metrics) => HeartbeatMetric::BackupSnapshotAge {
+                metrics,
+                created_at,
+            },
+            None => HeartbeatMetric::None,
+        },
         claimed_at,
     );
     tracing::info!(
@@ -560,7 +576,8 @@ async fn write_documents(
         source_table_details_json: serde_json::to_value(&manifest.source_table).ok(),
         completed: true,
     };
-    match failure::write_status(&**claim, JobStatus::Available, &fields).await {
+    match failure::write_status(&**claim, JobStatus::Creating, JobStatus::Available, &fields).await
+    {
         Written::Matched => Ok(bytes_uploaded),
         Written::NotMatched(why) | Written::Error(why) => Err(Stop::ClaimLost(format!(
             "the AVAILABLE write did not settle: {why}"
@@ -597,11 +614,17 @@ pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> 
     }
 }
 
-/// The points at which a job pauses under `backup-test-hooks` when
-/// `EXTENDDB_BACKUP_PAUSE` names one, until the file
-/// `EXTENDDB_BACKUP_PAUSE_RELEASE` names exists (or for good, for a test
-/// that kills the server there). Each is logged as `backup job reached kill
-/// point <name>`.
+/// The points at which a backup or restore job pauses under
+/// `backup-test-hooks` when `EXTENDDB_BACKUP_PAUSE` names one, until the
+/// file `EXTENDDB_BACKUP_PAUSE_RELEASE` names exists (or for good, for a
+/// test that kills the server there). Each is logged as `job reached kill
+/// point <name>` (the backend's own points log `restore job reached kill
+/// point <name>`; the harness matches `reached kill point <name>`). This
+/// enum is the engine's list: the points inside a backend's own writes are
+/// paused by the backend through
+/// `extenddb_storage::backup_catalog::restore_pause_point` under
+/// `extenddb-storage/test-hooks`, and each backend's own point is named
+/// beside `restore_pause_point`, once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillPoint {
     /// After the put of the first data file returned, before the next file
@@ -611,6 +634,22 @@ pub enum KillPoint {
     BeforeManifest,
     /// After the manifest's put returned, before the AVAILABLE write.
     AfterManifest,
+    /// Restore: after every data file downloaded and verified, before the
+    /// first `bulk_load`.
+    RestoreAfterDownload,
+    /// Restore: after the first file's `bulk_load` returned, before the
+    /// next file.
+    RestoreAfterFileCommit,
+    /// Restore: after a `finish_restore` that left the ACTIVE flip to the
+    /// backend's index backfill returned, before the job ends (MongoDB).
+    RestoreMongodbBeforeWorkerFlip,
+    /// Restore: after the FAILED write matched, before
+    /// `remove_restore_target`.
+    RestoreBetweenFailedAndRemoval,
+    /// Restore: before the DONE write, with the job's heartbeat stopped
+    /// first, so a reconciler takes the record over while the job pauses
+    /// and the job's write then matches no record.
+    RestoreFencedOut,
 }
 
 impl KillPoint {
@@ -621,7 +660,27 @@ impl KillPoint {
             Self::AfterDataFile => "after_data_file",
             Self::BeforeManifest => "before_manifest",
             Self::AfterManifest => "after_manifest",
+            Self::RestoreAfterDownload => "restore_after_download",
+            Self::RestoreAfterFileCommit => "restore_after_file_commit",
+            Self::RestoreMongodbBeforeWorkerFlip => "restore_mongodb_before_worker_flip",
+            Self::RestoreBetweenFailedAndRemoval => "restore_between_failed_and_removal",
+            Self::RestoreFencedOut => "restore_fenced_out",
         }
+    }
+}
+
+/// Whether the environment names `point` as the pause point (so a caller
+/// can do what the pause needs first, as the fenced-out point stops the
+/// heartbeat); `false` without `backup-test-hooks`.
+pub(crate) fn kill_point_named(point: KillPoint) -> bool {
+    #[cfg(feature = "backup-test-hooks")]
+    {
+        std::env::var("EXTENDDB_BACKUP_PAUSE").ok().as_deref() == Some(point.name())
+    }
+    #[cfg(not(feature = "backup-test-hooks"))]
+    {
+        let _ = point;
+        false
     }
 }
 
@@ -636,7 +695,7 @@ pub(crate) async fn kill_point(point: KillPoint, shutdown: &CancellationToken) {
         }
         let release = std::env::var("EXTENDDB_BACKUP_PAUSE_RELEASE").ok();
         tracing::warn!(
-            "backup job reached kill point {}; paused until {} exists",
+            "job reached kill point {}; paused until {} exists",
             point.name(),
             release
                 .as_deref()
@@ -646,12 +705,12 @@ pub(crate) async fn kill_point(point: KillPoint, shutdown: &CancellationToken) {
             if let Some(release) = &release
                 && std::path::Path::new(release).exists()
             {
-                tracing::warn!("backup job released from kill point {}", point.name());
+                tracing::warn!("job released from kill point {}", point.name());
                 return;
             }
             if shutdown.is_cancelled() {
                 tracing::warn!(
-                    "backup job at kill point {} released by the shutdown",
+                    "job at kill point {} released by the shutdown",
                     point.name()
                 );
                 return;

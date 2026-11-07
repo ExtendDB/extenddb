@@ -16,6 +16,7 @@ use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
+use extenddb_storage::backup_catalog::RestoreRegistrationRow;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{index_arn, stream_arn, table_arn};
 
@@ -35,7 +36,57 @@ pub(crate) struct RestoreRegistration<'a> {
     pub owner_generation: u64,
 }
 
+/// Which backup a restore target is created for, and so which row the
+/// registration re-checks in its write transaction: an in-catalog `backups`
+/// row (the legacy reader's restore, `kind = legacy`) or a `backup_index` row
+/// of a backup in the store (`kind = manifest`, with the store, the spool
+/// host and the claim's generation on the record).
+pub(crate) enum RestoreSource<'a> {
+    Legacy(&'a RestoreRegistration<'a>),
+    Manifest(&'a RestoreRegistrationRow),
+}
+
+impl RestoreSource<'_> {
+    fn backup_arn(&self) -> &str {
+        match self {
+            Self::Legacy(r) => r.backup_arn,
+            Self::Manifest(r) => &r.backup.backup_arn,
+        }
+    }
+}
+
 impl SqliteEngine {
+    /// The error for a restore into a name another restore holds the slot
+    /// of: `TableBeingRestored` naming that restore's backup once its
+    /// CREATING row is committed, else `TableAlreadyExists`, as CreateTable
+    /// reports a taken name. Reads committed state through the pool; a read
+    /// failure is "not a restore target": an error is being produced
+    /// already.
+    pub(crate) async fn name_taken_error(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> StorageError {
+        let restoring: Option<String> = sqlx::query_scalar(
+            "SELECT r.source_backup_arn FROM tables t \
+             JOIN table_restores r ON r.table_id = t.table_id \
+             WHERE t.account_id = ? AND t.table_name = ? AND t.table_status = 'CREATING'",
+        )
+        .bind(account_id)
+        .bind(table_name)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        match restoring {
+            Some(backup_arn) => StorageError::TableBeingRestored {
+                table_name: table_name.to_owned(),
+                backup_arn,
+            },
+            None => StorageError::TableAlreadyExists(table_name.to_owned()),
+        }
+    }
+
     /// Create a table. When `defer_active` is set (the restore path), the row
     /// is written `CREATING` with **no** scheduled transition, so the
     /// background control-plane worker cannot flip it to `ACTIVE` while the
@@ -61,8 +112,33 @@ impl SqliteEngine {
         input: CreateTableInput,
         registration: &RestoreRegistration<'_>,
     ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_inner(account_id, input, true, Some(registration))
-            .await
+        self.create_table_impl_inner(
+            account_id,
+            input,
+            true,
+            Some(RestoreSource::Legacy(registration)),
+        )
+        .await
+    }
+
+    /// Create a store-backed restore's target and register the restore in
+    /// the write transaction that also re-checks, on the backup's
+    /// `backup_index` row, that it is AVAILABLE and has no CREATING target.
+    /// The job record is born RUNNING, `kind = manifest`, with the
+    /// registration's store, spool host and generation.
+    pub(crate) async fn create_table_for_manifest_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistrationRow,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(
+            account_id,
+            input,
+            true,
+            Some(RestoreSource::Manifest(registration)),
+        )
+        .await
     }
 
     async fn create_table_impl_inner(
@@ -70,7 +146,7 @@ impl SqliteEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
-        restore: Option<&RestoreRegistration<'_>>,
+        restore: Option<RestoreSource<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
         // D1: every writer holds the engine write lock. This method runs two
@@ -153,7 +229,8 @@ impl SqliteEngine {
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
-        if let Some(RestoreRegistration { backup_arn, .. }) = restore {
+        if let Some(source) = &restore {
+            let backup_arn = source.backup_arn();
             // A restore into a name that is itself a CREATING restore target
             // is refused as such before the backup is checked, so a second
             // restore of the same backup into the same name is
@@ -175,19 +252,45 @@ impl SqliteEngine {
                     backup_arn: source_backup_arn,
                 });
             }
-            let available: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
-                 AND account_id = ? AND backup_status = 'AVAILABLE')",
-            )
-            .bind(backup_arn)
-            .bind(account_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if !available {
-                return Err(StorageError::Validation(format!(
-                    "Backup not found: {backup_arn}"
-                )));
+            match source {
+                RestoreSource::Legacy(_) => {
+                    let available: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+                         AND account_id = ? AND backup_status = 'AVAILABLE')",
+                    )
+                    .bind(backup_arn)
+                    .bind(account_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if !available {
+                        return Err(StorageError::Validation(format!(
+                            "Backup not found: {backup_arn}"
+                        )));
+                    }
+                }
+                RestoreSource::Manifest(registration) => {
+                    // The `backup_index` row's status, in the write
+                    // transaction `start_backup_delete` reads it in: the
+                    // engine write lock and `BEGIN IMMEDIATE` are the lock
+                    // on the row, so a DeleteBackup and this registration
+                    // order wholly one before the other, and two
+                    // registrations of one backup serialize before the
+                    // CREATING-target check below.
+                    let status: Option<String> = sqlx::query_scalar(
+                        "SELECT status FROM backup_index WHERE account_id = ? AND backup_id = ?",
+                    )
+                    .bind(account_id)
+                    .bind(&registration.backup.backup_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if status.as_deref() != Some("AVAILABLE") {
+                        return Err(extenddb_storage::backup_catalog::backup_not_found(
+                            backup_arn,
+                        ));
+                    }
+                }
             }
             // One restore of a backup at a time, as the service: while a
             // target restored from it is CREATING the backup is in use. Same
@@ -258,24 +361,51 @@ impl SqliteEngine {
             return Err(StorageError::TableAlreadyExists(input.table_name.clone()));
         }
 
-        if let Some(registration) = restore {
-            sqlx::query(&format!(
-                "INSERT INTO table_restores \
-                 (table_id, source_backup_arn, source_table_arn, restore_date_time, \
-                  status, kind, owner_generation, heartbeat_at) \
-                 VALUES (?, ?, ?, ?, 'RUNNING', 'legacy', ?, {})",
-                crate::backup_catalog::NOW
-            ))
-            .bind(&table_id)
-            .bind(registration.backup_arn)
-            .bind(registration.source_table_arn)
-            .bind(format_epoch_seconds(registration.restore_date_time))
-            .bind(crate::backup_catalog::generation_column(
-                registration.owner_generation,
-            ))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        match &restore {
+            Some(RestoreSource::Legacy(registration)) => {
+                sqlx::query(&format!(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, owner_generation, heartbeat_at) \
+                     VALUES (?, ?, ?, ?, 'RUNNING', 'legacy', ?, {})",
+                    crate::backup_catalog::NOW
+                ))
+                .bind(&table_id)
+                .bind(registration.backup_arn)
+                .bind(registration.source_table_arn)
+                .bind(format_epoch_seconds(registration.restore_date_time))
+                .bind(crate::backup_catalog::generation_column(
+                    registration.owner_generation,
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            Some(RestoreSource::Manifest(registration)) => {
+                sqlx::query(&format!(
+                    "INSERT INTO table_restores \
+                     (table_id, source_backup_arn, source_table_arn, restore_date_time, \
+                      status, kind, store_kind, store_root, store_id, spool_host, \
+                      owner_generation, heartbeat_at) \
+                     VALUES (?, ?, ?, ?, 'RUNNING', 'manifest', ?, ?, ?, ?, ?, {})",
+                    crate::backup_catalog::NOW
+                ))
+                .bind(&table_id)
+                .bind(&registration.backup.backup_arn)
+                .bind(&registration.source_table_arn)
+                .bind(format_epoch_seconds(registration.restore_date_time))
+                .bind(registration.store.store_kind.as_str())
+                .bind(&registration.store.store_root)
+                .bind(&registration.store.store_id)
+                .bind(registration.spool_host.as_deref())
+                .bind(crate::backup_catalog::generation_column(
+                    registration.owner_generation,
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            }
+            None => {}
         }
 
         // GSI / LSI metadata.
