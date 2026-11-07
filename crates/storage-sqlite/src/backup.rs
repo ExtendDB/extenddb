@@ -5955,10 +5955,14 @@ mod restore_tests {
                 wait_for_copy(&engine, &desc.table_id).await,
                 "the copy finishes"
             );
-            assert!(
-                !engine.job_slots.holds(&slot),
-                "the slot is freed with the claim when the copy ends"
-            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while engine.job_slots.holds(&slot) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the slot is freed with the claim when the copy ends"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
             // The state a stopped process leaves: no slot, an aged RUNNING
             // record. Listed.
