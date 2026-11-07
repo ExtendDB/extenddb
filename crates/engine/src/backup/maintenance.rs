@@ -54,7 +54,7 @@ use extenddb_storage::backup_catalog::{
     StaleClock, StoreIdentity, is_backup_not_found,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupCatalog, MaintenanceClaim};
+use extenddb_storage::{BackupCatalog, CancellationToken, MaintenanceClaim};
 use futures::TryStreamExt;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -62,9 +62,29 @@ use tokio::time::Instant;
 use super::StoreFence;
 
 /// A maintenance claim with its heartbeat on a timer.
+///
+/// The claim is confirmed by the job's rule (`job/heartbeat.rs`): each beat
+/// is bounded by one period ([`MaintenanceClaim::heartbeat_within`]), and a
+/// beat that answers `Lost`, fails or outlives its bound records the loss;
+/// between beats the claim counts as held while the last confirmed beat is
+/// at most two periods old, or a beat is in flight within its bound (for
+/// as long as it waits, on SQLite, where the beat parks on this process's
+/// own write lock). Past that, [`Self::lost`] answers as for a lost claim:
+/// a timer that stopped running, or a beat that hangs, does not keep the
+/// claim confirmed while the stale window lets another command take it
+/// over.
 pub struct HeldClaim {
     claim: Arc<dyn MaintenanceClaim>,
     lost: Arc<Mutex<Option<String>>>,
+    /// Cancelled when `lost` is set, for a writer that selects on the loss.
+    lost_signal: CancellationToken,
+    /// The instant of the last confirmed beat; the take stands for the
+    /// first.
+    confirmed: Arc<Mutex<Instant>>,
+    /// The instant the beat in flight started, while one is.
+    in_flight: Arc<Mutex<Option<Instant>>>,
+    parks: bool,
+    period: Duration,
     timer: tokio::task::JoinHandle<()>,
 }
 
@@ -73,32 +93,69 @@ impl HeldClaim {
     /// [`HeldClaim::release`] or the drop (the caller passes the jobs'
     /// heartbeat period, `extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL`,
     /// which every stale window the config accepts is at least three of).
+    /// Now stands for the first confirmed beat: the claim was just taken.
     #[must_use]
     pub fn start(claim: Box<dyn MaintenanceClaim>, interval: Duration) -> Self {
         let claim: Arc<dyn MaintenanceClaim> = Arc::from(claim);
         let lost = Arc::new(Mutex::new(None));
+        let lost_signal = CancellationToken::new();
+        let confirmed = Arc::new(Mutex::new(Instant::now()));
+        let in_flight = Arc::new(Mutex::new(None));
+        let parks = claim.heartbeat_parks_before_its_bound();
         let timer = tokio::spawn({
             let claim = Arc::clone(&claim);
             let lost = Arc::clone(&lost);
+            let lost_signal = lost_signal.clone();
+            let confirmed = Arc::clone(&confirmed);
+            let in_flight = Arc::clone(&in_flight);
             async move {
                 let mut ticks = tokio::time::interval(interval);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ticks.tick().await;
                 loop {
                     ticks.tick().await;
-                    let reason = match claim.heartbeat().await {
-                        Ok(Heartbeat::Confirmed) => continue,
-                        Ok(Heartbeat::Lost) => {
+                    *in_flight.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(Instant::now());
+                    let outcome = claim.heartbeat_within(interval).await;
+                    *in_flight.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    let reason = match outcome {
+                        Some(Ok(Heartbeat::Confirmed)) => {
+                            *confirmed.lock().unwrap_or_else(PoisonError::into_inner) =
+                                Instant::now();
+                            continue;
+                        }
+                        Some(Ok(Heartbeat::Lost)) => {
                             "the maintenance claim was lost (another holder took it over)"
                                 .to_owned()
                         }
-                        Err(e) => format!("the maintenance claim's heartbeat failed: {e}"),
+                        Some(Err(e)) => format!("the maintenance claim's heartbeat failed: {e}"),
+                        None => format!(
+                            "the maintenance claim's heartbeat did not return within {} s",
+                            interval.as_secs_f64()
+                        ),
                     };
                     *lost.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
+                    lost_signal.cancel();
                     return;
                 }
             }
         });
-        Self { claim, lost, timer }
+        Self {
+            claim,
+            lost,
+            lost_signal,
+            confirmed,
+            in_flight,
+            parks,
+            period: interval,
+            timer,
+        }
+    }
+
+    /// Cancelled once a heartbeat recorded the loss ([`Self::lost`]'s first
+    /// clause).
+    pub(crate) fn lost_signal(&self) -> &CancellationToken {
+        &self.lost_signal
     }
 
     /// The claim's fencing token.
@@ -107,14 +164,39 @@ impl HeldClaim {
         self.claim.generation()
     }
 
-    /// Why the claim is no longer held, once a heartbeat said so; `None`
-    /// while every heartbeat has confirmed it.
+    /// Why the claim is no longer held (the type's doc): a heartbeat that
+    /// answered `Lost`, failed or outlived its bound, or no beat confirmed
+    /// within two periods and none in flight within its bound. `None` while
+    /// the claim is confirmed.
     #[must_use]
     pub fn lost(&self) -> Option<String> {
-        self.lost
+        if let Some(reason) = self
+            .lost
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+        {
+            return Some(reason);
+        }
+        let since = self
+            .confirmed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed();
+        if since <= 2 * self.period {
+            return None;
+        }
+        let beat = *self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if beat.is_some_and(|started| self.parks || started.elapsed() <= self.period) {
+            return None;
+        }
+        Some(format!(
+            "no heartbeat confirmed the maintenance claim within two periods ({:.0} s ago)",
+            since.as_secs_f64()
+        ))
     }
 
     /// Stop the heartbeat, wait for one in flight to end, and release the
@@ -880,5 +962,79 @@ mod tests {
                 .contains("the release did not finish within 10 s"),
             "{err}"
         );
+    }
+
+    /// A claim whose heartbeat never answers (a half-open connection), or
+    /// one that parks before its bound as SQLite's does, as `parks` says.
+    struct StalledBeat {
+        parks: bool,
+    }
+
+    impl MaintenanceClaim for StalledBeat {
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+            Box::pin(std::future::pending())
+        }
+        fn heartbeat_within(
+            &self,
+            bound: Duration,
+        ) -> BoxFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+            if self.parks {
+                // Parked on the write lock: the bound has not started.
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async move { tokio::time::timeout(bound, self.heartbeat()).await.ok() })
+            }
+        }
+        fn heartbeat_parks_before_its_bound(&self) -> bool {
+            self.parks
+        }
+        fn release(&self) -> BoxFuture<'_, Result<(), StorageError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A heartbeat that hangs is bounded by one period: the claim stays
+    /// confirmed through the first beat's bound and reads lost once it
+    /// passes (two periods after the take), naming the bound, with the loss
+    /// token cancelled. A beat parked before its bound (SQLite's) keeps the
+    /// claim confirmed for as long as it waits.
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_that_hangs_loses_the_claim_after_two_periods() {
+        let period = Duration::from_secs(1);
+        let held = HeldClaim::start(Box::new(StalledBeat { parks: false }), period);
+        tokio::time::sleep(Duration::from_millis(1_900)).await;
+        assert_eq!(held.lost(), None, "within two periods");
+        assert!(!held.lost_signal().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reason = held.lost().expect("lost after the beat's bound");
+        assert!(reason.contains("did not return within 1 s"), "{reason}");
+        assert!(held.lost_signal().is_cancelled());
+
+        let parked = HeldClaim::start(Box::new(StalledBeat { parks: true }), period);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(parked.lost(), None, "a parked beat confirms while it waits");
+    }
+
+    /// A timer that stops running without recording a loss (here, aborted)
+    /// leaves no beat in flight: the claim reads lost once its last
+    /// confirmed beat is two periods old.
+    #[tokio::test(start_paused = true)]
+    async fn a_timer_that_stops_loses_the_claim_after_two_periods() {
+        let fake = Arc::new(FakeClaim::default());
+        let held = held_over(&fake, Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        held.timer.abort();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert_eq!(
+            held.lost(),
+            None,
+            "the beat at 1 s is under two periods old"
+        );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let reason = held.lost().expect("no beat within two periods");
+        assert!(reason.contains("within two periods"), "{reason}");
     }
 }

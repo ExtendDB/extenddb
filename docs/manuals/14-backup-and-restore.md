@@ -25,8 +25,9 @@ PostgreSQL, SQLite and MongoDB. The catalog keeps a row per backup as the index 
 Cassandra has no table snapshot. `CreateBackup` there writes the in-catalog format (inside the Cassandra
 cluster, in the catalog keyspace and the account's keyspace) whatever the store, and that copy pages the live
 table, so it is not point-in-time. A configured store serves restores into Cassandra of backups that another
-backend wrote to the store. For off-host copies of a Cassandra deployment use the cluster's own snapshot
-tooling.
+backend wrote to the store, and `extenddb backup migrate-legacy` copies Cassandra's own backups into it
+([Legacy backups](#legacy-backups)). For off-host copies of a Cassandra deployment use the cluster's own
+snapshot tooling.
 
 What a table backup is not:
 
@@ -505,7 +506,8 @@ id>); the catalog has no backup rows for it, so the store is unconfigured and Cr
 backups", and `/health` shows no `backup_store` component (`{"components":{},"status":"healthy"}`). Until
 the adoption below, `CreateBackup` answers `AVAILABLE` at once and writes an in-catalog backup into the
 database file, the failure domain this manual's first paragraph warns about; such a backup stays in-catalog
-after the adoption ([Legacy backups](#legacy-backups)). Pause scheduled backups until the adoption, or
+after the adoption until `extenddb backup migrate-legacy` copies it into the store ([Legacy
+backups](#legacy-backups)). Pause scheduled backups until the adoption, or
 configure `[backup.store]` explicitly, which gives the unhealthy store above instead.
 
 In both shapes plain `backup sync` refuses (exit 1, "owned by another catalog"). Then:
@@ -714,11 +716,85 @@ in-catalog format is deprecated: without a store `CreateBackup` logs a warning o
 in-catalog backup format, which a later release stops creating; configure [backup.store] ..."), and a later
 release stops creating it.
 
-This release has no command that converts a legacy backup to the store format (`backup migrate-legacy` is
-planned, #821). To move one into the store today, with the store configured:
+### Migrating legacy backups into the store
+
+`extenddb backup migrate-legacy <arn>` copies one legacy backup into the configured store, and `extenddb
+backup migrate-legacy --all` every legacy backup of every account that is not deleted, oldest first, and then
+deletes what a stopped run left under the prefix of every deleted one (below). Give exactly one of the two; a
+`<arn>` that is not a backup ARN exits 2 before anything is opened. Each backup keeps its ARN, backup id, name and `BackupCreationDateTime`: the items
+are read through the in-catalog reader, checked one by one as a store-backed `CreateBackup` checks them,
+written as data files under the backup's prefix, and the manifest is written last with `snapshot.kind`
+`legacy_in_catalog`. The command then reads the prefix back as `backup sync` does (the sidecar, the digest,
+the manifest, every data file at its listed size) and compares the item count with the one the legacy
+backup recorded. Only then does it replace the legacy backup by the backup's catalog row, in one step: on
+PostgreSQL and SQLite one transaction inserts the row and deletes the legacy row with its items and
+definition; on MongoDB one transaction inserts the row and marks the document, after which the item
+collection is dropped; on Cassandra the legacy row becomes the catalog row in place and the item buckets are
+deleted. A legacy row left `DELETED` is therefore always one a `DeleteBackup` deleted. `DescribeBackup`, `ListBackups`, `RestoreTableFromBackup` and `DeleteBackup` then
+serve it from the store, and `extenddb backup list` lists it. `<arn>` may be spelt with another region, as
+`DescribeBackup` accepts it.
+
+What it costs. The command opens the catalog as `serve` does and takes the maintenance claim on every
+backend for its whole run, so:
+
+- Every backup and restore job of the catalog answers `LimitExceededException` until the command ends,
+  on every server, and a second maintenance command (`backup purge --confirm`, the writing forms of `backup
+  sync`) fails at once. Before its first copy the command waits, as `backup purge` does, until no backup
+  or restore job of the store is running.
+- On SQLite the server is stopped for it: beside a running server the command exits 6 and writes nothing.
+- On PostgreSQL each backup's items are read in one `REPEATABLE READ` transaction on the catalog database,
+  held for as long as that backup's copy takes, which holds back vacuum of the catalog database meanwhile.
+  The legacy restore reads the same way.
+
+To keep the window short, migrate in pieces with `<arn>`, one backup at a time, between scheduled backups.
+
+The command prints one line per backup and a summary:
+
+```
+migrated arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/01793991641206-db64fc83 (account 123456789012): 303 items, 3158 bytes
+refused arn:aws:dynamodb:us-east-1:123456789012:table/orders/backup/1793254932797-4116998c (account 123456789012): its backup id 1793254932797-4116998c carries no instant (an id a 0.1.x release issued), and a store prefix carries only the 14-digit shape; restore it (RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. Its in-catalog backup is kept
+
+=== extenddb backup migrate-legacy complete: 1 migrated, 0 finished, 0 already in the store, 0 deleted, 1 refused, 0 skipped, 0 failed ===
+```
+
+The command's log lines (INFO and above, the store check's and the reconciler's among them) go to the same
+standard output, between these lines. Each migration, finish and deletion is also logged there under
+`extenddb::audit` with the account and the ARN. `finished` names a backup an earlier run had copied and given
+its row, whose legacy rows the command now removed; "already in the store" names an `<arn>` whose catalog row
+is in the store and AVAILABLE; `deleted` names a backup that was deleted, whose copy a stopped run left the
+command deleted (the note under the line says so; `--all` names no deleted backup it found nothing for), or an
+`<arn>` whose catalog row a `DeleteBackup` moved to `DELETED`; `skipped` names a legacy backup that is
+`CREATING` or `DELETING` (`DeleteBackup` again finishes a deletion that stopped) or that was deleted while
+the command ran; `failed` names a store or catalog call that failed, which a later run tries again. The
+indented lines under a backup's line are its notes: a copy deleted, a copy left and why, a region other than
+the server's. With `--all` the command goes on past a refused, skipped or failed backup and exits 1 at the
+end; it exits 0 when every backup it reached is in the store or deleted. A lost claim, a store found
+unhealthy, a failed catalog call or a signal stop it with exit 1; a first `SIGINT` or `SIGTERM` is acted on
+before the next backup and, inside a copy, at the writer's next step, and the copy in progress is deleted. A
+replacement already under way when the signal comes finishes first, and the run then stops, whether or not
+another backup follows.
+
+What it refuses, keeping the legacy backup as it is and leaving nothing under its prefix:
+
+- **Every backup a 0.1.x release took.** Their backup ids (13 digits, or 13 bare digits) carry no creation
+  instant, and a store prefix carries only the 14-digit shape. Only legacy backups taken by this release
+  line migrate: those of a server without a store, with `kind = "disabled"`, and on Cassandra.
+- A backup holding an item the item check refuses: a value the wire accepted before #618 was fixed (for
+  example an `N` of `1E126`), or an item over this instance's `max_item_size_bytes` or key limits. The
+  command logs each item's key and attribute, as a failed `CreateBackup` does.
+- A SQLite backup taken before catalog 0.0.4, which recorded no table definition, so its vector indexes
+  cannot be stated.
+- What the legacy restore refuses too (a vector index, a multi-part key); a table name that cannot name a
+  store prefix (only dots, or over 255 bytes); a backup name outside 3 to 255 characters of `a-z`, `A-Z`,
+  `0-9`, `_`, `-` and `.`; a MongoDB backup with no item collection; an ARN that a catalog row of another
+  store holds; and, at the replacement, a backup a restore target in `CREATING` still reads (`extenddb
+  backup remove-target` removes the target first).
+
+The way out for a refused backup, with the store configured:
 
 1. Restore it under a new name: `aws dynamodb restore-table-from-backup --backup-arn <legacy arn>
-   --target-table-name orders-moved --endpoint-url https://<host>:18443`, and wait for `ACTIVE`.
+   --target-table-name orders-moved --endpoint-url https://<host>:18443`, and wait for `ACTIVE`. For a
+   refused item, correct the items the command's log names in the restored table.
 2. `aws dynamodb create-backup --table-name orders-moved --backup-name <name> --endpoint-url
    https://<host>:18443` and wait for `AVAILABLE`. This is a store-backed backup with a new ARN and a new
    `BackupCreationDateTime`, of a table named `orders-moved`.
@@ -730,7 +806,50 @@ room loses every write since the legacy backup. While the table exists, `create-
 store-backed backup of that name with its current items; keep the legacy backup only for its older contents.
 A backup taken by an earlier release may restore without its secondary indexes
 (the upgrade manual's Current Status section); take a new backup of each table after an upgrade rather than
-moving the old ones. A table with a vector index has no legacy backup: the in-catalog format refuses it.
+moving the old ones. A table with a vector index has no legacy backup this release took (the in-catalog
+format refuses it); an earlier release's is refused by the command, as the legacy restore refuses it.
+
+What a migrated backup reports. `BackupSizeBytes` becomes the store's bytes, and `SourceTableDetails`'
+`TableSizeBytes` the sum of the copied items' sizes, so both can differ from what the legacy backup
+reported; the ARN, the name, the backup id, the creation times and the item count do not change. The
+source table recorded is the table the legacy restore would have created, with the table class, TTL and
+stream settings it recorded. One setting does not carry over: an `SSESpecification` with its own
+`KMSMasterKeyId` is recorded as `SSEType` `KMS` without the key id, so a table restored from the migrated
+backup reports KMS encryption without that key id.
+
+A run that stops after it wrote some of a backup's objects and before its row (a crash, a lost claim, a
+replacement whose answer did not come) leaves the legacy backup in place and the objects under its prefix.
+`backup sync` never adopts such a prefix while a legacy row holds its ARN, whatever the row's status: it
+skips it with "an in-catalog backup (AVAILABLE) holds this ARN; run extenddb backup migrate-legacy <arn>",
+and, once a `DeleteBackup` deleted the legacy backup, with "an in-catalog backup with this ARN was deleted;
+this prefix is a copy a stopped migration left, which extenddb backup migrate-legacy <arn> deletes". The
+next run deletes the objects: it writes the copy again while the legacy backup is AVAILABLE, and for a deleted
+one it deletes them and reports the backup `deleted`, with `<arn>` or `--all`. A backup `DeleteBackup`
+answered `DELETED` therefore never comes back as a store-backed backup. A copy that one run could not
+delete (the store refused, or the deletion fence did) is named in a note under the backup's line, and the
+next run deletes it.
+
+On MongoDB a replacement that committed and stopped before the item collection was dropped leaves the legacy
+document `DELETING` with its marker; the next run (`--all`, or `<arn>`) drops the collection and finishes it,
+whatever happened to the store-backed backup since. A Cassandra migration that stopped after the row was
+converted is finished by `migrate-legacy <arn>` (`--all` does not list it, since it is no longer a legacy
+row); until then the backup is served by `DescribeBackup`, `ListBackups` and `RestoreTableFromBackup` but
+`extenddb backup list` does not show it. Run `migrate-legacy <arn>` before deleting such a backup: once its
+catalog row is deleted and removed, nothing deletes the item buckets the conversion left in the account's
+keyspace until the release that drops `backup_items`.
+
+On Cassandra, `CreateBackup` writes the in-catalog format whether or not a store is configured, so a
+Cassandra deployment with a store gains legacy backups every day: run `migrate-legacy --all` after the
+backup schedule to keep its backups off the cluster, until a later release writes store-backed backups
+there.
+
+Memory. The command's peak resident memory did not grow with the backup's size on PostgreSQL, MongoDB
+and Cassandra: 56 MiB for 1,000 and for 100,000 items of the job's measurement shape on PostgreSQL (56 to 75
+MiB over two measurements, one beside a running server), 56 MiB on MongoDB and 55 MiB on Cassandra (a debug
+build, 16 cores, local NVMe; 8.2 to 12.4 s for 100,000 items). On SQLite it measured 55 to 149 MiB for 1,000
+to 250,000 items (7.0 s for 100,000, 17 s for 250,000): the excess is the page cache of the command's
+connections, 32 MB at most per connection (`cache_size`), so at most about 32 MB times `pool_size` (10 by
+default) whatever the backup's size, and for a small backup it follows the size of the database file.
 
 ## What a restore preserves
 

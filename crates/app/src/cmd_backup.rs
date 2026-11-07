@@ -87,9 +87,16 @@
 //! backends purge runs beside live servers; the maintenance claim is the
 //! exclusion.
 //!
+//! `backup migrate-legacy <arn>|--all` copies in-catalog backups into the
+//! configured store and replaces each by its catalog row, under the
+//! maintenance claim on every backend (on SQLite under the serve lock as
+//! well); its module (`cmd_backup/migrate_legacy.rs`) states its output and
+//! exit.
+//!
 //! Every command opens the catalog through the backend's factory, under its own
 //! name (`extenddb backup list`, `extenddb backup purge`, `extenddb backup
-//! remove-target`, `extenddb backup sync`), and none runs the startup recovery
+//! remove-target`, `extenddb backup sync`, `extenddb backup migrate-legacy`),
+//! and none runs the startup recovery
 //! a server runs (`ServerComponentsOptions::startup_recovery` off): that work
 //! belongs to the servers the command runs beside, and a command that ran it
 //! could exit with it half done. On PostgreSQL, MongoDB and Cassandra the
@@ -223,6 +230,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::hooks::ServingRegistrar;
 use futures::TryStreamExt;
 
+mod migrate_legacy;
+
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct BackupArgs {
@@ -319,6 +328,21 @@ enum BackupCommand {
         )]
         forget_backup: Vec<String>,
     },
+    /// Copy in-catalog backups into the configured backup store, each under its own ARN, and
+    /// replace each by its catalog row. Takes the maintenance claim first (every backup and
+    /// restore job answers LimitExceededException until it ends) and waits for running jobs; on
+    /// SQLite it needs the server stopped. Refuses a backup a 0.1.x release took (its id carries
+    /// no instant) and one with an item or a definition the store format cannot hold, keeping its
+    /// in-catalog backup; restore such a backup and take a new one.
+    #[command(group(clap::ArgGroup::new("backups").required(true).args(["arn", "all"])))]
+    MigrateLegacy {
+        /// The backup ARN of the in-catalog backup to migrate
+        #[arg(value_name = "ARN", value_parser = migrate_legacy::backup_arn_arg)]
+        arn: Option<String>,
+        /// Migrate every in-catalog backup of every account, going on past a backup it refuses
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// How often the waiting purge re-reads the rows.
@@ -332,6 +356,7 @@ const LIST: &str = "extenddb backup list";
 const PURGE: &str = "extenddb backup purge";
 const REMOVE_TARGET: &str = "extenddb backup remove-target";
 const SYNC: &str = "extenddb backup sync";
+const MIGRATE_LEGACY: &str = "extenddb backup migrate-legacy";
 
 pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> {
     if !std::path::Path::new(&args.config).exists() {
@@ -398,6 +423,7 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
         BackupCommand::Purge { confirm: true } => (PURGE, Mode::Write),
         BackupCommand::Sync { .. } if forgetting => (SYNC, Mode::Forget),
         BackupCommand::Sync { .. } => (SYNC, Mode::Sync),
+        BackupCommand::MigrateLegacy { .. } => (MIGRATE_LEGACY, Mode::Write),
         BackupCommand::RemoveTarget { .. } => unreachable!("handled above"),
     };
     let opening = open(
@@ -507,6 +533,24 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
             done
         }
         (BackupCommand::Sync { .. }, Opening::NoStore(reason)) => anyhow::bail!("{reason}"),
+        (BackupCommand::MigrateLegacy { arn, .. }, Opening::Store(opened)) => {
+            let done = migrate_legacy::migrate_legacy(
+                &opened,
+                &app_config,
+                release,
+                arn.as_deref(),
+                interrupt,
+            )
+            .await;
+            opened.close().await;
+            done
+        }
+        (BackupCommand::MigrateLegacy { .. }, Opening::NoStore(reason)) => {
+            anyhow::bail!(
+                "backup migrate-legacy needs a configured backup store to copy into, and this \
+                 server has none ({reason})"
+            )
+        }
         (_, Opening::CatalogOnly(catalog, reason)) => {
             catalog.close().await;
             anyhow::bail!("{reason}")

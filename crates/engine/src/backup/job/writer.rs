@@ -40,9 +40,11 @@
 //! number rule over every member); an item within the default is validated
 //! on the feeder's own task.
 //!
-//! Before every `put` the uploader checks the heartbeat
-//! ([`HeartbeatHandle::confirms_the_claim`]) and starts none otherwise; a
-//! lost claim or the shutdown token ends the pipeline at its next await.
+//! Before every `put` the uploader checks the claim the writer runs under
+//! ([`ClaimWatch::confirms_the_claim`]: the job's heartbeat,
+//! [`HeartbeatHandle`], or for `backup migrate-legacy` the maintenance
+//! claim's) and starts none otherwise; a lost claim or the shutdown token
+//! ends the pipeline at its next await.
 //! When the uploader fails on its own (a put refused, an encoder error) it
 //! cancels a token the feeder selects on, so the feeder stops reading at
 //! once rather than at the stream's next item and the FAILED write does not
@@ -128,8 +130,34 @@ pub(crate) struct DataFiles {
     pub bytes_uploaded: u64,
 }
 
+/// The claim the pipeline writes under, as the uploader and the feeder read
+/// it: the backup job's heartbeat ([`HeartbeatHandle`]), or the maintenance
+/// claim `backup migrate-legacy` holds.
+pub(crate) trait ClaimWatch: Send + Sync {
+    /// The pre-put check: `true` while the claim is confirmed held.
+    fn confirms_the_claim(&self) -> bool;
+    /// Cancelled once the claim is known to be lost.
+    fn lost(&self) -> &CancellationToken;
+    /// Why the claim is lost, once it is.
+    fn reason(&self) -> String;
+}
+
+impl ClaimWatch for HeartbeatHandle {
+    fn confirms_the_claim(&self) -> bool {
+        HeartbeatHandle::confirms_the_claim(self)
+    }
+
+    fn lost(&self) -> &CancellationToken {
+        HeartbeatHandle::lost(self)
+    }
+
+    fn reason(&self) -> String {
+        HeartbeatHandle::reason(self)
+    }
+}
+
 /// What the uploader needs from the job.
-pub(crate) struct Pipeline<'a> {
+pub(crate) struct Pipeline<'a, W: ?Sized = HeartbeatHandle> {
     pub store: &'a dyn BackupStore,
     /// The store as the runtime holds it: its health and identity, read
     /// before every put.
@@ -140,7 +168,8 @@ pub(crate) struct Pipeline<'a> {
     pub prefix: &'a str,
     /// The ARN, for the log lines.
     pub arn: &'a str,
-    pub heartbeat: &'a HeartbeatHandle,
+    /// The claim every put is checked against.
+    pub heartbeat: &'a W,
     pub shutdown: &'a CancellationToken,
     pub metrics: Option<&'a MetricsCollector>,
     /// `data_file_target_bytes`.
@@ -151,7 +180,7 @@ pub(crate) struct Pipeline<'a> {
     pub bucket: &'a str,
 }
 
-impl Pipeline<'_> {
+impl<W: ?Sized> Pipeline<'_, W> {
     /// The check before every put: the store is healthy as the runtime holds
     /// it (the reconciler's check sets it) and its identity is the one the
     /// row records. A store marked unhealthy mid-job, or whose identity file
@@ -189,6 +218,9 @@ impl Pipeline<'_> {
     }
 }
 
+/// The words between the count and the first item in [`refusal_reason`].
+const REFUSED_ITEMS: &str = " item(s) cannot be restored; first: ";
+
 /// The reason the FAILED row carries for refused items (module doc).
 fn refusal_reason(count: u64, first: &RestorableItemError) -> String {
     let issue = if matches!(first.reason, RestorableItemReason::InvalidNumber(_)) {
@@ -196,7 +228,15 @@ fn refusal_reason(count: u64, first: &RestorableItemError) -> String {
     } else {
         ""
     };
-    format!("{count} item(s) cannot be restored; first: {first}{issue}")
+    format!("{count}{REFUSED_ITEMS}{first}{issue}")
+}
+
+/// Whether a [`Stop::Fail`] reason is the validator's refusal of items
+/// ([`refusal_reason`]) rather than a store or encoder failure.
+pub(crate) fn is_item_refusal(reason: &str) -> bool {
+    reason
+        .split_once(REFUSED_ITEMS)
+        .is_some_and(|(count, _)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// What the feeder found by the end of the stream.
@@ -482,8 +522,8 @@ fn close(
 }
 
 /// The pipeline (module doc). `tracker` is `Some` for a key-ordered backup.
-pub(crate) async fn write_data_files(
-    p: &Pipeline<'_>,
+pub(crate) async fn write_data_files<W: ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
     items: BoxStream<'static, Result<Item, StorageError>>,
     key: RestorableKeySchema,
     limits: RestorableLimits,

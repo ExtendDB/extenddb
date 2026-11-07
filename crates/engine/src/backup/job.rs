@@ -644,7 +644,11 @@ async fn write_documents(
 
 /// One document's put under the backup prefix, after the pre-put check;
 /// returns the bytes the store reported.
-pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> Result<u64, Stop> {
+pub(crate) async fn put_document<W: writer::ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<u64, Stop> {
     if p.shutdown.is_cancelled() {
         return Err(Stop::Cancelled);
     }
