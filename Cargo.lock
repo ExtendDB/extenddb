@@ -1781,6 +1781,7 @@ dependencies = [
  "extenddb-backup-store",
  "extenddb-core",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "hex",
  "hmac 0.12.1",
