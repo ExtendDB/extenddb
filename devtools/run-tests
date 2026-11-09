@@ -37,7 +37,8 @@
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
-#   --shard K/N       run only shard K of N of each pytest suite (CI)
+#   --shard K/N       run only shard K of N of each pytest suite (CI); only
+#                     shard 1 runs --terraform
 #   --config PATH     config file path (default: extenddb.toml in repo root)
 #
 # Environment (--pytest against extenddb):
@@ -112,7 +113,8 @@ Options:
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
-  --shard K/N       run only shard K of N of each pytest suite
+  --shard K/N       run only shard K of N of each pytest suite; only shard 1
+                    runs --terraform
   --config PATH     config file path
 
 Environment (--extenddb with an integration suite):
@@ -664,6 +666,10 @@ if $RUN_TERRAFORM; then
     echo "=== Terraform apply → ${OUTFILE} ==="
     if [[ "$TARGET" == "real-dynamodb" ]]; then
         echo "  skipped: the configuration points at an ExtendDB endpoint"
+    elif [[ -n "$SHARD" && "${SHARD%%/*}" != "1" ]]; then
+        # The apply is one run, not a suite of test files, so a sharded job
+        # runs it on shard 1 only.
+        echo "  skipped: shard $SHARD (shard 1 runs the apply)"
     elif EXTENDDB_TEST_ENDPOINT="$EXTENDDB_TEST_ENDPOINT" \
         tests/terraform/warm-throughput/run.sh 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Terraform apply passed"
