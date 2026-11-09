@@ -54,6 +54,7 @@ mod table_helpers;
 mod update_table;
 mod vector_bench;
 mod vector_search;
+mod warm_throughput;
 mod worker;
 mod workers;
 

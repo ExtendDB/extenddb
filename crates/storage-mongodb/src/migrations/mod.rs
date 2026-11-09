@@ -169,6 +169,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
              (restore_job.file_index); the restore_progress table is PostgreSQL's data \
              database's",
         ),
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
     }
 }
 
