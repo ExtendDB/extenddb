@@ -351,7 +351,18 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         // member; nothing to resolve.
         table_throughput_mode: None,
         provisioned_throughput: tcp.provisioned_throughput.clone(),
-        global_secondary_indexes: tcp.global_secondary_indexes.clone(),
+        // TableCreationParameters has no table-level WarmThroughput, and an
+        // imported index's is cleared the same way: ImportTable does not run
+        // CreateTable's validation, so a value kept here would be stored
+        // unchecked. Imported tables and indexes report the defaults.
+        global_secondary_indexes: tcp.global_secondary_indexes.clone().map(|gsis| {
+            gsis.into_iter()
+                .map(|gsi| extenddb_core::types::GsiInput {
+                    warm_throughput: None,
+                    ..gsi
+                })
+                .collect()
+        }),
         local_secondary_indexes: None,
         vector_indexes: None,
         stream_specification: None,
@@ -360,6 +371,7 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         deletion_protection_enabled: None,
         table_class: None,
         on_demand_throughput: None,
+        warm_throughput: None,
     }
 }
 
@@ -460,5 +472,41 @@ mod export_arn_tests {
                 other => panic!("expected ValidationException for {arn}, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod import_warm_throughput_tests {
+    use super::*;
+
+    /// An imported index's WarmThroughput is not stored, as the table's is
+    /// not: a value CreateTable refuses (-7) cannot reach the catalog.
+    #[test]
+    fn an_imported_gsi_warm_throughput_is_cleared() {
+        let tcp: TableCreationParameters = serde_json::from_value(serde_json::json!({
+            "TableName": "t",
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" }
+            ],
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+                "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+                "WarmThroughput": { "ReadUnitsPerSecond": -7, "WriteUnitsPerSecond": 0 }
+            }]
+        }))
+        .expect("parameters");
+        let input = create_table_input_from_params(&tcp);
+        assert_eq!(input.warm_throughput, None);
+        let gsis = input.global_secondary_indexes.expect("the index is kept");
+        assert_eq!(gsis.len(), 1);
+        assert_eq!(gsis[0].index_name, "gsi");
+        assert_eq!(gsis[0].warm_throughput, None);
+        assert!(gsis[0].provisioned_throughput.is_some());
     }
 }

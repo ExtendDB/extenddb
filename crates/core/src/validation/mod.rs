@@ -3,6 +3,7 @@
 pub mod number;
 pub mod restorable_item;
 pub mod vector_item;
+pub mod warm_throughput;
 
 pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
@@ -11,6 +12,15 @@ pub use restorable_item::{
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
+};
+pub use warm_throughput::{
+    DELETE_GSI_WITH_WARM_THROUGHPUT, DELETION_PROTECTION_MUST_BE_ONLY_OPERATION,
+    INDEX_CHANGE_WITH_STREAM_CHANGE, ON_DEMAND_THROUGHPUT_NEEDS_BILLING_MODE,
+    SSE_MUST_BE_ONLY_OPERATION, TABLE_CLASS_MUST_BE_ONLY_OPERATION,
+    WARM_THROUGHPUT_MUST_BE_ONLY_OPERATION, WarmThroughputSubject,
+    validate_create_table_warm_throughput, validate_created_gsi_warm_throughput,
+    validate_warm_throughput_is_only_operation, validate_warm_throughput_on_create,
+    validate_warm_throughput_on_update,
 };
 
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
@@ -131,6 +141,7 @@ pub fn validate_create_table(
     ))?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    validate_create_table_warm_throughput(input)?;
     Ok(())
 }
 
@@ -2895,6 +2906,7 @@ mod tests {
             deletion_protection_enabled: None,
             table_class: None,
             on_demand_throughput: None,
+            warm_throughput: None,
         }
     }
 
@@ -3138,6 +3150,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3170,6 +3183,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3198,6 +3212,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3232,6 +3247,7 @@ mod tests {
                 read_capacity_units: 5,
                 write_capacity_units: 5,
             }),
+            warm_throughput: None,
         }]);
         let err = validate_create_table(&input, &limits).unwrap_err();
         assert!(
@@ -3260,6 +3276,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3305,6 +3322,7 @@ mod tests {
                     write_capacity_units: write,
                 }
             }),
+            warm_throughput: None,
         }]);
         input
     }
@@ -3354,6 +3372,7 @@ mod tests {
                 key_schema: vec![make_ks("gsi_pk", KeyType::Hash)],
                 projection: include(0..gsi_end),
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input.local_secondary_indexes = Some(vec![crate::types::LsiInput {
                 index_name: "my-lsi".to_owned(),
@@ -4500,6 +4519,7 @@ mod tests {
                 non_key_attributes: non_key,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         input.global_secondary_indexes = Some(vec![gsi(None)]);
@@ -4539,6 +4559,7 @@ mod tests {
                     non_key_attributes: non_key,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input
         };
