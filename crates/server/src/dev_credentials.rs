@@ -99,12 +99,19 @@ impl std::fmt::Debug for DevCredential {
 /// disable switch holds an unrecognised value, or when the example pair is
 /// disabled without an `EXTENDDB_DEV_*` pair to replace it.
 pub fn resolve() -> anyhow::Result<Vec<DevCredential>> {
+    resolve_with(|name| std::env::var(name).ok())
+}
+
+/// [`resolve`], reading each variable through `env` (`None` when unset), so
+/// tests can supply the environment.
+fn resolve_with(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Vec<DevCredential>> {
+    let non_empty = |name: &str| env(name).filter(|s| !s.is_empty());
     resolve_from(
-        non_empty_env(ENV_ACCESS_KEY_ID),
-        non_empty_env(ENV_SECRET_ACCESS_KEY),
-        // Read as-is, not through `non_empty_env`: an empty value is refused
+        non_empty(ENV_ACCESS_KEY_ID),
+        non_empty(ENV_SECRET_ACCESS_KEY),
+        // Read as-is, not through `non_empty`: an empty value is refused
         // rather than read as unset (see `parse_switch`).
-        parse_switch(ENV_DISABLE_EXAMPLE, std::env::var(ENV_DISABLE_EXAMPLE).ok())?,
+        parse_switch(ENV_DISABLE_EXAMPLE, env(ENV_DISABLE_EXAMPLE))?,
     )
 }
 
@@ -337,8 +344,15 @@ async fn remove_example_key(
             "dev credential {EXAMPLE_ACCESS_KEY_ID}: removed from user \
              {account_id}/{user_name} ({ENV_DISABLE_EXAMPLE} is set)"
         ),
-        // Deleted between the lookup and the delete: already gone.
-        Err(OpError::NotFound(_)) => {}
+        // The lookup above just read this row, and nothing else deletes access
+        // keys while the server starts, so `NotFound` means the delete missed
+        // the row and the public key still verifies. Refuse to start rather
+        // than run with the switch set and the key active.
+        Err(OpError::NotFound(_)) => anyhow::bail!(
+            "dev mode: the example credential {EXAMPLE_ACCESS_KEY_ID} is held by user \
+             {account_id}/{user_name}, but deleting it from that user removed nothing, so \
+             it would keep verifying; refusing to start with {ENV_DISABLE_EXAMPLE} set."
+        ),
         Err(e) => anyhow::bail!(
             "dev mode: failed to remove the example credential {EXAMPLE_ACCESS_KEY_ID} \
              from user {account_id}/{user_name}: {e:?}"
@@ -466,6 +480,50 @@ mod tests {
             assert!(msg.contains(ENV_DISABLE_EXAMPLE), "{msg}");
             assert!(msg.contains("empty"), "{msg}");
         }
+    }
+
+    /// Resolve with `vars` as the whole environment.
+    fn resolve_env(vars: &[(&str, &str)]) -> anyhow::Result<Vec<DevCredential>> {
+        resolve_with(|name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_owned())
+        })
+    }
+
+    #[test]
+    fn an_empty_switch_in_the_environment_refuses_to_resolve() {
+        // Reached through the environment reader, so reading the switch
+        // through the empty-as-unset filter would fail this test.
+        for empty in ["", " "] {
+            let err = resolve_env(&[
+                (ENV_ACCESS_KEY_ID, TEAM_KEY),
+                (ENV_SECRET_ACCESS_KEY, "team-secret"),
+                (ENV_DISABLE_EXAMPLE, empty),
+            ])
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(ENV_DISABLE_EXAMPLE), "{msg}");
+            assert!(msg.contains("empty"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn the_environment_reader_resolves_the_switch_and_the_pair() {
+        let creds = resolve_env(&[
+            (ENV_ACCESS_KEY_ID, TEAM_KEY),
+            (ENV_SECRET_ACCESS_KEY, "team-secret"),
+            (ENV_DISABLE_EXAMPLE, "1"),
+        ])
+        .unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].access_key_id, TEAM_KEY);
+        assert!(!example_pair_active(&creds));
+
+        // Empty key variables still count as unset.
+        let creds = resolve_env(&[(ENV_ACCESS_KEY_ID, ""), (ENV_SECRET_ACCESS_KEY, "")]).unwrap();
+        assert_eq!(creds.len(), 1);
+        assert!(creds[0].is_builtin);
     }
 
     #[test]
