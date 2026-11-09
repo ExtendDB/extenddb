@@ -343,9 +343,10 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-# These two sections run for either Rust suite. CI's mongodb-rust job passes
-# only --rust-integration, so they are where it runs the storage-mongodb tests
-# that need this replica set.
+# These two sections run when the arguments name --rust or --rust-integration.
+# They do not run for --all, which run-tests expands to both suites. CI's
+# mongodb-rust job passes --rust-integration, so these sections are where it
+# runs records_live and the migration tests.
 if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust "* \
     || " ${RUN_TESTS_ARGS[*]} " == *" --rust-integration "* ]]; then
     # The storage-level MongoDB tests that need a live server (the stream
