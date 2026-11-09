@@ -88,11 +88,16 @@ migration_ids! {
     RestoreProgress = 8, "restore_progress",
         "create the restore progress table of store-backed restores in the PostgreSQL data \
          database";
+    /// Adds a nullable `warm_throughput` column to the `tables` and `indexes`
+    /// catalog tables, where the `WarmThroughput` a client set on a table or
+    /// a global secondary index is stored.
+    WarmThroughput = 9, "warm_throughput",
+        "add a nullable warm_throughput column to the tables and indexes catalogs";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 8.
+/// `forget` refuses them. The v1.0 release PR raises it to 9.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {
