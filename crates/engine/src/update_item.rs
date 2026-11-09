@@ -37,6 +37,17 @@ pub async fn handle_update_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    handle_update_item_with(body, ctx, false).await
+}
+
+/// [`handle_update_item`], sizing the update by its finished item alone when
+/// `finished_item_sizing` is set, as the service sizes a PartiQL `UPDATE`
+/// (see `validate_update_item_size`).
+pub(crate) async fn handle_update_item_with(
+    body: Value,
+    ctx: &OperationContext,
+    finished_item_sizing: bool,
+) -> Result<DispatchResult, DynamoDbError> {
     // Sequential rather than aggregated, deliberately: UpdateItem stops at the
     // FIRST invalid enum and reports one error, where PutItem and DeleteItem
     // aggregate all of theirs. Measured 2026-08-24 (us-east-1): ReturnValues
@@ -161,6 +172,7 @@ pub async fn handle_update_item(
     // The storage layer sizes a desugared legacy update against the item limit
     // the way the service sizes `AttributeUpdates`, not an expression.
     maps.legacy_attribute_updates = input.attribute_updates.is_some();
+    maps.finished_item_sizing = finished_item_sizing;
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr.
