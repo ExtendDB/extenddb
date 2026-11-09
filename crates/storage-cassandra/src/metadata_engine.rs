@@ -3,6 +3,7 @@
 
 //! `MetadataEngine` trait implementation for `CassandraEngine`.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{Item, Tag, TimeToLiveDescription, TimeToLiveStatus};
 use extenddb_storage::MetadataEngine;
@@ -1106,12 +1107,15 @@ impl MetadataEngine for CassandraEngine {
                     "INSERT INTO {catalog}.tags (resource_arn, tag_key, tag_value) VALUES (?, ?, ?)"
                 );
                 self.session_arc()
-                    .query_with_values(
+                    .query_with_params(
                         &query,
-                        cdrs_tokio::query_values!(
-                            arn.as_str(),
-                            tag.key.as_str(),
-                            tag.value.as_str()
+                        params(
+                            Stmt::Write,
+                            cdrs_tokio::query_values!(
+                                arn.as_str(),
+                                tag.key.as_str(),
+                                tag.value.as_str()
+                            ),
                         ),
                     )
                     .await
@@ -1137,9 +1141,12 @@ impl MetadataEngine for CassandraEngine {
                 let query =
                     format!("DELETE FROM {catalog}.tags WHERE resource_arn = ? AND tag_key = ?");
                 self.session_arc()
-                    .query_with_values(
+                    .query_with_params(
                         &query,
-                        cdrs_tokio::query_values!(arn.as_str(), key.as_str()),
+                        params(
+                            Stmt::Write,
+                            cdrs_tokio::query_values!(arn.as_str(), key.as_str()),
+                        ),
                     )
                     .await
                     .map_err(|error| {
@@ -1159,7 +1166,10 @@ impl MetadataEngine for CassandraEngine {
                 format!("SELECT tag_key, tag_value FROM {catalog}.tags WHERE resource_arn = ?");
             let result = self
                 .session_arc()
-                .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str()))
+                .query_with_params(
+                    &query,
+                    params(Stmt::Read, cdrs_tokio::query_values!(arn.as_str())),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("list_tags: {e}");

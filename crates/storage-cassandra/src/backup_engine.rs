@@ -70,13 +70,12 @@
 //! returns the CREATING description, so a dropped request does not stop the
 //! restore.
 
+use crate::cassandra_util::{Stmt, params};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
@@ -593,7 +592,13 @@ impl CassandraEngine {
                 }
             }
             self.session
-                .query_with_values(&delete, cdrs_tokio::query_values!(backup_arn, bucket_i32))
+                .query_with_params(
+                    &delete,
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(backup_arn, bucket_i32),
+                    ),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Delete backup payload: {e}")))?;
             bucket += 1;
@@ -606,12 +611,15 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_account WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .query_with_params(
                 &by_account,
-                cdrs_tokio::query_values!(
-                    backup.account_id.as_str(),
-                    backup.created_at,
-                    backup.backup_arn.as_str()
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(
+                        backup.account_id.as_str(),
+                        backup.created_at,
+                        backup.backup_arn.as_str()
+                    ),
                 ),
             )
             .await
@@ -621,13 +629,16 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .query_with_params(
                 &by_table,
-                cdrs_tokio::query_values!(
-                    backup.account_id.as_str(),
-                    backup.table_name.as_str(),
-                    backup.created_at,
-                    backup.backup_arn.as_str()
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(
+                        backup.account_id.as_str(),
+                        backup.table_name.as_str(),
+                        backup.created_at,
+                        backup.backup_arn.as_str()
+                    ),
                 ),
             )
             .await
@@ -1202,9 +1213,12 @@ impl CassandraEngine {
             let bucket_i32 = bucket as i32;
             let rows = self
                 .session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -1869,13 +1883,16 @@ impl LegacyBackupReader for CassandraEngine {
                         #[allow(clippy::cast_possible_truncation)]
                         let bucket_i32 = bucket as i32;
                         self.session
-                            .query_with_values(
+                            .query_with_params(
                                 &insert_item,
-                                cdrs_tokio::query_values!(
-                                    backup_arn.as_str(),
-                                    bucket_i32,
-                                    item_count,
-                                    item_data.as_str()
+                                params(
+                                    Stmt::Write,
+                                    cdrs_tokio::query_values!(
+                                        backup_arn.as_str(),
+                                        bucket_i32,
+                                        item_count,
+                                        item_data.as_str()
+                                    ),
                                 ),
                             )
                             .await
@@ -1941,8 +1958,7 @@ impl LegacyBackupReader for CassandraEngine {
             // once its heartbeat is stale, rather than an AVAILABLE backup no
             // listing ever shows.
             let list_rows: Result<(), StorageError> = async {
-                let batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
+                let batch = crate::cassandra_util::batch()
                     .add_query(
                         insert_by_account,
                         cdrs_tokio::query_values!(
@@ -2076,9 +2092,12 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
                 );
                 self.session
-                    .query_with_values(
+                    .query_with_params(
                         &query,
-                        cdrs_tokio::query_values!(account_id.as_str(), table_name),
+                        params(
+                            Stmt::Read,
+                            cdrs_tokio::query_values!(account_id.as_str(), table_name),
+                        ),
                     )
                     .await
             } else {
@@ -2086,7 +2105,10 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_account WHERE account_id = ?"
                 );
                 self.session
-                    .query_with_values(&query, cdrs_tokio::query_values!(account_id.as_str()))
+                    .query_with_params(
+                        &query,
+                        params(Stmt::Read, cdrs_tokio::query_values!(account_id.as_str())),
+                    )
                     .await
             };
             let rows = result

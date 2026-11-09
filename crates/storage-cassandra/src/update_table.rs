@@ -3,7 +3,6 @@
 
 //! `update_table` implementation for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
@@ -108,7 +107,7 @@ impl CassandraEngine {
         // created with IF NOT EXISTS. See ADR-0021.
         let mut table_cols: Vec<(&'static str, Value)> = Vec::new();
         // Separate plain batch for `indexes` (plain INSERT/DELETE, no LWT mixing issue).
-        let mut indexes_batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut indexes_batch = crate::cassandra_util::batch();
         let mut indexes_batch_has_statements = false;
 
         macro_rules! add_update {

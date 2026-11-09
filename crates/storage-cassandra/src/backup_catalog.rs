@@ -62,13 +62,12 @@
 //! serial level is a local quorum with no Paxos read, so the scan reads at
 //! quorum and the coordinator clock after it.
 
+use crate::cassandra_util::Stmt;
 use std::time::Duration;
 
-use cdrs_tokio::consistency::Consistency;
 use cdrs_tokio::error::Error as DriverError;
 use cdrs_tokio::frame::message_error::ErrorType;
-use cdrs_tokio::query::{BatchQueryBuilder, QueryValues};
-use cdrs_tokio::statement::StatementParamsBuilder;
+use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::rows::Row;
 use cdrs_tokio::types::value::Value;
@@ -179,12 +178,10 @@ pub(crate) async fn conditional_write(
     query: &str,
     values: QueryValues,
 ) -> Result<WriteOutcome, StorageError> {
-    let params = StatementParamsBuilder::new()
-        .with_consistency(Consistency::LocalQuorum)
-        .with_serial_consistency(Consistency::LocalSerial)
-        .with_values(values)
-        .build();
-    match session.query_with_params(query, params).await {
+    match session
+        .query_with_params(query, crate::cassandra_util::params(Stmt::Lwt, values))
+        .await
+    {
         Ok(result) => Ok(if crate::cassandra_util::lwt_applied(&result)? {
             WriteOutcome::Matched
         } else {
@@ -419,8 +416,7 @@ impl CassandraEngine {
     async fn remove_index_entries(&self, row: &BackupRow) -> Result<(), StorageError> {
         let catalog = self.catalog_keyspace();
         let created_at = seconds_to_millis(row.created_at);
-        let batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let batch = crate::cassandra_util::batch()
             .add_query(
                 format!(
                     "DELETE FROM {catalog}.backup_index_by_status \
@@ -500,8 +496,7 @@ impl CassandraEngine {
         to: &str,
     ) {
         let catalog = self.catalog_keyspace();
-        let batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let batch = crate::cassandra_util::batch()
             .add_query(
                 format!(
                     "DELETE FROM {catalog}.backup_index_by_status \
@@ -969,8 +964,7 @@ impl BackupCatalog for CassandraEngine {
             }
             // The index rows, after the authoritative row.
             let created_at = seconds_to_millis(row.created_at);
-            let batch = BatchQueryBuilder::new()
-                .with_consistency(Consistency::LocalQuorum)
+            let batch = crate::cassandra_util::batch()
                 .add_query(
                     format!(
                         "INSERT INTO {catalog}.backups_by_account (account_id, created_at, \
@@ -1141,10 +1135,8 @@ impl BackupCatalog for CassandraEngine {
                 query.push_str(" AND created_at < ?");
                 values.push(Value::from((upper * 1_000.0).ceil() as i64));
             }
-            let params = StatementParamsBuilder::new()
-                .with_consistency(Consistency::LocalQuorum)
-                .with_values(QueryValues::SimpleValues(values))
-                .build();
+            let params =
+                crate::cassandra_util::params(Stmt::Read, QueryValues::SimpleValues(values));
             let listed = self
                 .session
                 .query_with_params(&query, params)
@@ -2331,6 +2323,7 @@ impl MaintenanceClaim for CassandraMaintenanceClaim {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::frame::message_error::{ErrorBody, WriteTimeoutError, WriteType};
 
     use super::*;

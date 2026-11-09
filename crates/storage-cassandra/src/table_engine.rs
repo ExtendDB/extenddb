@@ -3,6 +3,7 @@
 
 //! `TableEngine` trait implementation for `CassandraEngine`.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::types::IntoRustByName;
 use futures::future::BoxFuture;
 
@@ -69,16 +70,26 @@ impl TableEngine for CassandraEngine {
 
             let result = if let Some(ref start) = input.exclusive_start_table_name {
                 self.session
-                    .query_with_values(
+                    .query_with_params(
                         &query,
-                        cdrs_tokio::query_values!(account_id.as_str(), start.as_str(), limit + 1),
+                        params(
+                            Stmt::Read,
+                            cdrs_tokio::query_values!(
+                                account_id.as_str(),
+                                start.as_str(),
+                                limit + 1
+                            ),
+                        ),
                     )
                     .await
             } else {
                 self.session
-                    .query_with_values(
+                    .query_with_params(
                         &query,
-                        cdrs_tokio::query_values!(account_id.as_str(), limit + 1),
+                        params(
+                            Stmt::Read,
+                            cdrs_tokio::query_values!(account_id.as_str(), limit + 1),
+                        ),
                     )
                     .await
             };
