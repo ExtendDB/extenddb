@@ -33,6 +33,7 @@ pub mod migrations;
 pub mod operations;
 mod password_hash_store;
 pub(crate) mod propagation_hold;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
 pub mod stream_util;
@@ -42,6 +43,7 @@ mod table_helpers;
 pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
+mod warm_throughput;
 mod worker_store;
 pub mod workers;
 

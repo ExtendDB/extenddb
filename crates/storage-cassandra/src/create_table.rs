@@ -9,8 +9,12 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, RestoreSummary, SseDescription, SseType, TableDescription,
     TableStatus,
 };
+use extenddb_storage::backup_catalog::{RestoreKind, StoreIdentity};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn, table_arn};
+use extenddb_storage::util::{
+    index_arn, stream_arn, table_arn, warm_throughput_record_for_create,
+    warm_throughput_record_json,
+};
 
 use crate::CassandraEngine;
 use crate::backup_engine::JobHeartbeat;
@@ -121,6 +125,25 @@ impl CassandraEngine {
             StorageError::Internal("restore target created without a heartbeat".to_owned())
         })?;
         Ok((description, heartbeat))
+    }
+
+    /// Create a store-backed (manifest) restore target: CREATING, carrying
+    /// the `restore_kind = 'manifest'` job record and the store columns in
+    /// the one `INSERT ... IF NOT EXISTS`. No self-managed [`JobHeartbeat`]
+    /// is started: the engine owns the manifest restore's heartbeat through
+    /// the [`extenddb_storage::backup_catalog::JobClaim`] this registration
+    /// returns. The target's DDL that follows the insert is bounded by a
+    /// few schema statements, inside the engine's registration timeout.
+    pub(crate) async fn create_table_for_restore_manifest(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        restore: &RestoreTargetColumns,
+    ) -> Result<TableDescription, StorageError> {
+        let (description, _heartbeat) = self
+            .create_table_impl_inner(account_id, input, Some(restore))
+            .await?;
+        Ok(description)
     }
 
     async fn create_table_impl_inner(
@@ -265,10 +288,20 @@ impl CassandraEngine {
             Value::from(deletion_protection),
             Value::from(status_transition_at),
         ];
+        // WarmThroughput as sent, reported back and acted on by nothing (see
+        // catalog migration 9). UPDATING for the same delay the CREATING to
+        // ACTIVE flip takes. Named only when sent, so a table created without
+        // it writes no null cell.
+        let warm_record =
+            warm_throughput_record_for_create(input.warm_throughput.as_ref(), delay_seconds);
+        if let Some(record) = warm_record.as_ref() {
+            columns.push_str(", warm_throughput");
+            values.push(Value::from(warm_throughput_record_json(record)?.as_str()));
+        }
         let mut placeholders = vec!["?"; values.len()];
         if let Some(r) = restore {
-            // The job record: RUNNING under the claim's generation, kind
-            // legacy, the heartbeat stamped on the coordinator's clock.
+            // The job record: RUNNING under the claim's generation, the
+            // restore kind, the heartbeat stamped on the coordinator's clock.
             columns.push_str(
                 ", restore_source_backup_arn, restore_source_table_arn, restore_date_time, \
                  restore_status, restore_kind, restore_owner_generation, restore_heartbeat_at",
@@ -278,11 +311,29 @@ impl CassandraEngine {
                 Value::from(r.source_table_arn.as_str()),
                 Value::from(r.restore_date_time_ms),
                 Value::from("RUNNING"),
-                Value::from("legacy"),
+                Value::from(r.kind.as_str()),
                 Value::from(crate::backup_catalog::generation_column(r.owner_generation)),
             ]);
             placeholders.extend(["?"; 6]);
             placeholders.push("toTimestamp(now())");
+            // A store-backed restore records the store it reads and the
+            // claimant's spool, so the reconciler can resume it.
+            if let Some(store) = &r.store {
+                columns.push_str(
+                    ", restore_store_kind, restore_store_root, restore_store_id, \
+                     restore_spool_host",
+                );
+                values.extend([
+                    Value::from(store.store_kind.as_str()),
+                    Value::from(store.store_root.as_str()),
+                    Value::from(store.store_id.as_str()),
+                    match r.spool_host.as_deref() {
+                        Some(host) => Value::from(host),
+                        None => Value::NotSet,
+                    },
+                ]);
+                placeholders.extend(["?"; 4]);
+            }
         }
         let placeholders = placeholders.join(", ");
         let insert_table_cql = format!(
@@ -336,9 +387,11 @@ impl CassandraEngine {
             }
         }
 
-        // A restore target's heartbeat runs from here, before the DDL below.
-        // An error return from this function drops it, which stops it.
-        let heartbeat = restore.map(|r| {
+        // A legacy restore target's heartbeat runs from here, before the DDL
+        // below, and is dropped (stopped) on an error return. A store-backed
+        // (manifest) restore target has no self-managed heartbeat: the engine
+        // heartbeats it through the claim the registration returns.
+        let heartbeat = restore.filter(|r| r.kind == RestoreKind::Legacy).map(|r| {
             self.start_restore_heartbeat(
                 account_id,
                 &input.table_name,
@@ -349,6 +402,7 @@ impl CassandraEngine {
 
         // Insert GSI metadata
         let mut gsi_index_ids: Vec<String> = Vec::new();
+        let mut gsi_warm_records = Vec::new();
         if let Some(gsis) = &input.global_secondary_indexes {
             for gsi in gsis {
                 let gsi_ks = serde_json::to_value(&gsi.key_schema)
@@ -371,26 +425,39 @@ impl CassandraEngine {
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
 
                 let index_id = uuid::Uuid::new_v4().to_string();
+                let gsi_warm =
+                    warm_throughput_record_for_create(gsi.warm_throughput.as_ref(), delay_seconds);
+                let mut index_values = vec![
+                    Value::from(table_id.as_str()),
+                    Value::from(gsi.index_name.as_str()),
+                    Value::from(index_id.as_str()),
+                    Value::from(gsi_ks.to_string().as_str()),
+                    Value::from(gsi_proj.to_string().as_str()),
+                    match gsi_pt.as_ref() {
+                        Some(v) => Value::from(v.to_string().as_str()),
+                        None => Value::NotSet,
+                    },
+                ];
+                // Named only when sent; see the table insert above.
+                let (warm_column, warm_placeholder) = match gsi_warm.as_ref() {
+                    Some(record) => {
+                        index_values
+                            .push(Value::from(warm_throughput_record_json(record)?.as_str()));
+                        (", warm_throughput", ", ?")
+                    }
+                    None => ("", ""),
+                };
+                gsi_warm_records.push(gsi_warm);
                 let insert_index_cql = format!(
                     "INSERT INTO {catalog_keyspace}.indexes (table_id, index_name, index_id, index_type, \
-                     key_schema, projection, index_status, provisioned_throughput) \
-                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?)"
+                     key_schema, projection, index_status, provisioned_throughput{warm_column}) \
+                     VALUES (?, ?, ?, 'GSI', ?, ?, 'ACTIVE', ?{warm_placeholder})"
                 );
 
                 self.session
                     .query_with_values(
                         &insert_index_cql,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                            Value::from(table_id.as_str()),
-                            Value::from(gsi.index_name.as_str()),
-                            Value::from(index_id.as_str()),
-                            Value::from(gsi_ks.to_string().as_str()),
-                            Value::from(gsi_proj.to_string().as_str()),
-                            match gsi_pt.as_ref() {
-                                Some(v) => Value::from(v.to_string().as_str()),
-                                None => Value::NotSet,
-                            },
-                        ]),
+                        cdrs_tokio::query::QueryValues::SimpleValues(index_values),
                     )
                     .await
                     .map_err(|e| {
@@ -526,7 +593,8 @@ impl CassandraEngine {
 
         let gsis = input.global_secondary_indexes.as_ref().map(|gs| {
             gs.iter()
-                .map(|g| GsiDescription {
+                .zip(gsi_warm_records)
+                .map(|(g, warm)| GsiDescription {
                     index_name: g.index_name.clone(),
                     key_schema: g.key_schema.clone(),
                     projection: g.projection.clone(),
@@ -553,6 +621,8 @@ impl CassandraEngine {
                         &input.table_name,
                         &g.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: warm,
                 })
                 .collect()
         });
@@ -658,6 +728,9 @@ impl CassandraEngine {
                 restore_in_progress: true,
             }),
             vector_indexes: None,
+            // Derived by the engine from the record; see core.
+            warm_throughput: None,
+            warm_throughput_record: warm_record,
         };
         Ok((description, heartbeat))
     }
@@ -675,4 +748,16 @@ pub(crate) struct RestoreTargetColumns {
     /// The claim's fencing token (`tables.restore_owner_generation`): every
     /// write the copy makes to the target row is conditioned on it.
     pub(crate) owner_generation: u64,
+    /// `legacy` for an in-catalog restore (whose copy reads `backup_items`),
+    /// `manifest` for a store-backed one (whose copy the engine streams from
+    /// the store). A legacy target carries a self-managed heartbeat; a
+    /// manifest target is heartbeated by the engine's claim.
+    pub(crate) kind: RestoreKind,
+    /// The store a manifest restore reads its backup from; `None` on a legacy
+    /// restore, which reads the catalog.
+    pub(crate) store: Option<StoreIdentity>,
+    /// `<hostname>:<spool path>` of the instance downloading the backup into
+    /// its spool; `None` for a filesystem store (read in place) and on a
+    /// legacy restore.
+    pub(crate) spool_host: Option<String>,
 }

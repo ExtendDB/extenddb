@@ -321,6 +321,7 @@ mod tests {
                                 non_key_attributes: None,
                             },
                             provisioned_throughput: None,
+                            warm_throughput: None,
                         }),
                         update: None,
                         delete: None,
@@ -330,6 +331,8 @@ mod tests {
                     table_class: None,
                     on_demand_throughput: None,
                     vector_index_updates: None,
+                    sse_specification: None,
+                    warm_throughput: None,
                 },
             )
             .await

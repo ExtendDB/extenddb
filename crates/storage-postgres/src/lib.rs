@@ -26,6 +26,7 @@ pub mod migrations;
 mod operations;
 mod password_hash_store;
 mod pg_util;
+mod restore_engine;
 mod snapshot_engine;
 #[doc(hidden)]
 pub use snapshot_engine::{
@@ -40,6 +41,7 @@ mod ttl_worker;
 mod update_table;
 mod vector;
 mod vector_search;
+mod warm_throughput;
 mod worker_store;
 mod workers;
 
@@ -105,6 +107,11 @@ pub use delete_table::test_pause::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use migrations::apply_all_migrations;
+/// Pause `sweep_restore_progress` between its two reads, so a test can
+/// commit a registration and a progress row in between.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use restore_engine::sweep_pause;
 
 /// The `PostgreSQL` storage backend.
 ///

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The holder's side of the catalog-level maintenance claim, and the steps a
-//! maintenance command (`extenddb backup purge`) runs under it.
+//! maintenance command (`extenddb backup purge`, `extenddb backup
+//! remove-target`) runs under it.
 //!
 //! [`HeldClaim`] is the handle the command keeps from the take to the
 //! release, with the heartbeat running on a timer for the handle's whole
@@ -25,6 +26,23 @@
 //! operator's Ctrl-C ends the wait at once and the deletion loop before its
 //! next row, never inside one (the row's own steps are the idempotent
 //! sequence a second deleter finishes).
+//!
+//! [`remove_target`] is the whole of
+//! `extenddb backup remove-target --account <account> <table>`: the claim
+//! taken and held for its duration, the table's
+//! restore record read, the refusals, the removal through
+//! `remove_restore_target`, the release. It is the one command that removes
+//! a restore target DeleteTable refuses (a CREATING table): a FAILED
+//! record's target, whatever the reason (the reconciler leaves a
+//! `target_not_empty` one for this command; on MongoDB and Cassandra a
+//! crash before the first progress record, the whole first data file on
+//! MongoDB and the first 10,000 items or 32 MiB on Cassandra, ends in that
+//! state), and a RUNNING record's target whose owner is dead (the backend's
+//! `list_dead_restore_jobs` names it under the owner window: no heartbeat
+//! within the window on the catalog's clock); a legacy record's target the
+//! same way. It refuses a RUNNING record whose owner is live, a DONE record
+//! (the table is ACTIVE, or on MongoDB awaiting its index backfill) and a
+//! table no restore record names, the latter two as "not a restore target".
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -32,9 +50,10 @@ use std::time::Duration;
 use extenddb_backup_store::BackupStore;
 use extenddb_core::backup_format::{BackupArn, EXTENDDB_MANIFEST_FILE};
 use extenddb_storage::backup_catalog::{
-    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, StaleClock, StoreIdentity,
-    is_backup_not_found,
+    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreJobRow, RestoreKind,
+    StaleClock, StoreIdentity, is_backup_not_found,
 };
+use extenddb_storage::error::StorageError;
 use extenddb_storage::{BackupCatalog, MaintenanceClaim};
 use futures::TryStreamExt;
 use tokio::sync::watch;
@@ -105,7 +124,7 @@ impl HeldClaim {
     ///
     /// The backend's, when the release could not be written, or the bound;
     /// the claim then expires by the stale rule.
-    pub async fn release(mut self) -> Result<(), extenddb_storage::error::StorageError> {
+    pub async fn release(mut self) -> Result<(), StorageError> {
         self.timer.abort();
         // The abort lands at the task's next await; a heartbeat already sent
         // finishes first, so the release never overlaps it on the claim's
@@ -473,6 +492,183 @@ pub async fn purge_rows<S: BackupCatalog + ?Sized>(
         }
     }
     outcome
+}
+
+/// What `extenddb backup remove-target` is asked to do.
+#[derive(Debug, Clone)]
+pub struct RemoveTarget {
+    /// The account the table belongs to.
+    pub account_id: String,
+    /// The table's name.
+    pub table_name: String,
+    /// The maintenance claim's holder label (the command and its host).
+    pub holder: String,
+    /// `stale_job_after_secs`: the claim's stale window.
+    pub stale_after: Duration,
+    /// The window `list_dead_restore_jobs` is asked with: a RUNNING record
+    /// the backend does not list as dead under it (a heartbeat within the
+    /// window on the catalog's clock) has a live owner and is refused; zero
+    /// where every owner is known dead (SQLite under the serve lock, where
+    /// a zero window lists every RUNNING record).
+    pub owner_window: Duration,
+    /// The claim's heartbeat period (the jobs', `JOB_HEARTBEAT_INTERVAL`).
+    pub heartbeat_interval: Duration,
+}
+
+/// What [`remove_target`] removed: the record as it was read, for the
+/// command's line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemovedTarget {
+    /// The target's table id.
+    pub table_id: String,
+    /// The backup the restore read.
+    pub backup_arn: String,
+    /// The record's kind.
+    pub kind: RestoreKind,
+    /// The record's status when it was read: FAILED, or RUNNING with a
+    /// dead owner.
+    pub status: JobStatus,
+    /// The FAILED record's reason.
+    pub failure_reason: Option<String>,
+}
+
+/// `extenddb backup remove-target` (module doc): under the maintenance
+/// claim, taken here and released before the return, remove the CREATING
+/// target of the restore record that names `request`'s table and the record
+/// with it, through `remove_restore_target`.
+///
+/// # Errors
+///
+/// The text for the operator: the claim held by a live holder; a table no
+/// record names, a DONE record, or a target no longer a CREATING restore
+/// target with the record's id ("not a restore target"); a CREATING restore
+/// target whose owner's lock is still held (the record unchanged after the
+/// backend refused the removal: wait for the owner or stop it); a RUNNING
+/// record the backend does not list as dead under the owner window; the
+/// claim lost before the removal; a catalog call failing.
+pub async fn remove_target<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    request: &RemoveTarget,
+) -> Result<RemovedTarget, String> {
+    let claim = storage
+        .maintenance_claim(&request.holder, request.stale_after)
+        .await
+        .map_err(|e| match e {
+            StorageError::AlreadyExists(m) => format!(
+                "{m}; one maintenance command runs at a time, and a claim whose holder died \
+                 expires after stale_job_after_secs ({} s)",
+                request.stale_after.as_secs()
+            ),
+            other => format!("cannot take the maintenance claim: {other}"),
+        })?;
+    let claim = HeldClaim::start(claim, request.heartbeat_interval);
+    let outcome = remove_target_under(storage, request, &claim).await;
+    if let Err(e) = claim.release().await {
+        tracing::warn!("the maintenance claim could not be released; it expires on its own: {e}");
+    }
+    outcome
+}
+
+/// The steps of [`remove_target`] between the take and the release.
+async fn remove_target_under<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    request: &RemoveTarget,
+    claim: &HeldClaim,
+) -> Result<RemovedTarget, String> {
+    let what = format!("{} (account {})", request.table_name, request.account_id);
+    let records: Vec<RestoreJobRow> = storage
+        .list_restore_jobs(None)
+        .await
+        .map_err(|e| format!("cannot read the restore job records: {e}"))?;
+    let record = records
+        .into_iter()
+        .find(|r| {
+            r.target.account_id == request.account_id && r.target.table_name == request.table_name
+        })
+        .ok_or_else(|| format!("{what} is not a restore target: no restore record names it"))?;
+    match record.status {
+        JobStatus::Done => {
+            return Err(format!(
+                "{what} is not a restore target: its restore from {} is DONE (the table is \
+                 ACTIVE, or awaits its index backfill)",
+                record.source_backup_arn
+            ));
+        }
+        JobStatus::Running => {
+            // The owner is dead only if the backend's own listing says so:
+            // `list_dead_restore_jobs` compares the heartbeat with the
+            // catalog's clock, the one the owner stamps, so a skew of this
+            // host's clock can neither refuse a dead owner nor remove under
+            // a live one. A zero window (SQLite under the serve lock) lists
+            // every RUNNING record, as it does for the purge's wait.
+            let dead = storage
+                .list_dead_restore_jobs(request.owner_window)
+                .await
+                .map_err(|e| format!("cannot list the dead restore jobs: {e}"))?
+                .iter()
+                .any(|r| r.target.table_id == record.target.table_id);
+            if !dead {
+                return Err(format!(
+                    "the restore into {what} from {} is RUNNING with a live owner (a heartbeat \
+                     within stale_job_after_secs); stop it or wait for it",
+                    record.source_backup_arn
+                ));
+            }
+        }
+        JobStatus::Failed | JobStatus::Creating | JobStatus::Available => {}
+    }
+    if let Some(reason) = claim.lost() {
+        return Err(format!("stopped before the removal: {reason}"));
+    }
+    let removed = storage
+        .remove_restore_target_exclusive(&record.target)
+        .await
+        .map_err(|e| format!("cannot remove the restore target {what}: {e}"))?;
+    if !removed {
+        // The backend refused without saying which of its two conditions
+        // failed. The record tells them apart: the target and its record go
+        // together, and the ACTIVE flip writes DONE, so a record unchanged
+        // since the listing names a table that is still its CREATING restore
+        // target, and the refusal was the owner's lock (PostgreSQL's
+        // per-session advisory lock, held by a frozen owner's session).
+        let unchanged = storage
+            .read_restore_job(&record.target)
+            .await
+            .map_err(|e| format!("cannot re-read the restore record of {what}: {e}"))?
+            .is_some_and(|now| {
+                now.status == record.status && now.owner_generation == record.owner_generation
+            });
+        if unchanged {
+            return Err(format!(
+                "the restore into {what} from {} is a CREATING restore target (table id {}) \
+                 whose owner's lock is still held: its owner's session is alive though its \
+                 heartbeat is stale; wait for the owner to stop, or stop it, and run the \
+                 command again",
+                record.source_backup_arn, record.target.table_id
+            ));
+        }
+        return Err(format!(
+            "{what} is not a restore target: it is no longer a CREATING restore target with \
+             table id {}",
+            record.target.table_id
+        ));
+    }
+    tracing::info!(
+        target: "extenddb::audit",
+        action = "backup remove-target",
+        account_id = %record.target.account_id,
+        table_name = %record.target.table_name,
+        table_id = %record.target.table_id,
+        backup_arn = %record.source_backup_arn,
+        "removed the restore target and its record"
+    );
+    Ok(RemovedTarget {
+        table_id: record.target.table_id,
+        backup_arn: record.source_backup_arn,
+        kind: record.kind,
+        status: record.status,
+        failure_reason: record.failure_reason,
+    })
 }
 
 #[cfg(test)]

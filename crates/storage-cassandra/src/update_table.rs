@@ -12,7 +12,9 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::util::{
+    effective_attribute_definitions, warm_throughput_record_for_create, warm_throughput_record_json,
+};
 
 use crate::CassandraEngine;
 use crate::cassandra_util::query_optional;
@@ -151,6 +153,30 @@ impl CassandraEngine {
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        // The table's record is written by the table LWT below, conditional on
+        // the record read here; the indexes' by their own LWTs after the
+        // indexes batch (`store_index_warm_throughput`). Both read again and
+        // retry when another UpdateTable wrote the record first.
+        let mut warm_read: Option<String> = None;
+        if let Some(spec) = &input.warm_throughput {
+            let merge = self
+                .merged_table_warm_throughput(account_id, &input.table_name, spec)
+                .await?;
+            add_update!("warm_throughput", merge.merged.as_str());
+            warm_read = merge.read;
+        }
+        for update in input.global_secondary_index_updates.iter().flatten() {
+            if let Some(action) = &update.update
+                && let Some(spec) = &action.warm_throughput
+            {
+                // Refuse a missing index before anything is written.
+                self.merged_index_warm_throughput(&table_id, &action.index_name, spec)
+                    .await?;
+            }
+        }
+
         // Stream specification: add to batch, then handle shard init separately
         // (init_stream_shards writes to a different keyspace and does its own batch).
         let mut needs_shard_init = false;
@@ -272,21 +298,35 @@ impl CassandraEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?
                         .unwrap_or_default();
 
+                    let mut index_values = vec![
+                        Value::from(table_id.as_str()),
+                        Value::from(create.index_name.as_str()),
+                        Value::from(index_id.as_str()),
+                        Value::from(idx_ks_json.as_str()),
+                        Value::from(proj_json.as_str()),
+                        Value::from(pt_json.as_str()),
+                    ];
+                    // WarmThroughput named only when sent, as in create_table.
+                    let gsi_warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_secs().await,
+                    );
+                    let (warm_column, warm_placeholder) = match gsi_warm.as_ref() {
+                        Some(record) => {
+                            index_values
+                                .push(Value::from(warm_throughput_record_json(record)?.as_str()));
+                            (", warm_throughput", ", ?")
+                        }
+                        None => ("", ""),
+                    };
                     add_index_op!(
                         format!(
                             "INSERT INTO {catalog_ks}.indexes \
                              (table_id, index_name, index_id, index_type, key_schema, \
-                              projection, index_status, provisioned_throughput) \
-                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)"
+                              projection, index_status, provisioned_throughput{warm_column}) \
+                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?{warm_placeholder})"
                         ),
-                        QueryValues::SimpleValues(vec![
-                            Value::from(table_id.as_str()),
-                            Value::from(create.index_name.as_str()),
-                            Value::from(index_id.as_str()),
-                            Value::from(idx_ks_json.as_str()),
-                            Value::from(proj_json.as_str()),
-                            Value::from(pt_json.as_str()),
-                        ])
+                        QueryValues::SimpleValues(index_values)
                     );
                     gsi_creates.push((index_id, create.index_name.clone()));
                     surviving_index_key_schemas.push(create.key_schema.clone());
@@ -414,6 +454,7 @@ impl CassandraEngine {
                 account_id,
                 &input,
                 table_cols,
+                warm_read,
                 indexes_batch,
                 indexes_batch_has_statements,
                 needs_shard_init,
@@ -448,7 +489,8 @@ impl CassandraEngine {
         &self,
         account_id: &str,
         input: &UpdateTableInput,
-        table_cols: Vec<(&'static str, Value)>,
+        mut table_cols: Vec<(&'static str, Value)>,
+        mut warm_read: Option<String>,
         indexes_batch: BatchQueryBuilder,
         indexes_batch_has_statements: bool,
         needs_shard_init: bool,
@@ -505,20 +547,92 @@ impl CassandraEngine {
                 .map(|(col, _)| format!("{col} = ?"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // With a WarmThroughput the condition is also on the record read,
+            // and on `table_id`, which a missing row does not have.
+            let warm_col = table_cols
+                .iter()
+                .position(|(col, _)| *col == "warm_throughput");
+            let condition = if warm_col.is_some() {
+                "IF table_id = ? AND warm_throughput = ?"
+            } else {
+                "IF EXISTS"
+            };
             let cql = format!(
                 "UPDATE {catalog_ks}.tables SET {set_clause} \
-                 WHERE account_id = ? AND table_name = ? IF EXISTS"
+                 WHERE account_id = ? AND table_name = ? {condition}"
             );
-            let mut vals: Vec<Value> = table_cols.into_iter().map(|(_, v)| v).collect();
-            vals.push(Value::from(account_id));
-            vals.push(Value::from(input.table_name.as_str()));
-            let result = crate::cassandra_util::query_lwt(
-                &self.session,
-                &cql,
-                QueryValues::SimpleValues(vals),
-            )
-            .await
-            .inspect_err(|_e| {
+            let mut attempts = 0;
+            let applied = loop {
+                let mut vals: Vec<Value> = table_cols.iter().map(|(_, v)| v.clone()).collect();
+                vals.push(Value::from(account_id));
+                vals.push(Value::from(input.table_name.as_str()));
+                if warm_col.is_some() {
+                    vals.push(Value::from(table_id));
+                    vals.push(crate::warm_throughput::condition_value(
+                        warm_read.as_deref(),
+                    ));
+                }
+                let result = crate::cassandra_util::query_lwt(
+                    &self.session,
+                    &cql,
+                    QueryValues::SimpleValues(vals),
+                )
+                .await
+                .inspect_err(|_e| {
+                    for held_id in &taken_holds {
+                        let session = self.session_arc();
+                        let account_ks = account_ks.clone();
+                        let held_id = held_id.clone();
+                        let table_id = table_id.to_owned();
+                        tokio::spawn(async move {
+                            let _ = crate::propagation_hold::release_propagation_hold(
+                                &session,
+                                &account_ks,
+                                &table_id,
+                                &held_id,
+                            )
+                            .await;
+                        });
+                    }
+                })?;
+                if crate::cassandra_util::lwt_applied(&result)? {
+                    break Ok(true);
+                }
+                // Not applied: the row is gone, or another UpdateTable wrote the
+                // warm throughput since it was read. Merge again over what that
+                // request wrote and retry; a missing row ends the loop.
+                let (Some(col), Some(spec)) = (warm_col, input.warm_throughput.as_ref()) else {
+                    break Ok(false);
+                };
+                attempts += 1;
+                if attempts >= crate::warm_throughput::MERGE_ATTEMPTS {
+                    break Err(StorageError::Internal(
+                        "warm throughput: the record changed on every attempt to merge the \
+                         request"
+                            .to_owned(),
+                    ));
+                }
+                match self
+                    .merged_table_warm_throughput(account_id, &input.table_name, spec)
+                    .await
+                {
+                    Ok(merge) => {
+                        table_cols[col].1 = Value::from(merge.merged.as_str());
+                        warm_read = merge.read;
+                    }
+                    Err(StorageError::TableNotFound(_)) => break Ok(false),
+                    Err(e) => break Err(e),
+                }
+            };
+            // A condition that stays false means the row was deleted between
+            // our earlier SELECT and this UPDATE: treat as TableNotFound.
+            // NOTE: the tables LWT commits before the indexes batch below runs.
+            // A failure in the indexes batch leaves the table row updated with
+            // no corresponding index rows; the recovery worker does not cover
+            // this gap (it only scans existing CREATING index rows). This is a
+            // known atomicity gap — conditional batches cannot span tables in
+            // Cassandra. Tracked in ADR-0021.
+            let applied = applied.inspect_err(|_e| {
                 for held_id in &taken_holds {
                     let session = self.session_arc();
                     let account_ks = account_ks.clone();
@@ -535,15 +649,6 @@ impl CassandraEngine {
                     });
                 }
             })?;
-            // IF EXISTS returns false only if the row was deleted between our
-            // earlier SELECT and this UPDATE — treat as TableNotFound.
-            // NOTE: the tables LWT commits before the indexes batch below runs.
-            // A failure in the indexes batch leaves the table row updated with
-            // no corresponding index rows; the recovery worker does not cover
-            // this gap (it only scans existing CREATING index rows). This is a
-            // known atomicity gap — conditional batches cannot span tables in
-            // Cassandra. Tracked in ADR-0021.
-            let applied = crate::cassandra_util::lwt_applied(&result)?;
             if !applied {
                 for held_id in &taken_holds {
                     let session = self.session_arc();
@@ -589,6 +694,17 @@ impl CassandraEngine {
                 .await;
             }
             return Err(e);
+        }
+
+        // Post-batch: each GSI Update's WarmThroughput, as its own conditional
+        // write on the index row (see `store_index_warm_throughput`).
+        for update in input.global_secondary_index_updates.iter().flatten() {
+            if let Some(action) = &update.update
+                && let Some(spec) = &action.warm_throughput
+            {
+                self.store_index_warm_throughput(table_id, &action.index_name, spec)
+                    .await?;
+            }
         }
 
         // Post-batch: shard init (has its own internal batch across two keyspaces).
