@@ -189,10 +189,13 @@ def _last_line(output: str) -> str:
 
 
 # What `db.hello()` says about the member: `primary` once it is the writable
-# primary, `initiated` while the set has a configuration but no primary yet,
-# and `uninitiated` before any `rs.initiate` has taken effect (no `setName`).
+# primary of rs0, `initiated` while the set has a configuration but no primary
+# yet, and `uninitiated` before any `rs.initiate` has taken effect (no
+# `setName`). A mongod started without `--replSet` answers `isWritablePrimary:
+# true` with no `setName`, and the poll prints `uninitiated` for it.
 _MEMBER_STATE = (
-    "const h = db.hello(); print(h.isWritablePrimary ? 'primary' : h.setName ? 'initiated' : 'uninitiated')"
+    "const h = db.hello(); print(h.setName === 'rs0' && h.isWritablePrimary ? 'primary' "
+    ": h.setName ? 'initiated' : 'uninitiated')"
 )
 
 
