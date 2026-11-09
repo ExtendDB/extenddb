@@ -32,10 +32,10 @@ use futures::future::BoxFuture;
 
 use crate::PostgresEngine;
 use crate::catalog_json::{escape_json, from_catalog_json, to_catalog_json, unescape_json};
-use crate::create_table::RestoreRegistration;
+use crate::create_table::{RestoreRegistration, RestoreSource};
 use crate::data::{
     all_sort_key_info, data_table_name, index_table_name, insert_index_rows_multi,
-    item_has_index_keys, project_item_for_index,
+    item_has_index_keys, project_item_for_index, table_storage_relations,
 };
 
 /// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`, keeping the
@@ -66,10 +66,198 @@ fn pg_timestamp_to_epoch(ts: time::OffsetDateTime) -> f64 {
 pub const RESTORE_LOCK_SEED: i64 = 0x0045_4452; // 'E', 'D', 'R'
 
 /// A secondary index of a restore target, as the copy needs it.
-struct RestoreIndex {
-    table: String,
-    key_schema: Vec<KeySchemaElement>,
-    projection: Projection,
+pub(crate) struct RestoreIndex {
+    pub(crate) table: String,
+    pub(crate) key_schema: Vec<KeySchemaElement>,
+    pub(crate) projection: Projection,
+}
+
+/// The secondary indexes of `table_id` as the catalog records them, each
+/// with the data table its rows go into.
+pub(crate) async fn restore_indexes(
+    pool: &sqlx::PgPool,
+    table_id: &str,
+) -> Result<Vec<RestoreIndex>, StorageError> {
+    let index_rows: Vec<(String, serde_json::Value, serde_json::Value)> =
+        sqlx::query_as("SELECT index_id, key_schema, projection FROM indexes WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?;
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for (index_id, ks, proj) in index_rows {
+        indexes.push(RestoreIndex {
+            table: index_table_name(&index_id),
+            key_schema: from_catalog_json(ks)
+                .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?,
+            projection: from_catalog_json(proj)
+                .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?,
+        });
+    }
+    Ok(indexes)
+}
+
+/// Why [`insert_restore_rows`] stopped: the base table refused a key it
+/// already holds (the backup carries a key twice), or anything else. The
+/// legacy copy reports both as the database error ([`From`]); the
+/// store-backed load names the data file for the first.
+pub(crate) enum RowInsertError {
+    DuplicateKey(sqlx::Error),
+    Storage(StorageError),
+}
+
+impl From<StorageError> for RowInsertError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
+    }
+}
+
+impl From<RowInsertError> for StorageError {
+    fn from(e: RowInsertError) -> Self {
+        match e {
+            RowInsertError::DuplicateKey(e) => db_err(e),
+            RowInsertError::Storage(e) => e,
+        }
+    }
+}
+
+/// SQLSTATE `unique_violation`.
+const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
+
+/// A restore target as the row writes need it, built once per restore: the
+/// base data table, the key shape, and the secondary indexes with their
+/// data tables. `source` names the backup or data file in errors.
+pub(crate) struct RestoreTarget<'a> {
+    pub(crate) ddb_table: String,
+    pub(crate) key_schema: &'a [KeySchemaElement],
+    pub(crate) attribute_definitions: &'a [extenddb_core::types::AttributeDefinition],
+    pub(crate) sort_keys: Vec<(&'a str, ScalarAttributeType)>,
+    pub(crate) indexes: Vec<RestoreIndex>,
+    pub(crate) source: String,
+}
+
+impl<'a> RestoreTarget<'a> {
+    /// The target `table_id` with `key_schema` and `attribute_definitions`,
+    /// its indexes read from the catalog.
+    pub(crate) async fn load(
+        pool: &sqlx::PgPool,
+        table_id: &str,
+        key_schema: &'a [KeySchemaElement],
+        attribute_definitions: &'a [extenddb_core::types::AttributeDefinition],
+        source: String,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            ddb_table: data_table_name(table_id),
+            key_schema,
+            attribute_definitions,
+            sort_keys: all_sort_key_info(key_schema, attribute_definitions),
+            indexes: restore_indexes(pool, table_id).await?,
+            source,
+        })
+    }
+}
+
+/// Write one batch of restored items inside `tx`: one multi-row INSERT into
+/// the base table, then one multi-row INSERT into each secondary index for
+/// the batch's items that carry that index's keys. Plain INSERTs: two rows
+/// for one key fail the statement rather than collapsing into one item.
+pub(crate) async fn insert_restore_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &RestoreTarget<'_>,
+    batch: &[(Item, String)],
+) -> Result<(), RowInsertError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let RestoreTarget {
+        ddb_table,
+        key_schema,
+        attribute_definitions,
+        sort_keys,
+        indexes,
+        source,
+    } = target;
+    let mut cols = vec!["pk".to_owned()];
+    cols.extend(
+        sort_keys
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, t))| sk_column_n(i, t)),
+    );
+    cols.push("item_data".to_owned());
+    let width = cols.len();
+    // The last column is the item, bound as text and cast in SQL.
+    let tuples: Vec<String> = (0..batch.len())
+        .map(|r| {
+            let ps: Vec<String> = (1..=width)
+                .map(|c| {
+                    if c == width {
+                        format!("${}::jsonb", r * width + c)
+                    } else {
+                        format!("${}", r * width + c)
+                    }
+                })
+                .collect();
+            format!("({})", ps.join(", "))
+        })
+        .collect();
+    let sql = format!(
+        "INSERT INTO {ddb_table} ({}) VALUES {}",
+        cols.join(", "),
+        tuples.join(", ")
+    );
+    let mut query = sqlx::query(&sql);
+    for (item, item_json) in batch {
+        query = query.bind(composite_pk_to_text(item, key_schema)?);
+        for &(name, sk_type) in sort_keys {
+            let value = item.get(name).ok_or_else(|| {
+                StorageError::Internal(format!("{source} has an item without sort key {name}"))
+            })?;
+            query = match parse_sk(value, sk_type)? {
+                SortKeyValue::S(v) => query.bind(v),
+                SortKeyValue::N(v) => query.bind(v),
+                SortKeyValue::B(v) => query.bind(v),
+            };
+        }
+        query = query.bind(item_json.as_str());
+    }
+    query.execute(&mut **tx).await.map_err(|e| {
+        let duplicate = e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .is_some_and(|code| code == SQLSTATE_UNIQUE_VIOLATION);
+        if duplicate {
+            RowInsertError::DuplicateKey(e)
+        } else {
+            RowInsertError::Storage(db_err(e))
+        }
+    })?;
+
+    for idx in indexes {
+        let idx_sks = all_sort_key_info(&idx.key_schema, attribute_definitions);
+        let projected: Vec<(&Item, Item)> = batch
+            .iter()
+            .filter(|(item, _)| item_has_index_keys(item, &idx.key_schema))
+            .map(|(item, _)| {
+                (
+                    item,
+                    project_item_for_index(item, &idx.key_schema, key_schema, &idx.projection),
+                )
+            })
+            .collect();
+        let rows: Vec<(&Item, &Item)> = projected.iter().map(|(i, p)| (*i, p)).collect();
+        insert_index_rows_multi(
+            tx,
+            &idx.table,
+            &rows,
+            &idx.key_schema,
+            key_schema,
+            &idx_sks,
+            sort_keys,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Session-scoped ownership of one job, held for the job's life: a
@@ -111,6 +299,14 @@ impl ClaimSession {
     /// The claim connection, for the job's conditional writes.
     pub(crate) fn connection(&mut self) -> &mut sqlx::PgConnection {
         &mut self.conn
+    }
+
+    /// End the session, releasing its advisory lock; a close that fails is
+    /// logged (the server reaps the connection either way).
+    pub(crate) async fn close(self) {
+        if let Err(e) = <sqlx::PgConnection as sqlx::Connection>::close(self.conn).await {
+            tracing::warn!("closing a claim session: {e}");
+        }
     }
 
     /// Run `statement`, bound with the record's key and this generation, on
@@ -161,9 +357,9 @@ pub(crate) fn generation_column(generation: u64) -> i64 {
     i64::try_from(generation).unwrap_or(i64::MAX)
 }
 
-/// The heartbeat of a legacy restore: refresh its job record while it is
-/// RUNNING under this generation.
-const RESTORE_HEARTBEAT: &str = "UPDATE table_restores SET heartbeat_at = now() \
+/// The heartbeat of a restore: refresh its job record while it is RUNNING
+/// under this generation.
+pub(crate) const RESTORE_HEARTBEAT: &str = "UPDATE table_restores SET heartbeat_at = now() \
      WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2";
 
 /// The advisory-lock key for a restore into `table_name` in `account_id`.
@@ -174,7 +370,7 @@ const RESTORE_HEARTBEAT: &str = "UPDATE table_restores SET heartbeat_at = now() 
 /// `hashtextextended`, so a collision is negligible, and one would only make
 /// a second restore into the other name wait, never remove a table it should
 /// not.
-fn restore_lock_key(account_id: &str, table_name: &str) -> String {
+pub(crate) fn restore_lock_key(account_id: &str, table_name: &str) -> String {
     format!("{account_id}/{table_name}")
 }
 
@@ -182,6 +378,17 @@ fn restore_lock_key(account_id: &str, table_name: &str) -> String {
 pub(crate) fn backup_lock_key(backup_id: &str) -> String {
     format!("backup:{backup_id}")
 }
+
+/// The TCP keepalive settings a claim session asks the server for, as
+/// `(setting, seconds)`: idle 30 s before the first probe, then probes 10 s
+/// apart, three unanswered before the connection is dropped. Public for the
+/// test that reads them back with `SHOW`.
+#[doc(hidden)]
+pub const CLAIM_KEEPALIVES: [(&str, u32); 3] = [
+    ("tcp_keepalives_idle", 30),
+    ("tcp_keepalives_interval", 10),
+    ("tcp_keepalives_count", 3),
+];
 
 /// Take the lock `key` on a new dedicated connection, with a fresh
 /// generation. `Ok(None)`: another session holds it.
@@ -193,6 +400,18 @@ pub(crate) async fn try_claim(
     pool: &sqlx::PgPool,
     key: &str,
     permit: Option<JobPermit>,
+) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim_with(pool, key, permit, 1, Duration::ZERO).await
+}
+
+/// [`try_claim`] trying the lock up to `tries` times on the one connection,
+/// `pause` apart, before answering `Ok(None)`.
+pub(crate) async fn try_claim_with(
+    pool: &sqlx::PgPool,
+    key: &str,
+    permit: Option<JobPermit>,
+    tries: u32,
+    pause: Duration,
 ) -> Result<Option<ClaimSession>, StorageError> {
     let options = pool.connect_options();
     let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect_with(&options)
@@ -215,17 +434,73 @@ pub(crate) async fn try_claim(
              the server setting: {e}"
         );
     }
-    let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
-        .bind(key)
-        .bind(RESTORE_LOCK_SEED)
-        .fetch_one(&mut conn)
-        .await
-        .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+    // The server's TCP keepalive probes toward this process, so the
+    // advisory lock of a claim whose host vanished (no FIN, no RST) is
+    // released about a minute after the loss (30 s idle, then three probes
+    // 10 s apart) instead of after the kernel's default two hours, and the
+    // row's successor can take the lock once the row's heartbeat is stale.
+    // The owner's own liveness check is the heartbeat, not these. Each is a
+    // session setting a managed service may refuse; a refusal is a warning
+    // and the server's defaults stay.
+    for (name, value) in CLAIM_KEEPALIVES {
+        if let Err(e) = sqlx::query(&format!("SET {name} = {value}"))
+            .execute(&mut conn)
+            .await
+        {
+            tracing::warn!(
+                "could not set {name} for the claim session; continuing with the server \
+                 setting: {e}"
+            );
+        }
+    }
+    let mut taken = false;
+    for attempt in 1..=tries.max(1) {
+        taken = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
+            .bind(key)
+            .bind(RESTORE_LOCK_SEED)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+        if taken || attempt == tries {
+            break;
+        }
+        tokio::time::sleep(pause).await;
+    }
     Ok(taken.then(|| ClaimSession {
         conn,
         generation: new_generation(),
         _permit: permit,
     }))
+}
+
+/// Open a claim session on `key` as a job would and read `settings` back
+/// from it with `SHOW`, then end the session: for the test that checks the
+/// session settings [`try_claim`] applies. `None` when another session holds
+/// the lock.
+///
+/// # Errors
+///
+/// The claim's own errors, and `Internal` when a `SHOW` fails.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn claim_session_settings(
+    pool: &sqlx::PgPool,
+    key: &str,
+    settings: &[&str],
+) -> Result<Option<Vec<String>>, StorageError> {
+    let Some(mut session) = try_claim(pool, key, None).await? else {
+        return Ok(None);
+    };
+    let mut values = Vec::with_capacity(settings.len());
+    for name in settings {
+        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            .fetch_one(session.connection())
+            .await
+            .map_err(|e| StorageError::Internal(format!("SHOW {name}: {e}")))?;
+        values.push(value);
+    }
+    session.close().await;
+    Ok(Some(values))
 }
 
 /// Take the restore lock for `table_name` on a new dedicated connection.
@@ -384,6 +659,7 @@ impl PostgresEngine {
                     key_schema,
                     projection,
                     provisioned_throughput: throughput_from_catalog(ipt.as_ref()),
+                    warm_throughput: None,
                 });
             }
         }
@@ -451,24 +727,14 @@ impl PostgresEngine {
         use futures::TryStreamExt;
 
         let ddb_table = data_table_name(&desc.table_id);
-        let sort_keys = all_sort_key_info(&desc.key_schema, &desc.attribute_definitions);
-        let index_rows: Vec<(String, serde_json::Value, serde_json::Value)> = sqlx::query_as(
-            "SELECT index_id, key_schema, projection FROM indexes WHERE table_id = $1",
+        let target = RestoreTarget::load(
+            &self.pool,
+            &desc.table_id,
+            &desc.key_schema,
+            &desc.attribute_definitions,
+            format!("backup {backup_arn}"),
         )
-        .bind(&desc.table_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        let mut indexes = Vec::with_capacity(index_rows.len());
-        for (index_id, ks, proj) in index_rows {
-            indexes.push(RestoreIndex {
-                table: index_table_name(&index_id),
-                key_schema: from_catalog_json(ks)
-                    .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?,
-                projection: from_catalog_json(proj)
-                    .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?,
-            });
-        }
+        .await?;
 
         // The backup's rows are read from one catalog snapshot in which the
         // backup is still AVAILABLE. DeleteBackup refuses while this restore
@@ -510,10 +776,7 @@ impl PostgresEngine {
             batch_bytes += item_json.len();
             batch.push((item, item_json));
             if batch.len() == COPY_BATCH_ITEMS || batch_bytes >= COPY_BATCH_BYTES {
-                self.write_restore_batch(
-                    &ddb_table, desc, &sort_keys, &indexes, &batch, backup_arn,
-                )
-                .await?;
+                self.write_restore_batch(&target, &batch).await?;
                 item_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
                 batch.clear();
                 batch_bytes = 0;
@@ -522,8 +785,7 @@ impl PostgresEngine {
         drop(rows);
         snapshot.commit().await.map_err(db_err)?;
         if !batch.is_empty() {
-            self.write_restore_batch(&ddb_table, desc, &sort_keys, &indexes, &batch, backup_arn)
-                .await?;
+            self.write_restore_batch(&target, &batch).await?;
             item_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         }
 
@@ -538,18 +800,47 @@ impl PostgresEngine {
         // and its job record DONE, in one catalog transaction. The table was
         // created with the transition deferred, so this is the first point it
         // can become ACTIVE, by ordering rather than by timing.
-        //
-        // Only from CREATING, and only while the job record is RUNNING under
-        // this generation. DeleteTable refuses a restore target, but the
-        // reconciler can claim one whose owner it found dead (moving it to
-        // DELETING); that claim wins, and flipping the row back to ACTIVE
-        // would leave a table whose data tables are being dropped.
+        if !self
+            .activate_restore_target(&desc.table_id, generation, item_count, table_size)
+            .await?
+        {
+            // The target was claimed for removal while the copy ran, or the
+            // job record passed to another claim; the copy's rows go with it.
+            return Err(StorageError::TableNotFound(format!(
+                "restore of {backup_arn} into {} did not complete: the table was deleted \
+                 while it was being restored",
+                desc.table_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// The end of a restore in one catalog transaction: the job record
+    /// RUNNING to DONE under `generation`, the table CREATING to ACTIVE with
+    /// its counts, and every secondary and vector index of the table ACTIVE
+    /// (the indexes are created ACTIVE with a restore target, so this is the
+    /// rule stated once rather than a change). `Ok(false)`, with nothing
+    /// written, when the record is not RUNNING under `generation` or the
+    /// table is not CREATING.
+    ///
+    /// Only from CREATING, and only while the job record is RUNNING under
+    /// this generation. DeleteTable refuses a restore target, but the
+    /// reconciler can claim one whose owner it found dead (moving it to
+    /// DELETING); that claim wins, and flipping the row back to ACTIVE
+    /// would leave a table whose data tables are being dropped.
+    pub(crate) async fn activate_restore_target(
+        &self,
+        table_id: &str,
+        generation: u64,
+        item_count: i64,
+        table_size: i64,
+    ) -> Result<bool, StorageError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let done = sqlx::query(
             "UPDATE table_restores SET status = 'DONE', completed_at = now() \
              WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2",
         )
-        .bind(&desc.table_id)
+        .bind(table_id)
         .bind(generation_column(generation))
         .execute(&mut *tx)
         .await
@@ -563,7 +854,7 @@ impl PostgresEngine {
             )
             .bind(item_count)
             .bind(table_size)
-            .bind(&desc.table_id)
+            .bind(table_id)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?
@@ -573,16 +864,26 @@ impl PostgresEngine {
         };
         if activated == 0 {
             tx.rollback().await.map_err(db_err)?;
-            // The target was claimed for removal while the copy ran, or the
-            // job record passed to another claim; the copy's rows go with it.
-            return Err(StorageError::TableNotFound(format!(
-                "restore of {backup_arn} into {} did not complete: the table was deleted \
-                 while it was being restored",
-                desc.table_name
-            )));
+            return Ok(false);
         }
+        sqlx::query(
+            "UPDATE indexes SET index_status = 'ACTIVE' \
+             WHERE table_id = $1 AND index_status <> 'ACTIVE'",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL \
+             WHERE table_id = $1 AND index_status <> 'ACTIVE'",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(true)
     }
 
     /// RUNNING to FAILED on the job record of `table_id`, conditioned on
@@ -610,96 +911,15 @@ impl PostgresEngine {
         Ok(affected == 1)
     }
 
-    /// Write and commit one batch of restored items: one multi-row INSERT
-    /// into the base table, then one multi-row INSERT into each secondary
-    /// index for the batch's items that carry that index's keys.
+    /// Write and commit one batch of restored items ([`insert_restore_rows`]
+    /// in one data transaction).
     async fn write_restore_batch(
         &self,
-        ddb_table: &str,
-        desc: &TableDescription,
-        sort_keys: &[(&str, ScalarAttributeType)],
-        indexes: &[RestoreIndex],
+        target: &RestoreTarget<'_>,
         batch: &[(Item, String)],
-        backup_arn: &str,
     ) -> Result<(), StorageError> {
         let mut tx = self.data_pool.begin().await.map_err(db_err)?;
-        let mut cols = vec!["pk".to_owned()];
-        cols.extend(
-            sort_keys
-                .iter()
-                .enumerate()
-                .map(|(i, &(_, t))| sk_column_n(i, t)),
-        );
-        cols.push("item_data".to_owned());
-        let width = cols.len();
-        // The last column is the item, bound as text and cast in SQL.
-        let tuples: Vec<String> = (0..batch.len())
-            .map(|r| {
-                let ps: Vec<String> = (1..=width)
-                    .map(|c| {
-                        if c == width {
-                            format!("${}::jsonb", r * width + c)
-                        } else {
-                            format!("${}", r * width + c)
-                        }
-                    })
-                    .collect();
-                format!("({})", ps.join(", "))
-            })
-            .collect();
-        let sql = format!(
-            "INSERT INTO {ddb_table} ({}) VALUES {}",
-            cols.join(", "),
-            tuples.join(", ")
-        );
-        let mut query = sqlx::query(&sql);
-        for (item, item_json) in batch {
-            query = query.bind(composite_pk_to_text(item, &desc.key_schema)?);
-            for &(name, sk_type) in sort_keys {
-                let value = item.get(name).ok_or_else(|| {
-                    StorageError::Internal(format!(
-                        "backup {backup_arn} has an item without sort key {name}"
-                    ))
-                })?;
-                query = match parse_sk(value, sk_type)? {
-                    SortKeyValue::S(v) => query.bind(v),
-                    SortKeyValue::N(v) => query.bind(v),
-                    SortKeyValue::B(v) => query.bind(v),
-                };
-            }
-            query = query.bind(item_json.as_str());
-        }
-        query.execute(&mut *tx).await.map_err(db_err)?;
-
-        for idx in indexes {
-            let idx_sks = all_sort_key_info(&idx.key_schema, &desc.attribute_definitions);
-            let projected: Vec<(&Item, Item)> = batch
-                .iter()
-                .filter(|(item, _)| item_has_index_keys(item, &idx.key_schema))
-                .map(|(item, _)| {
-                    (
-                        item,
-                        project_item_for_index(
-                            item,
-                            &idx.key_schema,
-                            &desc.key_schema,
-                            &idx.projection,
-                        ),
-                    )
-                })
-                .collect();
-            let rows: Vec<(&Item, &Item)> = projected.iter().map(|(i, p)| (*i, p)).collect();
-            insert_index_rows_multi(
-                &mut tx,
-                &idx.table,
-                &rows,
-                &idx.key_schema,
-                &desc.key_schema,
-                &idx_sks,
-                sort_keys,
-            )
-            .await?;
-        }
+        insert_restore_rows(&mut tx, target, batch).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
@@ -717,6 +937,12 @@ impl PostgresEngine {
     /// exactly one wins. The claim also schedules the row for the ordinary
     /// DELETING removal, so if a drop below fails, the row stays DELETING with
     /// its index rows and the control plane finishes the job later.
+    ///
+    /// The relations dropped are the ones `DeleteTable` drops
+    /// (`table_storage_relations`): the data table, every secondary index's
+    /// table and every vector index's table, their ids read in the claiming
+    /// transaction while the catalog rows still exist (the `tables` row's
+    /// deletion cascades them away).
     ///
     /// Public for the test that runs it against an ACTIVE table; not an
     /// interface.
@@ -739,13 +965,17 @@ impl PostgresEngine {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(db_err)?;
+        let vector_index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+                .bind(table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         if !claimed {
             return Ok(false);
         }
-        let mut drops = vec![data_table_name(table_id)];
-        drops.extend(index_ids.iter().map(|id| index_table_name(id)));
-        for t in drops {
+        for t in table_storage_relations(table_id, &index_ids, &vector_index_ids) {
             sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
                 .execute(&self.data_pool)
                 .await
@@ -757,6 +987,44 @@ impl PostgresEngine {
             .await
             .map_err(db_err)?;
         Ok(true)
+    }
+
+    /// The body of `remove_restore_target` once its caller holds the target
+    /// name's advisory lock (`restore_lock_key`): the CREATING-target check,
+    /// the progress-row delete on the data pool (migration 8; a data
+    /// database from before it has no `restore_progress`), and the claim and
+    /// drop through [`Self::abort_restore`].
+    pub async fn remove_restore_target_locked(
+        &self,
+        key: &extenddb_storage::backup_catalog::RestoreTargetKey,
+    ) -> Result<bool, StorageError> {
+        let is_target: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tables t JOIN table_restores r \
+             ON r.table_id = t.table_id WHERE t.table_id = $1 AND t.account_id = $2 \
+             AND t.table_name = $3 AND t.table_status = 'CREATING')",
+        )
+        .bind(&key.table_id)
+        .bind(&key.account_id)
+        .bind(&key.table_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if !is_target {
+            return Ok(false);
+        }
+        let has_progress: bool =
+            sqlx::query_scalar("SELECT to_regclass('restore_progress') IS NOT NULL")
+                .fetch_one(&self.data_pool)
+                .await
+                .map_err(db_err)?;
+        if has_progress {
+            sqlx::query("DELETE FROM restore_progress WHERE table_id = $1")
+                .bind(&key.table_id)
+                .execute(&self.data_pool)
+                .await
+                .map_err(db_err)?;
+        }
+        self.abort_restore(&key.table_id).await
     }
 
     /// The detached task of RestoreTableFromBackup: take the restore lock,
@@ -840,7 +1108,7 @@ impl PostgresEngine {
             owner_generation: owner.generation(),
         };
         let mut desc = match self
-            .create_table_for_restore(&account_id, input, &registration)
+            .create_table_for_restore(&account_id, input, RestoreSource::Legacy(&registration))
             .await
         {
             Ok(desc) => desc,

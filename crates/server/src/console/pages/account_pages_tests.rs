@@ -1,8 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for the console dashboard: the deployment-wide counts are shown to
-//! admin sessions only.
+//! Tests for the console dashboard: the deployment-wide counts and the
+//! Accounts link are shown to admin sessions only, and an IAM-user session
+//! gets a link to its own user page.
 
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -54,10 +55,25 @@ async fn iam_user_dashboard_has_no_deployment_count() {
     assert!(!body.contains(&ADMIN_COUNT.to_string()), "{body}");
     assert!(!body.contains("Admin Users"), "{body}");
     assert!(!body.contains("<p>Accounts</p>"), "{body}");
+}
+
+#[tokio::test]
+async fn iam_user_dashboard_links_to_its_own_user_page_and_no_account_page() {
+    let response = render_dashboard(&session(iam_user()), None, "test-version");
+
+    let body = body_text(response).await;
     assert!(
-        body.contains(r#"<a href="/console/accounts/444455556666">"#),
+        body.contains(r#"<a href="/console/accounts/444455556666/users/bob">"#),
         "{body}"
     );
+    // The account list and the account page redirect an IAM-user session, so
+    // neither the card nor the navigation bar links to them.
+    assert!(!body.contains(r#"href="/console/accounts""#), "{body}");
+    assert!(
+        !body.contains(r#"href="/console/accounts/444455556666""#),
+        "{body}"
+    );
+    assert!(!body.contains("Accounts</a>"), "{body}");
 }
 
 #[tokio::test]
@@ -80,6 +96,10 @@ async fn admin_dashboard_shows_the_deployment_counts() {
         body.contains(&format!(
             "<h2 style=\"margin:0\">{ADMIN_COUNT}</h2>\n<p>Admin Users</p>"
         )),
+        "{body}"
+    );
+    assert!(
+        body.contains("<a href=\"/console\">Dashboard</a>\n<a href=\"/console/accounts\">Accounts</a>\n<a href=\"/console/metrics\">"),
         "{body}"
     );
 }

@@ -37,7 +37,7 @@ mod m0003_sort_key_definitions;
 mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0007_attribute_name_escape;
+mod m0010_attribute_name_escape;
 mod postcheck;
 mod registrar;
 mod rows;
@@ -58,7 +58,7 @@ use sqlx::postgres::PgConnectOptions;
 
 pub use backend::{PostgresMigrations, PostgresStores};
 pub use commands::{PostgresCatalogMigrations, resolve};
-pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, ServingRegistration};
+pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, SERVE_APPLICATION, ServingRegistration};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Column, Definitions, Index, compare, describe};
 pub use registrar::ServerRegistration;
@@ -139,6 +139,37 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0006_backup_catalog_index.sql"
             )],
         },
+        MigrationId::StreamPending => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0007_stream_pending.sql"
+            )],
+        },
+        MigrationId::RestoreProgress => Migration::Applies {
+            // A new table is additive by CONTRIBUTING's step 4, but declaring
+            // `Kind::Additive` needs the old-binary job, which does not exist
+            // yet (the paragraph after step 4; `refuse_additive` in
+            // `crates/bin` pins it).
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0008_restore_progress.sql"
+            )],
+        },
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0009_warm_throughput.sql"
+            )],
+        },
         MigrationId::AttributeNameEscape => Migration::Applies {
             // A binary without the decoder reads an escaped name as another
             // name, and one without the encoder writes a U+0001 raw, which
@@ -151,13 +182,13 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
             bodies: vec![
                 StoreBody::code(
                     StoreKind::Catalog,
-                    &m0007_attribute_name_escape::CatalogDocuments,
-                    m0007_attribute_name_escape::SOURCE,
+                    &m0010_attribute_name_escape::CatalogDocuments,
+                    m0010_attribute_name_escape::SOURCE,
                 ),
                 StoreBody::code(
                     StoreKind::Data,
-                    &m0007_attribute_name_escape::QueuedContexts,
-                    m0007_attribute_name_escape::SOURCE,
+                    &m0010_attribute_name_escape::QueuedContexts,
+                    m0010_attribute_name_escape::SOURCE,
                 ),
             ],
         },
@@ -184,6 +215,9 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::SortKeyDefinitions
         | MigrationId::DropContinuousBackups
         | MigrationId::BackupCatalogIndex
+        | MigrationId::StreamPending
+        | MigrationId::RestoreProgress
+        | MigrationId::WarmThroughput
         | MigrationId::AttributeNameEscape => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }

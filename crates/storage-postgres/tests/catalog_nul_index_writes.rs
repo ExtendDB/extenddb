@@ -56,6 +56,7 @@ fn table_input(table: &str, with_gsis: bool) -> CreateTableInput {
                     key_schema: vec![key(GK, KeyType::Hash)],
                     projection: include(&[NK]),
                     provisioned_throughput: None,
+                    warm_throughput: None,
                 },
                 GsiInput {
                     index_name: "by_u0".to_owned(),
@@ -65,6 +66,7 @@ fn table_input(table: &str, with_gsis: bool) -> CreateTableInput {
                         non_key_attributes: None,
                     },
                     provisioned_throughput: None,
+                    warm_throughput: None,
                 },
             ]
         }),

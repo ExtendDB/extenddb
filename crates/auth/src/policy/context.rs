@@ -131,9 +131,11 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 ///
 /// Two places read the set, through `is_unresolvable_key`. A condition fails
 /// closed when its key is listed, or when one of its values names a listed key
-/// through a `${key}` or `${key, 'default'}` variable
-/// (`condition::evaluate_condition_match`). A `Resource` or `NotResource`
-/// pattern whose variable names a listed key fails closed in the same way
+/// through a `${key}` or `${key, 'default'}` variable in a `2012-10-17`
+/// document under a string or ARN operator, where the value is expanded
+/// (`condition::evaluate_condition_match`); a value that is not expanded
+/// reads no key. A `Resource` or `NotResource` pattern whose variable names a
+/// listed key fails closed in the same way
 /// (`variables::resource_pattern_is_unresolvable`). In both, a default written
 /// beside a listed key is not used, because the service would have a value
 /// for the key.
@@ -183,6 +185,10 @@ pub struct RequestParams {
     pub return_consumed_capacity: Option<String>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
+    /// `dynamodb:FullTableScan` for a request that is not a scan
+    /// (`RequestContext::build` sets it to `true` for one). `None` leaves the
+    /// key absent; a PartiQL read by key sets `false`.
+    pub full_table_scan: Option<bool>,
     /// The caller ARN (`aws:PrincipalArn`), when known.
     pub principal_arn: Option<String>,
     /// The caller's account id (`aws:PrincipalAccount`), when known.
@@ -299,7 +305,8 @@ impl RequestContext {
     /// Build context for a `DynamoDB` operation.
     ///
     /// `principal_tags` and `resource_tags` come from the identity and target
-    /// table respectively. `is_scan` should be true for Scan operations.
+    /// table respectively. `is_scan` should be true for Scan operations; for
+    /// any other request `params.full_table_scan` gives the key.
     /// `params` carries operation-specific request parameters.
     #[must_use]
     pub fn build(
@@ -317,7 +324,11 @@ impl RequestContext {
             select: params.select,
             return_values: params.return_values,
             return_consumed_capacity: params.return_consumed_capacity,
-            full_table_scan: if is_scan { Some(true) } else { None },
+            full_table_scan: if is_scan {
+                Some(true)
+            } else {
+                params.full_table_scan
+            },
             enclosing_operation: params.enclosing_operation,
             principal_arn: params.principal_arn,
             principal_account: params.principal_account,
@@ -994,6 +1005,25 @@ mod tests {
         assert_eq!(
             ctx.resolve_key("dynamodb:FullTableScan"),
             Some(vec!["true"])
+        );
+    }
+
+    #[test]
+    fn request_context_full_table_scan_set_by_the_request() {
+        // A PartiQL read by key carries "false" (measured 2026-11-03); a
+        // request that sets nothing leaves the key absent unless it is a scan.
+        let ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                full_table_scan: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.resolve_key("dynamodb:FullTableScan"),
+            Some(vec!["false"])
         );
     }
 

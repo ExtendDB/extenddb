@@ -62,7 +62,7 @@ pub use locks::{MigrationLock, Timing};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Collection, Definitions, Index, describe_store};
 pub use registrar::ServerRegistration;
-pub use registrations::ServingRegistration;
+pub use registrations::{SERVE_COMMAND, ServingRegistration};
 
 /// The catalog database every MongoDB deployment uses.
 pub const CATALOG_DATABASE: &str = "extenddb_catalog";
@@ -160,6 +160,19 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0006_backup_catalog_index::SOURCE,
             )],
         },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "a MongoDB write draws its stream sequence number from its shard's counter inside its \
+             transaction, so the records of a shard commit in number order",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
         MigrationId::AttributeNameEscape => Migration::NotApplicable(
             "MongoDB stores the catalog's attribute names as BSON string values, which carry their \
              length and so can hold U+0000, and every name reads back as it was written",
@@ -352,7 +365,24 @@ pub async fn register_and_check(
     release: &str,
     timing: Timing,
 ) -> Result<ServerRegistration, MigrationError> {
-    let registration = ServingRegistration::register(target, release, timing).await?;
+    register_and_check_as(target, release, SERVE_COMMAND, timing).await
+}
+
+/// [`register_and_check`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose registration carries its name
+/// ([`ServingRegistration::register_as`]).
+///
+/// # Errors
+///
+/// As [`register_and_check`].
+pub async fn register_and_check_as(
+    target: &MongoTarget,
+    release: &str,
+    command: &'static str,
+    timing: Timing,
+) -> Result<ServerRegistration, MigrationError> {
+    let registration = ServingRegistration::register_as(target, release, command, timing).await?;
     let status = match catalog_status(target).await {
         Ok(status) => status,
         Err(e) => {
@@ -376,6 +406,7 @@ pub async fn register_and_check(
     Ok(ServerRegistration::new(
         target,
         release,
+        command,
         timing,
         status,
         registration,

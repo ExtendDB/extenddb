@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use extenddb_storage::MetadataEngine;
-use extenddb_storage::migrations::{CatalogStatus, Migration, MigrationId, Runner, exit};
+use extenddb_storage::migrations::{CatalogStatus, MigrationId, Runner, exit};
 
 use super::SqliteMigrations;
 use super::postcheck;
@@ -399,12 +399,14 @@ async fn a_catalog_an_older_release_wrote_to_is_reported_and_reconverged() {
 
         next_second().await;
         let report = reconverge(&db).await.expect("reconverge");
-        // Every convergent migration with a body on this backend ran again;
+        // Every convergent migration that applies on SQLite ran again;
         // migration 2, which is not convergent, is named as skipped.
         let convergent = MigrationId::ALL
             .into_iter()
-            .map(super::migration)
-            .filter(|m| matches!(m, Migration::Applies { .. }) && m.convergent())
+            .filter(|id| {
+                let m = super::migration(*id);
+                m.convergent() && !m.bodies().is_empty()
+            })
             .count();
         assert_eq!(report.applied.len(), convergent, "{trace}: {report:?}");
         let skipped = format!("Skipped {}:", MigrationId::ResourceTagConditionKeys);

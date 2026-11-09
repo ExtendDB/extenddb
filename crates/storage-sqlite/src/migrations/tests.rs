@@ -5,7 +5,7 @@
 //! protocol, the copy, the entry points and the in-memory case. The lock
 //! is in `serve_tests`, beside the server's refusal while a migration
 //! holds it.
-//! Released catalogs are in `released_tests`, migrations 2 to 4 in
+//! Released catalogs are in `released_tests`, migrations 2 to 4, 6 and 9 in
 //! `golden_tests`, refusals and rollbacks in `refusal_tests`, and the killed
 //! migrator in `crash_tests`.
 
@@ -14,9 +14,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
-    Body, CatalogStatus, CodeBody, Done, LedgerRow, Migration, MigrationBackend, MigrationError,
-    MigrationId, Outcome, RELEASED_THROUGH, Runner, Step, StoreBody, StoreKind, StoreRef,
-    check_released,
+    Body, CatalogStatus, CodeBody, Done, LedgerRow, MigrationBackend, MigrationError, MigrationId,
+    Outcome, RELEASED_THROUGH, Runner, Step, StoreBody, StoreKind, StoreRef, check_released,
 };
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -265,11 +264,10 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
     );
-    // A row for every id: `applied` for the ids with a body on this backend,
-    // `not_applicable` for the others.
+    // An id that does not apply on SQLite is recorded as not_applicable.
     let applies = MigrationId::ALL
         .into_iter()
-        .filter(|id| matches!(migration(*id), Migration::Applies { .. }))
+        .filter(|id| !migration(*id).bodies().is_empty())
         .count();
     assert_eq!(
         count(
@@ -277,11 +275,15 @@ async fn a_fresh_database_is_current_after_one_run_and_seeds_nothing() {
             "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'applied'"
         )
         .await,
-        i64::try_from(applies).expect("a count fits i64")
+        i64::try_from(applies).unwrap()
     );
     assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM extenddb_migrations").await,
-        i64::from(LATEST)
+        count(
+            &db,
+            "SELECT COUNT(*) FROM extenddb_migrations WHERE outcome = 'not_applicable'"
+        )
+        .await,
+        i64::from(LATEST) - i64::try_from(applies).unwrap()
     );
     assert_eq!(version_row(&db).await, Some(LATEST.to_string()));
     assert_eq!(

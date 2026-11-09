@@ -55,6 +55,7 @@ fn input(table: &str) -> CreateTableInput {
             key_schema: vec![key(GK, KeyType::Hash), key(GSK, KeyType::Range)],
             projection: include(&PROJECTED),
             provisioned_throughput: None,
+            warm_throughput: None,
         }]),
         local_secondary_indexes: Some(vec![LsiInput {
             index_name: "lsi1".to_owned(),
@@ -346,6 +347,7 @@ async fn names_without_either_character_are_stored_as_before() {
             key_schema: vec![key("gk", KeyType::Hash)],
             projection: include(&["nk"]),
             provisioned_throughput: None,
+            warm_throughput: None,
         }]),
         ..Default::default()
     };

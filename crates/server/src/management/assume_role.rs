@@ -378,11 +378,11 @@ async fn evaluate_trust_policy(
     )
 }
 
-/// Whether a trust policy's `Version` is `2012-10-17`. Its condition values
-/// then read the `${key, 'default'}` form and trim the key name, as an
-/// identity policy's do (`condition::evaluate_condition_with`); in a
-/// `2008-10-17` trust policy, or one with no `Version`, the text between the
-/// braces is the key name as written.
+/// Whether a trust policy's `Version` is `2012-10-17`. Only then do its
+/// condition values expand policy variables, as an identity policy's do
+/// (`condition::evaluate_condition_with`); a `2008-10-17` trust policy, or
+/// one with no `Version`, compares `${...}` as literal text (measured with
+/// AssumeRole on fresh roles, issue #534).
 fn trust_policy_is_version_2012(trust_policy: &Value) -> bool {
     trust_policy.get("Version").and_then(Value::as_str) == Some("2012-10-17")
 }
@@ -1047,6 +1047,9 @@ async fn fetch_caller_created_at(
         }
     }
 }
+
+#[cfg(test)]
+mod trust_version_tests;
 
 #[cfg(test)]
 mod tests {

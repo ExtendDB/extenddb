@@ -126,7 +126,7 @@ fn base_key_binds(
 }
 
 /// Column names for the base key, in key-schema order.
-fn base_key_columns(
+pub(crate) fn base_key_columns(
     base_key_schema: &[KeySchemaElement],
     attr_defs: &[AttributeDefinition],
 ) -> Vec<String> {
