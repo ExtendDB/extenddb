@@ -493,7 +493,7 @@ pub(crate) async fn enqueue_async_indexes(
             cdrs_tokio::types::value::Value::from(context_json.as_str()),
         ]);
 
-        let old = std::mem::replace(batch, BatchQueryBuilder::new());
+        let old = std::mem::take(batch);
         *batch = old.add_query(insert_cql, insert_qv);
 
         enqueued += 1;
@@ -577,7 +577,7 @@ pub(crate) fn delete_index_row_multi(
         where_cols.join(" AND ")
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
-    let old = std::mem::replace(batch, BatchQueryBuilder::new());
+    let old = std::mem::take(batch);
     *batch = old.add_query(cql, qv);
     Ok(())
 }
@@ -656,7 +656,7 @@ pub(crate) fn insert_index_row_multi(
         using
     );
     let qv = cdrs_tokio::query::QueryValues::SimpleValues(values);
-    let old = std::mem::replace(batch, BatchQueryBuilder::new());
+    let old = std::mem::take(batch);
     *batch = old.add_query(cql, qv);
     Ok(())
 }

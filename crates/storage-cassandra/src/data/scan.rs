@@ -108,14 +108,13 @@ async fn rows_no_values(
     session: &Arc<CassandraSession>,
     query: &str,
 ) -> Result<Vec<cdrs_tokio::types::rows::Row>, StorageError> {
-    let result = session
-        .query(query)
-        .await
-        .map_err(|e| StorageError::Internal(format!("scan query failed: {e}")))?;
-    let body = result
-        .response_body()
-        .map_err(|e| StorageError::Internal(format!("scan parse failed: {e}")))?;
-    Ok(body.into_rows().unwrap_or_default())
+    crate::cassandra_util::query_rows(
+        session,
+        query,
+        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+        "scan query failed",
+    )
+    .await
 }
 
 impl crate::CassandraEngine {

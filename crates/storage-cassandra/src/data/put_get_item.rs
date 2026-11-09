@@ -3,8 +3,6 @@
 
 //! `put_item` and `get_item` implementations for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -15,6 +13,7 @@ use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_colu
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{Stmt, batch, params};
 use crate::stream_util::stream_record_statement;
 
 /// How a put maintains GSIs.
@@ -151,8 +150,7 @@ impl CassandraEngine {
         };
         // The batch carries the timestamp, so the index statements pass none
         // of their own (Cassandra refuses a batch with both).
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let mut batch = batch()
             .with_timestamp(stamp)
             .add_query(cql, cdrs_tokio::query::QueryValues::SimpleValues(values));
         if !indexes.is_empty() {
@@ -322,8 +320,14 @@ impl CassandraEngine {
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let old_result =
-                query_with_pk_sk(&self.session, &select_query, pk_text.as_ref(), &sk).await?;
+            let old_result = query_with_pk_sk(
+                &self.session,
+                &select_query,
+                Stmt::Read,
+                pk_text.as_ref(),
+                &sk,
+            )
+            .await?;
 
             let body = old_result
                 .response_body()
@@ -605,7 +609,7 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&insert_cql, insert_qv)
+            .query_with_params(&insert_cql, params(Stmt::Lwt, insert_qv))
             .await
             .map_err(|e| StorageError::Internal(format!("put_item_if_not_exists: {e}")))?;
 
@@ -652,7 +656,7 @@ impl CassandraEngine {
         }
         // The index statements carry the version; the queue rows and the
         // stream record keep Cassandra's timestamp (`data::version`).
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
 
         if !indexes.is_empty() {
             super::index::sync_indexes_at(
@@ -793,7 +797,8 @@ impl CassandraEngine {
                 "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let result = query_with_pk_sk(&self.session, &query, pk_text.as_ref(), &sk).await?;
+            let result =
+                query_with_pk_sk(&self.session, &query, Stmt::Read, pk_text.as_ref(), &sk).await?;
 
             let body = result
                 .response_body()
@@ -813,7 +818,13 @@ impl CassandraEngine {
 
             let result = self
                 .session
-                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_ref() as &str))
+                .query_with_params(
+                    &query,
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(pk_text.as_ref() as &str),
+                    ),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Get item: {e}")))?;
 

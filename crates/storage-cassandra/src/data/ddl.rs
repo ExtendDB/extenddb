@@ -12,6 +12,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
 use crate::CassandraEngine;
+use crate::cassandra_util::batch;
 
 /// CQL table name for a DynamoDB table in an account keyspace.
 pub(crate) fn data_table_name(table_id: &str) -> String {
@@ -270,10 +271,12 @@ impl CassandraEngine {
             )
         };
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to create data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -287,10 +290,12 @@ impl CassandraEngine {
         let ddb_table = data_table_name(table_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{ddb_table}");
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to drop data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -304,10 +309,12 @@ impl CassandraEngine {
         let idx_table = index_table_name(index_id);
         let ddl = format!("DROP TABLE IF EXISTS {account_keyspace}.{idx_table}");
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to drop index data table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to drop index data table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -409,10 +416,12 @@ impl CassandraEngine {
             primary_key
         );
 
-        self.session
-            .query(&ddl)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Failed to create index table: {e}")))?;
+        crate::cassandra_util::ddl::<StorageError>(
+            &self.session,
+            &ddl,
+            "Failed to create index table",
+        )
+        .await?;
 
         Ok(())
     }
@@ -443,8 +452,6 @@ pub(crate) async fn backfill_gsi(
     projection: &extenddb_core::types::Projection,
 ) -> Result<(), StorageError> {
     use crate::data::index::{insert_index_row_multi, item_has_index_keys, project_item_for_index};
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
     use cdrs_tokio::types::IntoRustByName as _;
 
     const PAGE_SIZE: i64 = 500;
@@ -495,7 +502,7 @@ pub(crate) async fn backfill_gsi(
             break;
         }
 
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
         let mut batch_has_rows = false;
 
         for row in &rows {

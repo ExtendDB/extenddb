@@ -1331,7 +1331,12 @@ impl CassandraEngine {
         skip_txn_id: Option<Uuid>,
     ) -> Result<Option<Item>, StorageError> {
         Ok(self
-            .fetch_row_for_transaction(key_info, key, skip_txn_id, None)
+            .fetch_row_for_transaction(
+                key_info,
+                key,
+                skip_txn_id,
+                crate::cassandra_util::Stmt::Read,
+            )
             .await?
             .item)
     }
@@ -1347,8 +1352,9 @@ impl CassandraEngine {
     /// item and therefore a real old image. The version is `None` in that last
     /// case too: the row belongs to the other transaction until it finishes.
     ///
-    /// `consistency` is the read's consistency. COMMIT reads its own fenced
-    /// row at `LOCAL_SERIAL`: the read supplies the old image whose index rows
+    /// `read` is the kind of the read. COMMIT reads its own fenced row as a
+    /// [`Stmt::SerialRead`](crate::cassandra_util::Stmt::SerialRead), at
+    /// `LOCAL_SERIAL`: the read supplies the old image whose index rows
     /// the commit removes and the version it advances, and the commit's
     /// `IF prepared_txn_id = ?` checks neither, so a replica that missed the
     /// latest write must not answer it.
@@ -1357,7 +1363,7 @@ impl CassandraEngine {
         key_info: &TableKeyInfo,
         key: &Item,
         skip_txn_id: Option<Uuid>,
-        consistency: Option<Consistency>,
+        read: crate::cassandra_util::Stmt,
     ) -> Result<TransactionRow, StorageError> {
         let keyspace = self.account_keyspace(&key_info.account_id);
         let table = data_table_name(&key_info.table_id);
@@ -1373,7 +1379,7 @@ impl CassandraEngine {
             pk_text.as_str(),
             sk.as_ref(),
             sk_col.as_deref(),
-            consistency,
+            read,
         )
         .await?
         else {
@@ -1673,7 +1679,7 @@ impl CassandraEngine {
                         key_info,
                         item,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -1727,7 +1733,7 @@ impl CassandraEngine {
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let mut final_item = row.item.clone().unwrap_or_else(|| (*key).clone());
@@ -1777,7 +1783,7 @@ impl CassandraEngine {
                         key_info,
                         key,
                         Some(txn_id),
-                        Some(Consistency::LocalSerial),
+                        crate::cassandra_util::Stmt::SerialRead,
                     )
                     .await?;
                 let old_image = commit_old_image(row.item, row.created_to_prepare);
@@ -2413,7 +2419,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?;
         Ok(row.and_then(|row| row.get_by_name("version").ok().flatten()))
@@ -2440,7 +2446,7 @@ impl CassandraEngine {
             pk,
             sk.map(|(value, _)| value),
             sk.map(|(_, col)| col.as_str()),
-            Some(Consistency::LocalSerial),
+            crate::cassandra_util::Stmt::SerialRead,
         )
         .await?
         else {
