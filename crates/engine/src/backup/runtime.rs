@@ -42,13 +42,16 @@
 //! thread costs nothing at exit: the binary ends its runtime with a bounded
 //! shutdown that detaches it.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use extenddb_backup_store::{BackupStore, ByteStream, ObjectMeta, StoreError};
 use extenddb_core::error::DynamoDbError;
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::metrics::MetricsCollector;
+use extenddb_core::types::TableDescription;
 use extenddb_storage::backup_catalog::{
     JOB_HEARTBEAT_INTERVAL, JobBound, StoreIdentity, StoreKind, limit_exceeded_message,
 };
@@ -164,6 +167,61 @@ pub struct BackupRuntime {
     source_backend: String,
     /// The build's version, the manifest's `source_extenddb_version`.
     source_extenddb_version: String,
+    /// The instance's limits, which a restore the reconciler resumes
+    /// validates its items against (a request's restore reads them from
+    /// the operation context).
+    limits: Arc<LimitsConfig>,
+    /// The store-backed restore registrations this instance has spawned and
+    /// not yet seen return, by (account, target table name): what a retry
+    /// of the same request meets while the first registration is still in
+    /// flight ([`Self::begin_restore_registration`]).
+    restore_registrations: Arc<std::sync::Mutex<HashMap<(String, String), InFlightRegistration>>>,
+}
+
+/// The registration outcome a waiting retry reads: `None` until the
+/// registration returns.
+pub(crate) type RegistrationOutcome = Option<Result<TableDescription, DynamoDbError>>;
+
+/// A restore registration this instance has spawned and not yet seen
+/// return, as a retry of the request meets it.
+#[derive(Clone)]
+pub(crate) struct InFlightRegistration {
+    /// The backup the registration restores from.
+    pub backup_arn: String,
+    /// The registration's outcome once it returns.
+    pub outcome: tokio::sync::watch::Receiver<RegistrationOutcome>,
+}
+
+/// The registering request's side of an [`InFlightRegistration`]: the
+/// registration is in flight while this exists, and
+/// [`RegistrationGuard::finish`] publishes its outcome and ends it. Dropped
+/// without `finish`, it ends the entry with no outcome (the waiters read the
+/// closed channel).
+pub(crate) struct RegistrationGuard {
+    runtime_registrations: Arc<std::sync::Mutex<HashMap<(String, String), InFlightRegistration>>>,
+    key: (String, String),
+    outcome: tokio::sync::watch::Sender<RegistrationOutcome>,
+}
+
+impl RegistrationGuard {
+    /// Publish the registration's outcome to the retries waiting on it and
+    /// end the entry.
+    pub(crate) fn finish(self, outcome: Result<TableDescription, DynamoDbError>) {
+        let _ = self.outcome.send(Some(outcome));
+        self.runtime_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        self.runtime_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 impl std::fmt::Debug for BackupRuntime {
@@ -876,7 +934,57 @@ impl BackupRuntime {
             jobs: TaskTracker::new(),
             source_backend: "test".to_owned(),
             source_extenddb_version: env!("CARGO_PKG_VERSION").to_owned(),
+            limits: Arc::new(LimitsConfig::default()),
+            restore_registrations: Arc::default(),
         }
+    }
+
+    /// Mark a store-backed restore registration of `backup_arn` into
+    /// (`account_id`, `table_name`) as in flight, or return the one already
+    /// in flight for that name (a retry of the request, or another backup's
+    /// registration into the same name). The registering request's task
+    /// ends the entry through [`RegistrationGuard::finish`].
+    pub(crate) fn begin_restore_registration(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        backup_arn: &str,
+    ) -> Result<RegistrationGuard, InFlightRegistration> {
+        let key = (account_id.to_owned(), table_name.to_owned());
+        let mut registrations = self
+            .restore_registrations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(in_flight) = registrations.get(&key) {
+            return Err(in_flight.clone());
+        }
+        let (outcome, receiver) = tokio::sync::watch::channel(None);
+        registrations.insert(
+            key.clone(),
+            InFlightRegistration {
+                backup_arn: backup_arn.to_owned(),
+                outcome: receiver,
+            },
+        );
+        Ok(RegistrationGuard {
+            runtime_registrations: Arc::clone(&self.restore_registrations),
+            key,
+            outcome,
+        })
+    }
+
+    /// The same runtime with the instance's limits, which a resumed restore
+    /// validates its items against (the default is `LimitsConfig::default`).
+    #[must_use]
+    pub fn with_limits(mut self, limits: Arc<LimitsConfig>) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// The instance's limits.
+    #[must_use]
+    pub fn limits(&self) -> &Arc<LimitsConfig> {
+        &self.limits
     }
 
     /// The same runtime with `[backup] stale_job_after_secs` set, the window
@@ -1011,16 +1119,17 @@ impl BackupRuntime {
             return 0;
         }
         tracing::info!(
-            "waiting up to {} s for {running} backup job(s) to end",
+            "waiting up to {} s for {running} backup or restore job(s) to end",
             bound.as_secs()
         );
         if tokio::time::timeout(bound, self.jobs.wait()).await.is_err() {
             let left = self.jobs.len();
             tracing::warn!(
-                "{left} backup job task(s) did not end within {} s (tasks spawned by \
-                 CreateBackup, counted whether or not a row exists for them yet); a row one \
-                 left CREATING or FAILED is resolved or swept by the reconciler once its \
-                 heartbeat is stale",
+                "{left} job task(s) did not end within {} s (tasks spawned by CreateBackup and \
+                 RestoreTableFromBackup, counted whether or not a row exists for them yet); a \
+                 backup job's row left CREATING or FAILED is resolved or swept by the \
+                 reconciler once its heartbeat is stale, a restore job's record is RUNNING \
+                 with its progress and the reconciler resumes it",
                 bound.as_secs()
             );
             return left;
@@ -1069,6 +1178,15 @@ impl BackupRuntime {
     pub fn configured_store(&self) -> Option<&ConfiguredStore> {
         self.configured_store
             .as_deref()
+            .filter(|store| !store.is_set_aside())
+    }
+
+    /// [`Self::configured_store`] as the `Arc` a job's environment holds
+    /// ([`super::job::JobEnv::new`]).
+    #[must_use]
+    pub(crate) fn configured_store_arc(&self) -> Option<&Arc<ConfiguredStore>> {
+        self.configured_store
+            .as_ref()
             .filter(|store| !store.is_set_aside())
     }
 

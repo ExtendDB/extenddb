@@ -40,10 +40,12 @@
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
+use extenddb_core::types::{CreateTableInput, RestoreSummary, TableDescription};
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StaleClock,
-    StatusFields, StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
+    TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -52,7 +54,9 @@ use futures::stream::BoxStream;
 use mongodb::bson::{self, Bson, Document, doc};
 
 use crate::MongoEngine;
-use crate::backup_engine::{age_is_stale, restoring_target_filter};
+use crate::backup_engine::{
+    RestoreRecord, RestoreRegistration, age_is_stale, restoring_target_filter,
+};
 use crate::data_engine::{
     CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, TxErr, backoff_sleep, is_duplicate_key,
 };
@@ -70,10 +74,20 @@ pub(crate) const LOCK_SEQ: &str = "lock_seq";
 /// document, with the field names the job record has on every backend.
 pub(crate) const RESTORE_JOB: &str = "restore_job";
 pub(crate) const RESTORE_JOB_STATUS: &str = "restore_job.status";
+pub(crate) const RESTORE_JOB_KIND: &str = "restore_job.kind";
 pub(crate) const RESTORE_JOB_GENERATION: &str = "restore_job.owner_generation";
 pub(crate) const RESTORE_JOB_HEARTBEAT: &str = "restore_job.heartbeat_at";
 pub(crate) const RESTORE_JOB_FAILURE_REASON: &str = "restore_job.failure_reason";
 pub(crate) const RESTORE_JOB_COMPLETED_AT: &str = "restore_job.completed_at";
+pub(crate) const RESTORE_JOB_SPOOL_HOST: &str = "restore_job.spool_host";
+pub(crate) const RESTORE_JOB_FILE_INDEX: &str = "restore_job.file_index";
+/// Items of `file_index` applied so far, written with each batch's inserts
+/// in one transaction (`restore_engine.rs`).
+pub(crate) const RESTORE_JOB_ITEMS_APPLIED: &str = "restore_job.items_applied";
+/// Whether the registration's DDL finished: `false` from the record's
+/// insert, `true` once the target's collections and index metadata exist;
+/// the reconciler's resume refuses a record left `false`.
+pub(crate) const RESTORE_JOB_DDL_DONE: &str = "restore_job.ddl_done";
 
 fn internal(e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(e.to_string())
@@ -211,7 +225,7 @@ fn key_filter(key: &BackupKey) -> Document {
 /// `set` as the `$set` stage of a pipeline update: `$$NOW` stays the server's
 /// clock and every other value is wrapped in `$literal`, so a string, or a
 /// key inside the source table object, is never read as a field path.
-fn literal_set(set: Document) -> Document {
+pub(crate) fn literal_set(set: Document) -> Document {
     set.into_iter()
         .map(|(k, v)| {
             let v = match v {
@@ -294,28 +308,6 @@ pub(crate) fn dead_restore_job_filter(stale_after: Duration) -> Document {
             },
         ]
     }
-}
-
-/// A restore job record as the two listings read a table document.
-fn restore_job_row(doc: &Document) -> Result<RestoreJobRow, StorageError> {
-    let id = doc
-        .get_document("_id")
-        .map_err(|_| StorageError::Internal("table is missing _id".to_owned()))?;
-    let job = doc.get_document(RESTORE_JOB).map_err(|_| {
-        StorageError::Internal("restore target is missing its job record".to_owned())
-    })?;
-    Ok(RestoreJobRow {
-        target: RestoreTargetKey {
-            account_id: required_str(id, "account_id")?,
-            table_name: required_str(id, "table_name")?,
-            table_id: required_str(doc, "table_id")?,
-        },
-        source_backup_arn: required_str(doc, "restore_source_backup_arn")?,
-        kind: RestoreKind::parse(&required_str(job, "kind")?)?,
-        status: JobStatus::parse(&required_str(job, "status")?)?,
-        owner_generation: generation_from_field(job, "owner_generation"),
-        heartbeat_at: optional_datetime(job, "heartbeat_at").unwrap_or(0.0),
-    })
 }
 
 /// A backup job's handle on its `backup_index` document.
@@ -420,6 +412,165 @@ impl JobClaim for MongoBackupClaim {
     }
 }
 
+/// The filter of the `tables` document `key` names: the `_id` and the table
+/// id, so a table re-created under the name is never the one addressed.
+fn target_filter(key: &RestoreTargetKey) -> Document {
+    doc! {
+        "_id": { "account_id": &key.account_id, "table_name": &key.table_name },
+        "table_id": &key.table_id,
+    }
+}
+
+/// One restore target's `tables` document as a [`RestoreJobRow`]: the key,
+/// the provenance and every member of the `restore_job` subdocument; the
+/// store is read when all three of its fields are there.
+pub(crate) fn restore_job_from_doc(doc: &Document) -> Result<RestoreJobRow, StorageError> {
+    let id = doc
+        .get_document("_id")
+        .map_err(|_| StorageError::Internal("table is missing _id".to_owned()))?;
+    let job = doc.get_document(RESTORE_JOB).map_err(|_| {
+        StorageError::Internal("restore target is missing its job record".to_owned())
+    })?;
+    let source_backup_arn = required_str(doc, "restore_source_backup_arn")?;
+    let store = match (
+        job.get_str("store_kind"),
+        job.get_str("store_root"),
+        job.get_str("store_id"),
+    ) {
+        (Ok(kind), Ok(store_root), Ok(store_id)) => Some(StoreIdentity {
+            store_kind: StoreKind::parse(kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "restore of {source_backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?,
+            store_root: store_root.to_owned(),
+            store_id: store_id.to_owned(),
+        }),
+        _ => None,
+    };
+    Ok(RestoreJobRow {
+        target: RestoreTargetKey {
+            account_id: required_str(id, "account_id")?,
+            table_name: required_str(id, "table_name")?,
+            table_id: required_str(doc, "table_id")?,
+        },
+        source_backup_arn,
+        kind: RestoreKind::parse(&required_str(job, "kind")?)?,
+        status: JobStatus::parse(&required_str(job, "status")?)?,
+        owner_generation: generation_from_field(job, "owner_generation"),
+        heartbeat_at: optional_datetime(job, "heartbeat_at").unwrap_or(0.0),
+        store,
+        spool_host: job.get_str("spool_host").ok().map(str::to_owned),
+        file_index: match job.get("file_index") {
+            Some(Bson::Int32(i)) => u32::try_from(*i).ok(),
+            Some(Bson::Int64(i)) => u32::try_from(*i).ok(),
+            _ => None,
+        },
+        items_applied: match job.get("items_applied") {
+            Some(Bson::Int32(i)) => u64::try_from(*i).ok(),
+            Some(Bson::Int64(i)) => u64::try_from(*i).ok(),
+            _ => None,
+        },
+        failure_reason: job.get_str("failure_reason").ok().map(str::to_owned),
+        completed_at: optional_datetime(job, "completed_at"),
+    })
+}
+
+/// A store-backed restore job's handle on the job record of its target's
+/// `tables` document: every write carries the target's key, its table id
+/// and the generation, and the heartbeat and the status writes also require
+/// the record RUNNING (or the `from` status).
+struct MongoRestoreClaim {
+    tables: mongodb::Collection<Document>,
+    key: RestoreTargetKey,
+    generation: u64,
+}
+
+impl MongoRestoreClaim {
+    /// The filter of the record while it is in `status` under this claim.
+    fn owned_filter(&self, status: JobStatus) -> Document {
+        let mut filter = target_filter(&self.key);
+        filter.insert(RESTORE_JOB_STATUS, status.as_str());
+        filter.insert(RESTORE_JOB_GENERATION, generation_field(self.generation));
+        filter
+    }
+}
+
+impl JobClaim for MongoRestoreClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxFuture<'_, Result<Heartbeat, StorageError>> {
+        Box::pin(async move {
+            let result = self
+                .tables
+                .update_one(
+                    self.owned_filter(JobStatus::Running),
+                    vec![doc! { "$set": { RESTORE_JOB_HEARTBEAT: "$$NOW" } }],
+                )
+                .await
+                .map_err(|e| StorageError::Internal(format!("restore heartbeat: {e}")))?;
+            Ok(if result.matched_count == 1 {
+                Heartbeat::Confirmed
+            } else {
+                Heartbeat::Lost
+            })
+        })
+    }
+
+    fn set_status<'a>(
+        &'a self,
+        from: JobStatus,
+        to: JobStatus,
+        fields: &'a StatusFields,
+    ) -> BoxFuture<'a, Result<WriteOutcome, StorageError>> {
+        Box::pin(async move {
+            let mut set = doc! { RESTORE_JOB_STATUS: to.as_str() };
+            if let Some(reason) = &fields.failure_reason {
+                set.insert(RESTORE_JOB_FAILURE_REASON, reason.as_str());
+            }
+            if fields.completed {
+                set.insert(RESTORE_JOB_COMPLETED_AT, "$$NOW");
+            }
+            let set = literal_set(set);
+            match self
+                .tables
+                .update_one(self.owned_filter(from), vec![doc! { "$set": set }])
+                .await
+            {
+                Ok(result) if result.matched_count == 1 => Ok(WriteOutcome::Matched),
+                Ok(_) => Ok(WriteOutcome::NotMatched),
+                Err(e) if outcome_unknown(&e) => Ok(WriteOutcome::Unknown),
+                Err(e) => Err(internal(e)),
+            }
+        })
+    }
+
+    fn read(&self) -> BoxFuture<'_, Result<JobRow, StorageError>> {
+        Box::pin(async move {
+            let doc = self
+                .tables
+                .find_one(target_filter(&self.key))
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    StorageError::TableNotFound(format!(
+                        "restore target {} (table id {}) has no catalog document",
+                        self.key.table_name, self.key.table_id
+                    ))
+                })?;
+            let row = restore_job_from_doc(&doc)?;
+            Ok(JobRow {
+                status: row.status,
+                owner_generation: row.owner_generation,
+                heartbeat_at: row.heartbeat_at,
+                failure_reason: row.failure_reason,
+            })
+        })
+    }
+}
+
 impl MongoEngine {
     pub(crate) fn backup_index(&self) -> mongodb::Collection<Document> {
         self.catalog_db.collection::<Document>(BACKUP_INDEX)
@@ -519,6 +670,143 @@ impl MongoEngine {
             "DeleteBackup of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting \
              attempts",
             key.backup_arn
+        )))
+    }
+
+    /// A store-backed restore's registration (the design's 5.3 step 4) as
+    /// one session transaction: `$inc` the `backup_index` row's `lock_seq`
+    /// while it is AVAILABLE (the lock `start_backup_delete` takes, so the
+    /// two order wholly one before the other), run the in-use rule, insert
+    /// the CREATING target with its provenance and its RUNNING `kind =
+    /// manifest` record under a fresh generation, the store and the
+    /// claimant's spool, with the server's clock on its heartbeat. The
+    /// transaction commits right after the insert, before the target's
+    /// collections and indexes are created; one that lost a write conflict
+    /// (a DeleteBackup or another registration of the backup) is re-run and
+    /// sees the other's result.
+    ///
+    /// Refusals: a missing or non-AVAILABLE row is `Backup not found`; a
+    /// CREATING target of the backup is `BackupInUse` naming it; a taken
+    /// name is what `create_table_for_restore` reports (`TableAlreadyExists`,
+    /// or `TableBeingRestored` when the name is a CREATING restore target).
+    async fn claim_restore_tx(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistrationRow,
+    ) -> Result<RestoreRegistered, StorageError> {
+        let target_table_name = input.table_name.clone();
+        let backup_arn = registration.backup.backup_arn.as_str();
+        let index = self.backup_index();
+        let mut session = self.client.start_session().await.map_err(internal)?;
+        let tx_options = self.write_transaction_options();
+        let generation = new_generation();
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
+                .await
+                .map_err(internal)?;
+            let body: Result<Result<TableDescription, StorageError>, TxErr> = async {
+                let mut lock = key_filter(&registration.backup);
+                lock.insert("status", BackupStatus::Available.as_str());
+                let locked = index
+                    .find_one_and_update(lock, doc! { "$inc": { LOCK_SEQ: 1_i64 } })
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                if locked.is_none() {
+                    return Ok(Err(not_found(backup_arn)));
+                }
+                if let Some(restoring) = self
+                    .creating_restore_target(account_id, backup_arn, Some(&mut session))
+                    .await
+                    .map_err(TxErr::from)?
+                {
+                    return Ok(Err(backup_in_use(&restoring, backup_arn)));
+                }
+                let mut target = RestoreRegistration {
+                    backup_arn,
+                    source_table_arn: &registration.source_table_arn,
+                    restore_date_time: epoch_secs_datetime(registration.restore_date_time),
+                    owner_generation: generation,
+                    // This process's clock, replaced by the server's inside
+                    // the transaction (`stamp_server_clock`); test builds set
+                    // it behind to prove the replacement.
+                    first_heartbeat: self.local_now(),
+                    record: RestoreRecord::Manifest {
+                        store: &registration.store,
+                        spool_host: registration.spool_host.as_deref(),
+                    },
+                    session: Some(&mut session),
+                };
+                match self
+                    .create_table_for_restore(account_id, input.clone(), &mut target)
+                    .await
+                {
+                    Ok(desc) => Ok(Ok(desc)),
+                    Err(StorageError::Transient(_)) => Err(TxErr::Transient),
+                    Err(e) => {
+                        // A creation that failed after its insert committed
+                        // (a collection or index could not be created) left a
+                        // registered target under this generation; a name
+                        // refusal left nothing, and the removal matches
+                        // nothing.
+                        if let Err(cleanup) = self
+                            .remove_target_of_generation(account_id, &target_table_name, generation)
+                            .await
+                        {
+                            tracing::error!(
+                                "restore of {backup_arn} into {target_table_name} failed during \
+                                 target creation ({e}), and cleanup failed: {cleanup}"
+                            );
+                        }
+                        Ok(Err(e))
+                    }
+                }
+            }
+            .await;
+            match body {
+                // The insert committed its transaction before the target's
+                // collections were created; nothing is left to commit.
+                Ok(Ok(mut desc)) => {
+                    desc.restore_summary = Some(RestoreSummary {
+                        source_backup_arn: Some(backup_arn.to_owned()),
+                        source_table_arn: Some(registration.source_table_arn.clone()),
+                        restore_date_time: registration.restore_date_time,
+                        restore_in_progress: true,
+                    });
+                    let key = RestoreTargetKey {
+                        account_id: account_id.to_owned(),
+                        table_name: target_table_name,
+                        table_id: desc.table_id.clone(),
+                    };
+                    return Ok((
+                        desc,
+                        Box::new(MongoRestoreClaim {
+                            tables: self.tables(),
+                            key,
+                            generation,
+                        }) as Box<dyn JobClaim>,
+                    ));
+                }
+                Ok(Err(refusal)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(refusal);
+                }
+                Err(TxErr::Transient) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
+        }
+        Err(StorageError::Internal(format!(
+            "the registration of the restore of {backup_arn} into {target_table_name} did not \
+             commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting attempts"
         )))
     }
 }
@@ -884,7 +1172,7 @@ impl BackupCatalog for MongoEngine {
             // cannot read, so one such document does not stop the cycle.
             Ok(docs
                 .iter()
-                .filter_map(|doc| match restore_job_row(doc) {
+                .filter_map(|doc| match restore_job_from_doc(doc) {
                     Ok(row) => Some(row),
                     Err(e) => {
                         tracing::warn!(
@@ -895,6 +1183,97 @@ impl BackupCatalog for MongoEngine {
                     }
                 })
                 .collect())
+        })
+    }
+
+    fn claim_restore<'a>(
+        &'a self,
+        account_id: &'a str,
+        input: CreateTableInput,
+        registration: &'a RestoreRegistrationRow,
+    ) -> BoxFuture<'a, Result<RestoreRegistered, StorageError>> {
+        Box::pin(self.claim_restore_tx(account_id, input, registration))
+    }
+
+    fn claim_restore_dead<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+        stale_after: Duration,
+        spool_host: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        Box::pin(async move {
+            // The heartbeat is the liveness test, as for a backup row: a
+            // RUNNING manifest record whose heartbeat is older than the window
+            // on the server's clock has no owner, and the one write below
+            // tests that and takes the record under a fresh generation with
+            // the claimant's spool and `heartbeat_at` at the server's clock,
+            // so a second taker (another instance's reconciler in the period
+            // before the successor's first beat) finds it live; the trait doc
+            // says why a restore record is refreshed where a backup row is
+            // not. A legacy record is never taken over (the reconciler fails
+            // it), and a record that is not RUNNING is its owner's or
+            // finished.
+            let generation = new_generation();
+            let mut filter = target_filter(key);
+            filter.insert(RESTORE_JOB_STATUS, JobStatus::Running.as_str());
+            filter.insert(RESTORE_JOB_KIND, RestoreKind::Manifest.as_str());
+            filter.insert("$expr", age_is_stale(&[RESTORE_JOB_HEARTBEAT], stale_after));
+            let mut update = vec![doc! { "$set": literal_set(doc! {
+                RESTORE_JOB_GENERATION: generation_field(generation),
+                RESTORE_JOB_HEARTBEAT: "$$NOW",
+            }) }];
+            match spool_host {
+                Some(host) => update.push(doc! { "$set": literal_set(doc! {
+                    RESTORE_JOB_SPOOL_HOST: host,
+                }) }),
+                None => update.push(doc! { "$unset": RESTORE_JOB_SPOOL_HOST }),
+            }
+            let taken = self
+                .tables()
+                .find_one_and_update(filter, update)
+                .await
+                .map_err(internal)?;
+            Ok(taken.map(|_| {
+                Box::new(MongoRestoreClaim {
+                    tables: self.tables(),
+                    key: key.clone(),
+                    generation,
+                }) as Box<dyn JobClaim>
+            }))
+        })
+    }
+
+    fn read_restore_job<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            let mut filter = target_filter(key);
+            filter.insert(RESTORE_JOB, doc! { "$exists": true });
+            let doc = self.tables().find_one(filter).await.map_err(internal)?;
+            doc.as_ref().map(restore_job_from_doc).transpose()
+        })
+    }
+
+    fn list_restore_jobs<'a>(
+        &'a self,
+        status: Option<JobStatus>,
+    ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            let mut filter = doc! { RESTORE_JOB: { "$exists": true } };
+            if let Some(status) = status {
+                filter.insert(RESTORE_JOB_STATUS, status.as_str());
+            }
+            let docs: Vec<Document> = self
+                .tables()
+                .find(filter)
+                .sort(doc! { "_id": 1 })
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)?;
+            docs.iter().map(restore_job_from_doc).collect()
         })
     }
 
@@ -910,7 +1289,7 @@ impl BackupCatalog for MongoEngine {
                 .try_collect()
                 .await
                 .map_err(internal)?;
-            docs.iter().map(restore_job_row).collect()
+            docs.iter().map(restore_job_from_doc).collect()
         })
     }
 

@@ -75,16 +75,36 @@ pub enum MetricName {
     /// Seconds between a running backup job's snapshot instant and now
     /// (gauge), recorded at each confirmed heartbeat.
     BackupSnapshotAge,
-    /// Store operations a backup job or the backup reconciler saw fail; the
-    /// operation dimension names the store call (`put` by the job's
-    /// uploads, `delete_prefix` by its failure path and the reconciler's
-    /// deleting duties, `get` and `list` by the reconciler's manifest probe
-    /// and deleting duties).
+    /// Store operations a backup or restore job or the backup reconciler
+    /// saw fail; the operation dimension names the store call (`put` by a
+    /// backup job's uploads, `delete_prefix` by its failure path and the
+    /// reconciler's deleting duties, `get` by a restore's reads of the
+    /// manifest and its sidecar, in the request and in a resume, by a
+    /// restore job's downloads and by the reconciler's manifest probe, and
+    /// `list` by the reconciler's manifest probe and deleting duties).
     BackupStoreErrors,
+    /// Store-backed restore jobs ended, one per job; the operation dimension
+    /// carries the outcome ([`BackupJobOutcome`]: `succeeded` for a DONE
+    /// record, `failed` for a FAILED one or a job that stopped without a
+    /// status write of its own, `cancelled` for one the shutdown stopped,
+    /// whose record stays RUNNING for a resume). Named as `BackupJobs` is
+    /// (the `/metrics` name; a converter's would be
+    /// `restore_jobs_total{outcome}`).
+    RestoreJobs,
+    /// Duration of a store-backed restore job in microseconds, from its
+    /// registration to the end of its last catalog or store call, with the
+    /// outcome as the operation dimension.
+    RestoreJobDuration,
+    /// Bytes of each data-file download attempt of a restore job as they
+    /// arrived, verified or not, so an attempt the job retried counts its
+    /// bytes too; the manifest and sidecar reads, and a filesystem store's
+    /// second read of each file for the load, are not counted.
+    RestoreBytesDownloaded,
 }
 
-/// How a store-backed backup job ended, the operation dimension of
-/// [`MetricName::BackupJobs`] and [`MetricName::BackupJobDuration`].
+/// How a store-backed backup or restore job ended, the operation dimension
+/// of [`MetricName::BackupJobs`], [`MetricName::BackupJobDuration`],
+/// [`MetricName::RestoreJobs`] and [`MetricName::RestoreJobDuration`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackupJobOutcome {
     /// The manifest was written and the row is AVAILABLE.
@@ -92,8 +112,8 @@ pub enum BackupJobOutcome {
     /// The row is FAILED, or the job stopped without a status write of its
     /// own (its claim lost).
     Failed,
-    /// The server's shutdown stopped the job; the row is FAILED with reason
-    /// `shutdown`.
+    /// The server's shutdown stopped the job; a backup row is FAILED with
+    /// reason `shutdown`, a restore record stays RUNNING for a resume.
     Cancelled,
 }
 
@@ -141,6 +161,9 @@ impl std::fmt::Display for MetricName {
             Self::BackupBytesUploaded => f.write_str("BackupBytesUploaded"),
             Self::BackupSnapshotAge => f.write_str("BackupSnapshotAge"),
             Self::BackupStoreErrors => f.write_str("BackupStoreErrors"),
+            Self::RestoreJobs => f.write_str("RestoreJobs"),
+            Self::RestoreJobDuration => f.write_str("RestoreJobDuration"),
+            Self::RestoreBytesDownloaded => f.write_str("RestoreBytesDownloaded"),
         }
     }
 }
@@ -189,6 +212,9 @@ pub enum QuerySource {
     /// A store-backed backup job (the worker metrics are recorded once per
     /// job, at its end).
     BackupJob,
+    /// A store-backed restore job (the worker metrics are recorded once per
+    /// job, at its end; a job the shutdown stopped records none).
+    RestoreJob,
     /// Management CLI commands.
     Management,
 }
@@ -211,6 +237,7 @@ impl std::fmt::Display for QuerySource {
             Self::LoginAttemptCleanup => f.write_str("LoginAttemptCleanup"),
             Self::BackupReconciler => f.write_str("BackupReconciler"),
             Self::BackupJob => f.write_str("BackupJob"),
+            Self::RestoreJob => f.write_str("RestoreJob"),
             Self::Management => f.write_str("Management"),
         }
     }
