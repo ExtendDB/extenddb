@@ -26,9 +26,12 @@ pub mod migrations;
 mod operations;
 mod password_hash_store;
 mod pg_util;
+mod restore_engine;
 mod snapshot_engine;
 #[doc(hidden)]
-pub use snapshot_engine::map_fetch_error;
+pub use snapshot_engine::{
+    MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
+};
 mod stream_engine;
 mod stream_lifecycle;
 #[doc(hidden)]
@@ -39,11 +42,15 @@ mod ttl_worker;
 mod update_table;
 mod vector;
 mod vector_search;
+mod warm_throughput;
 mod worker_store;
 mod workers;
 
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub use backup_engine::RESTORE_LOCK_SEED;
+pub use backup_engine::claim_session_settings;
+#[doc(hidden)]
+pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;
 pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
@@ -101,6 +108,11 @@ pub use delete_table::test_pause::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use migrations::apply_all_migrations;
+/// Pause `sweep_restore_progress` between its two reads, so a test can
+/// commit a registration and a progress row in between.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use restore_engine::sweep_pause;
 
 /// The `PostgreSQL` storage backend.
 ///
@@ -295,6 +307,9 @@ pub struct PostgresEngine {
     /// wait; the open needs only a data connection by then, so they delay it
     /// no further.
     pub(crate) snapshot_open_slots: Arc<tokio::sync::Semaphore>,
+    /// The permits `snapshot_open_slots` was built with, for the refusal
+    /// that names the bound.
+    pub(crate) snapshot_slot_limit: usize,
     /// Whether `data_pool` is the catalog pool (no separate data database).
     /// The snapshot open uses one transaction on that layout, and
     /// `DeleteTable` runs its in-use probe and its synchronous drop on the
@@ -425,6 +440,7 @@ impl PostgresEngine {
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
             ))),
+            snapshot_slot_limit: snapshot_slot_count(pool_size),
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),

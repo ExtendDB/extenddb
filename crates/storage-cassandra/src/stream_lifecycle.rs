@@ -263,6 +263,36 @@ impl CassandraEngine {
         }
     }
 
+    /// The stream specification JSON and label of the table's row, as the
+    /// conditional catalog write of a stream change compares them, read at
+    /// `LOCAL_SERIAL` so that a write another lightweight transaction
+    /// committed is seen; `None` when the row is gone.
+    pub(crate) async fn stream_condition_fields(
+        &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, StorageError> {
+        let catalog_ks = self.catalog_keyspace();
+        let row = crate::cassandra_util::query_rows_serial::<StorageError>(
+            &self.session_arc(),
+            &format!(
+                "SELECT stream_specification, stream_label FROM {catalog_ks}.tables \
+                 WHERE account_id = ? AND table_name = ?"
+            ),
+            cdrs_tokio::query_values!(account_id, table_name),
+            "update_table stream condition re-read",
+        )
+        .await?
+        .into_iter()
+        .next();
+        Ok(row.map(|r| {
+            (
+                r.get_by_name("stream_specification").ok().flatten(),
+                r.get_by_name("stream_label").ok().flatten(),
+            )
+        }))
+    }
+
     /// The refusal for a stream change whose conditional catalog write found
     /// the stream fields changed: re-read the row and decide the request
     /// against it, which refuses the loser of two overlapping changes with the

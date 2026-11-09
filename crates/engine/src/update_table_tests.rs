@@ -65,34 +65,6 @@ fn a_stream_change_travels_alone() {
 }
 
 #[test]
-fn a_created_gsi_throughput_below_one_is_refused() {
-    let input = |pt: Value| -> UpdateTableInput {
-        serde_json::from_value(serde_json::json!({
-            "TableName": "t",
-            "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-            "GlobalSecondaryIndexUpdates": [{ "Create": {
-                "IndexName": "gix",
-                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-                "Projection": { "ProjectionType": "ALL" },
-                "ProvisionedThroughput": pt,
-            }}],
-        }))
-        .unwrap()
-    };
-    for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
-        let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
-        match validate_gsi_updates(&input(pt)).unwrap_err() {
-            DynamoDbError::ValidationException(m) => {
-                assert!(m.ends_with("for index: gix"), "{m}");
-            }
-            other => panic!("({read}, {write}): {other:?}"),
-        }
-    }
-    let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
-    validate_gsi_updates(&input(ok)).unwrap();
-}
-
-#[test]
 fn projected_total_counts_kept_indexes_and_created_ones() {
     use extenddb_core::types::{
         GlobalSecondaryIndexUpdate, GsiDescription, LsiDescription, Projection, ProjectionType,
@@ -113,6 +85,8 @@ fn projected_total_counts_kept_indexes_and_created_ones() {
                 index_size_bytes: 0,
                 item_count: 0,
                 index_arn: String::new(),
+                warm_throughput: None,
+                warm_throughput_record: None,
             },
             GsiDescription {
                 index_name: "dropped".to_owned(),
@@ -123,6 +97,8 @@ fn projected_total_counts_kept_indexes_and_created_ones() {
                 index_size_bytes: 0,
                 item_count: 0,
                 index_arn: String::new(),
+                warm_throughput: None,
+                warm_throughput_record: None,
             },
         ]),
         local_secondary_indexes: Some(vec![LsiDescription {

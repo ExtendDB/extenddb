@@ -32,6 +32,7 @@ pub mod migrations;
 pub mod operations;
 mod password_hash_store;
 pub(crate) mod propagation_hold;
+mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
 mod stream_lifecycle;
@@ -42,6 +43,7 @@ mod table_helpers;
 pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
+mod warm_throughput;
 mod worker_store;
 pub mod workers;
 
@@ -133,6 +135,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                None,                                // every account keyspace
                 token,
             )
             .await;
