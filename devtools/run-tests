@@ -38,7 +38,8 @@
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
 #   --shard K/N       run only shard K of N of each pytest suite (CI); only
-#                     shard 1 runs --terraform
+#                     shard 1 runs --terraform, and no shard runs the SQLite
+#                     build's backup store wire tests
 #   --config PATH     config file path (default: extenddb.toml in repo root)
 #
 # Environment (--pytest against extenddb):
@@ -114,7 +115,8 @@ Options:
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
   --shard K/N       run only shard K of N of each pytest suite; only shard 1
-                    runs --terraform
+                    runs --terraform, and no shard runs the SQLite build's
+                    backup store wire tests
   --config PATH     config file path
 
 Environment (--extenddb with an integration suite):
@@ -567,7 +569,8 @@ if $RUN_PYTEST; then
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
     # CLI lifecycle tests manage their own server; exclude from main suite.
     # tests/test_backup_store_config.py does too: it runs below, in the CLI
-    # lifecycle list on PostgreSQL and in its own step on a SQLite build.
+    # lifecycle list on PostgreSQL and, in a run without --shard, in its own
+    # step on a SQLite build.
     # tests/test_backup_job.py starts its own servers as well; CI runs it in
     # the integration workflows' backup steps, this script does not run it.
     # -rP: the summary repeats the passed tests that printed something (the
@@ -707,7 +710,10 @@ fi
 # EXTENDDB_TEST_S3_ENDPOINT names a moto endpoint), `backup list` and
 # `backup purge` with their signals and exit codes. Its PostgreSQL cells run
 # in the CLI lifecycle list above. The build decides: the step runs when the
-# binary reports itself a SQLite build.
+# binary reports itself a SQLite build. A run with --shard skips it: the file
+# is not split into shards, so every shard would run all of it, and CI's
+# run-integration-sqlite-s3 job runs it once per run on the same build, with
+# the S3 mock.
 if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" ]]; then
     WIRE_BINARY="${EXTENDDB_BINARY:-target/release/$TARGET}"
     if [[ ! -x "$WIRE_BINARY" ]]; then
@@ -716,17 +722,21 @@ if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" ]]; then
     if [[ -x "$WIRE_BINARY" ]] && "$WIRE_BINARY" version 2>/dev/null | grep -q '(sqlite)'; then
         WIRE_OUTFILE="discussions/test-backup-store-wire-${HASH}.txt"
         echo "=== Backup store wire tests (SQLite build) → ${WIRE_OUTFILE} ==="
-        echo "  binary: $WIRE_BINARY"
-        echo "  S3 endpoint: ${EXTENDDB_TEST_S3_ENDPOINT:-none (the S3 cells skip)}"
-        WIRE_ARGS=(python3 -m pytest tests/test_backup_store_config.py -v)
-        if [[ -n "$FILTER" ]]; then
-            WIRE_ARGS+=(-k "$FILTER")
-        fi
-        if EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE"; then
-            echo "  ✓ Backup store wire tests passed"
+        if [[ -n "$SHARD" ]]; then
+            echo "  skipped: shard $SHARD (run-integration-sqlite-s3 runs this file)"
         else
-            echo "  ✗ Backup store wire tests failed"
-            PASS=false
+            echo "  binary: $WIRE_BINARY"
+            echo "  S3 endpoint: ${EXTENDDB_TEST_S3_ENDPOINT:-none (the S3 cells skip)}"
+            WIRE_ARGS=(python3 -m pytest tests/test_backup_store_config.py -v)
+            if [[ -n "$FILTER" ]]; then
+                WIRE_ARGS+=(-k "$FILTER")
+            fi
+            if EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE"; then
+                echo "  ✓ Backup store wire tests passed"
+            else
+                echo "  ✗ Backup store wire tests failed"
+                PASS=false
+            fi
         fi
         echo ""
     fi
