@@ -233,7 +233,7 @@ All defaults match real DynamoDB limits. Override only for testing edge cases.
 | `level` | `info` | Initial log level (overridden by runtime setting) |
 | `format` | `pretty` | Log format: `pretty` or `json` |
 
-Logging always goes to syslog (facility: daemon, ident: extenddb).
+The server logs to syslog (facility: daemon, ident: extenddb) when it runs as a daemon, and to stderr with `--foreground`.
 
 ### Environment Variable Overrides
 
@@ -893,7 +893,7 @@ Sessions end 8 hours after login. Click "Logout" to end immediately. Deleting an
 
 ### Syslog
 
-All server logging goes to syslog (facility: daemon, ident: extenddb).
+The server logs to syslog (facility: daemon, ident: extenddb) when it runs as a daemon, and to stderr with `--foreground`.
 
 **Linux:**
 
@@ -926,14 +926,14 @@ log show --predicate 'processImagePath ENDSWITH "extenddb" AND messageType >= 16
 
 ### Audit Logging
 
-Management and settings operations are logged at WARN level:
+The server logs some management operations, and the settings changes made through the management API, at WARN level. [Security Model: Logging](10-security-model.md#logging) lists them.
 
 ```bash
 # View audit entries
 journalctl -t extenddb | grep 'extenddb::audit'
 ```
 
-Targets: `extenddb::audit::manage` (management ops), `extenddb::audit::settings` (settings changes).
+Targets: `extenddb::audit::manage` (some management operations), `extenddb::audit::settings` (settings changes made through the management API).
 
 ### Metrics
 
