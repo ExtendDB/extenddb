@@ -119,7 +119,7 @@ pub(super) async fn scan_request(
     insert_names_values(&mut body, &bridge)?;
     insert_common(&mut body, req, paging);
 
-    crate::handle_scan(Value::Object(body), &[], ctx)
+    crate::scan::handle_partiql_scan(Value::Object(body), ctx)
         .await
         .map_err(crate::partiql::bare_expression_error)
 }

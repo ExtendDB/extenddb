@@ -25,7 +25,8 @@ use crate::index_helpers::{
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::scan_request::{
-    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, member_order,
+    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, ValuesDepth,
+    member_order,
 };
 use crate::serialize_output;
 use crate::start_key::validate_scan_exclusive_start_key;
@@ -43,10 +44,37 @@ use crate::{DispatchMetrics, DispatchResult};
 /// # Errors
 ///
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
-#[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_scan(
+    body: Value,
+    raw_body: &[u8],
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
+    run_scan(body, raw_body, ValuesDepth::Checked, ctx).await
+}
+
+/// Handle the `Scan` a PartiQL `SELECT` is translated into: the checks and the
+/// read of [`handle_scan`], except the nesting depth of the
+/// `ExpressionAttributeValues` entries, which is not checked in either order
+/// (see [`ValuesDepth`]). The body has no request text, so the parsed body's
+/// member order stands in for the request's order.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
+pub(crate) async fn handle_partiql_scan(
+    body: Value,
+    ctx: &OperationContext,
+) -> Result<DispatchResult, DynamoDbError> {
+    run_scan(body, &[], ValuesDepth::Unchecked, ctx).await
+}
+
+/// The checks and the read of a `Scan` body, with the nesting depth of the
+/// `ExpressionAttributeValues` entries checked as `depth` says.
+#[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
+async fn run_scan(
     mut body: Value,
     raw_body: &[u8],
+    depth: ValuesDepth,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // The checks run in one of the service's two orders, measured 2026-10-25
@@ -87,7 +115,7 @@ pub async fn handle_scan(
     // request checks and the table.
     let order = CheckOrder::of(&body);
     let values_order = member_order(raw_body, "ExpressionAttributeValues");
-    crate::scan_request::validate_scan_request_body(&body, order, values_order.as_deref())?;
+    crate::scan_request::validate_scan_request_body(&body, order, values_order.as_deref(), depth)?;
     // A key, an ExpressionAttributeValues entry, a ScanFilter list value (order
     // U) or a Select value (order R) that the service reports later is held
     // back here, so that the typed deserialization does not report it ahead of
@@ -164,7 +192,9 @@ pub async fn handle_scan(
             // `ExpressionValuesBody`).
             start_key.validate(order)?;
             expression_values.validate()?;
-            if let Some(ref values) = input.expression_attribute_values {
+            if depth == ValuesDepth::Checked
+                && let Some(ref values) = input.expression_attribute_values
+            {
                 extenddb_core::validation::validate_attribute_values_nesting_depth(
                     values.values(),
                 )?;

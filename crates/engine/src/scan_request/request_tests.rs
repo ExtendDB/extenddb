@@ -8,7 +8,8 @@
 //! Every row is a request sent to the service (us-east-1, each request twice,
 //! a Scan of a table the probe created) with the answer it gave: on 2026-10-25
 //! at 10:38 and 10:55 UTC, on 2026-10-30 at 12:40 UTC, on 2026-10-31 between
-//! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The tests of
+//! 23:54 and 23:56 UTC and on 2026-11-05 where a test says so. The test of the
+//! PartiQL Scan's checks names its own measurement. The tests of
 //! `StartKeyBody::take` and `SelectBody::take` check which values they hold
 //! back, with no service answer; the tests of `ExpressionValuesBody::take` and
 //! `ScanFilterBody::take` also check the measured texts they keep; the tests of
@@ -19,7 +20,7 @@ use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
 use super::{
-    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody,
+    CheckOrder, ExpressionValuesBody, ScanFilterBody, SelectBody, StartKeyBody, ValuesDepth,
     fitted_member_order, hash_table_mask, java_hash_bucket, member_order,
     validate_scan_request_body,
 };
@@ -44,9 +45,21 @@ fn validation_message(result: Result<(), DynamoDbError>) -> Option<String> {
     }
 }
 
-/// The request-time checks on `body`, in the order of the body's class.
+/// The request-time checks of a `Scan` request on `body`, in the order of the
+/// body's class.
 fn check(body: &Value) -> Option<String> {
-    validation_message(validate_scan_request_body(body, CheckOrder::of(body), None))
+    check_with(body, ValuesDepth::Checked)
+}
+
+/// The request-time checks on `body` with the nesting depth checked as
+/// `depth` says, in the order of the body's class.
+fn check_with(body: &Value, depth: ValuesDepth) -> Option<String> {
+    validation_message(validate_scan_request_body(
+        body,
+        CheckOrder::of(body),
+        None,
+        depth,
+    ))
 }
 
 /// A Scan body with the fields of `extra` added to the table name.
@@ -887,7 +900,8 @@ fn the_order_r_number_check_visits_the_entries_in_the_hash_order() {
             validation_message(validate_scan_request_body(
                 &body,
                 CheckOrder::Readable,
-                Some(&names)
+                Some(&names),
+                ValuesDepth::Checked
             )),
             Some(numeric("fred")),
             "{request_order:?}"
@@ -905,7 +919,8 @@ fn the_order_r_number_check_visits_the_entries_in_the_hash_order() {
             validation_message(validate_scan_request_body(
                 &body,
                 CheckOrder::Readable,
-                Some(&names)
+                Some(&names),
+                ValuesDepth::Checked
             )),
             Some(numeric(first)),
             "{request_order:?}"
@@ -1172,6 +1187,40 @@ fn a_value_nested_32_levels_deep_is_refused_and_31_levels_pass() {
         json!({"ExclusiveStartKey": {"pk": {}, "sk": {"S": "x"}}}),
     );
     assert_eq!(check(&beside_key), None);
+}
+
+/// Measured 2026-11-09 at 11:44 UTC (us-east-1, each request once):
+/// `SELECT * FROM "t" WHERE a <> ?` with a parameter of 32 maps around a
+/// string returns two items, and with 33 maps answers the nesting text; a
+/// `Scan` with the `FilterExpression` `a <> :v` answers the nesting text for
+/// the 32-map `:v` and returns the two items for 31 maps. The body here is the
+/// one the `SELECT` is translated into. Beside the deep value the PartiQL
+/// Scan's number check still runs (no service answer: the PartiQL parameter
+/// check refuses such a number first).
+#[test]
+fn a_value_nested_32_levels_deep_passes_the_checks_of_a_partiql_scan() {
+    let deep = |levels: usize| {
+        (0..levels).fold(json!({"S": "leaf"}), |inner, _| json!({"M": {"n": inner}}))
+    };
+    let select = |value: Value| {
+        scan(json!({
+            "FilterExpression": "#n0 <> :v0",
+            "ExpressionAttributeNames": {"#n0": "a"},
+            "ExpressionAttributeValues": {":v0": value},
+        }))
+    };
+    let body = select(deep(32));
+    assert_eq!(CheckOrder::of(&body), CheckOrder::Readable);
+    assert_eq!(check(&body).as_deref(), Some(NESTING));
+    assert_eq!(check_with(&body, ValuesDepth::Unchecked), None);
+    assert_eq!(check(&select(deep(31))), None);
+    assert_eq!(check_with(&select(deep(31)), ValuesDepth::Unchecked), None);
+    let mut with_number = body;
+    with_number["ExpressionAttributeValues"][":v1"] = json!({"N": "bob"});
+    assert_eq!(
+        check_with(&with_number, ValuesDepth::Unchecked).as_deref(),
+        Some(NUMERIC_BOB)
+    );
 }
 
 #[test]

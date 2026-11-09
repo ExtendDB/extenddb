@@ -9,7 +9,7 @@
 use extenddb_core::error::DynamoDbError;
 use serde_json::{Value, json};
 
-use super::{CheckOrder, validate_scan_request_body};
+use super::{CheckOrder, ValuesDepth, validate_scan_request_body};
 
 const NUMERIC_BOB: &str = "The parameter cannot be converted to a numeric value: bob";
 const LIMIT_RANGE: &str = "Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1";
@@ -25,7 +25,12 @@ fn message(result: Result<(), DynamoDbError>) -> Option<String> {
 }
 
 fn check(body: &Value) -> Option<String> {
-    message(validate_scan_request_body(body, CheckOrder::of(body), None))
+    message(validate_scan_request_body(
+        body,
+        CheckOrder::of(body),
+        None,
+        ValuesDepth::Checked,
+    ))
 }
 
 /// A Scan whose filter reads `:n = {"N": "bob"}`.
@@ -316,7 +321,12 @@ fn a_shape_fault_anywhere_in_the_body_is_reported_first() {
     for body in shape_faults {
         assert!(
             matches!(
-                validate_scan_request_body(&body, CheckOrder::of(&body), None),
+                validate_scan_request_body(
+                    &body,
+                    CheckOrder::of(&body),
+                    None,
+                    ValuesDepth::Checked
+                ),
                 Err(DynamoDbError::SerializationException(_))
             ),
             "{body}"

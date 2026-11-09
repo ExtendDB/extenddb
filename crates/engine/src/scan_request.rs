@@ -53,7 +53,9 @@
 //!    Attributes in the item have nested levels beyond supported limit`, 31
 //!    levels pass, read or unused, with or without an expression (2026-10-30
 //!    and 2026-10-31: ahead of the no-expression check, B4-5a; 2026-11-05:
-//!    ahead of the filter syntax, the `Select` enum and the key's number);
+//!    ahead of the filter syntax, the `Select` enum and the key's number). The
+//!    Scan a PartiQL `SELECT` is translated into skips this check in both
+//!    orders (see [`ValuesDepth`]);
 //! 6. the request parameter checks: `ExpressionAttributeNames` with no
 //!    expression, then `ExpressionAttributeValues` with no expression, then
 //!    `ConditionalOperator` with no `ScanFilter`, then a `ScanFilter`
@@ -191,15 +193,32 @@ impl CheckOrder {
     }
 }
 
+/// Whether the `Scan` checks include the nesting depth of the
+/// `ExpressionAttributeValues` entries, in either order. A `Scan` request's
+/// checks do: the service refuses an entry nested 32 levels deep. The checks
+/// of the Scan a PartiQL `SELECT` is translated into do not: the service
+/// accepts a parameter nested 32 levels deep in the `SELECT`'s `WHERE` clause
+/// and refuses one nested 33 levels (measured 2026-11-09). The PartiQL
+/// parameter check refuses 33 levels before the statement is read (see
+/// `extenddb_core::partiql::params`), and the parser refuses a literal inside
+/// 32 maps or lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValuesDepth {
+    /// Refuse an entry nested 32 levels deep or more.
+    Checked,
+    /// Leave the depth of the entries unchecked.
+    Unchecked,
+}
+
 /// The `Scan` checks that run on the raw request body, in the service's order
 /// for `order` (see the module doc): the `AttributesToGet` length and the
 /// `Limit`, `Segment` and `TotalSegments` ranges in one message, the
 /// `ReturnConsumedCapacity` enum, in order U the `Select` enum, the expression
 /// and non-expression parameter mix, every number in
-/// `ExpressionAttributeValues`, and in order R the nesting depth of
-/// `ExpressionAttributeValues`. The `ExclusiveStartKey` values are checked
-/// later, by [`StartKeyBody`], and in order R the `Select` enum by
-/// [`SelectBody`].
+/// `ExpressionAttributeValues`, and in order R, when `depth` is
+/// [`ValuesDepth::Checked`], the nesting depth of `ExpressionAttributeValues`.
+/// The `ExclusiveStartKey` values are checked later, by [`StartKeyBody`], and
+/// in order R the `Select` enum by [`SelectBody`].
 ///
 /// The checks read the raw body, so a field that does not deserialize (an
 /// invalid `Select`, for one) does not stop the ones before it. When a check
@@ -217,8 +236,9 @@ pub(crate) fn validate_scan_request_body(
     body: &Value,
     order: CheckOrder,
     values_order: Option<&[String]>,
+    depth: ValuesDepth,
 ) -> Result<(), DynamoDbError> {
-    scan_request_checks(body, order, values_order)
+    scan_request_checks(body, order, values_order, depth)
         .map_err(|check| shape_fault_first::<ScanInput>(body, check))
 }
 
@@ -230,6 +250,7 @@ fn scan_request_checks(
     body: &Value,
     order: CheckOrder,
     values_order: Option<&[String]>,
+    depth: ValuesDepth,
 ) -> Result<(), DynamoDbError> {
     validate_constraints(body, order)?;
 
@@ -268,9 +289,9 @@ fn scan_request_checks(
         // order the key and the order-U step use (an entry the deserializer
         // refuses, one with a set fault, is skipped here), then the set faults
         // in sorted name order, then the nesting depth of the entries that
-        // deserialize. In order U the numbers and the set faults are reported
-        // at the map's own step (see the module doc). The numbers of the
-        // ScanFilter lists are #507's check (#564 item 3).
+        // deserialize when `depth` asks for it. In order U the numbers and the
+        // set faults are reported at the map's own step (see the module doc).
+        // The numbers of the ScanFilter lists are #507's check (#564 item 3).
         let values = readable_attribute_values(body, "ExpressionAttributeValues");
         for name in fitted_order_of(body, "ExpressionAttributeValues", values_order) {
             if let Some(value) = values.get(&name) {
@@ -278,7 +299,9 @@ fn scan_request_checks(
             }
         }
         expression_values_set_fault(body)?;
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+        if depth == ValuesDepth::Checked {
+            extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+        }
     }
     Ok(())
 }

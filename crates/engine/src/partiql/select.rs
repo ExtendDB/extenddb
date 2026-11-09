@@ -7,9 +7,10 @@
 //! key, their key conditions and filters), checks it the way the service
 //! does, composes the classic request the matching data-plane handler
 //! already understands, drives [`crate::handle_query`] /
-//! [`crate::handle_scan`], and shapes the response under `Items` with an
-//! opaque, statement-bound `NextToken`. Every behaviour is justified by a
-//! measurement against the live service, cited where it is implemented.
+//! [`crate::scan::handle_partiql_scan`], and shapes the response under
+//! `Items` with an opaque, statement-bound `NextToken`. Every behaviour is
+//! justified by a measurement against the live service, cited where it is
+//! implemented.
 //!
 //! A read of a table or an index by several disjuncts, or of a table by one
 //! that names a whole item, takes the disjuncts one after another, the
