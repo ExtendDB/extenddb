@@ -343,7 +343,11 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
+# These two sections run for either Rust suite. CI's mongodb-rust job passes
+# only --rust-integration, so they are where it runs the storage-mongodb tests
+# that need this replica set.
+if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust "* \
+    || " ${RUN_TESTS_ARGS[*]} " == *" --rust-integration "* ]]; then
     # The storage-level MongoDB tests that need a live server (the stream
     # records page over 16 MB and the shard ownership predicates) are
     # #[ignore]d in the crate and read their server from this variable; this

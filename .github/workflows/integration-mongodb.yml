@@ -190,7 +190,13 @@ jobs:
           # run-mongodb-tests gives the server a filesystem [backup.store]:
           # the Rust backup tests restore the store-backed job's backups.
           EXTENDDB_TEST_BACKUP_STORE: filesystem
-        run: devtools/run-mongodb-tests --rust-live -- --rust --rust-integration
+        # No --rust: it runs the whole workspace's `cargo test`, which the Test
+        # workflow runs on two toolchains. For --rust-integration,
+        # run-mongodb-tests still runs the storage-mongodb tests that need this
+        # replica set (records_live and the migration tests), and --rust-live
+        # runs the crate's other live tests. mongodb-snapshot runs the
+        # snapshot_engine tests.
+        run: devtools/run-mongodb-tests --rust-live -- --rust-integration
 
   # The store-backed CreateBackup on MongoDB: a server with a filesystem
   # store, the backup selection of the pytest suite with
