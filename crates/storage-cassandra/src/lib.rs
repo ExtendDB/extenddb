@@ -281,6 +281,42 @@ async fn make_catalog_store_from_connection_string(
     ))
 }
 
+/// Warn of each of the deployment's keyspaces whose replication differs from
+/// the config's `replication_factor` and `datacenter`. `serve` starts anyway:
+/// the keyspaces still work, but a replication factor other than the one the
+/// operator chose, or a datacenter the cluster does not have, is a mistake to
+/// fix with `ALTER KEYSPACE` and `nodetool repair`. A failed read is logged
+/// and skipped.
+async fn warn_of_replication_mismatches(
+    engine: &CassandraEngine,
+    cassandra_config: &CassandraStorageConfig,
+) {
+    let expected = catalog_store::network_topology(
+        &cassandra_config.datacenter,
+        cassandra_config.replication_factor,
+    );
+    match migrations::replication_mismatches(
+        engine.session(),
+        &cassandra_config.keyspace_prefix,
+        &cassandra_config.datacenter,
+        cassandra_config.replication_factor,
+    )
+    .await
+    {
+        Ok(mismatches) => {
+            for (keyspace, found) in mismatches {
+                tracing::warn!(
+                    "Keyspace {keyspace} has replication {found}, but the config asks for \
+                     {expected}. Cassandra keeps a keyspace's replication: change it with \
+                     ALTER KEYSPACE, then run `nodetool repair -full` on each node \
+                     (docs/cassandra-setup.md, Keyspace replication)."
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Could not check the keyspaces' replication: {e}"),
+    }
+}
+
 fn server_components_factory(
     config: &dyn extenddb_storage::config::StorageConfig,
     region: &str,
@@ -340,6 +376,10 @@ fn server_components_factory(
                 });
             }
         };
+
+        if options.command.is_none() {
+            warn_of_replication_mismatches(&engine, cassandra_config).await;
+        }
 
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);

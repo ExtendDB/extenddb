@@ -69,6 +69,16 @@ pub struct InitArgs {
     #[arg(long)]
     keyspace_prefix: Option<String>,
 
+    /// Cassandra replication factor for the keyspaces init creates, written
+    /// to the config file for later ones (default: 1, for a single node)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    replication_factor: Option<u32>,
+
+    /// Cassandra datacenter the keyspaces replicate in, written to the
+    /// config file (default: datacenter1)
+    #[arg(long)]
+    datacenter: Option<String>,
+
     /// extenddb application user
     #[arg(long)]
     extenddb_user: Option<String>,
@@ -240,13 +250,16 @@ pub async fn run(args: InitArgs, release: &str) -> anyhow::Result<u8> {
         .await
         .map_err(crate::cmd_migrate::op_err)?;
 
-    // Create catalog database — abort if it already exists.
+    // Create the catalog database. PostgreSQL and SQLite abort if it already
+    // exists. Cassandra and MongoDB take an existing one, and
+    // `init_on_runner` refuses it when it is already initialized.
     bootstrapper
         .create_catalog_db()
         .await
         .map_err(crate::cmd_migrate::op_err)?;
 
-    // Create data database — abort if it already exists.
+    // Create the data database. PostgreSQL aborts if it already exists. The
+    // other backends create nothing here.
     bootstrapper
         .create_data_db()
         .await
@@ -403,6 +416,41 @@ mod tests {
         let args =
             parse(&["--backend", "sqlite", "--sqlite-path", "/data/x.sqlite"]).expect("parse");
         assert_eq!(args.sqlite_path.as_deref(), Some("/data/x.sqlite"));
+    }
+
+    /// `--replication-factor` and `--datacenter` are declared to clap, so
+    /// `init` accepts them, in both the spaced and the `=` form. Without the
+    /// declarations clap returns "unexpected argument", as it did for
+    /// `--sqlite-path` (#267).
+    #[test]
+    fn init_accepts_replication_factor_and_datacenter() {
+        let args = parse(&[
+            "--backend",
+            "cassandra",
+            "--replication-factor",
+            "3",
+            "--datacenter",
+            "dc1",
+        ])
+        .expect("parse");
+        assert_eq!(args.replication_factor, Some(3));
+        assert_eq!(args.datacenter.as_deref(), Some("dc1"));
+
+        let args = parse(&["--replication-factor=2", "--datacenter=dc-east.1"]).expect("parse");
+        assert_eq!(args.replication_factor, Some(2));
+        assert_eq!(args.datacenter.as_deref(), Some("dc-east.1"));
+    }
+
+    /// clap refuses an RF that is not a positive integer, before the
+    /// bootstrapper reads the arguments.
+    #[test]
+    fn init_refuses_a_replication_factor_that_is_not_a_positive_integer() {
+        for rf in ["0", "-1", "three"] {
+            assert!(
+                parse(&["--replication-factor", rf]).is_err(),
+                "--replication-factor {rf} accepted"
+            );
+        }
     }
 
     /// The control: an actually-unknown flag must still be rejected, proving

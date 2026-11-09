@@ -176,8 +176,8 @@ contact_points = ["127.0.0.1:9042"]
 username = <extenddb-user>      # From extenddb init args
 password = <extenddb-pass>      # From extenddb init args
 keyspace_prefix = "extenddb"
-replication_factor = 1           # Single node (use 3 or more for production)
-datacenter = "datacenter1"
+replication_factor = 1           # From --replication-factor (default 1)
+datacenter = "datacenter1"       # From --datacenter (default datacenter1)
 max_connections = 10
 ```
 
@@ -189,15 +189,16 @@ Fields:
   time. Required against any authenticated node (which `init` requires anyway).
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
   `extenddb`).
-- `replication_factor` — keyspace replication factor. `init` always writes `1`
-  and creates its own keyspaces with it; see [Keyspace replication](#keyspace-replication)
-  for a multi-node cluster.
-- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. Currently,
-  `init` always writes `datacenter1` and has no flag to change it, and the keyspaces
-  it creates reference `datacenter1`, so the cluster's local datacenter must be
-  named `datacenter1`. A node started with a different datacenter name (for
-  example `CASSANDRA_DC=dc1`) fails keyspace creation with
-  `Unrecognized strategy option {datacenter1} ... for keyspace extenddb_catalog`.
+- `replication_factor` — keyspace replication factor. `init` creates its own
+  keyspaces with `--replication-factor` (default `1`) and writes the same value
+  here; see [Keyspace replication](#keyspace-replication) for a multi-node
+  cluster.
+- `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. `init`
+  creates its keyspaces in `--datacenter` (default `datacenter1`) and writes the
+  same value here. It must name a datacenter the cluster has: a node started
+  with another name (for example `CASSANDRA_DC=dc1`) fails keyspace creation
+  with `Unrecognized strategy option {datacenter1} ... for keyspace
+  extenddb_catalog` until you pass `--datacenter dc1`.
 - `max_connections` — maximum connections per host.
 
 Edit these values in `extenddb.toml` after `init`. Unlike the PostgreSQL and
@@ -262,23 +263,37 @@ section covers only what is specific to Cassandra.
 
 ### Keyspace replication
 
-Set `replication_factor` to 3 or more for a multi-node cluster. `init` has no
-flag for it: it creates the catalog keyspace and the default account's
-keyspace with replication factor 1 and writes `replication_factor = 1` to the
-config. Keyspaces created later (one per new account) take the value from the
-config when `serve` starts, except an account keyspace that `migrate --yes`
-creates for an account whose CreateAccount stopped before its keyspace, which
-takes the catalog keyspace's replication. On a multi-node cluster, after
-`init`:
+Use a replication factor of 3 or more for a multi-node cluster. Pass it to
+`init`, which creates the catalog keyspace and the default account's keyspace
+with it and writes it to the config:
 
-1. Set `replication_factor = 3` in `extenddb.toml` (example below), before you
+```bash
+./target/release/extenddb init --backend cassandra \
+    --cassandra-contact-points cass-1:9042 \
+    --replication-factor 3 --datacenter datacenter1 \
+    --config extenddb.toml
+```
+
+Keyspaces created later (one per new account) take the value from the config
+when `serve` starts, except an account keyspace that `migrate --yes` creates
+for an account whose CreateAccount stopped before its keyspace, which takes
+the catalog keyspace's replication. Cassandra keeps a keyspace's replication
+until an `ALTER KEYSPACE` changes it, so editing the config later changes only
+the account keyspaces created afterwards. At start-up, `serve` logs a warning
+for each of the deployment's keyspaces whose replication differs from the
+config's `replication_factor` and `datacenter`.
+
+Cassandra's own `system_auth` keyspace, which holds the roles ExtendDB logs in
+with, starts at `SimpleStrategy` with replication factor 1 whatever `init` is
+given. To raise replication on a cluster — `system_auth` after any `init`, or
+the deployment's keyspaces after an `init` at replication factor 1:
+
+1. Set `replication_factor` in `extenddb.toml` (example below), before you
    start `serve` or, if it is already running, restart it before you create
    accounts.
-2. Raise the replication of the keyspaces that already exist: Cassandra's own
-   `system_auth` keyspace, which holds the roles ExtendDB logs in with and
-   starts at `SimpleStrategy` with replication factor 1, and every keyspace
-   whose name starts with the keyspace prefix (`DESCRIBE KEYSPACES` lists
-   them):
+2. Raise the replication of the keyspaces that already exist: `system_auth`
+   and every keyspace whose name starts with the keyspace prefix
+   (`DESCRIBE KEYSPACES` lists them):
 
    ```sql
    ALTER KEYSPACE system_auth
@@ -290,16 +305,27 @@ takes the catalog keyspace's replication. On a multi-node cluster, after
 
 3. Run `nodetool repair -full` on each node.
 
-Use a replication factor no larger than the number of nodes in `datacenter1`.
+Use a replication factor no larger than the number of nodes in the datacenter.
+`init` does not check this. With fewer nodes, `init` stops after it creates
+the catalog keyspace, because its reads and writes need a quorum of replicas:
+it prints `No nodes available in query plan!`. A second `init` with the same
+`--replication-factor` stops the same way. A second `init` with another
+`--replication-factor` is refused, because the catalog keyspace already has
+the first one. To recover, lower the catalog keyspace's replication factor with
+`ALTER KEYSPACE` (as above, with a value no larger than the node count), or
+remove the keyspace with `DROP KEYSPACE`. Then run `init` again.
 Logins read `system_auth` at `QUORUM` for the default superuser, so a
 `system_auth` replication factor above the node count makes those logins fail
 with `Cannot achieve consistency level QUORUM`.
 
-The `datacenter` must be `datacenter1`:
-`init` hardcodes that name into the keyspace definitions and provides no flag to
-change it, so your cluster's local datacenter has to be named `datacenter1`
-until that is configurable. ExtendDB creates its keyspaces with
-`NetworkTopologyStrategy` using these values.
+ExtendDB creates its keyspaces with `NetworkTopologyStrategy`, with
+`replication_factor` replicas in `datacenter`. Use the name your cluster's
+nodes report (`nodetool status` prints it); in the `ALTER KEYSPACE` statements
+above, replace `datacenter1` with it.
+
+ExtendDB supports one datacenter. A keyspace that also replicates to a second
+datacenter still works, but `serve` logs the start-up warning for it at every
+start.
 
 With a replication factor of 1, the catalog has one replica, so a restart of
 that node stops every request to it. A running server renews its serving
@@ -322,7 +348,7 @@ username = "extenddb"
 password = "<application-password>"
 keyspace_prefix = "extenddb"
 replication_factor = 3
-datacenter = "datacenter1"   # must be datacenter1 (hardcoded by init)
+datacenter = "datacenter1"   # the name nodetool status prints
 max_connections = 10
 ```
 

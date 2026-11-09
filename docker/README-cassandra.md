@@ -10,8 +10,8 @@ Cassandra, `cqlsh` or a Java runtime.
 > validate it against your workload before you rely on it.
 
 Provide Apache Cassandra 4.1 or newer separately. `docs/cassandra-setup.md`
-covers the cluster requirements (password authentication, the `datacenter1`
-datacenter name, replication factor) and the backend's known limitations.
+covers the cluster requirements (password authentication, the datacenter
+name, replication factor) and the backend's known limitations.
 
 ## Image contents and security defaults
 
@@ -51,9 +51,10 @@ docker build \
 
 ## Connect to an existing Cassandra cluster
 
-The cluster must run `PasswordAuthenticator`, and its local datacenter must be
-named `datacenter1`; `docs/cassandra-setup.md` explains why. The contact point
-must be resolvable and reachable from the ExtendDB container.
+The cluster must run `PasswordAuthenticator`. Pass `init` its local
+datacenter's name with `--datacenter` when it is not `datacenter1`;
+`docs/cassandra-setup.md` explains why. The contact point must be resolvable
+and reachable from the ExtendDB container.
 
 **Run `CassandraAuthorizer`.** Under it, `init` grants the application role
 only what ExtendDB needs: SELECT, MODIFY, CREATE and ALTER on the catalog
@@ -137,12 +138,15 @@ docker run --rm -v extenddb-state:/v:ro --entrypoint cat \
 
 ### Replication factor
 
-`init` creates its keyspaces with replication factor 1 and has no flag to
-change that. On a multi-node cluster, follow "Keyspace replication" in
-[`docs/cassandra-setup.md`](../docs/cassandra-setup.md#keyspace-replication):
-set `replication_factor` in `extenddb.toml` and restart the serving
-container, raise the replication of `system_auth` and of the keyspaces `init`
-created, then repair. The config edit, with the volume and image from above:
+`init` creates its keyspaces with `--replication-factor` (default 1) and
+writes it to `extenddb.toml`. On a multi-node cluster, pass
+`--replication-factor 3` to `init`, then follow "Keyspace replication" in
+[`docs/cassandra-setup.md`](../docs/cassandra-setup.md#keyspace-replication)
+to raise the replication of `system_auth` and repair. To raise it after an
+`init` at replication factor 1: set `replication_factor` in `extenddb.toml`
+and restart the serving container, raise the replication of `system_auth` and
+of the keyspaces `init` created, then repair. The config edit, with the
+volume and image from above:
 
 ```bash
 docker run --rm -v extenddb-state:/v --entrypoint sed \

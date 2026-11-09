@@ -53,7 +53,9 @@ pub use backend::{CassandraMigrations, CassandraStores};
 pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
-pub(crate) use connect::{LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT};
+pub(crate) use connect::{
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, replication_differs, replication_mismatches,
+};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;

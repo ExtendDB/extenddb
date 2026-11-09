@@ -933,8 +933,32 @@ async fn bootstrapper_as(
     app_user: &str,
     app_password: &str,
 ) -> extenddb_storage_cassandra::CassandraBootstrapper {
+    let config = helpers::test_config();
+    bootstrapper_with(
+        prefix,
+        app_user,
+        app_password,
+        config.replication_factor,
+        &config.datacenter,
+    )
+    .await
+}
+
+/// `init`'s bootstrapper for the deployment of `prefix`, connected as the
+/// test node's superuser, that creates its keyspaces with
+/// `replication_factor` replicas in `datacenter`, as `init
+/// --replication-factor --datacenter` does.
+async fn bootstrapper_with(
+    prefix: &str,
+    app_user: &str,
+    app_password: &str,
+    replication_factor: u32,
+    datacenter: &str,
+) -> extenddb_storage_cassandra::CassandraBootstrapper {
     let mut config = helpers::test_config();
     config.keyspace_prefix = prefix.to_owned();
+    config.replication_factor = replication_factor;
+    config.datacenter = datacenter.to_owned();
     config.rebuild_cached_connection_string();
     let (host, port) = helpers::test_contact_point()
         .split_once(':')
@@ -1021,6 +1045,113 @@ async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_
             version: MigrationId::LATEST.number()
         }
     );
+}
+
+/// An `init` that finds the catalog keyspace already there, as a resumed
+/// `init` does, refuses it when its RF or datacenter differs from the ones
+/// this `init` was given. `CREATE KEYSPACE IF NOT EXISTS` keeps the existing
+/// keyspace's RF and datacenter, so without the check `init` would write the
+/// new values to `extenddb.toml` while the keyspace kept the old ones.
+#[tokio::test]
+async fn init_refuses_a_catalog_keyspace_with_another_replication_factor_or_datacenter() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let config = helpers::test_config();
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+
+    // An earlier `init` created the catalog keyspace: RF 1 in datacenter1.
+    let (prefix, _drops) = new_prefix("rfcheck");
+    let catalog = format!("{prefix}_catalog");
+    cql(
+        &session,
+        &format!(
+            "CREATE KEYSPACE {catalog} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'datacenter1': 1}}"
+        ),
+    )
+    .await;
+
+    for (replication_factor, datacenter) in [(2, "datacenter1"), (1, "dc2")] {
+        let err = bootstrapper_with(&prefix, &user, &password, replication_factor, datacenter)
+            .await
+            .create_catalog_db()
+            .await
+            .expect_err("a catalog keyspace with another RF or datacenter is refused");
+        let err = format!("{err:?}");
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '1'"),
+            "RF {replication_factor} in {datacenter}: {err}"
+        );
+
+        // `ensure_app_user`, `init`'s first step, refuses the keyspace
+        // before it creates the application role.
+        let role = format!("{prefix}_app");
+        let refused = bootstrapper_with(
+            &prefix,
+            &role,
+            "a-new-password",
+            replication_factor,
+            datacenter,
+        )
+        .await
+        .ensure_app_user()
+        .await;
+        let roles = role_rows(&session, &role).await;
+        if roles > 0 {
+            cql(&session, &format!("DROP ROLE IF EXISTS {role}")).await;
+        }
+        let err = format!(
+            "{:?}",
+            refused.expect_err("ensure_app_user refuses the keyspace")
+        );
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '1'"),
+            "ensure_app_user, RF {replication_factor} in {datacenter}: {err}"
+        );
+        assert_eq!(roles, 0, "the refused init created the role {role}");
+    }
+
+    // The same RF and datacenter: the keyspace is taken, as a resumed
+    // `init` takes it.
+    bootstrapper_with(&prefix, &user, &password, 1, "datacenter1")
+        .await
+        .create_catalog_db()
+        .await
+        .expect("a catalog keyspace with the same RF and datacenter is taken");
+
+    // An earlier `init` gave RF 3 on this one-node cluster and stopped: the
+    // catalog keyspace has 3 replicas, so a quorum read of it fails. A
+    // second `init` with RF 1 gets the RF error, not the failed read.
+    let (prefix, _drops) = new_prefix("rfhigh");
+    let catalog = format!("{prefix}_catalog");
+    // The stopped `init`: its catalog step creates the keyspace and the lock
+    // table, then its quorum writes fail.
+    bootstrapper_with(&prefix, &user, &password, 3, "datacenter1")
+        .await
+        .create_catalog_db()
+        .await
+        .expect("the catalog step of an init at RF 3");
+    let second = bootstrapper_with(&prefix, &user, &password, 1, "datacenter1").await;
+    // `ensure_app_user` is `init`'s first step that reads the catalog, so it
+    // gets the RF error first, before it creates the application role.
+    for (step, result) in [
+        ("ensure_app_user", second.ensure_app_user().await),
+        ("create_catalog_db", second.create_catalog_db().await),
+    ] {
+        let err = format!(
+            "{:?}",
+            result.expect_err("a catalog keyspace with RF 3 is refused by an init given RF 1")
+        );
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '3'"),
+            "{step}: {err}"
+        );
+    }
 }
 
 /// An `init` killed after its default account, before its admin user,
