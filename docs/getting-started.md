@@ -796,7 +796,7 @@ The management API is available at `/management/*` on the running extenddb serve
 
 Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
 
-**Note:** The `--password` flag is visible in process listings (`ps aux`). For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable instead.
+**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history, and `extenddb manage` prints a warning when it gets the flag. Omit the flag and set the `EXTENDDB_PASSWORD` environment variable instead.
 
 ### List admin users
 
@@ -928,7 +928,7 @@ Both `--secret-access-key` and `--yes` are required:
     --yes
 ```
 
-> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable for the password.
+> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For the password, omit `--password` and set the `EXTENDDB_PASSWORD` environment variable.
 
 Credential import is gated by the `allow_credential_import` runtime setting (default: `true`). To disable:
 

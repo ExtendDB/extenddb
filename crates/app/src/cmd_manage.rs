@@ -9,6 +9,8 @@
 //! Types are in `manage_types.rs`; HTTP transport and dispatch are in
 //! `manage_http.rs`.
 
+use std::io::Write;
+
 use crate::manage_http::{basic_auth, dispatch, resolve_endpoint};
 pub use crate::manage_types::ManageArgs;
 
@@ -28,21 +30,40 @@ fn choose_password(flag: Option<String>, env: Option<String>) -> anyhow::Result<
 /// when it was not. The flag takes precedence, so `Some` means the password
 /// came from the flag. The result depends only on `flag_given`, so the printed
 /// text never holds the password.
+///
+/// CodeQL's `rust/cleartext-logging` query traces a printed value back to the
+/// password when both come from one function result. So the warning comes from
+/// this function, which takes only a `bool`, and not from `choose_password`.
 fn flag_warning(flag_given: bool) -> Option<&'static str> {
     flag_given.then_some(PASSWORD_FLAG_WARNING)
 }
 
-/// Resolve the password from the `--password` flag or the `EXTENDDB_PASSWORD`
-/// env var, and warn on stderr when it came from the flag.
+/// Resolve the password from the `--password` value or the `EXTENDDB_PASSWORD`
+/// value, and write the warning to `warnings` when it came from the flag.
 ///
-/// Never reads from stdin. Errors if no password source is available.
-fn resolve_password(cli_password: Option<String>) -> anyhow::Result<String> {
+/// Never reads from stdin. Errors if no password source is available. A failed
+/// write of the warning does not stop the command.
+fn resolve_password_with(
+    cli_password: Option<String>,
+    env_password: Option<String>,
+    warnings: &mut impl Write,
+) -> anyhow::Result<String> {
     let warning = flag_warning(cli_password.is_some());
-    let password = choose_password(cli_password, std::env::var("EXTENDDB_PASSWORD").ok())?;
+    let password = choose_password(cli_password, env_password)?;
     if let Some(warning) = warning {
-        eprintln!("{warning}");
+        let _ = writeln!(warnings, "{warning}");
     }
     Ok(password)
+}
+
+/// [`resolve_password_with`] for the command line: reads `EXTENDDB_PASSWORD`
+/// and writes the warning to stderr.
+fn resolve_password(cli_password: Option<String>) -> anyhow::Result<String> {
+    resolve_password_with(
+        cli_password,
+        std::env::var("EXTENDDB_PASSWORD").ok(),
+        &mut std::io::stderr(),
+    )
 }
 
 // Caller (`run_interactive`) requires a Future; removing `async` would need a
@@ -78,48 +99,48 @@ pub async fn run(args: ManageArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PASSWORD_FLAG_WARNING, choose_password, flag_warning};
+    use super::{PASSWORD_FLAG_WARNING, resolve_password_with};
 
     fn value(s: &str) -> Option<String> {
         Some(s.to_owned())
     }
 
-    #[test]
-    fn a_password_from_the_flag_is_used() {
-        assert_eq!(
-            choose_password(value("from-flag"), None).unwrap(),
-            "from-flag"
-        );
+    /// Runs `resolve_password_with` and returns its result with what it wrote.
+    fn resolve(flag: Option<String>, env: Option<String>) -> (anyhow::Result<String>, String) {
+        let mut warnings = Vec::new();
+        let result = resolve_password_with(flag, env, &mut warnings);
+        (result, String::from_utf8(warnings).unwrap())
     }
 
     #[test]
-    fn a_password_from_the_variable_is_used() {
-        assert_eq!(
-            choose_password(None, value("from-env")).unwrap(),
-            "from-env"
-        );
+    fn a_password_from_the_flag_is_used_with_the_warning() {
+        let (password, warnings) = resolve(value("from-flag"), None);
+        assert_eq!(password.unwrap(), "from-flag");
+        assert_eq!(warnings, format!("{PASSWORD_FLAG_WARNING}\n"));
+        assert!(!warnings.contains("from-flag"));
     }
 
     #[test]
-    fn the_flag_takes_precedence_over_the_variable() {
-        assert_eq!(
-            choose_password(value("from-flag"), value("from-env")).unwrap(),
-            "from-flag"
-        );
+    fn a_password_from_the_variable_is_used_with_no_warning() {
+        let (password, warnings) = resolve(None, value("from-env"));
+        assert_eq!(password.unwrap(), "from-env");
+        assert_eq!(warnings, "");
     }
 
     #[test]
-    fn only_the_flag_gets_the_warning() {
-        assert_eq!(flag_warning(true), Some(PASSWORD_FLAG_WARNING));
-        assert_eq!(flag_warning(false), None);
+    fn the_flag_takes_precedence_over_the_variable_and_warns() {
+        let (password, warnings) = resolve(value("from-flag"), value("from-env"));
+        assert_eq!(password.unwrap(), "from-flag");
+        assert_eq!(warnings, format!("{PASSWORD_FLAG_WARNING}\n"));
     }
 
     #[test]
-    fn no_flag_and_no_variable_is_an_error() {
-        let err = choose_password(None, None).unwrap_err();
+    fn no_flag_and_no_variable_is_an_error_with_no_warning() {
+        let (password, warnings) = resolve(None, None);
         assert_eq!(
-            err.to_string(),
+            password.unwrap_err().to_string(),
             "No password provided. Use --password VALUE or set EXTENDDB_PASSWORD."
         );
+        assert_eq!(warnings, "");
     }
 }

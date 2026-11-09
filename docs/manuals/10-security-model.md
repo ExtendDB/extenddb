@@ -309,7 +309,7 @@ Import/export file paths are validated:
 ### Credential Handling
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
-- The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
+- `extenddb manage` reads the password from the `EXTENDDB_PASSWORD` environment variable when `--password` is omitted, which keeps it out of process listings, and it prints a warning on stderr when it gets the flag
 - Access key secrets are shown once on creation and cannot be retrieved afterward
 
 ### Logging
