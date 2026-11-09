@@ -9,7 +9,7 @@ use extenddb_storage::error::StorageError;
 use uuid::Uuid;
 
 use crate::CassandraEngine;
-use crate::cassandra_util::{get_column, query_optional, query_rows};
+use crate::cassandra_util::{Stmt, get_column, params, query_optional, query_rows};
 
 /// Transaction states (from DynamoDB paper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,15 +120,18 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(
-                    Bytes::new(txn_id.as_bytes().to_vec()),
-                    state.as_str(),
-                    started_at,
-                    client_token,
-                    request_fingerprint,
-                    items_blob
+                params(
+                    Stmt::Lwt,
+                    cdrs_tokio::query_values!(
+                        Bytes::new(txn_id.as_bytes().to_vec()),
+                        state.as_str(),
+                        started_at,
+                        client_token,
+                        request_fingerprint,
+                        items_blob
+                    ),
                 ),
             )
             .await
@@ -167,11 +170,14 @@ impl CassandraEngine {
         let query = format!("UPDATE {keyspace}.transaction_ledger SET state = ? WHERE txn_id = ?");
 
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(
-                    new_state.as_str(),
-                    Bytes::new(txn_id.as_bytes().to_vec())
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(
+                        new_state.as_str(),
+                        Bytes::new(txn_id.as_bytes().to_vec())
+                    ),
                 ),
             )
             .await
@@ -198,9 +204,12 @@ impl CassandraEngine {
         let query =
             format!("UPDATE {keyspace}.transaction_ledger SET items_blob = ? WHERE txn_id = ?");
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(blob, Bytes::new(txn_id.as_bytes().to_vec())),
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(blob, Bytes::new(txn_id.as_bytes().to_vec())),
+                ),
             )
             .await
             .map_err(|e| {
@@ -304,9 +313,12 @@ impl CassandraEngine {
         let query = format!("DELETE FROM {keyspace}.transaction_ledger WHERE txn_id = ?");
 
         self.session
-            .query_with_values(
+            .query_with_params(
                 &query,
-                cdrs_tokio::query_values!(Bytes::new(txn_id.as_bytes().to_vec())),
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(Bytes::new(txn_id.as_bytes().to_vec())),
+                ),
             )
             .await
             .map_err(|e| {
