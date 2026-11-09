@@ -38,6 +38,7 @@ from botocore.exceptions import ClientError
 
 from conftest import wait_for_active
 from management_helpers import ManagementClient
+from test_backup_restore_fidelity import _delete_backup_when_available
 
 
 def _require_auth_env() -> tuple[str, str, str]:
@@ -122,7 +123,13 @@ def _user_with_policy(mgmt: ManagementClient, account_id: str, policy: dict) -> 
 @pytest.fixture(scope="module")
 def table(auth_env, mgmt, account_id, region):
     """A table with a GSI, a stream, one item, and a backup. Returns the
-    canonical table, index, stream, and backup ARNs."""
+    canonical table, index, stream, and backup ARNs. The cells deny
+    DeleteBackup and DeleteTable to other users, so the backup and the table
+    are deleted here once the module is done: on a server with a configured
+    `[backup.store]` the backup is a complete set of objects under the store,
+    and one that is left behind stays until someone deletes it (CI runners
+    die with theirs; a developer's server keeps them). The backup is deleted
+    once AVAILABLE, since a backup still CREATING refuses DeleteBackup."""
     endpoint = auth_env[0]
     ak, sk = _user_with_policy(mgmt, account_id, ALLOW_ALL)
     admin = _client(endpoint, ak, sk, region)
@@ -147,13 +154,18 @@ def table(auth_env, mgmt, account_id, region):
     desc = admin.describe_table(TableName=name)["Table"]
     table_arn = desc["TableArn"]
     backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
-    return {
+    yield {
         "name": name,
         "table_arn": table_arn,
         "index_arn": table_arn + "/index/gsi1",
         "stream_arn": desc.get("LatestStreamArn"),
         "backup_arn": backup_arn,
     }
+    _delete_backup_when_available(admin, backup_arn)
+    try:
+        admin.delete_table(TableName=name)
+    except ClientError:
+        pass
 
 
 class TestExplicitDenyOnResourceArn:
@@ -628,13 +640,18 @@ class TestExplicitDenyOnResourceArn:
     # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
 
     def test_respelled_stream_arn_cannot_bypass_deny(self, table):
-        """A Deny on the canonical stream ARN must also block a request that
-        respells the partition. ExtendDB resolves the stream in this account
-        regardless of the ARN's partition, so authorizing the respelled string
-        verbatim would bypass the Deny."""
+        """A principal with a Deny on the canonical stream ARN gets no stream
+        back for a request that respells the partition. The service refuses the
+        respelled ARN before the IAM decision with ValidationException "Invalid
+        StreamArn" (measured 2026-10-22), so ExtendDB does the same instead of
+        canonicalizing it; the fuller matrix is in test_stream_arn_scope.py."""
         respelled = table["stream_arn"].replace("arn:aws:", "arn:aws-cn:")
         s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
-        self._assert_denied(lambda: s.describe_stream(StreamArn=respelled))
+        with pytest.raises(ClientError) as exc:
+            s.describe_stream(StreamArn=respelled)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err.get("Message") == "Invalid StreamArn", err
 
     def test_table_arn_in_tablename_deny_blocks(self, table):
         """A Deny on the table ARN blocks GetItem whether TableName is the bare

@@ -13,6 +13,8 @@ pub mod error;
 pub mod expression;
 pub mod limits;
 pub mod metrics;
+#[cfg(feature = "partiql")]
+pub mod partiql;
 pub mod serde_helpers;
 pub mod settings_keys;
 pub mod throttle;

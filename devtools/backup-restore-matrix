@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""One cell of the cross-backend restore matrix, at the binary level.
+
+A cell proves that a backup taken on the source backend restores, through the
+store, into the target backend: the restored table has the source's items,
+key schema, secondary indexes, throughput, SSE and (where the target supports
+them) vector indexes, and its class is STANDARD. The target's catalog has no
+`backup_index` row for the source's backup until `backup sync --adopt-store`
+runs (PR 10); the cell stands in for that command by copying the prefix under
+a root the target owns and seeding the row at the storage level, so it proves
+the restore and not the adoption. `matrix-nightly.yml` runs the twelve plain
+cells and the duplicate-key and vector cells through this committed script.
+
+    backup-restore-matrix --source <sqlite|postgres|mongodb> --target <sqlite|postgres|mongodb|cassandra>
+              [--items N] [--vector] [--duplicate-key] [--work DIR]
+              [--bin-sqlite PATH] [--bin-postgres PATH] [--bin-mongodb PATH] [--bin-cassandra PATH]
+
+Starts a source server from the backend's binary with a filesystem store at
+its own root, creates a composite-key table with a GSI and an LSI (and, with
+--vector, a vector index), writes --items items carrying every attribute
+type, takes a backup and waits for AVAILABLE. Starts the target server with
+its own empty root (it writes its own extenddb-store.json), copies the
+source's backup prefix under the target root, seeds the target's
+backup_index row at the storage level with the target's store id (what
+`backup sync --adopt-store` will do in PR 10; the cell proves the restore,
+not the adoption), restores, waits for ACTIVE, compares the item set and the
+description (key schema, indexes, throughput, SSE; the table class STANDARD),
+queries each GSI, and tears both servers down by PID and drops their
+databases. With --duplicate-key the copied prefix is replaced by a hand-built
+unordered backup whose two data files share one key, and the cell passes
+when the restore fails (the target gone, no table) instead.
+
+The two servers connect to PostgreSQL at 127.0.0.1:55432 (postgres/devpass),
+MongoDB at 127.0.0.1:27117 and Cassandra at 127.0.0.1:9042, the coordinates
+`matrix-nightly.yml` publishes its services on. Each server is an `init` with
+its port patched, `[backup]` with short intervals and `serve --foreground`,
+the test credentials provisioned through devtools/provision-test-credentials.
+The MongoDB and Cassandra deployments use the backends' fixed names (the
+`extenddb_catalog` and `extenddb_data` databases; the `extenddb_catalog` and
+`extenddb_account_<account>` keyspaces) and drop them in `init` and
+`teardown`, so two cells with a MongoDB or Cassandra role, or a cell beside
+another process on those names, destroy each other's catalogs: run such cells
+one at a time, as the nightly does. The MongoDB and Cassandra roles need
+`pymongo` and `cassandra-driver` (requirements-matrix.txt).
+
+Logs go under --work (default `$TMPDIR/backup-restore-matrix/<cell>`).
+Exit 0 when the cell passes, 1 on an assertion failure or a setup error.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+import boto3
+import requests
+import urllib3
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# The script lives at <repo>/devtools/backup-restore-matrix; the repo root
+# is its parent. A caller overrides the binaries with --bin-<backend>.
+REPO = os.path.abspath(os.path.join(HERE, ".."))
+ACCOUNT = "123456789012"
+REGION = "us-east-1"
+ADMIN_PASSWORD = "TestPass1!"
+PG = {"host": "127.0.0.1", "port": "55432", "user": "postgres", "password": "devpass"}
+MONGODB_URI = "mongodb://127.0.0.1:27117/?directConnection=true"
+
+DEFAULT_BINS = {
+    "sqlite": os.path.join(REPO, "target", "rel-sqlite", "release", "extenddb"),
+    "postgres": os.path.join(REPO, "target", "rel-postgres", "release", "extenddb"),  # or target/release
+    "mongodb": os.path.join(REPO, "target", "rel-mongodb", "release", "extenddb"),
+    "cassandra": os.path.join(REPO, "target", "rel-cassandra", "release", "extenddb"),
+}
+
+
+def say(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+class CellFailed(Exception):
+    pass
+
+
+def check(cond: bool, msg: str) -> None:
+    if not cond:
+        raise CellFailed(msg)
+
+
+def sqlite_module():
+    """pysqlite3 when installed (an old sqlite3 library bundled with the
+    interpreter cannot read the catalog), else the standard module."""
+    try:
+        import pysqlite3 as sqlite3  # type: ignore
+    except ImportError:
+        import sqlite3  # type: ignore
+    return sqlite3
+
+
+def free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# --- deployments -----------------------------------------------------------------
+
+
+class Deployment:
+    """One server: its binary, work directory, config, store root, PID and
+    the credentials provisioned on it."""
+
+    def __init__(self, backend: str, binary: str, work: str, role: str):
+        self.backend = backend
+        self.bin = binary
+        self.work = os.path.join(work, role)
+        self.role = role
+        os.makedirs(self.work, exist_ok=True)
+        self.config = os.path.join(self.work, "extenddb.toml")
+        self.root = os.path.join(self.work, "root")
+        self.port = free_port()
+        self.endpoint = f"https://127.0.0.1:{self.port}"
+        self.tag = f"mx{int(time.time()) % 1_000_000}{role[0]}"
+        self.proc: subprocess.Popen | None = None
+        self.creds: dict[str, str] = {}
+
+    # -- init and config --
+
+    def init(self) -> None:
+        env = dict(os.environ, EXTENDDB_ADMIN_PASSWORD=ADMIN_PASSWORD)
+        os.makedirs(self.root, mode=0o700, exist_ok=True)
+        if self.backend == "mongodb":
+            # The MongoDB backend uses fixed database names
+            # (extenddb_catalog / extenddb_data), so a cell drops them before
+            # it inits and after it tears down, and a MongoDB source and a
+            # MongoDB target never run at once (the source stops before the
+            # target starts).
+            self.mongo_drop_databases()
+            with open(self.config, "w") as f:
+                f.write(
+                    f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\n'
+                    f'connection_string = "{MONGODB_URI}"\n'
+                )
+            cmd = [self.bin, "init", "--backend", "mongodb", "--config", self.config,
+                   "--overwrite"]
+            with open(os.path.join(self.work, "init.log"), "w") as log:
+                r = subprocess.run(cmd, cwd=self.work, env=env, stdout=log, stderr=subprocess.STDOUT)
+            if r.returncode != 0:
+                print(open(os.path.join(self.work, "init.log")).read())
+                raise SystemExit(f"init of the {self.role} failed")
+            # `init` regenerates the config without the port, run_dir and
+            # backup sections the cell needs; write the whole config, as
+            # devtools/run-mongodb-tests does.
+            home = os.path.expanduser("~")
+            with open(self.config, "w") as f:
+                f.write(
+                    f'[server]\nbind_addr = "127.0.0.1"\nport = {self.port}\n'
+                    f'region = "{REGION}"\nrun_dir = "{self.work}/run"\n\n'
+                    f'[server.tls]\ncert_path = "{home}/.extenddb/tls/cert.pem"\n'
+                    f'key_path = "{home}/.extenddb/tls/key.pem"\n\n'
+                    f'[storage]\nbackend = "mongodb"\n\n[storage.mongodb]\n'
+                    f'connection_string = "{MONGODB_URI}"\n\n'
+                    f'[auth]\nprovider = "builtin"\n\n'
+                    f'[backup]\nreconcile_interval_secs = 2\nstale_job_after_secs = 45\n\n'
+                    f'[backup.store]\nkind = "filesystem"\n'
+                    f'[backup.store.filesystem]\npath = "{self.root}"\n'
+                )
+            return
+        if self.backend == "sqlite":
+            cmd = [self.bin, "init", "--backend", "sqlite", "--sqlite-path",
+                   os.path.join(self.work, "db.sqlite"), "--config", self.config]
+        elif self.backend == "postgres":
+            cmd = [self.bin, "init", "--pg-host", PG["host"], "--pg-port", PG["port"],
+                   "--pg-user", PG["user"], "--pg-pass", PG["password"],
+                   "--data-db", f"{self.tag}_data", "--catalog-db", f"{self.tag}_catalog",
+                   "--extenddb-user", f"{self.tag}_app", "--config", self.config]
+        elif self.backend == "cassandra":
+            cmd = [self.bin, "init", "--backend", "cassandra",
+                   "--cassandra-contact-points", "127.0.0.1:9042",
+                   "--cassandra-user", "cassandra", "--cassandra-pass", "cassandra",
+                   "--config", self.config]
+        else:
+            raise NotImplementedError(f"deployment of a {self.backend} server")
+        with open(os.path.join(self.work, "init.log"), "w") as log:
+            r = subprocess.run(cmd, cwd=self.work, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if r.returncode != 0:
+            print(open(os.path.join(self.work, "init.log")).read())
+            raise SystemExit(f"init of the {self.role} failed")
+        text = open(self.config).read()
+        text, n = re.subn(r"(?m)^[ \t]*#?[ \t]*port[ \t]*=[ \t]*\d+.*$", f"port = {self.port}", text, count=1)
+        assert n == 1, "no port line in the config"
+        text = re.sub(r'(?m)^run_dir = .*$', f'run_dir = "{self.work}/run"', text)
+        os.makedirs(self.root, mode=0o700, exist_ok=True)
+        text += (
+            "\n[backup]\nreconcile_interval_secs = 2\nstale_job_after_secs = 45\n"
+            f'\n[backup.store]\nkind = "filesystem"\n[backup.store.filesystem]\npath = "{self.root}"\n'
+        )
+        open(self.config, "w").write(text)
+
+    def mongo_drop_databases(self) -> None:
+        """Drop the MongoDB backend's fixed catalog and data databases and wait
+        until each drop has completed. On a replica set `dropDatabase` is
+        two-phase: the database stays drop-pending until the drop is
+        majority-committed, a collection created meanwhile fails with
+        `DatabaseDropPending` (code 215) or vanishes with the database when
+        the drop lands, and a server started over a pending drop then answers
+        `ResourceNotFoundException` to writes into a table it reported
+        ACTIVE. The probe below creates a collection in each database until
+        the server accepts it, then drops the collection (a collection drop
+        leaves no pending database)."""
+        from pymongo import MongoClient
+        from pymongo.errors import OperationFailure
+
+        client = MongoClient(MONGODB_URI)
+        try:
+            for name in ("extenddb_catalog", "extenddb_data"):
+                client.drop_database(name)
+            deadline = time.monotonic() + 120
+            for name in ("extenddb_catalog", "extenddb_data"):
+                while True:
+                    try:
+                        client[name].create_collection("drop_probe")
+                    except OperationFailure as e:
+                        if e.code == 215 and time.monotonic() < deadline:
+                            time.sleep(0.25)
+                            continue
+                        raise
+                    client[name].drop_collection("drop_probe")
+                    break
+        finally:
+            client.close()
+
+    # -- the process --
+
+    def start(self, log_name: str = "serve.log", extra_env: dict | None = None) -> None:
+        env = dict(os.environ, **(extra_env or {}))
+        self.log = open(os.path.join(self.work, log_name), "a")
+        self.proc = subprocess.Popen(
+            [self.bin, "serve", "--foreground", "--config", self.config],
+            cwd=self.work, env=env, stdout=self.log, stderr=subprocess.STDOUT,
+        )
+        for _ in range(300):
+            try:
+                if requests.get(f"{self.endpoint}/health", verify=False, timeout=2).status_code == 200:
+                    break
+            except requests.RequestException:
+                pass
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        else:
+            self.stop()
+            raise SystemExit(f"the {self.role} server did not start; see {self.log.name}")
+        if self.proc.poll() is not None:
+            raise SystemExit(f"the {self.role} server exited at start; see {self.log.name}")
+        say(f"{self.role} ({self.backend}) pid {self.proc.pid} on {self.port}")
+
+    def stop(self) -> None:
+        """SIGTERM by PID, then SIGKILL if it outlives the drain."""
+        if self.proc is None or self.proc.poll() is not None:
+            return
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        say(f"{self.role} pid {self.proc.pid} stopped (exit {self.proc.returncode})")
+
+    def teardown(self) -> None:
+        self.stop()
+        if self.backend == "postgres":
+            psql(f"DROP DATABASE IF EXISTS {self.tag}_data WITH (FORCE)")
+            psql(f"DROP DATABASE IF EXISTS {self.tag}_catalog WITH (FORCE)")
+            psql(f"DROP ROLE IF EXISTS {self.tag}_app")
+        elif self.backend == "mongodb":
+            self.mongo_drop_databases()
+        elif self.backend == "cassandra":
+            # The Cassandra target server used the default keyspace prefix
+            # `extenddb`; drop its catalog and this account's data keyspace.
+            # The names are fixed, so another cell or process on the same
+            # node loses its catalog here (module docstring).
+            try:
+                from cassandra.auth import PlainTextAuthProvider
+                from cassandra.cluster import Cluster
+
+                cluster = Cluster(
+                    ["127.0.0.1"], port=9042,
+                    auth_provider=PlainTextAuthProvider("cassandra", "cassandra"),
+                )
+                session = cluster.connect()
+                for ks in ("extenddb_catalog", f"extenddb_account_{ACCOUNT}"):
+                    session.execute(f"DROP KEYSPACE IF EXISTS {ks}")
+                cluster.shutdown()
+            except Exception as e:  # noqa: BLE001
+                print(f"cassandra teardown: {e}")
+
+    # -- credentials and clients --
+
+    def provision(self) -> None:
+        env = dict(os.environ, EXTENDDB_TEST_ENDPOINT=self.endpoint, EXTENDDB_ADMIN_USER="admin",
+                   EXTENDDB_ADMIN_PASSWORD=ADMIN_PASSWORD)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "devtools", "provision-test-credentials")],
+                           env=env, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit(f"provisioning on the {self.role} failed: {r.stderr}")
+        for line in r.stdout.splitlines():
+            m = re.match(r"export (\w+)=(.*)", line.strip())
+            if m:
+                self.creds[m.group(1)] = m.group(2)
+        for key, value in [("control_plane_delay_seconds", "0.05"), ("index_propagation_delay_ms", "0")]:
+            subprocess.run([self.bin, "settings", "--config", self.config, "set", key, value],
+                           cwd=self.work, capture_output=True)
+
+    def client(self):
+        return boto3.client(
+            "dynamodb", endpoint_url=self.endpoint, region_name=REGION, verify=False,
+            aws_access_key_id=self.creds["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=self.creds["AWS_SECRET_ACCESS_KEY"],
+            config=Config(retries={"max_attempts": 10, "mode": "standard"}, read_timeout=120),
+        )
+
+    def signed_post(self, operation: str, body: dict) -> requests.Response:
+        """A hand-signed request for an operation botocore's model lacks
+        (CreateTable with VectorIndexes, DescribeTable's VectorIndexes,
+        SearchVectors)."""
+        body_bytes = json.dumps(body).encode()
+        headers = {"X-Amz-Target": f"DynamoDB_20120810.{operation}",
+                   "Content-Type": "application/x-amz-json-1.0"}
+        frozen = boto3.Session(
+            aws_access_key_id=self.creds["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=self.creds["AWS_SECRET_ACCESS_KEY"],
+        ).get_credentials().get_frozen_credentials()
+        req = AWSRequest(method="POST", url=self.endpoint, data=body_bytes, headers=headers)
+        SigV4Auth(frozen, "dynamodb", REGION).add_auth(req)
+        return requests.post(self.endpoint, data=body_bytes, headers=dict(req.headers), verify=False)
+
+    def store_id(self) -> str:
+        return json.load(open(os.path.join(self.root, "extenddb-store.json")))["store_id"]
+
+
+def psql(statement: str, database: str = "postgres", tuples: bool = False) -> str:
+    env = dict(os.environ, PGPASSWORD=PG["password"])
+    cmd = ["psql", "-h", PG["host"], "-p", PG["port"], "-U", PG["user"], "-d", database, "-v", "ON_ERROR_STOP=1", "-q"]
+    if tuples:
+        cmd.append("-tA")
+    r = subprocess.run(cmd + ["-c", statement], env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"psql failed: {r.stderr}\n{statement}")
+    return r.stdout.strip()
+
+
+# --- the table, the items, the backup --------------------------------------------
+
+TABLE = "MatrixSource"
+TARGET = "MatrixTarget"
+
+
+def table_input(name: str, vector: bool) -> dict:
+    body = {
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "N"},
+            {"AttributeName": "g", "AttributeType": "S"},
+            {"AttributeName": "l", "AttributeType": "S"},
+        ],
+        "BillingMode": "PROVISIONED",
+        "ProvisionedThroughput": {"ReadCapacityUnits": 7, "WriteCapacityUnits": 9},
+        "GlobalSecondaryIndexes": [{
+            "IndexName": "by-g",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+            "Projection": {"ProjectionType": "ALL"},
+            "ProvisionedThroughput": {"ReadCapacityUnits": 3, "WriteCapacityUnits": 4},
+        }],
+        "LocalSecondaryIndexes": [{
+            "IndexName": "by-l",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "l", "KeyType": "RANGE"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+        }],
+        "SSESpecification": {"Enabled": True, "SSEType": "KMS"},
+    }
+    if vector:
+        # Vector indexes are accepted on on-demand tables only.
+        body["BillingMode"] = "PAY_PER_REQUEST"
+        del body["ProvisionedThroughput"]
+        del body["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"]
+        body["VectorIndexes"] = [{
+            "IndexName": "by-emb", "Dimensions": 3, "DistanceFunction": "COSINE",
+            "VectorAttribute": {"AttributeName": "emb"}, "Projection": {"ProjectionType": "ALL"},
+        }]
+    return body
+
+
+def item(i: int, vector: bool) -> dict:
+    """Item `i` with every attribute type; every second item carries the GSI
+    key, every third the LSI key, every fifth the vector."""
+    it = {
+        "pk": {"S": f"p{i % 11:03d}"},
+        "sk": {"N": str(i)},
+        "s": {"S": f"text {i} \u00e9\u2028"},
+        "n": {"N": f"{i}.25"},
+        "big": {"N": "12345678901234567890123456789012345678"},
+        "b": {"B": bytes([i % 256, 0, 255, 7])},
+        "ss": {"SS": [f"a{i}", "b", "c"]},
+        "ns": {"NS": ["1", "2.5", str(-i)]},
+        "bs": {"BS": [b"\x00\x01", bytes([i % 256])]},
+        "bool": {"BOOL": i % 2 == 0},
+        "null": {"NULL": True},
+        "list": {"L": [{"S": "x"}, {"N": "1"}, {"M": {"k": {"BOOL": False}}}]},
+        "map": {"M": {"nested": {"M": {"deep": {"L": [{"NULL": True}]}}}, "n": {"N": "3"}}},
+    }
+    if i % 2 == 0:
+        it["g"] = {"S": f"g{i % 4}"}
+    if i % 3 == 0:
+        it["l"] = {"S": f"l{i:05d}"}
+    if vector and i % 5 == 0:
+        it["emb"] = {"L": [{"N": "0.1"}, {"N": str(0.01 * (i % 50))}, {"N": "0.3"}]}
+    return it
+
+
+def create_and_fill(d: Deployment, items: int, vector: bool) -> None:
+    body = table_input(TABLE, vector)
+    r = d.signed_post("CreateTable", body)
+    check(r.status_code == 200, f"CreateTable on the source: {r.status_code} {r.text}")
+    c = d.client()
+    wait_active(d, TABLE)
+    reqs = []
+    for i in range(items):
+        reqs.append({"PutRequest": {"Item": item(i, vector)}})
+        if len(reqs) == 25 or i == items - 1:
+            pending = {TABLE: reqs}
+            while pending:
+                pending = c.batch_write_item(RequestItems=pending).get("UnprocessedItems") or {}
+            reqs = []
+    say(f"source: {items} items written")
+
+
+def wait_active(d: Deployment, name: str, timeout: float = 600) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        desc = d.signed_post("DescribeTable", {"TableName": name})
+        if desc.status_code == 200:
+            table = desc.json()["Table"]
+            indexes = (table.get("GlobalSecondaryIndexes") or []) + (table.get("VectorIndexes") or [])
+            if table["TableStatus"] == "ACTIVE" and all(x.get("IndexStatus", "ACTIVE") == "ACTIVE" for x in indexes):
+                return table
+        time.sleep(0.2)
+    raise CellFailed(f"{name} did not become ACTIVE on the {d.role} within {timeout} s")
+
+
+def take_backup(d: Deployment) -> tuple[str, dict]:
+    c = d.client()
+    arn = c.create_backup(TableName=TABLE, BackupName="matrix")["BackupDetails"]["BackupArn"]
+    deadline = time.monotonic() + 600
+    while True:
+        desc = c.describe_backup(BackupArn=arn)["BackupDescription"]
+        status = desc["BackupDetails"]["BackupStatus"]
+        if status == "AVAILABLE":
+            say(f"source: backup {arn} AVAILABLE ({desc['BackupDetails']['BackupSizeBytes']} bytes)")
+            return arn, desc
+        check(status == "CREATING", f"the backup is {status}")
+        check(time.monotonic() < deadline, "the backup did not become AVAILABLE")
+        time.sleep(0.2)
+
+
+def copy_prefix(source_prefix: str, target_prefix: str, target_root: str) -> None:
+    """Copy the backup's prefix under the target root, every directory
+    0700 and every file 0600 (the store refuses a root others can read)."""
+    rel = os.path.relpath(os.path.dirname(target_prefix), target_root)
+    path = target_root
+    for part in rel.split(os.sep):
+        path = os.path.join(path, part)
+        if not os.path.isdir(path):
+            os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+    shutil.copytree(source_prefix, target_prefix)
+    for dirpath, dirnames, filenames in os.walk(target_prefix):
+        os.chmod(dirpath, 0o700)
+        for name in filenames:
+            os.chmod(os.path.join(dirpath, name), 0o600)
+
+
+def prefix_of(root: str, arn: str) -> str:
+    backup_id = arn.rsplit("/", 1)[1]
+    table = arn.split(":table/")[1].split("/")[0]
+    return os.path.join(root, ACCOUNT, table, backup_id)
+
+
+# --- a hand-built unordered backup with one key in two files -----------------------
+
+
+def write_duplicate_key_prefix(prefix: str, manifest: dict, vector: bool) -> dict:
+    """Replace the data files under `prefix` with two unordered files that
+    share the key of item 0, and rewrite the manifest and its sidecar; every
+    file written here is 0600 and the data directory 0700, as `copy_prefix`
+    leaves the rest of the prefix."""
+    data_dir = os.path.join(prefix, "data")
+    shutil.rmtree(data_dir)
+    os.makedirs(data_dir, mode=0o700)
+    os.chmod(data_dir, 0o700)
+    files = []
+    total = 0
+    for index, rows in enumerate([[item(i, vector) for i in range(0, 6)], [item(i, vector) for i in range(6, 12)] + [item(0, vector)]], start=1):
+        lines = b"".join(json.dumps({"Item": r}, separators=(",", ":"), default=b64).encode() + b"\n" for r in rows)
+        import io
+
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
+            gz.write(lines)
+        compressed = buffer.getvalue()
+        key = f"data/{index:06d}.json.gz"
+        with open(os.path.join(prefix, key), "wb") as f:
+            f.write(compressed)
+        os.chmod(os.path.join(prefix, key), 0o600)
+        files.append({
+            "key": key, "item_count": len(rows),
+            "sha256": hashlib.sha256(compressed).hexdigest(),
+            "md5": base64.b64encode(hashlib.md5(compressed).digest()).decode(),
+            "bytes": len(compressed), "uncompressed_bytes": len(lines), "key_range": None,
+        })
+        total += len(compressed)
+    manifest = dict(manifest)
+    manifest["item_order"] = "unordered"
+    manifest["data_files"] = files
+    manifest["backup_size_bytes"] = total
+    manifest["source_table"] = dict(manifest["source_table"], item_count=13)
+    text = json.dumps(manifest, separators=(",", ":")).encode()
+    with open(os.path.join(prefix, "extenddb-manifest.json"), "wb") as f:
+        f.write(text)
+    os.chmod(os.path.join(prefix, "extenddb-manifest.json"), 0o600)
+    with open(os.path.join(prefix, "extenddb-manifest.sha256"), "w") as f:
+        f.write(f"{hashlib.sha256(text).hexdigest()}  extenddb-manifest.json\n")
+    os.chmod(os.path.join(prefix, "extenddb-manifest.sha256"), 0o600)
+    write_ddb_manifests(prefix, files, total)
+    return manifest
+
+
+def write_ddb_manifests(prefix: str, files: list[dict], size_bytes: int) -> None:
+    """Rewrite the two DynamoDB export manifests for the data files now under
+    `prefix`, so the prefix is a whole backup in the format's sense (one
+    `md5Checksum` and one `itemCount` per file, agreeing with the
+    extenddb manifest by construction): `manifest-files.json` is one line per
+    file, `manifest-summary.json` keeps the source's document with the new
+    item count and size."""
+    summary_path = os.path.join(prefix, "manifest-summary.json")
+    with open(summary_path) as f:
+        summary = json.load(f)
+    s3_prefix = summary["s3Prefix"]
+    with open(os.path.join(prefix, "manifest-files.json"), "w") as f:
+        for entry in files:
+            line = {
+                "itemCount": entry["item_count"],
+                "md5Checksum": entry["md5"],
+                "dataFileS3Key": f"{s3_prefix}/{entry['key']}" if s3_prefix else entry["key"],
+            }
+            f.write(json.dumps(line, separators=(",", ":")) + "\n")
+    os.chmod(os.path.join(prefix, "manifest-files.json"), 0o600)
+    summary["itemCount"] = sum(entry["item_count"] for entry in files)
+    summary["billedSizeBytes"] = size_bytes
+    with open(summary_path, "w") as f:
+        f.write(json.dumps(summary, separators=(",", ":")))
+    os.chmod(summary_path, 0o600)
+
+
+def b64(value):
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode()
+    raise TypeError(type(value))
+
+
+# --- the seed ------------------------------------------------------------------
+
+
+def seed_row(target: Deployment, arn: str, manifest: dict, size_bytes: int, item_count: int) -> None:
+    """Insert the target's `backup_index` row for the copied prefix, as
+    `backup sync` will (PR 10): AVAILABLE, the target's store identity, the
+    manifest's source table, `created_at` from the backup id."""
+    backup_id = arn.rsplit("/", 1)[1]
+    table = arn.split(":table/")[1].split("/")[0]
+    created_ms = int(backup_id.split("-")[0])
+    # `created_at` as the job writes it (the id's millisecond, six fraction
+    # digits on SQLite); `completed_at` and `heartbeat_at` are the seed's own
+    # instant, distinct from `created_at` as the job's AVAILABLE write and
+    # its last beat are.
+    created_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(created_ms / 1000)) + f".{created_ms % 1000:03d}000Z"
+    now_ms = int(time.time() * 1000)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_ms / 1000)) + f".{now_ms % 1000:03d}Z"
+    store_root = os.path.realpath(target.root)
+    source_table = json.dumps(manifest["source_table"], separators=(",", ":"))
+    if target.backend == "postgres":
+        catalog = f"{target.tag}_catalog"
+        psql(
+            "INSERT INTO backup_index (account_id, backup_id, table_name, backup_arn, backup_name, status, "
+            "store_kind, store_root, store_id, size_bytes, item_count, created_at, completed_at, "
+            "source_table_details_json, owner_generation, heartbeat_at) VALUES "
+            f"('{ACCOUNT}', '{backup_id}', '{table}', '{arn}', 'matrix', 'AVAILABLE', 'filesystem', "
+            f"'{store_root}', '{target.store_id()}', {size_bytes}, {item_count}, "
+            f"to_timestamp({created_ms} / 1000.0), now(), '{source_table.replace(chr(39), chr(39) * 2)}'::jsonb, 0, now())",
+            database=catalog,
+        )
+    elif target.backend == "sqlite":
+        conn = sqlite_module().connect(os.path.join(target.work, "db.sqlite"), timeout=10)
+        try:
+            conn.execute(
+                "INSERT INTO backup_index (account_id, backup_id, table_name, backup_arn, backup_name, status, "
+                "store_kind, store_root, store_id, size_bytes, item_count, created_at, completed_at, "
+                "source_table_details_json, owner_generation, heartbeat_at) VALUES (?, ?, ?, ?, 'matrix', 'AVAILABLE', "
+                "'filesystem', ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (ACCOUNT, backup_id, table, arn, store_root, target.store_id(), size_bytes, item_count,
+                 created_iso, now_iso, source_table, now_iso),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    elif target.backend == "mongodb":
+        import datetime
+
+        from bson import Int64
+        from pymongo import MongoClient
+
+        created = datetime.datetime.fromtimestamp(created_ms / 1000, tz=datetime.timezone.utc)
+        now = datetime.datetime.fromtimestamp(now_ms / 1000, tz=datetime.timezone.utc)
+        client = MongoClient(MONGODB_URI)
+        try:
+            client["extenddb_catalog"]["backup_index"].insert_one({
+                "account_id": ACCOUNT,
+                "backup_id": backup_id,
+                "table_name": table,
+                "backup_arn": arn,
+                "backup_name": "matrix",
+                "status": "AVAILABLE",
+                "store_kind": "filesystem",
+                "store_root": store_root,
+                "store_id": target.store_id(),
+                "size_bytes": Int64(size_bytes),
+                "item_count": Int64(item_count),
+                "created_at": created,
+                "completed_at": now,
+                "source_table_details_json": manifest["source_table"],
+                "owner_generation": Int64(0),
+                "heartbeat_at": now,
+                "lock_seq": Int64(0),
+            })
+        finally:
+            client.close()
+    elif target.backend == "cassandra":
+        # The catalog-index row (`store_kind` set) in `backups_by_arn`, plus
+        # its `backup_index_by_status` entry; DescribeTable and the restore
+        # re-read the authoritative row, so the two list rows are optional.
+        import datetime
+
+        from cassandra.auth import PlainTextAuthProvider
+        from cassandra.cluster import Cluster
+
+        st = manifest["source_table"]
+        created_dt = datetime.datetime.utcfromtimestamp(created_ms / 1000)
+        tct = st.get("table_creation_date_time")
+        table_created_dt = (
+            datetime.datetime.utcfromtimestamp(tct) if tct else created_dt
+        )
+        now_dt = datetime.datetime.utcnow()
+        cluster = Cluster(
+            ["127.0.0.1"], port=9042,
+            auth_provider=PlainTextAuthProvider("cassandra", "cassandra"),
+        )
+        session = cluster.connect()
+        try:
+            insert = session.prepare(
+                "INSERT INTO extenddb_catalog.backups_by_arn (account_id, backup_arn, backup_id, "
+                "backup_name, table_id, table_name, table_arn, backup_status, backup_type, "
+                "backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, "
+                "table_created_at, created_at, store_kind, store_root, store_id, "
+                "source_table_details_json, owner_generation, heartbeat_at) "
+                "VALUES (?, ?, ?, 'matrix', ?, ?, ?, 'AVAILABLE', 'USER', ?, ?, ?, ?, ?, ?, ?, "
+                "'filesystem', ?, ?, ?, 0, ?)"
+            )
+            session.execute(
+                insert,
+                (
+                    ACCOUNT, arn, backup_id, st["table_id"], table, st["table_arn"],
+                    size_bytes, item_count,
+                    json.dumps(st["key_schema"], separators=(",", ":")),
+                    json.dumps(st["attribute_definitions"], separators=(",", ":")),
+                    str(st.get("billing_mode", "PAY_PER_REQUEST")),
+                    table_created_dt, created_dt, store_root, target.store_id(),
+                    source_table, now_dt,
+                ),
+            )
+            status_entry = session.prepare(
+                "INSERT INTO extenddb_catalog.backup_index_by_status (store_root, backup_status, "
+                "backup_arn, account_id, store_kind, store_id) "
+                "VALUES (?, 'AVAILABLE', ?, ?, 'filesystem', ?)"
+            )
+            session.execute(status_entry, (store_root, arn, ACCOUNT, target.store_id()))
+        finally:
+            cluster.shutdown()
+    else:
+        raise NotImplementedError(f"seed_row for {target.backend}")
+    say(f"target: backup_index row seeded for {arn} (store {target.store_id()})")
+
+
+# --- comparison ---------------------------------------------------------------
+
+
+def normalize(it: dict) -> str:
+    def norm(v):
+        if isinstance(v, dict):
+            if len(v) == 1:
+                (k, inner), = v.items()
+                if k in ("SS", "NS"):
+                    return {k: sorted(inner)}
+                if k == "BS":
+                    return {k: sorted(base64.b64encode(x).decode() for x in inner)}
+                if k == "B":
+                    return {k: base64.b64encode(inner).decode()}
+                if k == "N":
+                    return {k: str(inner)}
+            return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        return v
+    return json.dumps(norm(it), sort_keys=True)
+
+
+def scan_all(d: Deployment, name: str, index: str | None = None) -> list[str]:
+    c = d.client()
+    out, kwargs = [], {"TableName": name}
+    if index:
+        kwargs["IndexName"] = index
+    while True:
+        page = c.scan(**kwargs)
+        out.extend(normalize(i) for i in page["Items"])
+        if "LastEvaluatedKey" not in page:
+            return sorted(out)
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def compare_descriptions(source: dict, target: dict) -> None:
+    def keys(x):
+        return [(k["AttributeName"], k["KeyType"]) for k in x["KeySchema"]]
+    check(keys(source) == keys(target), "key schema differs")
+    check(sorted((a["AttributeName"], a["AttributeType"]) for a in source["AttributeDefinitions"])
+          == sorted((a["AttributeName"], a["AttributeType"]) for a in target["AttributeDefinitions"]), "attribute definitions differ")
+    for kind in ("GlobalSecondaryIndexes", "LocalSecondaryIndexes"):
+        s = {g["IndexName"]: (keys(g), g["Projection"]["ProjectionType"]) for g in source.get(kind) or []}
+        t = {g["IndexName"]: (keys(g), g["Projection"]["ProjectionType"]) for g in target.get(kind) or []}
+        check(s == t, f"{kind} differ: {s} vs {t}")
+    def units(x):
+        pt = x.get("ProvisionedThroughput") or {}
+        return (pt.get("ReadCapacityUnits", 0), pt.get("WriteCapacityUnits", 0))
+    for g in target.get("GlobalSecondaryIndexes") or []:
+        sg = next(x for x in source["GlobalSecondaryIndexes"] if x["IndexName"] == g["IndexName"])
+        check(units(g) == units(sg), f"GSI {g['IndexName']} throughput differs: {units(g)} vs {units(sg)}")
+    check(units(source) == units(target), f"table throughput differs: {units(source)} vs {units(target)}")
+    check((source.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED")
+          == (target.get("BillingModeSummary") or {}).get("BillingMode", "PROVISIONED"), "billing mode differs")
+    check((source.get("SSEDescription") or {}).get("Status") == (target.get("SSEDescription") or {}).get("Status"), "SSE differs")
+    check((target.get("TableClassSummary") or {}).get("TableClass", "STANDARD") == "STANDARD", "the target's table class is not STANDARD")
+    sv = {v["IndexName"]: (v["Dimensions"], v["DistanceFunction"]) for v in source.get("VectorIndexes") or []}
+    tv = {v["IndexName"]: (v["Dimensions"], v["DistanceFunction"]) for v in target.get("VectorIndexes") or []}
+    check(sv == tv, f"vector indexes differ: {sv} vs {tv}")
+
+
+# --- the cell ------------------------------------------------------------------
+
+
+def run(args) -> int:
+    cell_tag = f"{args.source}-{args.target}" + ("-vector" if args.vector else "") + ("-dup" if args.duplicate_key else "")
+    work = args.work or os.path.join(tempfile.gettempdir(), "backup-restore-matrix", cell_tag)
+    work = os.path.abspath(work)
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    bins = {b: os.path.abspath(getattr(args, f"bin_{b}") or DEFAULT_BINS[b]) for b in DEFAULT_BINS}
+    for role, backend in (("source", args.source), ("target", args.target)):
+        check(os.path.isfile(bins[backend]), f"no {backend} binary at {bins[backend]} for the {role}")
+    source = Deployment(args.source, bins[args.source], work, "source")
+    target = Deployment(args.target, bins[args.target], work, "target")
+    rc = 0
+    try:
+        source.init()
+        source.start()
+        source.provision()
+        create_and_fill(source, args.items, args.vector)
+        source_desc = wait_active(source, TABLE)
+        arn, backup_desc = take_backup(source)
+        source_items = scan_all(source, TABLE)
+        source_prefix = prefix_of(source.root, arn)
+        manifest = json.load(open(os.path.join(source_prefix, "extenddb-manifest.json")))
+        source.stop()
+
+        target.init()
+        target.start()
+        target.provision()
+        check(os.path.isfile(os.path.join(target.root, "extenddb-store.json")), "the target wrote no identity file")
+        target_prefix = prefix_of(target.root, arn)
+        copy_prefix(source_prefix, target_prefix, target.root)
+        if args.duplicate_key:
+            manifest = write_duplicate_key_prefix(target_prefix, manifest, args.vector)
+            say("target: the prefix now holds an unordered backup with one key in two files")
+        seed_row(target, arn, manifest, manifest["backup_size_bytes"], manifest["source_table"]["item_count"])
+
+        c = target.client()
+        described = c.describe_backup(BackupArn=arn)["BackupDescription"]
+        check(described["BackupDetails"]["BackupStatus"] == "AVAILABLE", "the seeded row does not describe AVAILABLE")
+        started = time.monotonic()
+
+        if args.vector and args.target == "mongodb":
+            # A manifest with vector indexes into a backend without vector
+            # support is refused before any table is created (section 1,
+            # 5.3 step 2).
+            try:
+                c.restore_table_from_backup(TargetTableName=TARGET, BackupArn=arn)
+            except ClientError as e:
+                err = e.response["Error"]
+                check(err.get("Code") == "ValidationException",
+                      f"the refusal is a ValidationException: {err}")
+                check("vector" in err.get("Message", "").lower(),
+                      f"the refusal names vector indexes: {err}")
+                probe = target.signed_post("DescribeTable", {"TableName": TARGET})
+                check(probe.status_code == 400 and "ResourceNotFound" in probe.text,
+                      f"a table was created despite the refusal: {probe.status_code} {probe.text}")
+                say(f"target: the vector manifest was refused before any table: {err['Message'][:160]}")
+                print("CELL PASSED (vector manifest refused)")
+                return 0
+            raise CellFailed("a vector manifest into MongoDB was not refused")
+
+        # A vector manifest is refused into a backend without vector support
+        # (Cassandra), synchronously and before any table is created.
+        if args.vector and args.target == "cassandra":
+            try:
+                c.restore_table_from_backup(TargetTableName=TARGET, BackupArn=arn)
+            except ClientError as e:
+                err = e.response["Error"]
+                check(
+                    err.get("Code") == "ValidationException" and "vector index" in err.get("Message", ""),
+                    f"the vector manifest was not refused with a vector ValidationException: {err}",
+                )
+                probe = target.signed_post("DescribeTable", {"TableName": TARGET})
+                check(
+                    probe.status_code == 400 and "ResourceNotFound" in probe.text,
+                    f"a table was created for a refused vector restore: {probe.status_code} {probe.text}",
+                )
+                say("target: the vector manifest was refused before any table was created")
+                print("CELL PASSED (vector manifest refused)")
+                return 0
+            raise CellFailed("the vector manifest into Cassandra was not refused")
+
+        try:
+            resp = c.restore_table_from_backup(TargetTableName=TARGET, BackupArn=arn)
+        except ClientError as e:
+            raise CellFailed(f"RestoreTableFromBackup refused: {e.response['Error']}") from e
+        desc = resp["TableDescription"]
+        check(desc["TableStatus"] == "CREATING", f"the restore answered {desc['TableStatus']}")
+        summary = desc.get("RestoreSummary") or {}
+        check(summary.get("SourceBackupArn") == arn and summary.get("RestoreInProgress") is True,
+              f"the response carries no RestoreSummary: {summary}")
+        say(f"target: restore of {arn} into {TARGET} registered CREATING")
+
+        if args.duplicate_key:
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                r = target.signed_post("DescribeTable", {"TableName": TARGET})
+                if r.status_code == 400 and "ResourceNotFound" in r.text:
+                    break
+                # Cassandra removes a failed restore target in two writes
+                # (CREATING to DELETING, then the drop), so DELETING is a
+                # transient state on the way out, not a reached ACTIVE.
+                check(
+                    r.status_code != 200
+                    or r.json()["Table"]["TableStatus"] in ("CREATING", "DELETING"),
+                    f"a backup with a duplicated key reached {r.json()['Table']['TableStatus']}",
+                )
+                time.sleep(0.5)
+            else:
+                raise CellFailed("the target of the duplicated-key backup was not removed")
+            # The job logs its FAILED line just after it removes the target,
+            # so poll the log for a short window rather than reading it the
+            # instant the table disappears.
+            log_deadline = time.monotonic() + 15
+            failed = []
+            while time.monotonic() < log_deadline:
+                log = open(os.path.join(target.work, "serve.log")).read()
+                failed = [l for l in log.splitlines() if "FAILED" in l and TARGET in l]
+                if failed:
+                    break
+                time.sleep(0.25)
+            check(bool(failed), "the server log does not record the FAILED restore")
+            check(any("holds a key twice" in l or "the manifest lists" in l for l in failed),
+                  f"the failure names neither the duplicate key nor the count: {failed[-1][:300]}")
+            say(f"target: {failed[-1].split(': FAILED', 1)[-1][:200]}")
+            say(f"target: the duplicated-key restore failed and the target is gone after {time.monotonic() - started:.1f} s")
+            print("CELL PASSED (duplicate key refused)")
+            return 0
+
+        target_desc = wait_active(target, TARGET)
+        say(f"target: {TARGET} ACTIVE after {time.monotonic() - started:.1f} s")
+        check(target_desc.get("RestoreSummary") is None, "an ACTIVE table still reports a RestoreSummary")
+        target_items = scan_all(target, TARGET)
+        check(len(target_items) == args.items, f"the target holds {len(target_items)} items, the source wrote {args.items}")
+        check(target_items == source_items, "the item sets differ")
+        compare_descriptions(source_desc, target_desc)
+        for gsi in target_desc.get("GlobalSecondaryIndexes") or []:
+            name = gsi["IndexName"]
+            rows = c.query(TableName=TARGET, IndexName=name,
+                           KeyConditionExpression="g = :g", ExpressionAttributeValues={":g": {"S": "g0"}})["Items"]
+            expected = sum(1 for i in range(args.items) if i % 2 == 0 and i % 4 == 0)
+            check(len(rows) == expected, f"Query on {name} returned {len(rows)} items, expected {expected}")
+        lsi_rows = c.query(TableName=TARGET, IndexName="by-l",
+                           KeyConditionExpression="pk = :p", ExpressionAttributeValues={":p": {"S": "p000"}})["Items"]
+        expected_l = sum(1 for i in range(args.items) if i % 11 == 0 and i % 3 == 0)
+        check(len(lsi_rows) == expected_l, f"Query on by-l returned {len(lsi_rows)} items, expected {expected_l}")
+        if args.vector:
+            r = target.signed_post("SearchVectors", {"TableName": TARGET, "IndexName": "by-emb",
+                                                     "SearchVector": [{"N": "0.1"}, {"N": "0.0"}, {"N": "0.3"}],
+                                                     "TopK": 3})
+            check(r.status_code == 200, f"SearchVectors on the target: {r.status_code} {r.text}")
+            results = r.json().get("SearchResults") or []
+            check(len(results) == 3, f"SearchVectors returned {len(results)} results, expected 3")
+            # The index strips the vector from the projected item; the items it
+            # answers are the ones that carried one (every fifth).
+            keys = [int(x["Item"]["sk"]["N"]) for x in results]
+            check(all(k % 5 == 0 for k in keys), f"SearchVectors answered items that carried no vector: {keys}")
+        check(described["SourceTableDetails"]["ItemCount"] == args.items, "DescribeBackup's item count differs from the items written")
+        say("target: item set, description, GSI and LSI queries match the source")
+        print("CELL PASSED")
+        return 0
+    except CellFailed as e:
+        print(f"CELL FAILED: {e}")
+        return 1
+    finally:
+        for d in (target, source):
+            try:
+                d.teardown()
+            except Exception as e:  # noqa: BLE001
+                print(f"teardown of the {d.role}: {e}")
+        print(f"logs under {work}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", required=True, choices=["sqlite", "postgres", "mongodb"])
+    p.add_argument("--target", required=True, choices=["sqlite", "postgres", "mongodb", "cassandra"])
+    p.add_argument("--items", type=int, default=1200)
+    p.add_argument("--vector", action="store_true")
+    p.add_argument("--duplicate-key", action="store_true")
+    p.add_argument("--work")
+    for b in DEFAULT_BINS:
+        p.add_argument(f"--bin-{b}")
+    sys.exit(run(p.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
