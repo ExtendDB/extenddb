@@ -8,9 +8,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Developer mode: plain HTTP on loopback, open authorization (SigV4 still
-# enforced), seeded dev credential. A build-time profile for local development
-# and CI. The thin bin enforces that it is paired with the `sqlite` backend.
+# Developer mode: plain HTTP on loopback, open authorization (SigV4
+# authentication still enforced), seeded dev credential. A build-time profile
+# for local development and CI. The thin bin enforces that it is paired with the
+# `sqlite` backend.
 dev-mode = ["extenddb-config/dev-mode"]
 mongodb-test-hooks = ["extenddb-server/mongodb-test-hooks"]
 backup-test-hooks = ["extenddb-server/backup-test-hooks"]
