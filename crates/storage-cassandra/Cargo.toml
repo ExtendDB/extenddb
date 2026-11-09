@@ -32,6 +32,11 @@ chrono = { workspace = true }
 [features]
 # Entry points the integration tests build catalogs with.
 test-util = ["extenddb-storage/test-util"]
+# Coordination hooks used only by this crate's integration test binary
+# (`src/test_hooks.rs`). Production builds do not compile them. Enabling it
+# also arms `extenddb_storage::backup_catalog::restore_pause_point`, the
+# `bulk_load` kill point the restore kill-point harness drives.
+test-hooks = ["extenddb-storage/test-hooks"]
 
 [dev-dependencies]
 extenddb-storage = { workspace = true, features = ["test-util"] }

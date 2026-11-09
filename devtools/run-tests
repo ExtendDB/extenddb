@@ -26,6 +26,7 @@
 #   --external        External Java test suite
 #   --comprehensive   Comprehensive Python suite
 #   --all             all of the above
+#   --terraform       Terraform apply of tests/terraform/warm-throughput (not in --all)
 #   --catalog-check   post-test catalog integrity check
 #
 # Options:
@@ -36,7 +37,16 @@
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
+#   --shard K/N       run only shard K of N of each pytest suite (CI); only
+#                     shard 1 runs --terraform
 #   --config PATH     config file path (default: extenddb.toml in repo root)
+#
+# Environment (--pytest against extenddb):
+#   EXTENDDB_TEST_BACKUP_STORE  where the server writes its backups: filesystem,
+#                               s3 or none; the backup tests derive their
+#                               expected outcome from it, so it is required
+#                               (the Rust integration suite's backup tests read
+#                               it too and fail when it is unset).
 #
 # REQ-TEST-001, D-1, D-2, D-3, D-4, D-5
 
@@ -65,6 +75,7 @@ RUN_RUST_INTEGRATION=false
 RUN_PYTEST=false
 RUN_EXTERNAL=false
 RUN_COMPREHENSIVE=false
+RUN_TERRAFORM=false
 RUN_CATALOG_CHECK=false
 
 # Options
@@ -72,6 +83,8 @@ RELEASE=false
 FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
+# --shard K/N; CI sets EXTENDDB_TEST_SHARD instead.
+SHARD="${EXTENDDB_TEST_SHARD:-}"
 BACKEND="postgres"
 
 usage() {
@@ -88,7 +101,10 @@ Suites (at least one required):
   --pytest          Python integration tests
   --external        External Java test suite
   --comprehensive   Comprehensive Python suite
-  --all             all suites
+  --terraform       Terraform apply of tests/terraform/warm-throughput (installs
+                    the pinned linux_amd64 Terraform unless TERRAFORM names a
+                    binary, and downloads the AWS provider; not part of --all)
+  --all             all suites above except --terraform
   --catalog-check   post-test catalog integrity check
 
 Options:
@@ -97,7 +113,18 @@ Options:
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
+  --shard K/N       run only shard K of N of each pytest suite; only shard 1
+                    runs --terraform
   --config PATH     config file path
+
+Environment (--extenddb with an integration suite):
+  EXTENDDB_TEST_ENDPOINT      the server, https://localhost:<port> (required)
+  EXTENDDB_ADMIN_PASSWORD     the password from 'extenddb init' (required)
+  EXTENDDB_TEST_BACKUP_STORE  where the server writes its backups: filesystem,
+                              s3 or none (required for --pytest; the Rust
+                              integration suite's backup tests read it too)
+Environment (--real-dynamodb): EXTENDDB_TEST_ENDPOINT and EXTENDDB_ADMIN_PASSWORD
+  unset; AWS credentials from the SDK's chain or AWS_ACCESS_KEY_ID.
 EOF
     exit 1
 }
@@ -115,6 +142,7 @@ while [[ $# -gt 0 ]]; do
         --pytest)         RUN_PYTEST=true; shift ;;
         --external)       RUN_EXTERNAL=true; shift ;;
         --comprehensive)  RUN_COMPREHENSIVE=true; shift ;;
+        --terraform)      RUN_TERRAFORM=true; shift ;;
         --all)            RUN_RUST=true; RUN_RUST_INTEGRATION=true; RUN_PYTEST=true; RUN_EXTERNAL=true; RUN_COMPREHENSIVE=true; shift ;;
         --release)        RELEASE=true; shift ;;
         --filter)         FILTER="$2"; shift 2 ;;
@@ -128,6 +156,7 @@ while [[ $# -gt 0 ]]; do
         --parallel=*)
             PARALLEL="${1#--parallel=}"; shift
             ;;
+        --shard)          SHARD="$2"; shift 2 ;;
         -h|--help)        usage ;;
         *)                echo "error: unknown option: $1"; usage ;;
     esac
@@ -156,8 +185,8 @@ if [[ -z "$TARGET" ]]; then
 fi
 
 # --- Validate: at least one suite ---
-if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_CATALOG_CHECK; then
-    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --all, --catalog-check)"
+if ! $RUN_RUST && ! $RUN_RUST_INTEGRATION && ! $RUN_PYTEST && ! $RUN_EXTERNAL && ! $RUN_COMPREHENSIVE && ! $RUN_TERRAFORM && ! $RUN_CATALOG_CHECK; then
+    echo "error: at least one suite flag is required (--rust, --rust-integration, --pytest, --external, --comprehensive, --terraform, --all, --catalog-check)"
     exit 1
 fi
 
@@ -186,6 +215,25 @@ validate_local_target() {
         echo "error: --${prefix_lower} requires EXTENDDB_ADMIN_PASSWORD to be set."
         echo "  This is the password from '${prefix_lower} init'."
         exit 1
+    fi
+
+    # EXTENDDB_TEST_BACKUP_STORE must say where the server writes its backups.
+    # The backup tests derive their expected outcome from it (the store-backed
+    # create backs up vector tables and is asynchronous; the in-catalog create
+    # refuses them), so a run cannot leave it to be guessed.
+    if $RUN_PYTEST; then
+        case "${EXTENDDB_TEST_BACKUP_STORE:-}" in
+            filesystem|s3|none) ;;
+            *)
+                echo "error: --${prefix_lower} --pytest requires EXTENDDB_TEST_BACKUP_STORE to be set."
+                echo "  Set it to the server's [backup.store]: 'filesystem' or 's3' for a configured"
+                echo "  store (a file-backed SQLite server without the section has the defaulted"
+                echo "  filesystem root), 'none' for a server without one (kind = \"disabled\", or"
+                echo "  PostgreSQL, MongoDB and Cassandra without the section)."
+                echo "  Got: '${EXTENDDB_TEST_BACKUP_STORE:-}'"
+                exit 1
+                ;;
+        esac
     fi
 }
 
@@ -219,7 +267,7 @@ validate_real_dynamodb() {
 
 # Only validate credentials for integration suites
 NEEDS_INTEGRATION=false
-if $RUN_PYTEST || $RUN_EXTERNAL || $RUN_COMPREHENSIVE || $RUN_CATALOG_CHECK || $RUN_RUST_INTEGRATION; then
+if $RUN_PYTEST || $RUN_EXTERNAL || $RUN_COMPREHENSIVE || $RUN_TERRAFORM || $RUN_CATALOG_CHECK || $RUN_RUST_INTEGRATION; then
     NEEDS_INTEGRATION=true
 fi
 
@@ -244,22 +292,42 @@ fi
 echo ""
 
 # --- Health check (local targets only) ---
+# With EXTENDDB_TEST_BACKUP_STORE at filesystem or s3 the check also waits for
+# the backup store component to report healthy: /health answers 200 while the
+# component is still "checking", and the backup suites assert the component
+# is healthy at their start, so what is waited for here is what they assert.
 health_check() {
     local endpoint="$1"
     local timeout=30
     local interval=1
     local elapsed=0
+    local want_store=false
+    case "${EXTENDDB_TEST_BACKUP_STORE:-}" in
+        filesystem|s3) want_store=true ;;
+    esac
 
     echo "=== Health check: ${endpoint}/health ==="
     while [[ $elapsed -lt $timeout ]]; do
-        if curl -skf -o /dev/null "${endpoint}/health" 2>/dev/null; then
-            echo "  ✓ Server is healthy (${elapsed}s)"
-            return 0
+        local body
+        if body=$(curl -skf "${endpoint}/health" 2>/dev/null) && [[ -n "$body" ]]; then
+            if ! $want_store; then
+                echo "  ✓ Server is healthy (${elapsed}s)"
+                return 0
+            fi
+            if printf '%s' "$body" | python3 -c 'import json, sys
+h = json.load(sys.stdin)
+sys.exit(0 if h.get("components", {}).get("backup_store", {}).get("status") == "healthy" else 1)' 2>/dev/null; then
+                echo "  ✓ Server and its backup store are healthy (${elapsed}s)"
+                return 0
+            fi
         fi
         sleep "$interval"
         elapsed=$((elapsed + interval))
     done
     echo "  ✗ Server health check failed after ${timeout}s"
+    if $want_store; then
+        echo "  The backup store component did not report healthy; last: $(curl -sk "${endpoint}/health" 2>/dev/null)"
+    fi
     echo "  Is the server running? Check: curl -sk ${endpoint}/health"
     return 1
 }
@@ -457,6 +525,36 @@ if $RUN_RUST_INTEGRATION; then
     echo ""
 fi
 
+# --- Shards (--shard K/N) ---
+# CI splits the long pytest suites across jobs. Before each suite runs,
+# devtools/test-shards prepare collects the whole suite with the suite's own
+# arguments, picks this shard's files, and records both lists under
+# $SHARD_DIR for the summary job's `devtools/test-shards check`. pytest then
+# loads devtools/pytest_shard.py, which keeps only those files. A shard with
+# no files of a suite runs nothing for it. shard_suite SUITE CMD... leaves
+# the command to run in SHARD_CMD.
+SHARD_DIR="${EXTENDDB_SHARD_DIR:-discussions/shards}"
+shard_suite() {
+    local suite="$1" rc=0
+    shift
+    # "${@:4}" is the suite's arguments after "python3 -m pytest".
+    "$SCRIPT_DIR/test-shards" prepare --shard "$SHARD" --out "$SHARD_DIR" \
+        --backend "$BACKEND" --config "${CONFIG_PATH:-extenddb.toml}" \
+        "$suite" -- "${@:4}" || rc=$?
+    SHARD_CMD=("$@")
+    if (( rc == 0 )); then
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        export EXTENDDB_SHARD_FILES="$SHARD_DIR/files-$suite.txt"
+        SHARD_CMD+=(-p pytest_shard)
+    elif (( rc == 10 )); then
+        echo "  shard $SHARD has no $suite files; nothing to run"
+        SHARD_CMD=(true)
+    else
+        echo "  ✗ devtools/test-shards prepare failed for the $suite suite"
+        SHARD_CMD=(false)
+    fi
+}
+
 # --- Pytest ---
 if $RUN_PYTEST; then
     OUTFILE="discussions/test-pytest-${HASH}.txt"
@@ -467,8 +565,15 @@ if $RUN_PYTEST; then
         echo "  endpoint: $EXTENDDB_TEST_ENDPOINT"
     fi
     echo "  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}"
-    # CLI lifecycle tests manage their own server; exclude from main suite
-    PYTEST_ARGS=(python3 -m pytest tests/ -v --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_cli_vector_catalog_migration.py --ignore=tests/test_gsi_async_queue.py)
+    # CLI lifecycle tests manage their own server; exclude from main suite.
+    # tests/test_backup_store_config.py does too: it runs below, in the CLI
+    # lifecycle list on PostgreSQL and in its own step on a SQLite build.
+    # tests/test_backup_job.py starts its own servers as well; CI runs it in
+    # the integration workflows' backup steps, this script does not run it.
+    # -rP: the summary repeats the passed tests that printed something (the
+    # backup cells print which branch ran and which store the server reports),
+    # which pytest's capture would otherwise keep out of the log.
+    PYTEST_ARGS=(python3 -m pytest tests/ -v -rP --ignore=tests/python --ignore=tests/test_cli_lifecycle.py --ignore=tests/test_cli_container_readiness.py --ignore=tests/test_cli_migrate_concurrency.py --ignore=tests/test_cli_vector_catalog_migration.py --ignore=tests/test_gsi_async_queue.py --ignore=tests/test_backup_store_config.py --ignore=tests/test_backup_job.py)
     # Parallel execution (--parallel): distribute by file so module/class-scoped
     # fixtures stay within a single worker.
     if [[ -n "$PARALLEL" ]] && python3 -c "import xdist" 2>/dev/null; then
@@ -482,6 +587,7 @@ if $RUN_PYTEST; then
     if [[ -n "$FILTER" ]]; then
         PYTEST_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite main "${PYTEST_ARGS[@]}"; PYTEST_ARGS=("${SHARD_CMD[@]}"); fi
     if "${PYTEST_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Pytest passed"
     else
@@ -544,10 +650,31 @@ if $RUN_COMPREHENSIVE; then
     if [[ -n "$FILTER" ]]; then
         COMP_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite comprehensive "${COMP_ARGS[@]}"; COMP_ARGS=("${SHARD_CMD[@]}"); fi
     if "${COMP_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Comprehensive tests passed"
     else
         echo "  ✗ Comprehensive tests had failures (check output for details)"
+        PASS=false
+    fi
+    echo ""
+fi
+
+# --- Terraform (the provider's WarmThroughput wait, issue #462) ---
+if $RUN_TERRAFORM; then
+    OUTFILE="discussions/test-terraform-${HASH}.txt"
+    echo "=== Terraform apply → ${OUTFILE} ==="
+    if [[ "$TARGET" == "real-dynamodb" ]]; then
+        echo "  skipped: the configuration points at an ExtendDB endpoint"
+    elif [[ -n "$SHARD" && "${SHARD%%/*}" != "1" ]]; then
+        # The apply is one run, not a suite of test files, so a sharded job
+        # runs it on shard 1 only.
+        echo "  skipped: shard $SHARD (shard 1 runs the apply)"
+    elif EXTENDDB_TEST_ENDPOINT="$EXTENDDB_TEST_ENDPOINT" \
+        tests/terraform/warm-throughput/run.sh 2>&1 | tee "$OUTFILE"; then
+        echo "  ✓ Terraform apply passed"
+    else
+        echo "  ✗ Terraform apply failed"
         PASS=false
     fi
     echo ""
@@ -560,10 +687,11 @@ if $RUN_PYTEST \
         && -n "${EXTENDDB_TEST_PG_CONNECTION_STRING:-}" ]]; then
     CLI_OUTFILE="discussions/test-cli-${HASH}.txt"
     echo "=== CLI lifecycle tests → ${CLI_OUTFILE} ==="
-    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py tests/test_cli_vector_catalog_migration.py -v)
+    CLI_ARGS=(python3 -m pytest tests/test_cli_lifecycle.py tests/test_cli_container_readiness.py tests/test_cli_migrate_concurrency.py tests/test_cli_vector_catalog_migration.py tests/test_backup_store_config.py -v)
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite cli "${CLI_ARGS[@]}"; CLI_ARGS=("${SHARD_CMD[@]}"); fi
     if "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE"; then
         echo "  ✓ CLI lifecycle tests passed"
     else
@@ -571,6 +699,37 @@ if $RUN_PYTEST \
         PASS=false
     fi
     echo ""
+fi
+
+# --- Backup store wire tests on a SQLite build (run last — they start/stop their own servers) ---
+# tests/test_backup_store_config.py's SQLite cells: the default root, the
+# S3 store's health against moto (skipped with a reason unless
+# EXTENDDB_TEST_S3_ENDPOINT names a moto endpoint), `backup list` and
+# `backup purge` with their signals and exit codes. Its PostgreSQL cells run
+# in the CLI lifecycle list above. The build decides: the step runs when the
+# binary reports itself a SQLite build.
+if $RUN_PYTEST && [[ "$TARGET" != "real-dynamodb" ]]; then
+    WIRE_BINARY="${EXTENDDB_BINARY:-target/release/$TARGET}"
+    if [[ ! -x "$WIRE_BINARY" ]]; then
+        WIRE_BINARY="target/debug/$TARGET"
+    fi
+    if [[ -x "$WIRE_BINARY" ]] && "$WIRE_BINARY" version 2>/dev/null | grep -q '(sqlite)'; then
+        WIRE_OUTFILE="discussions/test-backup-store-wire-${HASH}.txt"
+        echo "=== Backup store wire tests (SQLite build) → ${WIRE_OUTFILE} ==="
+        echo "  binary: $WIRE_BINARY"
+        echo "  S3 endpoint: ${EXTENDDB_TEST_S3_ENDPOINT:-none (the S3 cells skip)}"
+        WIRE_ARGS=(python3 -m pytest tests/test_backup_store_config.py -v)
+        if [[ -n "$FILTER" ]]; then
+            WIRE_ARGS+=(-k "$FILTER")
+        fi
+        if EXTENDDB_BINARY="$WIRE_BINARY" "${WIRE_ARGS[@]}" 2>&1 | tee "$WIRE_OUTFILE"; then
+            echo "  ✓ Backup store wire tests passed"
+        else
+            echo "  ✗ Backup store wire tests failed"
+            PASS=false
+        fi
+        echo ""
+    fi
 fi
 
 # --- Catalog check ---

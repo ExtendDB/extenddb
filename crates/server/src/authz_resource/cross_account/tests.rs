@@ -7,10 +7,12 @@ use super::{
     MIXED_ACCOUNTS, OWNER_ONLY, OtherAccount, answer, find, principal_arn, refusal,
     resource_policy_denial,
 };
+use crate::authz_resource::validate_stream_arn_kind;
 use extenddb_auth::AuthIdentity;
 use extenddb_core::error::DynamoDbError;
 use serde_json::json;
 
+const R: &str = "us-east-1";
 const A: &str = "444455556666";
 const OTHER: &str = "111122223333";
 const OWN: &str = "arn:aws:dynamodb:us-east-1:444455556666:table/t";
@@ -287,27 +289,27 @@ fn the_answer_depends_on_the_operation_and_the_account() {
 
 /// An account the catalog holds gets the ARN shape checks before the refusal;
 /// one it does not hold is refused first (measured 2026-11-03 with an index
-/// ARN in `ResourceArn` and a `StreamArn` in another partition).
+/// ARN in `ResourceArn`). A `StreamArn` that is not a stream ARN is refused
+/// before either answer, in every account (measured 2026-11-05 with a table,
+/// index and backup ARN), by the step `authorize_request` runs before this
+/// refusal.
 #[test]
 fn shape_checks_come_first_only_for_a_known_account() {
     let p = "arn:aws:iam::444455556666:user/u";
     let access = ("AccessDeniedException", "Access is denied".to_owned());
-    // A table ARN where a stream ARN belongs.
+    let invalid = ("ValidationException", "Invalid StreamArn".to_owned());
+    // A table ARN where a stream ARN belongs is "Invalid StreamArn" whether or
+    // not the catalog holds the account: the kind step does not read the
+    // account, and the shape check for an account the catalog holds gives the
+    // same answer.
     let input = json!({ "StreamArn": FOREIGN });
-    let unknown = answer(
-        "DescribeStream",
-        &input,
-        "DescribeStream",
-        FOREIGN,
-        false,
-        p,
-    );
-    assert_eq!(message(&unknown), access);
-    let known = answer("DescribeStream", &input, "DescribeStream", FOREIGN, true, p);
-    assert_eq!(
-        message(&known),
-        ("ValidationException", "Invalid StreamArn".to_owned())
-    );
+    for op in ["DescribeStream", "GetShardIterator"] {
+        let kind = validate_stream_arn_kind(op, &input)
+            .expect_err("a table ARN in StreamArn is not a stream ARN");
+        assert_eq!(message(&kind), invalid, "{op}");
+        let known = answer(op, &input, op, FOREIGN, true, p, R);
+        assert_eq!(message(&known), invalid, "{op}");
+    }
     let index = format!("{FOREIGN}/index/gsi1");
     let input = json!({ "ResourceArn": index });
     let unknown = answer(
@@ -317,6 +319,7 @@ fn shape_checks_come_first_only_for_a_known_account() {
         &index,
         false,
         p,
+        R,
     );
     assert_eq!(message(&unknown), access);
     let (code, msg) = message(&answer(
@@ -326,16 +329,78 @@ fn shape_checks_come_first_only_for_a_known_account() {
         &index,
         true,
         p,
+        R,
     ));
     assert_eq!(code, "ValidationException");
     assert!(msg.contains("only table or stream is accepted"), "{msg}");
     // A well-formed stream ARN passes the shape check and gets the denial.
     let input = json!({ "StreamArn": STREAM });
-    let known = answer("DescribeStream", &input, "DescribeStream", STREAM, true, p);
+    let known = answer(
+        "DescribeStream",
+        &input,
+        "DescribeStream",
+        STREAM,
+        true,
+        p,
+        R,
+    );
     assert_eq!(
         message(&known).1,
         resource_policy_denial(p, "DescribeStream", STREAM)
     );
+}
+
+/// A stream ARN in another account with another partition, service or region,
+/// an empty region included, passes the `StreamArn` kind step and gets the
+/// cross-account answer: on `StreamArn`, "Invalid StreamArn" when the catalog
+/// holds the account and "Access is denied" when it does not; on a tag
+/// operation's `ResourceArn`, the denial naming the ARN as written and "Access
+/// is denied" (measured 2026-11-05, the same for an admin and a no-policy
+/// caller). The empty region in a tag `ResourceArn` of an account the catalog
+/// holds is the one cell left out (see the module docs).
+#[test]
+fn a_respelled_stream_arn_in_another_account_is_answered_as_measured() {
+    let p = "arn:aws:iam::444455556666:user/u";
+    let access = ("AccessDeniedException", "Access is denied".to_owned());
+    let invalid = ("ValidationException", "Invalid StreamArn".to_owned());
+    let empty_region = STREAM.replace("us-east-1", "");
+    let respelled = [
+        STREAM.replace("arn:aws:", "arn:aws-cn:"),
+        STREAM.replace("arn:aws:", "arn:aws-us-gov:"),
+        STREAM.replace(":dynamodb:", ":DynamoDB:"),
+        STREAM.replace(":dynamodb:", ":DYNAMODB:"),
+        STREAM.replace(":dynamodb:", ":s3:"),
+        STREAM.replace("us-east-1", "us-west-2"),
+        STREAM.replace("us-east-1", "US-EAST-1"),
+    ];
+    for arn in respelled.iter().chain([&empty_region]) {
+        let input = json!({ "StreamArn": arn });
+        for op in ["DescribeStream", "GetShardIterator"] {
+            assert!(validate_stream_arn_kind(op, &input).is_ok(), "{op} {arn}");
+            assert_eq!(find(op, &input, A), other(op, arn), "{op} {arn}");
+            let known = answer(op, &input, op, arn, true, p, R);
+            assert_eq!(message(&known), invalid, "{op} {arn}");
+            let unknown = answer(op, &input, op, arn, false, p, R);
+            assert_eq!(message(&unknown), access, "{op} {arn}");
+        }
+    }
+    for op in ["TagResource", "UntagResource", "ListTagsOfResource"] {
+        for arn in &respelled {
+            let input = json!({ "ResourceArn": arn });
+            assert_eq!(find(op, &input, A), other(op, arn), "{op} {arn}");
+            let known = answer(op, &input, op, arn, true, p, R);
+            assert_eq!(
+                message(&known).1,
+                resource_policy_denial(p, op, arn),
+                "{op} {arn}"
+            );
+            let unknown = answer(op, &input, op, arn, false, p, R);
+            assert_eq!(message(&unknown), access, "{op} {arn}");
+        }
+        let input = json!({ "ResourceArn": empty_region });
+        let unknown = answer(op, &input, op, &empty_region, false, p, R);
+        assert_eq!(message(&unknown), access, "{op} {empty_region}");
+    }
 }
 
 /// The service writes the apostrophe in "owner's" as U+2019, and the mixed

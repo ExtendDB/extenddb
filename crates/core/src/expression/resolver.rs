@@ -30,6 +30,11 @@ pub struct ExpressionMaps {
     /// and was desugared into an update expression. The service sizes that
     /// form against the item limit differently from an expression.
     pub legacy_attribute_updates: bool,
+    /// Set by the engine for an update translated from a PartiQL `UPDATE`.
+    /// The service sizes that statement by its finished item alone, as it
+    /// sizes a transacted Update, and not by the statement as it sizes
+    /// `UpdateItem`.
+    pub finished_item_sizing: bool,
     /// Pre-parsed `BigDecimal` values for numeric placeholders.
     /// Populated eagerly by `new()` and refreshed by `pre_parse_numerics()`.
     parsed_numerics: HashMap<String, bigdecimal::BigDecimal>,
@@ -45,6 +50,7 @@ impl ExpressionMaps {
             names,
             values,
             legacy_attribute_updates: false,
+            finished_item_sizing: false,
             parsed_numerics: HashMap::new(),
         };
         maps.pre_parse_numerics();
