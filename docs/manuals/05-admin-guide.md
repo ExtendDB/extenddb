@@ -869,12 +869,12 @@ The management web console is served at `/console/` on the same port as the Dyna
 
 ### Features
 
-- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info
-- **Account management**: Create, view, delete accounts (an IAM-user session views its own account only and is redirected to `/console` from the pages of any other account)
-- **User management**: Create, delete users; view access keys, policies, tags, group memberships
-- **Access key management**: Create and delete access keys (secret shown once)
-- **Group management**: Create, delete groups; add/remove members
-- **Role management**: Create, delete roles; view trust policies
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info
+- **Account management**: Create, view, delete accounts (admin only; an IAM-user session is redirected to `/console` from the account list and from every account page)
+- **User management**: Create, delete users; view access keys, policies, tags, group memberships (an IAM-user session opens its own user page only, which lists its access keys and leaves out its policies, groups and tags)
+- **Access key management**: Create and delete access keys (secret shown once; an IAM-user session manages its own keys only)
+- **Group management**: Create, delete groups; add/remove members (admin only)
+- **Role management**: Create, delete roles; view trust policies (admin only)
 - **Policy management**: Add, delete inline policies with JSON editor
 - **Metrics dashboard**: Operation metrics for every account, with charts (admin only; an IAM-user session is redirected to the console home page, `/console`)
 - **Settings and Cache**: The read-only settings viewer and the auth cache invalidation form (admin only; an IAM-user session is redirected to `/console`)

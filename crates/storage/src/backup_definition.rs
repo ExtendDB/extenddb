@@ -489,8 +489,29 @@ pub fn restore_input_from_manifest(
         version: BACKUP_DEFINITION_VERSION,
         billing_mode: crate::backup_catalog::billing_mode_name(source.billing_mode).to_owned(),
         provisioned_throughput: source.provisioned_throughput.clone(),
-        global_secondary_indexes: source.global_secondary_indexes.clone(),
-        local_secondary_indexes: source.local_secondary_indexes.clone(),
+        // The manifest records no warm throughput (row S6b), so the target
+        // and its indexes get none and report the defaults once ACTIVE (row
+        // S6c), as a restore of an in-catalog backup does.
+        global_secondary_indexes: source
+            .global_secondary_indexes
+            .iter()
+            .map(|g| GsiInput {
+                index_name: g.index_name.clone(),
+                key_schema: g.key_schema.clone(),
+                projection: g.projection.clone(),
+                provisioned_throughput: g.provisioned_throughput.clone(),
+                warm_throughput: None,
+            })
+            .collect(),
+        local_secondary_indexes: source
+            .local_secondary_indexes
+            .iter()
+            .map(|l| LsiInput {
+                index_name: l.index_name.clone(),
+                key_schema: l.key_schema.clone(),
+                projection: l.projection.clone(),
+            })
+            .collect(),
         table_class: source.table_class.clone(),
         sse_specification: source
             .sse_description
@@ -563,6 +584,7 @@ mod tests {
                     read_capacity_units: 3,
                     write_capacity_units: 4,
                 }),
+                warm_throughput: None,
             }],
             local_secondary_indexes: Vec::new(),
             table_class: Some("STANDARD_INFREQUENT_ACCESS".to_owned()),

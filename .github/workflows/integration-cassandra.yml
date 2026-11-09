@@ -210,12 +210,14 @@ jobs:
           path: target/release
       # Artifacts do not keep file modes.
       - run: chmod +x target/release/extenddb
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
       - name: Run Cassandra pytest suite
         env:
           # run-cassandra-tests initializes the server without [backup.store],
           # and Cassandra takes the in-catalog create with one.
           EXTENDDB_TEST_BACKUP_STORE: none
-        run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
+        run: devtools/run-cassandra-tests -- --pytest --comprehensive --terraform --parallel
 
       # cassandra-integration checks these lists.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
