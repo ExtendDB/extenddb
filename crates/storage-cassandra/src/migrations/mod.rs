@@ -159,6 +159,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
              (restore_file_index, restore_items_applied, which migration 6 adds); the \
              restore_progress table is PostgreSQL's data database's",
         ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0009_warm_throughput.cql"
+            )],
+        },
     }
 }
 

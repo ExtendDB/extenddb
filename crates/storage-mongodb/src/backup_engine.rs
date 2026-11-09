@@ -1480,6 +1480,7 @@ impl LegacyBackupReader for MongoEngine {
                                 &index_doc,
                                 "provisioned_throughput",
                             )?,
+                            warm_throughput: None,
                         });
                     }
                     "LSI" => {
@@ -1868,6 +1869,7 @@ mod tests {
                 read_capacity_units: 7,
                 write_capacity_units: 8,
             }),
+            warm_throughput: None,
         };
         let kept = restore_gsi_throughput("PROVISIONED", Some(vec![gsi.clone()])).expect("gsis");
         assert!(kept[0].provisioned_throughput.is_some());
