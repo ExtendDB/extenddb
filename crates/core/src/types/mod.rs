@@ -43,7 +43,9 @@ pub use key_schema::{
     ScalarAttributeType, TableKeyInfo, VectorIndexKeyInfo, hash_key_elements,
     is_multipart_key_schema, partition_indexes, range_key_elements,
 };
-pub use query::{Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select};
+pub use query::{
+    Condition, QueryInput, QueryOutput, ScanInput, ScanOutput, Select, saturated_int32,
+};
 pub use stream::{
     DescribeStreamInput, DescribeStreamOutput, GetRecordsInput, GetRecordsOutput,
     GetShardIteratorInput, GetShardIteratorOutput, ListStreamsInput, ListStreamsOutput,
