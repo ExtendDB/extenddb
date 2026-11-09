@@ -39,8 +39,11 @@
 //! what `DescribeTable` and `DescribeTimeToLive` reported for the source;
 //! `DescribeBackup` reports them as `SourceTableFeatureDetails` and a
 //! restore does not reproduce them (the restored table has no stream and no
-//! TTL, as on the service). Nested members reuse the `DynamoDB` wire types, as on the wire. Most
-//! of their optional members are omitted when absent; `OnDemandThroughput`
+//! TTL, as on the service). Nested members reuse the `DynamoDB` wire types, as on the wire,
+//! except the index entries: [`BackupGsi`] and [`BackupLsi`] are the manifest's own types,
+//! with the members, names, order and serialization the `CreateTable` request types had when
+//! format version 1 was frozen, so a member the request gains later (a GSI's `WarmThroughput`)
+//! does not change the format. Most of their optional members are omitted when absent; `OnDemandThroughput`
 //! is not, and writes `null` for an absent `MaxReadRequestUnits` or
 //! `MaxWriteRequestUnits` (`{"MaxReadRequestUnits":100,
 //! "MaxWriteRequestUnits":null}`), which is its wire serialization and part
@@ -93,9 +96,9 @@ use super::layout::{
 };
 use super::strict_item::item_without_duplicates_raw;
 use crate::types::{
-    AttributeDefinition, BillingMode, GsiInput, Item, KeySchemaElement, KeyType, LsiInput,
-    OnDemandThroughput, ProvisionedThroughput, SseDescription, StreamSpecification,
-    TimeToLiveDescription, VectorIndexSpecification,
+    AttributeDefinition, BillingMode, Item, KeySchemaElement, KeyType, OnDemandThroughput,
+    Projection, ProvisionedThroughput, SseDescription, StreamSpecification, TimeToLiveDescription,
+    VectorIndexSpecification,
 };
 
 /// The backup format version this build reads and writes.
@@ -158,9 +161,54 @@ pub enum ItemOrder {
     Unordered,
 }
 
+/// A global secondary index of the source table, as the manifest records it.
+///
+/// The members, serde names, order and `skip_serializing_if` are those of
+/// [`crate::types::GsiInput`] when format version 1 was frozen. The manifest
+/// has its own type so that a member the `CreateTable` request gains does not
+/// change the persisted format: `WarmThroughput`, which a backup does not
+/// record (the service's `GlobalSecondaryIndexInfo` in `DescribeBackup` has
+/// no warm member, and a restored table starts with the defaults).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupGsi {
+    /// Name of the index.
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    /// Key schema of the index.
+    #[serde(rename = "KeySchema")]
+    pub key_schema: Vec<KeySchemaElement>,
+    /// Attributes projected into the index.
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+    /// Provisioned throughput of the index; omitted when absent (the index
+    /// of an on-demand table).
+    #[serde(
+        rename = "ProvisionedThroughput",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub provisioned_throughput: Option<ProvisionedThroughput>,
+}
+
+/// A local secondary index of the source table, as the manifest records it,
+/// with the members, serde names and order of [`crate::types::LsiInput`] when
+/// format version 1 was frozen (see [`BackupGsi`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupLsi {
+    /// Name of the index.
+    #[serde(rename = "IndexName")]
+    pub index_name: String,
+    /// Key schema of the index.
+    #[serde(rename = "KeySchema")]
+    pub key_schema: Vec<KeySchemaElement>,
+    /// Attributes projected into the index.
+    #[serde(rename = "Projection")]
+    pub projection: Projection,
+}
+
 /// The source table definition captured at backup time.
 ///
-/// Field types reuse the existing wire types, so the nested JSON matches what
+/// Field types reuse the existing wire types, apart from the index entries
+/// ([`BackupGsi`], [`BackupLsi`]), so the nested JSON matches what
 /// the `DynamoDB` API itself carries (`PascalCase` members inside each element).
 /// Timestamps are `f64` epoch seconds, the same representation
 /// [`crate::types::BackupDetails`] uses.
@@ -195,10 +243,10 @@ pub struct SourceTableSchema {
     pub sse_description: Option<SseDescription>,
     /// Global secondary indexes defined on the source table; empty when none.
     /// Required (module docs).
-    pub global_secondary_indexes: Vec<GsiInput>,
+    pub global_secondary_indexes: Vec<BackupGsi>,
     /// Local secondary indexes defined on the source table; empty when none.
     /// Required (module docs).
-    pub local_secondary_indexes: Vec<LsiInput>,
+    pub local_secondary_indexes: Vec<BackupLsi>,
     /// Vector indexes, as creation specifications. Three states: `null`, the
     /// source backend has no vector support (a target with vector support
     /// restores the table without vector indexes); `[]`, the source supports
@@ -1541,7 +1589,7 @@ mod tests {
                         "arn:aws:kms:us-east-1:123456789012:key/abcd".to_owned(),
                     ),
                 }),
-                global_secondary_indexes: vec![GsiInput {
+                global_secondary_indexes: vec![BackupGsi {
                     index_name: "GenreIndex".to_owned(),
                     key_schema: vec![KeySchemaElement {
                         attribute_name: "Genre".to_owned(),
@@ -1556,7 +1604,7 @@ mod tests {
                         write_capacity_units: 1,
                     }),
                 }],
-                local_secondary_indexes: vec![LsiInput {
+                local_secondary_indexes: vec![BackupLsi {
                     index_name: "TitleIndex".to_owned(),
                     key_schema: vec![
                         KeySchemaElement {

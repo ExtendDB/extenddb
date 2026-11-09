@@ -151,6 +151,7 @@ column indexes.projection: jsonb NOT NULL
 column indexes.index_status: text NOT NULL DEFAULT 'ACTIVE'::text
 column indexes.provisioned_throughput: jsonb
 column indexes.propagation_delay_ms: integer
+column indexes.warm_throughput: jsonb
 column login_attempts.principal: text NOT NULL
 column login_attempts.attempted_at: timestamp with time zone NOT NULL DEFAULT now()
 column login_attempts.success: boolean NOT NULL
@@ -217,6 +218,7 @@ column tables.ttl_index_ready: boolean NOT NULL DEFAULT false
 column tables.table_class: text
 column tables.sse_specification: jsonb
 column tables.on_demand_throughput: jsonb
+column tables.warm_throughput: jsonb
 column tags.resource_arn: text NOT NULL
 column tags.tag_key: text NOT NULL
 column tags.tag_value: text NOT NULL

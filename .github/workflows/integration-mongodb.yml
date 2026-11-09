@@ -52,6 +52,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Build release (mongodb backend)
         run: cargo build --release --no-default-features --features mongodb-test-hooks
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
       - name: Run MongoDB pytest suite
         env:
           # run-mongodb-tests gives the server a filesystem [backup.store]
@@ -59,7 +61,7 @@ jobs:
           # and the restore cells (tests/test_mongodb_backup_restore.py)
           # rewrite prefixes under that root.
           EXTENDDB_TEST_BACKUP_STORE: filesystem
-        run: devtools/run-mongodb-tests -- --pytest --comprehensive --parallel
+        run: devtools/run-mongodb-tests -- --pytest --comprehensive --terraform --parallel
 
   # SnapshotEngine consistency check against a disposable replica set. The
   # tests build their own per-test scratch databases (snap<uuid>_cat and
