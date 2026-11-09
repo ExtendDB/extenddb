@@ -1270,7 +1270,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own account).
+- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own user page).
 - **Account management:** Create, view, and delete accounts (admin only).
 - **User management:** Create and delete IAM users, view access keys, policies, tags, and group memberships.
 - **Access key management:** Create and delete access keys. The secret key is shown once at creation time.
@@ -1279,7 +1279,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 - **Policy management:** Add and delete inline policies for users, groups, and roles. Includes a JSON editor with a default policy template.
 - **Metrics dashboard:** Operation metrics for every account, with charts (admin only).
 
-Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
+Admin users have full access to all management operations. IAM users open their own user page, which lists their access keys, and create and delete their own access keys there. These are the access key reads and writes the management API gives an IAM user. The console has no form to change the password or import a key. Every other page under `/console/accounts`, the account list included, redirects an IAM-user session to the dashboard.
 
 Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
