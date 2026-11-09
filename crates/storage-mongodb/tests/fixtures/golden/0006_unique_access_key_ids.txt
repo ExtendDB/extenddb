@@ -16,7 +16,7 @@
     }
   ],
   "notes": [
-    "access key AKIAEXTENDDBAIQC4XUG of account 123456789012, user cu-tester was stored 3 times: kept _id ObjectId(\"6ae3dbec99e7d94eaa5c300d\"), the copy credential lookups read, and deleted the other copies _id ObjectId(\"000000000000000000000001\"), _id ObjectId(\"000000000000000000000002\")",
-    "access key AKIAIOSFODNN7EXAMPLE of account 123456789012, user ci was stored 3 times: kept _id ObjectId(\"00000000000000000000000b\"), the copy credential lookups read, and deleted the other copies _id ObjectId(\"00000000000000000000000c\"), _id ObjectId(\"00000000000000000000000d\")"
+    "3 documents had the access key ID AKIAEXTENDDBAIQC4XUG, and all of them belonged to account 123456789012, user cu-tester. When a request uses this access key ID, ExtendDB reads _id ObjectId(\"6ae3dbec99e7d94eaa5c300d\") to authenticate the request. This migration kept _id ObjectId(\"6ae3dbec99e7d94eaa5c300d\") and deleted the other documents: _id ObjectId(\"000000000000000000000001\"), _id ObjectId(\"000000000000000000000002\").",
+    "3 documents had the access key ID AKIAIOSFODNN7EXAMPLE, and all of them belonged to account 123456789012, user ci. When a request uses this access key ID, ExtendDB reads _id ObjectId(\"00000000000000000000000b\") to authenticate the request. This migration kept _id ObjectId(\"00000000000000000000000b\") and deleted the other documents: _id ObjectId(\"00000000000000000000000c\"), _id ObjectId(\"00000000000000000000000d\")."
   ]
 }

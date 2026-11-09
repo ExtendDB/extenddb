@@ -157,41 +157,66 @@ impl Group {
     }
 
     /// What `detect` tells the operator about a group the body does not
-    /// resolve, with the `_id` a lookup reads when it is one of the copies.
+    /// resolve, with the `_id` a lookup reads when it is one of the copies:
+    /// the problem, the reason and the action, then the documents and the
+    /// command that deletes one of them, last so that it copies on its own.
     /// The runner's advice adds the command to run after the fix.
     fn refusal(&self, db: &str, read: Option<&Bson>) -> String {
         let n = self.copies.len();
         let copies = self.copies.iter().map(Stored::describe).collect::<Vec<_>>().join(", ");
-        let delete = delete_command(db);
+        let tail = format!(
+            "{copies}. To delete a document, run this command in mongosh: {}",
+            delete_command(db)
+        );
+        let key = &self.key;
         if self.array {
-            let (them, each) = if n == 1 { ("it", "its") } else { ("each of them", "each one's") };
-            return format!(
-                "the access key ID of {copies} in {db}.{COLLECTION} is the array {}, and a \
-                 credential lookup reads such a document for each ID in the array; delete \
-                 {them} with {delete}, or set {each} access_key_id to one string, in mongosh",
-                self.key
-            );
+            return if n == 1 {
+                format!(
+                    "a document in {db}.{COLLECTION} has the access key ID {key}, which is an \
+                     array. When a request uses an access key ID in the array, ExtendDB can \
+                     read this document to authenticate the request. This migration cannot \
+                     decide which access key ID the document keeps. In mongosh, delete the \
+                     document or set its access_key_id to one string. The document is: {tail}"
+                )
+            } else {
+                format!(
+                    "{n} documents in {db}.{COLLECTION} have the access key ID {key}, which is an \
+                     array. When a request uses an access key ID in the array, ExtendDB can \
+                     read one of these documents to authenticate the request. This migration \
+                     cannot decide which access key ID each document keeps. In mongosh, delete \
+                     each document or set its access_key_id to one string. The documents are: \
+                     {tail}"
+                )
+            };
         }
-        match (&self.key, self.access_key_id()) {
+        match (key, self.access_key_id()) {
             (_, Some(id)) => {
                 let read = read
-                    .map(|r| format!(", and a credential lookup reads _id {r}"))
+                    .map(|r| {
+                        format!(
+                            " When a request uses this access key ID, ExtendDB reads _id {r} to \
+                             authenticate the request."
+                        )
+                    })
                     .unwrap_or_default();
                 format!(
-                    "the access key ID {id} is stored {n} times in {db}.{COLLECTION}, for more \
-                     than one user: {copies}{read}; delete each copy that is not the key \
-                     owner's with {delete} in mongosh"
+                    "{n} documents in {db}.{COLLECTION} have the access key ID {id}, and these \
+                     documents belong to more than one user. This migration cannot decide which \
+                     user is the key owner.{read} Delete each document that does not belong to \
+                     the key owner. The documents are: {tail}"
                 )
             }
             (Bson::Null, None) => format!(
-                "{n} documents in {db}.{COLLECTION} have no access key ID, which no credential \
-                 lookup asks for, and the unique index takes one at most: {copies}; delete the \
-                 others with {delete} in mongosh"
+                "{n} documents in {db}.{COLLECTION} have no access key ID. ExtendDB never reads \
+                 these documents to authenticate a request. The unique index on access_key_id \
+                 allows at most one document with no access key ID. Delete all of these \
+                 documents except one. The documents are: {tail}"
             ),
             (key, None) => format!(
                 "{n} documents in {db}.{COLLECTION} have the access key ID {key}, which is not a \
-                 string and no credential lookup asks for, and the unique index takes one at \
-                 most: {copies}; delete the others with {delete} in mongosh"
+                 string. ExtendDB never reads these documents to authenticate a request. The \
+                 unique index on access_key_id allows at most one document with this access key \
+                 ID. Delete all of these documents except one. The documents are: {tail}"
             ),
         }
     }
@@ -542,20 +567,27 @@ impl CodeBody<MongoStores> for UniqueAccessKeyIds {
                 continue;
             }
             let owner = format!(
-                "access key {id} of account {}, user {}",
+                "account {}, user {}",
                 kept.account_id.as_deref().unwrap_or("(none)"),
                 kept.user_name.as_deref().unwrap_or("(none)"),
             );
+            let total = others.len() + 1;
+            let listed = ids(&others);
             let copies = match others.len() {
-                1 => format!("the other copy {}", ids(&others)),
-                _ => format!("the other copies {}", ids(&others)),
+                1 => format!("the other document: {listed}"),
+                _ => format!("the other documents: {listed}"),
             };
+            let reads = format!(
+                "When a request uses this access key ID, ExtendDB reads _id {} to authenticate \
+                 the request.",
+                kept.id
+            );
             // The ledger records the notes after the body returns; this line
             // names the copies when a run stops before then.
             tracing::warn!(
-                "migration 6 unique_access_key_ids: {owner} is stored {} times in {}.{COLLECTION}: \
-                 deleting {copies} and keeping _id {}, the copy credential lookups read",
-                others.len() + 1,
+                "migration 6 unique_access_key_ids: {total} documents in {}.{COLLECTION} have the \
+                 access key ID {id}, and all of them belong to {owner}. {reads} This migration \
+                 keeps _id {} and deletes {copies}.",
                 db.name(),
                 kept.id,
             );
@@ -573,12 +605,11 @@ impl CodeBody<MongoStores> for UniqueAccessKeyIds {
                 .await?;
             let deleted = match usize::try_from(result.deleted_count) {
                 Ok(n) if n == others.len() => copies,
-                _ => format!("{} of {copies}", result.deleted_count),
+                _ => format!("{} of the other documents: {listed}", result.deleted_count),
             };
             notes.push(format!(
-                "{owner} was stored {} times: kept _id {}, the copy credential lookups read, and \
-                 deleted {deleted}",
-                others.len() + 1,
+                "{total} documents had the access key ID {id}, and all of them belonged to \
+                 {owner}. {reads} This migration kept _id {} and deleted {deleted}.",
                 kept.id,
             ));
         }

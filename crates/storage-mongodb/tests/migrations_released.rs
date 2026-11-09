@@ -646,53 +646,47 @@ async fn migration_6_refuses_copies_it_cannot_resolve_and_writes_nothing() {
     assert_eq!(error.exit_code(), exit::ATTENTION);
     let message = error.to_string();
     let catalog = &d.target.catalog;
-    let delete =
-        format!("db.getSiblingDB(\"{catalog}\").access_keys.deleteOne({{ _id: <its _id> }})");
-    for part in [
+    let owners = |id: &str, read: &Bson, copies: [String; 2]| {
         format!(
-            "migration 6 unique_access_key_ids: the access key ID {fixture_id} is stored 2 \
-             times in {catalog}.access_keys, for more than one user: _id {owner} (account \
-             {account}, user cu-tester, created "
+            "{REFUSED}2 documents in {catalog}.access_keys have the access key ID {id}, and \
+             these documents belong to more than one user. This migration cannot decide which \
+             user is the key owner. When a request uses this access key ID, ExtendDB reads _id \
+             {read} to authenticate the request. Delete each document that does not belong to \
+             the key owner. The documents are: {}. {}",
+            copies.join(", "),
+            delete_sentence(catalog)
+        )
+    };
+    for item in [
+        owners(
+            &fixture_id,
+            &owner,
+            [
+                described(&owner, &account, "cu-tester", created),
+                described(&oid(1).into(), &account, "importer", created + 60_000),
+            ],
+        ),
+        owners(
+            TWO_ACCOUNTS_KEY_ID,
+            &oid(2).into(),
+            [
+                described(&oid(2).into(), &account, "shared", created + 30_000),
+                described(&oid(3).into(), OTHER_ACCOUNT, "shared", created + 90_000),
+            ],
         ),
         format!(
-            "), _id {} (account {account}, user importer, created ",
-            Bson::ObjectId(oid(1))
+            "{REFUSED}2 documents in {catalog}.access_keys have no access key ID. ExtendDB never \
+             reads these documents to authenticate a request. The unique index on access_key_id \
+             allows at most one document with no access key ID. Delete all of these documents \
+             except one. The documents are: {}, {}. {}",
+            described(&oid(21).into(), &account, "broken", created),
+            described(&oid(22).into(), &account, "broken", created),
+            delete_sentence(catalog)
         ),
-        format!(
-            "), and a credential lookup reads _id {owner}; delete each copy that is not the key \
-             owner's with {delete} in mongosh"
-        ),
-        format!(
-            "migration 6 unique_access_key_ids: the access key ID {TWO_ACCOUNTS_KEY_ID} is \
-             stored 2 times in {catalog}.access_keys, for more than one user: _id {} (account \
-             {account}, user shared, created ",
-            Bson::ObjectId(oid(2))
-        ),
-        format!(
-            "), _id {} (account {OTHER_ACCOUNT}, user shared, created ",
-            Bson::ObjectId(oid(3))
-        ),
-        format!(
-            "), and a credential lookup reads _id {}; delete each copy",
-            Bson::ObjectId(oid(2))
-        ),
-        format!(
-            "migration 6 unique_access_key_ids: 2 documents in {catalog}.access_keys have no \
-             access key ID"
-        ),
-        format!(
-            "migration 6 unique_access_key_ids: the access key ID of _id {} (account \
-             {account}, user listed, created ",
-            Bson::ObjectId(oid(31))
-        ),
-        format!(
-            ") in {catalog}.access_keys is the array [\"{}\", \"{}\"], and a credential lookup \
-             reads such a document for each ID in the array; delete it with {delete}, or set \
-             its access_key_id to one string, in mongosh",
-            ARRAY_KEY_IDS[0], ARRAY_KEY_IDS[1]
-        ),
+        array_refusal(catalog, &account, 31, created),
     ] {
-        assert!(message.contains(&part), "{part}\n{message}");
+        assert!(items.contains(&item), "{item}\n{items:#?}");
+        assert!(message.contains(&item), "{item}\n{message}");
     }
     assert!(!message.contains(EXAMPLE_KEY_ID), "{message}");
     assert_eq!(
@@ -765,7 +759,11 @@ async fn migration_6_run_refuses_copies_written_after_detect() {
     let items = run_body(&d).await;
     assert_eq!(items.len(), 1, "{items:?}");
     assert!(
-        items[0].starts_with(&format!("the access key ID {fixture_id} is stored 2 times")),
+        items[0].starts_with(&format!(
+            "2 documents in {}.access_keys have the access key ID {fixture_id}, and these \
+             documents belong to more than one user. ",
+            d.target.catalog
+        )),
         "{items:?}"
     );
     assert_eq!(
@@ -821,6 +819,43 @@ const ARRAY_KEY_IDS: [&str; 2] = ["AKIAARRAYEXAMPLE000A", "AKIAARRAYEXAMPLE000B"
 /// The `_id` [`stored_key`] gives document `n`.
 fn oid(n: u8) -> ObjectId {
     ObjectId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n])
+}
+
+/// What the runner writes before each of migration 6's refusals.
+const REFUSED: &str = "migration 6 unique_access_key_ids: ";
+
+/// How migration 6's refusals name a document of `user` in `account`,
+/// created at `created_ms`.
+fn described(id: &Bson, account: &str, user: &str, created_ms: i64) -> String {
+    let created = bson::DateTime::from_millis(created_ms)
+        .try_to_rfc3339_string()
+        .unwrap();
+    format!("_id {id} (account {account}, user {user}, created {created})")
+}
+
+/// The sentence that ends each of migration 6's refusals in `catalog`.
+fn delete_sentence(catalog: &str) -> String {
+    format!(
+        "To delete a document, run this command in mongosh: \
+         db.getSiblingDB(\"{catalog}\").access_keys.deleteOne({{ _id: <its _id> }})"
+    )
+}
+
+/// Migration 6's refusal, as the runner writes it, of document `n` of the
+/// user `listed` in `account`, created at `created_ms`, whose access key
+/// ID is the array [`ARRAY_KEY_IDS`].
+fn array_refusal(catalog: &str, account: &str, n: u8, created_ms: i64) -> String {
+    format!(
+        "{REFUSED}a document in {catalog}.access_keys has the access key ID [\"{}\", \"{}\"], \
+         which is an array. When a request uses an access key ID in the array, ExtendDB can \
+         read this document to authenticate the request. This migration cannot decide which \
+         access key ID the document keeps. In mongosh, delete the document or set its \
+         access_key_id to one string. The document is: {}. {}",
+        ARRAY_KEY_IDS[0],
+        ARRAY_KEY_IDS[1],
+        described(&oid(n).into(), account, "listed", created_ms),
+        delete_sentence(catalog)
+    )
 }
 
 /// Whether `access_key_id_1` is unique, or `None` when it does not exist.
@@ -895,18 +930,16 @@ async fn migration_6_refuses_array_ids_beside_its_own_index() {
     )
     .await
     .unwrap();
-    let prefix = "migration 6 unique_access_key_ids: ";
-    let refused_array = |n: u8| {
-        format!(
-            "{prefix}the access key ID of _id {} (account {account}, user listed, created ",
-            Bson::ObjectId(oid(n))
-        )
-    };
+    let catalog = &d.target.catalog;
+    let refused_array = |n: u8| array_refusal(catalog, &account, n, created);
 
     let items = status_items(&d).await;
     assert_eq!(items.len(), 2, "{items:?}");
     for start in [
-        format!("{prefix}the access key ID {fixture_id} is stored 2 times"),
+        format!(
+            "{REFUSED}2 documents in {catalog}.access_keys have the access key ID {fixture_id}, \
+             and these documents belong to more than one user. "
+        ),
         refused_array(31),
     ] {
         assert!(
@@ -926,8 +959,7 @@ async fn migration_6_refuses_array_ids_beside_its_own_index() {
         .await
         .unwrap();
     let items = status_items(&d).await;
-    assert_eq!(items.len(), 1, "{items:?}");
-    assert!(items[0].starts_with(&refused_array(31)), "{items:?}");
+    assert_eq!(items, [refused_array(31)]);
 
     keys.delete_one(doc! { "_id": oid(31) }).await.unwrap();
     d.migrate().await.expect("migrate");
@@ -1001,9 +1033,10 @@ async fn migration_6_keeps_the_copy_a_lookup_reads_through_an_operator_index() {
     assert_eq!(
         notes,
         format!(
-            "access key {fixture_id} of account {account}, user cu-tester was stored 3 times: \
-             kept _id {newest}, the copy credential lookups read, and deleted the other copies \
-             _id {first}, _id {}",
+            "3 documents had the access key ID {fixture_id}, and all of them belonged to account \
+             {account}, user cu-tester. When a request uses this access key ID, ExtendDB reads \
+             _id {newest} to authenticate the request. This migration kept _id {newest} and \
+             deleted the other documents: _id {first}, _id {}.",
             Bson::ObjectId(oid(2))
         )
     );
@@ -1154,9 +1187,10 @@ async fn migration_6_keeps_the_copy_a_lookup_reads_under_query_settings() {
         assert_eq!(
             notes,
             format!(
-                "access key {fixture_id} of account {account}, user cu-tester was stored 2 times: \
-                 kept _id {last}, the copy credential lookups read, and deleted the other copy \
-                 _id {first}"
+                "2 documents had the access key ID {fixture_id}, and all of them belonged to \
+                 account {account}, user cu-tester. When a request uses this access key ID, \
+                 ExtendDB reads _id {last} to authenticate the request. This migration kept _id \
+                 {last} and deleted the other document: _id {first}."
             )
         );
     })
