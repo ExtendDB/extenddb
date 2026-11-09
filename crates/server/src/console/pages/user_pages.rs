@@ -12,11 +12,14 @@ use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
+use extenddb_storage::management_store::UserDetail;
+
 use crate::console::ConsoleState;
 use crate::console::html;
+use crate::management::CallerIdentity;
 
-use super::account_scope::require_account_session;
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
+use super::account_scope::{require_account_session, require_user_session};
+use super::{CsrfOnly, SessionData, identity_label, is_admin, op_error_message, require_csrf};
 
 /// GET /console/accounts/{id}/users/new
 pub async fn new_user_form(
@@ -29,7 +32,7 @@ pub async fn new_user_form(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
@@ -86,7 +89,7 @@ pub async fn create_user(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
@@ -184,20 +187,10 @@ pub async fn user_detail(
     headers: HeaderMap,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
-    let session = match require_account_session(&headers, &state, &account_id).await {
+    let session = match require_user_session(&headers, &state, &account_id, &user_name).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-
-    let nav = html::nav_bar(&identity_label(&session.identity));
-    let eid = html::escape(&account_id);
-    let eun = html::escape(&user_name);
-    let crumbs = html::breadcrumb(&[
-        ("Dashboard", Some("/console")),
-        ("Accounts", Some("/console/accounts")),
-        (&account_id, Some(&format!("/console/accounts/{eid}"))),
-        (&user_name, None),
-    ]);
 
     // Fetch user detail via catalog store trait.
     let detail = state
@@ -205,6 +198,61 @@ pub async fn user_detail(
         .get_user_detail(&account_id, &user_name)
         .await
         .unwrap_or(None);
+
+    render_user_page(&session, &account_id, &user_name, detail.as_ref())
+}
+
+/// The breadcrumb trail of a page of the user `user_name`, ending in the
+/// user's name, or in `tail` after a link to the user page when `tail` is
+/// set.
+///
+/// An admin session gets the trail through the account list and the account
+/// page. An IAM-user session may open neither, so its trail holds the
+/// dashboard and its own user page only.
+pub(super) fn user_breadcrumb(
+    identity: &CallerIdentity,
+    account_id: &str,
+    user_name: &str,
+    tail: Option<&str>,
+) -> String {
+    let eid = html::escape(account_id);
+    let eun = html::escape(user_name);
+    let account_url = format!("/console/accounts/{eid}");
+    let user_url = format!("/console/accounts/{eid}/users/{eun}");
+    let mut items = vec![("Dashboard", Some("/console"))];
+    if is_admin(identity) {
+        items.push(("Accounts", Some("/console/accounts")));
+        items.push((account_id, Some(account_url.as_str())));
+    }
+    match tail {
+        Some(tail) => {
+            items.push((user_name, Some(user_url.as_str())));
+            items.push((tail, None));
+        }
+        None => items.push((user_name, None)),
+    }
+    html::breadcrumb(&items)
+}
+
+/// The page of the user `user_name`, or a "User not found" page when
+/// `detail` is `None`.
+///
+/// An admin session sees the user's access keys, inline policies, groups and
+/// tags, with the forms that change them. An IAM-user session, which gets
+/// here for its own user only, sees its access keys and the forms that create
+/// and delete them. The management API refuses an IAM user the list of its
+/// own policies and tags and has no list of its groups, so the page leaves
+/// them out.
+fn render_user_page(
+    session: &SessionData,
+    account_id: &str,
+    user_name: &str,
+    detail: Option<&UserDetail>,
+) -> Response {
+    let nav = html::nav_bar(&identity_label(&session.identity));
+    let eid = html::escape(account_id);
+    let eun = html::escape(user_name);
+    let crumbs = user_breadcrumb(&session.identity, account_id, user_name, None);
 
     let Some(detail) = detail else {
         let content = format!("{crumbs}{}", html::alert_error("User not found"));
@@ -255,28 +303,33 @@ pub async fn user_detail(
     }
     content.push_str("</tbody></table>");
 
+    // The policies, groups and tags sections are for admins.
+    if !is_admin(&session.identity) {
+        return Html(html::layout_csrf(
+            &format!("User {user_name}"),
+            &nav,
+            &content,
+            &session.csrf_token,
+        ))
+        .into_response();
+    }
+
     // Policies section.
     let _ = write!(content, "<h2>Policies ({})</h2>", detail.policies.len());
-    if is_admin(&session.identity) {
-        let _ = write!(
-            content,
-            r#"<a href="/console/accounts/{eid}/users/{eun}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
-        );
-    }
+    let _ = write!(
+        content,
+        r#"<a href="/console/accounts/{eid}/users/{eun}/policies/new" class="btn btn-primary btn-sm" style="margin-bottom:0.5rem;display:inline-block">Add Policy</a>"#
+    );
     content.push_str(r"<table><thead><tr><th>Policy Name</th><th></th></tr></thead><tbody>");
     for pname in &detail.policies {
         let ep = html::escape(pname);
-        let delete_btn = if is_admin(&session.identity) {
-            format!(
-                r#"<form class="inline" method="post" action="/console/accounts/{eid}/users/{eun}/policies/{ep}/delete"
+        let _ = write!(
+            content,
+            r#"<tr><td>{ep}</td><td><form class="inline" method="post" action="/console/accounts/{eid}/users/{eun}/policies/{ep}/delete"
                       onsubmit="return confirm('Delete policy {ep}?')">
 <button class="btn btn-danger btn-sm" type="submit">Delete</button>
-</form>"#
-            )
-        } else {
-            String::new()
-        };
-        let _ = write!(content, "<tr><td>{ep}</td><td>{delete_btn}</td></tr>");
+</form></td></tr>"#
+        );
     }
     content.push_str("</tbody></table>");
 
@@ -326,7 +379,7 @@ pub async fn delete_user(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
@@ -397,3 +450,7 @@ pub async fn delete_user(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "user_pages_tests.rs"]
+mod tests;
