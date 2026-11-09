@@ -8,6 +8,7 @@
 //! indexed into day-bucketed, 64-way sharded partitions and are deleted through
 //! the normal item mutation path.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
@@ -143,7 +144,7 @@ fn same_queue_key(left: &TtlEntry, right: &TtlEntry) -> bool {
 /// `&mut` needs a swap. Doing that inline at each call site buried the statements
 /// being built.
 fn push_query(batch: &mut BatchQueryBuilder, cql: String, values: cdrs_tokio::query::QueryValues) {
-    let previous = std::mem::replace(batch, BatchQueryBuilder::new());
+    let previous = std::mem::take(batch);
     *batch = previous.add_query(cql, values);
 }
 
@@ -319,8 +320,7 @@ pub(crate) async fn record_ttl_repair(
     // account deletion + same-id recreation safe in a multi-host fleet — a
     // process-lifetime "already registered" cache on any one host would go
     // stale the moment another host dropped and recreated the keyspace.
-    let batch = cdrs_tokio::query::BatchQueryBuilder::new()
-        .with_consistency(cdrs_tokio::consistency::Consistency::LocalQuorum)
+    let batch = crate::cassandra_util::batch()
         .add_query(
             format!(
                 "INSERT INTO {account_keyspace}.ttl_repair_inflight_partitions \
@@ -1294,13 +1294,16 @@ pub(crate) async fn clear_ttl_entries(
         );
         engine
             .session
-            .query_with_values(
+            .query_with_params(
                 &delete,
-                cdrs_tokio::query_values!(
-                    table_id,
-                    cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
-                    bucket,
-                    shard
+                params(
+                    Stmt::Write,
+                    cdrs_tokio::query_values!(
+                        table_id,
+                        cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                        bucket,
+                        shard
+                    ),
                 ),
             )
             .await
@@ -1310,7 +1313,10 @@ pub(crate) async fn clear_ttl_entries(
         format!("DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ?");
     engine
         .session
-        .query_with_values(&delete_buckets, cdrs_tokio::query_values!(table_id))
+        .query_with_params(
+            &delete_buckets,
+            params(Stmt::Write, cdrs_tokio::query_values!(table_id)),
+        )
         .await
         .map_err(|error| StorageError::Internal(format!("Clear TTL buckets: {error}")))?;
     Ok(())

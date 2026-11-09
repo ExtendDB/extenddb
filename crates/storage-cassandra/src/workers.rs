@@ -183,19 +183,13 @@ pub(crate) async fn list_account_keyspaces(
     engine: &CassandraEngine,
 ) -> Result<Vec<String>, extenddb_storage::error::StorageError> {
     let prefix = format!("{}_account_", engine.keyspace_prefix);
-    let rows = engine
-        .session
-        .query("SELECT keyspace_name FROM system_schema.keyspaces")
-        .await
-        .map_err(|e| {
-            extenddb_storage::error::StorageError::Internal(format!("list keyspaces: {e}"))
-        })?
-        .response_body()
-        .map_err(|e| {
-            extenddb_storage::error::StorageError::Internal(format!("list keyspaces body: {e}"))
-        })?
-        .into_rows()
-        .unwrap_or_default();
+    let rows: Vec<cdrs_tokio::types::rows::Row> = crate::cassandra_util::system_read(
+        &engine.session,
+        "SELECT keyspace_name FROM system_schema.keyspaces",
+        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+        "list keyspaces",
+    )
+    .await?;
 
     use cdrs_tokio::types::IntoRustByName as _;
     let mut keyspaces = Vec::new();
@@ -430,8 +424,6 @@ async fn gsi_apply_index(
         delete_index_row_multi, insert_index_row_multi, item_has_index_keys,
         project_item_for_index, same_index_row,
     };
-    use cdrs_tokio::consistency::Consistency;
-    use cdrs_tokio::query::BatchQueryBuilder;
 
     let idx = &context.index;
     let idx_table = crate::data::ddl::index_table_name(&idx.index_id);
@@ -441,7 +433,7 @@ async fn gsi_apply_index(
     // The entry's stamp is the base-row version its write committed, so a
     // later version's tombstone beats an earlier version's insert on the index
     // table even when the worker applies the entries in the other order.
-    let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+    let mut batch = crate::cassandra_util::batch();
     if let Some(stamp) = context.index_stamp {
         batch = batch.with_timestamp(stamp);
     }
