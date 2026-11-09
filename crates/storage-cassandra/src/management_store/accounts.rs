@@ -3,6 +3,7 @@
 
 //! Account management operations for `CassandraCatalogStore`.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 
@@ -32,7 +33,13 @@ impl CassandraCatalogStore {
 
         let result = self
             .session()
-            .query_with_values(&query, cdrs_tokio::query_values!(account_id, account_name))
+            .query_with_params(
+                &query,
+                params(
+                    Stmt::Lwt,
+                    cdrs_tokio::query_values!(account_id, account_name),
+                ),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("create_account query failed: {e}");

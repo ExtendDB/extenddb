@@ -7,6 +7,7 @@
 //! session credentials from Cassandra, decrypting secrets with AES-256-GCM
 //! through `extenddb_storage::secret_cipher`, with the access key id as the AAD.
 
+use crate::cassandra_util::{Stmt, params};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -84,7 +85,10 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .query_with_params(
+                &query,
+                params(Stmt::Read, cdrs_tokio::query_values!(access_key_id)),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Credential lookup failed for access key {access_key_id}: {e}");
@@ -159,7 +163,10 @@ impl CassandraCredentialStore {
 
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(access_key_id))
+            .query_with_params(
+                &query,
+                params(Stmt::Read, cdrs_tokio::query_values!(access_key_id)),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(

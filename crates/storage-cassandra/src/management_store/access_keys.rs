@@ -3,6 +3,7 @@
 
 //! Access key, session, and caller-tag operations for `CassandraCatalogStore`.
 
+use crate::cassandra_util::{Stmt, params};
 use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::IntoRustByName;
 use cdrs_tokio::types::blob::Blob;
@@ -98,9 +99,12 @@ impl CassandraCatalogStore {
 
         let result = self
             .session()
-            .query_with_values(
+            .query_with_params(
                 &delete_query,
-                cdrs_tokio::query_values!(key_id, account_id, user_name),
+                params(
+                    Stmt::Lwt,
+                    cdrs_tokio::query_values!(key_id, account_id, user_name),
+                ),
             )
             .await
             .map_err(|e| OpError::Internal(e.to_string()))?;

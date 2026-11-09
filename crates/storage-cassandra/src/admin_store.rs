@@ -3,6 +3,7 @@
 
 //! `AdminStore` implementation for `CassandraCatalogStore`.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{AdminEntry, OpError, OpResult};
 use futures::future::BoxFuture;
@@ -39,9 +40,12 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
             );
 
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(admin_name.as_str(), password_hash.as_str()),
+                    params(
+                        Stmt::Lwt,
+                        cdrs_tokio::query_values!(admin_name.as_str(), password_hash.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {

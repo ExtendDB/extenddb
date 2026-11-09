@@ -3,6 +3,7 @@
 
 //! `AuthorizationStore` implementation for `CassandraCatalogStore`.
 
+use crate::cassandra_util::{Stmt, params};
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
 use extenddb_storage::management_store::{OpError, OpResult};
@@ -26,9 +27,12 @@ impl AuthorizationStore for CassandraCatalogStore {
                  WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
             );
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -73,9 +77,12 @@ impl AuthorizationStore for CassandraCatalogStore {
                  WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
             );
             let groups_result = session
-                .query_with_values(
+                .query_with_params(
                     &groups_query,
-                    cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -103,9 +110,12 @@ impl AuthorizationStore for CassandraCatalogStore {
                      WHERE account_id = ? AND principal_type = 'group' AND principal_name = ?"
                 );
                 let policy_result = session
-                    .query_with_values(
+                    .query_with_params(
                         &policy_query,
-                        cdrs_tokio::query_values!(account_id.as_str(), group_name.as_str()),
+                        params(
+                            Stmt::Read,
+                            cdrs_tokio::query_values!(account_id.as_str(), group_name.as_str()),
+                        ),
                     )
                     .await
                     .map_err(|e| {
@@ -151,9 +161,12 @@ impl AuthorizationStore for CassandraCatalogStore {
                  WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
             );
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -266,12 +279,15 @@ impl AuthorizationStore for CassandraCatalogStore {
             );
 
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        role_name.as_str(),
-                        session_name.as_str()
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(
+                            account_id.as_str(),
+                            role_name.as_str(),
+                            session_name.as_str()
+                        ),
                     ),
                 )
                 .await
@@ -354,9 +370,12 @@ impl AuthorizationStore for CassandraCatalogStore {
             );
 
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -408,9 +427,12 @@ impl AuthorizationStore for CassandraCatalogStore {
             );
 
             let result = session
-                .query_with_values(
+                .query_with_params(
                     &query,
-                    cdrs_tokio::query_values!(account_id.as_str(), role_name.as_str()),
+                    params(
+                        Stmt::Read,
+                        cdrs_tokio::query_values!(account_id.as_str(), role_name.as_str()),
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -456,7 +478,10 @@ impl AuthorizationStore for CassandraCatalogStore {
             );
 
             let result = session
-                .query_with_values(&query, cdrs_tokio::query_values!(arn.as_str()))
+                .query_with_params(
+                    &query,
+                    params(Stmt::Read, cdrs_tokio::query_values!(arn.as_str())),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("fetch_resource_tags query failed: {e}");
