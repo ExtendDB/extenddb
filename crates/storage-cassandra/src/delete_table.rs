@@ -3,7 +3,8 @@
 
 //! `delete_table` implementation for `CassandraEngine`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{DeleteTableInput, TableDescription};
 use extenddb_storage::error::StorageError;
@@ -54,12 +55,10 @@ impl CassandraEngine {
 
         let table_result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &table_query,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-                ),
+                cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Query table: {e}")))?;
@@ -118,9 +117,10 @@ impl CassandraEngine {
 
         let index_result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &index_query,
-                params(Stmt::Read, cdrs_tokio::query_values!(table_id.as_str())),
+                cdrs_tokio::query_values!(table_id.as_str()),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Query indexes: {e}")))?;
@@ -163,9 +163,10 @@ impl CassandraEngine {
         let delete_indexes_query =
             format!("DELETE FROM {catalog_keyspace}.indexes WHERE table_id = ?");
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Write,
                 &delete_indexes_query,
-                params(Stmt::Write, cdrs_tokio::query_values!(table_id.as_str())),
+                cdrs_tokio::query_values!(table_id.as_str()),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Delete indexes: {e}")))?;
@@ -174,12 +175,10 @@ impl CassandraEngine {
         let delete_tags_query =
             format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Write,
                 &delete_tags_query,
-                params(
-                    Stmt::Write,
-                    cdrs_tokio::query_values!(description.table_arn.as_str()),
-                ),
+                cdrs_tokio::query_values!(description.table_arn.as_str()),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Delete tags: {e}")))?;

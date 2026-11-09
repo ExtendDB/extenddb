@@ -52,7 +52,8 @@ pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
@@ -367,12 +368,10 @@ fn server_components_factory(
             format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'");
         let enc_key_result = engine
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &enc_key_query,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| {

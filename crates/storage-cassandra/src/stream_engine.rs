@@ -3,7 +3,8 @@
 
 //! `StreamEngine` trait implementation for `CassandraEngine`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{
     SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
@@ -41,10 +42,7 @@ impl CassandraEngine {
         let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
         let result = self
             .session
-            .query_with_params(
-                &query,
-                params(Stmt::Read, cdrs_tokio::query_values!(table_id)),
-            )
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(table_id))
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -79,12 +77,10 @@ impl CassandraEngine {
         );
         let result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &query,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query_values!(account_id, table_name),
-                ),
+                cdrs_tokio::query_values!(account_id, table_name),
             )
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -177,9 +173,10 @@ impl StreamEngine for CassandraEngine {
 
             let shard_query =
                 format!("SELECT table_id FROM {keyspace}.stream_shards WHERE shard_id = ?");
-            let shard_read = self.session.query_with_params(
+            let shard_read = self.session.run(
+                Stmt::Read,
                 &shard_query,
-                params(Stmt::Read, cdrs_tokio::query_values!(shard_id.as_str())),
+                cdrs_tokio::query_values!(shard_id.as_str()),
             );
 
             let query = if let Some(ref after) = after_sequence {
@@ -198,19 +195,18 @@ impl StreamEngine for CassandraEngine {
             let records_read = async {
                 if let Some(ref after) = after_sequence {
                     self.session
-                        .query_with_params(
+                        .run(
+                            Stmt::Read,
                             &query,
-                            params(
-                                Stmt::Read,
-                                cdrs_tokio::query_values!(shard_id.as_str(), after.as_str()),
-                            ),
+                            cdrs_tokio::query_values!(shard_id.as_str(), after.as_str()),
                         )
                         .await
                 } else {
                     self.session
-                        .query_with_params(
+                        .run(
+                            Stmt::Read,
                             &query,
-                            params(Stmt::Read, cdrs_tokio::query_values!(shard_id.as_str())),
+                            cdrs_tokio::query_values!(shard_id.as_str()),
                         )
                         .await
                 }
@@ -278,15 +274,13 @@ impl StreamEngine for CassandraEngine {
             );
             let result = self
                 .session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query_values!(
-                            account_id.as_str(),
-                            table_name.as_str(),
-                            stream_label.as_str()
-                        ),
+                    cdrs_tokio::query_values!(
+                        account_id.as_str(),
+                        table_name.as_str(),
+                        stream_label.as_str()
                     ),
                 )
                 .await
@@ -347,19 +341,18 @@ impl StreamEngine for CassandraEngine {
 
             let shard_result = if let Some(ref start) = exclusive_start_shard_id {
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Read,
                         &shard_query,
-                        params(
-                            Stmt::Read,
-                            cdrs_tokio::query_values!(table_id.as_str(), start.as_str()),
-                        ),
+                        cdrs_tokio::query_values!(table_id.as_str(), start.as_str()),
                     )
                     .await
             } else {
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Read,
                         &shard_query,
-                        params(Stmt::Read, cdrs_tokio::query_values!(table_id.as_str())),
+                        cdrs_tokio::query_values!(table_id.as_str()),
                     )
                     .await
             }
@@ -448,9 +441,10 @@ impl StreamEngine for CassandraEngine {
             );
             let result = self
                 .session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(Stmt::Read, cdrs_tokio::query_values!(account_id.as_str())),
+                    cdrs_tokio::query_values!(account_id.as_str()),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -575,12 +569,10 @@ impl StreamEngine for CassandraEngine {
             );
             let shard_result = self
                 .session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &shard_query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query_values!(shard_id.as_str(), table_id.as_str()),
-                    ),
+                    cdrs_tokio::query_values!(shard_id.as_str(), table_id.as_str()),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -611,9 +603,10 @@ impl StreamEngine for CassandraEngine {
             );
             let result = self
                 .session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(Stmt::Read, cdrs_tokio::query_values!(shard_id.as_str())),
+                    cdrs_tokio::query_values!(shard_id.as_str()),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;

@@ -3,6 +3,7 @@
 
 //! `delete_item` implementation for the Cassandra backend.
 
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -14,7 +15,7 @@ use super::ddl::data_table_name;
 use super::index::fetch_indexes_for_table;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
-use crate::cassandra_util::{Stmt, batch, params};
+use crate::cassandra_util::{Stmt, batch};
 use crate::stream_util::stream_record_statement;
 
 /// Lifetime of the base-row claim an ordinary request holds while it commits
@@ -689,9 +690,10 @@ impl CassandraEngine {
                 && ttl_claim.is_none()
             {
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &delete_cql,
-                        params(Stmt::Write, cdrs_tokio::query_values!(pk_text.as_str())),
+                        cdrs_tokio::query_values!(pk_text.as_str()),
                     )
                     .await
                     .map_err(|e| StorageError::Internal(format!("Delete failed: {e}")))?;
@@ -1481,9 +1483,10 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Lwt,
                 &query_null,
-                params(Stmt::Lwt, cdrs_tokio::query_values!(now_ms, pk)),
+                cdrs_tokio::query_values!(now_ms, pk),
             )
             .await
             .map_err(|e| {
@@ -1512,9 +1515,10 @@ impl CassandraEngine {
             );
 
             self.session
-                .query_with_params(
+                .run(
+                    Stmt::Lwt,
                     &query_compare,
-                    params(Stmt::Lwt, cdrs_tokio::query_values!(now_ms, pk, now_ms)),
+                    cdrs_tokio::query_values!(now_ms, pk, now_ms),
                 )
                 .await
                 .map_err(|e| {

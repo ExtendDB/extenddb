@@ -60,6 +60,132 @@ pub fn params(kind: Stmt, values: QueryValues) -> cdrs_tokio::statement::Stateme
     builder.build()
 }
 
+/// Run one statement at the consistency level of its kind. Every statement
+/// outside this module and `migrations/` goes through [`PolicySession::run`]
+/// or a helper that calls it.
+pub trait PolicySession {
+    /// Run `query` with `values` as a statement of `kind`, with the
+    /// parameters [`params`] gives that kind. In a debug build, a statement
+    /// whose CQL does not match `kind` ([`shape_error`]) panics.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the statement fails.
+    fn run<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
+}
+
+impl PolicySession for CassandraSession {
+    fn run<Q: AsRef<str>>(
+        &self,
+        kind: Stmt,
+        query: Q,
+        values: QueryValues,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        let query = query.as_ref().to_owned();
+        debug_assert!(
+            shape_error(kind, &query).is_none(),
+            "{kind:?} statement: {}: {query}",
+            shape_error(kind, &query).unwrap_or_default()
+        );
+        async move { self.query_with_params(query, params(kind, values)).await }
+    }
+}
+
+/// What is wrong with `query` as a statement of `kind`, or `None` when its
+/// CQL matches `kind`:
+///
+/// - [`Stmt::Read`] and [`Stmt::SerialRead`]: a `SELECT`.
+/// - [`Stmt::SystemRead`]: a `SELECT` from `system.*` or `system_schema.*`.
+/// - [`Stmt::Write`]: an `INSERT`, `UPDATE`, `DELETE` or `BEGIN BATCH` with
+///   no `IF` condition.
+/// - [`Stmt::Lwt`]: an `INSERT`, `UPDATE` or `DELETE` with an `IF` condition.
+/// - [`Stmt::Ddl`]: a `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`.
+///
+/// Quoted literals and identifiers are removed before the check, so an `IF`
+/// inside a string does not count.
+#[must_use]
+pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
+    let words = cql_words(query);
+    let first = words.first().map_or("", String::as_str);
+    let conditional = words.iter().any(|word| word == "IF");
+    match kind {
+        Stmt::Read | Stmt::SerialRead => (first != "SELECT").then_some("a read must be a SELECT"),
+        Stmt::SystemRead => {
+            let system = words
+                .iter()
+                .skip_while(|word| *word != "FROM")
+                .nth(1)
+                .is_some_and(|table| {
+                    table.starts_with("SYSTEM.") || table.starts_with("SYSTEM_SCHEMA.")
+                });
+            if first != "SELECT" {
+                Some("a system read must be a SELECT")
+            } else if system {
+                None
+            } else {
+                Some("a system read must read system.* or system_schema.*")
+            }
+        }
+        Stmt::Write => {
+            if !matches!(first, "INSERT" | "UPDATE" | "DELETE" | "BEGIN") {
+                Some("a write must be an INSERT, UPDATE, DELETE or BEGIN BATCH")
+            } else if conditional {
+                Some("a write with an IF condition must use Stmt::Lwt")
+            } else {
+                None
+            }
+        }
+        Stmt::Lwt => {
+            if !matches!(first, "INSERT" | "UPDATE" | "DELETE") {
+                Some("an LWT must be an INSERT, UPDATE or DELETE")
+            } else if conditional {
+                None
+            } else {
+                Some("an LWT must have an IF condition")
+            }
+        }
+        Stmt::Ddl => (!matches!(first, "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE"))
+            .then_some("DDL must be a CREATE, ALTER, DROP, GRANT or REVOKE"),
+    }
+}
+
+/// The words of `query` in upper case, with quoted literals and quoted
+/// identifiers removed. A word holds letters, digits, `_` and `.`.
+fn cql_words(query: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    for c in query.chars() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            word.push(c.to_ascii_uppercase());
+            continue;
+        }
+        if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 /// A batch builder at `LOCAL_QUORUM`, with `LOCAL_SERIAL` for a conditional
 /// batch. Use it in place of `BatchQueryBuilder::new()`.
 #[must_use]
@@ -81,7 +207,7 @@ pub async fn ddl<E: FromDbError>(
     context: &str,
 ) -> Result<(), E> {
     session
-        .query_with_params(query, params(Stmt::Ddl, QueryValues::SimpleValues(vec![])))
+        .run(Stmt::Ddl, query, QueryValues::SimpleValues(vec![]))
         .await
         .map_err(|e| {
             tracing::error!("{context} DDL failed: {e}");
@@ -101,23 +227,21 @@ pub async fn system_read<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    rows_at(session, query, params(Stmt::SystemRead, values), context).await
+    rows_at(session, query, Stmt::SystemRead, values, context).await
 }
 
-/// Run `query` with `params` and return its rows.
+/// Run `query` with `values` as a statement of `kind` and return its rows.
 async fn rows_at<E: FromDbError>(
     session: &Arc<CassandraSession>,
     query: &str,
-    params: cdrs_tokio::statement::StatementParams,
+    kind: Stmt,
+    values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    let result = session
-        .query_with_params(query, params)
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} query failed: {e}");
-            E::db_error(format!("{context}: {e}"))
-        })?;
+    let result = session.run(kind, query, values).await.map_err(|e| {
+        tracing::error!("{context} query failed: {e}");
+        E::db_error(format!("{context}: {e}"))
+    })?;
 
     let body = result.response_body().map_err(|e| {
         tracing::error!("{context} response_body failed: {e}");
@@ -136,7 +260,7 @@ pub async fn query_lwt(
     values: QueryValues,
 ) -> Result<cdrs_tokio::frame::Envelope, extenddb_storage::error::StorageError> {
     session
-        .query_with_params(query, params(Stmt::Lwt, values))
+        .run(Stmt::Lwt, query, values)
         .await
         .map_err(|error| {
             extenddb_storage::error::StorageError::Internal(format!("LWT query failed: {error}"))
@@ -197,7 +321,7 @@ pub async fn query_rows<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    rows_at(session, query, params(Stmt::Read, values), context).await
+    rows_at(session, query, Stmt::Read, values, context).await
 }
 
 /// The same as [`query_rows`]. A later commit removes it.
@@ -220,7 +344,7 @@ pub async fn query_rows_serial<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<Vec<Row>, E> {
-    rows_at(session, query, params(Stmt::SerialRead, values), context).await
+    rows_at(session, query, Stmt::SerialRead, values, context).await
 }
 
 /// Execute a query and return the first row, if any.
@@ -249,13 +373,10 @@ pub async fn execute<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<(), E> {
-    session
-        .query_with_params(query, params(Stmt::Write, values))
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} execute failed: {e}");
-            E::db_error("Database error".to_owned())
-        })?;
+    session.run(Stmt::Write, query, values).await.map_err(|e| {
+        tracing::error!("{context} execute failed: {e}");
+        E::db_error("Database error".to_owned())
+    })?;
 
     Ok(())
 }
@@ -272,7 +393,7 @@ pub async fn execute_quorum<E: FromDbError>(
     context: &str,
 ) -> Result<(), E> {
     session
-        .query_with_params(query, params(Stmt::Write, values))
+        .run(Stmt::Write, query, values)
         .await
         .map_err(|error| {
             tracing::error!("{context} quorum execute failed: {error}");
@@ -424,13 +545,10 @@ pub async fn apply_lwt<E: FromDbError>(
     values: QueryValues,
     context: &str,
 ) -> Result<bool, E> {
-    let result = session
-        .query_with_params(query, params(Stmt::Lwt, values))
-        .await
-        .map_err(|e| {
-            tracing::error!("{context} lwt failed: {e}");
-            E::db_error("Database error".to_owned())
-        })?;
+    let result = session.run(Stmt::Lwt, query, values).await.map_err(|e| {
+        tracing::error!("{context} lwt failed: {e}");
+        E::db_error("Database error".to_owned())
+    })?;
     lwt_applied_flag(&result, context)
 }
 
@@ -469,7 +587,110 @@ fn lwt_applied_flag<E: FromDbError>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Stmt, batch, params};
+    use super::{Stmt, batch, params, shape_error};
+
+    #[test]
+    fn a_read_must_be_a_select() {
+        assert_eq!(
+            shape_error(Stmt::Read, "SELECT a FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert_eq!(shape_error(Stmt::SerialRead, "select a from ks.t"), None);
+        assert!(shape_error(Stmt::Read, "UPDATE ks.t SET a = 1 WHERE pk = ?").is_some());
+        assert!(shape_error(Stmt::SerialRead, "DELETE FROM ks.t WHERE pk = ?").is_some());
+    }
+
+    #[test]
+    fn a_system_read_must_read_a_system_table() {
+        assert_eq!(
+            shape_error(
+                Stmt::SystemRead,
+                "SELECT keyspace_name FROM system_schema.keyspaces"
+            ),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::SystemRead, "SELECT data_center FROM system.local"),
+            None
+        );
+        assert!(shape_error(Stmt::SystemRead, "SELECT role FROM system_auth.roles").is_some());
+        assert!(shape_error(Stmt::SystemRead, "SELECT a FROM ks.t").is_some());
+        assert!(shape_error(Stmt::SystemRead, "DELETE FROM system.local").is_some());
+    }
+
+    #[test]
+    fn a_write_has_no_condition() {
+        assert_eq!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES (?)"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Write, "UPDATE ks.t SET a = ? WHERE pk = ?"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Write, "DELETE FROM ks.t WHERE pk = ?"),
+            None
+        );
+        assert_eq!(
+            shape_error(
+                Stmt::Write,
+                "BEGIN BATCH\nINSERT INTO ks.t (a) VALUES (1)\nAPPLY BATCH"
+            ),
+            None
+        );
+        assert!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES (?) IF NOT EXISTS").is_some()
+        );
+        assert!(shape_error(Stmt::Write, "UPDATE ks.t SET a = ? WHERE pk = ? IF a = ?").is_some());
+        assert!(shape_error(Stmt::Write, "DELETE FROM ks.t WHERE pk = ? IF EXISTS").is_some());
+        assert!(shape_error(Stmt::Write, "SELECT a FROM ks.t").is_some());
+    }
+
+    #[test]
+    fn an_lwt_has_a_condition() {
+        assert_eq!(
+            shape_error(Stmt::Lwt, "INSERT INTO ks.t (a) VALUES (?) IF NOT EXISTS"),
+            None
+        );
+        assert_eq!(
+            shape_error(Stmt::Lwt, "UPDATE ks.t SET a = ? WHERE pk = ? IF a = null"),
+            None
+        );
+        assert!(shape_error(Stmt::Lwt, "UPDATE ks.t SET a = ? WHERE pk = ?").is_some());
+        assert!(shape_error(Stmt::Lwt, "SELECT a FROM ks.t").is_some());
+    }
+
+    #[test]
+    fn ddl_is_create_alter_drop_or_a_role_statement() {
+        for cql in [
+            "CREATE TABLE IF NOT EXISTS ks.t (a int PRIMARY KEY)",
+            "ALTER TABLE ks.t ADD b int",
+            "DROP KEYSPACE IF EXISTS ks",
+            "CREATE ROLE IF NOT EXISTS 'app' WITH PASSWORD = 'x' AND LOGIN = true",
+            "GRANT 'app' TO 'admin'",
+            "REVOKE 'app' FROM 'admin'",
+        ] {
+            assert_eq!(shape_error(Stmt::Ddl, cql), None, "{cql}");
+        }
+        assert!(shape_error(Stmt::Ddl, "INSERT INTO ks.t (a) VALUES (1)").is_some());
+    }
+
+    #[test]
+    fn a_quoted_if_is_not_a_condition() {
+        assert_eq!(
+            shape_error(Stmt::Write, "INSERT INTO ks.t (a) VALUES ('IF x = 1')"),
+            None
+        );
+        assert_eq!(
+            shape_error(
+                Stmt::Write,
+                "UPDATE ks.t SET \"IF\" = 'it''s IF' WHERE pk = ?"
+            ),
+            None
+        );
+        assert!(shape_error(Stmt::Lwt, "INSERT INTO ks.t (a) VALUES ('IF')").is_some());
+    }
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::query::QueryValues;
 

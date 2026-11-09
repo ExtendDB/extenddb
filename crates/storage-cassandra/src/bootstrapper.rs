@@ -3,7 +3,8 @@
 
 //! Cassandra implementation of `Bootstrapper`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use async_trait::async_trait;
 use cdrs_tokio::TryFromRow;
 use cdrs_tokio::frame::TryFromRow as TryFromRowTrait;
@@ -416,9 +417,10 @@ impl Bootstrapper for CassandraBootstrapper {
         let exists = self
             .engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 check_cql,
-                params(Stmt::Read, cdrs_tokio::query_values!(user.as_str())),
+                cdrs_tokio::query_values!(user.as_str()),
             )
             .await
             .ok()
@@ -456,12 +458,10 @@ impl Bootstrapper for CassandraBootstrapper {
         );
         self.engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 create_cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| OpError::Internal(format!("Create user: {e}")))?;
@@ -481,14 +481,12 @@ impl Bootstrapper for CassandraBootstrapper {
         let already_granted = self
             .engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 check_cql,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query_values!(
-                        self.config.app_user.as_str(),
-                        self.config.admin_user.as_str()
-                    ),
+                cdrs_tokio::query_values!(
+                    self.config.app_user.as_str(),
+                    self.config.admin_user.as_str()
                 ),
             )
             .await
@@ -507,12 +505,10 @@ impl Bootstrapper for CassandraBootstrapper {
         );
         self.engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 grant_cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| {
@@ -730,12 +726,10 @@ impl Bootstrapper for CassandraBootstrapper {
         let rows = match self
             .engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 cql,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
         {
@@ -777,12 +771,10 @@ impl Bootstrapper for CassandraBootstrapper {
         let rows = self
             .engine
             .session()
-            .query_with_params(
+            .run(
+                Stmt::SystemRead,
                 cql,
-                params(
-                    Stmt::SystemRead,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| OpError::Internal(format!("List keyspaces: {e}")))?

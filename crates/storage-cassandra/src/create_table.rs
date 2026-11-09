@@ -3,7 +3,8 @@
 
 //! `create_table` implementation for `CassandraEngine`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::value::Value;
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, CreateTableInput, GsiDescription, LsiDescription,
@@ -72,12 +73,10 @@ impl CassandraEngine {
         // All interpolated values are server-generated (UUIDs, timestamps, label from chrono).
         if let Err(e) = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Write,
                 &batch,
-                params(
-                    Stmt::Write,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
         {
@@ -214,12 +213,10 @@ impl CassandraEngine {
         let delay_query = format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = ?");
         let delay_seconds: f64 = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &delay_query,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query_values!("control_plane_delay_seconds"),
-                ),
+                cdrs_tokio::query_values!("control_plane_delay_seconds"),
             )
             .await
             .ok()
@@ -343,12 +340,10 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Lwt,
                 &insert_table_cql,
-                params(
-                    Stmt::Lwt,
-                    cdrs_tokio::query::QueryValues::SimpleValues(values),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(values),
             )
             .await
             .map_err(|e| {
@@ -435,22 +430,20 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &insert_index_cql,
-                        params(
-                            Stmt::Write,
-                            cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                                Value::from(table_id.as_str()),
-                                Value::from(gsi.index_name.as_str()),
-                                Value::from(index_id.as_str()),
-                                Value::from(gsi_ks.to_string().as_str()),
-                                Value::from(gsi_proj.to_string().as_str()),
-                                match gsi_pt.as_ref() {
-                                    Some(v) => Value::from(v.to_string().as_str()),
-                                    None => Value::NotSet,
-                                },
-                            ]),
-                        ),
+                        cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                            Value::from(table_id.as_str()),
+                            Value::from(gsi.index_name.as_str()),
+                            Value::from(index_id.as_str()),
+                            Value::from(gsi_ks.to_string().as_str()),
+                            Value::from(gsi_proj.to_string().as_str()),
+                            match gsi_pt.as_ref() {
+                                Some(v) => Value::from(v.to_string().as_str()),
+                                None => Value::NotSet,
+                            },
+                        ]),
                     )
                     .await
                     .map_err(|e| {
@@ -479,19 +472,17 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &insert_index_cql,
-                        params(
-                            Stmt::Write,
-                            cdrs_tokio::query::QueryValues::SimpleValues(vec![
-                                Value::from(table_id.as_str()),
-                                Value::from(lsi.index_name.as_str()),
-                                Value::from(index_id.as_str()),
-                                Value::from(lsi_ks.to_string().as_str()),
-                                Value::from(lsi_proj.to_string().as_str()),
-                                Value::NotSet,
-                            ]),
-                        ),
+                        cdrs_tokio::query::QueryValues::SimpleValues(vec![
+                            Value::from(table_id.as_str()),
+                            Value::from(lsi.index_name.as_str()),
+                            Value::from(index_id.as_str()),
+                            Value::from(lsi_ks.to_string().as_str()),
+                            Value::from(lsi_proj.to_string().as_str()),
+                            Value::NotSet,
+                        ]),
                     )
                     .await
                     .map_err(|e| {
@@ -511,15 +502,13 @@ impl CassandraEngine {
                 );
 
                 self.session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &insert_tag_cql,
-                        params(
-                            Stmt::Write,
-                            cdrs_tokio::query_values!(
-                                table_arn.as_str(),
-                                tag.key.as_str(),
-                                tag.value.as_str()
-                            ),
+                        cdrs_tokio::query_values!(
+                            table_arn.as_str(),
+                            tag.key.as_str(),
+                            tag.value.as_str()
                         ),
                     )
                     .await

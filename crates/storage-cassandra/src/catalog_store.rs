@@ -7,7 +7,8 @@
 //! `CassandraCatalogStore` wraps a Cassandra session connected to the catalog
 //! keyspace and implements the operational traits defined in `extenddb_storage`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::sync::Arc;
 
 use cdrs_tokio::cluster::TcpConnectionManager;
@@ -200,12 +201,10 @@ impl CassandraCatalogStore {
             "CREATE KEYSPACE IF NOT EXISTS {keyspace_name} WITH replication = {replication}"
         );
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| failed(&e))?;
@@ -226,12 +225,10 @@ impl CassandraCatalogStore {
         let cql = format!("DROP KEYSPACE IF EXISTS {keyspace_name}");
 
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| {
@@ -377,12 +374,10 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
         Box::pin(async move {
             let query = format!("SELECT COUNT(*) FROM {catalog_keyspace}.tables");
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    ),
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
                 )
                 .await
                 .map_err(|e| {
@@ -412,12 +407,10 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
         Box::pin(async move {
             let query = format!("SELECT COUNT(*) FROM {catalog_keyspace}.indexes");
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    ),
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
                 )
                 .await
                 .map_err(|e| {
@@ -452,12 +445,10 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
             // Get a sample account keyspace name from accounts table
             let query = format!("SELECT account_id FROM {catalog_keyspace}.accounts LIMIT 1");
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    ),
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
                 )
                 .await
                 .map_err(|e| {
@@ -482,12 +473,10 @@ impl extenddb_storage::diagnostics::DiagnosticsStore for CassandraCatalogStore {
                 let test_query = format!("SELECT COUNT(*) FROM {account_keyspace}.schema_history");
 
                 session
-                    .query_with_params(
+                    .run(
+                        Stmt::Read,
                         &test_query,
-                        params(
-                            Stmt::Read,
-                            cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                        ),
+                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
                     )
                     .await
                     .map_err(|e| {
@@ -529,16 +518,10 @@ impl RateLimitStore for CassandraCatalogStore {
                  AND source_ip = ? ALLOW FILTERING"
             );
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query_values!(
-                            principal.as_str(),
-                            cutoff_ms,
-                            source_ip.as_str()
-                        ),
-                    ),
+                    cdrs_tokio::query_values!(principal.as_str(), cutoff_ms, source_ip.as_str()),
                 )
                 .await
                 .map_err(|e| {
@@ -575,12 +558,10 @@ impl RateLimitStore for CassandraCatalogStore {
                  ALLOW FILTERING"
             );
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query_values!(source_ip.as_str(), cutoff_ms),
-                    ),
+                    cdrs_tokio::query_values!(source_ip.as_str(), cutoff_ms),
                 )
                 .await
                 .map_err(|e| {
@@ -610,12 +591,10 @@ impl RateLimitStore for CassandraCatalogStore {
                  (principal, attempted_at, success, source_ip) VALUES (?, ?, false, ?)"
             );
             if let Err(e) = session
-                .query_with_params(
+                .run(
+                    Stmt::Write,
                     &query,
-                    params(
-                        Stmt::Write,
-                        cdrs_tokio::query_values!(principal.as_str(), now_ms, source_ip.as_deref()),
-                    ),
+                    cdrs_tokio::query_values!(principal.as_str(), now_ms, source_ip.as_deref()),
                 )
                 .await
             {
@@ -637,12 +616,10 @@ impl RateLimitStore for CassandraCatalogStore {
             let select =
                 format!("SELECT DISTINCT principal FROM {catalog_keyspace}.login_attempts");
             let principals = match session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &select,
-                    params(
-                        Stmt::Read,
-                        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                    ),
+                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
                 )
                 .await
                 .and_then(|r| r.response_body())
@@ -663,12 +640,10 @@ impl RateLimitStore for CassandraCatalogStore {
                     continue;
                 };
                 if let Err(e) = session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &delete,
-                        params(
-                            Stmt::Write,
-                            cdrs_tokio::query_values!(principal.as_str(), cutoff_ms),
-                        ),
+                        cdrs_tokio::query_values!(principal.as_str(), cutoff_ms),
                     )
                     .await
                 {
@@ -697,21 +672,19 @@ impl MetricsStore for CassandraCatalogStore {
                 #[allow(clippy::cast_possible_truncation)]
                 let bucket_ms = (row.bucket.unix_timestamp_nanos() / 1_000_000) as i64;
                 if let Err(e) = session
-                    .query_with_params(
+                    .run(
+                        Stmt::Write,
                         &query,
-                        params(
-                            Stmt::Write,
-                            cdrs_tokio::query_values!(
-                                bucket_ms,
-                                row.metric.as_str(),
-                                row.table_name.as_deref().unwrap_or(""),
-                                row.index_name.as_deref().unwrap_or(""),
-                                row.operation.as_deref().unwrap_or(""),
-                                row.sum,
-                                row.count,
-                                row.min,
-                                row.max
-                            ),
+                        cdrs_tokio::query_values!(
+                            bucket_ms,
+                            row.metric.as_str(),
+                            row.table_name.as_deref().unwrap_or(""),
+                            row.index_name.as_deref().unwrap_or(""),
+                            row.operation.as_deref().unwrap_or(""),
+                            row.sum,
+                            row.count,
+                            row.min,
+                            row.max
                         ),
                     )
                     .await
@@ -749,9 +722,10 @@ impl MetricsStore for CassandraCatalogStore {
                  WHERE bucket >= ? AND bucket <= ? ALLOW FILTERING"
             );
             let result = session
-                .query_with_params(
+                .run(
+                    Stmt::Read,
                     &query,
-                    params(Stmt::Read, cdrs_tokio::query_values!(start_ms, end_ms)),
+                    cdrs_tokio::query_values!(start_ms, end_ms),
                 )
                 .await
                 .map_err(|e| {

@@ -3,7 +3,8 @@
 
 //! Account management operations for `CassandraCatalogStore`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{AccountDetail, OpError, OpResult};
 
@@ -33,12 +34,10 @@ impl CassandraCatalogStore {
 
         let result = self
             .session()
-            .query_with_params(
+            .run(
+                Stmt::Lwt,
                 &query,
-                params(
-                    Stmt::Lwt,
-                    cdrs_tokio::query_values!(account_id, account_name),
-                ),
+                cdrs_tokio::query_values!(account_id, account_name),
             )
             .await
             .map_err(|e| {

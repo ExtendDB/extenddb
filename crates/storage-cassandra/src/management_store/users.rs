@@ -3,7 +3,8 @@
 
 //! User management operations for `CassandraCatalogStore`.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use crate::catalog_store::CassandraCatalogStore;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::management_store::{OpError, OpResult, UserDetail};
@@ -73,15 +74,13 @@ impl CassandraCatalogStore {
         );
 
         session
-            .query_with_params(
+            .run(
+                Stmt::Write,
                 &policy_query,
-                params(
-                    Stmt::Write,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        user_name.as_str(),
-                        self_service_policy.to_string().as_str()
-                    ),
+                cdrs_tokio::query_values!(
+                    account_id.as_str(),
+                    user_name.as_str(),
+                    self_service_policy.to_string().as_str()
                 ),
             )
             .await

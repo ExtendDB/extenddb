@@ -3,7 +3,8 @@
 
 //! Data table operations for Cassandra.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::cluster::TcpConnectionManager;
 use cdrs_tokio::cluster::session::Session;
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
@@ -97,7 +98,7 @@ async fn run(
     values: cdrs_tokio::query::QueryValues,
 ) -> Result<cdrs_tokio::frame::Envelope, StorageError> {
     session
-        .query_with_params(query, params(kind, values))
+        .run(kind, query, values)
         .await
         .map_err(|e| StorageError::Internal(format!("Query failed: {e}")))
 }

@@ -3,6 +3,7 @@
 
 //! `update_item` implementation for the Cassandra backend.
 
+use crate::cassandra_util::PolicySession as _;
 use extenddb_core::expression::{self, Expr, ExpressionMaps, UpdateAction};
 use extenddb_core::types::{Item, KeyType, TableKeyInfo};
 use extenddb_core::validation;
@@ -13,7 +14,7 @@ use extenddb_storage::util::{parse_sk, pk_to_text, sk_column};
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
-use crate::cassandra_util::{Stmt, batch, params};
+use crate::cassandra_util::{Stmt, batch};
 use crate::stream_util::stream_record_statement;
 
 // 400 KB limit from DynamoDB specification
@@ -429,7 +430,7 @@ impl CassandraEngine {
             // Preserve f997485's Paxos linearization for ordinary writes.
             let result = self
                 .session
-                .query_with_params(&lwt_cql, params(Stmt::Lwt, lwt_qv))
+                .run(Stmt::Lwt, &lwt_cql, lwt_qv)
                 .await
                 .map_err(|e| StorageError::Internal(format!("occ_write lwt: {e}")))?;
             if !crate::cassandra_util::lwt_applied(&result)? {

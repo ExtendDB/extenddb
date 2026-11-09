@@ -3,7 +3,8 @@
 
 //! Helper methods for `TableEngine` operations.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::{IntoRustByName, rows::Row};
 use extenddb_core::types::{
     BillingMode, BillingModeSummary, GsiDescription, LsiDescription,
@@ -35,12 +36,10 @@ impl CassandraEngine {
 
         let table_result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &table_query,
-                params(
-                    Stmt::Read,
-                    cdrs_tokio::query_values!(account_id, table_name),
-                ),
+                cdrs_tokio::query_values!(account_id, table_name),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Query tables failed: {e}")))?;
@@ -67,9 +66,10 @@ impl CassandraEngine {
 
         let index_result = self
             .session
-            .query_with_params(
+            .run(
+                Stmt::Read,
                 &index_query,
-                params(Stmt::Read, cdrs_tokio::query_values!(table_id.as_str())),
+                cdrs_tokio::query_values!(table_id.as_str()),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Query indexes failed: {e}")))?;

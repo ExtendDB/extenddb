@@ -3,7 +3,8 @@
 
 //! Cassandra storage engine implementation.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::sync::Arc;
 
 use cdrs_tokio::authenticators::{NoneAuthenticatorProvider, StaticPasswordAuthenticatorProvider};
@@ -276,12 +277,10 @@ impl CassandraEngine {
         );
 
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to create keyspace: {e}")))?;
@@ -294,12 +293,10 @@ impl CassandraEngine {
         let cql = format!("DROP KEYSPACE IF EXISTS {keyspace_name}");
 
         self.session
-            .query_with_params(
+            .run(
+                Stmt::Ddl,
                 cql,
-                params(
-                    Stmt::Ddl,
-                    cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
-                ),
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
             )
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to drop keyspace: {e}")))?;
@@ -313,7 +310,7 @@ impl CassandraEngine {
 
         let rows = self
             .session
-            .query_with_params(cql, params(Stmt::SystemRead, query_values!(keyspace_name)))
+            .run(Stmt::SystemRead, cql, query_values!(keyspace_name))
             .await
             .map_err(|e| StorageError::Internal(format!("Failed to query keyspaces: {e}")))?
             .response_body()

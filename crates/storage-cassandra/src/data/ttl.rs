@@ -8,7 +8,8 @@
 //! indexed into day-bucketed, 64-way sharded partitions and are deleted through
 //! the normal item mutation path.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{AttributeValue, Item, TableKeyInfo};
@@ -1294,16 +1295,14 @@ pub(crate) async fn clear_ttl_entries(
         );
         engine
             .session
-            .query_with_params(
+            .run(
+                Stmt::Write,
                 &delete,
-                params(
-                    Stmt::Write,
-                    cdrs_tokio::query_values!(
-                        table_id,
-                        cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
-                        bucket,
-                        shard
-                    ),
+                cdrs_tokio::query_values!(
+                    table_id,
+                    cdrs_tokio::types::value::Bytes::new(generation.as_bytes().to_vec()),
+                    bucket,
+                    shard
                 ),
             )
             .await
@@ -1313,9 +1312,10 @@ pub(crate) async fn clear_ttl_entries(
         format!("DELETE FROM {account_keyspace}.{TTL_BUCKET_TABLE} WHERE table_id = ?");
     engine
         .session
-        .query_with_params(
+        .run(
+            Stmt::Write,
             &delete_buckets,
-            params(Stmt::Write, cdrs_tokio::query_values!(table_id)),
+            cdrs_tokio::query_values!(table_id),
         )
         .await
         .map_err(|error| StorageError::Internal(format!("Clear TTL buckets: {error}")))?;

@@ -62,6 +62,7 @@
 //! serial level is a local quorum with no Paxos read, so the scan reads at
 //! quorum and the coordinator clock after it.
 
+use crate::cassandra_util::PolicySession as _;
 use crate::cassandra_util::Stmt;
 use std::time::Duration;
 
@@ -178,10 +179,7 @@ pub(crate) async fn conditional_write(
     query: &str,
     values: QueryValues,
 ) -> Result<WriteOutcome, StorageError> {
-    match session
-        .query_with_params(query, crate::cassandra_util::params(Stmt::Lwt, values))
-        .await
-    {
+    match session.run(Stmt::Lwt, query, values).await {
         Ok(result) => Ok(if crate::cassandra_util::lwt_applied(&result)? {
             WriteOutcome::Matched
         } else {
@@ -1135,11 +1133,9 @@ impl BackupCatalog for CassandraEngine {
                 query.push_str(" AND created_at < ?");
                 values.push(Value::from((upper * 1_000.0).ceil() as i64));
             }
-            let params =
-                crate::cassandra_util::params(Stmt::Read, QueryValues::SimpleValues(values));
             let listed = self
                 .session
-                .query_with_params(&query, params)
+                .run(Stmt::Read, &query, QueryValues::SimpleValues(values))
                 .await
                 .map_err(|e| StorageError::Internal(format!("List backup index: {e}")))?
                 .response_body()

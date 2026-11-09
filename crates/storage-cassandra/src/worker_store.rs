@@ -3,7 +3,8 @@
 
 //! `WorkerStore` trait implementation and control plane transition processing.
 
-use crate::cassandra_util::{Stmt, params};
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use futures::future::BoxFuture;
 
@@ -118,9 +119,10 @@ impl CassandraEngine {
             // Delete tags
             let tag_delete = format!("DELETE FROM {catalog_keyspace}.tags WHERE resource_arn = ?");
             self.session
-                .query_with_params(
+                .run(
+                    Stmt::Write,
                     &tag_delete,
-                    params(Stmt::Write, cdrs_tokio::query_values!(table_arn.as_str())),
+                    cdrs_tokio::query_values!(table_arn.as_str()),
                 )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Failed to delete tags: {e}")))?;
