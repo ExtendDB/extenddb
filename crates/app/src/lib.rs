@@ -69,7 +69,7 @@ enum Command {
     Init(cmd_init::InitArgs),
     /// Tear down a extenddb deployment (the databases; the backup store is left untouched)
     Destroy(cmd_destroy::DestroyArgs),
-    /// List or purge the backups of the configured backup store
+    /// List or purge the backups of the configured backup store, or remove a restore target
     Backup(cmd_backup::BackupArgs),
     /// Validate a extenddb deployment
     Verify(cmd_verify::VerifyArgs),

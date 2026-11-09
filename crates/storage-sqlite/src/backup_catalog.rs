@@ -17,7 +17,12 @@
 //! ([`BackupCatalog::claim_dead_backup`]) reads no stale window here, and
 //! every RUNNING restore job record of the stopped process is aged at startup
 //! so the reconciler's first cycle finds it
-//! ([`SqliteEngine::expire_restore_job_heartbeats`]).
+//! ([`SqliteEngine::expire_restore_job_heartbeats`]). A store-backed
+//! restore's claim holds the slot of its target name
+//! ([`restore_slot_key`]) the same way: the registration takes it before the
+//! target exists, so two registrations into one name exclude each other in
+//! this process, and a RUNNING `manifest` record whose slot no task holds is
+//! taken over at once by [`BackupCatalog::claim_restore_dead`].
 //!
 //! Every write a job makes to its row goes through its claim and carries the
 //! claim's `owner_generation`, so a row a successor took over matches no
@@ -43,11 +48,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
+use extenddb_core::types::{CreateTableInput, RestoreSummary};
 use extenddb_storage::JobPermit;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreTargetKey, StaleClock,
-    StatusFields, StoreIdentity, StoreKind, TimeBounds, WriteOutcome, new_generation,
+    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
+    TimeBounds, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -114,12 +121,21 @@ pub(crate) fn legacy_backup_slot_key(backup_arn: &str) -> String {
     format!("legacy-backup:{backup_arn}")
 }
 
-/// The slot key of a restore's hold on its job record, by target table id.
-/// Held for the restore's life ([`SqliteJobClaim::for_restore`]), so the
-/// reconciler never judges a running restore of this process by its
-/// heartbeat, which queues behind every writer holding the write lock.
-pub(crate) fn restore_slot_key(table_id: &str) -> String {
-    format!("restore:{table_id}")
+/// The slot key of an in-catalog restore's hold on its job record, by
+/// target table id. Held for the restore's life
+/// ([`SqliteJobClaim::for_restore`]), so the reconciler never judges a
+/// running restore of this process by its heartbeat, which queues behind
+/// every writer holding the write lock.
+pub(crate) fn legacy_restore_slot_key(table_id: &str) -> String {
+    format!("legacy-restore:{table_id}")
+}
+
+/// The slot key of a store-backed restore's claim on its target name: taken
+/// before the target exists, so two registrations into one name in this
+/// process exclude each other before either reaches the catalog, and held
+/// by the claim for the job's life.
+pub(crate) fn restore_slot_key(account_id: &str, table_name: &str) -> String {
+    format!("restore:{account_id}/{table_name}")
 }
 
 /// An `owner_generation` as the catalog stores it (`INTEGER`); generations
@@ -152,7 +168,7 @@ impl SqliteJobClaim {
     /// A claim on a restore job record, born with the registration that
     /// writes `generation` on the row. The permit is the job's slot in the
     /// engine's `max_concurrent_jobs`, freed with the claim. The in-process
-    /// slot ([`restore_slot_key`]) is the SQLite rule of design 4(e): a
+    /// slot ([`legacy_restore_slot_key`]) is the SQLite rule of design 4(e): a
     /// RUNNING record whose slot a task of this process holds is alive
     /// whatever its heartbeat says, so a heartbeat delayed behind a long
     /// writer (an UpdateTable adding a GSI to a large table holds the write
@@ -168,8 +184,29 @@ impl SqliteJobClaim {
     ) -> Self {
         Self {
             engine: engine.clone(),
-            _slot: JobSlots::take(&engine.job_slots, restore_slot_key(table_id)),
+            _slot: JobSlots::take(&engine.job_slots, legacy_restore_slot_key(table_id)),
             _permit: Some(permit),
+            generation,
+            record: JobRecord::Restore {
+                table_id: table_id.to_owned(),
+            },
+        }
+    }
+
+    /// A claim on a store-backed restore's job record, born with the
+    /// registration that writes `generation` on the row, holding the
+    /// target name's slot ([`restore_slot_key`]) for the job's life. The
+    /// engine's job holds the permit; none is held here.
+    pub(crate) fn for_manifest_restore(
+        engine: &SqliteEngine,
+        table_id: &str,
+        generation: u64,
+        slot: JobSlot,
+    ) -> Self {
+        Self {
+            engine: engine.clone(),
+            _slot: Some(slot),
+            _permit: None,
             generation,
             record: JobRecord::Restore {
                 table_id: table_id.to_owned(),
@@ -313,15 +350,15 @@ impl JobClaim for SqliteJobClaim {
                     .await
                 }
                 JobRecord::Restore { table_id } => {
+                    // The record's progress (`file_index`, `items_applied`)
+                    // is `bulk_load`'s write; a status write leaves it.
                     sqlx::query(&format!(
                         "UPDATE table_restores SET status = ?, \
-                         items_applied = COALESCE(?, items_applied), \
                          failure_reason = COALESCE(?, failure_reason), \
                          completed_at = CASE WHEN ? THEN {NOW} ELSE completed_at END \
                          WHERE table_id = ? AND owner_generation = ? AND status = ?"
                     ))
                     .bind(to.as_str())
-                    .bind(fields.item_count)
                     .bind(fields.failure_reason.as_deref())
                     .bind(fields.completed)
                     .bind(table_id)
@@ -530,10 +567,36 @@ fn zero_window_clause(window: Duration, column: &str) -> String {
     }
 }
 
-/// A restore job record as the two listings select it.
+/// The columns of one restore job record joined with its table, in the
+/// order [`RestoreJobTuple`] reads them; every read of a record selects
+/// them.
+const RESTORE_ROW_COLUMNS: &str = "r.table_id, t.account_id, t.table_name, r.source_backup_arn, \
+     r.kind, r.status, r.owner_generation, r.heartbeat_at, r.store_kind, r.store_root, \
+     r.store_id, r.spool_host, r.file_index, r.items_applied, r.failure_reason, r.completed_at";
+
+/// One restore job record as the driver reads it.
 #[allow(clippy::type_complexity)]
-fn restore_job_row(
-    (
+type RestoreJobTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
+fn restore_job_from_tuple(t: RestoreJobTuple) -> Result<RestoreJobRow, StorageError> {
+    let (
         table_id,
         account_id,
         table_name,
@@ -542,8 +605,27 @@ fn restore_job_row(
         status,
         owner_generation,
         heartbeat_at,
-    ): (String, String, String, String, String, String, i64, String),
-) -> Result<RestoreJobRow, StorageError> {
+        store_kind,
+        store_root,
+        store_id,
+        spool_host,
+        file_index,
+        items_applied,
+        failure_reason,
+        completed_at,
+    ) = t;
+    let store = match (store_kind, store_root, store_id) {
+        (Some(kind), Some(store_root), Some(store_id)) => Some(StoreIdentity {
+            store_kind: StoreKind::parse(&kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "restore of {source_backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?,
+            store_root,
+            store_id,
+        }),
+        _ => None,
+    };
     Ok(RestoreJobRow {
         target: RestoreTargetKey {
             account_id,
@@ -555,6 +637,12 @@ fn restore_job_row(
         status: JobStatus::parse(&status)?,
         owner_generation: u64::try_from(owner_generation).unwrap_or_default(),
         heartbeat_at: timestamp_epoch_seconds(&heartbeat_at),
+        store,
+        spool_host,
+        file_index: file_index.and_then(|i| u32::try_from(i).ok()),
+        items_applied: items_applied.and_then(|i| u64::try_from(i).ok()),
+        failure_reason,
+        completed_at: completed_at.as_deref().map(timestamp_epoch_seconds),
     })
 }
 
@@ -562,28 +650,34 @@ impl SqliteEngine {
     /// Every RUNNING restore job record at startup was owned by the process
     /// that stopped: one process serves a file, so a restart is proof of
     /// death. Set each record's heartbeat to the epoch, so the reconciler's
-    /// first cycle fails it and removes its target without waiting the stale
-    /// window. Returns the names of the targets whose record was aged (one
-    /// already at the epoch is not reported again). Runs before the server
-    /// takes requests, so no restore of this process can be in flight.
-    pub(crate) async fn expire_restore_job_heartbeats(&self) -> Result<Vec<String>, StorageError> {
+    /// first cycle acts on it (a store-backed record is taken over and
+    /// resumed, a legacy one failed and its target removed) without waiting
+    /// the stale window. Returns the name and kind of each target whose
+    /// record was aged (one already at the epoch is not reported again).
+    /// Runs before the server takes requests, so no restore of this process
+    /// can be in flight.
+    pub(crate) async fn expire_restore_job_heartbeats(
+        &self,
+    ) -> Result<Vec<(String, RestoreKind)>, StorageError> {
         let _writer = self.write_lock.lock().await;
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        let names: Vec<String> = sqlx::query_scalar(
+        let rows: Vec<(String, String)> = sqlx::query_as(
             "UPDATE table_restores SET heartbeat_at = '1970-01-01T00:00:00.000Z' \
              WHERE status = 'RUNNING' AND heartbeat_at > '1970-01-01T00:00:00.000Z' \
              RETURNING COALESCE((SELECT table_name FROM tables t \
-             WHERE t.table_id = table_restores.table_id), table_id)",
+             WHERE t.table_id = table_restores.table_id), table_id), kind",
         )
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(names)
+        rows.into_iter()
+            .map(|(name, kind)| Ok((name, RestoreKind::parse(&kind)?)))
+            .collect()
     }
 
     /// Remove the maintenance claim, whoever holds it: the server's startup
@@ -993,23 +1087,11 @@ impl BackupCatalog for SqliteEngine {
             if !is_target {
                 return Ok(false);
             }
-            // Progress rows belong to a later release's restore path; a
-            // catalog without that table has none to delete.
-            let has_progress: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-                 WHERE type = 'table' AND name = 'restore_progress')",
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_err)?;
-            if has_progress {
-                let _writer = self.write_lock.lock().await;
-                sqlx::query("DELETE FROM restore_progress WHERE table_id = ?")
-                    .bind(&key.table_id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(db_err)?;
-            }
+            // A store-backed restore's progress lives on the `table_restores`
+            // row (`file_index`, `items_applied`); SQLite has
+            // no `restore_progress` table (migration 8 is `NotApplicable`
+            // here), so the record goes with the target below and there are
+            // no rows to delete.
             self.abort_restore(&key.table_id).await
         })
     }
@@ -1028,24 +1110,13 @@ impl BackupCatalog for SqliteEngine {
             // a task still on its own failure path to finish it. Both ages
             // are measured on the database's clock (`julianday('now')`); a
             // zero window selects by status alone (`zero_window_clause`).
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                i64,
-                String,
-            )> = sqlx::query_as(&format!(
-                "SELECT r.table_id, t.account_id, t.table_name, r.source_backup_arn, \
-                     r.kind, r.status, r.owner_generation, r.heartbeat_at \
-                     FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                     WHERE (r.status = 'RUNNING' AND {}) \
-                        OR (r.status = 'FAILED' AND t.table_status = 'CREATING' \
-                            AND {}) \
-                     ORDER BY t.account_id, t.table_name",
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+                "SELECT {RESTORE_ROW_COLUMNS} \
+                 FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE (r.status = 'RUNNING' AND {}) \
+                    OR (r.status = 'FAILED' AND t.table_status = 'CREATING' \
+                        AND {}) \
+                 ORDER BY t.account_id, t.table_name",
                 zero_window_clause(stale_after, "r.heartbeat_at"),
                 zero_window_clause(stale_after, "COALESCE(r.completed_at, r.heartbeat_at)"),
             ))
@@ -1057,21 +1128,25 @@ impl BackupCatalog for SqliteEngine {
             // A RUNNING record whose in-process slot a task holds is skipped,
             // however old its heartbeat: one process serves the file, so the
             // slot is the liveness rule and the heartbeat only what a restart
-            // ages (design 4(e)). A row this build cannot read (a kind or
-            // status no release writes) is logged and skipped, as ListBackups
-            // skips a row it cannot read, so one such row does not stop the
-            // cycle.
+            // ages (design 4(e)); an in-catalog restore holds its table id's
+            // slot, a store-backed one its target name's. A row this build
+            // cannot read (a kind or status no release writes) is logged and
+            // skipped, as ListBackups skips a row it cannot read, so one such
+            // row does not stop the cycle.
             Ok(rows
                 .into_iter()
                 .filter_map(|row| {
                     let (table_id, account_id, table_name, status) =
                         (row.0.clone(), row.1.clone(), row.2.clone(), row.5.clone());
                     if status == JobStatus::Running.as_str()
-                        && self.job_slots.holds(&restore_slot_key(&table_id))
+                        && (self.job_slots.holds(&legacy_restore_slot_key(&table_id))
+                            || self
+                                .job_slots
+                                .holds(&restore_slot_key(&account_id, &table_name)))
                     {
                         return None;
                     }
-                    match restore_job_row(row) {
+                    match restore_job_from_tuple(row) {
                         Ok(job) => Some(job),
                         Err(e) => {
                             tracing::warn!(
@@ -1090,26 +1165,164 @@ impl BackupCatalog for SqliteEngine {
         Box::pin(async move {
             // By status alone: a record stamped in this statement's instant,
             // or ahead of the database's clock, is RUNNING too.
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                i64,
-                String,
-            )> = sqlx::query_as(
-                "SELECT r.table_id, t.account_id, t.table_name, r.source_backup_arn, \
-                     r.kind, r.status, r.owner_generation, r.heartbeat_at \
-                     FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
-                     WHERE r.status = 'RUNNING' ORDER BY t.account_id, t.table_name",
-            )
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+                "SELECT {RESTORE_ROW_COLUMNS} \
+                 FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE r.status = 'RUNNING' ORDER BY t.account_id, t.table_name"
+            ))
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-            rows.into_iter().map(restore_job_row).collect()
+            rows.into_iter().map(restore_job_from_tuple).collect()
+        })
+    }
+
+    fn claim_restore<'a>(
+        &'a self,
+        account_id: &'a str,
+        input: CreateTableInput,
+        registration: &'a RestoreRegistrationRow,
+    ) -> BoxFuture<'a, Result<RestoreRegistered, StorageError>> {
+        Box::pin(async move {
+            let table_name = input.table_name.clone();
+            // The name's slot first, before the target exists (module doc):
+            // a slot already held is another store-backed restore into this
+            // name in flight in this process. It is refused as the name is
+            // taken: TableBeingRestored naming its source once its CREATING
+            // row is visible, else as CreateTable would report it.
+            let Some(slot) =
+                JobSlots::take(&self.job_slots, restore_slot_key(account_id, &table_name))
+            else {
+                return Err(self.name_taken_error(account_id, &table_name).await);
+            };
+            let generation = new_generation();
+            let registration = RestoreRegistrationRow {
+                owner_generation: generation,
+                ..registration.clone()
+            };
+            // The registration transaction (`BEGIN IMMEDIATE` under the
+            // engine write lock): the `backup_index` row's status, the
+            // in-use check, the CREATING target and its RUNNING record.
+            let mut desc = match self
+                .create_table_for_manifest_restore(account_id, input, &registration)
+                .await
+            {
+                Ok(desc) => desc,
+                Err(e) => {
+                    drop(slot);
+                    return Err(e);
+                }
+            };
+            desc.restore_summary = Some(RestoreSummary {
+                source_backup_arn: Some(registration.backup.backup_arn.clone()),
+                source_table_arn: Some(registration.source_table_arn.clone()),
+                restore_date_time: registration.restore_date_time,
+                restore_in_progress: true,
+            });
+            let claim =
+                SqliteJobClaim::for_manifest_restore(self, &desc.table_id, generation, slot);
+            Ok((desc, Box::new(claim) as Box<dyn JobClaim>))
+        })
+    }
+
+    fn claim_restore_dead<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+        _stale_after: Duration,
+        spool_host: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        Box::pin(async move {
+            // The slot is the liveness test, as for `claim_dead_backup`: a
+            // job of this process that holds the name's slot is alive
+            // whatever its heartbeat says, and a record without a holder is
+            // dead at once (a restart frees every slot, and ages every
+            // RUNNING record so the reconciler lists it). Taking the slot is
+            // the test and the exclusion of a second taker in one step.
+            let Some(slot) = JobSlots::take(
+                &self.job_slots,
+                restore_slot_key(&key.account_id, &key.table_name),
+            ) else {
+                return Ok(None);
+            };
+            let generation = new_generation();
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
+            // The generation, the claimant's spool and a fresh heartbeat in
+            // one write (the trait doc says why a restore record is refreshed
+            // where a backup row is not; here the slot already excludes a
+            // second taker of this process, and the beat keeps the record
+            // out of the reconciler's dead listing). A legacy record is
+            // never taken over: the reconciler fails and removes it.
+            let taken = sqlx::query(&format!(
+                "UPDATE table_restores SET owner_generation = ?, spool_host = ?, \
+                 heartbeat_at = {NOW} \
+                 WHERE table_id = ? AND status = 'RUNNING' AND kind = 'manifest' \
+                 AND EXISTS(SELECT 1 FROM tables t WHERE t.table_id = table_restores.table_id \
+                 AND t.account_id = ? AND t.table_name = ?)"
+            ))
+            .bind(generation_column(generation))
+            .bind(spool_host)
+            .bind(&key.table_id)
+            .bind(&key.account_id)
+            .bind(&key.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            tx.commit().await.map_err(db_err)?;
+            if taken != 1 {
+                drop(slot);
+                return Ok(None);
+            }
+            Ok(Some(Box::new(SqliteJobClaim::for_manifest_restore(
+                self,
+                &key.table_id,
+                generation,
+                slot,
+            )) as Box<dyn JobClaim>))
+        })
+    }
+
+    fn read_restore_job<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            let row: Option<RestoreJobTuple> = sqlx::query_as(&format!(
+                "SELECT {RESTORE_ROW_COLUMNS} \
+                 FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE r.table_id = ? AND t.account_id = ? AND t.table_name = ?"
+            ))
+            .bind(&key.table_id)
+            .bind(&key.account_id)
+            .bind(&key.table_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(restore_job_from_tuple).transpose()
+        })
+    }
+
+    fn list_restore_jobs<'a>(
+        &'a self,
+        status: Option<JobStatus>,
+    ) -> BoxFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+        Box::pin(async move {
+            let rows: Vec<RestoreJobTuple> = sqlx::query_as(&format!(
+                "SELECT {RESTORE_ROW_COLUMNS} \
+                 FROM table_restores r JOIN tables t ON t.table_id = r.table_id \
+                 WHERE (?1 IS NULL OR r.status = ?1) \
+                 ORDER BY t.account_id, t.table_name"
+            ))
+            .bind(status.map(JobStatus::as_str))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            rows.into_iter().map(restore_job_from_tuple).collect()
         })
     }
 
@@ -1546,6 +1759,7 @@ mod write_lock_tests {
             authorized_key_info: Default::default(),
             auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
             table_key_info_lookup: None,
+            item_authorizer: None,
         };
         call(
             &ctx,

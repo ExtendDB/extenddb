@@ -273,6 +273,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(account_id, input).await.unwrap();
@@ -337,6 +338,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -355,6 +357,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -430,6 +433,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -448,6 +452,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -545,6 +550,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
