@@ -258,14 +258,13 @@ class TestChecksBeforeTheNumbers:
             f"Non-expression parameters: {{{non_expression}}} Expression parameters: {{{expression}}}",
         )
 
-    def test_parameter_mix_beats_return_consumed_capacity(self, dynamodb_client_no_validation, table):
+    def test_return_consumed_capacity_beats_parameter_mix(self, dynamodb_client_no_validation, table):
+        # Measured 2026-11-05: the ReturnConsumedCapacity enum comes ahead of
+        # the parameter mix.
         assert _scan_error(
             dynamodb_client_no_validation, TableName=table, ScanFilter=SCAN_FILTER,
             ReturnConsumedCapacity="NOPE", **OK_FILTER,
-        ) == ("ValidationException", (
-            "Can not use both expression and non-expression parameters in the same request: "
-            "Non-expression parameters: {ScanFilter} Expression parameters: {FilterExpression}"
-        ))
+        ) == ("ValidationException", RCC_ENUM)
 
     def test_limit_range_beats_parameter_mix(self, dynamodb_client_no_validation, table):
         assert _scan_error(
