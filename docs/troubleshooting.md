@@ -614,6 +614,16 @@ The error log line names the exact relations for one leaked table and gives this
 
 **Fix:** Check PostgreSQL connectivity and logs.
 
+### `Credential import is disabled (allow_credential_import = false)`
+
+**Cause:** The server refused an access key import (`extenddb manage import-access-key`, or `POST /management/accounts/{id}/users/{name}/access-keys/import`) with HTTP 403 because the `allow_credential_import` runtime setting is not `true`. The message is the same when the catalog has no row for the setting. From v0.1.15 the server refuses the import when the row is missing. A deployment that imported keys before the upgrade without setting it gets this error after the upgrade.
+
+**Fix:** Enable import, then retry. The next import reads the new value, so you do not need to restart the server:
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+Keys imported earlier keep working while import is disabled.
+
 ### `Management API: check allow_credential_import failed: <error>`
 
 **Cause:** The query to check the `allow_credential_import` runtime setting failed during an access key import. Likely a database connectivity issue.
