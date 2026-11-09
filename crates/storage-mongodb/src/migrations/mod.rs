@@ -164,6 +164,11 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             "a MongoDB write draws its stream sequence number from its shard's counter inside its \
              transaction, so the records of a shard commit in number order",
         ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
         MigrationId::WarmThroughput => Migration::NotApplicable(
             "the catalog collections have no validator, so a table or index document carries \
              a warm_throughput field without a schema change",

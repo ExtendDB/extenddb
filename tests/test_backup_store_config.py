@@ -512,8 +512,8 @@ class TestSqlite:
         default of that build) on the SQLite build: with `[backup.store.filesystem]
         path` set the store is configured and healthy, its identity file is
         written, and a backup created there is written to the store (CREATING,
-        then AVAILABLE with its manifest under the root; its restore is
-        refused naming the store until the restore job lands); without
+        then AVAILABLE with its manifest under the root) and restores from it
+        with its item; without
         `[backup.store]` there is no default root (no database file to put it
         beside), no component, and CreateBackup writes a legacy backup with the
         warning naming `[backup.store]`."""
@@ -543,10 +543,15 @@ class TestSqlite:
             _wait_backup_available(ddb, arn)
             prefix = os.path.join(root, "123456789012", "Music", arn.rsplit("/", 1)[1])
             assert os.path.isfile(os.path.join(prefix, "extenddb-manifest.json")), os.listdir(root)
-            with pytest.raises(ClientError) as refused:
-                ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
-            assert refused.value.response["Error"]["Code"] == "ValidationException", refused.value.response
-            assert "is in a backup store" in refused.value.response["Error"]["Message"], refused.value.response
+            restored = ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
+            assert restored["TableDescription"]["TableStatus"] == "CREATING", restored
+            deadline = time.monotonic() + 60
+            while ddb.describe_table(TableName="Restored")["Table"]["TableStatus"] != "ACTIVE":
+                assert time.monotonic() < deadline, "the restore did not finish"
+                time.sleep(0.1)
+            item = ddb.get_item(TableName="Restored", Key={"pk": {"S": "a"}})["Item"]
+            assert item == {"pk": {"S": "a"}, "v": {"N": "1"}}, item
+            assert "restore of " + arn in server.log_text(), "the restore ran as a store-backed job"
             assert "configure [backup.store]" not in server.log_text(), server.log_text()
         finally:
             server.stop()
@@ -1373,6 +1378,22 @@ class TestSqlite:
         finally:
             server.stop()
 
+    def test_remove_target_creates_neither_the_default_root_nor_its_identity_file(self, sqlite_deployment):
+        # `backup remove-target` needs no store: on a fresh deployment it
+        # refuses a table no restore record names and leaves the default root
+        # as it found it, missing, then present and empty.
+        d = sqlite_deployment
+        root = os.path.join(d.dir, "backups")
+        res = d.run("backup", "remove-target", "--account", "000000000000", "nosuch")
+        assert res.returncode == 1, res.stdout + res.stderr
+        assert "nosuch (account 000000000000) is not a restore target" in res.stderr, res.stderr
+        assert not os.path.exists(root), "remove-target created the default root"
+        os.mkdir(root, 0o700)
+        res = d.run("backup", "remove-target", "--account", "000000000000", "nosuch")
+        assert res.returncode == 1, res.stdout + res.stderr
+        assert "is not a restore target" in res.stderr, res.stderr
+        assert os.listdir(root) == [], "remove-target wrote into the default root"
+
     def test_backup_list_and_purge_on_an_empty_store_and_the_serve_lock(self, sqlite_deployment, tmp_path):
         d = sqlite_deployment
         # Create the default root with a server once, then stop it.
@@ -1552,7 +1573,12 @@ class TestPostgres:
             with conn.cursor() as cur:
                 cur.execute("SET application_name = 'holds the serving key'")
                 cur.execute("SELECT pg_advisory_lock(%s, 2)", (0x00454442,))
-            for args in (("backup", "list"), ("backup", "purge"), ("backup", "purge", "--confirm")):
+            for args in (
+                ("backup", "list"),
+                ("backup", "purge"),
+                ("backup", "purge", "--confirm"),
+                ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+            ):
                 res = command(*args)
                 out = res.stdout + res.stderr
                 assert res.returncode == 6, f"{args}: {out}"
@@ -1565,7 +1591,11 @@ class TestPostgres:
 
         res = command("migrate", "--forget", "6", *lh._pg_args())
         assert res.returncode == 0, res.stdout + res.stderr
-        for args in (("backup", "list"), ("backup", "purge", "--confirm")):
+        for args in (
+            ("backup", "list"),
+            ("backup", "purge", "--confirm"),
+            ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+        ):
             res = command(*args)
             out = res.stdout + res.stderr
             assert res.returncode == 3, f"{args}: {out}"

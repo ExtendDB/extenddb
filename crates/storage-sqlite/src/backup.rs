@@ -72,9 +72,7 @@ use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column_n};
 use extenddb_storage::{BackupRestoreSource, JobPermit, LegacyBackupReader, RestoreRequest};
 use futures::future::BoxFuture;
 
-use crate::backup_catalog::{
-    JobSlots, NOW, SqliteJobClaim, generation_column, legacy_backup_slot_key,
-};
+use crate::backup_catalog::{JobSlots, SqliteJobClaim, generation_column, legacy_backup_slot_key};
 use crate::create_table::RestoreRegistration;
 use crate::data::{
     BoundValue, all_sort_key_info, data_table_name, index_table_name, insert_index_row_multi,
@@ -440,19 +438,16 @@ impl SqliteEngine {
                 // generation, and the table ACTIVE only from CREATING, which
                 // the check above confirmed under the same lock. A record
                 // another claim took over leaves the table to that owner.
-                let done = sqlx::query(&format!(
-                    "UPDATE table_restores SET status = 'DONE', items_applied = ?, \
-                     completed_at = {NOW} \
-                     WHERE table_id = ? AND status = 'RUNNING' AND owner_generation = ?"
-                ))
-                .bind(count)
-                .bind(&desc.table_id)
-                .bind(generation_column(generation))
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .rows_affected();
-                if done != 1 {
+                let activated = crate::restore_engine::activate_restore_target(
+                    &mut tx,
+                    &desc.table_id,
+                    generation,
+                    count,
+                    table_size,
+                    Some(count),
+                )
+                .await?;
+                if !activated.record {
                     tx.rollback().await.map_err(db_err)?;
                     return Err(StorageError::TableNotFound(format!(
                         "restore of {backup_arn} into {} did not complete: its job record \
@@ -460,17 +455,6 @@ impl SqliteEngine {
                         desc.table_name
                     )));
                 }
-                sqlx::query(
-                    "UPDATE tables SET item_count = ?, table_size_bytes = ?, \
-                     table_status = 'ACTIVE', status_transition_at = NULL \
-                     WHERE table_id = ? AND table_status = 'CREATING'",
-                )
-                .bind(count)
-                .bind(table_size)
-                .bind(&desc.table_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
                 tx.commit().await.map_err(db_err)?;
                 return Ok(count);
             };
@@ -3700,7 +3684,7 @@ mod restore_tests {
     #[tokio::test]
     async fn a_restart_ages_an_interrupted_restore_so_the_reconciler_removes_it() {
         use extenddb_storage::BackupCatalog;
-        use extenddb_storage::backup_catalog::{RestoreTargetKey, UNOWNED_GENERATION};
+        use extenddb_storage::backup_catalog::{RestoreKind, RestoreTargetKey, UNOWNED_GENERATION};
         let engine = engine().await;
         indexed_table(&engine, "src").await;
         let backup = engine
@@ -3744,7 +3728,7 @@ mod restore_tests {
             .expire_restore_job_heartbeats()
             .await
             .expect("expire");
-        assert_eq!(aged, vec!["dst".to_owned()]);
+        assert_eq!(aged, vec![("dst".to_owned(), RestoreKind::Legacy)]);
         let (heartbeat, record_generation): (String, i64) = sqlx::query_as(
             "SELECT heartbeat_at, owner_generation FROM table_restores WHERE table_id = ?",
         )
@@ -5892,7 +5876,7 @@ mod restore_tests {
         use extenddb_storage::backup_catalog::{JobStatus, RestoreKind, RestoreTargetKey};
 
         use super::*;
-        use crate::backup_catalog::restore_slot_key;
+        use crate::backup_catalog::legacy_restore_slot_key;
 
         const STALE: Duration = Duration::from_secs(300);
 
@@ -5938,7 +5922,7 @@ mod restore_tests {
             let desc = start_restore(&engine, "dst", &backup.backup_arn)
                 .await
                 .expect("registers");
-            let slot = restore_slot_key(&desc.table_id);
+            let slot = legacy_restore_slot_key(&desc.table_id);
             assert!(
                 engine.job_slots.holds(&slot),
                 "the restore holds its slot from registration"
@@ -6158,7 +6142,7 @@ mod restore_tests {
                 .await
                 .expect("registers");
             let key = key_of(&desc);
-            let slot = restore_slot_key(&desc.table_id);
+            let slot = legacy_restore_slot_key(&desc.table_id);
 
             // Hold the copy between two batches and write the record FAILED
             // under its own generation (the write lock is the test's, as a

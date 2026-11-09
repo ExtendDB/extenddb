@@ -28,7 +28,11 @@ jobs:
     # rather than "latest" because ubuntu-latest migrates to 26.04 in Oct–Nov
     # 2026 and this compiles Rust; move to 26 deliberately.
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    # With the backup store and job suites it ends with (3 min 3 s of it), the
+    # job took 39 min 49 s on #740's CI, at the old 40-minute bound. With the
+    # PartiQL wire tests it took 48 min 4 s on #411's CI, before #740. A run
+    # with both should take about 50 min; 70 leaves room for a slow runner.
+    timeout-minutes: 70
     services:
       postgres:
         # pgvector's own image, which is postgres:16 plus the extension. The
@@ -175,13 +179,33 @@ jobs:
           EXTENDDB_TEST_BACKUP_STORE: filesystem
         run: devtools/run-tests --extenddb --pytest --comprehensive --terraform --parallel --filter "not import_export"
 
+      # moto for the job suite's store-outage cell, the one cell that
+      # exercises `spool_path` on PostgreSQL (an S3 download into the spool,
+      # the retry under a cut, the spool entry removed); without the endpoint
+      # the cell skips. Same environment as the s3 job's.
+      - name: Start S3 mock
+        run: |
+          python3 -m venv "$RUNNER_TEMP/moto"
+          "$RUNNER_TEMP/moto/bin/pip" install -r requirements-moto.txt
+          nohup "$RUNNER_TEMP/moto/bin/moto_server" -p 9000 > moto.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/ > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "moto_server did not start"; cat moto.log; exit 1
+
       # The backup store and job suites start servers of their own, so they
       # are excluded from run-tests' line and run by name.
       - name: Run the backup store and job suites
         env:
           EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
           EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
         run: python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v -rP -p no:cacheprovider
+
+      - name: Print the S3 mock's log
+        if: failure()
+        run: cat moto.log || true
 
       # run-tests restarts the server daemonized to apply the import/export
       # config, and a daemonized server logs to syslog, not the job log. Without
@@ -193,7 +217,11 @@ jobs:
 
   run-integration-sqlite:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    # With the backup store and job suites it ends with (4 min 16 s of it), the
+    # job took 40 min 31 s on #740's CI, past the old 40-minute bound. With the
+    # PartiQL wire tests it took 43 min 27 s on #411's CI, before #740. 60
+    # leaves room for both and a slow runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -332,9 +360,11 @@ jobs:
   # with EXTENDDB_TEST_BACKUP_STORE=s3, and the fidelity suite's health check
   # confirms the server's store is the S3 one; the store configuration
   # suite's S3 cells need the same endpoint. The job suite
-  # (tests/test_backup_job.py) starts servers of its own with the SQLite
-  # build's defaulted filesystem root, as on the SQLite job: its deployment
-  # fixture has no S3 branch, so it covers the job and not this store.
+  # (tests/test_backup_job.py) starts servers of its own: most of its cells
+  # on the SQLite build's defaulted filesystem root, as on the SQLite job,
+  # and the store-outage cell on an S3 store at the moto endpoint, which it
+  # cuts mid-download and restores, so this job runs one restore from an S3
+  # store.
   run-integration-sqlite-s3:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -429,7 +459,9 @@ jobs:
         run: devtools/run-tests --extenddb --pytest --parallel --filter "backup"
 
       # The store configuration suite's S3 cells against moto; the job suite
-      # against the build's defaulted filesystem root (the job comment above).
+      # against the build's defaulted filesystem root, except the store-outage
+      # cell, which runs against moto through EXTENDDB_TEST_S3_ENDPOINT (the
+      # job comment above).
       - name: Run the store configuration suite's S3 cells and the job suite
         env:
           EXTENDDB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
@@ -502,7 +534,10 @@ jobs:
 
   run-rust-integration:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 40
+    # The job took 33 min 21 s on #740's merge queue run and 29 min 39 s on
+    # #411's CI, before #740. A run with both should take about 36 min; 50
+    # leaves room for a slow runner.
+    timeout-minutes: 50
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -778,7 +813,8 @@ jobs:
           # A file-backed SQLite server without [backup.store] has the defaulted
           # filesystem root beside its database file, so CreateBackup is the
           # asynchronous, store-backed one: the backup tests wait for AVAILABLE,
-          # delete what they create, and expect the restore's refusal.
+          # delete what they create, and restore the store-backed backups
+          # (the round trip).
           EXTENDDB_TEST_BACKUP_STORE: filesystem
         run: devtools/run-tests --extenddb --rust-integration --release
 

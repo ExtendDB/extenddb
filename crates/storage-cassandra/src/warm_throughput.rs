@@ -5,7 +5,7 @@
 //! the `UPDATING` window takes, and the `UpdateTable` merges.
 //!
 //! The record is written as sent (one JSON text per table and per index, see
-//! catalog migration 8) and read back by DescribeTable; nothing pre-warms
+//! catalog migration 9) and read back by DescribeTable; nothing pre-warms
 //! or scales on it, and it has no effect on throughput, throttling or
 //! storage. See `extenddb_core::types::WarmThroughputRecord`.
 

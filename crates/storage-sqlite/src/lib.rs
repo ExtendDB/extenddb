@@ -38,6 +38,9 @@ pub mod migrations;
 mod number_key;
 mod operations;
 mod password_hash_store;
+mod restore_engine;
+#[cfg(test)]
+mod restore_job_tests;
 mod schema;
 mod serve_lock;
 mod snapshot_engine;
@@ -329,18 +332,28 @@ fn sqlite_server_components_factory(
 
         // A restore the previous run left mid-copy: one process serves this
         // file, so its owner is gone. Age every RUNNING job record so the
-        // engine's reconciler fails it and removes its target on its first
-        // cycle rather than after the stale window. Before the server takes
-        // requests, so no restore of this process can be in flight. A backup
-        // the previous run left CREATING is reported to the reconciler by
+        // engine's reconciler acts on it on its first cycle rather than
+        // after the stale window: a store-backed (`manifest`) record is
+        // taken over and resumed, an in-catalog (`legacy`) one is failed and
+        // its target removed. Before the server takes requests, so no
+        // restore of this process can be in flight. A backup the previous
+        // run left CREATING is reported to the reconciler by
         // `abandoned_creating_backups` without a step here: no task of this
         // process holds its slot.
         match engine.expire_restore_job_heartbeats().await {
-            Ok(names) => {
-                for name in &names {
+            Ok(aged) => {
+                for (name, kind) in &aged {
+                    let duty = match kind {
+                        extenddb_storage::backup_catalog::RestoreKind::Manifest => {
+                            "the reconciler resumes it (a store-backed restore)"
+                        }
+                        extenddb_storage::backup_catalog::RestoreKind::Legacy => {
+                            "the reconciler removes it (an in-catalog restore)"
+                        }
+                    };
                     tracing::warn!(
                         "table '{name}': its restore did not finish before the last shutdown; \
-                         the reconciler removes it"
+                         {duty}"
                     );
                 }
             }

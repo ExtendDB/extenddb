@@ -305,7 +305,7 @@ def _as_released_catalog(sqlite_path: str) -> None:
     left: no ledger rows (the runner reads an empty ledger as it reads a
     missing one), a dotted catalog_version, the marker row every released
     baseline seeded, and the baseline's shape for every table migration 1
-    checks: the objects migration 6 (backup_catalog_index) and migration 8
+    checks: the objects migration 6 (backup_catalog_index) and migration 9
     (warm_throughput) add are removed, since no release before 1.0 had them
     and the check after migration 1 refuses a `table_restores` carrying its
     twelve job columns and a `tables` or `indexes` carrying warm_throughput.
@@ -319,7 +319,7 @@ def _as_released_catalog(sqlite_path: str) -> None:
         conn.execute("DROP TABLE IF EXISTS backup_index")
         conn.execute("DROP TABLE IF EXISTS backup_maintenance")
         conn.execute("DELETE FROM settings WHERE key = 'catalog_id'")
-        # Migration 8 adds warm_throughput to tables and indexes.
+        # Migration 9 adds warm_throughput to tables and indexes.
         for table in ("tables", "indexes"):
             conn.execute(f"ALTER TABLE {table} DROP COLUMN warm_throughput")
         conn.execute("DELETE FROM extenddb_migrations")

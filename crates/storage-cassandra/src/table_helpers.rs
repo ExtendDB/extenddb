@@ -165,7 +165,7 @@ impl CassandraEngine {
             .ok()
             .flatten()
             .and_then(|s: String| serde_json::from_str(&s).ok());
-        // Added by catalog migration 8; null when the client never set it.
+        // Added by catalog migration 9; null when the client never set it.
         let warm_json: Option<String> = table_row.get_by_name("warm_throughput").ok().flatten();
         let warm_throughput_record = parse_warm_throughput_record(warm_json.as_deref());
 

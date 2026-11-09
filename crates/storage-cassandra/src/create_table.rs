@@ -9,6 +9,7 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, RestoreSummary, SseDescription, SseType, TableDescription,
     TableStatus,
 };
+use extenddb_storage::backup_catalog::{RestoreKind, StoreIdentity};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{
     index_arn, stream_arn, table_arn, warm_throughput_record_for_create,
@@ -124,6 +125,25 @@ impl CassandraEngine {
             StorageError::Internal("restore target created without a heartbeat".to_owned())
         })?;
         Ok((description, heartbeat))
+    }
+
+    /// Create a store-backed (manifest) restore target: CREATING, carrying
+    /// the `restore_kind = 'manifest'` job record and the store columns in
+    /// the one `INSERT ... IF NOT EXISTS`. No self-managed [`JobHeartbeat`]
+    /// is started: the engine owns the manifest restore's heartbeat through
+    /// the [`extenddb_storage::backup_catalog::JobClaim`] this registration
+    /// returns. The target's DDL that follows the insert is bounded by a
+    /// few schema statements, inside the engine's registration timeout.
+    pub(crate) async fn create_table_for_restore_manifest(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        restore: &RestoreTargetColumns,
+    ) -> Result<TableDescription, StorageError> {
+        let (description, _heartbeat) = self
+            .create_table_impl_inner(account_id, input, Some(restore))
+            .await?;
+        Ok(description)
     }
 
     async fn create_table_impl_inner(
@@ -269,7 +289,7 @@ impl CassandraEngine {
             Value::from(status_transition_at),
         ];
         // WarmThroughput as sent, reported back and acted on by nothing (see
-        // catalog migration 8). UPDATING for the same delay the CREATING to
+        // catalog migration 9). UPDATING for the same delay the CREATING to
         // ACTIVE flip takes. Named only when sent, so a table created without
         // it writes no null cell.
         let warm_record =
@@ -280,8 +300,8 @@ impl CassandraEngine {
         }
         let mut placeholders = vec!["?"; values.len()];
         if let Some(r) = restore {
-            // The job record: RUNNING under the claim's generation, kind
-            // legacy, the heartbeat stamped on the coordinator's clock.
+            // The job record: RUNNING under the claim's generation, the
+            // restore kind, the heartbeat stamped on the coordinator's clock.
             columns.push_str(
                 ", restore_source_backup_arn, restore_source_table_arn, restore_date_time, \
                  restore_status, restore_kind, restore_owner_generation, restore_heartbeat_at",
@@ -291,11 +311,29 @@ impl CassandraEngine {
                 Value::from(r.source_table_arn.as_str()),
                 Value::from(r.restore_date_time_ms),
                 Value::from("RUNNING"),
-                Value::from("legacy"),
+                Value::from(r.kind.as_str()),
                 Value::from(crate::backup_catalog::generation_column(r.owner_generation)),
             ]);
             placeholders.extend(["?"; 6]);
             placeholders.push("toTimestamp(now())");
+            // A store-backed restore records the store it reads and the
+            // claimant's spool, so the reconciler can resume it.
+            if let Some(store) = &r.store {
+                columns.push_str(
+                    ", restore_store_kind, restore_store_root, restore_store_id, \
+                     restore_spool_host",
+                );
+                values.extend([
+                    Value::from(store.store_kind.as_str()),
+                    Value::from(store.store_root.as_str()),
+                    Value::from(store.store_id.as_str()),
+                    match r.spool_host.as_deref() {
+                        Some(host) => Value::from(host),
+                        None => Value::NotSet,
+                    },
+                ]);
+                placeholders.extend(["?"; 4]);
+            }
         }
         let placeholders = placeholders.join(", ");
         let insert_table_cql = format!(
@@ -349,9 +387,11 @@ impl CassandraEngine {
             }
         }
 
-        // A restore target's heartbeat runs from here, before the DDL below.
-        // An error return from this function drops it, which stops it.
-        let heartbeat = restore.map(|r| {
+        // A legacy restore target's heartbeat runs from here, before the DDL
+        // below, and is dropped (stopped) on an error return. A store-backed
+        // (manifest) restore target has no self-managed heartbeat: the engine
+        // heartbeats it through the claim the registration returns.
+        let heartbeat = restore.filter(|r| r.kind == RestoreKind::Legacy).map(|r| {
             self.start_restore_heartbeat(
                 account_id,
                 &input.table_name,
@@ -707,4 +747,16 @@ pub(crate) struct RestoreTargetColumns {
     /// The claim's fencing token (`tables.restore_owner_generation`): every
     /// write the copy makes to the target row is conditioned on it.
     pub(crate) owner_generation: u64,
+    /// `legacy` for an in-catalog restore (whose copy reads `backup_items`),
+    /// `manifest` for a store-backed one (whose copy the engine streams from
+    /// the store). A legacy target carries a self-managed heartbeat; a
+    /// manifest target is heartbeated by the engine's claim.
+    pub(crate) kind: RestoreKind,
+    /// The store a manifest restore reads its backup from; `None` on a legacy
+    /// restore, which reads the catalog.
+    pub(crate) store: Option<StoreIdentity>,
+    /// `<hostname>:<spool path>` of the instance downloading the backup into
+    /// its spool; `None` for a filesystem store (read in place) and on a
+    /// legacy restore.
+    pub(crate) spool_host: Option<String>,
 }

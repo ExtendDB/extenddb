@@ -385,11 +385,42 @@ impl MetricsCollector {
         self.record(MetricName::BackupSnapshotAge, age_secs, None, None, None);
     }
 
-    /// Record a failed store call of a backup job or of the backup
-    /// reconciler; `op` names the call (the job's `put` and
-    /// `delete_prefix`, the reconciler's `get`, `list` and `delete_prefix`).
+    /// Record a failed store call of a backup job, a restore job or the
+    /// backup reconciler; `op` names the call (a backup job's `put` and
+    /// `delete_prefix`, a restore's `get`, the reconciler's `get`, `list`
+    /// and `delete_prefix`).
     pub fn record_backup_store_error(&self, op: &str) {
         self.record(MetricName::BackupStoreErrors, 1.0, None, None, Some(op));
+    }
+
+    /// Record the end of a store-backed restore job: one `RestoreJobs` under
+    /// the outcome and its duration in microseconds under the same
+    /// dimension, as [`Self::record_backup_job`] records a backup's. The job
+    /// measures the duration from its registration to the end of its last
+    /// catalog or store call.
+    pub fn record_restore_job(&self, outcome: super::types::BackupJobOutcome, duration_us: f64) {
+        let outcome = outcome.to_string();
+        self.record(MetricName::RestoreJobs, 1.0, None, None, Some(&outcome));
+        self.record(
+            MetricName::RestoreJobDuration,
+            duration_us,
+            None,
+            None,
+            Some(&outcome),
+        );
+    }
+
+    /// Record bytes a restore job read from the store, as each download
+    /// arrived.
+    #[allow(clippy::cast_precision_loss)] // byte counts of one backup
+    pub fn record_restore_bytes_downloaded(&self, bytes: u64) {
+        self.record(
+            MetricName::RestoreBytesDownloaded,
+            bytes as f64,
+            None,
+            None,
+            None,
+        );
     }
 
     /// Record per-segment latency breakdown for a request.

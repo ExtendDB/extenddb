@@ -30,23 +30,28 @@ use extenddb_core::types::{
     ProjectionType, ScalarAttributeType, TableStatus,
 };
 use extenddb_storage::backup_catalog::{
-    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreKind, RestoreTargetKey,
-    StaleClock, StatusFields, StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION,
-    WriteOutcome,
+    BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreKind,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
+    TimeBounds, UNOWNED_GENERATION, WriteOutcome,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::restore_engine::{BulkLoadFile, Finished, RestoreEngine};
 use extenddb_storage::{
     BackupCatalog, JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides,
     TableEngine,
 };
-use futures::{FutureExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use mongodb::bson::{self, Document, doc};
 
 use super::{AfterBackupDrop, BackupLiveness, HeartbeatFault};
 use crate::MongoEngine;
-use crate::backup_catalog::{BACKUP_INDEX, RESTORE_JOB, RESTORE_JOB_HEARTBEAT, RESTORE_JOB_STATUS};
-use crate::data::{data_collection_name, item_to_document};
+use crate::backup_catalog::{
+    BACKUP_INDEX, RESTORE_JOB, RESTORE_JOB_GENERATION, RESTORE_JOB_HEARTBEAT, RESTORE_JOB_STATUS,
+};
+use crate::data::{data_collection_name, document_to_item, item_to_document};
 use crate::migrations::{MongoTarget, run_backup_catalog_index};
+use crate::restore_engine::INSERT_MANY_DOCUMENTS;
 
 const ACCOUNT: &str = "123456789012";
 const OTHER_ACCOUNT: &str = "210987654321";
@@ -421,6 +426,25 @@ async fn registered_targets(engine: &MongoEngine, targets: &[String]) -> Vec<Str
 }
 
 /// The restore job record of `name`'s table document.
+/// The server's clock (`$$NOW`), read through an aggregation.
+async fn server_now(engine: &MongoEngine) -> bson::DateTime {
+    let mut cursor = engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .aggregate(vec![
+            doc! { "$limit": 1 },
+            doc! { "$project": { "_id": 0, "now": "$$NOW" } },
+        ])
+        .await
+        .expect("aggregate");
+    let doc = cursor
+        .next()
+        .await
+        .expect("one document")
+        .expect("the server's clock");
+    *doc.get_datetime("now").expect("now")
+}
+
 async fn job_record(engine: &MongoEngine, name: &str) -> Document {
     table_doc(engine, name)
         .await
@@ -3358,6 +3382,1055 @@ async fn live_stream_record_created_at_matches_the_record_timestamp() {
     fx.finish().await;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Store-backed restore: claim_restore, the claim, claim_restore_dead,
+// read/list_restore_jobs, bulk_load, finish_restore, count_restore_target.
+// The registration takes the `backup_index` row's lock (as the legacy path
+// takes the `backups` row's), writes the record `kind = manifest` with the
+// store and the claimant's spool, and the record's heartbeat is the server's
+// clock from the registration on; bulk_load writes base documents only, the
+// GSI backfill worker fills the indexes and flips the table ACTIVE.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A composite-key input with a GSI (ALL) and an LSI (KEYS_ONLY), the shape
+/// `source_table_for` creates, for a restore target.
+fn manifest_input(name: &str) -> CreateTableInput {
+    CreateTableInput {
+        table_name: name.to_owned(),
+        key_schema: vec![key("pk", KeyType::Hash), key("sk", KeyType::Range)],
+        attribute_definitions: vec![
+            attr("pk", ScalarAttributeType::S),
+            attr("sk", ScalarAttributeType::N),
+            attr("gpk", ScalarAttributeType::S),
+            attr("lsk", ScalarAttributeType::N),
+        ],
+        billing_mode: Some(BillingMode::PayPerRequest),
+        global_secondary_indexes: Some(vec![GsiInput {
+            index_name: "g1".to_owned(),
+            key_schema: vec![key("gpk", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            warm_throughput: None,
+        }]),
+        local_secondary_indexes: Some(vec![LsiInput {
+            index_name: "l1".to_owned(),
+            key_schema: vec![key("pk", KeyType::Hash), key("lsk", KeyType::Range)],
+            projection: Projection {
+                projection_type: ProjectionType::KeysOnly,
+                non_key_attributes: None,
+            },
+        }]),
+        ..Default::default()
+    }
+}
+
+/// A `backup_index` row of a backup of `table`, left AVAILABLE: what a
+/// store-backed restore registers against. Returns the row (its `key()` is
+/// the registration's backup key).
+async fn available_backup(engine: &MongoEngine, table: &str, name: &str) -> BackupRow {
+    let row = row(ACCOUNT, table, name);
+    let claim = engine.claim_backup(&row).await.expect("claim backup row");
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default()
+            )
+            .await
+            .expect("to AVAILABLE"),
+        WriteOutcome::Matched
+    );
+    drop(claim);
+    row
+}
+
+/// The registration row for `row`, with the claimant's `spool_host`
+/// (`None` for a filesystem store). `owner_generation` is unowned: the
+/// backend mints its own.
+fn registration(row: &BackupRow, spool: Option<&str>) -> RestoreRegistrationRow {
+    RestoreRegistrationRow {
+        backup: row.key(),
+        source_table_arn: format!(
+            "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{}",
+            row.table_name
+        ),
+        restore_date_time: row.created_at,
+        store: store(),
+        spool_host: spool.map(str::to_owned),
+        owner_generation: UNOWNED_GENERATION,
+    }
+}
+
+/// Item `i` of a restore: every attribute the source shape carries, both
+/// index keys, and a 38-digit non-key number that survives as a string.
+fn manifest_item(i: usize) -> Item {
+    [
+        ("pk".to_owned(), AttributeValue::S(format!("p{}", i % 50))),
+        ("sk".to_owned(), AttributeValue::N(i.to_string())),
+        ("gpk".to_owned(), AttributeValue::S(format!("g{}", i % 7))),
+        ("lsk".to_owned(), AttributeValue::N((i * 3).to_string())),
+        (
+            "big".to_owned(),
+            AttributeValue::N("12345678901234567890123456789012345678".to_owned()),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The items `lo..hi` as the stream `bulk_load` reads.
+fn item_stream(lo: usize, hi: usize) -> BoxStream<'static, Result<Item, StorageError>> {
+    let items: Vec<_> = (lo..hi).map(manifest_item).collect();
+    futures::stream::iter(items.into_iter().map(Ok)).boxed()
+}
+
+/// The registration writes the target CREATING with its `RestoreSummary`
+/// and a RUNNING `kind = manifest` record carrying the store, the
+/// claimant's `spool_host`, a fresh generation and the server's clock on
+/// its heartbeat (the registering process's clock is an hour behind, and
+/// the stored heartbeat is within seconds of the server's `$$NOW`); the
+/// claim heartbeats and reads the record; `read_restore_job` and
+/// `list_restore_jobs` fill the store and spool; `backup_in_use` names the
+/// target.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_claim_restore_registers_the_target_and_its_record() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let reg = registration(&backup, Some("host-a:/var/spool/x"));
+    let behind = fx
+        .second_instance(BackupLiveness {
+            local_clock_behind: Duration::from_secs(3_600),
+            ..test_liveness()
+        })
+        .await;
+    let (desc, claim) = behind
+        .claim_restore(ACCOUNT, manifest_input("dst"), &reg)
+        .await
+        .expect("register");
+    assert_eq!(desc.table_status, TableStatus::Creating);
+    let summary = desc.restore_summary.as_ref().expect("a RestoreSummary");
+    assert_eq!(
+        summary.source_backup_arn.as_deref(),
+        Some(backup.backup_arn.as_str())
+    );
+    assert!(summary.restore_in_progress);
+    let generation = claim.generation();
+    assert_ne!(generation, UNOWNED_GENERATION);
+
+    let doc = table_doc(&fx.engine, "dst").await.expect("target");
+    let job = doc.get_document(RESTORE_JOB).expect("job record");
+    assert_eq!(job.get_str("status"), Ok("RUNNING"));
+    assert_eq!(job.get_str("kind"), Ok("manifest"));
+    assert_eq!(
+        u64::try_from(job.get_i64("owner_generation").unwrap()).unwrap(),
+        generation
+    );
+    assert_eq!(
+        job.get_str("store_kind"),
+        Ok(StoreKind::Filesystem.as_str())
+    );
+    assert_eq!(job.get_str("store_root"), Ok(store().store_root.as_str()));
+    assert_eq!(job.get_str("store_id"), Ok(store().store_id.as_str()));
+    assert_eq!(job.get_str("spool_host"), Ok("host-a:/var/spool/x"));
+    // The heartbeat is the server's clock stamped inside the registration,
+    // not the inserting process's (an hour behind): within seconds of the
+    // server's `$$NOW`, read back through an aggregation.
+    let heartbeat = *job.get_datetime("heartbeat_at").expect("heartbeat");
+    let now = server_now(&fx.engine).await;
+    let age_ms = now.timestamp_millis() - heartbeat.timestamp_millis();
+    assert!(
+        (-2_000..=5_000).contains(&age_ms),
+        "the record's heartbeat is the server's clock, not the slow process's: {heartbeat:?} \
+         is {age_ms} ms behind {now:?}"
+    );
+
+    let key = target_key(&doc);
+    let read = fx
+        .engine
+        .read_restore_job(&key)
+        .await
+        .expect("read")
+        .expect("a record");
+    assert_eq!(read.kind, RestoreKind::Manifest);
+    assert_eq!(read.status, JobStatus::Running);
+    assert_eq!(read.owner_generation, generation);
+    assert_eq!(
+        read.store.as_ref().map(|s| s.store_kind),
+        Some(StoreKind::Filesystem)
+    );
+    assert_eq!(read.spool_host.as_deref(), Some("host-a:/var/spool/x"));
+    assert_eq!(read.file_index, None);
+
+    let listed = fx
+        .engine
+        .list_restore_jobs(Some(JobStatus::Running))
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].target, key);
+    assert!(listed[0].store.is_some());
+    assert_eq!(listed[0].spool_host.as_deref(), Some("host-a:/var/spool/x"));
+
+    assert_eq!(
+        fx.engine
+            .backup_in_use(&backup.key())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("dst")
+    );
+    assert_eq!(claim.heartbeat().await.unwrap(), Heartbeat::Confirmed);
+    drop(claim);
+    fx.finish().await;
+}
+
+/// A DeleteBackup and a store-backed registration of one backup order wholly
+/// one before the other, on the `backup_index` row's lock: a delete that
+/// wins leaves the registration `Backup not found` and no target; a
+/// registration that wins makes the delete `BackupInUse`. A loop of
+/// concurrent races holds the invariant that no target is ever registered
+/// against a row that is not AVAILABLE.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_the_two_orderings_against_delete_backup_on_the_backup_index_row() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+
+    // Order A: the delete wins.
+    let a = available_backup(&fx.engine, "srcA", "ba").await;
+    assert_eq!(
+        fx.engine.start_backup_delete(&a.key()).await.unwrap(),
+        DeleteStart::Deleting
+    );
+    let refused = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("dstA"), &registration(&a, None))
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+        "the registration finds the backup gone: {refused:?}"
+    );
+    assert!(table_doc(&fx.engine, "dstA").await.is_none());
+
+    // Order B: the registration wins.
+    let b = available_backup(&fx.engine, "srcB", "bb").await;
+    let (_, claim) = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("dstB"), &registration(&b, None))
+        .await
+        .expect("register");
+    assert_eq!(
+        fx.engine.start_backup_delete(&b.key()).await.unwrap(),
+        DeleteStart::InUse("dstB".to_owned())
+    );
+    assert_eq!(
+        fx.engine
+            .read_backup_row(&arn_of(&b))
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        BackupStatus::Available,
+        "a refused delete leaves the row AVAILABLE"
+    );
+    drop(claim);
+
+    // Concurrent races: the lock keeps the two consistent every time, and
+    // both outcomes occur across the loop (no frozen answer).
+    let mut delete_won = 0;
+    let mut restore_won = 0;
+    for i in 0..16 {
+        let backup = available_backup(&fx.engine, &format!("srcC{i}"), "bc").await;
+        let name = format!("dstC{i}");
+        let e1 = fx.engine.clone();
+        let e2 = fx.engine.clone();
+        let key = backup.key();
+        let reg = registration(&backup, None);
+        let del = tokio::spawn(async move { e1.start_backup_delete(&key).await });
+        let res =
+            tokio::spawn(
+                async move { e2.claim_restore(ACCOUNT, manifest_input(&name), &reg).await },
+            );
+        let (del, res) = (del.await.unwrap().unwrap(), res.await.unwrap());
+        let res_ok = res.is_ok();
+        let res_err = res.err();
+        let target = table_doc(&fx.engine, &format!("dstC{i}")).await;
+        let status = fx
+            .engine
+            .read_backup_row(&arn_of(&backup))
+            .await
+            .unwrap()
+            .expect("the backup_index row")
+            .status;
+        if target.is_some() {
+            assert_eq!(
+                status,
+                BackupStatus::Available,
+                "a target was registered, so the delete must have lost"
+            );
+            assert!(
+                matches!(del, DeleteStart::InUse(_)),
+                "iteration {i}: {del:?}"
+            );
+            assert!(res_ok, "iteration {i}");
+            restore_won += 1;
+        } else {
+            assert!(
+                matches!(&res_err, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+                "iteration {i}: no target but the registration did not refuse: {res_err:?}"
+            );
+            assert_eq!(status, BackupStatus::Deleting, "iteration {i}");
+            delete_won += 1;
+        }
+    }
+    assert!(
+        delete_won > 0 && restore_won > 0,
+        "both orders occur: {delete_won} / {restore_won}"
+    );
+    fx.finish().await;
+}
+
+/// Two concurrent registrations of one backup leave one CREATING target and
+/// answer `BackupInUse` to the other (the in-use rule under the lock).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_two_concurrent_registrations_of_one_backup_leave_one_target() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let e1 = fx.engine.clone();
+    let e2 = fx.engine.clone();
+    let r1 = registration(&backup, None);
+    let r2 = registration(&backup, None);
+    let t1 =
+        tokio::spawn(async move { e1.claim_restore(ACCOUNT, manifest_input("r1"), &r1).await });
+    let t2 =
+        tokio::spawn(async move { e2.claim_restore(ACCOUNT, manifest_input("r2"), &r2).await });
+    let o1 = t1.await.unwrap();
+    let o2 = t2.await.unwrap();
+    let oks = [&o1, &o2].iter().filter(|o| o.is_ok()).count();
+    let in_use = [&o1, &o2]
+        .iter()
+        .filter(|o| matches!(o, Err(StorageError::BackupInUse(_))))
+        .count();
+    let errs: Vec<_> = [&o1, &o2]
+        .iter()
+        .filter_map(|o| o.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        (oks, in_use),
+        (1, 1),
+        "one target, one BackupInUse: oks={oks}, errs={errs:?}"
+    );
+    let targets = registered_targets(&fx.engine, &["r1".to_owned(), "r2".to_owned()]).await;
+    assert_eq!(
+        targets.len(),
+        1,
+        "exactly one target registered: {targets:?}"
+    );
+    for (_, claim) in [o1, o2].into_iter().flatten() {
+        drop(claim);
+    }
+    fx.finish().await;
+}
+
+/// A name a table or a CREATING restore target already holds is refused as
+/// `TableAlreadyExists` or `TableBeingRestored`, with nothing registered.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_claim_restore_refuses_a_taken_name() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    // A plain ACTIVE table.
+    fx.engine
+        .create_table_impl(ACCOUNT, manifest_input("taken"), false)
+        .await
+        .expect("create a table");
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let exists = fx
+        .engine
+        .claim_restore(
+            ACCOUNT,
+            manifest_input("taken"),
+            &registration(&backup, None),
+        )
+        .await
+        .err();
+    assert!(
+        matches!(&exists, Some(StorageError::TableAlreadyExists(n)) if n == "taken"),
+        "{exists:?}"
+    );
+
+    // A CREATING restore target.
+    let (_, claim) = fx
+        .engine
+        .claim_restore(
+            ACCOUNT,
+            manifest_input("being"),
+            &registration(&backup, None),
+        )
+        .await
+        .expect("first registration");
+    let b2 = available_backup(&fx.engine, "src2", "b2").await;
+    let restoring = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("being"), &registration(&b2, None))
+        .await
+        .err();
+    assert!(
+        matches!(
+            &restoring,
+            Some(StorageError::TableBeingRestored { table_name, backup_arn })
+                if table_name == "being" && backup_arn == &backup.backup_arn
+        ),
+        "{restoring:?}"
+    );
+    drop(claim);
+    fx.finish().await;
+}
+
+/// `claim_restore_dead` takes over a RUNNING manifest record whose heartbeat
+/// is stale: a fresh generation, the claimant's `spool_host` and
+/// `heartbeat_at` refreshed to the server's clock in one write, so a second
+/// taker issued right after the first (before the successor's first beat)
+/// finds the record live and is refused, and the first taker's beat
+/// confirms; the old generation's writes are fenced out. A live record, and
+/// a legacy record whatever its age, are left alone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_claim_restore_dead_takes_over_a_stale_manifest_record() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (doc, claim) = fx
+        .engine
+        .claim_restore(
+            ACCOUNT,
+            manifest_input("t"),
+            &registration(&backup, Some("old:/s")),
+        )
+        .await
+        .expect("register");
+    let desc_doc = table_doc(&fx.engine, "t").await.expect("target");
+    let key = target_key(&desc_doc);
+    let g1 = claim.generation();
+    let _ = doc;
+
+    // Live: fresh heartbeat, so not dead.
+    assert!(
+        fx.engine
+            .claim_restore_dead(&key, STALE_AFTER, Some("new:/s2"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a live record is not taken over"
+    );
+
+    // Age it past the window and take it over.
+    age_running_record(&fx.engine, "t", Duration::from_secs(600)).await;
+    let aged = *job_record(&fx.engine, "t")
+        .await
+        .get_datetime("heartbeat_at")
+        .expect("heartbeat");
+    let taken = fx
+        .engine
+        .claim_restore_dead(&key, STALE_AFTER, Some("new:/s2"))
+        .await
+        .expect("takeover")
+        .expect("a stale record is taken over");
+    let g2 = taken.generation();
+    assert_ne!(g2, g1, "a fresh generation");
+    let after = job_record(&fx.engine, "t").await;
+    assert_eq!(
+        u64::try_from(after.get_i64("owner_generation").unwrap()).unwrap(),
+        g2
+    );
+    assert_eq!(
+        after.get_str("spool_host"),
+        Ok("new:/s2"),
+        "the claimant's spool is written"
+    );
+    // A second taker right after the first, before the successor's first
+    // beat: the record is live to it, and the first taker's beat confirms.
+    let second = fx
+        .engine
+        .claim_restore_dead(&key, STALE_AFTER, Some("third:/s3"))
+        .await
+        .expect("a second takeover attempt");
+    assert!(
+        second.is_none(),
+        "a second taker right after the first is refused: {:?}",
+        second.as_ref().map(|c| c.generation())
+    );
+    assert_eq!(
+        taken.heartbeat().await.unwrap(),
+        Heartbeat::Confirmed,
+        "the first taker keeps the record"
+    );
+    let refreshed = *after.get_datetime("heartbeat_at").expect("heartbeat");
+    assert!(
+        refreshed > aged,
+        "the takeover refreshed heartbeat_at: {refreshed:?} was {aged:?}"
+    );
+    let now = server_now(&fx.engine).await;
+    let age_ms = now.timestamp_millis() - refreshed.timestamp_millis();
+    assert!(
+        (-2_000..=5_000).contains(&age_ms),
+        "the refreshed heartbeat is the server's now: {refreshed:?} is {age_ms} ms behind {now:?}"
+    );
+    assert!(
+        fx.engine
+            .list_dead_restore_jobs(STALE_AFTER)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the taken-over record is live to the listing at once"
+    );
+
+    // The old generation is fenced out; the new one owns the record.
+    assert_eq!(
+        claim
+            .set_status(
+                JobStatus::Running,
+                JobStatus::Failed,
+                &StatusFields::default()
+            )
+            .await
+            .unwrap(),
+        WriteOutcome::NotMatched
+    );
+    assert!(
+        matches!(
+            fx.engine.finish_restore(&key, &*claim, 0, 0).await.unwrap(),
+            Finished::NotMatched(_)
+        ),
+        "the dead generation cannot finish the restore"
+    );
+    drop(claim);
+    drop(taken);
+    fx.finish().await;
+}
+
+/// A legacy record, and a record that is not RUNNING, are never taken over.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_claim_restore_dead_leaves_a_legacy_or_finished_record() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (doc, claim) = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("leg"), &registration(&backup, None))
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "leg").await.expect("target"));
+    let _ = doc;
+    // Make the record legacy and stale.
+    fx.engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .update_one(
+            doc! { "_id": { "account_id": ACCOUNT, "table_name": "leg" } },
+            doc! { "$set": { "restore_job.kind": "legacy" } },
+        )
+        .await
+        .expect("to legacy");
+    age_running_record(&fx.engine, "leg", Duration::from_secs(600)).await;
+    // age_running_record rewrites the record RUNNING; set kind legacy again.
+    fx.engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .update_one(
+            doc! { "_id": { "account_id": ACCOUNT, "table_name": "leg" } },
+            doc! { "$set": { "restore_job.kind": "legacy" } },
+        )
+        .await
+        .expect("to legacy");
+    assert!(
+        fx.engine
+            .claim_restore_dead(&key, STALE_AFTER, Some("new:/s"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a legacy record is not taken over"
+    );
+    drop(claim);
+    fx.finish().await;
+}
+
+/// `bulk_load` writes a file's base documents and records `(file_index,
+/// items_applied)` in the same transaction as each batch, so a resume
+/// continues from the exact item `items_applied` names and re-applies
+/// nothing; a duplicate key on a file being loaded for the first time (a
+/// backup that holds a key twice) fails the file.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_bulk_load_records_each_batch_and_a_resume_continues_from_items_applied() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (doc, claim) = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("dst"), &registration(&backup, None))
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "dst").await.expect("target"));
+    let _ = doc;
+
+    // File 0: 2500 items across three insert_many batches, each committed
+    // with its progress in one transaction.
+    let applied = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 2500),
+        )
+        .await
+        .expect("file 0");
+    assert_eq!(applied, 2500);
+    assert_eq!(fx.engine.count_restore_target(&key).await.unwrap(), 2500);
+    let record = fx.engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.file_index, Some(0));
+    assert_eq!(record.items_applied, Some(2500));
+
+    // File 1's first 1000 items commit (one batch), then the process dies:
+    // the record names file 1 with 1000 applied.
+    let applied = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 1,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(2500, 3500),
+        )
+        .await
+        .expect("file 1, first batch");
+    assert_eq!(applied, 1000);
+    let record = fx.engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.file_index, Some(1));
+    assert_eq!(record.items_applied, Some(1000));
+
+    // The resume continues file 1 from item 1000: the engine skipped the
+    // 1000 already applied and streams only the rest, so nothing is
+    // re-applied and no duplicate arises (the `reapplying` flag the engine
+    // sets for the first resumed file is vestigial on this backend, since
+    // the progress is exact).
+    let resumed = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 1,
+                start_at: 1000,
+                reapplying: true,
+            },
+            item_stream(3500, 4000),
+        )
+        .await
+        .expect("resume file 1");
+    assert_eq!(resumed, 500);
+    assert_eq!(fx.engine.count_restore_target(&key).await.unwrap(), 4000);
+    let record = fx.engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(record.file_index, Some(1));
+    assert_eq!(record.items_applied, Some(1500));
+
+    // A file whose items the target already holds (a backup that holds a
+    // key twice) fails the file; the unique `_id` raises E11000.
+    let dup = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 2,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(2500, 3500),
+        )
+        .await;
+    assert!(
+        matches!(&dup, Err(StorageError::Validation(m)) if m.contains("holds a key twice")),
+        "{dup:?}"
+    );
+    assert_eq!(fx.engine.count_restore_target(&key).await.unwrap(), 4000);
+    drop(claim);
+    fx.finish().await;
+}
+
+/// A claim lost between two `insert_many` calls of one file (the record's
+/// generation moved by a takeover while the load ran): the read before the
+/// next call finds the record no longer this claim's, the file ends as a
+/// lost claim, and the second call's documents never land.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_bulk_load_stops_at_a_lost_claim_between_two_insert_many_calls() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (_doc, claim) = fx
+        .engine
+        .claim_restore(
+            ACCOUNT,
+            manifest_input("lost"),
+            &registration(&backup, None),
+        )
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "lost").await.expect("target"));
+    // The stream hands the first call's documents, then moves the record's
+    // generation when asked for the first item of the second call.
+    let tables = fx.engine.catalog_db.collection::<Document>("tables");
+    let moved_key = key.clone();
+    let stream: BoxStream<'static, Result<Item, StorageError>> = Box::pin(futures::stream::unfold(
+        0usize,
+        move |i| {
+            let tables = tables.clone();
+            let key = moved_key.clone();
+            async move {
+                if i >= 2 * INSERT_MANY_DOCUMENTS + 500 {
+                    return None;
+                }
+                if i == INSERT_MANY_DOCUMENTS {
+                    tables
+                        .update_one(
+                            doc! { "_id": { "account_id": &key.account_id, "table_name": &key.table_name } },
+                            doc! { "$inc": { RESTORE_JOB_GENERATION: 1_i64 } },
+                        )
+                        .await
+                        .expect("another owner takes the record");
+                }
+                Some((Ok(manifest_item(i)), i + 1))
+            }
+        },
+    ));
+    let out = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            stream,
+        )
+        .await;
+    assert!(
+        matches!(&out, Err(StorageError::Internal(m)) if m.contains("claim on the target was lost")),
+        "the second batch's fence finds another owner: {out:?}"
+    );
+    assert_eq!(
+        count(&fx.engine, &data_collection_name(&key.table_id)).await,
+        INSERT_MANY_DOCUMENTS as u64,
+        "the first batch's documents alone landed; the second batch is fenced out"
+    );
+    // The first batch committed its documents and its progress in one
+    // transaction, so the record carries that batch's progress; the second
+    // batch, fenced out, recorded nothing.
+    let record = fx.engine.read_restore_job(&key).await.unwrap().unwrap();
+    assert_eq!(
+        record.file_index,
+        Some(0),
+        "the first batch's progress is recorded"
+    );
+    assert_eq!(record.items_applied, Some(INSERT_MANY_DOCUMENTS as u64));
+    drop(claim);
+    fx.finish().await;
+}
+
+/// `bulk_load` refuses an `N` sort key beyond Decimal128's precision with
+/// the write path's `ValidationException`, and a 38-digit non-key number
+/// survives a restore as a string.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_bulk_load_refuses_a_long_sort_key_and_keeps_a_long_number() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (_, claim) = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("dec"), &registration(&backup, None))
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "dec").await.expect("target"));
+
+    let long_sk: Item = [
+        ("pk".to_owned(), AttributeValue::S("p".to_owned())),
+        // 35 significant digits: beyond Decimal128.
+        (
+            "sk".to_owned(),
+            AttributeValue::N("12345678901234567890123456789012345".to_owned()),
+        ),
+        ("gpk".to_owned(), AttributeValue::S("g".to_owned())),
+        ("lsk".to_owned(), AttributeValue::N("1".to_owned())),
+    ]
+    .into_iter()
+    .collect();
+    let refused = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            futures::stream::iter(vec![Ok(long_sk)]).boxed(),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(StorageError::Validation(m)) if m.contains("Decimal128")),
+        "{refused:?}"
+    );
+
+    // A good item with a 38-digit non-key number restores intact.
+    fx.engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 1),
+        )
+        .await
+        .expect("a good item");
+    let stored = fx
+        .engine
+        .data_db
+        .collection::<Document>(&data_collection_name(&key.table_id))
+        .find_one(doc! {})
+        .await
+        .unwrap()
+        .expect("the item");
+    let item = document_to_item(&stored).expect("item");
+    assert_eq!(
+        item.get("big"),
+        Some(&AttributeValue::N(
+            "12345678901234567890123456789012345678".to_owned()
+        )),
+        "the 38-digit non-key number survives"
+    );
+    drop(claim);
+    fx.finish().await;
+}
+
+/// `finish_restore` hands the target to the backfill worker (`Pending`,
+/// DONE + `restore_backfill_pending`), the backup stays in use until the
+/// worker flips the table ACTIVE, and `list_dead_restore_jobs` leaves the
+/// DONE record alone. A stale generation's `finish_restore` is `NotMatched`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_finish_restore_hands_over_and_the_worker_flips_active() {
+    const FEW: usize = 300;
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (_, claim) = fx
+        .engine
+        .claim_restore(ACCOUNT, manifest_input("fin"), &registration(&backup, None))
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "fin").await.expect("target"));
+    fx.engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, FEW),
+        )
+        .await
+        .expect("load");
+
+    // A stale generation cannot finish it.
+    age_running_record(&fx.engine, "fin", Duration::from_secs(600)).await;
+    let taken = fx
+        .engine
+        .claim_restore_dead(&key, STALE_AFTER, None)
+        .await
+        .unwrap()
+        .expect("takeover");
+    assert_eq!(
+        fx.engine
+            .finish_restore(&key, &*claim, FEW as u64, 1)
+            .await
+            .unwrap(),
+        Finished::NotMatched(format!(
+            "the job record of fin is not RUNNING under generation {}, or the table is not \
+             CREATING with table id {}",
+            claim.generation(),
+            key.table_id
+        ))
+    );
+
+    assert_eq!(
+        fx.engine
+            .finish_restore(&key, &*taken, FEW as u64, 1)
+            .await
+            .unwrap(),
+        Finished::Pending
+    );
+    let doc = table_doc(&fx.engine, "fin").await.expect("target");
+    assert_eq!(doc.get_str("table_status"), Ok("CREATING"));
+    assert!(doc.get_bool("restore_backfill_pending").unwrap_or(false));
+    assert_eq!(
+        doc.get_document(RESTORE_JOB).unwrap().get_str("status"),
+        Ok("DONE")
+    );
+    assert_eq!(doc.get_i64("item_count"), Ok(FEW as i64));
+
+    // Between the DONE write and the worker's flip the backup is in use and
+    // the DONE record is not dead.
+    assert_eq!(
+        fx.engine
+            .backup_in_use(&backup.key())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("fin")
+    );
+    assert!(
+        fx.engine
+            .list_dead_restore_jobs(STALE_AFTER)
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.target.table_name != "fin"),
+        "the DONE+pending record is not dead"
+    );
+
+    // The worker flips it ACTIVE with every index populated.
+    let worker = spawn_worker(&fx.engine);
+    let active = wait_for_status(&fx.engine, "fin", "ACTIVE").await;
+    let table_id = active.get_str("table_id").expect("table_id");
+    assert_eq!(active.get_i64("item_count"), Ok(FEW as i64));
+    assert_eq!(
+        count(&fx.engine, &data_collection_name(table_id)).await,
+        FEW as u64
+    );
+    for (index_name, index_id, status) in index_ids(&fx.engine, table_id).await {
+        assert_eq!(status, "ACTIVE", "{index_name}");
+        assert_eq!(
+            count(&fx.engine, &data_collection_name(&index_id)).await,
+            FEW as u64,
+            "index {index_name}"
+        );
+    }
+    let job = active.get_document(RESTORE_JOB).expect("job record");
+    assert_eq!(job.get_str("status"), Ok("DONE"));
+    assert_eq!(job.get_str("kind"), Ok("manifest"));
+    assert!(!active.contains_key("restore_backfill_pending"));
+    assert_eq!(fx.engine.backup_in_use(&backup.key()).await.unwrap(), None);
+    worker.abort();
+    drop(claim);
+    drop(taken);
+    fx.finish().await;
+}
+
+/// The `restore_mongodb_after_insert_many` kill point and the file-index
+/// write's fence: a claim taken over while `bulk_load` is paused between its
+/// `insert_many` and the record write finds the write matched nothing (the
+/// generation moved), so the lost claim's progress never lands. Runs only
+/// under `test-hooks` (the pause point is compiled then) and must run alone
+/// (`--test-threads=1`): the pause is driven by a process-wide environment
+/// variable.
+#[cfg(feature = "test-hooks")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a MongoDB replica set and --features test-hooks, run with --test-threads=1"]
+async fn a_takeover_during_bulk_load_fences_the_file_index_write() {
+    let fx = Fixture::new().await;
+    fx.worker.abort();
+    let backup = available_backup(&fx.engine, "src", "b").await;
+    let (_, claim) = fx
+        .engine
+        .claim_restore(
+            ACCOUNT,
+            manifest_input("fence"),
+            &registration(&backup, None),
+        )
+        .await
+        .expect("register");
+    let key = target_key(&table_doc(&fx.engine, "fence").await.expect("target"));
+
+    // Take the record over before the owner's batch runs: its heartbeat is
+    // aged and a second owner claims it under a fresh generation.
+    age_running_record(&fx.engine, "fence", Duration::from_secs(600)).await;
+    let taken = fx
+        .engine
+        .claim_restore_dead(&key, STALE_AFTER, None)
+        .await
+        .expect("takeover")
+        .expect("a stale record is taken over");
+
+    // The old claim's load is fenced inside the batch transaction: the
+    // `find_one_and_update` on the record (RUNNING under the old generation)
+    // matches nothing, so neither the documents nor the progress of the
+    // batch are written.
+    let out = fx
+        .engine
+        .bulk_load(
+            &key,
+            &*claim,
+            BulkLoadFile {
+                file_index: 0,
+                start_at: 0,
+                reapplying: false,
+            },
+            item_stream(0, 10),
+        )
+        .await;
+    assert!(
+        matches!(&out, Err(StorageError::Internal(m)) if m.contains("claim on the target was lost")),
+        "the fenced-out load must not write the batch: {out:?}"
+    );
+    assert_eq!(
+        count(&fx.engine, &data_collection_name(&key.table_id)).await,
+        0,
+        "no document lands after the takeover"
+    );
+    // The successor's record never advanced its file_index.
+    assert_eq!(
+        fx.engine
+            .read_restore_job(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .file_index,
+        None,
+        "the lost claim's batch wrote no progress"
+    );
+
+    drop(taken);
+    fx.finish().await;
+}
+
 /// The registration itself writes the record's first heartbeat on the
 /// server's clock (`$$NOW`, in the registration's transaction): a target
 /// registered with a first heartbeat ten minutes behind, as a host whose
@@ -3384,6 +4457,7 @@ async fn live_a_registration_writes_its_first_heartbeat_on_the_server_clock() {
         restore_date_time: bson::DateTime::now(),
         owner_generation: 7,
         first_heartbeat: behind,
+        record: crate::backup_engine::RestoreRecord::Legacy,
         session: None,
     };
     fx.engine

@@ -5,7 +5,7 @@
 //! protocol, the copy, the entry points and the in-memory case. The lock
 //! is in `serve_tests`, beside the server's refusal while a migration
 //! holds it.
-//! Released catalogs are in `released_tests`, migrations 2 to 4, 6 and 8 in
+//! Released catalogs are in `released_tests`, migrations 2 to 4, 6 and 9 in
 //! `golden_tests`, refusals and rollbacks in `refusal_tests`, and the killed
 //! migrator in `crash_tests`.
 

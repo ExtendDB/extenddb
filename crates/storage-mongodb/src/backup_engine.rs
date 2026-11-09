@@ -96,7 +96,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::backup_catalog::{
     AbandonedLegacyBackup, BackupCatalog, JOB_HEARTBEAT_INTERVAL, JobStatus, RestoreKind,
-    RestoreTargetKey, new_generation,
+    RestoreTargetKey, StoreIdentity, new_generation,
 };
 use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTableDefinition};
 use extenddb_storage::error::StorageError;
@@ -353,6 +353,19 @@ pub(crate) fn age_is_stale(fields: &[&str], stale_after: Duration) -> Document {
     }
 }
 
+/// How the job of a registration reads its backup, and what the record
+/// carries for it beyond the members every record has.
+pub(crate) enum RestoreRecord<'a> {
+    /// The in-catalog backup: `kind = legacy`, nothing more.
+    Legacy,
+    /// A backup in the store: `kind = manifest`, the store the backup row
+    /// names and the claimant's spool.
+    Manifest {
+        store: &'a StoreIdentity,
+        spool_host: Option<&'a str>,
+    },
+}
+
 /// What a restore's registration writes into the target's first catalog
 /// document: the provenance `DescribeTable` reports and the job record.
 pub(crate) struct RestoreRegistration<'a> {
@@ -363,8 +376,11 @@ pub(crate) struct RestoreRegistration<'a> {
     pub(crate) owner_generation: u64,
     /// The record's first heartbeat. An insert cannot use `$$NOW`, so this is
     /// the inserting process's clock; the copy task's first refresh replaces
-    /// it with the server's as soon as the task starts.
+    /// it with the server's as soon as the task starts. A manifest record
+    /// has it rewritten with the server's clock inside the registration's
+    /// transaction ([`Self::stamp_server_clock`]).
     pub(crate) first_heartbeat: bson::DateTime,
+    pub(crate) record: RestoreRecord<'a>,
     /// The session whose transaction the target's insert runs in and which
     /// the insert commits; `None` inserts and commits nothing beyond the
     /// document itself.
@@ -376,15 +392,60 @@ impl RestoreRegistration<'_> {
         table_doc.insert("restore_source_backup_arn", self.backup_arn);
         table_doc.insert("restore_source_table_arn", self.source_table_arn);
         table_doc.insert("restore_date_time", self.restore_date_time);
-        table_doc.insert(
-            RESTORE_JOB,
-            doc! {
-                "status": JobStatus::Running.as_str(),
-                "kind": RestoreKind::Legacy.as_str(),
-                "owner_generation": generation_field(self.owner_generation),
-                "heartbeat_at": self.first_heartbeat,
-            },
-        );
+        let kind = match self.record {
+            RestoreRecord::Legacy => RestoreKind::Legacy,
+            RestoreRecord::Manifest { .. } => RestoreKind::Manifest,
+        };
+        let mut job = doc! {
+            "status": JobStatus::Running.as_str(),
+            "kind": kind.as_str(),
+            "owner_generation": generation_field(self.owner_generation),
+            "heartbeat_at": self.first_heartbeat,
+            // Set once the target's collections and index metadata exist
+            // (`create_table_impl_inner`); a resume refuses an unmarked
+            // record.
+            "ddl_done": false,
+        };
+        if let RestoreRecord::Manifest { store, spool_host } = &self.record {
+            job.insert("store_kind", store.store_kind.as_str());
+            job.insert("store_root", &store.store_root);
+            job.insert("store_id", &store.store_id);
+            if let Some(spool_host) = spool_host {
+                job.insert("spool_host", *spool_host);
+            }
+        }
+        table_doc.insert(RESTORE_JOB, job);
+    }
+
+    /// Rewrite the record's first heartbeat with the server's clock, inside
+    /// the registration's transaction: a manifest record is heartbeated by
+    /// the engine's timer, whose first beat comes one period after the
+    /// registration, so the record must not start on the inserting
+    /// process's clock. The driver's error is returned as it is, so a write
+    /// conflict keeps its transient label for the caller's retry. Nothing
+    /// for a legacy record, whose copy task beats at once.
+    pub(crate) async fn stamp_server_clock(
+        &mut self,
+        tables_coll: &mongodb::Collection<Document>,
+        table_id: &str,
+    ) -> Result<(), mongodb::error::Error> {
+        if !matches!(self.record, RestoreRecord::Manifest { .. }) {
+            return Ok(());
+        }
+        let Some(session) = self.session.as_deref_mut() else {
+            return Ok(());
+        };
+        tables_coll
+            .update_one(
+                doc! {
+                    "table_id": table_id,
+                    RESTORE_JOB_GENERATION: generation_field(self.owner_generation),
+                },
+                vec![doc! { "$set": { RESTORE_JOB_HEARTBEAT: "$$NOW" } }],
+            )
+            .session(session)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -447,7 +508,7 @@ impl MongoEngine {
 
     /// This process's clock, for the one heartbeat that cannot use the
     /// server's (the target insert). Test builds can set it behind.
-    fn local_now(&self) -> bson::DateTime {
+    pub(crate) fn local_now(&self) -> bson::DateTime {
         let now = bson::DateTime::now();
         #[cfg(test)]
         let now = bson::DateTime::from_millis(
@@ -580,6 +641,7 @@ impl MongoEngine {
                     restore_date_time: epoch_secs_datetime(*restore_date_time),
                     owner_generation,
                     first_heartbeat: self.local_now(),
+                    record: RestoreRecord::Legacy,
                     session: Some(&mut session),
                 };
                 match self
@@ -650,7 +712,7 @@ impl MongoEngine {
     /// Remove the CREATING restore target `target_table_name` registered
     /// under `owner_generation`, with its collections; `Ok(false)` when there
     /// is none.
-    async fn remove_target_of_generation(
+    pub(crate) async fn remove_target_of_generation(
         &self,
         account_id: &str,
         target_table_name: &str,
@@ -766,6 +828,52 @@ impl MongoEngine {
         Ok(result.matched_count == 1)
     }
 
+    /// The end of a restore's load (the design's 5.3 step 6 on this
+    /// backend): the job record DONE and the target handed to the GSI
+    /// backfill worker (`restore_backfill_pending`), with `item_count` and,
+    /// when given, `table_size_bytes`, in one write conditioned on the
+    /// generation, on the record RUNNING and on the table CREATING. From
+    /// then on the worker owns the target: it promotes each index and flips
+    /// the table ACTIVE, conditioned on the flag and on CREATING, and the
+    /// reconciler leaves a DONE record alone. `Ok(false)` when the record is
+    /// not RUNNING under `owner_generation` or the table is not CREATING.
+    pub(crate) async fn hand_over_to_backfill(
+        &self,
+        target: &RestoreTargetKey,
+        owner_generation: u64,
+        item_count: u64,
+        size_bytes: Option<u64>,
+    ) -> Result<bool, StorageError> {
+        let mut set = doc! {
+            "item_count": { "$literal": i64::try_from(item_count).unwrap_or(i64::MAX) },
+            "restore_backfill_pending": { "$literal": true },
+            RESTORE_JOB_STATUS: { "$literal": JobStatus::Done.as_str() },
+            RESTORE_JOB_COMPLETED_AT: "$$NOW",
+        };
+        if let Some(size_bytes) = size_bytes {
+            set.insert(
+                "table_size_bytes",
+                doc! { "$literal": i64::try_from(size_bytes).unwrap_or(i64::MAX) },
+            );
+        }
+        let handed_over = self
+            .catalog_db
+            .collection::<Document>("tables")
+            .update_one(
+                doc! {
+                    "_id": { "account_id": &target.account_id, "table_name": &target.table_name },
+                    "table_id": &target.table_id,
+                    "table_status": "CREATING",
+                    RESTORE_JOB_STATUS: JobStatus::Running.as_str(),
+                    RESTORE_JOB_GENERATION: generation_field(owner_generation),
+                },
+                vec![doc! { "$set": set }],
+            )
+            .await
+            .map_err(internal)?;
+        Ok(handed_over.matched_count == 1)
+    }
+
     /// The detached copy of a restore: copy the backup's items into the
     /// target with `$out` while the job record is heartbeated, then hand the
     /// target to the backfill worker, marking the record DONE in the same
@@ -824,26 +932,18 @@ impl MongoEngine {
             // the flag and on CREATING, and the reconciler leaves a DONE
             // record alone.
             let handed_over = self
-                .catalog_db
-                .collection::<Document>("tables")
-                .update_one(
-                    doc! {
-                        "_id": { "account_id": account_id, "table_name": target_table_name },
-                        "table_id": table_id,
-                        "table_status": "CREATING",
-                        RESTORE_JOB_STATUS: JobStatus::Running.as_str(),
-                        RESTORE_JOB_GENERATION: generation_field(owner_generation),
+                .hand_over_to_backfill(
+                    &RestoreTargetKey {
+                        account_id: account_id.to_owned(),
+                        table_name: target_table_name.to_owned(),
+                        table_id: table_id.to_owned(),
                     },
-                    vec![doc! { "$set": {
-                        "item_count": { "$literal": i64::try_from(item_count).unwrap_or(i64::MAX) },
-                        "restore_backfill_pending": { "$literal": true },
-                        RESTORE_JOB_STATUS: { "$literal": JobStatus::Done.as_str() },
-                        RESTORE_JOB_COMPLETED_AT: "$$NOW",
-                    } }],
+                    owner_generation,
+                    item_count,
+                    None,
                 )
-                .await
-                .map_err(internal)?;
-            Ok::<_, StorageError>((item_count, handed_over.matched_count == 1))
+                .await?;
+            Ok::<_, StorageError>((item_count, handed_over))
         };
         let heartbeat =
             self.restore_heartbeat_loop(account_id, target_table_name, table_id, owner_generation);
@@ -1826,8 +1926,9 @@ mod tests {
 #[cfg(test)]
 mod definition_tests {
     use super::{
-        LockMiss, RestoreRegistration, backup_definition_from_doc, description_from_doc,
-        gone_statuses, lock_miss, restore_source_from_doc, restoring_target_filter,
+        LockMiss, RestoreRecord, RestoreRegistration, backup_definition_from_doc,
+        description_from_doc, gone_statuses, lock_miss, restore_source_from_doc,
+        restoring_target_filter,
     };
     use extenddb_core::types::{
         OnDemandThroughput, ProvisionedThroughput, StreamViewType, TimeToLiveStatus,
@@ -2071,6 +2172,7 @@ mod definition_tests {
             restore_date_time: bson::DateTime::from_millis(1_791_976_431_438),
             owner_generation: 7,
             first_heartbeat: bson::DateTime::from_millis(1_791_976_500_000),
+            record: RestoreRecord::Legacy,
             session: None,
         };
         let mut table_doc = doc! { "table_status": "CREATING" };
@@ -2097,6 +2199,71 @@ mod definition_tests {
         );
         assert!(!table_doc.contains_key("restore_operation_id"));
         assert!(!table_doc.contains_key("restore_heartbeat_at"));
+    }
+
+    /// The manifest arm writes `kind = manifest`, the store the backup row
+    /// names and the claimant's spool; a filesystem store leaves
+    /// `spool_host` out.
+    #[test]
+    fn a_manifest_registration_writes_the_kind_store_and_spool() {
+        use extenddb_storage::backup_catalog::{StoreIdentity, StoreKind};
+        let store = StoreIdentity {
+            store_kind: StoreKind::S3,
+            store_root: "s3://bucket/prefix".to_owned(),
+            store_id: "store-7".to_owned(),
+        };
+        let registration = RestoreRegistration {
+            backup_arn: ARN,
+            source_table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/src",
+            restore_date_time: bson::DateTime::from_millis(1_791_976_431_438),
+            owner_generation: 9,
+            first_heartbeat: bson::DateTime::from_millis(1_791_976_500_000),
+            record: RestoreRecord::Manifest {
+                store: &store,
+                spool_host: Some("host-b:/var/spool"),
+            },
+            session: None,
+        };
+        let mut table_doc = doc! { "table_status": "CREATING" };
+        registration.insert_into(&mut table_doc);
+        let job = table_doc.get_document("restore_job").expect("job record");
+        assert_eq!(job.get_str("status"), Ok("RUNNING"));
+        assert_eq!(job.get_str("kind"), Ok("manifest"));
+        assert_eq!(job.get_str("store_kind"), Ok(StoreKind::S3.as_str()));
+        assert_eq!(job.get_str("store_root"), Ok("s3://bucket/prefix"));
+        assert_eq!(job.get_str("store_id"), Ok("store-7"));
+        assert_eq!(job.get_str("spool_host"), Ok("host-b:/var/spool"));
+
+        // A filesystem store spools nothing.
+        let fs = StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/var/lib/extenddb/backups".to_owned(),
+            store_id: "store-1".to_owned(),
+        };
+        let registration = RestoreRegistration {
+            backup_arn: ARN,
+            source_table_arn: "x",
+            restore_date_time: bson::DateTime::from_millis(0),
+            owner_generation: 9,
+            first_heartbeat: bson::DateTime::from_millis(0),
+            record: RestoreRecord::Manifest {
+                store: &fs,
+                spool_host: None,
+            },
+            session: None,
+        };
+        let mut table_doc = doc! { "table_status": "CREATING" };
+        registration.insert_into(&mut table_doc);
+        let job = table_doc.get_document("restore_job").expect("job record");
+        assert_eq!(job.get_str("kind"), Ok("manifest"));
+        assert_eq!(
+            job.get_str("store_kind"),
+            Ok(StoreKind::Filesystem.as_str())
+        );
+        assert!(
+            job.get_str("spool_host").is_err(),
+            "no spool for a filesystem store"
+        );
     }
 }
 

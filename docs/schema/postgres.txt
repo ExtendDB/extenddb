@@ -348,6 +348,7 @@ sequence stream_seq: bigint START 1 INCREMENT 1
 table extenddb_migrations
 table gsi_pending
 table idempotency_tokens
+table restore_progress
 table schema_history
 table stream_pending
 table stream_records
@@ -372,6 +373,9 @@ column idempotency_tokens.account_id: text NOT NULL
 column idempotency_tokens.token: text NOT NULL
 column idempotency_tokens.fingerprint: text NOT NULL
 column idempotency_tokens.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column restore_progress.table_id: text NOT NULL
+column restore_progress.file_index: bigint NOT NULL
+column restore_progress.items_applied: bigint NOT NULL
 column schema_history.filename: text NOT NULL
 column schema_history.applied_at: timestamp with time zone NOT NULL DEFAULT now()
 column stream_pending.shard_id: text NOT NULL
@@ -404,6 +408,7 @@ index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_create
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
 index idx_vector_index_holds_table: CREATE INDEX idx_vector_index_holds_table ON public.vector_index_holds USING btree (table_id)
+index restore_progress_pkey: CREATE UNIQUE INDEX restore_progress_pkey ON public.restore_progress USING btree (table_id, file_index)
 index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
 index stream_pending_pkey: CREATE UNIQUE INDEX stream_pending_pkey ON public.stream_pending USING btree (shard_id, id)
 index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
@@ -412,6 +417,7 @@ index vector_index_holds_pkey: CREATE UNIQUE INDEX vector_index_holds_pkey ON pu
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint gsi_pending.gsi_pending_pkey: PRIMARY KEY (id)
 constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (account_id, token)
+constraint restore_progress.restore_progress_pkey: PRIMARY KEY (table_id, file_index)
 constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
 constraint stream_pending.stream_pending_pkey: PRIMARY KEY (shard_id, id)
 constraint stream_pending.stream_pending_shard_id_fkey: FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE

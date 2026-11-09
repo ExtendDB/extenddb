@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Golden tests for SQLite migrations 2 to 4, 6 and 8, each run on a released
+//! Golden tests for SQLite migrations 2 to 4, 6 and 9, each run on a released
 //! catalog with the damage or the content its body handles, and migration
 //! 1's accepted and converged pre-release shapes.
 
@@ -731,12 +731,12 @@ async fn migration_6_adds_the_catalog_index_and_backfills_the_registrations() {
     );
 }
 
-/// Migration 8 adds `warm_throughput` to `tables` and `indexes` of a released
+/// Migration 9 adds `warm_throughput` to `tables` and `indexes` of a released
 /// catalog, leaving every existing row NULL (DescribeTable then reports the
 /// defaults), and running it again changes nothing.
 #[tokio::test]
-async fn migration_8_adds_the_warm_throughput_columns() {
-    let db = temp_db("m8");
+async fn migration_9_adds_the_warm_throughput_columns() {
+    let db = temp_db("m9");
     load_dump(&db, DEV_0_1_14).await;
     let columns = "SELECT COUNT(*) FROM pragma_table_info('tables') WHERE name = 'warm_throughput'";
     assert_eq!(
@@ -746,7 +746,7 @@ async fn migration_8_adds_the_warm_throughput_columns() {
     );
     run(&db).await.expect("migrate");
     let report = reconverge(&db).await.expect("reconverge");
-    assert!(report.applied.iter().any(|s| s.id == 8), "{report:?}");
+    assert!(report.applied.iter().any(|s| s.id == 9), "{report:?}");
     assert_eq!(
         status(&db).await,
         CatalogStatus::Current { version: LATEST }
@@ -778,5 +778,5 @@ async fn migration_8_adds_the_warm_throughput_columns() {
         )
         .await,
     );
-    golden("0008_warm_throughput", &text);
+    golden("0009_warm_throughput", &text);
 }

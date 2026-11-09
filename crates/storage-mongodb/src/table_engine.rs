@@ -274,11 +274,28 @@ impl MongoEngine {
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
         let for_restore = restore.is_some();
-        let mut session = restore.and_then(|registration| registration.session.as_deref_mut());
-        let inserted = match session.as_deref_mut() {
+        let mut restore = restore;
+        let inserted = match restore
+            .as_deref_mut()
+            .and_then(|registration| registration.session.as_deref_mut())
+        {
             Some(session) => tables_coll.insert_one(table_doc).session(session).await,
             None => tables_coll.insert_one(table_doc).await,
         };
+        // A manifest record's first heartbeat is rewritten with the server's
+        // clock in the same transaction (nothing for a legacy one).
+        let inserted = match inserted {
+            Ok(_) => match restore.as_deref_mut() {
+                Some(registration) => {
+                    registration
+                        .stamp_server_clock(&tables_coll, &table_id)
+                        .await
+                }
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        };
+        let mut session = restore.and_then(|registration| registration.session.as_deref_mut());
         if let Err(e) = inserted {
             if let Some(session) = session {
                 let _ = session.abort_transaction().await;
@@ -578,6 +595,24 @@ impl MongoEngine {
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
             }
+        }
+
+        // A restore target's DDL is complete here: the data collection, its
+        // unique key index and every GSI and LSI metadata document and data
+        // collection exist. The record was committed before any of them (the
+        // registration's transaction ends at the catalog insert), so the
+        // record carries `restore_job.ddl_done = false` until this write,
+        // and the reconciler's resume refuses a record left unmarked by an
+        // owner that died in between (`restore_target_ready`), rather than
+        // resuming into a target that is missing its indexes.
+        if for_restore {
+            tables_coll
+                .update_one(
+                    doc! { "table_id": &table_id },
+                    doc! { "$set": { crate::backup_catalog::RESTORE_JOB_DDL_DONE: true } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
         // Derive the SSEDescription from the SSESpecification, mirroring the

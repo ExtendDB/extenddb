@@ -24,6 +24,7 @@
 //! alter the meaning of backups already on disk. A reader that finds a version
 //! it does not know refuses the restore rather than guessing.
 
+use extenddb_core::backup_format::SourceTableSchema;
 use extenddb_core::types::{
     AttributeDefinition, BillingMode, CreateTableInput, GsiInput, KeySchemaElement, KeyType,
     LsiInput, OnDemandThroughput, ProvisionedThroughput, StreamSpecification,
@@ -435,6 +436,96 @@ impl BackupRestoreSource {
         }
         input
     }
+}
+
+/// What the engine answers a `RestoreTableFromBackup` with, beside the
+/// target's description: the three members of the `RestoreSummary`, from a
+/// legacy backup's [`BackupRestoreSource`] or a store-backed backup's
+/// manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoreSource {
+    pub backup_arn: String,
+    pub source_table_arn: String,
+    /// Epoch seconds; reported as `RestoreSummary.RestoreDateTime`, as the
+    /// service does.
+    pub backup_creation_date_time: f64,
+}
+
+impl From<&BackupRestoreSource> for RestoreSource {
+    fn from(source: &BackupRestoreSource) -> Self {
+        Self {
+            backup_arn: source.backup_arn.clone(),
+            source_table_arn: source.source_table_arn.clone(),
+            backup_creation_date_time: source.backup_creation_date_time,
+        }
+    }
+}
+
+/// The restore target's `CreateTableInput` for a store-backed backup: the
+/// manifest's `source_table` with the request's billing, throughput and SSE
+/// overrides applied, by the rule [`BackupTableDefinition::apply_to`] applies
+/// to a legacy definition (one rule for both paths: the GSI throughput
+/// defaulting, the on-demand normalization, `TableClass` not restored). The
+/// engine applies the index and on-demand overrides to the result and
+/// validates it with `validate_create_table`. `vector_indexes` is the
+/// manifest's list when it is non-empty (a target without vector support has
+/// refused it before this is called), else `None`; the recorded SSE
+/// description maps back to the specification the backends derive it from
+/// (an `ENABLED` description was an enabled `KMS` specification). Streams,
+/// TTL and tags are not restored, as the service does not.
+#[must_use]
+pub fn restore_input_from_manifest(
+    source: &SourceTableSchema,
+    target_table_name: &str,
+    overrides: &RestoreTableOverrides,
+) -> CreateTableInput {
+    let mut input = CreateTableInput {
+        table_name: target_table_name.to_owned(),
+        key_schema: source.key_schema.clone(),
+        attribute_definitions: source.attribute_definitions.clone(),
+        ..Default::default()
+    };
+    let definition = BackupTableDefinition {
+        version: BACKUP_DEFINITION_VERSION,
+        billing_mode: crate::backup_catalog::billing_mode_name(source.billing_mode).to_owned(),
+        provisioned_throughput: source.provisioned_throughput.clone(),
+        // The manifest records no warm throughput (row S6b), so the target
+        // and its indexes get none and report the defaults once ACTIVE (row
+        // S6c), as a restore of an in-catalog backup does.
+        global_secondary_indexes: source
+            .global_secondary_indexes
+            .iter()
+            .map(|g| GsiInput {
+                index_name: g.index_name.clone(),
+                key_schema: g.key_schema.clone(),
+                projection: g.projection.clone(),
+                provisioned_throughput: g.provisioned_throughput.clone(),
+                warm_throughput: None,
+            })
+            .collect(),
+        local_secondary_indexes: source
+            .local_secondary_indexes
+            .iter()
+            .map(|l| LsiInput {
+                index_name: l.index_name.clone(),
+                key_schema: l.key_schema.clone(),
+                projection: l.projection.clone(),
+            })
+            .collect(),
+        table_class: source.table_class.clone(),
+        sse_specification: source
+            .sse_description
+            .as_ref()
+            .filter(|sse| sse.status == "ENABLED")
+            .map(|_| serde_json::json!({"Enabled": true, "SSEType": "KMS"})),
+        on_demand_throughput: source.on_demand_throughput.clone(),
+        vector_index_names: Vec::new(),
+        time_to_live: None,
+        stream_specification: None,
+    };
+    definition.apply_to(&mut input, overrides);
+    input.vector_indexes = source.vector_indexes.clone().filter(|v| !v.is_empty());
+    input
 }
 
 /// What a backend is asked to do for one `RestoreTableFromBackup`, after the

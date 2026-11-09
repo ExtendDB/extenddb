@@ -23,7 +23,7 @@ pub const CATALOG_MIGRATION_6: &str =
 /// The definitions a keyspace of `dir` (`catalog` or `account`) holds after
 /// every migration: migration 1's, without `continuous_backups`, which
 /// migration 5 drops, and in the catalog with what migration 6 adds and the
-/// `warm_throughput` column migration 8 adds to `tables` and `indexes`.
+/// `warm_throughput` column migration 9 adds to `tables` and `indexes`.
 ///
 /// # Panics
 ///

@@ -2282,6 +2282,15 @@ pub const UPDATE_LIST_INDEX_TARGET_COST: usize = 1;
 /// `finished` is the whole finished item; `actions` are the statement's clauses
 /// with `#name` placeholders still in place, resolved here through `maps`.
 ///
+/// An update translated from a PartiQL `UPDATE` (`maps.finished_item_sizing`)
+/// is sized by the finished item alone, as
+/// [`validate_transact_update_item_size`] sizes a transacted Update: at a
+/// three-byte key, `UPDATE ... SET p = ?` writes a finished item of exactly
+/// 409,600 bytes that `UpdateItem` with `SET p = :p` refuses, two `SET`
+/// clauses or an `if_not_exists` add nothing, and one byte more is refused
+/// with the update wording, in `ExecuteStatement` and `BatchExecuteStatement`
+/// alike (measured us-east-1, 2026-11-04).
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the update wording when
@@ -2292,6 +2301,9 @@ pub fn validate_update_item_size(
     maps: &crate::expression::ExpressionMaps,
     max_bytes: usize,
 ) -> Result<(), DynamoDbError> {
+    if maps.finished_item_sizing {
+        return validate_transact_update_item_size(finished, max_bytes);
+    }
     let statement = if maps.legacy_attribute_updates {
         legacy_update_statement_size(finished, actions, maps)?
     } else {
@@ -4824,6 +4836,21 @@ mod update_size_tests {
         let mut finished = Item::new();
         finished.insert("p".to_owned(), s("0123456789"));
         assert!(validate_update_item_size(&finished, &actions, &maps, 5).is_err());
+    }
+
+    #[test]
+    fn a_partiql_update_is_sized_by_its_finished_item_alone() {
+        // The 33-byte statement of the test above is refused at 32 as an
+        // UpdateItem. Translated from a PartiQL UPDATE, only the finished item
+        // ({p: 10 bytes}, 11 bytes) counts.
+        let (actions, mut maps) = build("SET p = :v", &[("v", s("0123456789"))]);
+        maps.finished_item_sizing = true;
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+
+        assert!(validate_update_item_size(&finished, &actions, &maps, 11).is_ok());
+        let err = validate_update_item_size(&finished, &actions, &maps, 10).unwrap_err();
+        assert_eq!(err.to_string(), ITEM_SIZE_TO_UPDATE_EXCEEDED);
     }
 
     #[test]
