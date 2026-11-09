@@ -422,3 +422,96 @@ async fn overlapping_stream_changes_apply_exactly_one() {
         activate(&engine).await;
     }
 }
+
+/// The catalog write of a stream enable on a table created without a stream
+/// binds null for the specification and the label it read. Cassandra meets a
+/// condition that compares a column with null on a row that does not exist,
+/// and an UPDATE writes the row. The write is also conditional on `table_id`,
+/// so for a table deleted after the read it does not apply and writes no row,
+/// while on the table that exists it applies.
+#[tokio::test]
+async fn a_stream_enable_write_does_not_apply_to_a_missing_row() {
+    use cdrs_tokio::types::value::Value;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = crate::helpers::unique_test_account();
+    crate::helpers::ensure_test_account(&engine, &account)
+        .await
+        .unwrap();
+    let set = [
+        (
+            "stream_specification",
+            Value::from(r#"{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}"#),
+        ),
+        ("stream_label", Value::from("2026-11-09T18:00:00.000")),
+    ];
+    let rows_named = |name: &'static str| {
+        let engine = &engine;
+        let account = account.clone();
+        async move {
+            extenddb_storage_cassandra::cassandra_util::query_rows::<StorageError>(
+                &engine.session_arc(),
+                &format!(
+                    "SELECT table_name FROM {}.tables WHERE account_id = ? AND table_name = ?",
+                    engine.catalog_keyspace()
+                ),
+                cdrs_tokio::query_values!(account.as_str(), name),
+                "tables row",
+            )
+            .await
+            .unwrap()
+            .len()
+        }
+    };
+
+    let missing = "StreamEnableMissingRow";
+    assert_eq!(rows_named(missing).await, 0);
+    let applied = engine
+        .write_tables_row(
+            &account,
+            missing,
+            &set,
+            "550e8400-e29b-41d4-a716-446655440000",
+            None,
+            Some((None, None)),
+        )
+        .await
+        .unwrap();
+    assert!(!applied, "the write applied to a row that does not exist");
+    assert_eq!(
+        rows_named(missing).await,
+        0,
+        "the write left a row for a table that does not exist"
+    );
+
+    // The same write on a table created without a stream applies.
+    let name = "StreamEnableNoStream";
+    engine
+        .create_table(
+            &account,
+            CreateTableInput {
+                table_name: name.to_owned(),
+                key_schema: vec![KeySchemaElement {
+                    attribute_name: "id".to_owned(),
+                    key_type: KeyType::Hash,
+                }],
+                attribute_definitions: vec![AttributeDefinition {
+                    attribute_name: "id".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    activate(&engine).await;
+    let table_id = describe_table(&engine, &account, name).await.table_id;
+    let applied = engine
+        .write_tables_row(&account, name, &set, &table_id, None, Some((None, None)))
+        .await
+        .unwrap();
+    assert!(applied, "the write did not apply to the table that exists");
+}

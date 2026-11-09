@@ -548,12 +548,19 @@ impl CassandraEngine {
                 if written {
                     break Ok(true);
                 }
-                // Not applied: the row is gone, a stream change committed since
-                // the row was read, or another UpdateTable wrote the warm
-                // throughput since it was read. Only the last is retried, merged
-                // again over what that request wrote; the other two end the
-                // loop and are answered below. A stream change that finds its
-                // stream fields as read ran into a warm throughput write.
+                // The write did not apply for one of these reasons:
+                // - The row is gone, or it holds a table created again under
+                //   the same name.
+                // - A stream change committed after this request read the row.
+                // - Another UpdateTable wrote the warm throughput after this
+                //   request read it.
+                // The loop retries only the last case, merged again over what
+                // that request wrote. With a stream change pending, the other
+                // two end the loop, and the code below answers them. Without
+                // one, the merge reads the record by name, so the loop retries
+                // a table created again until MERGE_ATTEMPTS and then answers
+                // Internal. A stream change that finds its table and stream
+                // fields as it read them ran into a warm throughput write.
                 let (Some(col), Some(spec)) = (warm_col, input.warm_throughput.as_ref()) else {
                     break Ok(false);
                 };
@@ -562,8 +569,9 @@ impl CassandraEngine {
                         .stream_condition_fields(account_id, &input.table_name)
                         .await
                     {
-                        Ok(Some((specification, label)))
-                            if specification == pending.read_specification
+                        Ok(Some((id, specification, label)))
+                            if id.as_deref() == Some(table_id)
+                                && specification == pending.read_specification
                                 && label == pending.read_label => {}
                         Ok(_) => break Ok(false),
                         Err(e) => break Err(e),
@@ -593,7 +601,8 @@ impl CassandraEngine {
             // our earlier SELECT and this UPDATE: treat as TableNotFound. Under
             // a stream change the condition also fails when another stream
             // change committed in between; `refuse_overlapping_stream_change`
-            // re-reads the row and answers as that later request would be.
+            // re-reads the row and answers as that later request would be, or
+            // with TableNotFound when the row is gone or holds another table.
             // NOTE: the tables LWT commits before the indexes batch below runs.
             // A failure in the indexes batch leaves the table row updated with
             // no corresponding index rows; the recovery worker does not cover
@@ -634,8 +643,13 @@ impl CassandraEngine {
                     });
                 }
                 if pending_stream.is_some() {
-                    self.refuse_overlapping_stream_change(account_id, &input.table_name, input)
-                        .await?;
+                    self.refuse_overlapping_stream_change(
+                        account_id,
+                        &input.table_name,
+                        table_id,
+                        input,
+                    )
+                    .await?;
                 }
                 return Err(StorageError::TableNotFound(input.table_name.clone()));
             }
@@ -758,8 +772,10 @@ impl CassandraEngine {
 
     /// One attempt of `update_table`'s write of the `tables` row: `UPDATE ...
     /// SET` the columns of `set`, conditional on [`tables_write_condition`].
-    /// `true` when the write applied.
-    pub(crate) async fn write_tables_row(
+    /// `true` when the write applied. Public for the direct tests, which run
+    /// it against a row that does not exist.
+    #[doc(hidden)]
+    pub async fn write_tables_row(
         &self,
         account_id: &str,
         table_name: &str,
@@ -795,13 +811,17 @@ impl CassandraEngine {
 /// it binds, in the order of its parts.
 ///
 /// `warm_read` is the warm throughput record the request read, when the write
-/// carries a WarmThroughput: the write is conditional on that record and on
-/// `table_id`, which a missing row does not have. `stream_read` is the stream
-/// specification and label the request read, when a stream change is pending:
-/// of two overlapping stream changes the one whose write finds them changed
-/// re-reads the row and is refused by `stream_change` as a request arriving
-/// after the other's commit would be. With neither the write is conditional on
-/// the row existing.
+/// carries a WarmThroughput. `stream_read` is the stream specification and
+/// label the request read, when a stream change is pending: of two overlapping
+/// stream changes the one whose write finds them changed re-reads the row and
+/// is refused by `stream_change` as a request arriving after the other's commit
+/// would be. With either, the write is also conditional on `table_id`, which a
+/// missing row does not have. A condition that compares a column with null is
+/// met by a missing row, so without it a stream enable on a table created
+/// without a stream (both stream columns null) that runs after a DeleteTable
+/// would write a row holding only the columns it sets. A table created again
+/// under the same name has another `table_id` and fails the condition too.
+/// With neither, the write is conditional on the row existing.
 fn tables_write_condition(
     table_id: &str,
     warm_read: Option<Option<&str>>,
@@ -809,9 +829,11 @@ fn tables_write_condition(
 ) -> (String, Vec<Value>) {
     let mut parts = Vec::new();
     let mut values = Vec::new();
-    if let Some(read) = warm_read {
+    if warm_read.is_some() || stream_read.is_some() {
         parts.push("table_id = ?");
         values.push(Value::from(table_id));
+    }
+    if let Some(read) = warm_read {
         parts.push("warm_throughput = ?");
         values.push(crate::warm_throughput::condition_value(read));
     }
@@ -825,4 +847,77 @@ fn tables_write_condition(
         return ("IF EXISTS".to_owned(), values);
     }
     (format!("IF {}", parts.join(" AND ")), values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const WARM: &str = r#"{"ReadUnitsPerSecond":12000,"WriteUnitsPerSecond":4000}"#;
+    const SPEC: &str = r#"{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}"#;
+    const LABEL: &str = "2026-11-09T18:00:00.000";
+
+    fn condition(
+        warm_read: Option<Option<&str>>,
+        stream_read: Option<(Option<&str>, Option<&str>)>,
+    ) -> (String, Vec<Value>) {
+        let (text, values) = tables_write_condition(TID, warm_read, stream_read);
+        assert_eq!(text.matches('?').count(), values.len(), "{text}");
+        (text, values)
+    }
+
+    /// The condition of the `tables` write and the values it binds, in order,
+    /// with neither a WarmThroughput nor a stream change, with each alone, and
+    /// with both. Every case with a part is also conditional on `table_id`,
+    /// bound first.
+    #[test]
+    fn the_tables_write_condition_binds_its_values_in_the_order_of_its_parts() {
+        assert_eq!(condition(None, None), ("IF EXISTS".to_owned(), vec![]));
+
+        let warm_only = "IF table_id = ? AND warm_throughput = ?".to_owned();
+        assert_eq!(
+            condition(Some(Some(WARM)), None),
+            (warm_only.clone(), vec![Value::from(TID), Value::from(WARM)])
+        );
+        assert_eq!(
+            condition(Some(None), None),
+            (warm_only, vec![Value::from(TID), Value::Null])
+        );
+
+        // A table created without a stream has both stream columns null, so
+        // its first enable binds two nulls. `table_id` keeps a row that does
+        // not exist from meeting the condition.
+        let stream_only =
+            "IF table_id = ? AND stream_specification = ? AND stream_label = ?".to_owned();
+        assert_eq!(
+            condition(None, Some((None, None))),
+            (
+                stream_only.clone(),
+                vec![Value::from(TID), Value::Null, Value::Null]
+            )
+        );
+        assert_eq!(
+            condition(None, Some((Some(SPEC), Some(LABEL)))),
+            (
+                stream_only,
+                vec![Value::from(TID), Value::from(SPEC), Value::from(LABEL)]
+            )
+        );
+
+        assert_eq!(
+            condition(Some(Some(WARM)), Some((Some(SPEC), None))),
+            (
+                "IF table_id = ? AND warm_throughput = ? AND stream_specification = ? \
+                 AND stream_label = ?"
+                    .to_owned(),
+                vec![
+                    Value::from(TID),
+                    Value::from(WARM),
+                    Value::from(SPEC),
+                    Value::Null
+                ]
+            )
+        );
+    }
 }

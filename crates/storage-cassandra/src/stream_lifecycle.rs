@@ -263,20 +263,20 @@ impl CassandraEngine {
         }
     }
 
-    /// The stream specification JSON and label of the table's row, as the
-    /// conditional catalog write of a stream change compares them, read at
-    /// `LOCAL_SERIAL` so that a write another lightweight transaction
-    /// committed is seen; `None` when the row is gone.
+    /// The table id, stream specification JSON and stream label of the
+    /// table's row, as the conditional catalog write of a stream change
+    /// compares them, read at `LOCAL_SERIAL` so that a write another
+    /// lightweight transaction committed is seen; `None` when the row is gone.
     pub(crate) async fn stream_condition_fields(
         &self,
         account_id: &str,
         table_name: &str,
-    ) -> Result<Option<(Option<String>, Option<String>)>, StorageError> {
+    ) -> Result<Option<(Option<String>, Option<String>, Option<String>)>, StorageError> {
         let catalog_ks = self.catalog_keyspace();
         let row = crate::cassandra_util::query_rows_serial::<StorageError>(
             &self.session_arc(),
             &format!(
-                "SELECT stream_specification, stream_label FROM {catalog_ks}.tables \
+                "SELECT table_id, stream_specification, stream_label FROM {catalog_ks}.tables \
                  WHERE account_id = ? AND table_name = ?"
             ),
             cdrs_tokio::query_values!(account_id, table_name),
@@ -287,6 +287,7 @@ impl CassandraEngine {
         .next();
         Ok(row.map(|r| {
             (
+                r.get_by_name("table_id").ok().flatten(),
                 r.get_by_name("stream_specification").ok().flatten(),
                 r.get_by_name("stream_label").ok().flatten(),
             )
@@ -300,30 +301,24 @@ impl CassandraEngine {
     /// no stream to disable`). When the re-read state would accept the request
     /// (a disable overlapped an enable), the table is reported as not ACTIVE,
     /// the nearest of ExtendDB's answers to the service's in-progress refusal.
+    /// A row that is gone, or that holds a table created again under the same
+    /// name (another `table_id` than `table_id`, the one the request read), is
+    /// the table the request read no longer existing: `TableNotFound`.
     pub(crate) async fn refuse_overlapping_stream_change(
         &self,
         account_id: &str,
         table_name: &str,
+        table_id: &str,
         input: &extenddb_core::types::UpdateTableInput,
     ) -> Result<(), StorageError> {
         let Some(spec) = &input.stream_specification else {
             return Ok(());
         };
-        let catalog_ks = self.catalog_keyspace();
-        let row = query_rows::<StorageError>(
-            &self.session,
-            &format!(
-                "SELECT stream_specification FROM {catalog_ks}.tables \
-                 WHERE account_id = ? AND table_name = ?"
-            ),
-            cdrs_tokio::query_values!(account_id, table_name),
-            "update_table stream re-read",
-        )
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
-        let current: Option<String> = row.get_by_name("stream_specification").ok().flatten();
+        let (_, current, _) = self
+            .stream_condition_fields(account_id, table_name)
+            .await?
+            .filter(|(id, _, _)| id.as_deref() == Some(table_id))
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
         let current: Option<StreamSpecification> = current
             .as_deref()
             .map(serde_json::from_str)
