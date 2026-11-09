@@ -237,6 +237,7 @@ async fn a_dead_restore_is_resumed_by_one_cycle_from_its_recorded_progress() {
         authorized_key_info: Default::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
     };
 
     call(
