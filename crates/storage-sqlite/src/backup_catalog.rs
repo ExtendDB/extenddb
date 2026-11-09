@@ -1759,6 +1759,7 @@ mod write_lock_tests {
             authorized_key_info: Default::default(),
             auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
             table_key_info_lookup: None,
+            item_authorizer: None,
         };
         call(
             &ctx,
