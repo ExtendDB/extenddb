@@ -197,8 +197,9 @@ impl CassandraCatalogStore {
             "delete_user iam_user_tags",
         )
         .await?;
-        // iam_users last: user is only gone once all dependent rows are cleaned up
-        crate::cassandra_util::apply_lwt(
+        // iam_users last: user is only gone once all dependent rows are cleaned up.
+        // Quorum commit, so the console's quorum session check sees the deletion.
+        crate::cassandra_util::apply_lwt_quorum(
             &session,
             &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
             cdrs_tokio::query_values!(account_id, user_name),
@@ -391,22 +392,12 @@ impl CassandraCatalogStore {
         )
         .await?;
 
-        let Some(row) = row else {
-            return Ok(false);
-        };
-
-        let hash_opt: Option<String> = row.get_by_name("password_hash").ok().flatten();
-
-        let Some(hash) = hash_opt else {
-            return Ok(false);
-        };
-
-        let pw = password.to_owned();
-        Ok(
-            tokio::task::spawn_blocking(move || bcrypt::verify(pw, &hash).unwrap_or(false))
-                .await
-                .unwrap_or(false),
-        )
+        // `None` when the user is absent or has no console password, which
+        // still runs one bcrypt check (see `verify_stored_password`), as a
+        // wrong password does.
+        let hash: Option<String> =
+            row.and_then(|row| row.get_by_name("password_hash").ok().flatten());
+        extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(
@@ -426,7 +417,8 @@ impl CassandraCatalogStore {
              WHERE account_id = ? AND user_name = ? IF EXISTS"
         );
 
-        crate::cassandra_util::apply_lwt(
+        // Quorum commit, so the console's quorum session check sees the new hash.
+        crate::cassandra_util::apply_lwt_quorum(
             self.session(),
             &update_query,
             cdrs_tokio::query_values!(password_hash, account_id, user_name),

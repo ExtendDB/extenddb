@@ -14,7 +14,9 @@ extenddb-check-lock-<mongo port>, published on 127.0.0.1 only:
 - the migrate preview and verify run beside a server and exit 0, and
   migrate --yes exits 6 naming the server's host and pid;
 - a server stopped with SIGTERM deletes its registration, so migrate --yes
-  then runs at once;
+  then runs at once; `backup list` and `backup purge`'s dry run, with and
+  without a store configured, release the registration they take, so
+  migrate --yes right after them runs at once too;
 - while a migration holds the lock, a server exits 6 and a second
   migrate --yes exits 6, and the preview still runs;
 - a server refuses a catalog behind this binary with 3, and the command it
@@ -51,6 +53,7 @@ from catalog_checks import (
     start_mongo,
     stop,
     watch_lost_registration,
+    with_filesystem_store,
 )
 
 
@@ -114,6 +117,30 @@ def main(binary: str, mongo_port: int, api_port: int) -> int:
         report(server.returncode == 0, f"the server stopped on SIGTERM with exit {server.returncode}")
         report(live_servers(container, mongo_port) == 0, "the stopped server deleted its registration")
         expect_exit(0, "migrate --yes once the server stopped", migrate + ["--yes", "--lock-timeout", "2"], env)
+
+        # The backup commands register as a server does and release the
+        # registration when they exit, whatever the outcome, so a migration
+        # right after them does not wait for the document to expire 45 s
+        # after its last renewal. With no store configured the command
+        # releases on its no-store path before it prints; with a filesystem
+        # store (a root under the work directory) it opens the store, runs,
+        # and releases when it closes the catalog, the path a store-backed
+        # deployment takes.
+        backup = [binary, "backup", "--config", "extenddb.toml"]
+        expect_exit(0, "backup list with no server running", backup + ["list"], env, contains="none (")
+        expect_exit(0, "backup purge's dry run with no server running", backup + ["purge"], env,
+                    contains="Dry run: nothing was deleted")
+        store_config, root = with_filesystem_store(os.path.join(work, "extenddb.toml"), work)
+        backup = [binary, "backup", "--config", store_config]
+        expect_exit(0, "backup list with a filesystem store configured", backup + ["list"], env,
+                    contains=f"=== backups in the filesystem store {root}")
+        expect_exit(0, "backup purge's dry run with a filesystem store configured", backup + ["purge"], env,
+                    contains="Dry run: nothing was deleted. Run again with --confirm")
+        report(live_servers(container, mongo_port) == 0, "the backup commands released their registration")
+        started = time.monotonic()
+        expect_exit(0, "migrate --yes right after the backup commands", migrate + ["--yes", "--lock-timeout", "2"],
+                    env)
+        report(time.monotonic() - started < 20, "migrate --yes did not wait for a backup command's registration")
 
         # Another migration's lock, as its claim writes it.
         mongosh(container, mongo_port, "db.getSiblingDB('extenddb_catalog').settings.insertOne("

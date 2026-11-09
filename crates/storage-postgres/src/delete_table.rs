@@ -47,7 +47,8 @@ impl PostgresEngine {
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
-                      table_class, sse_specification, on_demand_throughput
+                      table_class, sse_specification, on_demand_throughput,
+                      warm_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2
                  AND table_status IN ('ACTIVE', 'CREATING', 'DELETING')
                FOR UPDATE",
@@ -63,7 +64,7 @@ impl PostgresEngine {
         // Fetch indexes for the response description.
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
-                      index_status, provisioned_throughput
+                      index_status, provisioned_throughput, warm_throughput
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)
@@ -94,7 +95,7 @@ impl PostgresEngine {
         // filled by RestoreTableFromBackup. The service refuses to delete a
         // table it is still creating, and deleting this one would make the
         // restore fail part-way; refuse until the restore finishes. An
-        // abandoned target is removed by the restore sweep, not here.
+        // abandoned target is removed by the reconciler, not here.
         if row.table_status == "CREATING" {
             let restoring: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM tables WHERE table_id = $1 \

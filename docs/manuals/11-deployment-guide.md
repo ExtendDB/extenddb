@@ -120,7 +120,13 @@ exec extenddb serve --foreground --config "$CONFIG"
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
 read; stop the container instead, which delivers `SIGTERM` and triggers the same
-graceful shutdown. Outside a container, where you may want `stop` to work, add
+graceful shutdown. With a backup job running the shutdown takes up to 35
+seconds before the workers stop, and up to 76 seconds in all when the database
+is slow to answer (the admin guide's Stopping section); a runtime whose grace
+period is shorter (Docker's default is 10 s) kills the process during the job
+drain, and the reconciler resolves the job's row as it does after a crash. The
+repository's compose files set `stop_grace_period: 80s`, above that sum; a
+compose file of your own needs the same. Outside a container, where you may want `stop` to work, add
 `--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
@@ -216,12 +222,12 @@ extenddb init \
 
 - [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
 - [ ] Firewall: allow only necessary ports (extenddb port, storage backend port)
-- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging
+- [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Unless the proxy preserves the client address, login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
 ### Database (PostgreSQL)
 
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
-- [ ] Configure PostgreSQL `max_connections` ≥ extenddb `pool_size` + 3
+- [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
 - [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
@@ -261,6 +267,13 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# On a host that backs up tables of large items, one malloc arena keeps a
+# backup job's high-water mark at the pipeline's terms whatever the number of
+# large items it reads (the admin guide's [backup] max_concurrent_jobs row
+# gives the figures). It costs the request path a few percent (3.5 to 9.2%
+# on GetItem, Query and Scan on SQLite, about 2% on PostgreSQL (the scans,
+# 2.1%)), so the line is left to the operator:
+#Environment=MALLOC_ARENA_MAX=1
 
 [Install]
 WantedBy=multi-user.target
@@ -277,7 +290,8 @@ Run one extenddb instance per catalog. Multiple instances behind a load balancer
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
-- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
+- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation. It does report the backup store: `components.backup_store` is `unhealthy` and `status` is `degraded` while the configured store cannot be reached or fails its identity check, with HTTP 200 kept, so a store outage never drains a replica.
+- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch that only `backup purge` resolves. Point every instance at one root before the first backup. Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
 
 On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
@@ -296,7 +310,23 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is admitted against the pool so it cannot take every connection from ordinary requests. On PostgreSQL and MongoDB one server runs at most 4 `RestoreTableFromBackup` copies per account and `min(16, pool/2)` in total (PostgreSQL: `pool_size`; MongoDB: the engine's driver pool, `maxPoolSize` in the connection string or `max_connections`, default 10, so 5 restores); a restore that waits more than 30 seconds for a slot is refused with `LimitExceededException` and creates nothing. On SQLite one server runs at most `pool_size / 2 - 1` `CreateBackup` copies at once (between 1 and 16; 4 for the default `pool_size` of 10), each holding its snapshot connection for its duration, and refuses a backup that waited 30 seconds with `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests, and raises a smaller `pool_size` to `2 * (max_concurrent_jobs + 1)`, at most 34, so that bound refuses no job `max_concurrent_jobs` admits (the admin guide's `max_concurrent_jobs` row; above 16 jobs the slot refuses the seventeenth); a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+
+### Cassandra Connection Pool
+
+The Cassandra backend opens `max_connections` connections per node (default 10)
+and scatters requests across them:
+
+```toml
+[storage.cassandra]
+max_connections = 10  # connections per node
+```
+
+Keep this above 1. A single connection serializes every request's protocol
+stream id onto one socket and leaves no headroom if that socket drops. Spreading
+requests over several connections also divides the stream-id space, which eases a
+driver-level stream-id reuse hazard seen under sustained load with a slow
+statement in flight.
 
 ### PostgreSQL Tuning
 
@@ -305,7 +335,7 @@ Key PostgreSQL settings for extenddb workloads:
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
 - `work_mem`: 64MB (for sort operations in Query/Scan)
-- `max_connections`: ≥ `2 * pool_size + catalog_pool_size`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, and `max_connections` is per cluster, so the default pool sizes need 60 of PostgreSQL's default 100
+- `max_connections`: ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per vector index build you expect to overlap and one during a schema migration. `pool_size` sizes both the catalog and the data pool, each backup or restore job holds one claim connection outside every pool, and `max_connections` is per cluster, so the default pool sizes and the default `max_concurrent_jobs` of 4 need 64 of PostgreSQL's default 100
 
 ### Monitoring Queries
 

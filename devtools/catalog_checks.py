@@ -15,6 +15,7 @@ check prints one line, `ok` or `FAIL` and what was checked, with the
 command's output indented under a FAIL; `finish` prints the count of failed
 checks or `all checks passed` and returns the script's exit code.
 """
+import os
 import signal
 import subprocess
 import time
@@ -125,6 +126,20 @@ def stop(proc: subprocess.Popen) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def with_filesystem_store(config: str, work: str) -> tuple[str, str]:
+    """A copy of `config` with a filesystem backup store at `<work>/backups`
+    (created `0700`), for the backup commands' store-configured runs; the
+    copy's path and the root's canonical path, as the commands print it."""
+    root = os.path.realpath(os.path.join(work, "backups"))
+    os.mkdir(root, 0o700)
+    store_config = os.path.join(work, "extenddb-store.toml")
+    with open(config, encoding="utf-8") as f:
+        base = f.read()
+    with open(store_config, "w", encoding="utf-8") as f:
+        f.write(f'{base}\n[backup.store]\nkind = "filesystem"\n\n[backup.store.filesystem]\npath = "{root}"\n')
+    return store_config, root
 
 
 def finish() -> int:

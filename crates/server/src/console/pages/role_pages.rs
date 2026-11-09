@@ -15,7 +15,8 @@ use serde::Deserialize;
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf, require_session};
+use super::account_scope::require_account_session;
+use super::{CsrfOnly, identity_label, is_admin, op_error_message, require_csrf};
 
 /// GET /console/accounts/{id}/roles/new
 pub async fn new_role_form(
@@ -23,12 +24,12 @@ pub async fn new_role_form(
     headers: HeaderMap,
     Path(account_id): Path<String>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
@@ -87,12 +88,12 @@ pub async fn create_role(
     Path(account_id): Path<String>,
     Form(form): Form<CreateRoleForm>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
@@ -188,10 +189,15 @@ pub async fn role_detail(
     headers: HeaderMap,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The page shows the role's trust policy, policies and tags, which the
+    // management API gives admins only.
+    if !is_admin(&session.identity) {
+        return Redirect::to("/console").into_response();
+    }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
     let eid = html::escape(&account_id);
@@ -296,12 +302,12 @@ pub async fn delete_role(
     Path((account_id, role_name)): Path<(String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_session(&headers, &state).await {
+    let session = match require_account_session(&headers, &state, &account_id).await {
         Ok(s) => s,
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to(&format!("/console/accounts/{account_id}")).into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;

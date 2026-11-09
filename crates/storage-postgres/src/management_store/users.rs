@@ -223,16 +223,11 @@ impl PostgresCatalogStore {
             OpError::Internal("Database error".to_owned())
         })?;
 
-        let Some((hash,)) = row else {
-            return Ok(false);
-        };
-
-        let pw = password.to_owned();
-        Ok(
-            tokio::task::spawn_blocking(move || bcrypt::verify(pw, &hash).unwrap_or(false))
-                .await
-                .unwrap_or(false),
-        )
+        // `None` when the user is absent or has no console password, which
+        // still runs one bcrypt check (see `verify_stored_password`), as a
+        // wrong password does.
+        let hash = row.map(|(hash,)| hash);
+        extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 
     pub(crate) async fn change_user_password_impl(

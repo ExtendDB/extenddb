@@ -6,10 +6,12 @@
 use std::sync::Arc;
 
 use cdrs_tokio::authenticators::{NoneAuthenticatorProvider, StaticPasswordAuthenticatorProvider};
+use cdrs_tokio::cluster::connection_pool::ConnectionPoolConfigBuilder;
 use cdrs_tokio::cluster::session::{Session, SessionBuilder, TcpSessionBuilder};
 use cdrs_tokio::cluster::{NodeTcpConfigBuilder, TcpConnectionManager};
 use cdrs_tokio::load_balancing::RoundRobinLoadBalancingStrategy;
 use cdrs_tokio::query_values;
+use cdrs_tokio::retry::ExponentialReconnectionPolicy;
 use cdrs_tokio::transport::TransportTcp;
 
 use extenddb_storage::error::StorageError;
@@ -96,15 +98,25 @@ pub struct CassandraEngine {
     /// a restart merely restarts the traversal from the front.
     pub(crate) ttl_repair_scan_cursors:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, i32), uuid::Uuid>>>,
-
-    /// Identifies this engine instance as the owner of the restore copies it
-    /// runs (`tables.restore_owner`). Random per process start, so a restore
-    /// left behind by a crashed process is never mistaken for a live one.
-    pub(crate) restore_owner: uuid::Uuid,
 }
 
 /// Cap on concurrently in-flight detached TTL claim releases.
 const TTL_RELEASE_MAX_IN_FLIGHT: usize = 1_024;
+
+// Reconnection backoff bounds for the driver (issue #403).
+//
+// cdrs-tokio's default policy doubles a 1s base up to 60s, and each outage
+// starts a new schedule, so it reaches 60s after about a minute of failed
+// attempts. We cap it at 5s: the waits are about 2s, about 4s, then 4.25 to
+// 5s, then a fixed 5s with no retry limit. The pool and the control
+// connection both use this policy. Declared as constants so they are easy to
+// surface as config later if needed.
+const RECONNECT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Attempts after which the exponential delay has saturated at
+/// `RECONNECT_MAX_DELAY`. With a 1s base and 5s cap, the backoff delay will hit
+/// the cap by the third attempt.
+const RECONNECT_MAX_ATTEMPTS: usize = 3;
 
 /// `(account_id, table_name)` → `(fetched_at, config)`; see the field docs.
 pub(crate) type TtlConfigCache = Arc<
@@ -142,7 +154,6 @@ impl CassandraEngine {
             ttl_repair_scan_cursors: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            restore_owner: uuid::Uuid::new_v4(),
         })
     }
 
@@ -177,11 +188,35 @@ impl CassandraEngine {
             StorageError::Connection(format!("Failed to build cluster config: {e}"))
         })?;
 
-        // Create session with round-robin load balancing
+        // Create session with round-robin load balancing.
+        //
+        // Pool size: cdrs-tokio defaults to ONE connection per node
+        // (ConnectionPoolConfig::default is local_size=1, remote_size=1). One
+        // connection serializes the whole CQL stream-id space onto a single
+        // socket and gives no headroom if that socket drops, so we size the pool
+        // from `max_connections` (default 10) and scatter requests across it.
+        // This also eases the cdrs-tokio stream-id reuse hazard (issue #403):
+        // more connections divide the id space. A single-node
+        // deployment is "local", so local_size is the one that matters; we set
+        // remote_size the same for multi-node clusters.
+        let pool_size = pool_size_for(config.max_connections);
+        let pool_config = ConnectionPoolConfigBuilder::new()
+            .with_local_size(pool_size)
+            .with_remote_size(pool_size)
+            .build();
         // Wrap in timeout to prevent indefinite hangs on connection/auth failures
         const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let lb = RoundRobinLoadBalancingStrategy::new();
-        let session_future = TcpSessionBuilder::new(lb, cluster_config).build();
+        let session_future = TcpSessionBuilder::new(lb, cluster_config)
+            .with_connection_pool_config(pool_config)
+            // Cap the reconnection delay at 5s instead of the driver's default
+            // 60s (issue #403). See the RECONNECT_* constants.
+            .with_reconnection_policy(std::sync::Arc::new(ExponentialReconnectionPolicy::new(
+                RECONNECT_BASE_DELAY,
+                RECONNECT_MAX_DELAY,
+                RECONNECT_MAX_ATTEMPTS,
+            )))
+            .build();
 
         let session = tokio::time::timeout(CONNECTION_TIMEOUT, session_future)
             .await
@@ -290,6 +325,19 @@ impl CassandraEngine {
     }
 }
 
+/// Map the configured `max_connections` to the per-node pool size we request
+/// from cdrs-tokio.
+///
+/// cdrs-tokio defaults to a single connection per node; we instead size the
+/// pool from `max_connections`. The driver takes a `usize`, and a pool of zero
+/// connections is unusable, so clamp to at least 1. This is the only decision
+/// ExtendDB owns here — the driver then opens and manages that many connections.
+/// It is a free function so it can be unit-tested without a session, a driver,
+/// or a node.
+fn pool_size_for(max_connections: u32) -> usize {
+    (max_connections.max(1)) as usize
+}
+
 // TODO: Implement storage traits:
 // - TableEngine
 // - DataEngine
@@ -305,3 +353,23 @@ impl CassandraEngine {
 // - RateLimitStore
 // - AuthorizationStore
 // - CatalogStore (composite trait)
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::pool_size_for;
+
+    #[test]
+    fn maps_max_connections_to_pool_size() {
+        // The configured value passes through unchanged for any usable size.
+        assert_eq!(pool_size_for(1), 1);
+        assert_eq!(pool_size_for(2), 2);
+        assert_eq!(pool_size_for(8), 8);
+        assert_eq!(pool_size_for(10), 10);
+    }
+
+    #[test]
+    fn clamps_zero_to_one() {
+        // A zero-size pool is unusable; we request at least one connection.
+        assert_eq!(pool_size_for(0), 1);
+    }
+}

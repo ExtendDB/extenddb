@@ -25,11 +25,12 @@ use super::registrations::ServingRegistration;
 use super::{MongoTarget, catalog_status};
 
 /// The serving registration of a running server, with what it needs to
-/// take it again: the catalog, the release it registers as, its timings and
-/// the status the server started with.
+/// take it again: the catalog, the release and the process name it
+/// registers as, its timings and the status the server started with.
 pub struct ServerRegistration {
     target: MongoTarget,
     release: String,
+    command: &'static str,
     timing: Timing,
     started: CatalogStatus,
     current: Mutex<Arc<ServingRegistration>>,
@@ -39,6 +40,7 @@ impl ServerRegistration {
     pub(super) fn new(
         target: &MongoTarget,
         release: &str,
+        command: &'static str,
         timing: Timing,
         started: CatalogStatus,
         registration: ServingRegistration,
@@ -46,6 +48,7 @@ impl ServerRegistration {
         Self {
             target: target.clone(),
             release: release.to_owned(),
+            command,
             timing,
             started,
             current: Mutex::new(Arc::new(registration)),
@@ -86,12 +89,18 @@ impl ServingRegistrar for ServerRegistration {
     }
 
     async fn register_again(&self) -> Reregistration {
-        let registration =
-            match ServingRegistration::register(&self.target, &self.release, self.timing).await {
-                Ok(registration) => registration,
-                Err(MigrationError::Locked(why)) => return Reregistration::Refused(why),
-                Err(e) => return Reregistration::Unavailable(e.to_string()),
-            };
+        let registration = match ServingRegistration::register_as(
+            &self.target,
+            &self.release,
+            self.command,
+            self.timing,
+        )
+        .await
+        {
+            Ok(registration) => registration,
+            Err(MigrationError::Locked(why)) => return Reregistration::Refused(why),
+            Err(e) => return Reregistration::Unavailable(e.to_string()),
+        };
         let status = match catalog_status(&self.target).await {
             Ok(status) => status,
             Err(e) => {
