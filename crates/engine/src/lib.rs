@@ -27,6 +27,7 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
@@ -53,6 +54,7 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
 #[cfg(feature = "partiql")]
 use partiql::PartiqlExecutor;
 
