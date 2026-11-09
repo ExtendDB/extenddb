@@ -150,7 +150,11 @@ jobs:
 
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 45
+    # With the PartiQL wire tests the job took up to 42 min 10 s on #411's CI,
+    # near the old 45-minute bound; on main it took 30 to 40 min. A run with a
+    # cold build cache should take about 44 min; 60 leaves room for a slow
+    # runner.
+    timeout-minutes: 60
     needs: build-cassandra
     # Five shards by test file, each with its own Cassandra node;
     # cassandra-integration checks that together they collected every test
