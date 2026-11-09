@@ -203,6 +203,7 @@ async fn a_job_task_that_panics_leaves_a_row_the_next_cycle_resolves_without_a_r
         authorized_key_info: Default::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
     };
 
     call(
