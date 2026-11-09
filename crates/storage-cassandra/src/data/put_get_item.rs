@@ -80,6 +80,103 @@ impl CassandraEngine {
         .map(|_| ())
     }
 
+    /// The write a store-backed restore makes for one backup item, at the
+    /// write timestamp `stamp` (microseconds since the epoch, the domain of
+    /// `version`): the base row and every GSI and LSI row of the item in one
+    /// logged batch carrying `USING TIMESTAMP stamp`, with no lightweight
+    /// transaction and no read before it. A CREATING restore target has no
+    /// writer but its restore job, whose writes are idempotent upserts of the
+    /// backup's items, so the put path's version fence has nothing to
+    /// serialize against; what the timestamp buys is the fence the restore
+    /// needs instead (`restore_engine`'s module doc): a job reads `stamp`
+    /// before it checks its claim, so a batch it lands late, after a takeover,
+    /// carries a timestamp below every write and delete the successor made,
+    /// and Cassandra keeps the later cell. `version` is set to `stamp`, so a
+    /// later ordinary write's `next_row_version` is above it and its index
+    /// rows resolve in order (`data::version`). `indexes` are the target's,
+    /// read once per data file by the caller, each with its propagation delay
+    /// zeroed so every GSI is written in the batch as LSIs always are.
+    pub(crate) async fn put_restored_item_at(
+        &self,
+        key_info: &TableKeyInfo,
+        indexes: &[super::index::IndexMeta],
+        item: &Item,
+        stamp: i64,
+    ) -> Result<(), StorageError> {
+        let data_keyspace = self.account_keyspace(&key_info.account_id);
+        let ddb_table = data_table_name(&key_info.table_id);
+        let pk_text = composite_pk_to_text(item, &key_info.key_schema)?;
+        let item_text = serde_json::to_value(item)
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .to_string();
+        if !indexes.is_empty() {
+            extenddb_core::validation::validate_index_keys(
+                item,
+                &super::index::index_key_refs(indexes),
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
+        let (cql, values) = if let Some((sk_name, sk_type)) =
+            sk_info(&key_info.key_schema, &key_info.attribute_definitions)
+        {
+            let sk_value = item
+                .get(sk_name)
+                .ok_or_else(|| StorageError::Internal("missing sort key".to_owned()))?;
+            let sk = parse_sk(sk_value, sk_type)?;
+            let sk_col = sk_column(sk_type);
+            (
+                format!(
+                    "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? \
+                     WHERE pk = ? AND {sk_col} = ?"
+                ),
+                vec![
+                    item_text.into(),
+                    stamp.into(),
+                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
+                    super::index::sk_to_value(&sk),
+                ],
+            )
+        } else {
+            (
+                format!(
+                    "UPDATE {data_keyspace}.{ddb_table} SET item_data = ?, version = ? WHERE pk = ?"
+                ),
+                vec![
+                    item_text.into(),
+                    stamp.into(),
+                    cdrs_tokio::types::value::Value::from(pk_text.as_str()),
+                ],
+            )
+        };
+        // The batch carries the timestamp, so the index statements pass none
+        // of their own (Cassandra refuses a batch with both).
+        let mut batch = BatchQueryBuilder::new()
+            .with_consistency(Consistency::LocalQuorum)
+            .with_timestamp(stamp)
+            .add_query(cql, cdrs_tokio::query::QueryValues::SimpleValues(values));
+        if !indexes.is_empty() {
+            super::index::sync_indexes_at(
+                &mut batch,
+                &data_keyspace,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+                indexes,
+                None,
+                Some(item),
+                0,
+                None,
+            )?;
+        }
+        let built = batch
+            .build()
+            .map_err(|error| StorageError::Internal(error.to_string()))?;
+        self.session.batch(built).await.map_err(|error| {
+            StorageError::Internal(format!("put_restored_item_at batch: {error}"))
+        })?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn put_item_with_retry(
         &self,

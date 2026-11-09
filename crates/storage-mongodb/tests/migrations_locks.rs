@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use bson::{Document, doc};
 use extenddb_storage::hooks::ServingRegistrar;
-use extenddb_storage::migrations::{CatalogStatus, MigrationError, Runner};
+use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId, Runner};
 use extenddb_storage_mongodb::migrations::{
     MigrationLock, MongoMigrations, ServingRegistration, Timing, lock, migrate_holding,
-    register_and_check,
+    register_and_check, register_and_check_as,
 };
 use migrations_support::{Deployment, fixture, server};
 
@@ -53,10 +53,15 @@ async fn two_migrators_started_together_apply_once_and_the_other_finds_nothing()
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 6],
+        [0, 10],
         "one applies every step and the other finds nothing"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     d.drop_databases().await;
 }
 
@@ -204,7 +209,12 @@ async fn migrate_waits_for_a_running_server_and_a_server_refuses_while_a_migrati
             .is_none()
     );
     // The preview and verify read the status beside the server.
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     serving.release().await;
     let (held, _) = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION)
         .await
@@ -226,6 +236,74 @@ async fn migrate_waits_for_a_running_server_and_a_server_refuses_while_a_migrati
         .expect("serve")
         .release()
         .await;
+    d.drop_databases().await;
+}
+
+/// A command that opens the catalog as a server does (`extenddb backup
+/// list`) registers under its own name: the document carries it, a
+/// migration's wait names it, the name is kept when the registration is
+/// taken again, and its refusal while a migration holds the lock names the
+/// holder without the server's advice to start the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_registers_under_its_own_name() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "command").await;
+    d.create().await;
+    const COMMAND: &str = "extenddb backup list";
+
+    let registered = register_and_check_as(&d.target, "test", COMMAND, Timing::PRODUCTION)
+        .await
+        .expect("registered");
+    let documents = Deployment::documents(&d.catalog(), "extenddb_servers").await;
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    assert_eq!(documents[0].get_str("command"), Ok(COMMAND));
+    let error = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION)
+        .await
+        .err()
+        .expect("the command's registration is waited for");
+    assert_eq!(error.exit_code(), 6);
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("{COMMAND}, pid {}", std::process::id())),
+        "{message}"
+    );
+    let again = registered.register_again().await;
+    assert!(
+        matches!(again, extenddb_storage::hooks::Reregistration::Registered),
+        "{again:?}"
+    );
+    let documents = Deployment::documents(&d.catalog(), "extenddb_servers").await;
+    assert!(
+        documents
+            .iter()
+            .any(|d| d.get_str("command") == Ok(COMMAND)),
+        "taken again under the command's name: {documents:?}"
+    );
+    registered.release().await;
+
+    let (held, _) = lock(&d.target, false, Duration::from_secs(2), Timing::PRODUCTION)
+        .await
+        .expect("no server runs");
+    let refused = register_and_check_as(&d.target, "test", COMMAND, Timing::PRODUCTION)
+        .await
+        .err()
+        .expect("a migration holds the lock");
+    assert_eq!(refused.exit_code(), 6);
+    let why = refused.to_string();
+    assert!(
+        why.contains("holds the migration lock on this catalog"),
+        "{why}"
+    );
+    assert!(!why.contains("the server does not start"), "{why}");
+    let served = register_and_check(&d.target, "test", Timing::PRODUCTION)
+        .await
+        .err()
+        .expect("a server is refused too");
+    assert!(
+        served.to_string().contains("the server does not start"),
+        "{served}"
+    );
+    held.release().await;
     d.drop_databases().await;
 }
 

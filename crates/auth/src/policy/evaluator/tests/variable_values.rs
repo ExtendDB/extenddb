@@ -4,16 +4,21 @@
 //! Text that comes from a variable value or a default: it is not expanded a
 //! second time, and a `*` or `?` in it is not a wildcard. Also the two
 //! condition-value rules, the `${key, 'default'}` form and no expansion for a
-//! multivalued key, under the set operators and `IfExists`, and the default
-//! form under `Null`, which does not read it.
+//! multivalued key, under the set operators and `IfExists`, and the same two
+//! value shapes under `Null`, which expands no variable and reads the value
+//! as the boolean `false`.
 //!
-//! Except for the `Null` row, none of these expectations was measured on its
-//! own. Each follows from a rule the PR #535 body table measured with the IAM
-//! policy simulator on 2026-10-24: text from a value is matched literally
-//! (`team=bl*` matches only `table/bl*`), and a condition value naming
-//! `dynamodb:LeadingKeys` is not expanded under `StringEquals`. The default
-//! form in a condition value was measured on 2026-11-03 under `StringEquals`,
-//! `ArnLike` and `Null` (`condition_variable_scope.rs`).
+//! The `Null` cases have the shapes of cells N1f and N1a, measured with the
+//! IAM policy simulator on 2026-10-28 (`condition_variables_operators.rs`),
+//! and of row N5, measured on 2026-11-03 (`condition_variable_scope.rs`).
+//! No other expectation here was measured on its own. Each follows from a
+//! rule the PR #535 body table measured with the IAM policy simulator on
+//! 2026-10-24: text from a value is matched literally (`team=bl*` matches only
+//! `table/bl*`), and a condition value naming `dynamodb:LeadingKeys` is not
+//! expanded under `StringEquals`. The default form in a condition value was
+//! measured under `StringEquals` (cell E8, `condition_variables.rs`) and, on
+//! 2026-11-03, under `StringEquals`, `ArnLike` and `Null`
+//! (`condition_variable_scope.rs`).
 
 use super::*;
 
@@ -147,10 +152,26 @@ fn the_default_form_expands_under_set_operators_and_if_exists() {
 }
 
 #[test]
+fn a_null_value_written_with_a_default_reads_as_false() {
+    // `Null` expands no variable. The text `${aws:PrincipalTag/flag, 'false'}`
+    // is not `true`, so it reads as `false` and the Allow needs `team`; the
+    // default is not used. With `team` this is cell N1f.
+    let p = allow_get_if(
+        "Null",
+        "aws:PrincipalTag/team",
+        "${aws:PrincipalTag/flag, 'false'}",
+    );
+    let with_team = Ctx::empty().with("aws:PrincipalTag/team", vec!["blue"]);
+    assert_eq!(get(&p, "T", &with_team), AuthzDecision::Allow);
+    assert_eq!(get(&p, "T", &Ctx::empty()), AuthzDecision::Deny);
+}
+
+#[test]
 fn the_default_form_is_not_read_in_a_null_condition() {
     // Row N5 of `condition_variable_scope.rs`: the Deny does not apply to a
-    // caller with neither tag. Read with its default, the value would be
-    // `true` and the Deny would apply.
+    // caller with neither tag. The text `${aws:PrincipalTag/f, 'true'}` reads
+    // as `false`, so the Deny needs `team`. Read with its default, the value
+    // would be `true` and the Deny would apply.
     let p = deny_get_if(
         "Null",
         "aws:PrincipalTag/team",
@@ -176,11 +197,14 @@ fn a_multivalued_key_in_a_condition_value_is_not_expanded_under_any_form() {
         let p = deny_get_if(operator, key, "${dynamodb:LeadingKeys}");
         assert_eq!(get(&p, "T", &ctx), AuthzDecision::Allow, "{operator}");
     }
-    // Under `Null`, the first value `false` would say that `team` is present,
-    // which it is, and the Deny would apply.
+    // `Null` expands no variable. The text `${dynamodb:LeadingKeys}` is not
+    // `true`, so it reads as `false`, which says that `team` is present. It
+    // is, and the Deny applies, as in cell N1a; the leading key is not read.
+    // Expanded to its first value, the text would be `true`, which says that
+    // `team` is absent, and the Deny would not apply.
     let null = Ctx::empty()
-        .with("dynamodb:LeadingKeys", vec!["false"])
+        .with("dynamodb:LeadingKeys", vec!["true"])
         .with("aws:PrincipalTag/team", vec!["blue"]);
     let p = deny_get_if("Null", "aws:PrincipalTag/team", "${dynamodb:LeadingKeys}");
-    assert_eq!(get(&p, "T", &null), AuthzDecision::Allow, "Null");
+    assert_eq!(get(&p, "T", &null), AuthzDecision::Deny, "Null");
 }

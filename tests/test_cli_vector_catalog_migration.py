@@ -259,7 +259,7 @@ class TestVectorCatalogMigration:
         assert _ids_in("catalog") == list(range(1, _latest() + 1))
         data_ids = _ledger_ids(_data_db(cli_env))
         assert data_ids == _ids_in("data")
-        # Migrations 1 and 4 have bodies in the data database.
+        # Migrations 1, 4, 7 and 8 have bodies in the data database.
         assert data_ids[:2] == [1, 4], data_ids
 
         # Migration 1 also writes the legacy ledger rows, so a release before

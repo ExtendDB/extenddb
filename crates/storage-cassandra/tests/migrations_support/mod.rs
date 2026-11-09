@@ -10,11 +10,54 @@ use std::time::Duration;
 
 use extenddb_storage_cassandra::cassandra_util::CassandraSession;
 use extenddb_storage_cassandra::engine::CassandraEngine;
-use extenddb_storage_cassandra::migrations::wait_for_schema_agreement;
+use extenddb_storage_cassandra::migrations::{postcheck, wait_for_schema_agreement};
 
 use crate::helpers;
 
 pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The columns and indexes migration 6 adds to the catalog keyspace.
+pub const CATALOG_MIGRATION_6: &str =
+    include_str!("../fixtures/0006_backup_catalog_index.expected.json");
+
+/// The definitions a keyspace of `dir` (`catalog` or `account`) holds after
+/// every migration: migration 1's, without `continuous_backups`, which
+/// migration 5 drops, and in the catalog with what migration 6 adds and the
+/// `warm_throughput` column migration 9 adds to `tables` and `indexes`.
+///
+/// # Panics
+///
+/// A committed file cannot be read or is not a definitions file.
+#[must_use]
+pub fn expected_definitions(dir: &str) -> postcheck::Definitions {
+    let path = format!(
+        "{}/migrations/{dir}/0001_baseline.expected.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut expected: postcheck::Definitions =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+    expected
+        .columns
+        .retain(|name, _| !name.starts_with("continuous_backups."));
+    if dir == "catalog" {
+        let added: postcheck::Definitions =
+            serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
+        expected.columns.extend(added.columns);
+        expected.indexes.extend(added.indexes);
+        for table in ["tables", "indexes"] {
+            expected.columns.insert(
+                format!("{table}.warm_throughput"),
+                postcheck::Column {
+                    kind: "regular".to_owned(),
+                    position: -1,
+                    clustering_order: "none".to_owned(),
+                    data_type: "text".to_owned(),
+                },
+            );
+        }
+    }
+    expected
+}
 
 pub async fn session() -> Arc<CassandraSession> {
     Arc::new(
