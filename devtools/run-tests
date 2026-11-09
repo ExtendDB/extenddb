@@ -37,6 +37,8 @@
 #   --release         use release build for Rust tests
 #   --filter PATTERN  pass to cargo test / pytest -k
 #   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
+#   --shard K/N       run only shard K of N of each pytest suite (CI); only
+#                     shard 1 runs --terraform
 #   --config PATH     config file path (default: extenddb.toml in repo root)
 #
 # Environment (--pytest against extenddb):
@@ -81,6 +83,8 @@ RELEASE=false
 FILTER=""
 CONFIG_PATH=""
 PARALLEL=""
+# --shard K/N; CI sets EXTENDDB_TEST_SHARD instead.
+SHARD="${EXTENDDB_TEST_SHARD:-}"
 BACKEND="postgres"
 
 usage() {
@@ -109,6 +113,8 @@ Options:
   --release         release build for Rust tests
   --filter PATTERN  filter for cargo test / pytest -k
   --parallel[=N]    run pytest in parallel (default: 1/3 of CPU cores)
+  --shard K/N       run only shard K of N of each pytest suite; only shard 1
+                    runs --terraform
   --config PATH     config file path
 
 Environment (--extenddb with an integration suite):
@@ -150,6 +156,7 @@ while [[ $# -gt 0 ]]; do
         --parallel=*)
             PARALLEL="${1#--parallel=}"; shift
             ;;
+        --shard)          SHARD="$2"; shift 2 ;;
         -h|--help)        usage ;;
         *)                echo "error: unknown option: $1"; usage ;;
     esac
@@ -518,6 +525,36 @@ if $RUN_RUST_INTEGRATION; then
     echo ""
 fi
 
+# --- Shards (--shard K/N) ---
+# CI splits the long pytest suites across jobs. Before each suite runs,
+# devtools/test-shards prepare collects the whole suite with the suite's own
+# arguments, picks this shard's files, and records both lists under
+# $SHARD_DIR for the summary job's `devtools/test-shards check`. pytest then
+# loads devtools/pytest_shard.py, which keeps only those files. A shard with
+# no files of a suite runs nothing for it. shard_suite SUITE CMD... leaves
+# the command to run in SHARD_CMD.
+SHARD_DIR="${EXTENDDB_SHARD_DIR:-discussions/shards}"
+shard_suite() {
+    local suite="$1" rc=0
+    shift
+    # "${@:4}" is the suite's arguments after "python3 -m pytest".
+    "$SCRIPT_DIR/test-shards" prepare --shard "$SHARD" --out "$SHARD_DIR" \
+        --backend "$BACKEND" --config "${CONFIG_PATH:-extenddb.toml}" \
+        "$suite" -- "${@:4}" || rc=$?
+    SHARD_CMD=("$@")
+    if (( rc == 0 )); then
+        export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        export EXTENDDB_SHARD_FILES="$SHARD_DIR/files-$suite.txt"
+        SHARD_CMD+=(-p pytest_shard)
+    elif (( rc == 10 )); then
+        echo "  shard $SHARD has no $suite files; nothing to run"
+        SHARD_CMD=(true)
+    else
+        echo "  ✗ devtools/test-shards prepare failed for the $suite suite"
+        SHARD_CMD=(false)
+    fi
+}
+
 # --- Pytest ---
 if $RUN_PYTEST; then
     OUTFILE="discussions/test-pytest-${HASH}.txt"
@@ -550,6 +587,7 @@ if $RUN_PYTEST; then
     if [[ -n "$FILTER" ]]; then
         PYTEST_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite main "${PYTEST_ARGS[@]}"; PYTEST_ARGS=("${SHARD_CMD[@]}"); fi
     if "${PYTEST_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Pytest passed"
     else
@@ -612,6 +650,7 @@ if $RUN_COMPREHENSIVE; then
     if [[ -n "$FILTER" ]]; then
         COMP_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite comprehensive "${COMP_ARGS[@]}"; COMP_ARGS=("${SHARD_CMD[@]}"); fi
     if "${COMP_ARGS[@]}" 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Comprehensive tests passed"
     else
@@ -627,6 +666,10 @@ if $RUN_TERRAFORM; then
     echo "=== Terraform apply → ${OUTFILE} ==="
     if [[ "$TARGET" == "real-dynamodb" ]]; then
         echo "  skipped: the configuration points at an ExtendDB endpoint"
+    elif [[ -n "$SHARD" && "${SHARD%%/*}" != "1" ]]; then
+        # The apply is one run, not a suite of test files, so a sharded job
+        # runs it on shard 1 only.
+        echo "  skipped: shard $SHARD (shard 1 runs the apply)"
     elif EXTENDDB_TEST_ENDPOINT="$EXTENDDB_TEST_ENDPOINT" \
         tests/terraform/warm-throughput/run.sh 2>&1 | tee "$OUTFILE"; then
         echo "  ✓ Terraform apply passed"
@@ -648,6 +691,7 @@ if $RUN_PYTEST \
     if [[ -n "$FILTER" ]]; then
         CLI_ARGS+=(-k "$FILTER")
     fi
+    if [[ -n "$SHARD" ]]; then shard_suite cli "${CLI_ARGS[@]}"; CLI_ARGS=("${SHARD_CMD[@]}"); fi
     if "${CLI_ARGS[@]}" 2>&1 | tee "$CLI_OUTFILE"; then
         echo "  ✓ CLI lifecycle tests passed"
     else
