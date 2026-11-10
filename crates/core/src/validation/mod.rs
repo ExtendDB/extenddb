@@ -2540,8 +2540,8 @@ pub(crate) const MAX_ITEM_NESTING_DEPTH: usize = 32;
 
 /// Validate that no attribute value in `item` nests beyond `MAX_ITEM_NESTING_DEPTH`.
 pub fn validate_item_nesting_depth(item: &Item) -> Result<(), DynamoDbError> {
-    for value in item.values() {
-        check_attribute_value_depth(value, 0)?;
+    if item.values().any(nests_beyond_item_limit) {
+        return Err(nesting_depth_error());
     }
     Ok(())
 }
@@ -2552,38 +2552,32 @@ pub fn validate_attribute_values_nesting_depth<'a, I>(values: I) -> Result<(), D
 where
     I: IntoIterator<Item = &'a AttributeValue>,
 {
-    for v in values {
-        check_attribute_value_depth(v, 0)?;
+    if values.into_iter().any(nests_beyond_item_limit) {
+        return Err(nesting_depth_error());
     }
     Ok(())
 }
 
-fn check_attribute_value_depth(
-    value: &AttributeValue,
-    current_depth: usize,
-) -> Result<(), DynamoDbError> {
+/// Whether `value` nests beyond `MAX_ITEM_NESTING_DEPTH` levels. A check that
+/// refuses such a value with its own text calls this, so the limit has one
+/// definition.
+pub(crate) fn nests_beyond_item_limit(value: &AttributeValue) -> bool {
+    wrappers_reach_limit(value, 0)
+}
+
+/// Whether `value`, under `current_depth` M or L wrappers, brings the number
+/// of wrappers on some path to `MAX_ITEM_NESTING_DEPTH`.
+fn wrappers_reach_limit(value: &AttributeValue, current_depth: usize) -> bool {
+    let next = current_depth + 1;
     match value {
         AttributeValue::M(map) => {
-            let next = current_depth + 1;
-            if next >= MAX_ITEM_NESTING_DEPTH {
-                return Err(nesting_depth_error());
-            }
-            for v in map.values() {
-                check_attribute_value_depth(v, next)?;
-            }
+            next >= MAX_ITEM_NESTING_DEPTH || map.values().any(|v| wrappers_reach_limit(v, next))
         }
         AttributeValue::L(list) => {
-            let next = current_depth + 1;
-            if next >= MAX_ITEM_NESTING_DEPTH {
-                return Err(nesting_depth_error());
-            }
-            for v in list {
-                check_attribute_value_depth(v, next)?;
-            }
+            next >= MAX_ITEM_NESTING_DEPTH || list.iter().any(|v| wrappers_reach_limit(v, next))
         }
-        _ => {}
+        _ => false,
     }
-    Ok(())
 }
 
 fn nesting_depth_error() -> DynamoDbError {

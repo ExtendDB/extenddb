@@ -7,15 +7,15 @@ use std::collections::BTreeMap;
 
 use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
+use crate::validation::nests_beyond_item_limit;
 
 use super::ast::UpdateAction;
 use super::resolver::{ExpressionMaps, resolve_element_name};
 
-/// Most M or L wrappers an attribute value may have: 31 wrappers around a
-/// scalar is 32 levels, the service's limit.
-const MAX_WRAPPERS: usize = 31;
-
 /// Refuse an updated item whose SET or ADD targets now nest beyond the limit.
+///
+/// The limit is the item limit of `crate::validation`: 31 M or L wrappers
+/// around a scalar is 32 levels, the service's limit.
 ///
 /// Only the top-level attributes a SET or an ADD writes are checked, each
 /// once however many actions write into it. ADD is checked because it
@@ -48,31 +48,13 @@ pub(super) fn validate_written_nesting_depth(
         }
     }
     for name in &written {
-        if item
-            .get(name.as_ref())
-            .is_some_and(|v| wrappers_exceed(v, 0))
-        {
+        if item.get(name.as_ref()).is_some_and(nests_beyond_item_limit) {
             return Err(DynamoDbError::ValidationException(
                 "Nesting Levels have exceeded supported limits".to_owned(),
             ));
         }
     }
     Ok(())
-}
-
-/// Whether `value`, sitting under `above` wrappers, has more than
-/// [`MAX_WRAPPERS`] wrappers on any path down to a scalar.
-fn wrappers_exceed(value: &AttributeValue, above: usize) -> bool {
-    let here = above + 1;
-    match value {
-        AttributeValue::M(map) => {
-            here > MAX_WRAPPERS || map.values().any(|v| wrappers_exceed(v, here))
-        }
-        AttributeValue::L(list) => {
-            here > MAX_WRAPPERS || list.iter().any(|v| wrappers_exceed(v, here))
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
