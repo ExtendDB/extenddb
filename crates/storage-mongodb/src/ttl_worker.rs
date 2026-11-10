@@ -87,25 +87,14 @@ pub(crate) async fn stream_record_cleanup_worker(
 /// says the table has no indexes; an invalidated in-flight observation
 /// cannot publish that stale no-index result.
 ///
-/// Every `heartbeat_interval` the loop also runs the backup sweep
-/// ([`MongoEngine::sweep_stale_backup_claims`]), so a claim or restore target
-/// left by a process that died is removed within about
-/// `stale_after + heartbeat_interval + GSI_BACKFILL_INTERVAL` without a restart
-/// of this one. The sweep removes only state whose heartbeat stopped, so it is
-/// safe while other processes share the catalog. Returns once `shutdown`
-/// fires, at its next pause between cycles.
+/// A restore target whose load stopped before its hand-over is not this
+/// worker's: its job record keeps a stale heartbeat, and the backup
+/// reconciler acts on it, by its kind: a legacy (in-catalog) record is
+/// failed and its target removed; a store-backed (`manifest`) record is
+/// taken over and its load resumed, and the hand-over comes from the resume.
+/// Returns once `shutdown` fires, at its next pause between cycles.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
-    let mut last_backup_sweep = std::time::Instant::now();
     while sleep_or_shutdown(&shutdown, GSI_BACKFILL_INTERVAL).await {
-        if last_backup_sweep.elapsed() >= storage.backup_liveness.heartbeat_interval {
-            last_backup_sweep = std::time::Instant::now();
-            match storage.sweep_stale_backup_claims().await {
-                Ok(sweep) if sweep.is_empty() => {}
-                Ok(sweep) => tracing::warn!("periodic backup sweep: {sweep}"),
-                Err(e) => tracing::warn!("periodic backup sweep failed: {e}"),
-            }
-        }
-
         let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
         let cursor = match indexes_coll
             .find(doc! {
@@ -300,9 +289,11 @@ async fn restore_backfill_is_ready(
 }
 
 /// Complete restored tables after every restored GSI/LSI has been populated.
-/// The restore request records `restore_backfill_pending` only after the base
-/// `$out` copy succeeds, so this remains safe to retry after a process restart
-/// or a client disconnect during index backfill.
+/// `restore_backfill_pending` is set only once every base document is in
+/// place: by the legacy copy after its `$out` succeeds, and by a store-backed
+/// restore's `finish_restore` after its count check (`hand_over_to_backfill`),
+/// so this remains safe to retry after a process restart or a client
+/// disconnect during index backfill.
 async fn finish_ready_restores(storage: &MongoEngine) {
     let tables_coll = storage.catalog_db.collection::<Document>("tables");
     let mut cursor = match tables_coll

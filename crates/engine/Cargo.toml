@@ -7,10 +7,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["partiql"]
+# Kill-point pauses in the backup job (`EXTENDDB_BACKUP_PAUSE`), for the
+# binary-level crash tests; never enabled in a release build.
+backup-test-hooks = []
+# PartiQL surface (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction),
+# a pure translation over the existing data-plane handlers. Removable: with this
+# off, the three operations are not known and the server answers them with
+# UnknownOperationException exactly as before.
+partiql = ["extenddb-core/partiql"]
+
 [dependencies]
 extenddb-auth = { workspace = true }
 extenddb-core = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -21,3 +33,15 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 tokio = { workspace = true }
+# `TaskTracker` for the backup jobs the server drains at shutdown;
+# `StreamReader` and `SyncIoBridge` for the restore's in-place decode of a
+# store object on the blocking pool.
+tokio-util = { workspace = true, features = ["rt", "io", "io-util"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` for the tests of timers that must not depend on the wall clock.
+tokio = { workspace = true, features = ["test-util"] }
+# A storage engine for the tests that need an `OperationContext`.
+extenddb-storage-sqlite = { workspace = true }

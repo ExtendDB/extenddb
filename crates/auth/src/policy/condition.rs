@@ -8,8 +8,8 @@
 //! set operators ForAllValues/ForAnyValue with optional `IfExists` suffix.
 
 use super::context::ConditionContext;
-use super::document::{Condition, ConditionOperator};
-use super::matcher::wildcard_match;
+use super::document::{Condition, ConditionOperator, base_operator};
+use super::variables::{ConditionValue, arn_value_lacks_fields};
 
 /// Evaluate a single condition against a context.
 ///
@@ -33,7 +33,7 @@ use super::matcher::wildcard_match;
 /// - `ForAnyValue`: at least one context value must match some policy value.
 ///   Absent key is false (unless wrapped in `IfExists`).
 ///
-/// Policy variables in the values are read as in a `2012-10-17` document;
+/// Policy variables in the values are expanded as in a `2012-10-17` document;
 /// [`evaluate_condition_with`] takes the document's choice.
 pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext) -> bool {
     evaluate_condition_with(condition, true, context)
@@ -43,8 +43,10 @@ pub fn evaluate_condition(condition: &Condition, context: &impl ConditionContext
 /// `2012-10-17` when `version_2012` is true
 /// ([`super::document::PolicyDocument::expands_policy_variables`]).
 ///
-/// The value says how the text between `${` and `}` in a condition value is
-/// read ([`reads_iam_variable_syntax`]); `${key}` expands whatever it is.
+/// Only such a document expands policy variables in condition values, and in
+/// it only the string and ARN operators do ([`expands_variables`]). A
+/// `2008-10-17` document, or one with no `Version`, compares each value as
+/// written.
 pub fn evaluate_condition_with(
     condition: &Condition,
     version_2012: bool,
@@ -52,13 +54,17 @@ pub fn evaluate_condition_with(
 ) -> bool {
     let context_values = context.resolve_key(&condition.key);
     let is_multivalued = context.is_multivalued_key(&condition.key);
-    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
+    // Only the string and ARN operators expand policy variables (measured). A
+    // numeric value written as a variable is compared as written, and a `Bool`
+    // or `Null` value written as one is read as the boolean `false`
+    // (`bool_matches`, `null_holds`).
+    let expand_variables = expands_variables(&condition.operator, version_2012);
 
     // Expand policy variables (e.g. `${aws:PrincipalTag/Team}`) in condition values.
-    let expanded_values: Vec<String> = condition
+    let expanded_values: Vec<ConditionValue> = condition
         .values
         .iter()
-        .map(|v| expand_policy_variables(v, iam_syntax, context))
+        .map(|v| expand_policy_variables(v, expand_variables, context))
         .collect();
 
     match &condition.operator {
@@ -66,7 +72,8 @@ pub fn evaluate_condition_with(
             let key_absent = context_values.is_none();
             expanded_values
                 .first()
-                .is_some_and(|v| (v == "true" && key_absent) || (v == "false" && !key_absent))
+                .and_then(ConditionValue::text)
+                .is_some_and(|v| null_holds(v, key_absent))
         }
         ConditionOperator::ForAllValues(inner) => {
             let (_absent_passes, base_op) = unwrap_if_exists(inner);
@@ -189,28 +196,53 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that contains `${` and cannot
+    /// have the six fields of an ARN, which IAM refuses in a document of any
+    /// `Version`. The statement fails closed.
     Unresolvable,
 }
 
 /// Evaluate one condition three-valued.
 ///
 /// Returns [`ConditionMatch::Unresolvable`] when the key is unresolved and the
-/// context reports it as service-populated (case 3), and when a condition value
-/// reads such a key through a `${name}` policy variable, or through a
-/// `${name, 'default'}` one where [`reads_iam_variable_syntax`] holds, since
-/// the variable has no value to expand to and the service, which has one,
-/// would not use the default. Otherwise returns `Match` or `NoMatch` from the
-/// ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is as
-/// in [`evaluate_condition_with`].
+/// context reports it as service-populated (case 3), and, when the value is
+/// expanded ([`expands_variables`]: a `2012-10-17` document and a string or
+/// ARN operator), when a condition value reads such a key through a `${name}`
+/// or `${name, 'default'}` policy variable, since the variable has no value to
+/// expand to and the service, which has one, would not use the default. A
+/// value that also names a key the request does not carry, with no default,
+/// fails closed here although it matches nothing whatever the other key
+/// holds; a `Resource` pattern of that shape does not. Where the value is not
+/// expanded it is compared as written and reads no key. It also returns
+/// `Unresolvable`, whatever `version_2012` says, when a value of an `Arn*`
+/// operator, with or without a set qualifier or `IfExists`, contains `${` and
+/// has fewer than five `:` written outside its `${...}` references, such as
+/// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from
+/// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
+/// as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
     version_2012: bool,
     context: &impl ConditionContext,
 ) -> ConditionMatch {
-    let iam_syntax = reads_iam_variable_syntax(&condition.operator, version_2012);
     if is_unresolvable(&condition.key, context)
-        || reads_unresolvable_variable(condition, iam_syntax, context)
+        || (expands_variables(&condition.operator, version_2012)
+            && reads_unresolvable_variable(condition, context))
+    {
+        return ConditionMatch::Unresolvable;
+    }
+    // The IAM policy simulator refuses a policy with such an ARN value
+    // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
+    // IAM gives no decision to match. Failing closed makes a `Deny` apply and
+    // keeps an `Allow` from granting. IAM checks the value's fields whatever
+    // the document's `Version`, so the rule does not read `version_2012`.
+    if matches!(
+        base_operator(&condition.operator),
+        ConditionOperator::ArnEquals
+            | ConditionOperator::ArnNotEquals
+            | ConditionOperator::ArnLike
+            | ConditionOperator::ArnNotLike
+    ) && condition.values.iter().any(|v| arn_value_lacks_fields(v))
     {
         return ConditionMatch::Unresolvable;
     }
@@ -232,53 +264,34 @@ fn is_unresolvable(key: &str, context: &impl ConditionContext) -> bool {
 ///
 /// The names come from [`super::variables::variable_key_names`], which reads
 /// the text between the braces the way [`expand_policy_variables`] expands
-/// it with the same `iam_syntax`, so with it a default written beside such a
-/// key does not hide the key from this check.
-fn reads_unresolvable_variable(
-    condition: &Condition,
-    iam_syntax: bool,
-    context: &impl ConditionContext,
-) -> bool {
+/// it, so a default written beside such a key does not hide the key from this
+/// check. The caller asks only where the value is expanded
+/// ([`expands_variables`]).
+fn reads_unresolvable_variable(condition: &Condition, context: &impl ConditionContext) -> bool {
     condition.values.iter().any(|value| {
-        super::variables::variable_key_names(value, iam_syntax)
-            .any(|name| is_unresolvable(name, context))
+        super::variables::variable_key_names(value).any(|name| is_unresolvable(name, context))
     })
 }
 
 /// Whether the values of a condition under `operator`, in a document whose
-/// `Version` is `2012-10-17` when `version_2012` is true, are read with IAM's
-/// variable syntax: the `${key, 'default'}` form, and a key name trimmed of
-/// the code points up to U+0020.
+/// `Version` is `2012-10-17` when `version_2012` is true, expand policy
+/// variables: only in such a document, and only under the string and ARN
+/// operators ([`operator_expands_variables`]).
 ///
-/// IAM reads that syntax only in a `2012-10-17` document and under the string
-/// and ARN operators, with or without a set qualifier or `IfExists` (IAM
-/// policy simulator, 2026-11-03, two samples per row). In a `2008-10-17`
-/// document and in one with no `Version`, `${aws:username, 'x'}` is compared
-/// as written under `StringEquals` and `StringNotEquals`. In a `2012-10-17`
-/// document a default does not take part under `NumericEquals`,
-/// `DateGreaterThan`, `IpAddress`, `Bool` or `Null`, while it does under
-/// `StringEquals` and `ArnLike`. Elsewhere the text between the braces is the
-/// key name as written, which is how condition values were read before the
-/// default form: `${key}` still expands there, as it did.
-fn reads_iam_variable_syntax(operator: &ConditionOperator, version_2012: bool) -> bool {
-    version_2012 && operator_reads_variables(operator)
-}
-
-/// Whether `operator`, unwrapped from its set qualifier and `IfExists`, is a
-/// string or ARN operator.
-fn operator_reads_variables(operator: &ConditionOperator) -> bool {
-    match operator {
-        ConditionOperator::ForAllValues(inner)
-        | ConditionOperator::ForAnyValue(inner)
-        | ConditionOperator::IfExists(inner) => operator_reads_variables(inner),
-        ConditionOperator::StringEquals
-        | ConditionOperator::StringNotEquals
-        | ConditionOperator::StringEqualsIgnoreCase
-        | ConditionOperator::StringNotEqualsIgnoreCase
-        | ConditionOperator::StringLike
-        | ConditionOperator::StringNotLike => true,
-        other => is_arn_operator(other),
-    }
+/// IAM reads the `${key, 'default'}` form, and a key name trimmed of the code
+/// points up to U+0020, in the same places (IAM policy simulator, 2026-11-03,
+/// two samples per row): in a `2008-10-17` document and in one with no
+/// `Version`, `${aws:username, 'x'}` is compared as written under
+/// `StringEquals` and `StringNotEquals`, and in a `2012-10-17` document a
+/// default does not take part under `NumericEquals`, `DateGreaterThan`,
+/// `IpAddress`, `Bool` or `Null`, while it does under `StringEquals` and
+/// `ArnLike`. Where this is false the whole value is compared as written:
+/// `${key}` is not expanded either (measured, issue #534: `StringEquals`
+/// `${aws:username}` in a document with no `Version` matches the text and not
+/// the user name, and `NumericEquals` `${aws:PrincipalTag/age}` in a
+/// `2012-10-17` document does not match the tag's value).
+fn expands_variables(operator: &ConditionOperator, version_2012: bool) -> bool {
+    version_2012 && operator_expands_variables(operator)
 }
 
 /// Evaluate a statement's whole condition block (all conditions are ANDed).
@@ -311,29 +324,58 @@ pub fn evaluate_statement_conditions(
 
 /// Expand IAM policy variables in a string value.
 ///
-/// Replaces `${variable}` and `${variable, 'default'}` patterns with their
-/// resolved values from the context (see [`super::variables`]). Supported
+/// With `expand_variables`, replaces `${variable}` and `${variable, 'default'}`
+/// patterns with their resolved values from the context and `${*}`, `${?}` and
+/// `${$}` with the literal character (see [`super::variables`]). Supported
 /// variables: `aws:PrincipalTag/*` and any single-valued key the context can
-/// resolve. A variable whose key the request does not carry, with no default,
-/// stays literal, which gives IAM's answer except when the compared value
-/// holds the variable's text. A variable that names a multivalued key
-/// (`aws:TagKeys`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`) also stays
-/// literal: a set of values has no one value to expand to. IAM leaves such a
-/// variable as text (measured 2026-10-27: a Deny on `aws:ResourceTag/team`
-/// equal to `${aws:TagKeys}` applies to no request, whatever order the
-/// request lists its tag keys in, and the same Deny under `StringNotEquals`
-/// applies to every request). A variable naming a key the context reports
-/// unresolvable also stays literal here, with or without a default; the
-/// condition fails closed on it before this expansion is compared
-/// ([`evaluate_condition_match`]). Without `iam_syntax`
-/// ([`reads_iam_variable_syntax`]) the default form is not read, so
-/// `${key, 'default'}` stays literal too.
+/// resolve. A variable with no default whose key the request does not carry
+/// makes the value match nothing, and so does one that names a multivalued key
+/// (`aws:TagKeys`, `dynamodb:LeadingKeys`, `dynamodb:Attributes`) the request
+/// carries: a set of values has no one value to expand to. IAM gives such a
+/// variable no value (measured 2026-10-27: a Deny on `aws:ResourceTag/team`
+/// equal to `${aws:TagKeys}` applies to no request, whatever order the request
+/// lists its tag keys in, and the same Deny under `StringNotEquals` applies to
+/// every request; measured 2026-10-31: with `aws:TagKeys` holding two values,
+/// one value or none, `StringEquals` against `${aws:TagKeys}` is false even
+/// for a request value equal to that text). A variable naming a key the
+/// context reports unresolvable also makes the value match nothing here, with
+/// or without a default; the condition fails closed on it before this
+/// expansion is compared ([`evaluate_condition_match`]). See
+/// [`super::variables::expand_condition_value`]. Without `expand_variables`
+/// the value is compared as written.
 fn expand_policy_variables(
     value: &str,
-    iam_syntax: bool,
+    expand_variables: bool,
     context: &impl ConditionContext,
-) -> String {
-    super::variables::expand_condition_value(value, iam_syntax, context)
+) -> ConditionValue {
+    super::variables::expand_condition_value(value, expand_variables, context)
+}
+
+/// Whether `op` expands policy variables in its values: the string and ARN
+/// operators, with or without a set qualifier or `IfExists`.
+///
+/// IAM's condition operator reference lists policy variables as supported for
+/// the string, Boolean and ARN operators and not supported for the numeric,
+/// date, binary and IP address operators, and says a variable cannot be used
+/// with `Null`. The IAM policy simulator expands a variable for the string and
+/// ARN operators only: it compares a `NumericEquals` value written as a
+/// variable as written, and reads a `Bool` or `Null` one as the boolean `false`
+/// (`bool_matches`, `null_holds`), although IAM Access Analyzer reports those
+/// two as `INVALID_VARIABLE_FOR_OPERATOR`. The date and address operators are
+/// treated as the numeric ones; that is not measured.
+fn operator_expands_variables(op: &ConditionOperator) -> bool {
+    match op {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => operator_expands_variables(inner),
+        ConditionOperator::StringEquals
+        | ConditionOperator::StringNotEquals
+        | ConditionOperator::StringEqualsIgnoreCase
+        | ConditionOperator::StringNotEqualsIgnoreCase
+        | ConditionOperator::StringLike
+        | ConditionOperator::StringNotLike => true,
+        other => is_arn_operator(other),
+    }
 }
 
 /// Unwrap an `IfExists` wrapper if present.
@@ -365,7 +407,7 @@ fn unwrap_if_exists(op: &ConditionOperator) -> (bool, &ConditionOperator) {
 fn evaluate_single_value_condition(
     op: &ConditionOperator,
     context_values: &[&str],
-    policy_values: &[String],
+    policy_values: &[ConditionValue],
 ) -> bool {
     if is_negative_operator(op) {
         // Negative operators: context value must not match ANY policy value.
@@ -438,13 +480,35 @@ fn arn_operator_sees_non_arn(op: &ConditionOperator, context_values: &[&str]) ->
 
 /// Compare a single context value against a single policy value.
 ///
-/// Returns `true` if the comparison holds for the given operator.
+/// Returns `true` if the comparison holds for the given operator. An
+/// unresolved policy value ([`ConditionValue::Unresolved`]) matches nothing:
+/// a positive operator is false and a negative operator true, the answer an
+/// absent key gets (measured for `StringEquals` and `StringNotEquals`). The
+/// `Arn*` operators check the context value before that: one that is not an
+/// ARN matches none of the four, whatever the policy value.
 ///
 /// # Panics
 ///
 /// Does not panic. Returns `false` for set/wrapper operators that should
 /// have been handled by the caller.
-fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &str) -> bool {
+fn compare_single(op: &ConditionOperator, context_value: &str, value: &ConditionValue) -> bool {
+    // A context value that is not an ARN (fewer than six fields) matches
+    // neither the positive nor the negative Arn operators, so a Deny on
+    // ArnNotEquals does not apply to a malformed value; under `ForAnyValue:`
+    // `arn_operator_sees_non_arn` applies the same rule to the whole set
+    // before this per-value comparison. The non-ARN rule was measured for all
+    // four operators on 2026-10-28 with the values `notanarn` and
+    // `arn:aws:dynamodb` (PR #471), and on 2026-10-31 with a policy value whose
+    // variable has no value: `ArnNotLike` and `ArnNotEquals` on
+    // `.../table/${aws:PrincipalTag/team}` with no `team` tag hold for an ARN
+    // and not for `notanarn` (PR #541). So the check comes before the
+    // unresolved value's answer.
+    if is_arn_operator(op) && !super::matcher::is_arn(context_value) {
+        return false;
+    }
+    let Some(policy_value) = value.text() else {
+        return is_negative_operator(op);
+    };
     match op {
         ConditionOperator::StringEquals => context_value == policy_value,
         ConditionOperator::StringNotEquals => context_value != policy_value,
@@ -454,8 +518,8 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::StringNotEqualsIgnoreCase => {
             !context_value.eq_ignore_ascii_case(policy_value)
         }
-        ConditionOperator::StringLike => wildcard_match(policy_value, context_value),
-        ConditionOperator::StringNotLike => !wildcard_match(policy_value, context_value),
+        ConditionOperator::StringLike => value.wildcard_matches(context_value),
+        ConditionOperator::StringNotLike => !value.wildcard_matches(context_value),
         ConditionOperator::NumericEquals => parse_f64_cmp(context_value, policy_value, f64::eq),
         ConditionOperator::NumericNotEquals => {
             parse_f64_cmp(context_value, policy_value, |a, b| a != b)
@@ -486,29 +550,23 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         ConditionOperator::DateGreaterThanEquals => {
             compare_dates(context_value, policy_value, |a, b| a >= b)
         }
-        ConditionOperator::Bool => context_value.eq_ignore_ascii_case(policy_value),
+        ConditionOperator::Bool => bool_matches(context_value, policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
-        // as ArnNotLike, with the matcher in `arn_value::arn_condition_match`:
-        // `*` and `?` match in every field, matching is case sensitive, a
-        // pattern of two to five fields starting `arn` compares only the
-        // fields it has, and a one-field pattern (bare `*` included) matches
-        // nothing, so the negative operators hold for it. Measured on a live
-        // role session on 2026-10-30 (issue #665).
-        // A context value that is not an ARN (fewer than six fields) matches
-        // neither the positive nor the negative operator, so a Deny on
-        // ArnNotEquals does not apply to a malformed value; under
-        // `ForAnyValue:` `arn_operator_sees_non_arn` applies the same rule to
-        // the whole set before this per-value comparison. The rows measured
-        // with simulate-custom-policy are in the description of PR #471; the
-        // non-ARN rule was measured for all four operators on 2026-10-28 with
-        // the values `notanarn` and `arn:aws:dynamodb`.
+        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
+        // case sensitive, and both sides need the same number of fields,
+        // except that a bare `*` pattern matches any six-field value
+        // (`arn_match` returns before it compares fields; derived, since the
+        // simulator refuses `*` against an ARN). The rows measured with
+        // simulate-custom-policy are in the description of PR #471. The
+        // context value is an ARN here (checked above). The pattern is the
+        // expanded value with the wildcards the policy wrote, so a `*` or `?`
+        // that came from a variable value, a default or an escape is matched
+        // literally (`ConditionValue::arn_matches`).
         ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
-            super::matcher::is_arn(context_value)
-                && super::arn_value::arn_condition_match(policy_value, context_value)
+            value.arn_matches(context_value)
         }
         ConditionOperator::ArnNotEquals | ConditionOperator::ArnNotLike => {
-            super::matcher::is_arn(context_value)
-                && !super::arn_value::arn_condition_match(policy_value, context_value)
+            !value.arn_matches(context_value)
         }
         // IpAddress matches only when the caller address and the policy range
         // are the same family and the address is in the range. NotIpAddress
@@ -524,6 +582,41 @@ fn compare_single(op: &ConditionOperator, context_value: &str, policy_value: &st
         // Null, ForAllValues, ForAnyValue, IfExists handled by caller
         _ => false,
     }
+}
+
+/// Whether `Null` with the policy value `policy_value` holds: `true` means the
+/// key must be absent and `false` that it must be present, and any other text
+/// matches nothing. `Null` does not expand a policy variable. IAM reads a value
+/// written as one as a boolean, `false` unless the text is `true` ignoring
+/// case, so the key must be present whatever the variable's value or default
+/// (measured with the IAM policy simulator, cells N1a to N1f). The cells are
+/// `2012-10-17` documents; a `2008-10-17` or no-`Version` document is read the
+/// same way, since IAM reads the text without expanding it whatever the
+/// `Version` (not measured).
+fn null_holds(policy_value: &str, key_absent: bool) -> bool {
+    if policy_value.contains("${") {
+        // A text that contains `${` is never `true`, so it reads as `false`:
+        // the key must be present.
+        return !key_absent;
+    }
+    (policy_value == "true" && key_absent) || (policy_value == "false" && !key_absent)
+}
+
+/// Whether `Bool` with the policy value `policy_value` matches the request
+/// value: the two texts are equal ignoring case. `Bool` does not expand a
+/// policy variable. IAM reads a value written as one as a boolean, `false`
+/// unless the text is `true` ignoring case, so it matches a request value that
+/// is not `true` whatever the variable's value (measured with the IAM policy
+/// simulator, cells N2a to N2e). The cells are `2012-10-17` documents; a
+/// `2008-10-17` or no-`Version` document is read the same way, since IAM reads
+/// the text without expanding it whatever the `Version` (not measured).
+fn bool_matches(context_value: &str, policy_value: &str) -> bool {
+    if policy_value.contains("${") {
+        // A text that contains `${` is never `true`, so it reads as `false`
+        // and matches a request value that is not `true`.
+        return !context_value.eq_ignore_ascii_case("true");
+    }
+    context_value.eq_ignore_ascii_case(policy_value)
 }
 
 /// Parse two strings as f64 and compare them.

@@ -2,12 +2,104 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Backup and restore integration tests — mirrors Java `BackupRestoreTests`.
+//!
+//! The service creates a backup asynchronously; so does ExtendDB with a
+//! configured `[backup.store]` (CreateBackup answers CREATING and a job
+//! uploads it). A backup still CREATING refuses DeleteBackup
+//! (`BackupInUseException`) and restore, so every test that goes on to
+//! describe, delete or restore a backup it just created waits for AVAILABLE
+//! first ([`wait_for_backup_available`]), and deletes the backups it made so
+//! the server's store does not keep them. Where a backup lives decides what
+//! RestoreTableFromBackup answers this release; the tests read it from
+//! `EXTENDDB_TEST_BACKUP_STORE` ([`backup_store`]), as the Python suite does.
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, PointInTimeRecoverySpecification,
     ScalarAttributeType,
 };
+use aws_sdk_dynamodb::Client;
+use std::time::{Duration, Instant};
+
+/// Where the server under test writes its backups, from
+/// `EXTENDDB_TEST_BACKUP_STORE`: `filesystem` or `s3` (a configured
+/// `[backup.store]`, under which a backup is in the store and the restore
+/// job restores it) or `none` (the in-catalog create, which the legacy
+/// reader restores). Against the service the variable is
+/// not read (the restore runs). Against ExtendDB a test whose outcome depends
+/// on it fails when it is unset, with the text the Python fixture prints,
+/// rather than accept either outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupStore {
+    Filesystem,
+    S3,
+    None,
+}
+
+pub fn backup_store() -> BackupStore {
+    const VALUES: [&str; 3] = ["filesystem", "s3", "none"];
+    if is_real_dynamodb() {
+        return BackupStore::None;
+    }
+    let raw = std::env::var("EXTENDDB_TEST_BACKUP_STORE").unwrap_or_default();
+    match raw.trim() {
+        "filesystem" => BackupStore::Filesystem,
+        "s3" => BackupStore::S3,
+        "none" => BackupStore::None,
+        "" => panic!(
+            "EXTENDDB_TEST_BACKUP_STORE is unset; set it to one of {VALUES:?} to say where the \
+             server under test writes its backups"
+        ),
+        other => panic!(
+            "EXTENDDB_TEST_BACKUP_STORE is {other:?}; set it to one of {VALUES:?} to say where \
+             the server under test writes its backups"
+        ),
+    }
+}
+
+/// Poll DescribeBackup until the backup is AVAILABLE. Any other status than
+/// CREATING is a failure: a backup that fails is BackupNotFound, never
+/// FAILED, on the wire, so the describe itself errors then.
+pub async fn wait_for_backup_available(c: &Client, arn: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let resp = c
+            .describe_backup()
+            .backup_arn(arn)
+            .send()
+            .await
+            .unwrap_or_else(|e| {
+                panic!("describe_backup of {arn} while waiting for AVAILABLE: {e:?}")
+            });
+        let status = resp
+            .backup_description()
+            .and_then(|b| b.backup_details())
+            .map(|d| d.backup_status().as_str().to_owned())
+            .unwrap_or_default();
+        if status == "AVAILABLE" {
+            return;
+        }
+        assert_eq!(status, "CREATING", "backup {arn} is {status}");
+        assert!(
+            Instant::now() < deadline,
+            "backup {arn} not AVAILABLE in time"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// CreateBackup, then wait for AVAILABLE; the backup's ARN.
+pub async fn create_available_backup(c: &Client, table: &str, backup_name: &str) -> String {
+    let create = create_backup_with_retry(c, table, backup_name).await;
+    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    wait_for_backup_available(c, &arn).await;
+    arn
+}
+
+/// DeleteBackup after the test; a backup already gone is not a failure.
+pub async fn delete_backup_quietly(c: &Client, arn: &str) {
+    c.delete_backup().backup_arn(arn).send().await.ok();
+}
 
 async fn make_table(name: &str) {
     let c = client();
@@ -71,8 +163,27 @@ async fn create_backup_happy_case() {
     let resp = create_backup_with_retry(c, &table, "test-backup-1").await;
     let details = resp.backup_details().unwrap();
     assert!(!details.backup_arn().is_empty());
-    assert_eq!(details.backup_status().as_str(), "AVAILABLE");
+    // The in-catalog create answers AVAILABLE; the service and a store-backed
+    // ExtendDB answer CREATING and the backup reaches AVAILABLE later.
+    let status = details.backup_status().as_str();
+    assert!(
+        status == "AVAILABLE" || status == "CREATING",
+        "CreateBackup answered {status}"
+    );
+    let arn = details.backup_arn().to_string();
+    wait_for_backup_available(c, &arn).await;
+    let desc = c.describe_backup().backup_arn(&arn).send().await.unwrap();
+    assert_eq!(
+        desc.backup_description()
+            .unwrap()
+            .backup_details()
+            .unwrap()
+            .backup_status()
+            .as_str(),
+        "AVAILABLE"
+    );
 
+    delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&table).send().await.ok();
 }
 
@@ -101,13 +212,13 @@ async fn describe_backup() {
     let table = format!("DescBackup_{}", ts());
     make_table(&table).await;
 
-    let create = create_backup_with_retry(c, &table, "desc-backup").await;
-    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    let arn = create_available_backup(c, &table, "desc-backup").await;
 
     let resp = c.describe_backup().backup_arn(&arn).send().await.unwrap();
     let desc = resp.backup_description().unwrap();
     assert_eq!(desc.backup_details().unwrap().backup_arn(), arn.as_str());
 
+    delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&table).send().await.ok();
 }
 
@@ -129,12 +240,14 @@ async fn list_backups() {
     let table = format!("ListBackup_{}", ts());
     make_table(&table).await;
 
-    create_backup_with_retry(c, &table, "list-1").await;
-    create_backup_with_retry(c, &table, "list-2").await;
+    let first = create_available_backup(c, &table, "list-1").await;
+    let second = create_available_backup(c, &table, "list-2").await;
 
     let resp = c.list_backups().table_name(&table).send().await.unwrap();
     assert!(resp.backup_summaries().len() >= 2);
 
+    delete_backup_quietly(c, &first).await;
+    delete_backup_quietly(c, &second).await;
     c.delete_table().table_name(&table).send().await.ok();
 }
 
@@ -156,8 +269,7 @@ async fn delete_backup() {
     let table = format!("DelBackup_{}", ts());
     make_table(&table).await;
 
-    let create = create_backup_with_retry(c, &table, "del-backup").await;
-    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    let arn = create_available_backup(c, &table, "del-backup").await;
 
     let resp = c.delete_backup().backup_arn(&arn).send().await.unwrap();
     let desc = resp.backup_description().unwrap();
@@ -185,31 +297,50 @@ async fn restore_table_from_backup() {
             .unwrap();
     }
 
-    let create = create_backup_with_retry(c, &table, "restore-backup").await;
-    let arn = create.backup_details().unwrap().backup_arn().to_string();
+    let arn = create_available_backup(c, &table, "restore-backup").await;
 
     let restored = format!("Restored_{}", ts());
-    let resp = c
+    let restore = c
         .restore_table_from_backup()
         .target_table_name(&restored)
         .backup_arn(&arn)
         .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.table_description()
-            .unwrap()
-            .table_status()
-            .unwrap()
-            .as_str(),
-        "CREATING"
-    );
+        .await;
+    // The round trip on either path: a backup in the configured store is
+    // restored by the restore job, an in-catalog one by the legacy reader.
+    let resp = restore.unwrap();
+    let desc = resp.table_description().unwrap();
+    assert_eq!(desc.table_status().unwrap().as_str(), "CREATING");
+    let summary = desc
+        .restore_summary()
+        .expect("a CREATING restore target carries its RestoreSummary");
+    assert_eq!(summary.source_backup_arn(), Some(arn.as_str()));
+    assert!(summary.restore_in_progress());
 
     wait_for_active(c, &restored).await;
     let scan = c.scan().table_name(&restored).send().await.unwrap();
     assert_eq!(scan.count(), 5);
-
+    let after = c
+        .describe_table()
+        .table_name(&restored)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        after.table().unwrap().restore_summary().is_none(),
+        "RestoreSummary is reported only while CREATING"
+    );
+    println!(
+        "restore of a {} backup completed with {} items",
+        match backup_store() {
+            BackupStore::Filesystem | BackupStore::S3 => "store-backed",
+            BackupStore::None => "in-catalog",
+        },
+        scan.count()
+    );
     c.delete_table().table_name(&restored).send().await.ok();
+
+    delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&table).send().await.ok();
 }
 
