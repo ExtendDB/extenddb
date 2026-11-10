@@ -11,15 +11,23 @@ IdempotentParameterMismatchException with the message
     Specified idempotent token was used with different request parameters
     within the idempotency window
 
-A replay with matching fields answers 200 and reports the replay as a
-transactional read (ReadCapacityUnits, no WriteCapacityUnits) when
-ReturnConsumedCapacity asks for capacity, and carries no
-ItemCollectionMetrics. An invalid enum value on the replay is refused by
-validation before the token is compared.
+On a table without a local secondary index, a replay with matching
+fields answers 200 and reports the replay as a transactional read
+(ReadCapacityUnits, no WriteCapacityUnits) when ReturnConsumedCapacity
+asks for capacity, and carries no ItemCollectionMetrics. An invalid enum
+value on the replay is refused by validation before the token is
+compared.
 
-Every expected answer here was measured against Amazon DynamoDB in
-us-east-1 on 2026-10-24 (17:31 UTC and 17:36 UTC), client retries off.
-The tests run against both Amazon DynamoDB and ExtendDB.
+The expected answers were measured against Amazon DynamoDB in us-east-1,
+client retries off, on 2026-10-24 (17:31 UTC and 17:36 UTC), except as
+follows. The answers and reads of
+test_changed_items_with_the_same_return_field_is_a_mismatch were
+measured on 2026-11-10, two sends for each parameter. Two other tests
+read the changed key back and expect no item. The read in
+test_changed_items_and_return_field_is_a_mismatch was measured on
+2026-10-24. The read in test_changed_items_alone_is_a_mismatch was
+measured on 2026-11-10, two sends. The tests run against both Amazon
+DynamoDB and ExtendDB.
 """
 
 from __future__ import annotations
@@ -67,7 +75,8 @@ def _items(table: str, pk: str) -> list[dict]:
 
 
 def _fresh() -> tuple[str, str]:
-    return f"tok-{uuid.uuid4().hex}", uuid.uuid4().hex[:32]
+    """Return a new (pk, token) pair."""
+    return uuid.uuid4().hex[:32], f"tok-{uuid.uuid4().hex}"
 
 
 def _call(client, table: str, pk: str, token: str, **extra) -> dict:
@@ -144,6 +153,29 @@ def test_changed_items_alone_is_a_mismatch(dynamodb_client, table):
     with pytest.raises(ClientError) as exc:
         _call(dynamodb_client, table, pk + "-b", token)
     _assert_mismatch(exc)
+    assert "Item" not in dynamodb_client.get_item(
+        TableName=table, Key={"pk": {"S": pk + "-b"}}, ConsistentRead=True
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({"ReturnConsumedCapacity": "TOTAL"}, id="rcc-total"),
+        pytest.param({"ReturnItemCollectionMetrics": "SIZE"}, id="ricm-size"),
+    ],
+)
+def test_changed_items_with_the_same_return_field_is_a_mismatch(
+    dynamodb_client, table, fields
+):
+    pk, token = _fresh()
+    _call(dynamodb_client, table, pk, token, **fields)
+    with pytest.raises(ClientError) as exc:
+        _call(dynamodb_client, table, pk + "-b", token, **fields)
+    _assert_mismatch(exc)
+    assert "Item" not in dynamodb_client.get_item(
+        TableName=table, Key={"pk": {"S": pk + "-b"}}, ConsistentRead=True
+    )
 
 
 # ---------------------------------------------------------------------------
