@@ -207,8 +207,10 @@ def test_transact_update_up_to_the_limit_is_applied(dynamodb_client, table):
 
 # The tests below that expect the size answer run on SQLite and PostgreSQL. The
 # MongoDB layer applies no item size limit on updates, and the Cassandra layer
-# sizes every update by the updated item with other wording, both documented in
-# docs/differences-from-dynamodb.md. With the backend unset (a run against the
+# sizes every update by the updated item, both documented in
+# docs/differences-from-dynamodb.md. The Cassandra refusal is worded "Item size
+# has exceeded the maximum allowed size" (validate_item_size in
+# crates/core/src/validation/mod.rs). With the backend unset (a run against the
 # service), they run.
 SIZED_UPDATES = pytest.mark.skipif(
     os.environ.get("EXTENDDB_TEST_BACKEND", "") in {"mongodb", "cassandra"},

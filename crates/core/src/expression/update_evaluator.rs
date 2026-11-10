@@ -87,6 +87,10 @@ pub(crate) fn apply_update(
 /// not reject an unrelated update to an item carrying a pre-existing invalid
 /// value (measured 2026-08-14), and whole-image validation would make items
 /// the backfill deliberately skipped permanently un-updatable.
+///
+/// Returns `ValidationException` `Nesting Levels have exceeded supported
+/// limits` when an attribute that a `SET` or an `ADD` writes nests past the
+/// limit, before the vector check.
 pub fn apply_update_validated(
     actions: &[UpdateAction],
     item: &mut BTreeMap<String, AttributeValue>,
@@ -115,10 +119,14 @@ pub fn apply_update_validated(
 /// within the limit and whose result nests too deep gets the depth refusal,
 /// even when the updated item is over the limit. Only these orders are
 /// measured, so the statement is sized ahead of the depth check only when that
-/// check refuses. The vector check keeps its place after the depth check and
-/// ahead of the size check. An update from a PartiQL `UPDATE` and the legacy
-/// `AttributeUpdates` form are not sized by their statement, and their checks
-/// run in the order of [`apply_update_validated`].
+/// check refuses. The order of the depth check against the vector check is not
+/// measured, and the vector check keeps its place after the depth check and
+/// ahead of the size check. A PartiQL `UPDATE` (`maps.finished_item_sizing`)
+/// is sized by its updated item alone. The figure of the legacy
+/// `AttributeUpdates` form (`maps.legacy_attribute_updates`) is computed from
+/// the finished values of the attributes it names. The statement check does
+/// not apply to either form, so their checks run in the order of
+/// [`apply_update_validated`].
 ///
 /// # Errors
 ///

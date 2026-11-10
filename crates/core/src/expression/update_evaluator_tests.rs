@@ -766,10 +766,12 @@ mod update_item_sizing {
     }
 
     #[test]
-    fn a_form_not_sized_by_its_statement_keeps_the_depth_refusal() {
-        // A PartiQL UPDATE and the legacy AttributeUpdates form: the statement
-        // is over the limit, and the answer is the one apply_update_validated
-        // gives.
+    fn a_partiql_or_legacy_update_keeps_the_depth_refusal() {
+        // A PartiQL UPDATE is sized by its updated item alone, and the figure
+        // of the legacy AttributeUpdates form is computed from the finished
+        // values of the attributes it names, so the statement check does not
+        // apply to either. The expression's statement figure is over the
+        // limit, and the answer is the one apply_update_validated gives.
         for partiql in [true, false] {
             let (actions, mut maps) = update(409_500, 30, false);
             maps.finished_item_sizing = partiql;

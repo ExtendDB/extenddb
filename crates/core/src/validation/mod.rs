@@ -2318,10 +2318,11 @@ pub fn validate_update_item_size(
 }
 
 /// The statement half of [`validate_update_item_size`], for a standalone
-/// `UpdateItem` written as an expression. An update from a PartiQL `UPDATE`
-/// (`maps.finished_item_sizing`) and the legacy `AttributeUpdates` form
-/// (`maps.legacy_attribute_updates`) are not sized by their statement, and
-/// pass here.
+/// `UpdateItem` written as an expression. It passes an update from a PartiQL
+/// `UPDATE` (`maps.finished_item_sizing`), which is sized by its updated item
+/// alone. It also passes the legacy `AttributeUpdates` form
+/// (`maps.legacy_attribute_updates`), whose figure is computed from the
+/// finished values of the attributes it names.
 ///
 /// # Errors
 ///
