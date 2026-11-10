@@ -129,11 +129,29 @@ pub fn check_config_permissions(config_path: &str) -> anyhow::Result<()> {
 /// warnings to the same stream.
 const TLS_KEY: &str = "TLS private key (server.tls.key_path)";
 
-/// The last sentence of each key warning: a key that was readable may already
-/// have been copied.
+/// The last sentence of the warning for a key that was narrowed: while it was
+/// readable it may have been copied.
 const TLS_KEY_ROTATE: &str = "Other users could read it while its mode was wider; if that \
      matters, replace the key and certificate (see \"TLS private key readable by other users\" \
      in docs/troubleshooting.md).";
+
+/// The last sentence of the warnings for a key whose mode did not change: it
+/// stays readable, and a key replaced before its mode is fixed lands at the
+/// same mode.
+const TLS_KEY_STILL_OPEN: &str = "Other users can read it until its mode is fixed; after \
+     that, replace the key and certificate, since it may already have been copied (see \"TLS \
+     private key readable by other users\" in docs/troubleshooting.md).";
+
+/// A key another user owns, as the advice for it needs it.
+#[derive(Debug, Clone, Copy)]
+struct OtherOwner {
+    uid: u32,
+    /// The key's group.
+    gid: u32,
+    /// Whether this process is in the key's group, so that removing other
+    /// access keeps its own.
+    server_in_group: bool,
+}
 
 /// [`narrow_tls_key_permissions`] on the key a server with this TLS section
 /// loads: `None` without a look at the key when the server loads none (TLS
@@ -179,7 +197,11 @@ pub fn narrow_tls_key_permissions(key_path: &str) -> Option<String> {
         }
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        let other_owner = (meta.uid() != euid).then_some(meta.uid());
+        let other_owner = (meta.uid() != euid).then(|| OtherOwner {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            server_in_group: process_in_group(meta.gid()),
+        });
         if other_owner.is_some() && mode & 0o007 == 0 {
             return None;
         }
@@ -191,7 +213,7 @@ pub fn narrow_tls_key_permissions(key_path: &str) -> Option<String> {
                         .ok()
                         .map(|m| m.permissions().mode() & 0o777),
                 ),
-                Err(e) => failed_warning(mode, other_owner, &e),
+                Err(e) => failed_warning(mode, other_owner, server_gid(), &e),
             },
         )
     }
@@ -217,43 +239,93 @@ fn narrowed_warning(before: u32, after: Option<u32>) -> String {
             "WARNING: {TLS_KEY} has permissions {before:04o}, which let other users read it. \
              Setting it to 0600 was accepted but did not take effect (its mode is now {}), so \
              its filesystem does not keep file modes. Keep the key on a filesystem that does, \
-             or mount it with an owner-only mode. {TLS_KEY_ROTATE}",
+             or mount it with an owner-only mode. {TLS_KEY_STILL_OPEN}",
             after.map_or_else(|| "unknown".to_owned(), |m| format!("{m:04o}"))
         ),
     }
 }
 
 /// The warning when the mode change failed with `error`, with the fix for its
-/// cause. `other_owner` is the key's owner when another user owns it.
-fn failed_warning(mode: u32, other_owner: Option<u32>, error: &std::io::Error) -> String {
+/// cause. `other_owner` is set when another user owns the key; `server_gid`
+/// is this process's effective group.
+fn failed_warning(
+    mode: u32,
+    other_owner: Option<OtherOwner>,
+    server_gid: u32,
+    error: &std::io::Error,
+) -> String {
     if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        // A Secret volume's files are root's unless the pod sets `fsGroup`,
+        // and the image runs as uid 10001, so 0400 would lock the server out.
         return format!(
             "WARNING: {TLS_KEY} has permissions {mode:04o}, which let other users read it, and \
              it is on a read-only filesystem, so its mode cannot be changed here. Set the mode \
-             where the file is provided, for example `defaultMode: 0400` on a Kubernetes Secret \
-             volume. {TLS_KEY_ROTATE}"
+             where the file is provided, for example `defaultMode: 0440` on a Kubernetes Secret \
+             volume with the pod's `fsGroup` set to this server's group (gid {server_gid}). \
+             {TLS_KEY_STILL_OPEN}"
         );
     }
-    if let Some(uid) = other_owner {
+    if let Some(owner) = other_owner {
+        let OtherOwner { uid, gid, .. } = owner;
+        if owner.server_in_group {
+            return format!(
+                "WARNING: {TLS_KEY} has permissions {mode:04o}, which let every user read it. \
+                 Another user (uid {uid}) owns it, so this server cannot change its mode. Ask \
+                 its owner to remove other access with `chmod o-rwx` on the file; this server \
+                 reads it through its group (gid {gid}), which keeps that access. \
+                 {TLS_KEY_STILL_OPEN}"
+            );
+        }
         return format!(
-            "WARNING: {TLS_KEY} has permissions {mode:04o}, which let every user read it. Another \
-             user (uid {uid}) owns it, so this server cannot change its mode. Ask its owner to \
-             remove other access with `chmod o-rwx` on the file; group access, which this server \
-             may read it through, can stay. {TLS_KEY_ROTATE}"
+            "WARNING: {TLS_KEY} has permissions {mode:04o}, which let every user read it. \
+             Another user (uid {uid}) owns it, so this server cannot change its mode, and this \
+             server is not in its group (gid {gid}): it reads the key through the access every \
+             user has, so removing that alone would stop it reading the key. Ask its owner to \
+             give the key to this server's group and then remove other access: \
+             `chgrp {server_gid}` and then `chmod 640` on the file. {TLS_KEY_STILL_OPEN}"
         );
     }
     format!(
         "WARNING: {TLS_KEY} has permissions {mode:04o}, which let other users read it, and \
          setting it to 0600 failed: {error}. Fix it with `chmod 600` on the file. \
-         {TLS_KEY_ROTATE}"
+         {TLS_KEY_STILL_OPEN}"
     )
+}
+
+/// This process's effective group.
+#[cfg(unix)]
+fn server_gid() -> u32 {
+    // SAFETY: getegid has no preconditions and cannot fail.
+    unsafe { libc::getegid() }
+}
+
+/// Whether `gid` is this process's effective group or one of its
+/// supplementary groups: the groups whose bits decide its access to a file.
+#[cfg(unix)]
+fn process_in_group(gid: u32) -> bool {
+    if gid == server_gid() {
+        return true;
+    }
+    // SAFETY: a zero-length call writes nothing and returns the count.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let Ok(len) = usize::try_from(count) else {
+        return false;
+    };
+    let mut groups: Vec<libc::gid_t> = vec![0; len];
+    // SAFETY: `groups` has room for `count` entries.
+    let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    let Ok(filled) = usize::try_from(filled) else {
+        return false;
+    };
+    groups.truncate(filled);
+    groups.contains(&gid)
 }
 
 #[cfg(all(test, unix))]
 mod tls_key_permission_tests {
     use super::{
-        TLS_KEY, TLS_KEY_ROTATE, failed_warning, narrow_served_tls_key, narrow_tls_key_permissions,
-        narrowed_warning,
+        OtherOwner, TLS_KEY, TLS_KEY_ROTATE, TLS_KEY_STILL_OPEN, failed_warning,
+        narrow_served_tls_key, narrow_tls_key_permissions, narrowed_warning, process_in_group,
     };
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -392,24 +464,33 @@ mod tls_key_permission_tests {
         })
     }
 
-    /// A key another user owns that every user can read gets the advice to
-    /// remove other access only, not `chmod 600`, which would take the
-    /// group's access away. Its mode stays as it was. `/etc/hosts` stands in
-    /// for such a key: it is root's and 0644 on Linux and macOS.
+    /// A key another user owns that every user can read gets advice that keeps
+    /// this server's access: `chmod o-rwx` when the server is in the key's
+    /// group, and `chgrp` then `chmod 640` when it reads the key through the
+    /// other bits. Never `chmod 600`. Its mode stays as it was. `/etc/hosts`
+    /// stands in for such a key: it is root's and 0644 on Linux and macOS.
     #[test]
-    fn a_world_readable_key_of_another_user_gets_the_owner_advice() {
+    fn a_world_readable_key_of_another_user_gets_advice_that_keeps_access() {
         let Some(path) = file_of_another_user(&["/etc/hosts"], |m| m & 0o004 != 0) else {
             eprintln!("skipped: no world-readable file of another user");
             return;
         };
+        let meta = std::fs::metadata(&path).expect("metadata");
         let before = mode(std::path::Path::new(&path));
 
         let warning = narrow_tls_key_permissions(&path).expect("a warning");
 
         assert!(warning.contains("Another user (uid "), "{warning}");
-        assert!(warning.contains("`chmod o-rwx`"), "{warning}");
+        if process_in_group(meta.gid()) {
+            assert!(warning.contains("`chmod o-rwx`"), "{warning}");
+        } else {
+            assert!(warning.contains("`chmod 640`"), "{warning}");
+            assert!(warning.contains("`chgrp "), "{warning}");
+            assert!(!warning.contains("chmod o-rwx"), "{warning}");
+        }
         assert!(!warning.contains("chmod 600"), "{warning}");
         assert!(!warning.contains(&path), "{warning}");
+        assert!(warning.ends_with(TLS_KEY_STILL_OPEN), "{warning}");
         assert_eq!(mode(std::path::Path::new(&path)), before);
     }
 
@@ -441,38 +522,85 @@ mod tls_key_permission_tests {
             "{warning}"
         );
         assert!(!warning.contains("It is now 0600"), "{warning}");
+        assert!(warning.ends_with(TLS_KEY_STILL_OPEN), "{warning}");
         assert!(narrowed_warning(0o644, None).contains("its mode is now unknown"));
+        assert!(narrowed_warning(0o644, Some(0o600)).ends_with(TLS_KEY_ROTATE));
     }
 
-    /// The advice follows the cause of a failed change: a read-only mount gets
-    /// the mount-time fix, another owner the owner's fix, and anything else
-    /// `chmod 600`.
+    /// The group check counts the effective group and every supplementary
+    /// group, and no other.
+    #[test]
+    fn the_group_check_knows_this_processes_groups() {
+        // SAFETY: getegid has no preconditions and cannot fail.
+        let egid = unsafe { libc::getegid() };
+        assert!(process_in_group(egid));
+        // SAFETY: a zero-length call writes nothing and returns the count.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups: Vec<libc::gid_t> = vec![0; usize::try_from(count).expect("count")];
+        // SAFETY: `groups` has room for `count` entries.
+        let filled = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(filled).expect("filled"));
+        for gid in &groups {
+            assert!(process_in_group(*gid), "gid {gid}");
+        }
+        let outside = (1..u32::MAX)
+            .rev()
+            .find(|gid| *gid != egid && !groups.contains(gid))
+            .expect("a gid this process is not in");
+        assert!(!process_in_group(outside), "gid {outside}");
+    }
+
+    /// The advice follows the cause of a failed change, and keeps the
+    /// server's access to the key: a read-only mount gets `defaultMode: 0440`
+    /// with `fsGroup` (0400 would leave a root-owned Secret file unreadable to
+    /// the server), another owner gets `chmod o-rwx` when the server is in the
+    /// key's group and `chgrp` then `chmod 640` when it is not, and anything
+    /// else `chmod 600`. None of them says the key was readable only in the
+    /// past.
     #[test]
     fn a_failed_change_gets_the_fix_for_its_cause() {
         let read_only = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let in_group = OtherOwner {
+            uid: 0,
+            gid: 7,
+            server_in_group: true,
+        };
+        let outside = OtherOwner {
+            server_in_group: false,
+            ..in_group
+        };
 
-        let warning = failed_warning(0o644, None, &read_only);
-        assert!(warning.contains("read-only filesystem"), "{warning}");
-        assert!(warning.contains("`defaultMode: 0400`"), "{warning}");
-        assert!(!warning.contains("chmod"), "{warning}");
+        let warning = failed_warning(0o644, None, 10001, &read_only);
+        assert!(warning.contains("read-only filesystem"));
+        assert!(warning.contains("`defaultMode: 0440`"));
+        assert!(warning.contains("`fsGroup` set to this server's group (gid 10001)"));
+        assert!(!warning.contains("0400"));
+        assert!(!warning.contains("chmod"));
 
-        let warning = failed_warning(0o644, Some(0), &denied);
-        assert!(warning.contains("Another user (uid 0)"), "{warning}");
-        assert!(!warning.contains("chmod 600"), "{warning}");
+        let warning = failed_warning(0o644, Some(in_group), 10001, &denied);
+        assert!(warning.contains("`chmod o-rwx`"));
+        assert!(warning.contains("through its group (gid 7)"));
+        assert!(!warning.contains("chmod 600"));
 
-        let warning = failed_warning(0o644, None, &denied);
-        assert!(
-            warning.contains("Fix it with `chmod 600` on the file."),
-            "{warning}"
-        );
+        let warning = failed_warning(0o644, Some(outside), 10001, &denied);
+        assert!(warning.contains("not in its group (gid 7)"));
+        assert!(warning.contains("`chgrp 10001` and then `chmod 640`"));
+        assert!(!warning.contains("chmod o-rwx"));
+        assert!(!warning.contains("chmod 600"));
+
+        let warning = failed_warning(0o644, None, 10001, &denied);
+        assert!(warning.contains("Fix it with `chmod 600` on the file."));
+
         for warning in [
-            failed_warning(0o644, None, &read_only),
-            failed_warning(0o644, Some(0), &denied),
-            failed_warning(0o644, None, &denied),
+            failed_warning(0o644, None, 10001, &read_only),
+            failed_warning(0o644, Some(in_group), 10001, &denied),
+            failed_warning(0o644, Some(outside), 10001, &denied),
+            failed_warning(0o644, None, 10001, &denied),
         ] {
-            assert!(warning.contains("permissions 0644,"), "{warning}");
-            assert!(warning.ends_with(TLS_KEY_ROTATE), "{warning}");
+            assert!(warning.contains("permissions 0644,"));
+            assert!(warning.ends_with(TLS_KEY_STILL_OPEN));
+            assert!(!warning.contains("while its mode was wider"));
         }
     }
 
@@ -505,12 +633,14 @@ mod tls_key_permission_tests {
         // The same key named from `~`: `~/` and one `..` per component of
         // $HOME, then the path from `/`. Unexpanded, `~` is a directory name
         // that does not exist, and there is no key to narrow.
+        // The kernel resolves `..` from the directory a symlink names, so the
+        // count comes from $HOME with its symlinks resolved.
         if !cfg!(feature = "dev-mode")
             && let Ok(home) = std::env::var("HOME")
-            && home.starts_with('/')
+            && let Ok(home) = std::fs::canonicalize(&home)
         {
             std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-            let ups = std::path::Path::new(&home)
+            let ups = home
                 .components()
                 .filter(|c| matches!(c, std::path::Component::Normal(_)))
                 .count();
