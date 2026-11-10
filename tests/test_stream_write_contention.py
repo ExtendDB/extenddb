@@ -19,6 +19,7 @@ that reports that conflict as an error instead of retrying it.
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
 import uuid
@@ -44,6 +45,11 @@ TXN_ROUNDS = 10
 # passes never reaches the limit.
 REPLAY_PASSES = 200
 REPLAY_PAUSE = 0.01
+# Resends of a single-item write that answered 503 ServiceUnavailable, and the
+# first pause, which doubles up to 64 times this value, with jitter, as in
+# tests/test_concurrency.py.
+UNAVAILABLE_RESENDS = 20
+UNAVAILABLE_PAUSE = 0.05
 
 
 @pytest.fixture(scope="module")
@@ -138,6 +144,24 @@ def _error_code(e: ClientError) -> str:
     return f"{e.response['ResponseMetadata']['HTTPStatusCode']} {e.response['Error']['Code']}"
 
 
+def _resend_unavailable(call, **kwargs):
+    """Return `call(**kwargs)`, sending it again after each 503
+    ServiceUnavailable answer, up to UNAVAILABLE_RESENDS times.
+
+    A 503 here means the write did not commit within the server's retry
+    budget and nothing was applied, so a resend cannot apply it twice. Any
+    other error, and the 503 after the last resend, is raised.
+    """
+    for attempt in range(UNAVAILABLE_RESENDS + 1):
+        try:
+            return call(**kwargs)
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ServiceUnavailable" or attempt == UNAVAILABLE_RESENDS:
+                raise
+            pause = UNAVAILABLE_PAUSE * (2 ** min(attempt, 6))
+            time.sleep(pause + random.random() * pause)
+
+
 def _backend() -> str:
     """The backend under test as devtools/run-tests exports it with --backend
     (the MongoDB and Cassandra runners always pass it); empty when unset."""
@@ -175,7 +199,18 @@ def test_racing_puts_and_deletes_on_a_stream_table_all_succeed(
     dynamodb_client, raw_client, streams_client, stream_table
 ):
     """PutItem and DeleteItem churn over a few keys: every call answers 200
-    and the stream holds one record per write that changed the item."""
+    and the stream holds one record per write that changed the item.
+
+    Amazon DynamoDB answered 200 to every contended single-item write in the
+    measurements behind these tests (us-east-1, 2026-10-23, client retries
+    off, up to 64 writers on one key). On the MongoDB backend the writers also
+    conflict on the stream sequence counter, and a write that does not commit
+    within the server's retry budget answers 503 ServiceUnavailable with
+    nothing applied. The writer sends such a write again, as
+    tests/test_concurrency.py does, so a busy host does not fail the test. A
+    500, any other error, a 503 after the last resend, and a stream record
+    count that differs from the writes that changed an item still fail it.
+    """
     prefix = f"churn-{uuid.uuid4().hex[:8]}-"
 
     def body(i: int) -> tuple[list[str], int]:
@@ -185,10 +220,19 @@ def test_racing_puts_and_deletes_on_a_stream_table_all_succeed(
             key = {"pk": {"S": f"{prefix}{(i + n) % KEYS}"}}
             try:
                 if n % 2 == 0:
-                    raw_client.put_item(TableName=stream_table, Item={**key, "w": {"S": f"w{i}-{n}"}})
+                    _resend_unavailable(
+                        raw_client.put_item,
+                        TableName=stream_table,
+                        Item={**key, "w": {"S": f"w{i}-{n}"}},
+                    )
                     records += 1
                 else:
-                    r = raw_client.delete_item(TableName=stream_table, Key=key, ReturnValues="ALL_OLD")
+                    r = _resend_unavailable(
+                        raw_client.delete_item,
+                        TableName=stream_table,
+                        Key=key,
+                        ReturnValues="ALL_OLD",
+                    )
                     # A delete of an item that does not exist writes no record.
                     if r.get("Attributes"):
                         records += 1
