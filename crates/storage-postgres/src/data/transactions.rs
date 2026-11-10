@@ -230,11 +230,12 @@ impl PostgresEngine {
             });
         }
 
-        // Item history for every member at one instant, so a reconstruct
-        // holds all of the transaction or none of it.
+        // Item history for every member at one instant, read after every
+        // member's write, so a reconstruct holds all of the transaction or
+        // none of it.
         #[cfg(feature = "pitr")]
         {
-            let commit_time = std::time::SystemTime::now();
+            let mut commit_time = None;
             for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
                 let (TransactWriteOp::Put { key_info, .. }
                 | TransactWriteOp::Delete { key_info, .. }
@@ -245,7 +246,7 @@ impl PostgresEngine {
                     key_info,
                     old_item.as_ref(),
                     new_item.as_ref(),
-                    commit_time,
+                    &mut commit_time,
                 )
                 .await
                 .map_err(cancel_all)?;

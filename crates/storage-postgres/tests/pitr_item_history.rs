@@ -120,6 +120,59 @@ async fn concurrent_writers_leave_the_state_equal_to_the_live_table() {
     close(s).await;
 }
 
+/// Writers racing on one key: a key's history rows take their commit times
+/// in the order of their `seq`. A row with a higher `seq` and an earlier time
+/// would make a restore between the two times return the later write.
+#[tokio::test]
+async fn racing_writes_of_one_key_take_their_times_in_seq_order() {
+    use extenddb_core::expression::ExpressionMaps;
+    let Some(s) = open().await else { return };
+    let info = s.table("t", None, true).await;
+    let engine = std::sync::Arc::new(s);
+    let mut tasks = Vec::new();
+    for task in 0..16_u64 {
+        let engine = engine.clone();
+        let info = info.clone();
+        tasks.push(tokio::spawn(async move {
+            let maps = ExpressionMaps::default();
+            let key = Item::from([("pk".to_owned(), AttributeValue::S("k".to_owned()))]);
+            for i in 0..150_u64 {
+                if i % 10 == 9 {
+                    engine
+                        .engine
+                        .delete_item(&info, &key, false, None, &maps, None)
+                        .await
+                        .expect("delete");
+                } else {
+                    let mut item = key.clone();
+                    item.insert("v".to_owned(), AttributeValue::S(format!("{task}-{i}")));
+                    engine
+                        .engine
+                        .put_item(&info, item, false, None, &maps, None)
+                        .await
+                        .expect("put");
+                }
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.expect("writer");
+    }
+    let s = std::sync::Arc::into_inner(engine).expect("sole owner");
+    let (rows, inversions): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE commit_time_us < prev) FROM \
+         (SELECT commit_time_us, lag(commit_time_us) OVER (PARTITION BY pk, sk ORDER BY seq) \
+         AS prev FROM item_history WHERE table_id = $1) x",
+    )
+    .bind(&info.table_id)
+    .fetch_one(&s.db)
+    .await
+    .expect("count");
+    assert!(rows > 2_000, "{rows} rows");
+    assert_eq!(inversions, 0, "{inversions} of {rows} rows");
+    close(s).await;
+}
+
 /// A delete of a key whose first put is still uncommitted deletes nothing and
 /// records nothing. The delete takes no row lock, so a recorded delete would
 /// draw a higher `seq` than the put that commits after it, and the reconstruct

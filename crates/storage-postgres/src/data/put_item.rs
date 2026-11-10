@@ -204,14 +204,8 @@ impl PostgresEngine {
                     .await?;
                 }
                 #[cfg(feature = "pitr")]
-                crate::pitr::record_item_history_in_tx(
-                    &mut tx,
-                    key_info,
-                    &item,
-                    Some(&item),
-                    std::time::SystemTime::now(),
-                )
-                .await?;
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, &item, Some(&item), None)
+                    .await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(
@@ -405,14 +399,8 @@ impl PostgresEngine {
                     .await?;
                 }
                 #[cfg(feature = "pitr")]
-                crate::pitr::record_item_history_in_tx(
-                    &mut tx,
-                    key_info,
-                    &item,
-                    Some(&item),
-                    std::time::SystemTime::now(),
-                )
-                .await?;
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, &item, Some(&item), None)
+                    .await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(

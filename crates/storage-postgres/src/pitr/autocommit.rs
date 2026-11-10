@@ -5,24 +5,22 @@
 //! statement that also records the write's history row when the table's
 //! recovery is enabled.
 
-use std::time::SystemTime;
-
 use extenddb_core::types::{ScalarAttributeType, TableKeyInfo};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::pitr::unix_micros;
 use extenddb_storage::util::{SortKeyValue, sk_column};
 
-use super::sk_text;
+use super::{DB_NOW_US, sk_text};
 use crate::data::data_table_name;
 use crate::data::index::db_error;
 
 /// The history row of a write that is its statement's only data row, added
 /// when the table has a `pitr_state` row. `$1` is the data pk, then
-/// `$table`, `$sk`, `$time` and `$image` name the statement's parameters.
-fn history_from(w: &str, table: &str, sk: &str, time: &str, image: &str) -> String {
+/// `$table`, `$sk` and `$image` name the statement's parameters. The commit
+/// time is read per row of `w`, so after the data write took the row lock.
+fn history_from(w: &str, table: &str, sk: &str, image: &str) -> String {
     format!(
         "INSERT INTO item_history (table_id, pk, sk, commit_time_us, item_data) \
-         SELECT {table}, $1, {sk}, {time}, {image} FROM {w} \
+         SELECT {table}, $1, {sk}, {DB_NOW_US}, {image} FROM {w} \
          WHERE EXISTS (SELECT 1 FROM pitr_state WHERE table_id = {table})"
     )
 }
@@ -37,18 +35,16 @@ pub(crate) async fn autocommit_put(
     item_json: &serde_json::Value,
 ) -> Result<(), StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let commit_time = unix_micros(SystemTime::now())?;
     let Some(sk) = sk else {
         let sql = format!(
             "WITH w AS (INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
              ON CONFLICT (pk) DO UPDATE SET item_data = EXCLUDED.item_data RETURNING 1) {}",
-            history_from("w", "$3", "''", "$4", "$2")
+            history_from("w", "$3", "''", "$2")
         );
         sqlx::query(&sql)
             .bind(pk_text)
             .bind(item_json)
             .bind(&key_info.table_id)
-            .bind(commit_time)
             .execute(pool)
             .await
             .map_err(db_error)?;
@@ -58,14 +54,13 @@ pub(crate) async fn autocommit_put(
     let sql = format!(
         "WITH w AS (INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
          ON CONFLICT (pk, {sk_col}) DO UPDATE SET item_data = EXCLUDED.item_data RETURNING 1) {}",
-        history_from("w", "$4", "$5", "$6", "$3")
+        history_from("w", "$4", "$5", "$3")
     );
     let query = bind_typed_sk(sqlx::query(&sql).bind(pk_text), sk);
     query
         .bind(item_json)
         .bind(&key_info.table_id)
         .bind(sk_text(sk))
-        .bind(commit_time)
         .execute(pool)
         .await
         .map_err(db_error)?;
@@ -82,16 +77,14 @@ pub(crate) async fn autocommit_delete(
     sk: Option<&SortKeyValue>,
 ) -> Result<(), StorageError> {
     let ddb_table = data_table_name(&key_info.table_id);
-    let commit_time = unix_micros(SystemTime::now())?;
     let Some(sk) = sk else {
         let sql = format!(
             "WITH w AS (DELETE FROM {ddb_table} WHERE pk = $1 RETURNING 1) {}",
-            history_from("w", "$2", "''", "$3", "NULL")
+            history_from("w", "$2", "''", "NULL")
         );
         sqlx::query(&sql)
             .bind(pk_text)
             .bind(&key_info.table_id)
-            .bind(commit_time)
             .execute(pool)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -100,12 +93,11 @@ pub(crate) async fn autocommit_delete(
     let sk_col = sk_column(sk_type(sk));
     let sql = format!(
         "WITH w AS (DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2 RETURNING 1) {}",
-        history_from("w", "$3", "$4", "$5", "NULL")
+        history_from("w", "$3", "$4", "NULL")
     );
     bind_typed_sk(sqlx::query(&sql).bind(pk_text), sk)
         .bind(&key_info.table_id)
         .bind(sk_text(sk))
-        .bind(commit_time)
         .execute(pool)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;

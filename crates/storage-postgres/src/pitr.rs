@@ -16,6 +16,11 @@
 //! statement takes the data table's lock before it takes its snapshot, so a
 //! write held by an enable reads the `pitr_state` row the enable committed.
 //!
+//! A row's commit time is read from the PostgreSQL server's clock
+//! ([`DB_NOW_US`]) after the data write, so under the item's row lock: two
+//! writes of one key take their times in the order they take their `seq`,
+//! and every ExtendDB server of the database reads one clock.
+//!
 //! A page first pins its time in `pitr_state` and a prune lowers its cutoff
 //! to a pin that holds; both lock the table's `pitr_state` row, so a prune
 //! either sees the pin or has already moved `pruned_to_us` past the time and
@@ -38,6 +43,10 @@ use crate::data::{data_table_name, json_to_item};
 
 mod autocommit;
 pub(crate) use autocommit::{autocommit_delete, autocommit_put};
+
+/// The PostgreSQL server's clock in microseconds since the Unix epoch, read
+/// when the expression is evaluated.
+pub(crate) const DB_NOW_US: &str = "(extract(epoch FROM clock_timestamp()) * 1000000)::bigint";
 
 /// Superseded: a later row of the same key committed at or before `$2`.
 const SUPERSEDED: &str = "EXISTS (SELECT 1 FROM item_history n \
@@ -89,15 +98,16 @@ fn sk_sql(sk: Option<ScalarAttributeType>) -> &'static str {
 /// Record one committed mutation of the table `key_info` names, in the
 /// mutation's data transaction, after its data write. `key` is any image that
 /// carries the primary key; `image` is the item after the mutation, `None`
-/// for a delete. Returns whether a row was added, which is when the table's
+/// for a delete. `commit_time` `None` reads [`DB_NOW_US`]. Returns the
+/// recorded commit time when a row was added, which is when the table's
 /// recovery is enabled.
 pub(crate) async fn record_item_history_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
     key: &Item,
     image: Option<&Item>,
-    commit_time: SystemTime,
-) -> Result<bool, StorageError> {
+    commit_time: Option<SystemTime>,
+) -> Result<Option<i64>, StorageError> {
     let pk_name = &key_info.key_schema[0].attribute_name;
     let pk_value = key
         .get(pk_name)
@@ -116,19 +126,20 @@ pub(crate) async fn record_item_history_in_tx(
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let done = sqlx::query(
+    let commit_time = commit_time.map(unix_micros).transpose()?;
+    sqlx::query_scalar(&format!(
         "INSERT INTO item_history (table_id, pk, sk, commit_time_us, item_data) \
-         SELECT $1, $2, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM pitr_state WHERE table_id = $1)",
-    )
+         SELECT $1, $2, $3, coalesce($4, {DB_NOW_US}), $5 \
+         WHERE EXISTS (SELECT 1 FROM pitr_state WHERE table_id = $1) RETURNING commit_time_us"
+    ))
     .bind(&key_info.table_id)
     .bind(pk_text.as_ref())
     .bind(sk)
-    .bind(unix_micros(commit_time)?)
+    .bind(commit_time)
     .bind(item_json)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| store_err("record", e))?;
-    Ok(done.rows_affected() == 1)
+    .map_err(|e| store_err("record", e))
 }
 
 /// The write paths' hook: record a mutation from its before and after images,
@@ -136,19 +147,23 @@ pub(crate) async fn record_item_history_in_tx(
 /// neither image changed nothing (a delete of a missing item, a condition
 /// check) and records nothing: a delete of a missing key holds no row lock, so
 /// its row could take a higher `seq` than a concurrent first put of the key
-/// that commits after it. Every mutation of one transaction passes the same
-/// `commit_time`, so a reconstruct never splits a transaction.
+/// that commits after it. The mutations of one transaction share
+/// `commit_time`: the first one recorded reads [`DB_NOW_US`] and sets it, so
+/// a reconstruct never splits a transaction.
 pub(crate) async fn capture_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key_info: &TableKeyInfo,
     old: Option<&Item>,
     new: Option<&Item>,
-    commit_time: SystemTime,
+    commit_time: &mut Option<i64>,
 ) -> Result<(), StorageError> {
     let Some(key) = new.or(old) else {
         return Ok(());
     };
-    record_item_history_in_tx(tx, key_info, key, new, commit_time).await?;
+    let at = commit_time.map(from_unix_micros);
+    if let Some(recorded) = record_item_history_in_tx(tx, key_info, key, new, at).await? {
+        *commit_time = Some(recorded);
+    }
     Ok(())
 }
 
@@ -558,7 +573,9 @@ impl PostgresEngine {
             .begin()
             .await
             .map_err(|e| store_err("begin", e))?;
-        let added = record_item_history_in_tx(&mut tx, key_info, key, image, commit_time).await?;
+        let added = record_item_history_in_tx(&mut tx, key_info, key, image, Some(commit_time))
+            .await?
+            .is_some();
         if commit {
             tx.commit().await.map_err(|e| store_err("commit", e))?;
         } else {
