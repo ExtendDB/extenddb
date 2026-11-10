@@ -169,8 +169,9 @@ pub(crate) async fn handle_request(
 
     let table_name = extract_table_name(&input);
     // The table the metrics are recorded under: the request's `TableName` only
-    // when the operation has that member and the name passes the table name
-    // rules, with a table ARN reduced to its name. See `metric_table_name`.
+    // when the operation acts on the table it names and the name passes the
+    // table name rules, with a table ARN reduced to its name. See
+    // `metric_table_name`.
     let metric_table = metric_table_name(&operation, &input, &state.limits);
 
     // --- Throttle segment ---

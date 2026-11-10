@@ -7,16 +7,17 @@ A request that fails validation can carry any string as its ``TableName``.
 The metrics used to record that string as a dimension value, so after
 rejected CreateTable calls the metrics table held names such as
 ``x";DROP TABLE tables;--`` and ``a`` U+0000 ``b``. The metrics now carry a
-table name only when the operation has a ``TableName`` member and the name is
-valid, a table ARN is reduced to its name, ``UserErrors`` carries none
-(CloudWatch reports it per account and Region), and
+table name only when the operation acts on the table its ``TableName`` names
+and the name is valid, a table ARN is reduced to its name, ``UserErrors``
+carries none (CloudWatch reports it per account and Region), and
 ``SuccessfulRequestLatency`` counts successful requests only.
 
-The test sends the rejected requests, a successful ListBackups that names a
-table of its own by its ARN, a successful BatchWriteItem with an extra
-top-level ``TableName``, and last a successful PutItem on that table. It waits
-for the PutItem's and the ListBackups' rows, then reads once more after the
-flush has had time to write the rest of its rows (see ``flushed``).
+The test sends the rejected requests, a successful ListBackups filtered by a
+table that does not exist, a successful CreateBackup that names a table of its
+own by its ARN, a successful BatchWriteItem with an extra top-level
+``TableName``, and last a successful PutItem on that table. It waits for the
+PutItem's and the CreateBackup's rows, then reads once more after the flush
+has had time to write the rest of its rows (see ``flushed``).
 
 Prerequisites:
   - extenddb running on EXTENDDB_TEST_ENDPOINT
@@ -128,6 +129,9 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
     # A valid name sent as an extra top-level TableName on a BatchWriteItem,
     # which has no such member and writes to the test table.
     decoy = f"metrics-names-decoy-{suffix}"
+    # A valid name of no table, as the filter of a ListBackups, which succeeds
+    # with an empty list.
+    missing = f"metrics-names-missing-{suffix}"
 
     for name in INVALID_NAMES:
         with pytest.raises(dynamodb_client_no_validation.exceptions.ClientError):
@@ -139,12 +143,17 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
             KeySchema=[],
             BillingMode="PAY_PER_REQUEST",
         )
+    listed = dynamodb_client.list_backups(TableName=missing)
+    assert listed["BackupSummaries"] == [], listed
 
     dynamodb_client.create_table(TableName=sentinel, **KEY)
+    backup_arn = None
     try:
         wait_for_active(dynamodb_client, sentinel)
         arn = dynamodb_client.describe_table(TableName=sentinel)["Table"]["TableArn"]
-        dynamodb_client.list_backups(TableName=arn)
+        backup_arn = dynamodb_client.create_backup(
+            TableName=arn, BackupName=f"metrics-names-{suffix}"
+        )["BackupDetails"]["BackupArn"]
         resp = _raw_post(
             endpoint_url,
             "BatchWriteItem",
@@ -167,11 +176,11 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
             )
             # Under the bare name or, if the ARN were not reduced, the ARN, so
             # that a regression fails the ARN test rather than this wait.
-            list_backups = any(
+            create_backup = any(
                 _dimension(m, "TableName") in (sentinel, arn)
-                for m in _rows(data, "SuccessfulRequestLatency", "ListBackups")
+                for m in _rows(data, "SuccessfulRequestLatency", "CreateBackup")
             )
-            return put_item and list_backups
+            return put_item and create_backup
 
         deadline = time.monotonic() + FLUSH_DEADLINE_SECONDS
         while True:
@@ -180,18 +189,21 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
                 break
             time.sleep(POLL_SECONDS)
         assert sentinel_rows_flushed(data), (
-            f"the metrics flush did not persist the PutItem and ListBackups rows "
+            f"the metrics flush did not persist the PutItem and CreateBackup rows "
             f"for {sentinel} within {FLUSH_DEADLINE_SECONDS}s"
         )
         # The flush writes one statement per row, in no fixed order, so a read
         # can land partway through it. The rows with no table name (the
-        # BatchWriteItem's, the rejected CreateTables') cannot be waited for by
-        # name on a shared server. Writing this test's rows takes milliseconds,
-        # so a read after SETTLE_SECONDS sees the whole flush.
+        # BatchWriteItem's, the ListBackups', the rejected CreateTables') cannot
+        # be waited for by name on a shared server. Writing this test's rows
+        # takes milliseconds, so a read after SETTLE_SECONDS sees the whole
+        # flush.
         time.sleep(SETTLE_SECONDS)
         data = _admin_metrics(endpoint_url, window="LastHour")
-        yield (*INVALID_NAMES, refused_valid, decoy), sentinel, data
+        yield (*INVALID_NAMES, refused_valid, decoy, missing), sentinel, data
     finally:
+        if backup_arn is not None:
+            dynamodb_client.delete_backup(BackupArn=backup_arn)
         dynamodb_client.delete_table(TableName=sentinel)
         wait_for_deleted(dynamodb_client, sentinel)
 
@@ -216,9 +228,9 @@ def test_user_errors_carry_no_table_name(flushed) -> None:
 
 def test_a_table_named_by_its_arn_is_reported_under_its_name(flushed) -> None:
     _, sentinel, data = flushed
-    listed = _rows(data, "SuccessfulRequestLatency", "ListBackups")
-    assert sentinel in {_dimension(m, "TableName") for m in listed}, (
-        f"no SuccessfulRequestLatency for ListBackups under {sentinel}: {listed}"
+    backed_up = _rows(data, "SuccessfulRequestLatency", "CreateBackup")
+    assert sentinel in {_dimension(m, "TableName") for m in backed_up}, (
+        f"no SuccessfulRequestLatency for CreateBackup under {sentinel}: {backed_up}"
     )
     arns = sorted(n for n in _table_names(data) if n.startswith("arn:"))
     assert not arns, f"metrics recorded table ARNs as table names: {arns}"

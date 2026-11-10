@@ -50,9 +50,18 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Operations whose input has a top-level `TableName` member: every operation
-/// the engine dispatches whose input shape has one in botocore 1.43.125's
-/// `dynamodb` and `dynamodbstreams` models (`ListStreams` is the Streams one).
+/// Operations whose top-level `TableName` names the table the request acts
+/// on. These are the operations the engine dispatches whose input shape has a
+/// top-level `TableName` in botocore 1.43.125's `dynamodb` and
+/// `dynamodbstreams` models, less `ListBackups` and `ListStreams`.
+///
+/// Each of these succeeds only when the table exists (`CreateTable` once it
+/// does), so a successful request records metrics under a real table. In
+/// `ListBackups` and `ListStreams`, `TableName` is a filter over the account's
+/// backups or streams, and either answers 200 with an empty list for a table
+/// that does not exist. Under it, any valid name a caller makes up would become
+/// a dimension value, so they record no table.
+///
 /// Any other operation ignores or refuses a `TableName` it is sent, so its
 /// metrics must not take one from the request either: a `BatchWriteItem` with
 /// an extra `TableName` would otherwise record its metrics under a table it
@@ -66,8 +75,6 @@ const TABLE_NAME_OPERATIONS: &[&str] = &[
     "DescribeTable",
     "DescribeTimeToLive",
     "GetItem",
-    "ListBackups",
-    "ListStreams",
     "PutItem",
     "Query",
     "Scan",
@@ -82,9 +89,9 @@ const TABLE_NAME_OPERATIONS: &[&str] = &[
 /// request names no valid table.
 ///
 /// The name comes from the request's top-level `TableName`, and only for an
-/// operation whose input has that member ([`TABLE_NAME_OPERATIONS`]). A table
-/// ARN is reduced to its table name, so a table has one dimension value however
-/// the request named it. The result must pass the table name rules
+/// operation that acts on the table it names ([`TABLE_NAME_OPERATIONS`]). A
+/// table ARN is reduced to its table name, so a table has one dimension value
+/// however the request named it. The result must pass the table name rules
 /// (`validate_table_name`); a request that fails validation can carry any
 /// string, control characters included, and every reader of the metrics would
 /// get it as a dimension value (issue #728). Otherwise the result is `None`,
@@ -734,10 +741,12 @@ mod tests {
         assert_eq!(metric_table_name("PutItem", &json!({}), &limits), None);
     }
 
-    /// An operation whose input has no top-level `TableName` member records no
-    /// table, whatever valid name the request adds; one that has it keeps it.
+    /// An operation that does not act on the table its `TableName` names
+    /// records no table, whatever valid name the request carries: those whose
+    /// input has no top-level `TableName` member, and `ListBackups` and
+    /// `ListStreams`, where it is a filter. One that acts on it keeps it.
     #[test]
-    fn metric_table_name_reads_table_name_only_where_the_operation_has_it() {
+    fn metric_table_name_reads_table_name_only_for_operations_on_that_table() {
         let limits = extenddb_core::limits::LimitsConfig::default();
         let input = json!({ "TableName": "Orders" });
         for operation in [
@@ -749,6 +758,8 @@ mod tests {
             "BatchExecuteStatement",
             "ExecuteTransaction",
             "ListTables",
+            "ListBackups",
+            "ListStreams",
             "TagResource",
             "DescribeBackup",
             "RestoreTableFromBackup",
@@ -774,8 +785,6 @@ mod tests {
             "DescribeTable",
             "DescribeTimeToLive",
             "GetItem",
-            "ListBackups",
-            "ListStreams",
             "PutItem",
             "Query",
             "Scan",
