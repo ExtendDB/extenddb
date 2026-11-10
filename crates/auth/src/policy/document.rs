@@ -197,9 +197,10 @@ impl PolicyDocument {
     /// parsing on the request path rather than failing the principal closed:
     /// a `Sid` is a label that does not affect evaluation, a stored document
     /// with another `Version` matches its `Resource` patterns as written, as
-    /// it did before, a stored value with such a reference is compared as
-    /// written, and a stored Arn value evaluates as written unless it is one
-    /// of the values `arn_value::fails_closed_at_evaluation` fails closed.
+    /// it did before, a stored value with such a reference is read as
+    /// before #926, each `${` ending at the next `}`, and a stored Arn value
+    /// evaluates as written unless it is one of the values
+    /// `arn_value::fails_closed_at_evaluation` fails closed.
     ///
     /// # Errors
     ///
