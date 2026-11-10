@@ -16,8 +16,8 @@
 
 use super::tests::ctx;
 use super::{
-    check_session_policy, stored_trust_arn_value, trust_decision, validate_trust_policy,
-    warn_on_stored_trust_arn_value,
+    check_session_policy, stored_trust_arn_value, trust_decision, trust_decision_for,
+    validate_trust_policy, warn_on_stored_trust_arn_value,
 };
 use extenddb_auth::policy::document::PolicyDocument;
 use serde_json::{Value, json};
@@ -352,4 +352,106 @@ fn a_six_field_value_whose_first_field_is_not_arn_fails_closed_and_is_named() {
         )),
         "{lines:#?}"
     );
+}
+
+#[test]
+fn a_first_field_that_holds_a_reference_is_left_to_the_matcher() {
+    // With `x` absent the default `}:::::` gives one field, which matches
+    // nothing, so `ArnNotLike` holds for every caller. The IAM policy
+    // simulator allowed an `Allow` gated on `ArnNotLike` with this value in
+    // an identity policy, two samples per `Version` (issue #834). The trust
+    // write check accepts the value, which has six fields, and the AssumeRole
+    // warning does not name it.
+    let value = "${x, '}:::::'}";
+    let allow = [stmt("Allow", "*", Some(arn_cond("ArnNotLike", value)))];
+    assert_eq!(validate_trust_policy(&doc(&allow)), Ok(()));
+    for version_2012 in [true, false] {
+        assert!(
+            trust_decision_for(&allow, CALLER, &ctx(), false, version_2012),
+            "version_2012 {version_2012}"
+        );
+    }
+    assert_eq!(stored_trust_arn_value(&doc(&allow)), None);
+}
+
+/// A federated user of the caller's account. Its ARN has the service `sts`,
+/// so the five fields `arn:aws:iam::123456789012` do not match it.
+const FEDERATED: &str = "arn:aws:sts::123456789012:federated-user/carol";
+
+/// A value whose quoted default holds `}:`. Counted with each `${` ending at
+/// the next `}`, as IAM counts the fields of an Arn value, it has five written
+/// `:`, and the trust write check sees six fields. The evaluator reads the
+/// reference up to its last `}`, so for a caller in account 123456789012 the
+/// value expands to `arn:aws:iam::123456789012`, which has five fields. How
+/// IAM evaluates such a value was not measured.
+const QUOTED_COLON: &str = "arn:aws:iam::${aws:PrincipalAccount, '}:'}";
+
+/// For `ArnLike` and `ArnNotLike` and for each effect, whether alice and the
+/// federated user, both in account 123456789012, may assume a role whose
+/// trust policy holds the effect gated on the operator with `value`, with
+/// `Version` `2012-10-17` when `version_2012` holds and `2008-10-17`
+/// otherwise. A `Deny` comes with an unconditional `Allow`.
+fn by_caller(version_2012: bool, value: &str) -> Vec<(&'static str, &'static str, [bool; 2])> {
+    let mut federated = ctx();
+    federated.principal_arn = FEDERATED.to_owned();
+    let mut rows = Vec::new();
+    for op in ["ArnLike", "ArnNotLike"] {
+        for effect in ["Allow", "Deny"] {
+            let gated = stmt(effect, "*", Some(arn_cond(op, value)));
+            let statements = if effect == "Deny" {
+                vec![stmt("Allow", "*", None), gated]
+            } else {
+                vec![gated]
+            };
+            let decisions = [
+                trust_decision_for(&statements, CALLER, &ctx(), false, version_2012),
+                trust_decision_for(&statements, FEDERATED, &federated, false, version_2012),
+            ];
+            rows.push((op, effect, decisions));
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_value_whose_quoted_default_leaves_five_fields_fails_closed() {
+    // The trust write check accepts the value. Its statement fails closed
+    // under both operators and both effects, for a caller the five fields
+    // match and for one they do not, and the AssumeRole warning names it.
+    let d = doc(&[stmt("Allow", "*", Some(arn_cond("ArnLike", QUOTED_COLON)))]);
+    assert_eq!(validate_trust_policy(&d), Ok(()));
+    let closed = [false, false];
+    assert_eq!(
+        by_caller(true, QUOTED_COLON),
+        [
+            ("ArnLike", "Allow", closed),
+            ("ArnLike", "Deny", closed),
+            ("ArnNotLike", "Allow", closed),
+            ("ArnNotLike", "Deny", closed),
+        ]
+    );
+    assert_eq!(
+        stored_trust_arn_value(&d),
+        Some(("aws:PrincipalArn".to_owned(), QUOTED_COLON.to_owned()))
+    );
+}
+
+#[test]
+fn a_value_whose_quoted_default_holds_a_colon_is_compared_as_written_in_a_2008_document() {
+    // A `2008-10-17` trust policy expands no variable, so the value has six
+    // fields and its account field is the text `${aws`, which no caller's ARN
+    // holds.
+    let mut d = doc(&[stmt("Allow", "*", Some(arn_cond("ArnLike", QUOTED_COLON)))]);
+    d["Version"] = json!("2008-10-17");
+    assert_eq!(validate_trust_policy(&d), Ok(()));
+    assert_eq!(
+        by_caller(false, QUOTED_COLON),
+        [
+            ("ArnLike", "Allow", [false, false]),
+            ("ArnLike", "Deny", [true, true]),
+            ("ArnNotLike", "Allow", [true, true]),
+            ("ArnNotLike", "Deny", [false, false]),
+        ]
+    );
+    assert_eq!(stored_trust_arn_value(&d), None);
 }

@@ -200,3 +200,87 @@ fn a_stored_value_iam_rejects_at_write_otherwise_evaluates_as_written() {
         assert!(holds("ArnNotLike", value, &[]), "{value:?}");
     }
 }
+
+/// A federated user of bob's account. Its ARN has the service `sts`, so the
+/// five fields `arn:aws:iam::123456789012` do not match it.
+const FEDERATED: &str = "arn:aws:sts::123456789012:federated-user/carol";
+
+/// A value whose quoted default holds `}:`. Counted with each `${` ending at
+/// the next `}`, as IAM counts the fields of an Arn value, it has five written
+/// `:`. The evaluator reads the reference up to its last `}`, so for a caller
+/// in account 123456789012 the value expands to `arn:aws:iam::123456789012`,
+/// which has five fields. How IAM evaluates such a value was not measured.
+const QUOTED_COLON: &str = "arn:aws:iam::${aws:PrincipalAccount, '}:'}";
+
+/// For `ArnLike` and `ArnNotLike` and for each effect, `GetItem` by bob and by
+/// the federated user, both in account 123456789012, under a document with
+/// `Version` `version` that holds the effect gated on the operator with
+/// `value`. A `Deny` comes with an unconditional `Allow`.
+fn by_caller(version: &str, value: &str) -> Vec<(&'static str, &'static str, [AuthzDecision; 2])> {
+    let mut rows = Vec::new();
+    for operator in ["ArnLike", "ArnNotLike"] {
+        for effect in ["Allow", "Deny"] {
+            let mut statements = gated(effect, operator, value);
+            if effect == "Deny" {
+                statements = format!("{ALLOW_ALL},{statements}");
+            }
+            let policy = parse(&format!(
+                r#"{{"Version":"{version}","Statement":[{statements}]}}"#
+            ));
+            let decisions = [BOB, FEDERATED].map(|caller| {
+                let ctx = Ctx::empty()
+                    .with(PRINCIPAL, vec![caller])
+                    .with("aws:PrincipalAccount", vec!["123456789012"]);
+                evaluate_policies(
+                    std::slice::from_ref(&policy),
+                    None,
+                    None,
+                    "dynamodb:GetItem",
+                    TABLE,
+                    &ctx,
+                )
+            });
+            rows.push((operator, effect, decisions));
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_value_whose_quoted_default_leaves_five_fields_fails_closed() {
+    // The write check refuses the value, whose account field is `${aws`, so
+    // only a policy stored before the check holds it. Its condition fails
+    // closed under both operators and both effects, for a caller the five
+    // fields match and for one they do not.
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+        gated("Allow", "ArnLike", QUOTED_COLON)
+    );
+    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    let closed = [AuthzDecision::Deny; 2];
+    assert_eq!(
+        by_caller("2012-10-17", QUOTED_COLON),
+        [
+            ("ArnLike", "Allow", closed),
+            ("ArnLike", "Deny", closed),
+            ("ArnNotLike", "Allow", closed),
+            ("ArnNotLike", "Deny", closed),
+        ]
+    );
+}
+
+#[test]
+fn a_value_whose_quoted_default_holds_a_colon_is_compared_as_written_in_a_2008_document() {
+    // A `2008-10-17` document expands no variable, so the value has six
+    // fields and its account field is the text `${aws`, which no ARN holds.
+    let (allow, deny) = (AuthzDecision::Allow, AuthzDecision::Deny);
+    assert_eq!(
+        by_caller("2008-10-17", QUOTED_COLON),
+        [
+            ("ArnLike", "Allow", [deny, deny]),
+            ("ArnLike", "Deny", [allow, allow]),
+            ("ArnNotLike", "Allow", [allow, allow]),
+            ("ArnNotLike", "Deny", [deny, deny]),
+        ]
+    );
+}
