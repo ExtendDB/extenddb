@@ -868,8 +868,6 @@ async fn migration_10_refuses_copies_it_cannot_resolve_and_writes_nothing() {
 /// collection. It returns NeedsAttention and writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_10_run_refuses_copies_written_after_detect() {
-    use extenddb_storage::migrations::MigrationId;
-
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "run10").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
@@ -918,7 +916,7 @@ async fn migration_10_run_refuses_copies_written_after_detect() {
 /// Migration 10's body `run`, called directly under the lock; the items it
 /// refuses the migration for.
 async fn run_body(d: &Deployment) -> Vec<String> {
-    use extenddb_storage::migrations::{Body, MigrationError, MigrationId};
+    use extenddb_storage::migrations::{Body, MigrationError};
     use extenddb_storage_mongodb::migrations::{MigrationLock, Timing, migration};
 
     let held = MigrationLock::acquire(
@@ -1033,8 +1031,6 @@ async fn status_items(d: &Deployment) -> Vec<String> {
 /// of those two documents.
 #[tokio::test(flavor = "multi_thread")]
 async fn migration_10_refuses_array_ids_beside_its_own_index() {
-    use extenddb_storage::migrations::MigrationId;
-
     let Some(uri) = server() else { return };
     let d = Deployment::new(&uri, "arrays10").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
