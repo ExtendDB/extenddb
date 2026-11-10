@@ -449,8 +449,8 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         "arn:aws:IAM::123456789012:root",
         "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}",
         "arn:aws:iam::123456789012:user/${aws:username}",
-        // A first field that holds a variable is left to the matcher. Its
-        // references hold every `:`, so its expansion has one field.
+        // A first field that holds a variable is left to the matcher when the
+        // references hold every `:`: the expansion has one field.
         "${x, '}:::::'}",
     ] {
         for expanded in [true, false] {

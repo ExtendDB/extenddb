@@ -73,11 +73,14 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 ///
 /// On the request path a value with a variable reaches this with six fields,
 /// or, when it is expanded, with one field if its references hold every `:`
-/// it has, as `${x, '}:::::'}` does. Its condition fails closed before it is
+/// it has, as `${x, '}:::::'}` does. When it is expanded and has six fields,
+/// its first field holds no variable. Its condition fails closed before it is
 /// matched when it has fewer than five written `:`, each `${` ending at the
 /// next `}` ([`super::variables::arn_value_lacks_fields`]), and, when it is
 /// expanded, when its references as the evaluator reads them leave one to
-/// four written `:` ([`super::variables::expanded_arn_value_is_short`]).
+/// four written `:` ([`super::variables::expanded_arn_value_is_short`]) or
+/// leave a written `:` after a first field that holds `${`
+/// ([`fails_closed_at_evaluation`]).
 ///
 /// Not measured: how the service evaluates a pattern of two to five fields
 /// whose first field holds a wildcard, such as `*:aws:iam:*` or `ar?:aws:iam`.
@@ -211,17 +214,26 @@ pub fn is_unmeasured_short_pattern(value: &str) -> bool {
 ///   as `arn:aws:iam::${aws:PrincipalAccount, '}:'}`;
 /// - a value whose first field holds no `${` and does not match `arn` under
 ///   `*` and `?` wildcards, `""` included, since no ARN starts that way;
+/// - when `expanded`, a value whose first field holds `${` and that has a
+///   `:` written outside its references as the evaluator reads them
+///   ([`super::variables::expanded_written_colons`]), such as
+///   `${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*`;
 /// - a value that [`is_unmeasured_short_pattern`] reports.
 ///
-/// The second kind applies only when `expanded`: a value compared as written
-/// splits on every `:`, and when the first kind does not report it, it has at
-/// least five `:` and so six fields.
+/// The second and fourth kinds apply only when `expanded`. A value compared
+/// as written splits on every `:`. When the first kind does not report it, it
+/// has at least five `:` and so six fields, and a first field that holds `${`
+/// is text with a `$` and a `{`, which no ARN holds.
 ///
-/// A first field that holds `${` is left to the matcher. `${x, '}:::::'}`
-/// matches nothing in a document of either `Version`: expanded with `x`
-/// absent it is the one field `}:::::`, and as written its first field is
-/// `${x, '}`. So `ArnNotLike` with it holds, which is what the IAM policy
-/// simulator answered for both `Version` values (issue #834).
+/// In an expanded value, a first field that holds `${` is left to the matcher
+/// only when the references hold every `:` of the value. `${x, '}:::::'}` is
+/// such a value, and it matches nothing in a document of either `Version`:
+/// expanded with `x` absent it is the one field `}:::::`, and as written its
+/// first field is `${x, '}`. So `ArnNotLike` with it holds, which is what the
+/// IAM policy simulator answered for both `Version` values (issue #834). An
+/// expanded value whose first field holds a variable and that has five
+/// written `:` has six fields, and its first field comes from the variable.
+/// How IAM evaluates such a value was not measured.
 ///
 /// An identity policy write rejects each of these, so in an identity policy,
 /// boundary or session policy one can only be stored from before the write
@@ -229,15 +241,20 @@ pub fn is_unmeasured_short_pattern(value: &str) -> bool {
 /// `arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}` (a variable in
 /// the account field), `${x, '}:::::'}` (a variable in the first field) or an
 /// empty partition, keep evaluating as written, so a policy stored before the
-/// check loads and decides as it did. The first three kinds can occur in a
+/// check loads and decides as it did. The first four kinds can occur in a
 /// role trust policy too, whose write check accepts every value of six
 /// fields.
 #[must_use]
 pub fn fails_closed_at_evaluation(value: &str, expanded: bool) -> bool {
     let first = value.split(':').next().unwrap_or_default();
+    let first_field_fails = if first.contains("${") {
+        expanded && super::variables::expanded_written_colons(value) > 0
+    } else {
+        !wildcard_match(first, "arn")
+    };
     super::variables::arn_value_lacks_fields(value)
         || (expanded && super::variables::expanded_arn_value_is_short(value))
-        || (!first.contains("${") && !wildcard_match(first, "arn"))
+        || first_field_fails
         || is_unmeasured_short_pattern(value)
 }
 
@@ -336,10 +353,11 @@ pub fn invalid_trust_arn_value(conditions: &[Condition]) -> Option<(&str, &str)>
 ///
 /// The trust write check accepts a value of the second kind when it has six
 /// fields, such as `ARN:aws:iam::123456789012:user/x`, as IAM accepted that
-/// shape in a trust policy (2026-10-30), or
-/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`. Such a value fails its
-/// statement closed on every AssumeRole call, so the AssumeRole warning names
-/// it too.
+/// shape in a trust policy (2026-10-30), and, in a `2012-10-17` trust policy,
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}` or
+/// `${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*`. Such a
+/// value fails its statement closed on every AssumeRole call, so the
+/// AssumeRole warning names it too.
 #[must_use]
 pub fn fail_closed_trust_arn_value(
     conditions: &[Condition],

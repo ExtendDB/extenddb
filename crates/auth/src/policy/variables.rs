@@ -531,7 +531,16 @@ pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
 /// `:`, and the write check rejects a value with a `${` in any of them.
 #[must_use]
 pub(super) fn expanded_arn_value_is_short(value: &str) -> bool {
-    value.contains("${") && (1..5).contains(&written_colons(&parts(value)))
+    value.contains("${") && (1..5).contains(&expanded_written_colons(value))
+}
+
+/// The number of `:` written outside the `${...}` references of `value`,
+/// with the references read as the evaluator reads them when it expands the
+/// value ([`parts`]). Only these `:` separate the fields of the expanded
+/// value.
+#[must_use]
+pub(super) fn expanded_written_colons(value: &str) -> usize {
+    written_colons(&parts(value))
 }
 
 /// Match an expanded `Resource` or `NotResource` pattern against an ARN value

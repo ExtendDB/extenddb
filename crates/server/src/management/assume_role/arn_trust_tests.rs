@@ -356,7 +356,7 @@ fn a_six_field_value_whose_first_field_is_not_arn_fails_closed_and_is_named() {
 }
 
 #[test]
-fn a_first_field_that_holds_a_reference_is_left_to_the_matcher() {
+fn a_first_field_reference_that_holds_every_colon_is_left_to_the_matcher() {
     // With `x` absent the default `}:::::` gives one field, which matches
     // nothing, so `ArnNotLike` holds for every caller. The IAM policy
     // simulator allowed an `Allow` gated on `ArnNotLike` with this value in

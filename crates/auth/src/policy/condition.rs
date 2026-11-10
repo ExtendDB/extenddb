@@ -201,8 +201,9 @@ pub enum ConditionMatch {
     /// contains `${` and cannot have the six fields of an ARN, which IAM
     /// refuses in a document of any `Version`, one whose first field holds no
     /// `${` and does not match `arn`, or one whose evaluation by IAM was not
-    /// measured: a value whose expansion in a `2012-10-17` document has two
-    /// to five fields, or a short pattern. The statement fails closed.
+    /// measured: a short pattern, or, in a `2012-10-17` document, a value
+    /// whose expansion has two to five fields, or six fields and a first
+    /// field that holds `${`. The statement fails closed.
     Unresolvable,
 }
 
@@ -227,7 +228,9 @@ pub enum ConditionMatch {
 /// not match `arn`, such as `""`, and a short pattern with a wildcard in its
 /// first field, such as `*:aws:iam:*`. When the value is expanded, it is also
 /// a value whose expansion has two to five fields, such as
-/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`. Otherwise returns `Match` or
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, and a value whose first
+/// field holds `${` and whose expansion has six fields, such as
+/// `${x}:aws:iam::123456789012:user/alice`. Otherwise returns `Match` or
 /// `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
 /// `version_2012` is as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
@@ -247,14 +250,17 @@ pub fn evaluate_condition_match(
     // IAM's identity policy write check refuses a value whose first field is
     // not `arn` (a role trust policy write accepts one of six fields, and how
     // IAM evaluates it there was not measured), and the short wildcard
-    // pattern was not measured. A first field that holds a variable is left
-    // to the matcher, which gives the simulator's answer for
-    // `${x, '}:::::'}`. How IAM evaluates an expanded value of two to five
-    // fields was not measured either. Failing closed makes a `Deny` apply and
-    // keeps an `Allow` from granting. IAM checks the value's fields whatever
-    // the document's `Version`, so those rules do not read `version_2012`.
-    // Only an expanded value can expand to two to five fields, so that rule
-    // reads whether the value is expanded.
+    // pattern was not measured. A first field that holds `${` is left to the
+    // matcher where the value is compared as written: that first field is
+    // text with `${`, which no ARN holds. It is also left to the matcher
+    // where the references hold every `:` once expanded, which gives the
+    // simulator's answer for `${x, '}:::::'}`. How IAM evaluates an
+    // expanded value of two to five fields, or of six fields whose first
+    // field holds a variable, was not measured either. Failing closed makes a
+    // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
+    // fields whatever the document's `Version`, so the other rules do not
+    // read `version_2012`. Only an expanded value has an expansion, so these
+    // two rules read whether the value is expanded.
     let expanded = expands_variables(&condition.operator, version_2012);
     if matches!(
         base_operator(&condition.operator),
