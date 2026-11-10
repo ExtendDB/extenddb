@@ -481,12 +481,13 @@ impl ConditionContext for RequestContext {
         // left absent on query shapes the extractor cannot pin to a partition
         // value, where the service populates it. `dynamodb:Attributes` is
         // absent only on a `SearchVectors` with no `ProjectionExpression`
-        // (#729) and, on a table that does not exist, on a `GetItem` or
-        // transaction `Get` that names no attribute outside its `Key`, a
-        // `Query` that names none outside its key condition and a `Scan` that
-        // names none. On the service the key is present on a `Scan` that
-        // names no attribute, and an Allow gated on a bare `StringNotEquals`
-        // over it grants no `Scan` (measured 2026-11-01).
+        // (#729) and, on a table that does not exist, on a `GetItem`,
+        // transaction `Get` or `BatchGetItem` that names no attribute outside
+        // its keys, a `Query` whose key condition the key condition parser
+        // refuses and that names none elsewhere, and a `Scan` that names none.
+        // On the service the key is present on a `Scan` that names no
+        // attribute, and an Allow gated on a bare `StringNotEquals` over it
+        // grants no `Scan` (measured 2026-11-01).
         // For those two keys an absent key keeps the no-match rule, so an
         // Allow gated on a bare negated operator over them grants nothing.
         super::casefold::case_fold(key) == "aws:tagkeys"

@@ -3,11 +3,17 @@
 
 //! Unit tests for `dynamodb:Attributes` extraction.
 //!
-//! Rows marked "Measured" mirror the service's answers of 2026-10-31 and
-//! 2026-11-01; the parent module's docs list what was measured. Index key
-//! attributes and a table's sort key follow the IAM guide's rule, not measured
-//! (the measured table was keyed on `pk` alone). Other unmeasured parameters
-//! follow the rule measured for the same parameter on another operation.
+//! Rows marked "Measured" mirror the service's answers of 2026-10-31,
+//! 2026-11-01, 2026-11-09 and 2026-11-10; the parent module's docs list what
+//! was measured. The 2026-11-09 rows were measured on a table keyed on `pk`
+//! and `sk` with a global and a local secondary index: the key attributes of
+//! a queried GSI, of a scanned GSI and the sort key of a scanned LSI on a
+//! `Scan` with no `ExclusiveStartKey`, a table's sort key, and the key
+//! condition of a `Query` and the `Keys` of a `BatchGetItem` on a table that
+//! does not exist. The 2026-11-10 rows were measured on a table of the same
+//! shape: a later page of a `Scan` of a GSI and of an LSI. Other unmeasured
+//! parameters follow the rule measured for the same parameter on another
+//! operation.
 
 use std::collections::HashMap;
 
@@ -276,6 +282,16 @@ fn a_table_that_does_not_exist_adds_no_key_schema() {
 
 #[test]
 fn query_holds_the_table_and_index_keys_and_its_read_parameters() {
+    // Measured: a Query of a GSI whose key condition names only the GSI's
+    // partition key is refused under an Allow whose ForAllValues list holds
+    // the table's keys, the GSI's partition key and the projected name, and
+    // allowed once the list holds the GSI's sort key too. Only the index's
+    // key schema gives `gsk` here.
+    let gsi = json!({"TableName": "i", "IndexName": "gsi1", "KeyConditionExpression": "gpk = :g"});
+    assert_eq!(
+        single("Query", &gsi, Some(&indexed_table())),
+        names(&["gpk", "gsk", "pk", "sk"])
+    );
     let input = json!({
         "TableName": "i",
         "IndexName": "gsi1",
@@ -311,6 +327,85 @@ fn query_holds_the_legacy_filter_and_attributes_to_get() {
 }
 
 #[test]
+fn a_query_of_a_table_that_does_not_exist_holds_its_key_condition_names() {
+    // Measured: on a table that does not exist, a Query whose
+    // KeyConditionExpression is `#n = :p` with `#n` for `name` is refused
+    // under a Deny on name, and one whose KeyConditions name pk is refused
+    // under a Deny on pk, with AccessDeniedException rather than
+    // ResourceNotFoundException.
+    let input = json!({
+        "TableName": "gone",
+        "KeyConditionExpression": "#n = :p",
+        "ExpressionAttributeNames": {"#n": "name"},
+        "ExpressionAttributeValues": {":p": {"S": "p1"}},
+    });
+    assert_eq!(single("Query", &input, None), names(&["name"]));
+    let legacy = json!({
+        "TableName": "gone",
+        "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "p1"}]}},
+    });
+    assert_eq!(single("Query", &legacy, None), names(&["pk"]));
+    // Every clause of the condition, a BETWEEN and a begins_with included.
+    let two = json!({
+        "TableName": "gone",
+        "KeyConditionExpression": "pk = :p AND sk BETWEEN :a AND :b",
+    });
+    assert_eq!(single("Query", &two, None), names(&["pk", "sk"]));
+    let prefix = json!({
+        "TableName": "gone",
+        "KeyConditionExpression": "begins_with(#s, :a) AND #p = :p",
+        "ExpressionAttributeNames": {"#s": "sort", "#p": "part"},
+    });
+    assert_eq!(single("Query", &prefix, None), names(&["part", "sort"]));
+    // A key condition the key condition parser refuses gives none. On this
+    // table, which does not exist, the engine answers
+    // ResourceNotFoundException before it reads the key condition.
+    let refused = json!({"TableName": "gone", "KeyConditionExpression": "pk > :v"});
+    assert_eq!(single("Query", &refused, None), None);
+    let refused = json!({"TableName": "gone", "KeyConditionExpression": "pk = :p OR sk = :s"});
+    assert_eq!(single("Query", &refused, None), None);
+}
+
+#[test]
+fn a_key_condition_with_a_reserved_word_gives_no_names() {
+    // The engine's key condition parser refuses `name = :p`, with the
+    // reserved word `name` written bare, when enforce_reserved_keywords is
+    // set (the default), so the key condition adds no name. With the check
+    // off, the engine accepts it and the key holds `name`.
+    let input = json!({"TableName": "gone", "KeyConditionExpression": "name = :p"});
+    assert_eq!(single("Query", &input, None), None);
+    let placeholder = json!({
+        "TableName": "gone",
+        "KeyConditionExpression": "#n = :p",
+        "ExpressionAttributeNames": {"#n": "name"},
+    });
+    assert_eq!(single("Query", &placeholder, None), names(&["name"]));
+    let lax = LimitsConfig {
+        enforce_reserved_keywords: false,
+        ..LimitsConfig::default()
+    };
+    assert_eq!(
+        single_table_attributes("Query", &input, None, &lax),
+        names(&["name"])
+    );
+}
+
+#[test]
+fn a_key_condition_on_a_table_that_exists_adds_no_name_the_key_lacks() {
+    let input = json!({
+        "TableName": "i",
+        "IndexName": "gsi1",
+        "KeyConditionExpression": "gpk = :g AND gsk < :s",
+    });
+    assert_eq!(
+        single("Query", &input, Some(&indexed_table())),
+        names(&["gpk", "gsk", "pk", "sk"])
+    );
+    let input = json!({"TableName": "t", "KeyConditionExpression": "pk = :p"});
+    assert_eq!(single("Query", &input, Some(&hash_table())), names(&["pk"]));
+}
+
+#[test]
 fn scan_with_no_named_attribute_holds_the_table_key_attributes() {
     // Measured: a Deny on pk refuses a Scan with no projection, and a Deny
     // gated on Null true refuses none, so the key holds pk. A Scan with
@@ -340,23 +435,64 @@ fn scan_holds_the_sort_key_of_the_table() {
 }
 
 #[test]
-fn scan_on_an_index_holds_the_index_key_attributes() {
-    // Follows the IAM guide's rule for the key attributes of an index; not
-    // measured.
+fn scan_on_an_index_holds_the_table_key_attributes_and_not_the_index_keys() {
+    // Measured, on a Scan with no ExclusiveStartKey: a Scan of a GSI is
+    // allowed under an Allow whose ForAllValues list holds the table's keys
+    // and not the GSI's, and under a Deny on the GSI's partition key, and an
+    // Allow whose list holds the GSI's keys and not the table's refuses it. A
+    // Scan of an LSI projecting name is allowed under an Allow over pk, sk and
+    // name, so the LSI's sort key is not in the key.
     let gsi = json!({"TableName": "i", "IndexName": "gsi1"});
     assert_eq!(
         single("Scan", &gsi, Some(&indexed_table())),
-        names(&["gpk", "gsk", "pk", "sk"])
+        names(&["pk", "sk"])
+    );
+    let projected = json!({
+        "TableName": "i",
+        "IndexName": "gsi1",
+        "ProjectionExpression": "#n",
+        "ExpressionAttributeNames": {"#n": "name"},
+    });
+    assert_eq!(
+        single("Scan", &projected, Some(&indexed_table())),
+        names(&["name", "pk", "sk"])
     );
     let lsi = json!({"TableName": "i", "IndexName": "lsi1"});
     assert_eq!(
         single("Scan", &lsi, Some(&indexed_table())),
-        names(&["lsk", "pk", "sk"])
+        names(&["pk", "sk"])
     );
     let unknown = json!({"TableName": "i", "IndexName": "nope"});
     assert_eq!(
         single("Scan", &unknown, Some(&indexed_table())),
         names(&["pk", "sk"])
+    );
+}
+
+#[test]
+fn a_later_page_of_an_index_scan_holds_the_index_keys_of_its_start_key() {
+    // Measured, on a later page: a Scan of a GSI or an LSI whose start key
+    // holds the table's and the index's key attributes is refused under an
+    // Allow whose ForAllValues list holds the table's keys, and under a Deny
+    // on the GSI's partition key or the LSI's sort key. The key holds the
+    // start key's names as written.
+    let gsi = json!({
+        "TableName": "i",
+        "IndexName": "gsi1",
+        "ExclusiveStartKey": {"pk": {"S": "a"}, "sk": {"S": "b"}, "gpk": {"S": "g"}, "gsk": {"S": "h"}},
+    });
+    assert_eq!(
+        single("Scan", &gsi, Some(&indexed_table())),
+        names(&["gpk", "gsk", "pk", "sk"])
+    );
+    let lsi = json!({
+        "TableName": "i",
+        "IndexName": "lsi1",
+        "ExclusiveStartKey": {"pk": {"S": "a"}, "sk": {"S": "b"}, "lsk": {"S": "l"}},
+    });
+    assert_eq!(
+        single("Scan", &lsi, Some(&indexed_table())),
+        names(&["lsk", "pk", "sk"])
     );
 }
 
@@ -466,7 +602,7 @@ fn an_expression_the_engine_refuses_gives_no_names() {
 // ---- batch and transaction requests ---------------------------------------
 
 #[test]
-fn batch_get_item_holds_every_key_and_the_projection_per_table() {
+fn batch_get_item_holds_the_key_schema_and_the_projection_per_table() {
     // Measured: BatchGetItem with ProjectionExpression=ssn matches a Deny on
     // ssn; with no projection it does not.
     let body = json!({
@@ -484,6 +620,32 @@ fn batch_get_item_holds_every_key_and_the_projection_per_table() {
         names(&["name", "pk"])
     );
     let body = json!({"Keys": [{"pk": {"S": "a"}}]});
+    assert_eq!(
+        batch_table_attributes("BatchGetItem", &body, Some(&hash_table()), &limits),
+        names(&["pk"])
+    );
+}
+
+#[test]
+fn batch_get_item_keys_add_no_names_of_their_own() {
+    // Measured: on a table that does not exist, a BatchGetItem whose only key
+    // names pk is answered ResourceNotFoundException under a Deny on pk, as a
+    // GetItem of the same key is. The names in Keys are not in the key; the
+    // table's key schema is, as for GetItem.
+    let limits = LimitsConfig::default();
+    let body = json!({"Keys": [{"pk": {"S": "a"}}, {"pk": {"S": "b"}}]});
+    assert_eq!(
+        batch_table_attributes("BatchGetItem", &body, None, &limits),
+        None
+    );
+    let body = json!({"Keys": [{"pk": {"S": "a"}}], "ProjectionExpression": "ssn"});
+    assert_eq!(
+        batch_table_attributes("BatchGetItem", &body, None, &limits),
+        names(&["ssn"])
+    );
+    // A key naming an attribute outside the key schema is refused by the
+    // engine; the key holds the schema, not the name.
+    let body = json!({"Keys": [{"pk": {"S": "a"}, "extra": {"S": "x"}}]});
     assert_eq!(
         batch_table_attributes("BatchGetItem", &body, Some(&hash_table()), &limits),
         names(&["pk"])
