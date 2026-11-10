@@ -20,10 +20,14 @@ use super::auth::authenticate_admin;
 use super::crypto::{
     encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
 };
-use extenddb_auth::policy::arn_value::holds_invalid_trust_arn_value;
+use extenddb_auth::policy::arn_value::{
+    fail_closed_trust_arn_value, invalid_trust_arn_value, trust_arn_value_message,
+};
 use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
-use extenddb_auth::policy::document::parse_conditions;
+use extenddb_auth::policy::document::{
+    Condition, PolicyDocument, PolicyParseError, parse_conditions,
+};
 
 #[derive(Deserialize)]
 pub struct AssumeRoleRequest {
@@ -123,6 +127,11 @@ pub async fn assume_role(
         )
             .into_response();
     }
+    if let Some(ref sp) = request.session_policy
+        && let Err(msg) = check_session_policy(sp)
+    {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
 
     // Load the role and its trust policy.
     let trust_policy = match state
@@ -139,16 +148,7 @@ pub async fn assume_role(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    // A trust policy stored before writes checked Arn condition values can hold
-    // one the check rejects. Its statement fails closed at evaluation; name the
-    // role so an operator can find the policy and rewrite it.
-    if let Some(v) = extenddb_auth::policy::arn_value::invalid_trust_arn_value(&trust_policy) {
-        tracing::warn!(
-            "trust policy of role {role_name} in account {account_id} holds Arn condition \
-             value {v:?}, which policy writes reject; its statement fails closed until the \
-             policy is rewritten"
-        );
-    }
+    warn_on_stored_trust_arn_value(&trust_policy, &role_name, &account_id);
 
     // Session tags passed on the call require sts:TagSession in the trust
     // policy, so the STS action set the decision checks depends on their
@@ -215,6 +215,62 @@ pub async fn assume_role(
         caller_arn,
     )
     .await
+}
+
+/// Refuse a session policy that does not load, or that holds an Arn condition
+/// value the identity write check refuses
+/// (`PolicyDocument::from_json_for_session_policy`), answering
+/// `MalformedPolicyDocument`, the error the STS API reference lists for a
+/// malformed policy document.
+///
+/// Before this check AssumeRole issued credentials for both. A session policy
+/// that does not load, such as one with a malformed CIDR, made every request
+/// with those credentials fail. A session policy with such an Arn value
+/// worked, and AssumeRole now refuses it for parity with the identity write
+/// check. The `Version` and `Sid` checks of a policy write do not apply, so a
+/// session policy that AssumeRole accepted for those keeps getting
+/// credentials. What STS answers for these session policies was not measured;
+/// the text after the code is ExtendDB's own.
+fn check_session_policy(session_policy: &Value) -> Result<(), String> {
+    PolicyDocument::from_json_for_session_policy(&session_policy.to_string())
+        .map(|_| ())
+        .map_err(|e| format!("MalformedPolicyDocument: {}", e.0))
+}
+
+/// A stored trust policy can hold an Arn condition value that fails its
+/// statement closed at evaluation: one stored before the trust write check,
+/// which that check now rejects, or a six-field value whose first field does
+/// not match `arn`, which the check accepts as IAM does. Log the role so an
+/// operator can find the policy and rewrite it. The value is read as the
+/// evaluator reads it ([`stored_trust_arn_value`]).
+fn warn_on_stored_trust_arn_value(trust_policy: &Value, role_name: &str, account_id: &str) {
+    if let Some((key, value)) = stored_trust_arn_value(trust_policy) {
+        tracing::warn!(
+            "trust policy of role {role_name} in account {account_id} holds Arn condition \
+             value {value:?} on {key}, so its statement fails closed until the policy is \
+             rewritten"
+        );
+    }
+}
+
+/// The first Arn condition value in a stored trust policy that fails its
+/// statement closed at evaluation (`arn_value::fail_closed_trust_arn_value`),
+/// with its key, read statement by statement as [`evaluate_conditions`] reads
+/// it ([`trust_conditions`]), or `None`.
+fn stored_trust_arn_value(trust_policy: &Value) -> Option<(String, String)> {
+    statements_vec(trust_policy)?.iter().find_map(|stmt| {
+        let conds = trust_conditions(&stmt["Condition"]).ok()?;
+        fail_closed_trust_arn_value(&conds).map(|(k, v)| (k.to_owned(), v.to_owned()))
+    })
+}
+
+/// A trust policy statement's `Condition` block as the trust evaluator reads
+/// it: each number or boolean as its JSON text
+/// ([`normalize_condition_scalars`]), then `parse_conditions`. The write check,
+/// the evaluator and its guard, and the AssumeRole warning all read Arn
+/// condition values through this.
+fn trust_conditions(condition: &Value) -> Result<Vec<Condition>, PolicyParseError> {
+    parse_conditions(&normalize_condition_scalars(condition))
 }
 
 /// Generate ASIA* credentials, encrypt, store session, and return the response.
@@ -551,12 +607,11 @@ fn evaluate_conditions(
     context: &AssumeRoleContext,
     version_2012: bool,
 ) -> ConditionOutcome {
-    let normalized = normalize_condition_scalars(&stmt["Condition"]);
-    match parse_conditions(&normalized) {
+    match trust_conditions(&stmt["Condition"]) {
         // An Arn condition value the trust write check rejects (fewer than six
         // fields) can only be a value stored before that check. It fails
         // closed like an unparseable block.
-        Ok(conds) if holds_invalid_trust_arn_value(&conds) => ConditionOutcome::Unparseable,
+        Ok(conds) if invalid_trust_arn_value(&conds).is_some() => ConditionOutcome::Unparseable,
         Ok(conds) => match evaluate_statement_conditions(&conds, version_2012, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
@@ -766,8 +821,8 @@ const STS_TRUST_ACTIONS: [&str; 3] = ["sts:assumerole", "sts:tagsession", "sts:s
 /// `Action`/`NotAction`; an action outside the STS trust set; a
 /// `Resource`/`NotResource` field; a `Condition` with an unknown operator
 /// or invalid structure; and an Arn condition value that does not split into
-/// six ARN fields, a number or boolean read as its text, whose error carries
-/// IAM's code and message. Accepts a missing `Version`, a single-object
+/// six ARN fields, a number or boolean read as its text. Accepts a missing
+/// `Version`, a single-object
 /// `Statement`, numeric condition values under other operators and unknown
 /// condition keys.
 pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> {
@@ -805,11 +860,21 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     // Measured on live IAM CreateRole and UpdateAssumeRolePolicy: an Arn
     // condition value that does not split into six ARN fields is rejected with
     // MalformedPolicyDocument and a message naming the value. A number or
-    // boolean is read as its text and rejected the same way. This error
-    // carries the service's code and message.
-    if let Some(msg) = extenddb_auth::policy::arn_value::trust_policy_arn_value_error(trust_policy)
-    {
-        return Err(msg);
+    // boolean is read as its text and rejected the same way. Each operator
+    // entry is read on its own, because this check accepts operators the
+    // evaluator does not parse, and IAM checks the Arn values beside them.
+    for stmt in &statements {
+        let Some(block) = stmt.get("Condition").and_then(Value::as_object) else {
+            continue;
+        };
+        for (op, keys) in block {
+            let entry = Value::Object(serde_json::Map::from_iter([(op.clone(), keys.clone())]));
+            if let Ok(conds) = trust_conditions(&entry)
+                && let Some((key, value)) = invalid_trust_arn_value(&conds)
+            {
+                return Err(trust_arn_value_message(key, value));
+            }
+        }
     }
     Ok(())
 }

@@ -13,8 +13,6 @@
 //! evaluation question was not measured, and [`arn_condition_match_tokens`]
 //! names it.
 
-use serde_json::Value;
-
 use super::document::{Condition, ConditionOperator, PolicyParseError, Statement, base_operator};
 use super::matcher::wildcard_match;
 use super::variables::{Token, match_tokens, split_fields};
@@ -29,22 +27,6 @@ pub fn is_arn_condition_operator(op: &ConditionOperator) -> bool {
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnLike
             | ConditionOperator::ArnNotLike
-    )
-}
-
-/// Whether the operator name `name`, as written in a policy document, is an
-/// Arn condition operator in any `ForAllValues:`, `ForAnyValue:` or `IfExists`
-/// form.
-#[must_use]
-pub fn is_arn_operator_name(name: &str) -> bool {
-    let base = name
-        .strip_prefix("ForAllValues:")
-        .or_else(|| name.strip_prefix("ForAnyValue:"))
-        .unwrap_or(name);
-    let base = base.strip_suffix("IfExists").unwrap_or(base);
-    matches!(
-        base,
-        "ArnEquals" | "ArnNotEquals" | "ArnLike" | "ArnNotLike"
     )
 }
 
@@ -248,23 +230,29 @@ pub fn is_valid_trust_arn_value(value: &str) -> bool {
     value.splitn(6, ':').count() == 6
 }
 
-/// The message the live service returns for a trust policy Arn condition
-/// value that [`is_valid_trust_arn_value`] rejects. The service's text holds
-/// `\n` and `\"` as two-character escapes, not as a newline and a bare quote;
-/// this returns the same characters.
+/// The write error for an Arn condition value on `key` in a role trust
+/// policy that [`is_valid_trust_arn_value`] rejects.
+///
+/// The live service answers `MalformedPolicyDocument` with the message
+/// `value used for ARN condition is incorrect type: STRING\nstring:
+/// \"<value>\"\n`, where `\n` and `\"` are two-character escapes because
+/// the service embeds JSON in a string, and a number or boolean shows as its
+/// JSON text. This text is ExtendDB's own; it names the key and the value.
 #[must_use]
-pub fn trust_arn_value_message(value: &str) -> String {
-    format!("value used for ARN condition is incorrect type: STRING\\nstring: \\\"{value}\\\"\\n")
+pub fn trust_arn_value_message(key: &str, value: &str) -> String {
+    format!("Arn condition on {key} holds {value:?}, which does not have the six fields of an ARN")
 }
 
 /// Reject an Arn condition value that the identity write check of the live
 /// service rejects ([`identity_arn_value_problem`]), or that ExtendDB does
 /// not accept ([`is_unmeasured_short_pattern`]).
 ///
-/// `PolicyDocument::from_json_for_write` runs this, so it applies when an
-/// identity policy, a permissions boundary or a session policy is written and
-/// not on the request path: a policy stored before the check keeps loading,
-/// and [`fails_closed_at_evaluation`] decides which of its values fail closed.
+/// `PolicyDocument::from_json_for_write` runs this when an identity policy or
+/// a permissions boundary is written, and
+/// `PolicyDocument::from_json_for_session_policy` runs it when AssumeRole
+/// receives a session policy. It does not run on the request path: a policy
+/// stored before the check keeps loading, and [`fails_closed_at_evaluation`]
+/// decides which of its values fail closed.
 /// Trust policies do not use this; they follow [`is_valid_trust_arn_value`].
 ///
 /// # Errors
@@ -299,75 +287,53 @@ pub(super) fn validate_statement_arn_values(
     Ok(())
 }
 
-/// Whether a trust policy statement's parsed conditions hold an Arn condition
-/// value that [`is_valid_trust_arn_value`] rejects. The trust evaluator treats
-/// such a statement as unparseable, so a Deny blocks and an Allow does not
-/// grant.
+/// The first Arn condition value in a role trust policy statement's parsed
+/// conditions that [`is_valid_trust_arn_value`] rejects, with its condition
+/// key, or `None`.
+///
+/// The trust write check and the trust evaluator's guard call this, and the
+/// AssumeRole warning calls [`fail_closed_trust_arn_value`], on conditions
+/// read the same way: each number or boolean as its JSON text, then
+/// `parse_conditions` (`assume_role::trust_conditions` in the server). The
+/// service rejected
+/// `123`, `true` and `1.5` under `ArnEquals` at `UpdateAssumeRolePolicy`
+/// (measured twice each on 2026-10-30), so a number or boolean, whose text
+/// never has six fields, is rejected too. The evaluator treats a statement
+/// holding such a value as unparseable, so a Deny blocks and an Allow does
+/// not grant.
 #[must_use]
-pub fn holds_invalid_trust_arn_value(conditions: &[Condition]) -> bool {
-    conditions.iter().any(|c| {
-        is_arn_condition_operator(&c.operator)
-            && c.values.iter().any(|v| !is_valid_trust_arn_value(v))
+pub fn invalid_trust_arn_value(conditions: &[Condition]) -> Option<(&str, &str)> {
+    first_arn_value(conditions, |v| !is_valid_trust_arn_value(v))
+}
+
+/// The first Arn condition value in a role trust policy statement's parsed
+/// conditions that fails the statement closed at evaluation, with its
+/// condition key, or `None`: a value [`invalid_trust_arn_value`] reports, or
+/// one [`fails_closed_at_evaluation`] reports.
+///
+/// The trust write check accepts a value of the second kind when it has six
+/// fields, such as `ARN:aws:iam::123456789012:user/x`, as IAM accepted that
+/// shape in a trust policy (2026-10-30). Such a value fails its statement
+/// closed on every AssumeRole call, so the AssumeRole warning names it too.
+#[must_use]
+pub fn fail_closed_trust_arn_value(conditions: &[Condition]) -> Option<(&str, &str)> {
+    first_arn_value(conditions, |v| {
+        !is_valid_trust_arn_value(v) || fails_closed_at_evaluation(v)
     })
 }
 
-/// The write error for a role trust policy holding an Arn condition value
-/// that [`is_valid_trust_arn_value`] rejects, or `None`.
-///
-/// A number or boolean is read as its JSON text, which never splits into six
-/// fields, so it is always rejected. The service rejected `123`, `true` and
-/// `1.5` under `ArnEquals` at `UpdateAssumeRolePolicy` (measured twice each on
-/// 2026-10-30), with that text in the message.
-#[must_use]
-pub fn trust_policy_arn_value_error(policy: &Value) -> Option<String> {
-    invalid_trust_arn_value(policy)
-        .map(|v| format!("MalformedPolicyDocument: {}", trust_arn_value_message(&v)))
-}
-
-/// The first Arn condition value in a role trust policy that
-/// [`is_valid_trust_arn_value`] rejects, read the way the trust evaluator reads
-/// it (a number or boolean as its JSON text), or `None`.
-#[must_use]
-pub fn invalid_trust_arn_value(policy: &Value) -> Option<String> {
-    trust_arn_values(policy)
-        .into_iter()
-        .find(|v| !is_valid_trust_arn_value(v))
-}
-
-/// Every scalar value under an Arn condition operator in a trust policy
-/// document, as text: a string as it is, a number or boolean as its JSON text.
-fn trust_arn_values(policy: &Value) -> Vec<String> {
-    let statements: Vec<&Value> = match &policy["Statement"] {
-        Value::Array(a) => a.iter().collect(),
-        v @ Value::Object(_) => vec![v],
-        _ => Vec::new(),
-    };
-    let mut out = Vec::new();
-    for stmt in statements {
-        let Some(block) = stmt["Condition"].as_object() else {
-            continue;
-        };
-        for (op, keys) in block {
-            let Some(keys) = keys.as_object().filter(|_| is_arn_operator_name(op)) else {
-                continue;
-            };
-            for v in keys.values() {
-                let items: Vec<&Value> = match v {
-                    Value::Array(a) => a.iter().collect(),
-                    other => vec![other],
-                };
-                for item in items {
-                    match item {
-                        Value::String(s) => out.push(s.clone()),
-                        Value::Number(n) => out.push(n.to_string()),
-                        Value::Bool(b) => out.push(b.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    out
+/// The first value under an Arn condition operator in `conditions` for which
+/// `pred` holds, with its condition key.
+fn first_arn_value(conditions: &[Condition], pred: impl Fn(&str) -> bool) -> Option<(&str, &str)> {
+    conditions
+        .iter()
+        .filter(|c| is_arn_condition_operator(&c.operator))
+        .find_map(|c| {
+            c.values
+                .iter()
+                .find(|v| pred(v))
+                .map(|v| (c.key.as_str(), v.as_str()))
+        })
 }
 
 #[cfg(test)]

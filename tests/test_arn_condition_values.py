@@ -88,12 +88,13 @@ TRUST_ACCEPTED = [
 ]
 
 
+TRUST_ERROR = "which does not have the six fields of an ARN"
+
+
 def _trust_error(value: Any) -> str:
-    # The service's text holds backslash escapes, not a newline and a quote,
-    # and shows a number or boolean as its JSON text.
+    # A number or boolean shows as its JSON text.
     text = value if isinstance(value, str) else json.dumps(value)
-    return ("MalformedPolicyDocument: value used for ARN condition is incorrect "
-            'type: STRING\\nstring: \\"' + text + '\\"\\n')
+    return f"Arn condition on aws:PrincipalArn holds {json.dumps(text)}, {TRUST_ERROR}"
 
 
 def _policy(*statements: dict) -> dict:
@@ -231,7 +232,32 @@ class TestArnValueWrites:
         if resp.status_code == 303:
             self.cleanup.callback(self.mgmt.delete_role, self.account_id, role)
         assert resp.status_code == 200, resp.status_code
-        assert "value used for ARN condition is incorrect type: STRING" in resp.text
+        assert TRUST_ERROR in resp.text
+
+    def test_assume_role_refuses_a_session_policy_the_write_check_refuses(self):
+        role = self._role()
+        caller = f"arn:aws:iam::{self.account_id}:user/alice"
+        for value in ["", "*:aws:iam:*", "arn:aws:iam::${aws:PrincipalAccount}:user/a"]:
+            resp = self.mgmt.assume_role(self.account_id, role, caller, "s1",
+                                         session_policy=_policy(_stmt("Allow", "ArnLike", value)))
+            assert resp.status_code == 400, f"{value!r}: {resp.status_code} {resp.text}"
+            assert resp.text.startswith("MalformedPolicyDocument: " + IDENTITY_ERROR), resp.text
+        cidr = _policy(_stmt("Allow"))
+        cidr["Statement"][0]["Condition"] = {"IpAddress": {"aws:SourceIp": "nope"}}
+        resp = self.mgmt.assume_role(self.account_id, role, caller, "s1", session_policy=cidr)
+        assert resp.status_code == 400, f"cidr: {resp.status_code} {resp.text}"
+        assert resp.text.startswith("MalformedPolicyDocument: malformed CIDR"), resp.text
+        # A policy write refuses this Sid and this Version; AssumeRole accepted
+        # both before its session policy check, and still does.
+        sid = _policy(_stmt("Allow", "ArnLike", "arn:aws:iam:*"))
+        sid["Statement"][0]["Sid"] = "Read-Only"
+        version = _policy(_stmt("Allow"))
+        version["Version"] = "2020-01-01"
+        for label, session_policy in [("arn", _policy(_stmt("Allow", "ArnLike", "arn:aws:iam:*"))),
+                                      ("sid", sid), ("version", version)]:
+            resp = self.mgmt.assume_role(self.account_id, role, caller, "s1",
+                                         session_policy=session_policy)
+            assert resp.status_code == 201, f"{label}: {resp.status_code} {resp.text}"
 
 
 class TestShortValuesOnTheRequestPath:

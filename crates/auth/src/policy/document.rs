@@ -210,6 +210,27 @@ impl PolicyDocument {
         super::arn_value::validate_statement_arn_values(&doc.statements)?;
         Ok(doc)
     }
+
+    /// Parse the session policy of an AssumeRole call and apply the Arn
+    /// condition value check of a policy write
+    /// (`arn_value::validate_statement_arn_values`).
+    ///
+    /// Everything `from_json` checks, so a session policy that would not load
+    /// on the request path is refused when the session is issued. The
+    /// `Version` and `Sid` checks of `from_json_for_write` do not run: a
+    /// session policy with another `Version` or such a `Sid` loads and
+    /// evaluates on the request path, and AssumeRole accepted one before. What
+    /// STS answers for these session policies was not measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document or an
+    /// Arn condition value fails the write check.
+    pub fn from_json_for_session_policy(json: &str) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json(json)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
+        Ok(doc)
+    }
 }
 
 /// Unwrap a condition operator to its base, dropping any `ForAllValues:` /

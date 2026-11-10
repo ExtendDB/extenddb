@@ -148,10 +148,10 @@ fn trust_check_rejects_what_the_service_rejected() {
 }
 
 #[test]
-fn trust_message_matches_the_service_text() {
+fn trust_message_names_the_key_and_the_value() {
     assert_eq!(
-        trust_arn_value_message("arn:aws:iam:*"),
-        r#"value used for ARN condition is incorrect type: STRING\nstring: \"arn:aws:iam:*\"\n"#
+        trust_arn_value_message("aws:PrincipalArn", "arn:aws:iam:*"),
+        r#"Arn condition on aws:PrincipalArn holds "arn:aws:iam:*", which does not have the six fields of an ARN"#
     );
 }
 
@@ -273,30 +273,6 @@ fn matcher_compares_a_short_pattern_with_the_context_first_field() {
         "arn:aws",
         "foo:aws:iam::964157134968:role/r"
     ));
-}
-
-#[test]
-fn operator_names_cover_every_form() {
-    for name in [
-        "ArnEquals",
-        "ArnNotEquals",
-        "ArnLike",
-        "ArnNotLike",
-        "ForAnyValue:ArnLike",
-        "ForAllValues:ArnNotEquals",
-        "ArnNotLikeIfExists",
-        "ForAnyValue:ArnEqualsIfExists",
-    ] {
-        assert!(is_arn_operator_name(name), "{name}");
-    }
-    for name in [
-        "StringEquals",
-        "ArnEqualsX",
-        "arnequals",
-        "ForAnyValue:StringLike",
-    ] {
-        assert!(!is_arn_operator_name(name), "{name}");
-    }
 }
 
 fn identity_doc(effect: &str, op: &str, value: &serde_json::Value) -> String {
@@ -472,77 +448,68 @@ fn from_json_leaves_other_operators_alone() {
 #[test]
 fn trust_conditions_with_a_short_value_are_flagged() {
     let short = parse_conditions(&json!({"ArnNotEquals": {"aws:PrincipalArn": "*"}})).unwrap();
-    assert!(holds_invalid_trust_arn_value(&short));
+    assert_eq!(
+        invalid_trust_arn_value(&short),
+        Some(("aws:PrincipalArn", "*"))
+    );
     let wrapped = parse_conditions(
-        &json!({"ForAnyValue:ArnLikeIfExists": {"aws:PrincipalArn": ["arn:aws:iam:*"]}}),
+        &json!({"ForAnyValue:ArnLikeIfExists": {"aws:SourceArn": ["arn:aws:iam:*"]}}),
     )
     .unwrap();
-    assert!(holds_invalid_trust_arn_value(&wrapped));
+    assert_eq!(
+        invalid_trust_arn_value(&wrapped),
+        Some(("aws:SourceArn", "arn:aws:iam:*"))
+    );
     let full = parse_conditions(
         &json!({"ArnNotEquals": {"aws:PrincipalArn": "arn::dynamodb:us-east-1:123456789012:table/t"}}),
     )
     .unwrap();
-    assert!(!holds_invalid_trust_arn_value(&full));
+    assert_eq!(invalid_trust_arn_value(&full), None);
     let other = parse_conditions(&json!({"StringEquals": {"aws:PrincipalArn": "*"}})).unwrap();
-    assert!(!holds_invalid_trust_arn_value(&other));
-}
-
-fn trust_doc(condition: &serde_json::Value) -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
-             "Action": "sts:AssumeRole"},
-            {"Effect": "Deny", "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
-             "Action": "sts:AssumeRole", "Condition": condition}
-        ]
-    })
+    assert_eq!(invalid_trust_arn_value(&other), None);
 }
 
 #[test]
-fn trust_write_error_carries_the_service_code_and_message() {
-    let doc = trust_doc(
-        &json!({"ArnNotEquals": {"aws:PrincipalArn": ["arn:aws:iam::123456789012:user/a", "*"]}}),
-    );
+fn the_session_policy_check_runs_the_arn_check_and_not_the_version_or_sid_check() {
+    let doc = |version: &str, sid: &str, value: &str| {
+        json!({"Version": version, "Statement": [{
+            "Sid": sid, "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+            "Condition": {"ArnLike": {"aws:PrincipalArn": value}}}]})
+        .to_string()
+    };
+    let other = doc("2020-01-01", "Read-Only", "arn:aws:iam:*");
+    assert!(PolicyDocument::from_json_for_write(&other).is_err());
+    assert!(PolicyDocument::from_json_for_session_policy(&other).is_ok());
+    let err = PolicyDocument::from_json_for_session_policy(&doc("2012-10-17", "", ""))
+        .expect_err("an empty Arn value is refused");
     assert_eq!(
-        trust_policy_arn_value_error(&doc).as_deref(),
-        Some(
-            r#"MalformedPolicyDocument: value used for ARN condition is incorrect type: STRING\nstring: \"*\"\n"#
-        )
+        err.0,
+        r#"Arn condition on aws:PrincipalArn holds "": its first field does not match arn"#
     );
-    let ok = trust_doc(&json!({"ArnNotEquals": {"aws:PrincipalArn": "*:*:*:*:*:*"}}));
-    assert_eq!(trust_policy_arn_value_error(&ok), None);
+    assert!(
+        PolicyDocument::from_json_for_session_policy(&doc("2012-10-17", "", "*:aws:iam:*"))
+            .is_err()
+    );
 }
 
 #[test]
-fn trust_write_check_reads_a_number_or_boolean_as_its_text() {
-    // `UpdateAssumeRolePolicy` rejected 123, true and 1.5 under `ArnEquals`,
-    // twice each, with the value's text in the message.
-    for (value, text) in [
-        (json!(123), "123"),
-        (json!(true), "true"),
-        (json!(1.5), "1.5"),
-        (json!(["arn:aws:iam::123456789012:user/a", 123]), "123"),
-    ] {
-        let doc = trust_doc(&json!({"ArnEquals": {"aws:PrincipalArn": value}}));
-        assert_eq!(
-            trust_policy_arn_value_error(&doc),
-            Some(format!(
-                r#"MalformedPolicyDocument: value used for ARN condition is incorrect type: STRING\nstring: \"{text}\"\n"#
-            )),
-            "{text}"
-        );
-        assert_eq!(invalid_trust_arn_value(&doc).as_deref(), Some(text));
-    }
-}
-
-#[test]
-fn stored_trust_value_scan_reads_a_single_statement_object() {
-    let doc = json!({"Statement": {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
-        "Action": "sts:AssumeRole", "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:iam"}}}});
+fn a_trust_value_that_fails_closed_at_evaluation_is_found() {
+    let value = "ARN:aws:iam::123456789012:user/x";
+    let first_field =
+        parse_conditions(&json!({"ArnNotEquals": {"aws:PrincipalArn": value}})).unwrap();
+    assert_eq!(invalid_trust_arn_value(&first_field), None);
     assert_eq!(
-        invalid_trust_arn_value(&doc).as_deref(),
-        Some("arn:aws:iam")
+        fail_closed_trust_arn_value(&first_field),
+        Some(("aws:PrincipalArn", value))
     );
-    assert_eq!(invalid_trust_arn_value(&json!({"Statement": []})), None);
+    let short = parse_conditions(&json!({"ArnLike": {"aws:SourceArn": "arn:aws:iam:*"}})).unwrap();
+    assert_eq!(
+        fail_closed_trust_arn_value(&short),
+        Some(("aws:SourceArn", "arn:aws:iam:*"))
+    );
+    let full = parse_conditions(
+        &json!({"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::123456789012:user/x"}}),
+    )
+    .unwrap();
+    assert_eq!(fail_closed_trust_arn_value(&full), None);
 }

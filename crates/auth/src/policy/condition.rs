@@ -240,8 +240,10 @@ pub fn evaluate_condition_match(
     // IAM gives no decision to match for these values: the IAM policy
     // simulator refuses a value with a variable and too few fields
     // (`InvalidInput`, and IAM Access Analyzer reports `MISSING_ARN_FIELD`),
-    // IAM's write check refuses a value whose first field is not `arn`, and
-    // the short wildcard pattern was not measured. Failing closed makes a
+    // IAM's identity policy write check refuses a value whose first field is
+    // not `arn` (a role trust policy write accepts one of six fields, and how
+    // IAM evaluates it there was not measured), and the short wildcard
+    // pattern was not measured. Failing closed makes a
     // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
     // fields whatever the document's `Version`, so the rule does not read
     // `version_2012`.
