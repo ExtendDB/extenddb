@@ -212,11 +212,15 @@ const FEDERATED: &str = "arn:aws:sts::123456789012:federated-user/carol";
 /// which has five fields. How IAM evaluates such a value was not measured.
 const QUOTED_COLON: &str = "arn:aws:iam::${aws:PrincipalAccount, '}:'}";
 
-/// For `ArnLike` and `ArnNotLike` and for each effect, `GetItem` by bob and by
-/// the federated user, both in account 123456789012, under a document with
-/// `Version` `version` that holds the effect gated on the operator with
-/// `value`. A `Deny` comes with an unconditional `Allow`.
-fn by_caller(version: &str, value: &str) -> Vec<(&'static str, &'static str, [AuthzDecision; 2])> {
+/// For `ArnLike` and `ArnNotLike` and for each effect, `GetItem` in each of
+/// the request contexts `contexts` under a document with `Version` `version`
+/// that holds the effect gated on the operator with `value`. A `Deny` comes
+/// with an unconditional `Allow`.
+fn by_context<const N: usize>(
+    version: &str,
+    value: &str,
+    contexts: &[Ctx; N],
+) -> Vec<(&'static str, &'static str, [AuthzDecision; N])> {
     let mut rows = Vec::new();
     for operator in ["ArnLike", "ArnNotLike"] {
         for effect in ["Allow", "Deny"] {
@@ -227,23 +231,31 @@ fn by_caller(version: &str, value: &str) -> Vec<(&'static str, &'static str, [Au
             let policy = parse(&format!(
                 r#"{{"Version":"{version}","Statement":[{statements}]}}"#
             ));
-            let decisions = [BOB, FEDERATED].map(|caller| {
-                let ctx = Ctx::empty()
-                    .with(PRINCIPAL, vec![caller])
-                    .with("aws:PrincipalAccount", vec!["123456789012"]);
+            let decisions = contexts.each_ref().map(|ctx| {
                 evaluate_policies(
                     std::slice::from_ref(&policy),
                     None,
                     None,
                     "dynamodb:GetItem",
                     TABLE,
-                    &ctx,
+                    ctx,
                 )
             });
             rows.push((operator, effect, decisions));
         }
     }
     rows
+}
+
+/// [`by_context`] for bob and for the federated user, both in account
+/// 123456789012.
+fn by_caller(version: &str, value: &str) -> Vec<(&'static str, &'static str, [AuthzDecision; 2])> {
+    let contexts = [BOB, FEDERATED].map(|caller| {
+        Ctx::empty()
+            .with(PRINCIPAL, vec![caller])
+            .with("aws:PrincipalAccount", vec!["123456789012"])
+    });
+    by_context(version, value, &contexts)
 }
 
 #[test]
@@ -281,6 +293,65 @@ fn a_value_whose_quoted_default_holds_a_colon_is_compared_as_written_in_a_2008_d
             ("ArnLike", "Deny", [allow, allow]),
             ("ArnNotLike", "Allow", [allow, allow]),
             ("ArnNotLike", "Deny", [deny, deny]),
+        ]
+    );
+}
+
+/// A value whose first field is a variable with the default `arn`. It has
+/// five written `:`, so expanded it has six fields. With no `kind` tag, or
+/// with `kind` `arn`, it is `arn:aws:iam::123456789012:user/*`, which matches
+/// bob. How IAM evaluates an expanded value whose first field holds a
+/// variable was not measured.
+const VARIABLE_FIRST: &str = "${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*";
+
+/// [`by_context`] for bob with no `kind` tag, with `kind` `arn` and with
+/// `kind` `x`.
+fn by_kind(version: &str, value: &str) -> Vec<(&'static str, &'static str, [AuthzDecision; 3])> {
+    let contexts = [None, Some("arn"), Some("x")].map(|kind| {
+        let ctx = Ctx::empty().with(PRINCIPAL, vec![BOB]);
+        match kind {
+            Some(kind) => ctx.with("aws:PrincipalTag/kind", vec![kind]),
+            None => ctx,
+        }
+    });
+    by_context(version, value, &contexts)
+}
+
+#[test]
+fn a_value_whose_first_field_is_a_variable_fails_closed_when_expanded() {
+    // The write check refuses the value, whose first field is `${aws`, so
+    // only a policy stored before the check holds it. Its condition fails
+    // closed under both operators and both effects, for the two tags whose
+    // expansion matches bob and for one whose expansion does not.
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+        gated("Allow", "ArnLike", VARIABLE_FIRST)
+    );
+    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    let closed = [AuthzDecision::Deny; 3];
+    assert_eq!(
+        by_kind("2012-10-17", VARIABLE_FIRST),
+        [
+            ("ArnLike", "Allow", closed),
+            ("ArnLike", "Deny", closed),
+            ("ArnNotLike", "Allow", closed),
+            ("ArnNotLike", "Deny", closed),
+        ]
+    );
+}
+
+#[test]
+fn a_value_whose_first_field_is_a_variable_is_compared_as_written_in_a_2008_document() {
+    // A `2008-10-17` document expands no variable, so the first field is the
+    // text `${aws`, which no ARN holds, whatever the tag.
+    let (allow, deny) = (AuthzDecision::Allow, AuthzDecision::Deny);
+    assert_eq!(
+        by_kind("2008-10-17", VARIABLE_FIRST),
+        [
+            ("ArnLike", "Allow", [deny; 3]),
+            ("ArnLike", "Deny", [allow; 3]),
+            ("ArnNotLike", "Allow", [allow; 3]),
+            ("ArnNotLike", "Deny", [deny; 3]),
         ]
     );
 }

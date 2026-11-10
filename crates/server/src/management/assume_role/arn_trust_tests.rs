@@ -19,6 +19,7 @@ use super::{
     check_session_policy, stored_trust_arn_value, trust_decision, trust_decision_for,
     validate_trust_policy, warn_on_stored_trust_arn_value,
 };
+use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::PolicyDocument;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -386,14 +387,16 @@ const FEDERATED: &str = "arn:aws:sts::123456789012:federated-user/carol";
 /// IAM evaluates such a value was not measured.
 const QUOTED_COLON: &str = "arn:aws:iam::${aws:PrincipalAccount, '}:'}";
 
-/// For `ArnLike` and `ArnNotLike` and for each effect, whether alice and the
-/// federated user, both in account 123456789012, may assume a role whose
-/// trust policy holds the effect gated on the operator with `value`, with
+/// For `ArnLike` and `ArnNotLike` and for each effect, whether each caller of
+/// `callers`, an ARN with its request context, may assume a role whose trust
+/// policy holds the effect gated on the operator with `value`, with
 /// `Version` `2012-10-17` when `version_2012` holds and `2008-10-17`
 /// otherwise. A `Deny` comes with an unconditional `Allow`.
-fn by_caller(version_2012: bool, value: &str) -> Vec<(&'static str, &'static str, [bool; 2])> {
-    let mut federated = ctx();
-    federated.principal_arn = FEDERATED.to_owned();
+fn by_context<const N: usize>(
+    version_2012: bool,
+    value: &str,
+    callers: &[(&str, AssumeRoleContext); N],
+) -> Vec<(&'static str, &'static str, [bool; N])> {
     let mut rows = Vec::new();
     for op in ["ArnLike", "ArnNotLike"] {
         for effect in ["Allow", "Deny"] {
@@ -403,14 +406,25 @@ fn by_caller(version_2012: bool, value: &str) -> Vec<(&'static str, &'static str
             } else {
                 vec![gated]
             };
-            let decisions = [
-                trust_decision_for(&statements, CALLER, &ctx(), false, version_2012),
-                trust_decision_for(&statements, FEDERATED, &federated, false, version_2012),
-            ];
+            let decisions = callers.each_ref().map(|(arn, context)| {
+                trust_decision_for(&statements, arn, context, false, version_2012)
+            });
             rows.push((op, effect, decisions));
         }
     }
     rows
+}
+
+/// [`by_context`] for alice and for the federated user, both in account
+/// 123456789012.
+fn by_caller(version_2012: bool, value: &str) -> Vec<(&'static str, &'static str, [bool; 2])> {
+    let mut federated = ctx();
+    federated.principal_arn = FEDERATED.to_owned();
+    by_context(
+        version_2012,
+        value,
+        &[(CALLER, ctx()), (FEDERATED, federated)],
+    )
 }
 
 #[test]
@@ -451,6 +465,79 @@ fn a_value_whose_quoted_default_holds_a_colon_is_compared_as_written_in_a_2008_d
             ("ArnLike", "Deny", [true, true]),
             ("ArnNotLike", "Allow", [true, true]),
             ("ArnNotLike", "Deny", [false, false]),
+        ]
+    );
+    assert_eq!(stored_trust_arn_value(&d), None);
+}
+
+/// A value whose first field is a variable with the default `arn`. The trust
+/// write check sees six fields. The value has five written `:`, so expanded
+/// it has six fields. With no `kind` tag, or with `kind` `arn`, it is
+/// `arn:aws:iam::123456789012:user/*`, which matches alice. How IAM evaluates
+/// an expanded value whose first field holds a variable was not measured.
+const VARIABLE_FIRST: &str = "${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*";
+
+/// [`by_context`] for alice with no `kind` tag, with `kind` `arn` and with
+/// `kind` `x`.
+fn by_kind(version_2012: bool, value: &str) -> Vec<(&'static str, &'static str, [bool; 3])> {
+    let callers = [None, Some("arn"), Some("x")].map(|kind| {
+        let mut context = ctx();
+        if let Some(kind) = kind {
+            context
+                .principal_tags
+                .insert("kind".to_owned(), kind.to_owned());
+        }
+        (CALLER, context)
+    });
+    by_context(version_2012, value, &callers)
+}
+
+#[test]
+fn a_value_whose_first_field_is_a_variable_fails_closed_when_expanded() {
+    // The trust write check accepts the value. Its statement fails closed
+    // under both operators and both effects, for the two tags whose expansion
+    // matches alice and for one whose expansion does not, and the AssumeRole
+    // warning names it.
+    let d = doc(&[stmt(
+        "Allow",
+        "*",
+        Some(arn_cond("ArnLike", VARIABLE_FIRST)),
+    )]);
+    assert_eq!(validate_trust_policy(&d), Ok(()));
+    let closed = [false; 3];
+    assert_eq!(
+        by_kind(true, VARIABLE_FIRST),
+        [
+            ("ArnLike", "Allow", closed),
+            ("ArnLike", "Deny", closed),
+            ("ArnNotLike", "Allow", closed),
+            ("ArnNotLike", "Deny", closed),
+        ]
+    );
+    assert_eq!(
+        stored_trust_arn_value(&d),
+        Some(("aws:PrincipalArn".to_owned(), VARIABLE_FIRST.to_owned()))
+    );
+}
+
+#[test]
+fn a_value_whose_first_field_is_a_variable_is_compared_as_written_in_a_2008_document() {
+    // A `2008-10-17` trust policy expands no variable, so the first field is
+    // the text `${aws`, which no caller's ARN holds, whatever the tag.
+    let mut d = doc(&[stmt(
+        "Allow",
+        "*",
+        Some(arn_cond("ArnLike", VARIABLE_FIRST)),
+    )]);
+    d["Version"] = json!("2008-10-17");
+    assert_eq!(validate_trust_policy(&d), Ok(()));
+    assert_eq!(
+        by_kind(false, VARIABLE_FIRST),
+        [
+            ("ArnLike", "Allow", [false; 3]),
+            ("ArnLike", "Deny", [true; 3]),
+            ("ArnNotLike", "Allow", [true; 3]),
+            ("ArnNotLike", "Deny", [false; 3]),
         ]
     );
     assert_eq!(stored_trust_arn_value(&d), None);

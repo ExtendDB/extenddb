@@ -420,12 +420,16 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
             "{v:?}"
         );
     }
-    // Values whose expansion has two to five fields fail closed only where
-    // they are expanded. The write check refuses each.
+    // Values whose expansion has two to five fields, and values whose first
+    // field holds a variable and whose expansion has six fields, fail closed
+    // only where they are expanded. Compared as written, a first field that
+    // holds `${` matches no ARN. The write check refuses each.
     for v in [
         "arn:aws:iam::${aws:PrincipalAccount, '}:'}",
         "*:${x, '}::::'}",
         "arn:aws:iam::${}:}",
+        "${x}:aws:iam::123456789012:user/alice",
+        "${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*",
     ] {
         assert!(fails_closed_at_evaluation(v, true), "{v:?}");
         assert!(!fails_closed_at_evaluation(v, false), "{v:?}");
