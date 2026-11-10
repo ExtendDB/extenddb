@@ -119,6 +119,22 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         return Err(overflow_err());
     }
 
+    // The small side mirrors it: an underflow is reported before the digits
+    // are counted when the exponent of the normalized form is below i64::MIN.
+    // Measured with the forty digits `1234567890123456789012345678901234567891`
+    // after the point, where each fraction zero before them lowers that
+    // exponent by one: `.0<digits>E-9223372036854775808` and
+    // `.00<digits>E-9223372036854775807` (i64::MIN - 1),
+    // `.00<digits>E-9223372036854775808` (i64::MIN - 2) and the same with
+    // forty zeros (i64::MIN - 40) are underflows, while
+    // `.<digits>E-9223372036854775808`, `.0<digits>E-9223372036854775807` and
+    // `.00<digits>E-9223372036854775806` (i64::MIN) are too many digits, as is
+    // `<digits>E-9223372036854775808` (i64::MIN + 40). The answers are the
+    // same with 39 digits and with a minus sign.
+    if normalized_exponent_is_below_i64(magnitude_exp) {
+        return Err(underflow_err());
+    }
+
     if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
         return Err(too_many_digits_err());
     }
@@ -155,6 +171,18 @@ fn digit_count(digits: &str) -> i128 {
 /// at `i64::MAX` and `i64::MAX + 1`, and with the zero `0E9223372036854775807`.
 fn normalized_exponent_exceeds_i64(magnitude_exp: i128) -> bool {
     magnitude_exp + 1 > i128::from(i64::MAX)
+}
+
+/// Whether the exponent of the normalized form `0.d * 10^n`, which is the
+/// given order of magnitude plus one, is below `i64::MIN`. `DynamoDB` answers
+/// such a nonzero value with an underflow before it counts the digits.
+/// Measured with forty digits, with 39 digits and with a minus sign at
+/// normalized exponents of `i64::MIN - 1`, `i64::MIN - 2` and `i64::MIN - 40`,
+/// against `i64::MIN` and `i64::MIN + 40`, which get the digit count. A zero
+/// takes the other path in the caller: its exponent is range checked, and a
+/// zero this far down is an underflow there as well.
+fn normalized_exponent_is_below_i64(magnitude_exp: i128) -> bool {
+    magnitude_exp + 1 < i128::from(i64::MIN)
 }
 
 /// Refuse an order of magnitude outside `DynamoDB`'s supported range.
