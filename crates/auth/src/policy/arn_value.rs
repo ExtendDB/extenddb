@@ -19,12 +19,6 @@ use super::document::{Condition, ConditionOperator, PolicyParseError, Statement,
 use super::matcher::wildcard_match;
 use super::variables::{Token, match_tokens, split_fields};
 
-/// Code and message the live service returns when an identity policy or a
-/// permissions boundary holds an Arn condition value that
-/// [`is_valid_identity_arn_value`] rejects.
-pub const IDENTITY_ARN_VALUE_ERROR: &str =
-    "MalformedPolicyDocument: The policy failed legacy parsing";
-
 /// Whether `op` is an Arn condition operator, in any `ForAllValues:`,
 /// `ForAnyValue:` or `IfExists` form.
 #[must_use]
@@ -125,10 +119,12 @@ pub fn arn_condition_match_tokens(pattern: &[Token], arn: &str) -> bool {
     }
 }
 
-/// Whether `value` passes the check the live service applies to an Arn
-/// condition value when an identity policy or a permissions boundary is
-/// written (measured with `CreatePolicy` and `PutRolePolicy`; the service
-/// calls it legacy parsing).
+/// Why the check the live service applies to an Arn condition value when an
+/// identity policy or a permissions boundary is written rejects `value`, or
+/// `None` when it accepts it (measured with `CreatePolicy` and
+/// `PutRolePolicy`). The service answers `MalformedPolicyDocument` with the
+/// message "The policy failed legacy parsing"; the text returned here is
+/// ExtendDB's own and names the field.
 ///
 /// The value is split on `:` into at most six fields. It is rejected when the
 /// first field does not match `arn` under `*` and `?` wildcards (case
@@ -160,25 +156,86 @@ pub fn arn_condition_match_tokens(pattern: &[Token], arn: &str) -> bool {
 /// counting the fields on every `:` and counting them on the written `:`
 /// give six fields or the same number.
 #[must_use]
-pub fn is_valid_identity_arn_value(value: &str) -> bool {
+pub fn identity_arn_value_problem(value: &str) -> Option<String> {
+    const NAMES: [&str; 5] = ["first", "partition", "service", "region", "account"];
     let fields: Vec<&str> = value.splitn(6, ':').collect();
     if !wildcard_match(fields[0], "arn") {
-        return false;
+        return Some("its first field does not match arn".to_owned());
     }
-    if fields.get(1).is_some_and(|f| f.is_empty()) || fields.get(2).is_some_and(|f| f.is_empty()) {
-        return false;
+    for i in [1, 2] {
+        if fields.get(i).is_some_and(|f| f.is_empty()) {
+            return Some(format!("its {} field is empty", NAMES[i]));
+        }
+    }
+    for (name, field) in NAMES.iter().zip(&fields).skip(1) {
+        if field.contains('/') {
+            return Some(format!("its {name} field holds /"));
+        }
+        if field.contains("${") {
+            return Some(format!("its {name} field holds a policy variable"));
+        }
     }
     if fields
         .get(2)
         .is_some_and(|f| f.bytes().any(|b| b.is_ascii_uppercase()))
     {
-        return false;
+        return Some("its service field holds an upper-case letter".to_owned());
     }
-    !fields
-        .iter()
-        .take(5)
-        .skip(1)
-        .any(|f| f.contains('/') || f.contains("${"))
+    None
+}
+
+/// Whether `value` passes the identity write check of the live service
+/// ([`identity_arn_value_problem`]).
+#[must_use]
+pub fn is_valid_identity_arn_value(value: &str) -> bool {
+    identity_arn_value_problem(value).is_none()
+}
+
+/// Whether `value` is a pattern of two to five `:`-separated fields whose
+/// first field holds a `*` or `?`, other than `*:*`.
+///
+/// Identity policy writes on the live service accept such a pattern
+/// (measured: `*:aws:iam:*`, `a*:aws:iam:*`, `ar?:aws:iam` and
+/// `*:aws:iam::<account>`), but how the service evaluates one was not
+/// measured. Neither answer is safe to assume: no match would let a `Deny` on
+/// `ArnLike` that the service applies stop applying, and a match would let an
+/// `Allow` on `ArnNotLike` that the service grants stop granting, or the
+/// reverse for the other operator. So ExtendDB refuses such a value at write,
+/// a deviation from the service, and a stored one fails its condition closed
+/// ([`fails_closed_at_evaluation`]). `*:*` was measured to match nothing, and
+/// it is accepted and evaluated so.
+#[must_use]
+pub fn is_unmeasured_short_pattern(value: &str) -> bool {
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    (2..=5).contains(&fields.len()) && fields[0].contains(['*', '?']) && value != "*:*"
+}
+
+/// Whether the Arn condition value `value` makes its condition fail closed at
+/// evaluation, whatever the request: a `Deny` holding it applies and an
+/// `Allow` holding it does not grant.
+///
+/// That holds for a value that has no meaning as an ARN pattern, and for one
+/// whose evaluation on the live service was not measured:
+///
+/// - a value that holds `${` and has fewer than five `:` written outside its
+///   `${...}` references ([`super::variables::arn_value_lacks_fields`]);
+/// - a value whose first field does not match `arn` under `*` and `?`
+///   wildcards, `""` included, since no ARN starts that way;
+/// - a value that [`is_unmeasured_short_pattern`] reports.
+///
+/// An identity policy write rejects each of these, so in an identity policy,
+/// boundary or session policy one can only be stored from before the write
+/// check. The other values that the write check rejects, such as
+/// `arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}` (a variable in
+/// the account field) or an empty partition, keep evaluating as written, so a
+/// policy stored before the check loads and decides as it did. The first two
+/// kinds can occur in a role trust policy too, whose write check accepts
+/// every value of six fields.
+#[must_use]
+pub fn fails_closed_at_evaluation(value: &str) -> bool {
+    super::variables::arn_value_lacks_fields(value)
+        || !wildcard_match(value.split(':').next().unwrap_or_default(), "arn")
+        || is_unmeasured_short_pattern(value)
 }
 
 /// Whether `value` passes the check the live service applies to an Arn
@@ -200,18 +257,20 @@ pub fn trust_arn_value_message(value: &str) -> String {
     format!("value used for ARN condition is incorrect type: STRING\\nstring: \\\"{value}\\\"\\n")
 }
 
-/// Reject an Arn condition value that [`is_valid_identity_arn_value`] rejects.
+/// Reject an Arn condition value that the identity write check of the live
+/// service rejects ([`identity_arn_value_problem`]), or that ExtendDB does
+/// not accept ([`is_unmeasured_short_pattern`]).
 ///
-/// `PolicyDocument::from_json` runs this on the identity-policy write path and
-/// on the request path. At write the caller gets the service's code and
-/// message. On the request path a stored policy holding such a value no longer
-/// parses, so the request it governs is denied whether the statement is an
-/// Allow or a Deny: the same fail-closed path as a malformed CIDR. Trust
-/// policies do not use `from_json`; they follow [`is_valid_trust_arn_value`].
+/// `PolicyDocument::from_json_for_write` runs this, so it applies when an
+/// identity policy, a permissions boundary or a session policy is written and
+/// not on the request path: a policy stored before the check keeps loading,
+/// and [`fails_closed_at_evaluation`] decides which of its values fail closed.
+/// Trust policies do not use this; they follow [`is_valid_trust_arn_value`].
 ///
 /// # Errors
 ///
-/// Returns `PolicyParseError` naming the condition key and the value.
+/// Returns `PolicyParseError` naming the condition key, the value and what is
+/// wrong with it.
 pub(super) fn validate_statement_arn_values(
     statements: &[Statement],
 ) -> Result<(), PolicyParseError> {
@@ -220,22 +279,24 @@ pub(super) fn validate_statement_arn_values(
             if !is_arn_condition_operator(&cond.operator) {
                 continue;
             }
-            if let Some(v) = cond.values.iter().find(|v| !is_valid_identity_arn_value(v)) {
-                return Err(PolicyParseError(format!(
-                    "{IDENTITY_ARN_VALUE_ERROR} (Arn condition on {} holds {v:?})",
-                    cond.key
-                )));
+            for v in &cond.values {
+                let problem = identity_arn_value_problem(v).or_else(|| {
+                    is_unmeasured_short_pattern(v).then(|| {
+                        "ExtendDB does not accept a value of two to five fields whose first \
+                         field holds a wildcard"
+                            .to_owned()
+                    })
+                });
+                if let Some(problem) = problem {
+                    return Err(PolicyParseError(format!(
+                        "Arn condition on {} holds {v:?}: {problem}",
+                        cond.key
+                    )));
+                }
             }
         }
     }
     Ok(())
-}
-
-/// Whether `e` is the error `PolicyDocument::from_json` returns for an Arn
-/// condition value that [`is_valid_identity_arn_value`] rejects.
-#[must_use]
-pub fn is_arn_value_error(e: &PolicyParseError) -> bool {
-    e.0.starts_with(IDENTITY_ARN_VALUE_ERROR)
 }
 
 /// Whether a trust policy statement's parsed conditions hold an Arn condition

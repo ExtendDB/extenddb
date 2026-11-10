@@ -313,7 +313,7 @@ fn identity_doc(effect: &str, op: &str, value: &serde_json::Value) -> String {
 }
 
 #[test]
-fn from_json_rejects_a_bad_value_under_every_operator_form_and_effect() {
+fn the_write_check_rejects_a_bad_value_under_every_operator_form_and_effect() {
     for op in [
         "ArnEquals",
         "ArnNotEquals",
@@ -325,23 +325,136 @@ fn from_json_rejects_a_bad_value_under_every_operator_form_and_effect() {
         "ArnNotLikeIfExists",
     ] {
         for effect in ["Allow", "Deny"] {
-            let err = PolicyDocument::from_json(&identity_doc(effect, op, &json!("")))
-                .expect_err("empty value must not parse");
-            assert!(
-                err.0.starts_with(IDENTITY_ARN_VALUE_ERROR),
-                "{op} {effect}: {err}"
+            let doc = identity_doc(effect, op, &json!(""));
+            let err = PolicyDocument::from_json_for_write(&doc)
+                .expect_err("empty value must not be written");
+            assert_eq!(
+                err.0,
+                r#"Arn condition on aws:PrincipalArn holds "": its first field does not match arn"#,
+                "{op} {effect}"
             );
-            assert!(err.0.contains("aws:PrincipalArn"), "{err}");
+            // A stored one still loads; its condition fails closed instead.
+            assert!(PolicyDocument::from_json(&doc).is_ok(), "{op} {effect}");
         }
     }
 }
 
 #[test]
-fn from_json_rejects_a_list_holding_one_bad_value() {
+fn the_write_check_rejects_a_list_holding_one_bad_value() {
     let value = json!(["arn:aws:iam::123456789012:user/alice", "foo:*"]);
-    let err = PolicyDocument::from_json(&identity_doc("Allow", "ArnNotEquals", &value))
-        .expect_err("list with a bad value must not parse");
+    let doc = identity_doc("Allow", "ArnNotEquals", &value);
+    let err = PolicyDocument::from_json_for_write(&doc)
+        .expect_err("list with a bad value must not be written");
     assert!(err.0.contains("\"foo:*\""), "{err}");
+    assert!(PolicyDocument::from_json(&doc).is_ok());
+}
+
+#[test]
+fn the_write_check_names_what_is_wrong() {
+    for (value, problem) in [
+        ("b*", "its first field does not match arn"),
+        ("arn::", "its partition field is empty"),
+        ("arn:aws:", "its service field is empty"),
+        (
+            "arn:aws/x:iam::123456789012:root",
+            "its partition field holds /",
+        ),
+        (
+            "arn:${aws:username}:iam::123456789012:root",
+            "its partition field holds a policy variable",
+        ),
+        ("arn:*:role/x", "its service field holds /"),
+        (
+            "arn:aws:dynamodb:${aws:RequestedRegion}:123456789012:table/t",
+            "its region field holds a policy variable",
+        ),
+        (
+            "arn:aws:iam::${aws:PrincipalAccount}:user/alice",
+            "its account field holds a policy variable",
+        ),
+        (
+            "arn:aws:IAM::123456789012:root",
+            "its service field holds an upper-case letter",
+        ),
+    ] {
+        assert_eq!(
+            identity_arn_value_problem(value).as_deref(),
+            Some(problem),
+            "{value:?}"
+        );
+    }
+    assert_eq!(identity_arn_value_problem("arn:aws:iam:*"), None);
+}
+
+/// Accepted by `CreatePolicy` or `PutRolePolicy`, 2026-10-30; how the
+/// service evaluates them was not measured.
+const UNMEASURED_SHORT: &[&str] = &[
+    "*:aws:iam:*",
+    "a*:aws:iam:*",
+    "ar?:aws:iam",
+    "*:aws:iam::123456789012",
+];
+
+#[test]
+fn a_short_pattern_with_a_wildcard_first_field_is_refused_at_write() {
+    for v in UNMEASURED_SHORT {
+        assert!(is_valid_identity_arn_value(v), "the service accepts {v:?}");
+        assert!(is_unmeasured_short_pattern(v), "{v:?}");
+        let err = PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
+            .expect_err("refused at write");
+        assert_eq!(
+            err.0,
+            format!(
+                "Arn condition on aws:PrincipalArn holds {v:?}: ExtendDB does not accept a value \
+                 of two to five fields whose first field holds a wildcard"
+            )
+        );
+    }
+    // `*:*` was measured to match nothing, and the six-field and one-field
+    // wildcard values were measured too.
+    for v in ["*:*", "*", "a*", "*:*:*:*:*:*", "arn:*"] {
+        assert!(!is_unmeasured_short_pattern(v), "{v:?}");
+        assert!(
+            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
+                .is_ok(),
+            "{v:?}"
+        );
+    }
+}
+
+#[test]
+fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
+    for v in [
+        "",
+        "foo:*",
+        "b*",
+        "ARN:aws:iam::123456789012:user/alice",
+        "${aws:PrincipalArn}",
+        "arn:aws:iam::${aws:PrincipalAccount}",
+        "*:aws:iam:*",
+        "ar?:aws:iam",
+    ] {
+        assert!(fails_closed_at_evaluation(v), "{v:?}");
+        // Each is one the write check refuses.
+        assert!(
+            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
+                .is_err(),
+            "{v:?}"
+        );
+    }
+    for v in [
+        "*",
+        "*:*",
+        "a*",
+        "arn:aws:iam:*",
+        "arn::dynamodb:us-east-1:123456789012:table/t",
+        "arn:*:role/x",
+        "arn:aws:IAM::123456789012:root",
+        "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}",
+        "arn:aws:iam::123456789012:user/${aws:username}",
+    ] {
+        assert!(!fails_closed_at_evaluation(v), "{v:?}");
+    }
 }
 
 #[test]

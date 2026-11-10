@@ -177,7 +177,6 @@ impl PolicyDocument {
         let version = raw["Version"].as_str().map(ToOwned::to_owned);
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
-        super::arn_value::validate_statement_arn_values(&statements)?;
         Ok(Self {
             version,
             statements,
@@ -188,22 +187,27 @@ impl PolicyDocument {
     /// a managed or boundary policy) and apply the checks the service applies
     /// only when a policy is written.
     ///
-    /// Everything `from_json` checks, plus the `Version` value and the `Sid`
-    /// charset. Both run at write only, so a policy stored before either check
-    /// existed keeps parsing on the request path rather than failing the
-    /// principal closed: a `Sid` is a label that does not affect evaluation,
-    /// and a stored document with another `Version` matches its `Resource`
-    /// patterns as written, as it did before.
+    /// Everything `from_json` checks, plus the `Version` value, the `Sid`
+    /// charset and the Arn condition values
+    /// (`arn_value::validate_statement_arn_values`). All three run at write
+    /// only, so a policy stored before a check existed keeps parsing on the
+    /// request path rather than failing the principal closed: a `Sid` is a
+    /// label that does not affect evaluation, a stored document with another
+    /// `Version` matches its `Resource` patterns as written, as it did before,
+    /// and a stored Arn value evaluates as written unless it is one of the
+    /// values `arn_value::fails_closed_at_evaluation` fails closed.
     ///
     /// # Errors
     ///
     /// Returns `PolicyParseError` if `from_json` rejects the document, its
-    /// `Version` is not `2012-10-17` or `2008-10-17`, or a statement `Sid` is
-    /// outside the service's charset.
+    /// `Version` is not `2012-10-17` or `2008-10-17`, a statement `Sid` is
+    /// outside the service's charset, or an Arn condition value fails the
+    /// write check.
     pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
         let doc = Self::from_json(json)?;
         super::variables::validate_version(json)?;
         validate_statement_sids(&doc.statements)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
         Ok(doc)
     }
 }

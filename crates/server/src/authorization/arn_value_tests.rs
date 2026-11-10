@@ -5,11 +5,14 @@
 //!
 //! A value that policy writes reject (the live service rejects it with
 //! `MalformedPolicyDocument`) can only be one stored before ExtendDB checked
-//! it. The policy then fails to load and the request is denied, whether the
-//! statement holding the value is an Allow or a Deny, the same as a stored
-//! malformed CIDR, and the one line logged for the denial names the policy's
-//! owner. A value the write check accepts is evaluated the way the live
-//! service evaluated it on 2026-10-30.
+//! it. The policy still loads. A value with no meaning as an ARN pattern, or
+//! a short pattern whose evaluation by IAM was not measured, fails its
+//! condition closed: a Deny holding it applies and an Allow holding it does
+//! not grant. Any other such value evaluates as written. A value the write
+//! check accepts is evaluated the way the live service evaluated it on
+//! 2026-10-30. A policy that does not load, such as one with a malformed
+//! CIDR, denies the request, and the one line logged for the denial names
+//! the policy's owner.
 
 use super::check_user_authorization;
 use crate::authz_cache::CachedAuthzStore;
@@ -26,13 +29,24 @@ const TABLE: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/t";
 /// The denial a policy that fails to load produces.
 const LOAD_DENIED: &str = "Not authorized to perform this action (policy evaluation error)";
 
-/// Values the service rejected at `CreatePolicy` or `PutRolePolicy`.
-const REJECTED: [&str; 5] = [
+/// Values the service rejected at `CreatePolicy` or `PutRolePolicy` that no
+/// ARN can match, and a short pattern whose evaluation was not measured.
+const FAIL_CLOSED: [&str; 4] = [
     "",
-    "arn::dynamodb:us-east-1:123456789012:table/t",
     "foo:*",
-    "arn:*:role/x",
-    "arn:aws:iam::${aws:PrincipalAccount}:user/u",
+    "ARN:aws:iam::123456789012:user/u",
+    "*:aws:iam:*",
+];
+
+/// Values the service rejected at write that ExtendDB evaluates as written,
+/// with whether `ArnEquals` holds for user `u`.
+const EVALUATED: [(&str, bool); 3] = [
+    ("arn::dynamodb:us-east-1:123456789012:table/t", false),
+    ("arn:*:role/x", false),
+    (
+        "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}",
+        true,
+    ),
 ];
 
 fn allow_if(op: &str, value: &str) -> String {
@@ -147,64 +161,85 @@ fn denied_at_load(r: &Result<(), DynamoDbError>) -> bool {
 }
 
 #[tokio::test]
-async fn stored_rejected_value_under_an_allow_denies() {
-    // Before the write and load checks each of these Allows granted: the
-    // negated condition held for every caller.
+async fn stored_value_with_no_meaning_fails_closed_under_an_allow() {
+    // On main each of these Allows granted: the negated condition held for
+    // every caller. The policy loads, and the condition fails closed.
     for op in ["ArnNotEquals", "ArnNotLike", "ArnNotEqualsIfExists"] {
-        for v in REJECTED {
+        for v in FAIL_CLOSED {
             let r = get_item(allow_if(op, v), None).await;
-            assert!(denied_at_load(&r), "{op} {v:?}: {r:?}");
+            assert!(r.is_err(), "{op} {v:?}: {r:?}");
+            assert!(!denied_at_load(&r), "{op} {v:?}: {r:?}");
         }
     }
 }
 
 #[tokio::test]
-async fn stored_rejected_value_under_a_deny_denies() {
-    // Before the write and load checks none of these Denys applied, so the
-    // Allow granted.
+async fn stored_value_with_no_meaning_fails_closed_under_a_deny() {
+    // On main none of these Denys applied, so the Allow granted.
     for op in ["ArnEquals", "ArnLike", "ForAnyValue:ArnLike"] {
-        for v in REJECTED {
+        for v in FAIL_CLOSED {
             let r = get_item(allow_all_deny_if(op, v), None).await;
-            assert!(denied_at_load(&r), "{op} {v:?}: {r:?}");
+            assert!(r.is_err(), "{op} {v:?}: {r:?}");
+            assert!(!denied_at_load(&r), "{op} {v:?}: {r:?}");
         }
     }
 }
 
 #[tokio::test]
-async fn stored_rejected_value_in_a_boundary_denies() {
+async fn stored_value_iam_rejects_at_write_otherwise_loads_and_evaluates() {
+    // The "only me" shape and the others load and decide as written.
+    for (v, matches_u) in EVALUATED {
+        let r = get_item(allow_if("ArnEquals", v), None).await;
+        assert_eq!(r.is_ok(), matches_u, "ArnEquals {v:?}: {r:?}");
+        let r = get_item(allow_if("ArnNotEquals", v), None).await;
+        assert_eq!(r.is_ok(), !matches_u, "ArnNotEquals {v:?}: {r:?}");
+        let r = get_item(allow_all_deny_if("ArnEquals", v), None).await;
+        assert_eq!(r.is_ok(), !matches_u, "Deny ArnEquals {v:?}: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn stored_value_in_a_boundary_follows_the_same_rules() {
     let all = allow_all_deny_if("ArnEquals", "arn:aws:iam::123456789012:user/nobody");
     let r = get_item(all.clone(), Some(allow_if("ArnNotEquals", ""))).await;
-    assert!(denied_at_load(&r), "{r:?}");
+    assert!(r.is_err() && !denied_at_load(&r), "{r:?}");
+    let only_me = "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}";
+    let r = get_item(all.clone(), Some(allow_if("ArnEquals", only_me))).await;
+    assert!(r.is_ok(), "{r:?}");
     let r = get_item(all, Some(allow_if("ArnNotEquals", "arn:aws:dynamodb:*"))).await;
     assert!(r.is_ok(), "{r:?}");
 }
 
+/// A policy that does not load: its CIDR is malformed.
+fn bad_cidr() -> String {
+    json!({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": "*",
+        "Condition": {"IpAddress": {"aws:SourceIp": "not-a-cidr"}}}]})
+    .to_string()
+}
+
 #[tokio::test]
-async fn stored_rejected_value_logs_one_line_naming_the_owner() {
-    let (r, lines) = logged(|| get_item(allow_if("ArnNotEquals", ""), None)).await;
+async fn a_policy_that_does_not_load_logs_one_line_naming_the_owner() {
+    let (r, lines) = logged(|| get_item(bad_cidr(), None)).await;
     assert!(denied_at_load(&r), "{r:?}");
     assert_eq!(lines.len(), 1, "{lines:#?}");
     assert!(
         lines[0].contains(
-            "an inline policy of user u in account 123456789012 holds an Arn condition value \
-             that policy writes reject"
+            "policy parse failed: an inline policy of user u in account 123456789012: policy \
+             parse error: malformed CIDR"
         ),
-        "{lines:#?}"
-    );
-    assert!(
-        lines[0].contains(r#"Arn condition on aws:PrincipalArn holds """#),
         "{lines:#?}"
     );
 }
 
 #[tokio::test]
-async fn stored_rejected_value_in_a_group_policy_names_the_group() {
+async fn a_group_policy_that_does_not_load_names_the_group() {
     // The user's own policy is valid; the group's policy is not.
     let store = || {
         let s = store_for(allow_if("ArnNotEquals", "arn:aws:dynamodb:*"), None);
         s.user_group_policies.lock().unwrap().insert(
             (ACCOUNT.to_owned(), "u".to_owned()),
-            vec![("g".to_owned(), allow_all_deny_if("ArnEquals", "foo:*"))],
+            vec![("g".to_owned(), bad_cidr())],
         );
         s
     };
@@ -213,8 +248,8 @@ async fn stored_rejected_value_in_a_group_policy_names_the_group() {
     assert_eq!(lines.len(), 1, "{lines:#?}");
     assert!(
         lines[0].contains(
-            "an inline policy of group g in account 123456789012 (user u is a member) holds an \
-             Arn condition value that policy writes reject"
+            "an inline policy of group g in account 123456789012 (user u is a member): policy \
+             parse error"
         ),
         "{lines:#?}"
     );

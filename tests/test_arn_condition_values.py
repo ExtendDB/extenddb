@@ -9,9 +9,12 @@ pull request for issue #665.
   whose first ``:`` field does not match ``arn``, whose partition or service
   field is empty, whose partition, service, region or account field holds
   ``/`` or ``${``, or whose service field holds an upper-case letter, with
-  MalformedPolicyDocument "The policy failed legacy parsing".
-  They accepted the values in IDENTITY_ACCEPTED, including values shorter
-  than an ARN.
+  MalformedPolicyDocument "The policy failed legacy parsing". ExtendDB
+  rejects the same values with its own message, which names the condition
+  key, the value and the field. They accepted the values in
+  IDENTITY_ACCEPTED, including values shorter than an ARN, and the values in
+  UNMEASURED_SHORT, whose evaluation was not measured and which ExtendDB
+  refuses at write.
 - Role trust policies (CreateRole, UpdateAssumeRolePolicy) reject a value that
   does not split into six ``:`` fields, a JSON number or boolean included,
   with a message naming the value. They accepted every six-field value tried,
@@ -41,7 +44,8 @@ from botocore.exceptions import ClientError
 from management_helpers import ManagementClient
 from test_console_integration import ConsoleClient
 
-IDENTITY_ERROR = "MalformedPolicyDocument: The policy failed legacy parsing"
+IDENTITY_ERROR = "Arn condition on aws:PrincipalArn holds"
+SHORT_REFUSED = "ExtendDB does not accept a value of two to five fields"
 
 OPERATORS = ["ArnEquals", "ArnNotEquals", "ArnLike", "ArnNotLike",
              "ForAnyValue:ArnLike", "ArnNotLikeIfExists"]
@@ -69,6 +73,8 @@ IDENTITY_ACCEPTED = [
     "arn:aws:dynamodb:us-east-1:123456789012:table/a:b",
     "arn:aws:iam::123456789012:user/${aws:username}",
 ]
+
+UNMEASURED_SHORT = ["*:aws:iam:*", "a*:aws:iam:*", "ar?:aws:iam", "*:aws:iam::123456789012"]
 
 # A JSON number or boolean is read as its text, which never has six fields.
 TRUST_REJECTED: list[Any] = ["*", "", "arn:aws:dynamodb:us-east-1:123456789012",
@@ -179,6 +185,11 @@ class TestArnValueWrites:
             doc = _policy(_stmt("Allow", "ArnNotEquals", value))
             resp = self.mgmt.put_user_policy(self.account_id, user, "p", doc)
             assert resp.status_code == 204, f"{value!r}: {resp.status_code} {resp.text}"
+        for value in UNMEASURED_SHORT:
+            doc = _policy(_stmt("Deny", "ArnLike", value))
+            resp = self.mgmt.put_user_policy(self.account_id, user, "p", doc)
+            self._rejected(resp, f"{value!r}")
+            assert SHORT_REFUSED in resp.text, f"{value!r}: {resp.text}"
 
     def test_every_identity_write_path_rejects(self):
         bad = _policy(_stmt("Deny", "ArnEquals", "arn::dynamodb:us-east-1:123456789012:table/t"))

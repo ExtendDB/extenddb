@@ -96,3 +96,107 @@ fn a_pattern_with_a_variable_follows_the_rules_of_one_written_in_full() {
     assert!(!holds("ArnEquals", "*", &tags));
     assert!(holds("ArnNotLike", "*", &tags));
 }
+
+/// `GetItem` under `statements` for a request context `ctx`.
+fn decide(statements: &str, ctx: &Ctx) -> AuthzDecision {
+    let policy = parse(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#
+    ));
+    evaluate_policies(&[policy], None, None, "dynamodb:GetItem", TABLE, ctx)
+}
+
+/// One statement with `effect` on `dynamodb:GetItem` and `*` that holds when
+/// `operator` on `aws:PrincipalArn` holds for `value`.
+fn gated(effect: &str, operator: &str, value: &str) -> String {
+    format!(
+        r#"{{"Effect":"{effect}","Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{{"{operator}":{{"{PRINCIPAL}":"{value}"}}}}}}"#
+    )
+}
+
+const ALLOW_ALL: &str = r#"{"Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}"#;
+
+#[test]
+fn the_only_me_policy_loads_and_evaluates_as_written() {
+    // IAM rejects this value at write (the variable's own `:` puts `${aws` in
+    // the account field), so ExtendDB refuses it at write too. A policy
+    // stored before that check loads and matches the caller's own ARN.
+    let value = "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}";
+    let statement = gated("Allow", "ArnEquals", value);
+    let json = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
+    assert!(PolicyDocument::from_json_for_write(&json).is_err());
+    let caller = |user: &str| {
+        Ctx::empty()
+            .with(PRINCIPAL, vec![BOB])
+            .with("aws:PrincipalAccount", vec!["123456789012"])
+            .with("aws:username", vec![user])
+    };
+    assert_eq!(decide(&statement, &caller("bob")), AuthzDecision::Allow);
+    assert_eq!(decide(&statement, &caller("alice")), AuthzDecision::Deny);
+    let deny = format!("{ALLOW_ALL},{}", gated("Deny", "ArnEquals", value));
+    assert_eq!(decide(&deny, &caller("bob")), AuthzDecision::Deny);
+    assert_eq!(decide(&deny, &caller("alice")), AuthzDecision::Allow);
+}
+
+#[test]
+fn a_tag_value_holding_a_star_does_not_widen_the_account_field() {
+    let value = "arn:aws:iam::${aws:PrincipalTag/acct}:user/bob";
+    assert!(!holds("ArnLike", value, &[("acct", "*")]));
+    assert!(holds("ArnNotLike", value, &[("acct", "*")]));
+    assert!(holds("ArnLike", value, &[("acct", "123456789012")]));
+    assert_eq!(
+        get("Deny", "ArnNotEquals", value, &[("acct", "*")]),
+        AuthzDecision::Deny
+    );
+}
+
+#[test]
+fn a_tag_value_holding_a_colon_does_not_add_fields() {
+    // Three written fields and a variable: the tag's `:` would make the
+    // expanded text bob's six-field ARN. Only a written `:` separates fields,
+    // so the value has too few fields and its condition fails closed.
+    let value = "arn:aws:${aws:PrincipalTag/svc}";
+    let tags = [("svc", "iam::123456789012:user/bob")];
+    for op in OPERATORS {
+        assert!(!holds(op, value, &tags), "{op}");
+        assert_eq!(get("Deny", op, value, &tags), AuthzDecision::Deny, "{op}");
+    }
+}
+
+#[test]
+fn a_stored_value_with_no_meaning_fails_closed() {
+    // Values the write check refuses that no ARN can match, and a short
+    // pattern with a wildcard in its first field, whose evaluation by IAM was
+    // not measured: a Deny holding one applies and an Allow does not grant,
+    // under the positive and the negative operators.
+    for value in [
+        "",
+        "foo:*",
+        "ARN:aws:iam::123456789012:user/bob",
+        "*:aws:iam:*",
+        "ar?:aws:iam",
+    ] {
+        for op in OPERATORS {
+            assert!(!holds(op, value, &[]), "{op} {value:?}");
+            assert_eq!(
+                get("Deny", op, value, &[]),
+                AuthzDecision::Deny,
+                "{op} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stored_value_iam_rejects_at_write_otherwise_evaluates_as_written() {
+    // An empty partition and `/` in the service field match no ARN, as on
+    // main, so the negative operators hold for them.
+    for value in [
+        "arn::iam::123456789012:user/bob",
+        "arn:*:role/x",
+        "arn:aws:IAM:*",
+    ] {
+        assert!(!holds("ArnLike", value, &[]), "{value:?}");
+        assert!(holds("ArnNotLike", value, &[]), "{value:?}");
+    }
+}

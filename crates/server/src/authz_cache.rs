@@ -26,7 +26,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use extenddb_auth::policy::arn_value::is_arn_value_error;
 use extenddb_auth::policy::document::PolicyDocument;
 use extenddb_cache::{Loader, SwrCache, SwrCacheConfig};
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData};
@@ -985,18 +984,11 @@ fn parse_documents(
 
 /// Parse one stored policy. The error names `owner`, the principal the policy
 /// belongs to, and `authorization.rs` logs it as the one line for the denied
-/// request, so an operator can find the policy and rewrite it. For a policy
-/// holding an Arn condition value that policy writes reject, the error says so.
+/// request, so an operator can find the policy and rewrite it.
 fn parse_document(s: &str, owner: &dyn fmt::Display) -> OpResult<Arc<PolicyDocument>> {
-    PolicyDocument::from_json(s).map(Arc::new).map_err(|e| {
-        let why = if is_arn_value_error(&e) {
-            " holds an Arn condition value that policy writes reject, so every request it \
-             governs is denied until it is rewritten"
-        } else {
-            ""
-        };
-        OpError::Internal(format!("policy parse failed: {owner}{why}: {e}"))
-    })
+    PolicyDocument::from_json(s)
+        .map(Arc::new)
+        .map_err(|e| OpError::Internal(format!("policy parse failed: {owner}: {e}")))
 }
 
 #[cfg(test)]

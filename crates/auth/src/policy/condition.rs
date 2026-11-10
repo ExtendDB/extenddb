@@ -9,7 +9,7 @@
 
 use super::context::ConditionContext;
 use super::document::{Condition, ConditionOperator, base_operator};
-use super::variables::{ConditionValue, arn_value_lacks_fields};
+use super::variables::ConditionValue;
 
 /// Evaluate a single condition against a context.
 ///
@@ -196,9 +196,12 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve, or has an `Arn*` value that contains `${` and cannot
-    /// have the six fields of an ARN, which IAM refuses in a document of any
-    /// `Version`. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that
+    /// [`super::arn_value::fails_closed_at_evaluation`] reports: one that
+    /// contains `${` and cannot have the six fields of an ARN, which IAM
+    /// refuses in a document of any `Version`, one whose first field does not
+    /// match `arn`, or a short pattern whose evaluation by IAM was not
+    /// measured. The statement fails closed.
     Unresolvable,
 }
 
@@ -215,9 +218,12 @@ pub enum ConditionMatch {
 /// holds; a `Resource` pattern of that shape does not. Where the value is not
 /// expanded it is compared as written and reads no key. It also returns
 /// `Unresolvable`, whatever `version_2012` says, when a value of an `Arn*`
-/// operator, with or without a set qualifier or `IfExists`, contains `${` and
-/// has fewer than five `:` written outside its `${...}` references, such as
-/// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from
+/// operator, with or without a set qualifier or `IfExists`, is one that
+/// [`super::arn_value::fails_closed_at_evaluation`] reports: it contains `${`
+/// and has fewer than five `:` written outside its `${...}` references, such
+/// as `${aws:ResourceTag/owner}`, its first field does not match `arn`, such
+/// as `""`, or it is a short pattern with a wildcard in its first field, such
+/// as `*:aws:iam:*`. Otherwise returns `Match` or `NoMatch` from
 /// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
 /// as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
@@ -231,18 +237,24 @@ pub fn evaluate_condition_match(
     {
         return ConditionMatch::Unresolvable;
     }
-    // The IAM policy simulator refuses a policy with such an ARN value
-    // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
-    // IAM gives no decision to match. Failing closed makes a `Deny` apply and
-    // keeps an `Allow` from granting. IAM checks the value's fields whatever
-    // the document's `Version`, so the rule does not read `version_2012`.
+    // IAM gives no decision to match for these values: the IAM policy
+    // simulator refuses a value with a variable and too few fields
+    // (`InvalidInput`, and IAM Access Analyzer reports `MISSING_ARN_FIELD`),
+    // IAM's write check refuses a value whose first field is not `arn`, and
+    // the short wildcard pattern was not measured. Failing closed makes a
+    // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
+    // fields whatever the document's `Version`, so the rule does not read
+    // `version_2012`.
     if matches!(
         base_operator(&condition.operator),
         ConditionOperator::ArnEquals
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnLike
             | ConditionOperator::ArnNotLike
-    ) && condition.values.iter().any(|v| arn_value_lacks_fields(v))
+    ) && condition
+        .values
+        .iter()
+        .any(|v| super::arn_value::fails_closed_at_evaluation(v))
     {
         return ConditionMatch::Unresolvable;
     }
