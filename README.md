@@ -41,6 +41,28 @@ cargo build --release
 
 # Use with any AWS SDK (TLS with self-signed cert — trust via AWS_CA_BUNDLE)
 export AWS_CA_BUNDLE=~/.extenddb/tls/cert.pem
+
+# Requests must be signed with an access key this server issued. Create an IAM
+# user, attach a policy that allows DynamoDB, and create an access key for the
+# user, with the admin password that init printed. manage reads the password
+# from EXTENDDB_PASSWORD, which keeps it out of the shell history and the
+# process list. list-accounts prints the account_id of the default account
+# that init created.
+read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD   # the admin password, not echoed
+./target/release/extenddb manage --user admin list-accounts
+./target/release/extenddb manage --user admin \
+    create-user --account-id <account-id> --user-name quickstart
+./target/release/extenddb manage --user admin \
+    put-user-policy --account-id <account-id> --user-name quickstart \
+    --policy-name FullAccess \
+    --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"dynamodb:*","Resource":"*"}]}'
+./target/release/extenddb manage --user admin \
+    create-access-key --account-id <account-id> --user-name quickstart
+unset EXTENDDB_PASSWORD
+
+# Set the access_key_id and secret_access_key that create-access-key printed
+export AWS_ACCESS_KEY_ID=<access-key-id>
+export AWS_SECRET_ACCESS_KEY=<secret-access-key>
 aws dynamodb list-tables --endpoint-url https://127.0.0.1:18443 --region us-east-1
 ```
 
@@ -173,8 +195,8 @@ extenddb init --catalog-db extenddb_catalog \
 # Health check
 curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/health
 
-# JSON metrics (DynamoDB CloudWatch-style)
-curl --cacert ~/.extenddb/tls/cert.pem https://127.0.0.1:18443/metrics
+# JSON metrics (DynamoDB CloudWatch-style), admin credentials required
+curl --cacert ~/.extenddb/tls/cert.pem -u admin:<admin-password> https://127.0.0.1:18443/metrics
 
 # Syslog (Linux)
 journalctl -t extenddb -f
