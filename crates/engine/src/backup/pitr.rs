@@ -432,6 +432,8 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
 
 #[cfg(feature = "pitr")]
 mod capture;
+#[cfg(feature = "pitr")]
+mod restore;
 
 #[cfg(test)]
 mod tests;
