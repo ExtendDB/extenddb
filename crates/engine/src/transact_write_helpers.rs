@@ -266,10 +266,25 @@ pub(crate) fn validate_client_request_token(token: &str) -> Result<(), DynamoDbE
 /// `TransactItems` array, followed by the request's `ReturnConsumedCapacity`
 /// and `ReturnItemCollectionMetrics` values. The service compares those two
 /// fields on a token replay and treats an absent field as `NONE`, so each
-/// field contributes to the hash only when it is not `NONE`. A request with
-/// neither field, or with both set to `NONE`, hashes the items alone, which
-/// is the value stored by earlier versions; tokens stored before this change
-/// still replay. The keyed hash prevents an attacker from crafting a
+/// field contributes to the hash only when it is not `NONE`. An
+/// `ExecuteTransaction` write calls `handle_transact_write_items` with its
+/// `ReturnConsumedCapacity`, so this fingerprint decides its replays too.
+///
+/// Versions before this change hashed the items alone. A retry replays only
+/// when its fingerprint equals the stored one, and a token expires after 10
+/// minutes, so for 10 minutes after an upgrade or a downgrade:
+/// - A token stored for a request with neither field, or with both set to
+///   `NONE`, has the same fingerprint in both versions. An identical retry
+///   replays in both directions.
+/// - A token that an earlier version stored for a request with `TOTAL`,
+///   `INDEXES` or `SIZE` answers `IdempotentParameterMismatchException` to an
+///   identical retry on this version. A retry without the field replays.
+/// - A token that this version stored for a request with `TOTAL`, `INDEXES`
+///   or `SIZE` answers `IdempotentParameterMismatchException` to every retry
+///   on an earlier version. This includes an identical retry and a retry
+///   without the field.
+///
+/// The keyed hash prevents an attacker from crafting a
 /// different request body that produces the same fingerprint for a given token.
 /// The result is truncated to 16 hex chars (64 bits) for storage efficiency
 /// while remaining collision-resistant for the idempotency use case.
