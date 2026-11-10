@@ -184,6 +184,9 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                // Reached only with a row deleted: a missing item returned above.
+                #[cfg(feature = "pitr")]
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, key, None, None).await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(
@@ -236,32 +239,46 @@ impl PostgresEngine {
                     Ok(None)
                 }
             } else {
-                let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
                 super::gsi_build::pause_before_autocommit_statement().await;
-                match &sk {
-                    SortKeyValue::S(s) => {
-                        sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
-                            .bind(s)
-                            .execute(&self.data_pool)
-                            .await
+                // Item history, when the table records it and an item was
+                // deleted, in the same statement as the write.
+                #[cfg(feature = "pitr")]
+                crate::pitr::autocommit_delete(
+                    &self.data_pool,
+                    key_info,
+                    pk_text.as_ref(),
+                    Some(&sk),
+                )
+                .await?;
+                #[cfg(not(feature = "pitr"))]
+                {
+                    let delete_sql =
+                        format!("DELETE FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2");
+                    match &sk {
+                        SortKeyValue::S(s) => {
+                            sqlx::query(&delete_sql)
+                                .bind(pk_text.as_ref())
+                                .bind(s)
+                                .execute(&self.data_pool)
+                                .await
+                        }
+                        SortKeyValue::N(n) => {
+                            sqlx::query(&delete_sql)
+                                .bind(pk_text.as_ref())
+                                .bind(n)
+                                .execute(&self.data_pool)
+                                .await
+                        }
+                        SortKeyValue::B(b) => {
+                            sqlx::query(&delete_sql)
+                                .bind(pk_text.as_ref())
+                                .bind(b)
+                                .execute(&self.data_pool)
+                                .await
+                        }
                     }
-                    SortKeyValue::N(n) => {
-                        sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
-                            .bind(n)
-                            .execute(&self.data_pool)
-                            .await
-                    }
-                    SortKeyValue::B(b) => {
-                        sqlx::query(&delete_sql)
-                            .bind(pk_text.as_ref())
-                            .bind(b)
-                            .execute(&self.data_pool)
-                            .await
-                    }
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
                 }
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
                 self.fix_up_autocommit(stamp, key_info, key).await;
                 Ok(None)
             }
@@ -346,6 +363,9 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                // Reached only with a row deleted: a missing item returned above.
+                #[cfg(feature = "pitr")]
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, key, None, None).await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(
@@ -398,9 +418,14 @@ impl PostgresEngine {
                     Ok(None)
                 }
             } else {
-                let delete_sql = format!("DELETE FROM {ddb_table} WHERE pk = $1");
                 super::gsi_build::pause_before_autocommit_statement().await;
-                sqlx::query(&delete_sql)
+                // Item history, when the table records it and an item was
+                // deleted, in the same statement as the write.
+                #[cfg(feature = "pitr")]
+                crate::pitr::autocommit_delete(&self.data_pool, key_info, pk_text.as_ref(), None)
+                    .await?;
+                #[cfg(not(feature = "pitr"))]
+                sqlx::query(&format!("DELETE FROM {ddb_table} WHERE pk = $1"))
                     .bind(pk_text.as_ref())
                     .execute(&self.data_pool)
                     .await

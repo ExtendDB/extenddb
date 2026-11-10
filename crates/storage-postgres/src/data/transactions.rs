@@ -230,6 +230,29 @@ impl PostgresEngine {
             });
         }
 
+        // Item history for every member at one instant, read after every
+        // member's write, so a reconstruct holds all of the transaction or
+        // none of it.
+        #[cfg(feature = "pitr")]
+        {
+            let mut commit_time = None;
+            for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
+                let (TransactWriteOp::Put { key_info, .. }
+                | TransactWriteOp::Delete { key_info, .. }
+                | TransactWriteOp::Update { key_info, .. }
+                | TransactWriteOp::ConditionCheck { key_info, .. }) = op;
+                crate::pitr::capture_in_tx(
+                    &mut tx,
+                    key_info,
+                    old_item.as_ref(),
+                    new_item.as_ref(),
+                    &mut commit_time,
+                )
+                .await
+                .map_err(cancel_all)?;
+            }
+        }
+
         // Write stream records atomically within the transaction (BLOCKER #1 fix).
         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
             let capture = match op {

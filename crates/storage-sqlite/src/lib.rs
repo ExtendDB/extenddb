@@ -38,6 +38,8 @@ pub mod migrations;
 mod number_key;
 mod operations;
 mod password_hash_store;
+#[cfg(feature = "pitr")]
+mod pitr;
 mod restore_engine;
 #[cfg(test)]
 mod restore_job_tests;

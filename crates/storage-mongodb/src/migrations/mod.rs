@@ -173,6 +173,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             "the catalog collections have no validator, so a table or index document carries \
              a warm_throughput field without a schema change",
         ),
+        MigrationId::PointInTimeRecovery => Migration::NotApplicable(
+            "point-in-time recovery is not available on MongoDB; its restore answers \
+             PointInTimeRecoveryUnavailableException",
+        ),
     }
 }
 

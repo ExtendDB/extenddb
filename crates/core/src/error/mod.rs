@@ -113,6 +113,10 @@ pub enum DynamoDbError {
     /// on `UpdateContinuousBackups`.
     #[error("{0}")]
     PointInTimeRecoveryUnavailableException(String),
+    /// A `RestoreDateTime` outside the source table's restorable window, the
+    /// exception the service models on `RestoreTableToPointInTime`.
+    #[error("{0}")]
+    InvalidRestoreTimeException(String),
     #[error("{0}")]
     ServiceUnavailable(String),
     /// SP-ERR-002: Concurrent modification of the same item in a transaction.
@@ -173,6 +177,7 @@ impl DynamoDbError {
             | Self::ExpiredIteratorException(_)
             | Self::ContinuousBackupsUnavailableException(_)
             | Self::PointInTimeRecoveryUnavailableException(_)
+            | Self::InvalidRestoreTimeException(_)
             | Self::TransactionConflictException(_)
             | Self::ProvisionedThroughputExceededException(_)
             | Self::ThrottlingException(_)
@@ -230,6 +235,7 @@ impl DynamoDbError {
             Self::PointInTimeRecoveryUnavailableException(_) => {
                 "PointInTimeRecoveryUnavailableException"
             }
+            Self::InvalidRestoreTimeException(_) => "InvalidRestoreTimeException",
             Self::ServiceUnavailable(_) => "ServiceUnavailable",
             Self::TransactionConflictException(_) => "TransactionConflictException",
             Self::ProvisionedThroughputExceededException(_) => {
@@ -302,6 +308,7 @@ impl DynamoDbError {
             | Self::ExpiredIteratorException(m)
             | Self::ContinuousBackupsUnavailableException(m)
             | Self::PointInTimeRecoveryUnavailableException(m)
+            | Self::InvalidRestoreTimeException(m)
             | Self::ServiceUnavailable(m)
             | Self::TransactionConflictException(m)
             | Self::ProvisionedThroughputExceededException(m)
@@ -422,6 +429,10 @@ mod tests {
             ),
             (
                 DynamoDbError::PointInTimeRecoveryUnavailableException(String::new()),
+                400,
+            ),
+            (
+                DynamoDbError::InvalidRestoreTimeException(String::new()),
                 400,
             ),
             (DynamoDbError::TableNotFoundException(String::new()), 400),

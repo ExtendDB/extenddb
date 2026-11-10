@@ -22,6 +22,8 @@ pub mod management_store_factory;
 pub mod migrations;
 pub mod operations;
 pub mod password;
+#[cfg(feature = "pitr")]
+pub mod pitr;
 pub mod policy_migration;
 pub mod restore_engine;
 pub mod secret_cipher;
@@ -451,6 +453,13 @@ pub trait DataEngine: Send + Sync {
     /// vector indexes it is given on the table paths, and that it maintains them
     /// on writes.
     fn as_vector_search(&self) -> Option<&dyn VectorSearchEngine> {
+        None
+    }
+
+    /// The backend's point-in-time recovery store, `None` on a backend
+    /// without one, whose recovery operations keep the unavailable answer.
+    #[cfg(feature = "pitr")]
+    fn as_pitr(&self) -> Option<&dyn pitr::PitrCaptureStore> {
         None
     }
 

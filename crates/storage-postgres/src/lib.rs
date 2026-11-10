@@ -26,6 +26,8 @@ pub mod migrations;
 mod operations;
 mod password_hash_store;
 mod pg_util;
+#[cfg(feature = "pitr")]
+mod pitr;
 mod restore_engine;
 mod snapshot_engine;
 #[doc(hidden)]
@@ -716,6 +718,17 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::stream_record_cleanup_worker(storage_for_stream, metrics, token).await;
         });
 
+        // 3a. Point-in-time recovery retention sweep
+        #[cfg(feature = "pitr")]
+        let pitr_retention = {
+            let storage = self.engine.clone();
+            let metrics = ctx.metrics.clone();
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move {
+                extenddb_storage::pitr::retention_worker(storage, metrics, token).await;
+            })
+        };
+
         // 3b. Stream record numbering worker
         let storage_for_numbering = self.engine.clone();
         let token = ctx.shutdown.clone();
@@ -771,7 +784,8 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::poll_gsi_delay(catalog_store_for_gsi, gsi_delay, token).await;
         });
 
-        vec![
+        #[allow(unused_mut)]
+        let mut tasks = vec![
             control_plane,
             table_size,
             stream_cleanup,
@@ -782,7 +796,10 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             gsi_builds,
             pool_metrics,
             gsi_poller,
-        ]
+        ];
+        #[cfg(feature = "pitr")]
+        tasks.push(pitr_retention);
+        tasks
     }
 
     fn backend_info(&self) -> Option<String> {

@@ -203,6 +203,9 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                #[cfg(feature = "pitr")]
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, &item, Some(&item), None)
+                    .await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(
@@ -259,18 +262,32 @@ impl PostgresEngine {
                     Ok(None)
                 }
             } else {
-                let upsert_sql = format!(
-                    "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
-                     ON CONFLICT (pk, {sk_col}) DO UPDATE SET item_data = EXCLUDED.item_data"
-                );
                 super::gsi_build::pause_before_autocommit_statement().await;
-                bind_sk_execute!(
-                    &upsert_sql,
+                // Item history, when the table records it, in the same
+                // statement as the write.
+                #[cfg(feature = "pitr")]
+                crate::pitr::autocommit_put(
+                    &self.data_pool,
+                    key_info,
                     pk_text.as_str(),
-                    &sk,
+                    Some(&sk),
                     &item_json,
-                    &self.data_pool
-                )?;
+                )
+                .await?;
+                #[cfg(not(feature = "pitr"))]
+                {
+                    let upsert_sql = format!(
+                        "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
+                         ON CONFLICT (pk, {sk_col}) DO UPDATE SET item_data = EXCLUDED.item_data"
+                    );
+                    bind_sk_execute!(
+                        &upsert_sql,
+                        pk_text.as_str(),
+                        &sk,
+                        &item_json,
+                        &self.data_pool
+                    )?;
+                }
                 self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }
@@ -381,6 +398,9 @@ impl PostgresEngine {
                     )
                     .await?;
                 }
+                #[cfg(feature = "pitr")]
+                crate::pitr::record_item_history_in_tx(&mut tx, key_info, &item, Some(&item), None)
+                    .await?;
                 // Persist async GSI work inside the same transaction — one row
                 // per async index, each honoring its own propagation delay.
                 let mut async_enqueued = enqueue_async_indexes(
@@ -437,17 +457,31 @@ impl PostgresEngine {
                     Ok(None)
                 }
             } else {
-                let upsert_sql = format!(
-                    "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
-                     ON CONFLICT (pk) DO UPDATE SET item_data = EXCLUDED.item_data"
-                );
                 super::gsi_build::pause_before_autocommit_statement().await;
-                sqlx::query(&upsert_sql)
-                    .bind(pk_text.as_str())
-                    .bind(&item_json)
-                    .execute(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                // Item history, when the table records it, in the same
+                // statement as the write.
+                #[cfg(feature = "pitr")]
+                crate::pitr::autocommit_put(
+                    &self.data_pool,
+                    key_info,
+                    pk_text.as_str(),
+                    None,
+                    &item_json,
+                )
+                .await?;
+                #[cfg(not(feature = "pitr"))]
+                {
+                    let upsert_sql = format!(
+                        "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
+                         ON CONFLICT (pk) DO UPDATE SET item_data = EXCLUDED.item_data"
+                    );
+                    sqlx::query(&upsert_sql)
+                        .bind(pk_text.as_str())
+                        .bind(&item_json)
+                        .execute(&self.data_pool)
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                }
                 self.fix_up_autocommit(stamp, key_info, &item).await;
                 Ok(None)
             }

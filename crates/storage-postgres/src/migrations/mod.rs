@@ -167,6 +167,16 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0009_warm_throughput.sql"
             )],
         },
+        MigrationId::PointInTimeRecovery => Migration::Applies {
+            // Declared `Kind::Breaking` for the reason migration 8 gives.
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0010_point_in_time_recovery.sql"
+            )],
+        },
     }
 }
 
@@ -192,7 +202,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::BackupCatalogIndex
         | MigrationId::StreamPending
         | MigrationId::RestoreProgress
-        | MigrationId::WarmThroughput => RunsIn::Transaction,
+        | MigrationId::WarmThroughput
+        | MigrationId::PointInTimeRecovery => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

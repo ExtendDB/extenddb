@@ -18,6 +18,8 @@ mongodb-test-hooks = []
 # `extenddb-storage/test-hooks` arms them in whichever backend the build
 # selects without naming a backend crate here (the server depends on none).
 backup-test-hooks = ["extenddb-engine/backup-test-hooks", "extenddb-storage/test-hooks"]
+# Point-in-time recovery, off by default (see the engine's feature).
+pitr = ["extenddb-engine/pitr"]
 
 [dependencies]
 extenddb-cache = { workspace = true }

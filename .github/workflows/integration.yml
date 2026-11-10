@@ -781,6 +781,14 @@ jobs:
           EXTENDDB_TEST_PG_REQUIRED: "1"
         run: cargo test --release -p extenddb-storage-postgres --tests
 
+      # The item-history store's checks, compiled only with the crate's
+      # `pitr` feature.
+      - name: Run the PostgreSQL point-in-time recovery store tests
+        env:
+          EXTENDDB_TEST_PG_CONNECTION_STRING: postgresql://postgres:devpass@127.0.0.1:5432
+          EXTENDDB_TEST_PG_REQUIRED: "1"
+        run: cargo test --release -p extenddb-storage-postgres --features pitr --test pitr_item_history
+
   # The runtime-detection proof: the same binary, against a PostgreSQL with no
   # pgvector, must refuse vector indexes over the wire. Today the job above runs
   # on a plain image too, so this looks like a duplicate of it; it is not, because
@@ -966,6 +974,128 @@ jobs:
         if: failure()
         run: sudo journalctl -t extenddb --no-pager -n 500 || true
 
+  # A build with point-in-time recovery (the `pitr` features), which no other
+  # build job makes: one binary per backend whose item-history store it
+  # selects.
+  build-pitr:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgres]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The two legs compile different features; a key per leg keeps each
+          # leg's cache its own.
+          key: ${{ matrix.backend }}-pitr
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release (${{ matrix.backend }},pitr)
+        run: cargo build --release -p extenddb --no-default-features --features ${{ matrix.backend }},pitr
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-${{ matrix.backend }}-pitr
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
+  # The continuous-backups wire tests on the pitr builds, SQLite and
+  # PostgreSQL. test_continuous_backups.py skips here only the cells whose
+  # answer the feature changes; test_pitr_enable.py skips on every other job.
+  run-pitr-wire:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    needs: build-pitr
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            init: --backend sqlite
+          - backend: postgres
+            init: --pg-host 127.0.0.1 --pg-port 5432 --pg-user postgres --pg-pass devpass
+    services:
+      postgres:
+        # Services take no `if`. The runner skips a service whose image is
+        # empty, so only the postgres leg starts the container.
+        image: ${{ matrix.backend == 'postgres' && 'pgvector/pgvector:pg16' || '' }}
+        env:
+          POSTGRES_PASSWORD: devpass
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 127.0.0.1:5432:5432
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-${{ matrix.backend }}-pitr
+          path: target/release
+
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
+
+      - name: Initialize ExtendDB
+        id: init
+        run: |
+          output=$(./target/release/extenddb init ${{ matrix.init }} --config extenddb.toml 2>&1)
+          echo "$output"
+          password=$(echo "$output" | grep -oP 'Password: \K\S+')
+          echo "admin_password=$password" >> "$GITHUB_OUTPUT"
+
+      # A foreground server logs to stderr, so its log is this file.
+      - name: Start ExtendDB
+        run: |
+          ./target/release/extenddb serve --config extenddb.toml --foreground > extenddb-server.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sk https://127.0.0.1:18443/health | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin).get("status") == "healthy" else 1)' 2>/dev/null; then
+              echo "Server ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          curl -sk https://127.0.0.1:18443/health || true
+          exit 1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the continuous-backups wire tests
+        env:
+          EXTENDDB_TEST_ENDPOINT: https://127.0.0.1:18443
+          EXTENDDB_ADMIN_USER: admin
+          EXTENDDB_ADMIN_PASSWORD: ${{ steps.init.outputs.admin_password }}
+          EXTENDDB_TEST_PITR: "1"
+        run: |
+          eval "$(python3 devtools/provision-test-credentials)"
+          python3 -m pytest tests/test_pitr_enable.py tests/test_continuous_backups.py -v -rs -p no:cacheprovider
+
+      - name: Print the server log on failure
+        if: failure()
+        run: cat extenddb-server.log || true
+
   integration:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 40
@@ -979,6 +1109,7 @@ jobs:
         run-postgres-storage-tests,
         run-rust-integration-postgres-novector,
         run-rust-integration-sqlite,
+        run-pitr-wire,
       ]
     if: always()
     steps:
@@ -990,7 +1121,8 @@ jobs:
              [ "${{ needs.run-rust-integration.result }}" != "success" ] || \
              [ "${{ needs.run-postgres-storage-tests.result }}" != "success" ] || \
              [ "${{ needs.run-rust-integration-postgres-novector.result }}" != "success" ] || \
-             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ]; then
+             [ "${{ needs.run-rust-integration-sqlite.result }}" != "success" ] || \
+             [ "${{ needs.run-pitr-wire.result }}" != "success" ]; then
             exit 1
           fi
 

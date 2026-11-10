@@ -1,0 +1,24 @@
+-- SELECT type, name, tbl_name, sql FROM sqlite_master WHERE tbl_name IN ('pitr_state', 'item_history') ORDER BY type, name
+index	idx_item_history_key	item_history	CREATE INDEX idx_item_history_key ON item_history (table_id, pk, sk, seq)
+index	idx_item_history_table_seq	item_history	CREATE INDEX idx_item_history_table_seq ON item_history (table_id, seq)
+index	sqlite_autoindex_pitr_state_1	pitr_state	NULL
+table	item_history	item_history	CREATE TABLE item_history (
+    seq INTEGER PRIMARY KEY,
+    table_id TEXT NOT NULL REFERENCES tables(table_id) ON DELETE CASCADE,
+    pk TEXT NOT NULL,
+    sk,
+    commit_time_us INTEGER NOT NULL,
+    item_data TEXT
+)
+table	pitr_state	pitr_state	CREATE TABLE pitr_state (
+    table_id TEXT PRIMARY KEY REFERENCES tables(table_id) ON DELETE CASCADE,
+    recovery_period_days INTEGER NOT NULL,
+    enabled_at_us INTEGER NOT NULL,
+    pruned_to_us INTEGER NOT NULL DEFAULT 0,
+    pinned_at_us INTEGER,
+    pin_expires_us INTEGER
+)
+-- SELECT COUNT(*) FROM pitr_state
+0
+-- SELECT COUNT(*) FROM item_history
+0

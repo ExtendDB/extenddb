@@ -24,6 +24,11 @@ impl DataEngine for SqliteEngine {
         Some(self)
     }
 
+    #[cfg(feature = "pitr")]
+    fn as_pitr(&self) -> Option<&dyn extenddb_storage::pitr::PitrCaptureStore> {
+        Some(self)
+    }
+
     fn put_item(
         &self,
         key_info: &TableKeyInfo,

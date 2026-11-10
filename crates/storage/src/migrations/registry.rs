@@ -93,6 +93,12 @@ migration_ids! {
     /// a global secondary index is stored.
     WarmThroughput = 9, "warm_throughput",
         "add a nullable warm_throughput column to the tables and indexes catalogs";
+    /// Creates `pitr_state`, a table's point-in-time recovery setting, and
+    /// `item_history`, one row for each committed mutation of a table whose
+    /// recovery is enabled, which a restore reads.
+    PointInTimeRecovery = 10, "point_in_time_recovery",
+        "create pitr_state and item_history, the point-in-time recovery setting and item \
+         history of each table";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:

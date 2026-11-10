@@ -44,6 +44,16 @@ impl ServerRuntimeHooks for SqliteRuntimeHooks {
             workers::stream_record_cleanup_worker(engine, metrics, token).await;
         });
 
+        #[cfg(feature = "pitr")]
+        let pitr_retention = {
+            let engine = self.engine.clone();
+            let metrics = ctx.metrics.clone();
+            let token = ctx.shutdown.clone();
+            tokio::spawn(async move {
+                extenddb_storage::pitr::retention_worker(engine, metrics, token).await;
+            })
+        };
+
         let engine = self.engine.clone();
         let metrics = ctx.metrics.clone();
         let token = ctx.shutdown.clone();
@@ -73,7 +83,8 @@ impl ServerRuntimeHooks for SqliteRuntimeHooks {
             workers::poll_index_propagation_delay(catalog_store, index_delay_cache, token).await;
         });
 
-        vec![
+        #[allow(unused_mut)]
+        let mut tasks = vec![
             control_plane,
             table_size,
             stream_cleanup,
@@ -81,7 +92,10 @@ impl ServerRuntimeHooks for SqliteRuntimeHooks {
             ttl_cleanup,
             gsi_propagation,
             gsi_delay,
-        ]
+        ];
+        #[cfg(feature = "pitr")]
+        tasks.push(pitr_retention);
+        tasks
     }
 
     fn backend_info(&self) -> Option<String> {

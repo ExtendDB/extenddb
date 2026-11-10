@@ -105,6 +105,15 @@ impl SqliteEngine {
             if let Some(capture) = stream {
                 write_stream_record_in_tx(&mut tx, key_info, capture, old.as_ref(), None).await?;
             }
+            #[cfg(feature = "pitr")]
+            crate::pitr::capture_in_tx(
+                &mut tx,
+                key_info,
+                old.as_ref(),
+                None,
+                std::time::SystemTime::now(),
+            )
+            .await?;
         }
 
         tx.commit()

@@ -9,7 +9,9 @@ PointInTimeRecoveryStatus DISABLED, UpdateContinuousBackups refuses to enable
 recovery with ContinuousBackupsUnavailableException, and
 RestoreTableToPointInTime refuses with PointInTimeRecoveryUnavailableException
 after resolving the source table. These tests pin that divergence, so they run
-only against ExtendDB.
+only against ExtendDB. On a server built with the pitr feature
+(EXTENDDB_TEST_PITR=1) an enable succeeds, so the test of the enable refusal
+is skipped there; the other answers are the same on both builds.
 
 The request validation before those answers, and its order, are the
 service's: a missing table name member and the table name constraints, the
@@ -30,6 +32,12 @@ from botocore.exceptions import ClientError
 pytestmark = pytest.mark.skipif(
     not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip(),
     reason="pins ExtendDB's documented divergence: point-in-time recovery is unsupported",
+)
+
+needs_no_pitr = pytest.mark.skipif(
+    os.environ.get("EXTENDDB_TEST_PITR") == "1",
+    reason="a server built with the pitr feature enables recovery "
+    "(tests/test_pitr_enable.py pins that answer)",
 )
 
 TABLE_NAME_REQUIRED = (
@@ -106,6 +114,7 @@ def test_describe_continuous_backups_reports_recovery_disabled(
     assert pitr == {"PointInTimeRecoveryStatus": "DISABLED"}
 
 
+@needs_no_pitr
 def test_enable_point_in_time_recovery_is_refused(
     dynamodb_client, create_and_cleanup_table, unique_table_name
 ):

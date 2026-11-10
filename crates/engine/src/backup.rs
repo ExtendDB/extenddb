@@ -2024,6 +2024,7 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use pitr::check_member_types;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
     handle_update_continuous_backups,

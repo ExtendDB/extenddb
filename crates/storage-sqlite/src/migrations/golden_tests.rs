@@ -780,3 +780,35 @@ async fn migration_9_adds_the_warm_throughput_columns() {
     );
     golden("0009_warm_throughput", &text);
 }
+
+/// Migration 10 creates `pitr_state` and `item_history` on a released
+/// catalog, both empty, and running it again changes nothing.
+#[tokio::test]
+async fn migration_10_creates_the_point_in_time_recovery_tables() {
+    let db = temp_db("m10");
+    load_dump(&db, DEV_0_1_14).await;
+    let tables = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+                  AND name IN ('pitr_state', 'item_history')";
+    assert_eq!(
+        count(&db, tables).await,
+        0,
+        "the 0.1.14 catalog predates them"
+    );
+    run(&db).await.expect("migrate");
+    let report = reconverge(&db).await.expect("reconverge");
+    assert!(report.applied.iter().any(|s| s.id == 10), "{report:?}");
+    assert_eq!(
+        status(&db).await,
+        CatalogStatus::Current { version: LATEST }
+    );
+    let mut text = String::new();
+    for sql in [
+        "SELECT type, name, tbl_name, sql FROM sqlite_master \
+         WHERE tbl_name IN ('pitr_state', 'item_history') ORDER BY type, name",
+        "SELECT COUNT(*) FROM pitr_state",
+        "SELECT COUNT(*) FROM item_history",
+    ] {
+        text.push_str(&dump(&db, sql).await);
+    }
+    golden("0010_point_in_time_recovery", &text);
+}
