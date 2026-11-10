@@ -289,3 +289,176 @@ async fn a_malformed_stream_arn_is_a_validation_error() {
         .expect_err("malformed ARN");
     assert!(matches!(err, StorageError::Validation(_)), "{err:?}");
 }
+
+/// Shard `i` of the stream `label` on `table_id`, in the shape
+/// `init_stream_shards` writes since streams were named in shard ids.
+fn labelled_shard(table_id: &str, label: &str, i: u32) -> String {
+    extenddb_storage::stream_lineage::shard_id(
+        table_id,
+        label,
+        extenddb_core::types::StreamViewType::KeysOnly,
+        i,
+    )
+    .expect("label shape")
+}
+
+/// Four shard rows of the stream `label` on `table_id`, closed at
+/// `ending_sequence_number` when it is given.
+async fn labelled_shards(engine: &SqliteEngine, table_id: &str, label: &str, end: Option<u64>) {
+    for i in 0..4u32 {
+        sqlx::query(
+            "INSERT INTO stream_shards (shard_id, table_id, starting_sequence_number, \
+             ending_sequence_number) VALUES (?, ?, ?, ?)",
+        )
+        .bind(labelled_shard(table_id, label, i))
+        .bind(table_id)
+        .bind(format!("{:021}", 0))
+        .bind(end.map(|e| format!("{e:021}")))
+        .execute(&engine.pool)
+        .await
+        .expect("shard");
+    }
+}
+
+/// A table whose stream was disabled and enabled again: the closed stream's
+/// labelled shards, then the enabled stream's, with the table's label on the
+/// new stream. Returns the table id.
+async fn re_enabled_table(engine: &SqliteEngine, old: &str, new: &str) -> String {
+    let table_id = stream_table(engine, ACCOUNT, "t", new).await;
+    sqlx::query("DELETE FROM stream_shards WHERE table_id = ?")
+        .bind(&table_id)
+        .execute(&engine.pool)
+        .await
+        .expect("drop the legacy rows the fixture wrote");
+    labelled_shards(engine, &table_id, old, Some(2)).await;
+    labelled_shards(engine, &table_id, new, None).await;
+    write_records(
+        engine,
+        &labelled_shard(&table_id, old, 0),
+        &table_id,
+        &[1, 2],
+    )
+    .await;
+    write_records(engine, &labelled_shard(&table_id, new, 0), &table_id, &[3]).await;
+    table_id
+}
+
+#[tokio::test]
+async fn a_closed_stream_stays_readable_after_the_table_has_a_newer_one() {
+    let engine = engine().await;
+    let (old, new) = ("2026-01-01T00:00:00.000", "2026-02-02T00:00:00.000");
+    let table_id = re_enabled_table(&engine, old, new).await;
+    let old_arn = stream_arn(REGION, ACCOUNT, "t", old);
+    let new_arn = stream_arn(REGION, ACCOUNT, "t", new);
+
+    let (records, last) = engine
+        .get_stream_records(
+            ACCOUNT,
+            &old_arn,
+            &labelled_shard(&table_id, old, 0),
+            None,
+            10,
+        )
+        .await
+        .expect("the closed stream reads under its own ARN");
+    assert_eq!(records.len(), 2);
+    assert_eq!(last.as_deref(), Some(format!("{:021}", 2).as_str()));
+
+    let (records, _) = engine
+        .get_stream_records(
+            ACCOUNT,
+            &new_arn,
+            &labelled_shard(&table_id, new, 0),
+            None,
+            10,
+        )
+        .await
+        .expect("the new stream reads under its own ARN");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].dynamodb.sequence_number, format!("{:021}", 3));
+}
+
+#[tokio::test]
+async fn the_newer_arn_with_an_older_streams_shard_id_is_not_found() {
+    let engine = engine().await;
+    let (old, new) = ("2026-01-01T00:00:00.000", "2026-02-02T00:00:00.000");
+    let table_id = re_enabled_table(&engine, old, new).await;
+    let old_arn = stream_arn(REGION, ACCOUNT, "t", old);
+    let new_arn = stream_arn(REGION, ACCOUNT, "t", new);
+
+    // An iterator pairing the new ARN with a closed shard, and one pairing the
+    // closed stream's ARN with a new shard: neither shard is the stream's.
+    assert_stream_not_found(
+        engine
+            .get_stream_records(
+                ACCOUNT,
+                &new_arn,
+                &labelled_shard(&table_id, old, 0),
+                None,
+                10,
+            )
+            .await,
+    );
+    assert_stream_not_found(
+        engine
+            .get_stream_records(
+                ACCOUNT,
+                &old_arn,
+                &labelled_shard(&table_id, new, 0),
+                None,
+                10,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn the_newer_arn_with_a_legacy_shard_of_the_closed_stream_is_not_found() {
+    // A stream created before shard ids named their stream, disabled and
+    // enabled again under the labelled scheme: the legacy rows are closed, and
+    // the table's label is the new labelled stream's.
+    let engine = engine().await;
+    let new = "2026-02-02T00:00:00.000";
+    let table_id = stream_table(&engine, ACCOUNT, "t", new).await;
+    write_records(&engine, &shard(&table_id, 0), &table_id, &[1, 2]).await;
+    sqlx::query(
+        "UPDATE stream_shards SET ending_sequence_number = ? WHERE table_id = ? AND shard_id = ?",
+    )
+    .bind(format!("{:021}", 2))
+    .bind(&table_id)
+    .bind(shard(&table_id, 0))
+    .execute(&engine.pool)
+    .await
+    .expect("close shard 0");
+    sqlx::query(
+        "UPDATE stream_shards SET ending_sequence_number = starting_sequence_number \
+         WHERE table_id = ? AND ending_sequence_number IS NULL",
+    )
+    .bind(&table_id)
+    .execute(&engine.pool)
+    .await
+    .expect("close the other legacy shards");
+    labelled_shards(&engine, &table_id, new, None).await;
+    write_records(&engine, &labelled_shard(&table_id, new, 0), &table_id, &[3]).await;
+    let new_arn = stream_arn(REGION, ACCOUNT, "t", new);
+
+    for i in 0..4u32 {
+        assert_stream_not_found(
+            engine
+                .get_stream_records(ACCOUNT, &new_arn, &shard(&table_id, i), None, 10)
+                .await,
+        );
+    }
+    // The control: the new stream's own shard reads under the new ARN.
+    let (records, _) = engine
+        .get_stream_records(
+            ACCOUNT,
+            &new_arn,
+            &labelled_shard(&table_id, new, 0),
+            None,
+            10,
+        )
+        .await
+        .expect("the new stream reads under its own ARN");
+    assert_eq!(records.len(), 1);
+}
