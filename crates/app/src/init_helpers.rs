@@ -304,7 +304,7 @@ key_path = "{tls_key}"
 # [backup]
 # Backup and restore jobs. stale_job_after_secs must be at least three
 # heartbeat periods, the larger of heartbeat_interval_secs and the 15 s the
-# jobs of this release heartbeat at (45 at the least); pool_size is raised to
+# in-catalog jobs heartbeat at (45 at the least); pool_size is raised to
 # at least 2 * max_concurrent_jobs + 10 on PostgreSQL; max_concurrent_jobs
 # is at most 1024.
 # data_file_target_bytes = 67108864    # Uncompressed bytes per data file (minimum 32 MiB)
@@ -318,9 +318,10 @@ key_path = "{tls_key}"
 #                                        # it defaults to backup-spool/ beside the database file
 
 # [backup.store]
-# Where CreateBackup's backups will live, from a later release (this release's
-# CreateBackup writes in-catalog backups with any store, and the store serves
-# restores and deletes of the backups it holds). Absent on file-backed SQLite: a filesystem
+# Where CreateBackup writes its backups on PostgreSQL, SQLite and MongoDB
+# (CreateBackup answers CREATING and a job of the server uploads; Cassandra
+# writes in-catalog backups with or without a store), and where restores and
+# deletes of store-backed backups read. Absent on file-backed SQLite: a filesystem
 # store at backups/ beside the database file. Absent on PostgreSQL, MongoDB,
 # Cassandra and an in-memory SQLite database: no store, and CreateBackup
 # writes in-catalog backups with a deprecation warning. kind = "disabled"

@@ -5,9 +5,12 @@
 //! `TCP_NODELAY` on both listener modes, and the stop a lost serving
 //! registration asks for.
 
+use std::sync::Arc;
+
 use super::*;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 /// Bind a loopback listener and connect one client to it.
 async fn bind_and_connect() -> (TcpListener, TcpStream) {
@@ -187,19 +190,17 @@ fn self_signed_localhost(dir: &std::path::Path) -> (ServerTlsConfig, Vec<u8>) {
     )
 }
 
-/// Complete a TLS handshake with the server at `addr` as a client that
-/// trusts `cert_der`, send `after_handshake` as application data, then read
-/// until EOF, an error, or `bound`. Runs rustls over a blocking socket so
-/// the test needs no async TLS client. Returns `Ok(())` for EOF or an error
-/// from the server side, `Err(n)` for `n` application bytes received, and
-/// panics when the bound passes with the connection still open.
-fn tls_client_expect_closed_within(
+/// Connect to the server at `addr` as a client that trusts `cert_der`,
+/// complete the TLS handshake, and send `after_handshake` as application
+/// data. Runs rustls over a blocking socket so the test needs no async TLS
+/// client; each socket read of the handshake is bounded by `bound`. Returns
+/// the connection and the socket for [`tls_expect_closed_within`].
+fn tls_connect_and_send(
     addr: std::net::SocketAddr,
     cert_der: Vec<u8>,
-    after_handshake: &'static [u8],
+    after_handshake: &[u8],
     bound: Duration,
-    what: &'static str,
-) {
+) -> (rustls::ClientConnection, std::net::TcpStream) {
     // The rustls client needs the process-level provider as well. serve_app
     // installs it in the TLS arm, but this client can reach the builder
     // before the server task gets there, and ClientConfig::builder panics
@@ -214,18 +215,34 @@ fn tls_client_expect_closed_within(
         .with_root_certificates(roots)
         .with_no_client_auth();
     let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
-    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
-        .expect("client connection");
+    let mut conn =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
     let mut sock = std::net::TcpStream::connect(addr).expect("connect");
     sock.set_read_timeout(Some(bound)).expect("read timeout");
     while conn.is_handshaking() {
         conn.complete_io(&mut sock).expect("TLS handshake");
     }
-    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
     if !after_handshake.is_empty() {
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
         std::io::Write::write_all(&mut tls, after_handshake).expect("write application data");
         std::io::Write::flush(&mut tls).expect("flush");
     }
+    (conn, sock)
+}
+
+/// Read from the TLS connection until EOF, an error, or `bound`, which is
+/// set on the socket here so that it runs from this call. Returns on EOF or
+/// on an error from the server side, and panics with `what` when `n`
+/// application bytes arrive or when the bound passes with the connection
+/// still open.
+fn tls_expect_closed_within(
+    conn: &mut rustls::ClientConnection,
+    sock: &mut std::net::TcpStream,
+    bound: Duration,
+    what: &str,
+) {
+    sock.set_read_timeout(Some(bound)).expect("read timeout");
+    let mut tls = rustls::Stream::new(conn, sock);
     let mut buf = [0u8; 64];
     match std::io::Read::read(&mut tls, &mut buf) {
         Ok(0) => {}
@@ -244,11 +261,41 @@ fn tls_client_expect_closed_within(
     }
 }
 
+/// [`tls_connect_and_send`], then [`tls_expect_closed_within`] with the same
+/// `bound`: the client's read starts right after the handshake, for a server
+/// whose deadline starts there too.
+fn tls_client_expect_closed_within(
+    addr: std::net::SocketAddr,
+    cert_der: Vec<u8>,
+    after_handshake: &'static [u8],
+    bound: Duration,
+    what: &'static str,
+) {
+    let (mut conn, mut sock) = tls_connect_and_send(addr, cert_der, after_handshake, bound);
+    tls_expect_closed_within(&mut conn, &mut sock, bound, what);
+}
+
 /// Start the TLS listener on a loopback port with `timeout`, returning its
 /// address, the certificate to trust, the temp dir holding the key pair and
 /// the server task.
 async fn start_tls_listener(
     timeout: Duration,
+) -> (
+    std::net::SocketAddr,
+    Vec<u8>,
+    std::path::PathBuf,
+    tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+) {
+    let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
+    start_tls_listener_with(timeout, app, Admission::default()).await
+}
+
+/// [`start_tls_listener`] with the router and the admission of the caller's
+/// choice.
+async fn start_tls_listener_with(
+    timeout: Duration,
+    app: Router,
+    admission: Admission,
 ) -> (
     std::net::SocketAddr,
     Vec<u8>,
@@ -269,14 +316,13 @@ async fn start_tls_listener(
         .await
         .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
-    let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
     let server = tokio::spawn(serve_app(
         listener,
         app,
         timeout,
         Some(tls),
         None,
-        Admission::default(),
+        admission,
     ));
     (addr, cert_der, dir, server)
 }
@@ -428,4 +474,137 @@ async fn a_stop_after_a_lost_registration_ends_the_server_as_a_signal_does() {
         admission.stop_reason(),
         Some("the registration could not be taken again")
     );
+}
+
+/// A router whose one route signals `entered` when its handler runs and then
+/// never answers, so a request to it is in flight for as long as the
+/// connection lives. A drain test waits for the signal before it asks for
+/// the stop: a stop that lands while hyper is still reading the request
+/// closes the connection at once instead of draining it.
+fn never_answering_app(entered: Arc<Notify>) -> Router {
+    Router::new().route(
+        "/slow",
+        axum::routing::get(move || async move {
+            entered.notify_one();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            "late"
+        }),
+    )
+}
+
+/// Wait until the handler of [`never_answering_app`] has run.
+async fn handler_entered(entered: &Notify) {
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the request reaches the handler within 10 s");
+}
+
+/// `request_timeout` for the drain tests: long enough that neither the
+/// header read timer nor the body timer can close the connection first.
+const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Slack the drain tests allow past `CONNECTION_DRAIN_TIMEOUT`, measured
+/// from the stop, for the server's return and for the client's read.
+const DRAIN_SLACK: Duration = Duration::from_secs(3);
+
+/// Wait for `server` to return, and check that it did so after the drain
+/// bound (the stop waited for the request in flight) and before the bound
+/// plus [`DRAIN_SLACK`] (the connection did not hold the listener past it).
+async fn expect_drained_at_the_bound(
+    server: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    stopped_at: tokio::time::Instant,
+    what: &str,
+) {
+    tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT + DRAIN_SLACK, server)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: a request in flight held the listener open past the drain bound of {:?}",
+                CONNECTION_DRAIN_TIMEOUT
+            )
+        })
+        .expect("the server task")
+        .expect("the server");
+    let elapsed = stopped_at.elapsed();
+    assert!(
+        elapsed >= CONNECTION_DRAIN_TIMEOUT,
+        "{what}: the listener closed a request in flight {elapsed:?} after the stop, before the \
+         drain bound of {:?}",
+        CONNECTION_DRAIN_TIMEOUT
+    );
+}
+
+/// The plaintext path: a stop with a request in flight drains for
+/// `CONNECTION_DRAIN_TIMEOUT`, then closes the connection and returns.
+#[tokio::test]
+async fn plaintext_listener_closes_a_request_in_flight_at_the_drain_bound() {
+    let (listener, mut client) = bind_and_connect().await;
+    let admission = Admission::default();
+    let entered = Arc::new(Notify::new());
+    let server = tokio::spawn(serve_app(
+        listener,
+        never_answering_app(entered.clone()),
+        LONG_REQUEST_TIMEOUT,
+        None,
+        None,
+        admission.clone(),
+    ));
+
+    client
+        .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("write request");
+    handler_entered(&entered).await;
+    let stopped_at = tokio::time::Instant::now();
+    admission.stop("the registration could not be taken again".to_owned());
+
+    expect_drained_at_the_bound(server, stopped_at, "plaintext, request in flight").await;
+    expect_closed_within(
+        &mut client,
+        Duration::from_secs(1),
+        "plaintext, request in flight after the drain",
+    )
+    .await;
+}
+
+/// The TLS path: the same stop drains for `CONNECTION_DRAIN_TIMEOUT` and
+/// closes the connection whose request is in flight. The client sends its
+/// request on a blocking thread, then holds its read until the stop, so the
+/// read's bound runs from the stop as the server's does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_listener_closes_a_request_in_flight_at_the_drain_bound() {
+    let admission = Admission::default();
+    let entered = Arc::new(Notify::new());
+    let (addr, cert_der, dir, server) = start_tls_listener_with(
+        LONG_REQUEST_TIMEOUT,
+        never_answering_app(entered.clone()),
+        admission.clone(),
+    )
+    .await;
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel::<()>();
+    let client = tokio::task::spawn_blocking(move || {
+        let (mut conn, mut sock) = tls_connect_and_send(
+            addr,
+            cert_der,
+            b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            Duration::from_secs(10),
+        );
+        stopped_rx.recv().expect("the test signals the stop");
+        tls_expect_closed_within(
+            &mut conn,
+            &mut sock,
+            CONNECTION_DRAIN_TIMEOUT + DRAIN_SLACK,
+            "TLS, request in flight",
+        );
+    });
+    handler_entered(&entered).await;
+    let stopped_at = tokio::time::Instant::now();
+    admission.stop("the registration could not be taken again".to_owned());
+    stopped_tx
+        .send(())
+        .expect("the client holds its read until the stop");
+
+    expect_drained_at_the_bound(server, stopped_at, "TLS, request in flight").await;
+    client.await.expect("client task");
+    let _ = std::fs::remove_dir_all(dir);
 }

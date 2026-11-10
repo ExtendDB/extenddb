@@ -240,9 +240,9 @@ journalctl -t extenddb -f
 
 **Fix:** If permission denied, run `extenddb stop` as the same user that started extenddb. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
 
-### `extenddb (pid <pid>) did not exit within 10s after SIGTERM`
+### `extenddb (pid <pid>) did not exit within 76s after SIGTERM`
 
-**Cause:** The server received SIGTERM but did not shut down within the 10-second timeout. It may be stuck draining long-running requests or waiting on a database operation.
+**Cause:** The server received SIGTERM but did not shut down within the 76-second timeout, the sum of its shutdown bounds (5 s to drain connections, 30 s for running backup jobs to end, 36 s to stop its background workers and give up its serving registration, 5 s for its runtime). It may be stuck draining long-running requests or waiting on a database operation.
 
 **Fix:** Send SIGKILL to force termination: `kill -9 <pid>`. Check PostgreSQL for long-running queries that may be blocking shutdown.
 
@@ -613,6 +613,16 @@ The error log line names the exact relations for one leaked table and gives this
 **Cause:** The `UPDATE iam_users` query to change the password failed. Likely a database connectivity issue.
 
 **Fix:** Check PostgreSQL connectivity and logs.
+
+### `Credential import is disabled (allow_credential_import = false)`
+
+**Cause:** The server refused an access key import (`extenddb manage import-access-key`, or `POST /management/accounts/{id}/users/{name}/access-keys/import`) with HTTP 403 because the `allow_credential_import` runtime setting is not `true`. The message is the same when the catalog has no row for the setting. From v0.1.15 the server refuses the import when the row is missing. A deployment that imported keys before the upgrade without setting it gets this error after the upgrade.
+
+**Fix:** Enable import, then retry. The next import reads the new value, so you do not need to restart the server:
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+Keys imported earlier keep working while import is disabled.
 
 ### `Management API: check allow_credential_import failed: <error>`
 

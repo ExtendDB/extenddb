@@ -120,7 +120,13 @@ exec extenddb serve --foreground --config "$CONFIG"
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
 read; stop the container instead, which delivers `SIGTERM` and triggers the same
-graceful shutdown. Outside a container, where you may want `stop` to work, add
+graceful shutdown. With a backup job running the shutdown takes up to 35
+seconds before the workers stop, and up to 76 seconds in all when the database
+is slow to answer (the admin guide's Stopping section); a runtime whose grace
+period is shorter (Docker's default is 10 s) kills the process during the job
+drain, and the reconciler resolves the job's row as it does after a crash. The
+repository's compose files set `stop_grace_period: 80s`, above that sum; a
+compose file of your own needs the same. Outside a container, where you may want `stop` to work, add
 `--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
@@ -204,7 +210,7 @@ extenddb init \
 - [ ] Set `auth.provider = "builtin"` in `extenddb.toml`
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
-- [ ] Disable credential import if not needed: `extenddb settings set allow_credential_import false`
+- [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
 
 ### Transport
 
@@ -261,6 +267,13 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# On a host that backs up tables of large items, one malloc arena keeps a
+# backup job's high-water mark at the pipeline's terms whatever the number of
+# large items it reads (the admin guide's [backup] max_concurrent_jobs row
+# gives the figures). It costs the request path a few percent (3.5 to 9.2%
+# on GetItem, Query and Scan on SQLite, about 2% on PostgreSQL (the scans,
+# 2.1%)), so the line is left to the operator:
+#Environment=MALLOC_ARENA_MAX=1
 
 [Install]
 WantedBy=multi-user.target
@@ -297,7 +310,7 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests; a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests, and raises a smaller `pool_size` to `2 * (max_concurrent_jobs + 1)`, at most 34, so that bound refuses no job `max_concurrent_jobs` admits (the admin guide's `max_concurrent_jobs` row; above 16 jobs the slot refuses the seventeenth); a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
 
 ### Cassandra Connection Pool
 

@@ -71,8 +71,11 @@
 //! while the command holds the file, so before the wait the command runs
 //! the reconciler's duties itself with a zero stale window, as the holder
 //! of the maintenance claim (the cycle takes its held branch and does not
-//! read the claim back through that window): a legacy restore
-//! the stopped server left RUNNING is failed and its target removed, a
+//! read the claim back through that window): a restore the stopped server
+//! left RUNNING is failed and its target removed, a store-backed one too,
+//! which the held branch fails rather than resumes (a record with no
+//! recorded progress over a target that holds items is failed
+//! `target_not_empty` and its target left for `remove-target`), a
 //! target a FAILED restore left CREATING is removed, an in-catalog CREATING
 //! backup it left is removed, and a DELETING row is finished; the wait and
 //! the CREATING-row removal then also use a zero window, so a CREATING or
@@ -85,17 +88,18 @@
 //! exclusion.
 //!
 //! Every command opens the catalog through the backend's factory, under its
-//! own name (`extenddb backup list`, `extenddb backup purge`), and none runs
-//! the startup recovery a server runs (`ServerComponentsOptions::startup_recovery`
-//! off): that work belongs to the servers the command runs beside, and a
-//! command that ran it could exit with it half done. On
-//! PostgreSQL, MongoDB and Cassandra the command holds a serving
-//! registration for its run, as a server does, so a migration waits for it,
-//! and the registration carries the command's name, which the migration's
-//! wait prints (PostgreSQL's session `application_name`, MongoDB's
-//! `extenddb_servers` document, Cassandra's `extenddb_servers` row). The
-//! command releases the registration when it ends, whatever the outcome, so
-//! a migration does not wait for a row or document to expire. A catalog the
+//! own name (`extenddb backup list`, `extenddb backup purge`, `extenddb
+//! backup remove-target`), and none runs the startup recovery a server runs
+//! (`ServerComponentsOptions::startup_recovery` off): that work belongs to
+//! the servers the command runs beside, and a command that ran it could exit
+//! with it half done. On PostgreSQL, MongoDB and Cassandra the command holds
+//! a serving registration for its run, as a server does, so a migration
+//! waits for it, and the registration carries the command's name, which the
+//! migration's wait prints (PostgreSQL's session `application_name`,
+//! MongoDB's `extenddb_servers` document, Cassandra's `extenddb_servers`
+//! row). The command releases the registration when it ends, whatever the
+//! outcome, so a migration does not wait for a row or document to expire. A
+//! catalog the
 //! factory refuses (a migration running, the catalog at another migration
 //! than this binary's) ends the command with the message and the exit code
 //! `serve` gives for it: 6 while a migration runs, 3 for a catalog behind
@@ -109,6 +113,24 @@
 //! `extenddb destroy` removes the databases and leaves the store untouched:
 //! the store is the copy that survives destroy, and this command is the one
 //! that deletes it.
+//!
+//! `backup remove-target --account <id> <table>` removes a restore target
+//! DeleteTable refuses (a CREATING table) with its restore record, under the
+//! maintenance claim like `purge`: a FAILED record's target whatever the
+//! reason (`target_not_empty` included, the one state the reconciler leaves
+//! for this command: on MongoDB and Cassandra a crash before the first
+//! progress record, the whole first data file on MongoDB and the first
+//! 10,000 items or 32 MiB on Cassandra, ends in it), a RUNNING record's
+//! target whose owner is dead (no heartbeat within `stale_job_after_secs`;
+//! on SQLite under the serve lock every owner is dead), and a legacy
+//! record's target the same way. It refuses a RUNNING record whose owner is
+//! live, a DONE record and a table no record names ("not a restore target";
+//! an ACTIVE table is one or the other). It needs no store: it opens the
+//! catalog as `serve` does (on SQLite under the serve lock) whether or not
+//! `[backup.store]` is configured, prints the claim it took and the one line
+//! of what it removed (`extenddb_engine::maintenance::remove_target` states
+//! each step), and logs the removal under `extenddb::audit` with the
+//! account, the table and the backup's ARN.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -116,12 +138,12 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use extenddb_config as config;
 use extenddb_engine::maintenance::{
-    Interrupt, Stop, Wait, WaitOutcome, purge_rows, wait_for_quiet,
+    Interrupt, RemoveTarget, Stop, Wait, WaitOutcome, purge_rows, remove_target, wait_for_quiet,
 };
 use extenddb_engine::{BackupRuntime, ConfiguredStore, HeldClaim, StoreHealth, StoreProblem};
 use extenddb_storage::StorageEngine;
 use extenddb_storage::backup_catalog::{
-    BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL, StoreIdentity,
+    BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL, JobStatus, StoreIdentity,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::hooks::ServingRegistrar;
@@ -157,6 +179,17 @@ enum BackupCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Remove a restore target DeleteTable refuses (a CREATING table) and its restore record:
+    /// the target of a FAILED restore (target_not_empty included) or of a RUNNING restore whose
+    /// owner is dead. Takes the maintenance claim first. Refuses a RUNNING restore with a live
+    /// owner, a DONE restore and a table no restore record names.
+    RemoveTarget {
+        /// The account the table belongs to
+        #[arg(long)]
+        account: String,
+        /// The table's name
+        table: String,
+    },
 }
 
 /// How often the waiting purge re-reads the rows.
@@ -168,6 +201,7 @@ const WAIT_POLL: Duration = Duration::from_secs(2);
 /// carries this name, which the migration prints while it waits.
 const LIST: &str = "extenddb backup list";
 const PURGE: &str = "extenddb backup purge";
+const REMOVE_TARGET: &str = "extenddb backup remove-target";
 
 pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> {
     if !std::path::Path::new(&args.config).exists() {
@@ -184,10 +218,31 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
     // `migrate --yes` to wait out. During the purge the same handle ends the
     // wait at once and the deletion loop before its next row.
     let interrupt = listen_for_signals();
+    if let BackupCommand::RemoveTarget { account, table } = &args.command {
+        // The catalog as `serve` opens it; the store is not needed, so it is
+        // described and never checked, and the default root and an identity
+        // file are not created.
+        let (catalog, _) = open_catalog(
+            &app_config,
+            &args.config,
+            release,
+            REMOVE_TARGET,
+            Mode::WriteCatalogOnly,
+        )
+        .await?;
+        if let Some(signal) = interrupt.signalled() {
+            catalog.close().await;
+            anyhow::bail!("{signal} received while opening the catalog; nothing was changed");
+        }
+        let done = remove_restore_target(&catalog, &app_config, account, table).await;
+        catalog.close().await;
+        return done;
+    }
     let (command, mode) = match args.command {
         BackupCommand::List { .. } => (LIST, Mode::Read),
         BackupCommand::Purge { confirm: false } => (PURGE, Mode::Read),
         BackupCommand::Purge { confirm: true } => (PURGE, Mode::Write),
+        BackupCommand::RemoveTarget { .. } => unreachable!("handled above"),
     };
     let opening = open(&app_config, &args.config, release, command, mode).await?;
     if let Some(signal) = interrupt.signalled() {
@@ -233,6 +288,7 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
         (BackupCommand::Purge { confirm: true }, Opening::NoStore(reason)) => {
             anyhow::bail!("{reason}")
         }
+        (BackupCommand::RemoveTarget { .. }, _) => unreachable!("handled above"),
     }
 }
 
@@ -256,55 +312,46 @@ enum Mode {
     /// and which the command must not exit with half done; the store's
     /// check may write the identity file of an empty root.
     Write,
+    /// As `serve` opens it, for a command that needs no store
+    /// (`remove-target`): the store is described as `Read` leaves it, so
+    /// neither the default root nor an identity file is created.
+    WriteCatalogOnly,
 }
 
-/// The storage engine, the backup runtime with the configured store, the
-/// store's identity as the command read it, and the serving registration
-/// the command holds for its run.
-struct Opened {
+/// The open catalog: the storage engine, the backup runtime (with the
+/// configured store when there is one), the backend's name, and the serving
+/// registration the command holds for its run.
+struct Catalog {
     storage: Arc<dyn StorageEngine>,
     runtime: Arc<BackupRuntime>,
     backend: String,
-    identity: Identity,
     registration: Option<Arc<dyn ServingRegistrar>>,
 }
 
-/// The store's identity as the command read it.
-enum Identity {
-    /// The check passed, or the file was read and agrees with the rows.
-    Known(StoreIdentity),
-    /// The root has no identity file and the catalog no rows for it: a
-    /// fresh root nothing has written to.
-    Empty,
-    /// The check failed (a listing still runs; a purge refuses).
-    Problem(StoreProblem),
-}
-
-impl Opened {
+impl Catalog {
     /// End the command's use of the catalog: release its serving
     /// registration.
     async fn close(self) {
         release_registration(self.registration).await;
     }
-
-    fn store(&self) -> &ConfiguredStore {
-        self.runtime
-            .configured_store()
-            .expect("open returns only with a configured store")
-    }
 }
 
-/// Open the catalog as `command`. A catalog the factory refuses (on
-/// PostgreSQL: a migration running, or the catalog at another migration than
-/// this binary's) is an [`extenddb_server::CatalogRefusal`], with the
-/// message and exit code `serve` gives for the same status.
-async fn open(
+/// Open the catalog as `command` in `mode` and describe the configured
+/// store without checking it; the second member is why no store is
+/// configured, when none is. A catalog the factory refuses (a migration
+/// running, or the catalog at another migration than this binary's) is an
+/// [`extenddb_server::CatalogRefusal`], with the message and exit code
+/// `serve` gives for the same status.
+async fn open_catalog(
     app_config: &config::AppConfig,
     config_path: &str,
     release: &'static str,
     command: &'static str,
     mode: Mode,
-) -> anyhow::Result<Opening> {
+) -> anyhow::Result<(
+    Catalog,
+    Option<extenddb_server::backup_store::NotConfigured>,
+)> {
     let mut options = extenddb_storage::server_components::ServerComponentsOptions::default();
     options.release = release;
     options.max_concurrent_jobs = app_config.backup.max_concurrent_jobs;
@@ -337,7 +384,7 @@ async fn open(
         Err(e) => anyhow::bail!("cannot open the catalog: {e}"),
     };
     // The registration is the runtime hooks', which the command does not
-    // otherwise keep: held here, it lasts until `Opened::close`.
+    // otherwise keep: held here, it lasts until `Catalog::close`.
     let registration = components
         .runtime_hooks
         .as_ref()
@@ -350,7 +397,9 @@ async fn open(
         &backend,
         &*storage,
         match mode {
-            Mode::Read => extenddb_server::backup_store::Caller::ReadOnlyCommand,
+            Mode::Read | Mode::WriteCatalogOnly => {
+                extenddb_server::backup_store::Caller::ReadOnlyCommand
+            }
             Mode::Write => extenddb_server::backup_store::Caller::Command,
         },
     )
@@ -362,17 +411,69 @@ async fn open(
             return Err(e);
         }
     };
-    let runtime = Arc::new(setup.runtime);
-    let Some(store) = runtime.configured_store() else {
+    Ok((
+        Catalog {
+            storage,
+            runtime: Arc::new(setup.runtime),
+            backend,
+            registration,
+        },
+        setup.not_configured,
+    ))
+}
+
+/// The catalog with the configured store and the store's identity as the
+/// command read it.
+struct Opened {
+    catalog: Catalog,
+    identity: Identity,
+}
+
+/// The store's identity as the command read it.
+enum Identity {
+    /// The check passed, or the file was read and agrees with the rows.
+    Known(StoreIdentity),
+    /// The root has no identity file and the catalog no rows for it: a
+    /// fresh root nothing has written to.
+    Empty,
+    /// The check failed (a listing still runs; a purge refuses).
+    Problem(StoreProblem),
+}
+
+impl Opened {
+    /// End the command's use of the catalog: release its serving
+    /// registration.
+    async fn close(self) {
+        self.catalog.close().await;
+    }
+
+    fn store(&self) -> &ConfiguredStore {
+        self.catalog
+            .runtime
+            .configured_store()
+            .expect("open returns only with a configured store")
+    }
+}
+
+async fn open(
+    app_config: &config::AppConfig,
+    config_path: &str,
+    release: &'static str,
+    command: &'static str,
+    mode: Mode,
+) -> anyhow::Result<Opening> {
+    let (catalog, not_configured) =
+        open_catalog(app_config, config_path, release, command, mode).await?;
+    let Some(store) = catalog.runtime.configured_store() else {
         // Why there is none, as `configure_described` found it: the section
         // absent or disabled, the default root not yet created, or the
         // default root failed its check with no rows for it.
-        let why = setup
-            .not_configured
-            .expect("a runtime without a store carries the reason");
-        release_registration(registration).await;
+        let why = not_configured.expect("a runtime without a store carries the reason");
+        catalog.close().await;
         return Ok(Opening::NoStore(why.to_string()));
     };
+    let storage = &catalog.storage;
+    let backend = &catalog.backend;
     // The server's startup leaves an S3 store's check to its reconciler;
     // the command runs it here. A read leaves the root as it finds it: the
     // identity file is read, never created, under the store's check bound as
@@ -380,13 +481,15 @@ async fn open(
     // or a mount that has stopped answering costs the command the bound and
     // not the store's retries.
     let identity = match (mode, store.health()) {
-        (Mode::Read, _) => match extenddb_engine::read_identity_bounded(store, &*storage).await {
-            Ok(Some(identity)) => Identity::Known(identity),
-            Ok(None) => Identity::Empty,
-            Err(problem) => Identity::Problem(problem),
-        },
+        (Mode::Read | Mode::WriteCatalogOnly, _) => {
+            match extenddb_engine::read_identity_bounded(store, &**storage).await {
+                Ok(Some(identity)) => Identity::Known(identity),
+                Ok(None) => Identity::Empty,
+                Err(problem) => Identity::Problem(problem),
+            }
+        }
         (Mode::Write, StoreHealth::Checking) => {
-            let outcome = extenddb_engine::check_configured_store(store, &*storage, &backend).await;
+            let outcome = extenddb_engine::check_configured_store(store, &**storage, backend).await;
             store.record_check(outcome.clone());
             match outcome {
                 Ok(identity) => Identity::Known(identity),
@@ -401,13 +504,7 @@ async fn open(
         },
         (Mode::Write, StoreHealth::Unhealthy(problem)) => Identity::Problem(problem),
     };
-    Ok(Opening::Store(Opened {
-        storage,
-        runtime,
-        backend,
-        identity,
-        registration,
-    }))
+    Ok(Opening::Store(Opened { catalog, identity }))
 }
 
 /// How long a command waits for its registration's release: a row or
@@ -478,6 +575,7 @@ async fn rows_of_root(
 ) -> anyhow::Result<(Vec<String>, Vec<BackupRow>)> {
     let store = opened.store();
     let mut ids = opened
+        .catalog
         .storage
         .read_store_ids(store.kind, &store.root)
         .await
@@ -494,7 +592,7 @@ async fn rows_of_root(
             store_root: store.root.clone(),
             store_id: id.clone(),
         };
-        rows.extend(rows_of(&*opened.storage, &identity, status).await?);
+        rows.extend(rows_of(&*opened.catalog.storage, &identity, status).await?);
     }
     Ok((ids, rows))
 }
@@ -603,7 +701,7 @@ async fn purge(
     mut interrupt: Interrupt,
 ) -> anyhow::Result<()> {
     let backup = &app_config.backup;
-    let storage = &*opened.storage;
+    let storage = &*opened.catalog.storage;
     let configured = opened.store();
     let identity = match &opened.identity {
         Identity::Known(identity) => identity,
@@ -650,7 +748,7 @@ async fn purge(
     // owner of any row is dead whatever its heartbeat says, so the window a
     // live owner is told apart by is zero. On the other backends purge runs
     // beside live servers, whose jobs heartbeat within `stale_after`.
-    let owner_window = if opened.backend == "sqlite" {
+    let owner_window = if opened.catalog.backend == "sqlite" {
         resolve_dead_owners(opened).await;
         Duration::ZERO
     } else {
@@ -825,10 +923,10 @@ async fn signal_name() -> &'static str {
 /// wait decides.
 async fn resolve_dead_owners(opened: &Opened) {
     match extenddb_engine::reconciler::cycle(
-        &*opened.storage,
-        &opened.runtime,
+        &opened.catalog.storage,
+        &opened.catalog.runtime,
         Duration::ZERO,
-        &opened.backend,
+        &opened.catalog.backend,
         &mut extenddb_engine::reconciler::ReconcilerState::for_maintenance_holder(),
     )
     .await
@@ -851,6 +949,24 @@ async fn resolve_dead_owners(opened: &Opened) {
             for arn in &report.deletions_finished {
                 println!("finished the deletion of {arn}");
             }
+            for (arn, status) in &report.creating_resolved {
+                println!(
+                    "resolved the CREATING backup {arn} to {status}: its owner is dead{}",
+                    match status {
+                        extenddb_storage::backup_catalog::BackupStatus::Available =>
+                            " and the store holds its complete manifest",
+                        _ =>
+                            " and the store holds no complete manifest; its objects are \
+                              deleted once the row's heartbeat is stale",
+                    }
+                );
+            }
+            for arn in &report.creating_left_to_owner {
+                println!(
+                    "left the CREATING backup {arn}: another owner took it over before this \
+                     command's write"
+                );
+            }
         }
         Err(e) => println!("could not resolve the jobs the stopped server left: {e}"),
     }
@@ -862,6 +978,60 @@ async fn release(claim: HeldClaim) {
     if let Err(e) = claim.release().await {
         println!("could not release the maintenance claim ({e}); it expires on its own");
     }
+}
+
+/// `backup remove-target --account <id> <table>` (module doc).
+async fn remove_restore_target(
+    catalog: &Catalog,
+    app_config: &config::AppConfig,
+    account_id: &str,
+    table_name: &str,
+) -> anyhow::Result<()> {
+    let stale_after = Duration::from_secs(app_config.backup.stale_job_after_secs);
+    let holder = format!(
+        "extenddb backup remove-target on {} (pid {})",
+        extenddb_server::backup_store::hostname(),
+        std::process::id()
+    );
+    println!("=== extenddb backup remove-target ===");
+    println!("Taking the maintenance claim as {holder:?}.");
+    // On SQLite the command holds the file alone, so every job owner is
+    // dead whatever its heartbeat says; on the other backends a RUNNING
+    // record whose heartbeat is within `stale_after` has a live owner.
+    let owner_window = if catalog.backend == "sqlite" {
+        Duration::ZERO
+    } else {
+        stale_after
+    };
+    let removed = remove_target(
+        &*catalog.storage,
+        &RemoveTarget {
+            account_id: account_id.to_owned(),
+            table_name: table_name.to_owned(),
+            holder,
+            stale_after,
+            owner_window,
+            heartbeat_interval: JOB_HEARTBEAT_INTERVAL,
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let state = match (removed.status, removed.failure_reason.as_deref()) {
+        (JobStatus::Running, _) => "RUNNING with a dead owner".to_owned(),
+        (status, Some(reason)) => format!("{status} ({reason})"),
+        (status, None) => status.to_string(),
+    };
+    let kind = match removed.kind {
+        extenddb_storage::backup_catalog::RestoreKind::Manifest => "store-backed",
+        extenddb_storage::backup_catalog::RestoreKind::Legacy => "in-catalog",
+    };
+    println!(
+        "removed the restore target {table_name} (account {account_id}, table id {}) and its \
+         record: its {kind} restore from {} was {state}",
+        removed.table_id, removed.backup_arn
+    );
+    println!("The maintenance claim is released.");
+    Ok(())
 }
 
 #[cfg(test)]

@@ -175,3 +175,118 @@ fn segments_multiple_operations() {
         assert_eq!(s.count, 1);
     }
 }
+
+/// The backup job's recorders land under their names and dimensions: one
+/// `BackupJobs` and one `BackupJobDuration` (microseconds) per job with the
+/// outcome as the operation dimension, the bytes and the snapshot age
+/// undimensioned, a store error under the call's name.
+#[test]
+fn backup_job_recorders_land_under_the_outcome_and_the_store_call() {
+    use crate::metrics::types::BackupJobOutcome;
+
+    let c = MetricsCollector::new();
+    c.record_backup_job(BackupJobOutcome::Succeeded, 1_500.0);
+    c.record_backup_job(BackupJobOutcome::Failed, 300.0);
+    c.record_backup_bytes_uploaded(4096);
+    c.record_backup_snapshot_age(12.5);
+    c.record_backup_store_error("put");
+
+    let by = |metric: MetricName| {
+        let mut snaps = c.query(&MetricsQuery {
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        });
+        snaps.sort_by(|a, b| format!("{:?}", a.dimensions).cmp(&format!("{:?}", b.dimensions)));
+        snaps
+    };
+    let jobs = by(MetricName::BackupJobs);
+    let outcomes: Vec<String> = jobs.iter().map(|s| format!("{:?}", s.dimensions)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            "[Operation(\"failed\")]".to_owned(),
+            "[Operation(\"succeeded\")]".to_owned()
+        ]
+    );
+    assert!(jobs.iter().all(|s| s.count == 1 && s.sum == 1.0));
+    let durations = by(MetricName::BackupJobDuration);
+    assert_eq!(durations.len(), 2);
+    assert_eq!(durations.iter().map(|s| s.sum).sum::<f64>(), 1_800.0);
+    let bytes = by(MetricName::BackupBytesUploaded);
+    assert_eq!(bytes.len(), 1);
+    assert!(bytes[0].dimensions.is_empty());
+    assert_eq!(bytes[0].sum, 4096.0);
+    let age = by(MetricName::BackupSnapshotAge);
+    assert_eq!(age[0].max, 12.5);
+    let errors = by(MetricName::BackupStoreErrors);
+    assert_eq!(
+        format!("{:?}", errors[0].dimensions),
+        "[Operation(\"put\")]"
+    );
+    for (outcome, text) in [
+        (BackupJobOutcome::Succeeded, "succeeded"),
+        (BackupJobOutcome::Failed, "failed"),
+        (BackupJobOutcome::Cancelled, "cancelled"),
+    ] {
+        assert_eq!(outcome.to_string(), text);
+    }
+}
+
+/// The restore job's recorders land as the backup job's do: one
+/// `RestoreJobs` and one `RestoreJobDuration` per job under the outcome,
+/// the bytes undimensioned, a `get` failure under `BackupStoreErrors`; and
+/// the names render as the `/metrics` endpoint prints them.
+#[test]
+fn restore_job_recorders_land_under_the_outcome_and_render_their_names() {
+    use crate::metrics::types::{BackupJobOutcome, QuerySource};
+
+    let c = MetricsCollector::new();
+    c.record_restore_job(BackupJobOutcome::Succeeded, 2_000.0);
+    c.record_restore_job(BackupJobOutcome::Cancelled, 500.0);
+    c.record_restore_bytes_downloaded(8192);
+    c.record_backup_store_error("get");
+
+    let by = |metric: MetricName| {
+        let mut snaps = c.query(&MetricsQuery {
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        });
+        snaps.sort_by(|a, b| format!("{:?}", a.dimensions).cmp(&format!("{:?}", b.dimensions)));
+        snaps
+    };
+    let jobs = by(MetricName::RestoreJobs);
+    let outcomes: Vec<String> = jobs.iter().map(|s| format!("{:?}", s.dimensions)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            "[Operation(\"cancelled\")]".to_owned(),
+            "[Operation(\"succeeded\")]".to_owned()
+        ]
+    );
+    assert!(jobs.iter().all(|s| s.count == 1 && s.sum == 1.0));
+    let durations = by(MetricName::RestoreJobDuration);
+    assert_eq!(durations.len(), 2);
+    assert_eq!(durations.iter().map(|s| s.sum).sum::<f64>(), 2_500.0);
+    let bytes = by(MetricName::RestoreBytesDownloaded);
+    assert_eq!(bytes.len(), 1);
+    assert!(bytes[0].dimensions.is_empty());
+    assert_eq!(bytes[0].sum, 8192.0);
+    let errors = by(MetricName::BackupStoreErrors);
+    assert_eq!(
+        format!("{:?}", errors[0].dimensions),
+        "[Operation(\"get\")]"
+    );
+    assert!(by(MetricName::BackupJobs).is_empty());
+    assert_eq!(MetricName::RestoreJobs.to_string(), "RestoreJobs");
+    assert_eq!(
+        MetricName::RestoreJobDuration.to_string(),
+        "RestoreJobDuration"
+    );
+    assert_eq!(
+        MetricName::RestoreBytesDownloaded.to_string(),
+        "RestoreBytesDownloaded"
+    );
+    assert_eq!(QuerySource::RestoreJob.to_string(), "RestoreJob");
+}

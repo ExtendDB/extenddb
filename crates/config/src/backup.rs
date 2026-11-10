@@ -22,17 +22,28 @@
 //!
 //! `stale_job_after_secs` must be at least three heartbeat periods: a job
 //! checks before each store write that its latest heartbeat confirmed its
-//! claim within one period, and the margin is what makes that detection
-//! precede a reconciler's deletion of the job's prefix. The period the floor
-//! is computed from is the one the jobs run at: the larger of
-//! `heartbeat_interval_secs` and [`JOB_HEARTBEAT_INTERVAL`] (15 s), since
-//! until a later release wires the knob to the jobs every backend heartbeats
-//! at that constant, and a floor on a shorter configured interval would let
-//! the reconciler declare a live job dead between two of its heartbeats. The
-//! floor is a floor: on SQLite a heartbeat waits for the engine write lock
-//! like any writer, so a long write transaction delays it, and a
-//! `stale_job_after_secs` near three periods on a busy file can declare a
-//! live restore dead.
+//! claim recently enough (within two periods: one for the timer, one for the
+//! beat to return), and the margin is what makes that detection precede a
+//! reconciler's deletion of the job's prefix. The period the floor is
+//! computed from is the one the jobs run at: the larger of
+//! `heartbeat_interval_secs` and [`JOB_HEARTBEAT_INTERVAL`] (15 s). The
+//! store-backed backup job heartbeats at that period; the in-catalog backup
+//! and restore paths heartbeat at the constant whatever the knob says, and a
+//! floor on a shorter configured interval would let the reconciler declare
+//! one of those dead between two of its heartbeats. The floor is a floor: on
+//! SQLite a heartbeat waits for the engine write lock like any writer, so a
+//! long write transaction delays it, and a `stale_job_after_secs` near three
+//! periods on a busy file can declare a live restore dead.
+//!
+//! `data_file_target_bytes` is read by the store-backed backup job (a data
+//! file closes once its uncompressed bytes reach it, so a file exceeds it by
+//! less than one line); `failed_row_retention_secs` by the reconciler, which
+//! removes a FAILED or DELETED row whose prefix is empty once its
+//! `completed_at` is older than that. The retention is at least
+//! `stale_job_after_secs`: a job stopped and resumed (SIGSTOP) can land a put
+//! after its row was failed, and the reconciler's FAILED-prefix duty deletes
+//! that object only while the row exists, so the row must outlive the
+//! window in which the stopped owner can still write.
 //!
 //! `max_concurrent_jobs` is at most [`MAX_CONCURRENT_JOBS`]: a value over
 //! the runtime's permit ceiling would stop the server at startup rather than
@@ -59,16 +70,25 @@
 //!   unconfigured and startup logs that.
 //! - `kind = "disabled"` leaves the store unconfigured on purpose, on any
 //!   backend.
-//! - Without a configured store, CreateBackup writes the in-catalog format
-//!   and logs a deprecation warning naming `[backup.store]` on each call;
-//!   backups of either format stay readable, listable, restorable and
-//!   deletable.
+//! - With a configured store, CreateBackup on PostgreSQL, SQLite and
+//!   MongoDB writes the backup to the store and returns CREATING; without
+//!   one, and on Cassandra always, it writes the in-catalog format and logs
+//!   a deprecation warning naming `[backup.store]` on each call; backups of
+//!   either format stay readable, listable, restorable and deletable.
 //!
 //! The spool. Restores from an S3 store download to `spool_path`, created
-//! `0700` with files `0600`. On file-backed SQLite it defaults to
+//! `0700` with files `0600`: one entry `restore-<table id>/` per running
+//! restore, holding the manifest, its sidecar and each data file with a
+//! `.verified` marker once its digests matched, so the spool costs the
+//! compressed size of the backups being restored at once; the job removes
+//! its entry when it ends, a server stopped by SIGTERM keeps it for the
+//! resume, and the reconciler removes entries of restores no longer RUNNING
+//! with this host's `spool_host`. On file-backed SQLite it defaults to
 //! `backup-spool/` beside the database file; on every other backend an S3
 //! store needs `spool_path` and startup refuses without it (a filesystem
-//! store needs no spool: files are verified in place). A `spool_path` that
+//! store needs no spool: files are hashed in place and read again for the
+//! load, so a filesystem store's `get` errors, which are local I/O errors,
+//! are not retried as an S3 store's transport errors are). A `spool_path` that
 //! contains or is contained in a filesystem store root is refused (the store
 //! would list and delete it, and a sync would read its first component as an
 //! account id), and so is one that is or contains the database file's
@@ -196,9 +216,9 @@ pub struct ResolvedStore {
 }
 
 impl BackupConfig {
-    /// The period the jobs heartbeat at: the larger of
-    /// `heartbeat_interval_secs` and [`JOB_HEARTBEAT_INTERVAL`], which is
-    /// what every backend runs at until the knob reaches the jobs.
+    /// The period the store-backed backup job heartbeats at, and the floor's
+    /// unit: the larger of `heartbeat_interval_secs` and
+    /// [`JOB_HEARTBEAT_INTERVAL`] (the in-catalog paths run at the constant).
     #[must_use]
     pub fn effective_heartbeat_interval_secs(&self) -> u64 {
         self.heartbeat_interval_secs
@@ -250,12 +270,20 @@ impl BackupConfig {
             return Err(format!(
                 "backup.stale_job_after_secs = {} is under {MIN_STALE_HEARTBEATS} * the job \
                  heartbeat period of {period} s = {floor} (the larger of \
-                 backup.heartbeat_interval_secs = {} and the {} s the jobs heartbeat at in \
-                 this release); a reconciler could declare a running job dead between two \
+                 backup.heartbeat_interval_secs = {} and the {} s the in-catalog jobs \
+                 heartbeat at); a reconciler could declare a running job dead between two \
                  of its heartbeats",
                 self.stale_job_after_secs,
                 self.heartbeat_interval_secs,
                 JOB_HEARTBEAT_INTERVAL.as_secs()
+            ));
+        }
+        if self.failed_row_retention_secs < self.stale_job_after_secs {
+            return Err(format!(
+                "backup.failed_row_retention_secs = {} is under backup.stale_job_after_secs = \
+                 {}; a FAILED row removed before its owner's last heartbeat is stale leaves no \
+                 row for the reconciler to delete that owner's late objects under",
+                self.failed_row_retention_secs, self.stale_job_after_secs
             ));
         }
         if self.data_file_target_bytes < MIN_DATA_FILE_TARGET_BYTES {
@@ -648,6 +676,31 @@ mod tests {
         };
         assert_eq!(long.effective_heartbeat_interval_secs(), 40);
         long.validate().unwrap();
+    }
+
+    /// The retention is at least the stale window: a FAILED row removed
+    /// sooner leaves a stopped owner's late object with no row under which
+    /// the reconciler deletes it.
+    #[test]
+    fn a_retention_under_the_stale_window_is_refused() {
+        let c = BackupConfig {
+            stale_job_after_secs: 300,
+            failed_row_retention_secs: 299,
+            ..BackupConfig::default()
+        };
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("failed_row_retention_secs = 299"), "{e}");
+        assert!(e.contains("stale_job_after_secs = 300"), "{e}");
+        let ok = BackupConfig {
+            failed_row_retention_secs: 300,
+            ..c
+        };
+        ok.validate().unwrap();
+        let zero = BackupConfig {
+            failed_row_retention_secs: 0,
+            ..BackupConfig::default()
+        };
+        assert!(zero.validate().is_err());
     }
 
     #[test]

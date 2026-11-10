@@ -226,7 +226,7 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 
 ## Web Console Security
 
-An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list shows an IAM-user session its own account alone, and the console home page shows the deployment's account count and admin count to admin sessions only. In its own account an IAM-user session currently reads every user, group and role page, including other users' access key IDs, policy names and tags, which the management API refuses the same user. Issue #731 tracks this. An IAM-user session can create and delete access keys for its own user, and every other change in the console needs an admin session.
+An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list, and the deployment's account count and admin count on the console home page, are for admin sessions only. In its own account an IAM-user session opens its own user page, which lists its access keys, and creates and deletes its own access keys: the access key reads and writes the management API gives the same user. The console has no form to change the password or import a key. Its own user page leaves out the user's inline policies, groups and tags, which the management API does not give it either. Every other page and form under its account redirects it to `/console`: the account page, the pages of the other users, every group and role page, and every form that changes a user, group, role or policy, its own user and its own policies included. The handler compares the user name in the path with the session's own before it reads anything about that user, so another user's name and a name that no user has get the same answer. The only read before that comparison is the session check, which reads the password hash of the session's own principal.
 
 The management web console (`/console/*`) implements:
 
@@ -248,6 +248,8 @@ The console login form, the management API (HTTP Basic auth) and the `/metrics` 
 - **Bounded verification.** At most 4 bcrypt operations (password checks and password hashes) run at once per process. A login that waits more than 10 seconds for a slot is answered `500` and is not counted as a failure, since no password was checked.
 
 A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
+
+Every login that the limits admit runs one bcrypt check, or is answered `500` after waiting 10 seconds for a slot, whatever the name. When no admin or IAM user has the name, or the IAM user has no console password, that check runs against a fixed hash, and the login is answered and counted as a wrong password.
 
 The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
 
@@ -315,13 +317,14 @@ Import/export file paths are validated:
 ### Credential Handling
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
-- The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
+- `extenddb manage` reads the password from the `EXTENDDB_PASSWORD` environment variable when `--password` is not given, so the password does not appear in process listings
 - Access key secrets are shown once on creation and cannot be retrieved afterward
 
 ### Logging
 
-- All logging goes to syslog (no log files with sensitive data on disk)
-- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted and denied), and settings changes. Other management changes, such as creating or deleting users, roles, access keys and policies, are not audit-logged
+- The server logs to syslog when it runs as a daemon and to stderr with `--foreground`, and writes no log files of its own
+- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted, and refused by the role's trust policy), and settings changes made through the management API. `extenddb settings set` changes the catalog without the server and prints its entry on its own standard output, so the server writes no audit entry for that change. Other management changes, such as creating or deleting IAM users, roles, access keys and policies, are not audit-logged
+- Audit entries are WARN events, so none are written while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off
 - Cache flushes (`cache invalidate`) are logged at INFO with the admin name, the scope and its selectors, so they are not recorded when the log level (`logging.level`, or the `log_level` setting, which overrides it) is `warn` or `error`
 - Log messages do not contain secret keys, passwords, or item data. Access key IDs can appear, for example in cache flush records
 

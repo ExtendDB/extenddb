@@ -94,6 +94,9 @@ use stream_scope::{check_stream_arn_kind, check_stream_arn_scope, stream_arn_in_
 /// The item actions the service requires on the target table of a restore, in
 /// addition to the restore action itself (measured live). A Deny on any of
 /// these for the target table name blocks a restore into it.
+/// `RestoreTableToPointInTime` checks them, Scan first, before the restore
+/// action: a caller with no policy is denied on `dynamodb:Scan` on the target
+/// table, as on the service (measured 2026-10-22, issue #446).
 const RESTORE_TARGET_ACTIONS: &[&str] = &[
     "Scan",
     "Query",
@@ -739,15 +742,19 @@ pub(crate) fn authz_targets(
             v.extend(restore_target_actions(input, region, account_id));
             v
         }
-        // RestoreTableToPointInTime requires dynamodb:RestoreTableToPointInTime
-        // on the source table and the item actions on the target table it
-        // writes (measured live).
+        // RestoreTableToPointInTime requires the item actions on the target
+        // table it writes and dynamodb:RestoreTableToPointInTime on the source
+        // table (measured live). The service checks the target's item actions
+        // first: a caller with no policy is denied on dynamodb:Scan on the
+        // target table, not on the restore action on the source (measured
+        // 2026-10-22 with an index SourceTableArn).
         "RestoreTableToPointInTime" => {
             let source = str_field(input, "SourceTableArn")
                 .or_else(|| str_field(input, "SourceTableName"))
                 .unwrap_or_default();
-            let mut v = from(table_resource_arn(&source, region, account_id), &source);
-            v.extend(restore_target_actions(input, region, account_id));
+            let restore = from(table_resource_arn(&source, region, account_id), &source);
+            let mut v = restore_target_actions(input, region, account_id);
+            v.extend(restore);
             v
         }
         // Query and Scan on an index authorize the index ARN. With a table ARN
@@ -1529,3 +1536,7 @@ mod key_lookup_name_tests {
 /// The denial names the resource as the caller supplied it (issue #447).
 #[cfg(test)]
 mod supplied_resource_tests;
+
+/// A point-in-time restore authorizes its target before its source (issue #446).
+#[cfg(test)]
+mod restore_order_tests;

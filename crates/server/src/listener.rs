@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use axum::Router;
 
-use crate::ServerTlsConfig;
 use crate::registration::Admission;
+use crate::{CONNECTION_DRAIN_TIMEOUT, ServerTlsConfig};
 
 /// Serve `app` on `listener` until a shutdown signal arrives, or until
 /// `admission` asks for a stop after the serving registration was lost.
@@ -20,7 +20,9 @@ use crate::registration::Admission;
 /// rustls. When `tls` is `None`, the server serves plaintext HTTP. Both arms
 /// run on the same `axum-server` builder, so the request timeouts, the
 /// shutdown handle and `TCP_NODELAY` apply to every listener mode, and a
-/// signal and a stop drain the listener the same way.
+/// signal and a stop drain the listener the same way: for up to
+/// [`CONNECTION_DRAIN_TIMEOUT`], after which the connections still open are
+/// closed and the function returns.
 pub(crate) async fn serve_app(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -36,7 +38,9 @@ pub(crate) async fn serve_app(
     let shutdown_pid = pid_file.clone();
     tokio::spawn(async move {
         signal_or_stop(&admission).await;
-        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        // `extenddb stop` waits for the sum of the server's shutdown bounds
+        // and counts this drain as `CONNECTION_DRAIN_TIMEOUT`.
+        shutdown_handle.graceful_shutdown(Some(CONNECTION_DRAIN_TIMEOUT));
         // P50: Log timeout but don't call std::process::exit — let the
         // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
         tokio::time::sleep(Duration::from_secs(10)).await;
@@ -77,7 +81,7 @@ pub(crate) async fn serve_app(
         };
         let server = axum_server::from_tcp_rustls(std_listener, rustls_config)?
             .map(|tls| FirstByteAcceptor::new(tls.acceptor(redirect_acceptor), request_timeout))
-            .handle(handle);
+            .handle(handle.clone());
         with_request_timeouts(server, request_timeout)
             .serve(make_service)
             .await?;
@@ -85,10 +89,20 @@ pub(crate) async fn serve_app(
         tracing::info!("extenddb listening on {local_addr}");
         let server = axum_server::from_tcp(std_listener)?
             .acceptor(FirstByteAcceptor::new(NodelayAcceptor, request_timeout))
-            .handle(handle);
+            .handle(handle.clone());
         with_request_timeouts(server, request_timeout)
             .serve(make_service)
             .await?;
+    }
+
+    // Either arm returns once every connection has closed, or once
+    // `CONNECTION_DRAIN_TIMEOUT` has passed since the stop, when `axum-server`
+    // closes the connections still open; those are still counted here.
+    if handle.connection_count() > 0 {
+        tracing::warn!(
+            "connections still open {} s after the stop; the listener is closed with them",
+            CONNECTION_DRAIN_TIMEOUT.as_secs()
+        );
     }
 
     // Normal shutdown path — clean up PID file after connections drain.

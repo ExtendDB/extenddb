@@ -702,6 +702,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // checked. A configuration error stops startup here; a transport or
     // identity failure starts the server with the store unhealthy
     // (`backup_store` module doc). The spool lock lives until shutdown.
+    // Workers and backup jobs run until `shutdown` is cancelled, which
+    // happens after the HTTP server stops accepting; the jobs are cancelled
+    // on a child token first, so their failure paths run and record their
+    // metrics before the workers (the metrics flush among them) are drained.
+    let shutdown = CancellationToken::new();
     let backend_name = app_config.storage.backend.clone();
     let (backup_runtime, _spool_lock) = crate::backup_store::configure(
         &app_config.backup,
@@ -711,7 +716,13 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         crate::backup_store::Caller::Server,
     )
     .await?;
-    let backup_runtime = Arc::new(backup_runtime);
+    let backup_runtime = Arc::new(
+        backup_runtime
+            .with_metrics(metrics.clone())
+            .with_shutdown(shutdown.child_token())
+            .with_source(&backend_name, build.version)
+            .with_limits(Arc::clone(&limits)),
+    );
     let backup_runtime_for_reconciler = Arc::clone(&backup_runtime);
     let state = AppState {
         storage: storage.clone(),
@@ -744,13 +755,11 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     };
 
     // The server's own workers and the backend's run as one set, each set on
-    // a child token of `shutdown`, which is cancelled after the HTTP server
-    // stops accepting. The registration supervisor stops the set while the
-    // server holds no registration and starts a new one once it holds one.
-    // Handles are kept so a stop can drain them (the metrics flush worker
-    // persists its final bucket on the way out) instead of leaving the work
-    // to a runtime drop.
-    let shutdown = CancellationToken::new();
+    // a child token of `shutdown`. The registration supervisor stops the set
+    // while the server holds no registration and starts a new one once it
+    // holds one. Handles are kept so a stop can drain them (the metrics flush
+    // worker persists its final bucket on the way out) instead of leaving the
+    // work to a runtime drop.
     let hooks: Option<Arc<dyn extenddb_storage::ServerRuntimeHooks>> = runtime_hooks.map(Arc::from);
     let reconciler_settings = extenddb_engine::reconciler::ReconcilerSettings {
         interval: std::time::Duration::from_secs(app_config.backup.reconcile_interval_secs),
@@ -768,7 +777,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         let config_log_level = app_config.logging.level.clone();
         let metrics = metrics.clone();
         let storage = storage.clone();
-        let backup_runtime = backup_runtime_for_reconciler;
+        let backup_runtime = Arc::clone(&backup_runtime_for_reconciler);
         Box::new(move |token: CancellationToken| {
             let catalog_store = catalog_store.clone();
             let reload_handle = reload_handle.clone();
@@ -842,7 +851,10 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             })
         })
     };
-    let background = Arc::new(BackgroundWorkers::new(spawn, &shutdown));
+    let background = Arc::new(
+        BackgroundWorkers::new(spawn, &shutdown)
+            .with_jobs(Arc::clone(&backup_runtime_for_reconciler)),
+    );
     background.start().await;
     // A backend whose registration the database can end: the supervisor
     // refuses requests and stops the workers while it is lost, and asks for
@@ -869,22 +881,16 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
 
     let server_result = crate::start_server(listener, state, pid_file, tls_config).await;
 
-    // The HTTP server has stopped accepting. The supervisor returns once the
-    // token fires; then the workers stop, so in-flight cycles finish and the
-    // metrics flush worker writes its final bucket, and the serving
-    // registration is given up once every one of them has ended.
-    shutdown.cancel();
-    if let Some(supervisor) = supervisor
-        && tokio::time::timeout(SUPERVISOR_TIMEOUT, supervisor)
-            .await
-            .is_err()
-    {
-        tracing::warn!(
-            "The registration supervisor did not return within {}s",
-            SUPERVISOR_TIMEOUT.as_secs()
-        );
-    }
-    stop_then_release(&background, held.as_deref()).await;
+    // The HTTP server has stopped accepting.
+    drain_then_release(
+        &backup_runtime_for_reconciler,
+        JOB_DRAIN_TIMEOUT,
+        &shutdown,
+        supervisor,
+        &background,
+        held.as_deref(),
+    )
+    .await;
 
     server_result?;
 
@@ -900,6 +906,44 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The shutdown sequence once the listener has stopped. The backup jobs are
+/// cancelled and awaited first, within `job_drain` (a cancelled job's
+/// failure path deletes its prefix, which on S3 is what sweeps an upload
+/// still in flight), so their failure paths record their metrics before the
+/// workers, the metrics flush among them, stop. Then the supervisor returns
+/// once the token fires, the workers stop, so in-flight cycles finish and
+/// the metrics flush worker writes its final bucket, and the serving
+/// registration is given up once every job and worker has ended: a job
+/// still running at the drain's bound keeps the registration, which expires
+/// by itself ([`stop_then_release`]).
+async fn drain_then_release(
+    jobs: &extenddb_engine::BackupRuntime,
+    job_drain: Duration,
+    shutdown: &CancellationToken,
+    supervisor: Option<tokio::task::JoinHandle<()>>,
+    workers: &BackgroundWorkers,
+    registrar: Option<&dyn extenddb_storage::hooks::ServingRegistrar>,
+) {
+    let jobs_left = jobs.drain_jobs(job_drain).await;
+    shutdown.cancel();
+    if let Some(supervisor) = supervisor
+        && tokio::time::timeout(SUPERVISOR_TIMEOUT, supervisor)
+            .await
+            .is_err()
+    {
+        tracing::warn!(
+            "The registration supervisor did not return within {}s",
+            SUPERVISOR_TIMEOUT.as_secs()
+        );
+    }
+    stop_then_release(workers, registrar, jobs_left == 0).await;
+}
+
+/// How long shutdown waits for the backup jobs' failure paths, before the
+/// supervisor and the workers: a `delete_prefix` of a large S3 prefix takes
+/// longer than the workers' drain allows.
+pub const JOB_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long `serve` waits for the registration supervisor once the shutdown
 /// token fires: longer than a stop of the workers, which the supervisor may
 /// be running then.
@@ -911,6 +955,23 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for the aborted workers to end.
 const ABORT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long shutdown's stop of the workers waits: the drain and the abort,
+/// plus a supervisor's own stop it may queue behind (one that did not
+/// return within [`SUPERVISOR_TIMEOUT`]).
+const STOP_TIMEOUT: Duration = Duration::from_secs(
+    DRAIN_TIMEOUT.as_secs() + ABORT_TIMEOUT.as_secs() + SUPERVISOR_TIMEOUT.as_secs(),
+);
+
+/// How long shutdown waits for the serving registration's release.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest shutdown takes after the job drain: the supervisor's return,
+/// the workers' stop and the registration's release, each under its own
+/// bound. `extenddb stop` waits for the sum of the shutdown bounds.
+pub const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(
+    SUPERVISOR_TIMEOUT.as_secs() + STOP_TIMEOUT.as_secs() + RELEASE_TIMEOUT.as_secs(),
+);
 
 /// Starts one set of background workers on the token it is given, and
 /// returns their handles.
@@ -932,7 +993,11 @@ struct WorkerSet {
 /// and stop as one set. `serve` starts the first set and stops the one that
 /// runs at shutdown; the registration supervisor stops the set while the
 /// server holds no registration and starts a new one once it holds one.
-/// Each set runs on a child token of the server's shutdown token.
+/// Each set runs on a child token of the server's shutdown token. A stop
+/// also cancels the backup jobs running then ([`Self::with_jobs`]): a
+/// migration can take the catalog once a lost registration expires, and a
+/// job's heartbeats and status writes would otherwise go on beside it; the
+/// jobs started under a new registration run on a fresh token.
 struct BackgroundWorkers {
     spawn: SpawnWorkers,
     shutdown: CancellationToken,
@@ -941,6 +1006,8 @@ struct BackgroundWorkers {
     left_running: AtomicBool,
     drain: Duration,
     abort: Duration,
+    /// The runtime whose jobs a stop cancels, when the server has one.
+    jobs: Option<Arc<extenddb_engine::BackupRuntime>>,
 }
 
 impl BackgroundWorkers {
@@ -961,7 +1028,14 @@ impl BackgroundWorkers {
             left_running: AtomicBool::new(false),
             drain,
             abort,
+            jobs: None,
         }
+    }
+
+    /// The same workers with the backup jobs a stop cancels (type doc).
+    fn with_jobs(mut self, jobs: Arc<extenddb_engine::BackupRuntime>) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 }
 
@@ -973,6 +1047,15 @@ impl WorkerControl for BackgroundWorkers {
     /// outlives its abort (one that blocks its thread) is reported once and
     /// for the rest of the process.
     async fn stop(&self) -> bool {
+        if let Some(jobs) = &self.jobs {
+            let cancelled = jobs.cancel_jobs();
+            if cancelled > 0 {
+                tracing::warn!(
+                    "{cancelled} backup job(s) cancelled with the workers' stop; each fails its \
+                     row with reason shutdown and deletes its objects"
+                );
+            }
+        }
         let mut running = self.running.lock().await;
         if let Some(set) = running.take()
             && !stop_set(set, self.drain, self.abort).await
@@ -1035,16 +1118,16 @@ async fn stop_set(set: WorkerSet, drain: Duration, abort: Duration) -> bool {
 
 /// Stop the workers, then release the serving registration: a migration
 /// that waits for the servers starts once the registration is gone, so
-/// releasing it while a worker runs would let the migration run beside a
-/// worker that still writes to the catalog. When a worker could not be
-/// stopped, the registration is not released and expires by itself. The
+/// releasing it while a worker or a backup job runs would let the migration
+/// run beside work that still writes to the catalog. When a worker could
+/// not be stopped, or `jobs_ended` is false (a backup job outlived its
+/// drain), the registration is not released and expires by itself. The
 /// stop and the release are bounded.
 async fn stop_then_release(
     workers: &BackgroundWorkers,
     registrar: Option<&dyn extenddb_storage::hooks::ServingRegistrar>,
+    jobs_ended: bool,
 ) {
-    const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
-
     let bound = workers.drain + workers.abort + SUPERVISOR_TIMEOUT;
     let ended = tokio::time::timeout(bound, workers.stop())
         .await
@@ -1056,6 +1139,13 @@ async fn stop_then_release(
         tracing::warn!(
             "A background worker may still run, so the serving registration is not released; it \
              expires by itself"
+        );
+        return;
+    }
+    if !jobs_ended {
+        tracing::warn!(
+            "A backup job may still run, so the serving registration is not released; it expires \
+             by itself"
         );
         return;
     }
@@ -1173,7 +1263,7 @@ mod tests {
         workers.start().await;
         let registrar = Recorder(events.clone());
         shutdown.cancel();
-        super::stop_then_release(&workers, Some(&registrar)).await;
+        super::stop_then_release(&workers, Some(&registrar), true).await;
         assert_eq!(*events.lock().unwrap(), ["worker stopped", "released"]);
     }
 
@@ -1199,7 +1289,7 @@ mod tests {
         workers.start().await;
         let registrar = Recorder(events.clone());
         shutdown.cancel();
-        super::stop_then_release(&workers, Some(&registrar)).await;
+        super::stop_then_release(&workers, Some(&registrar), true).await;
         assert_eq!(*events.lock().unwrap(), ["released"]);
         let at_release = ticks.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1225,9 +1315,113 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let registrar = Recorder(events.clone());
         shutdown.cancel();
-        super::stop_then_release(&workers, Some(&registrar)).await;
+        super::stop_then_release(&workers, Some(&registrar), true).await;
         assert!(events.lock().unwrap().is_empty(), "released");
         assert!(!workers.stop().await, "a later stop forgot the worker");
+    }
+
+    /// A backup job still running after its drain keeps the registration
+    /// as a worker that could not be stopped does: the workers stop, and
+    /// the registration is left to expire.
+    #[tokio::test]
+    async fn a_job_left_running_keeps_the_registration() {
+        let events: Events = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = CancellationToken::new();
+        let workers = {
+            let events = events.clone();
+            workers(&shutdown, move |token| {
+                let events = events.clone();
+                async move {
+                    token.cancelled().await;
+                    events.lock().unwrap().push("worker stopped");
+                }
+            })
+        };
+        workers.start().await;
+        let registrar = Recorder(events.clone());
+        shutdown.cancel();
+        super::stop_then_release(&workers, Some(&registrar), false).await;
+        assert_eq!(*events.lock().unwrap(), ["worker stopped"]);
+    }
+
+    /// The shutdown sequence `serve` runs after its listener stops, with a
+    /// job that outlives a short drain bound: the job's token is cancelled,
+    /// the drain gives up at its bound, the server's token fires, the
+    /// workers stop, and the registration is not released. The same
+    /// sequence with the job ending at its cancellation releases it, after
+    /// the worker stopped.
+    #[tokio::test]
+    async fn the_shutdown_sequence_keeps_the_registration_while_a_job_outlives_the_drain() {
+        for (ends_on_cancel, expected) in [
+            (false, vec!["worker stopped"]),
+            (true, vec!["job ended", "worker stopped", "released"]),
+        ] {
+            let events: Events = Arc::new(Mutex::new(Vec::new()));
+            let shutdown = CancellationToken::new();
+            let runtime =
+                extenddb_engine::BackupRuntime::new(4).with_shutdown(shutdown.child_token());
+            let token = runtime.shutdown();
+            runtime.spawn_job({
+                let events = events.clone();
+                async move {
+                    if ends_on_cancel {
+                        token.cancelled().await;
+                        events.lock().unwrap().push("job ended");
+                    } else {
+                        // A job in a store call that does not return.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            });
+            let workers = {
+                let events = events.clone();
+                workers(&shutdown, move |token| {
+                    let events = events.clone();
+                    async move {
+                        token.cancelled().await;
+                        events.lock().unwrap().push("worker stopped");
+                    }
+                })
+            };
+            workers.start().await;
+            let registrar = Recorder(events.clone());
+            super::drain_then_release(
+                &runtime,
+                Duration::from_millis(100),
+                &shutdown,
+                None,
+                &workers,
+                Some(&registrar),
+            )
+            .await;
+            assert!(shutdown.is_cancelled());
+            assert_eq!(*events.lock().unwrap(), expected, "{ends_on_cancel}");
+            assert_eq!(runtime.running_jobs(), usize::from(!ends_on_cancel));
+        }
+    }
+
+    /// A stop of the workers (the supervisor's, at a registration loss)
+    /// cancels the jobs running then and leaves a fresh token for the jobs
+    /// that start under the new registration.
+    #[tokio::test]
+    async fn a_stop_of_the_workers_cancels_the_jobs_and_renews_their_token() {
+        let shutdown = CancellationToken::new();
+        let runtime =
+            Arc::new(extenddb_engine::BackupRuntime::new(4).with_shutdown(shutdown.child_token()));
+        let before = runtime.shutdown();
+        let workers = workers(&shutdown, |token| async move { token.cancelled().await })
+            .with_jobs(Arc::clone(&runtime));
+        workers.start().await;
+        assert!(workers.stop().await);
+        assert!(before.is_cancelled(), "the jobs' token is cancelled");
+        let after = runtime.shutdown();
+        assert!(!after.is_cancelled(), "a fresh token for the next jobs");
+        assert!(!shutdown.is_cancelled(), "the server's token is untouched");
+        shutdown.cancel();
+        assert!(
+            after.is_cancelled(),
+            "the fresh token is the server's child"
+        );
     }
 
     /// A stopped set starts again on a new token: the supervisor stops the

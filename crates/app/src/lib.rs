@@ -69,7 +69,7 @@ enum Command {
     Init(cmd_init::InitArgs),
     /// Tear down a extenddb deployment (the databases; the backup store is left untouched)
     Destroy(cmd_destroy::DestroyArgs),
-    /// List or purge the backups of the configured backup store
+    /// List or purge the backups of the configured backup store, or remove a restore target
     Backup(cmd_backup::BackupArgs),
     /// Validate a extenddb deployment
     Verify(cmd_verify::VerifyArgs),
@@ -197,6 +197,13 @@ fn print_version(build: BuildInfo) {
             "disabled"
         }
     );
+    // The backup jobs' pause points (`EXTENDDB_BACKUP_PAUSE`) are this
+    // crate's feature, not the binary's, so they are read here. The line is
+    // printed only on such a build; `test-hooks` above stays the MongoDB
+    // hooks' line that `devtools/run-mongodb-tests` reads.
+    if cfg!(feature = "backup-test-hooks") {
+        println!("backup-test-hooks enabled");
+    }
 }
 
 /// Run an async subcommand with a single-threaded tokio runtime and stderr logging.

@@ -230,6 +230,20 @@ pub(crate) async fn authorize_request(
         return Ok(authorized_key_info);
     }
 
+    // A PartiQL request names its tables inside its statements. The service
+    // authorizes each statement with the action of its type
+    // (`dynamodb:PartiQLSelect` and the others) against the table or index it
+    // reads or writes, and needs no action for the operation itself (measured
+    // 2026-11-03). The engine authorizes each statement through the item
+    // authorizer the handler gives it, and refuses every statement without
+    // one (see `item_authz`).
+    if matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
+    ) {
+        return Ok(authorized_key_info);
+    }
+
     // Request-level condition keys every evaluation below carries: the
     // deployment region, aws:SecureTransport, aws:SourceIp and aws:UserAgent,
     // and the tag condition keys the operation populates (aws:TagKeys and
@@ -417,7 +431,8 @@ pub(crate) async fn authorize_request(
     } else {
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
-        // request.
+        // request. The pairs are checked in the order `authz_targets` returns
+        // them, and the first denied pair is the one the denial names.
         for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),

@@ -16,6 +16,7 @@ pub mod console;
 pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
+mod item_authz;
 pub mod key_info_cache;
 mod leading_keys;
 mod listener;
@@ -32,8 +33,8 @@ mod throttle_helpers;
 mod workers;
 
 pub use serve::{
-    BuildInfo, CatalogRefusal, LogTarget, RegistrationLost, ServeParams, catalog_refusal,
-    log_to_syslog_raw, serve,
+    BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
+    WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
 };
 
 use std::path::PathBuf;
@@ -119,6 +120,12 @@ pub struct ServerTlsConfig {
     /// Path to the PEM private key file.
     pub key_path: PathBuf,
 }
+
+/// How long the listener drains active connections after a stop, on HTTPS
+/// and on plain HTTP alike: connections still open at the bound are closed,
+/// and the PID file is removed once the drain ends. `extenddb stop` waits for
+/// the sum of the shutdown bounds.
+pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build and start the HTTP server on a pre-bound listener.
 ///

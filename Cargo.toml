@@ -121,6 +121,19 @@ aws-smithy-http-client = { version = "=1.1.9", default-features = false, feature
 url = { version = "=2.5.8" }
 bytes = "1"
 
+# Auth tests
+# Already in the graph through aws-config; named directly so the auth crate's
+# tests can sign requests with the SDK's SigV4 signer and check the server's
+# verifier against it.
+aws-sigv4 = { version = "=1.3.8", default-features = false }
+# Already in the graph through aws-config; named directly because the
+# aws-sigv4 signer takes this crate's credentials type and does not re-export
+# it.
+aws-credential-types = { version = "=1.2.11", default-features = false }
+# Already in the graph through the MongoDB backend's tests; named directly so
+# the auth tests can generate requests from a fixed seed.
+proptest = { version = "1.11", default-features = false }
+
 # Crypto & checksums
 crc32fast = "1"
 # Pinned to the versions already resolved in Cargo.lock.
