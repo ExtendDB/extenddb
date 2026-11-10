@@ -292,10 +292,12 @@ def main() -> None:
 # format and no backup taken on a Cassandra server restores through the
 # store-backed job. A Cassandra kill point therefore takes its backup on a
 # SQLite source server (`--source-bin`, a SQLite build), copies the prefix
-# under the Cassandra target's root and seeds the target's `backup_index`
-# row as `devtools/backup-restore-matrix` does (and as `backup sync
-# --adopt-store` will), then restores on the paused Cassandra server. The
-# matrix script is imported for `copy_prefix`, `prefix_of` and `seed_row`.
+# under the Cassandra target's root and adopts it with `extenddb backup
+# sync` beside the target's server, as `devtools/backup-restore-matrix`
+# does (the sync takes the maintenance claim and releases it before it
+# exits, so the restore request that follows is not refused), then restores
+# on the paused Cassandra server. The matrix script is imported for
+# `copy_prefix` and `prefix_of`.
 #
 # `--second-reach` kills at the point's second reach instead of its first:
 # the first pause is released (the release file written, then removed once
@@ -812,7 +814,7 @@ def _tamper_a_data_file(dep: Deployment, arn: str) -> str:
 
 def _matrix_module():
     """`devtools/backup-restore-matrix` imported as a module, for the prefix
-    copy and the `backup_index` seed a Cassandra target needs."""
+    copy a Cassandra target needs."""
     import importlib.machinery
     import importlib.util
 
@@ -831,27 +833,24 @@ def _matrix_module():
 
 
 def _adopt_backup(source: Deployment, target: Deployment, arn: str) -> None:
-    """Copy the source's backup prefix under the target's root and seed the
-    target's `backup_index` row, the matrix's stand-in for `backup sync
-    --adopt-store`."""
-    import json
-    import types
-
+    """Copy the source's backup prefix under the target's root and adopt it
+    with `extenddb backup sync` beside the target's server, as the matrix's
+    `adopt_backup` does: the sync must exit 0 and name the one backup
+    adopted. Its output is kept in `sync.log`."""
     mx = _matrix_module()
     src_prefix = mx.prefix_of(source.root, arn)
     dst_prefix = mx.prefix_of(target.root, arn)
     mx.copy_prefix(src_prefix, dst_prefix, target.root)
-    with open(os.path.join(dst_prefix, "extenddb-manifest.json")) as f:
-        manifest = json.load(f)
-
-    def store_id() -> str:
-        with open(os.path.join(target.root, "extenddb-store.json")) as f:
-            return json.load(f)["store_id"]
-
-    adapter = types.SimpleNamespace(backend=target.backend, root=target.root, work=target.work,
-                                    tag=target.tag, store_id=store_id)
-    mx.seed_row(adapter, arn, manifest, manifest["backup_size_bytes"], manifest["source_table"]["item_count"])
-    _say(f"backup {arn} adopted by the {target.backend} target (prefix copied, backup_index row seeded)")
+    r = subprocess.run(
+        [target.bin, "backup", "sync", "--config", target.config],
+        cwd=target.work, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600,
+    )
+    with open(os.path.join(target.work, "sync.log"), "a") as log:
+        log.write(f"$ extenddb backup sync: exit {r.returncode}\n{r.stdout}{r.stderr}\n")
+    if r.returncode != 0 or f"  {arn}" not in r.stdout.splitlines() or "1 backup(s) adopted" not in r.stdout:
+        raise SystemExit(f"backup sync on the {target.backend} target did not adopt {arn} "
+                         f"(exit {r.returncode}): {(r.stdout + r.stderr)[-3000:]}")
+    _say(f"backup {arn} adopted by the {target.backend} target (prefix copied, backup sync)")
 
 
 def _run_restore_point(backend: str, point: str, binary: str, items: int, work: str,
