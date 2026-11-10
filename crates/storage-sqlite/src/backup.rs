@@ -4751,6 +4751,11 @@ mod restore_tests {
                 DeleteStart::InUse("del_target".to_owned())
             );
             assert_eq!(
+                engine.forget_available_backup_row(&key).await.unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+                "the outright removal keeps the in-use rule"
+            );
+            assert_eq!(
                 engine
                     .read_backup_row(&arn_of(&row))
                     .await
@@ -4776,6 +4781,55 @@ mod restore_tests {
                 DeleteStart::Status(BackupStatus::Deleting),
                 "a retry finds the row DELETING"
             );
+            assert_eq!(
+                engine.forget_available_backup_row(&key).await.unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+                "only an AVAILABLE row is removed outright"
+            );
+            // An AVAILABLE row goes outright, read and listed nowhere, with no
+            // tombstone; a second removal finds no row.
+            let mut adopted = self::row(ACCOUNT, "Music", "adopted");
+            adopted.status = BackupStatus::Available;
+            assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+            assert_eq!(
+                engine
+                    .forget_available_backup_row(&adopted.key())
+                    .await
+                    .unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::Removed
+            );
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&adopted))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for status in [None, Some(BackupStatus::Available)] {
+                let listed: Vec<BackupRow> = engine
+                    .list_backup_rows(status, &adopted.store)
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(
+                    !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+                    "{status:?}"
+                );
+            }
+            let by_account: Vec<BackupRow> = engine
+                .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                !by_account
+                    .iter()
+                    .any(|r| r.backup_arn == adopted.backup_arn)
+            );
+            assert!(matches!(
+                engine.forget_available_backup_row(&adopted.key()).await,
+                Err(StorageError::Validation(m)) if m.contains("Backup not found")
+            ));
             assert!(
                 !engine.remove_backup_row(&key).await.unwrap(),
                 "DELETING is not a tombstone"
@@ -5204,6 +5258,144 @@ mod restore_tests {
                     .expect("ids")
                     .is_empty()
             );
+        }
+
+        /// `insert_backup_row`: the row lands as given, unowned, with
+        /// `completed_at` and `heartbeat_at` on the database's clock; a
+        /// second insert, an insert over a CREATING row a claim holds, and an
+        /// insert of the id under another account (the unique `backup_id`)
+        /// answer `false` and change nothing; a claim over the inserted row
+        /// is refused; the row is read and listed like a created one.
+        #[tokio::test]
+        async fn insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+            let engine = engine().await;
+            let mut adopted = row(ACCOUNT, "Music", "adopted");
+            adopted.status = BackupStatus::Available;
+            adopted.size_bytes = 1234;
+            adopted.item_count = 5;
+            // Ignored: the insert sets these three itself.
+            adopted.owner_generation = 99;
+            adopted.completed_at = None;
+            adopted.heartbeat_at = 0.0;
+            // A year before the id's instant: the two clock columns must be
+            // the database's clock at the insert, not the row's `created_at`.
+            adopted.created_at -= 365.0 * 86_400.0;
+            assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+            let stored = engine
+                .read_backup_row(&arn_of(&adopted))
+                .await
+                .expect("read")
+                .expect("the row exists");
+            assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+            let completed_at = stored.completed_at.expect("completed_at is set");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_secs_f64();
+            for at in [completed_at, stored.heartbeat_at] {
+                assert!(
+                    (at - now).abs() < 60.0,
+                    "{at} is not the insert's instant {now}"
+                );
+            }
+            assert!(
+                (stored.created_at - adopted.created_at).abs() < 1e-3,
+                "{} is the row's created_at {}",
+                stored.created_at,
+                adopted.created_at
+            );
+            assert_eq!(
+                BackupRow {
+                    owner_generation: 99,
+                    completed_at: None,
+                    heartbeat_at: 0.0,
+                    created_at: adopted.created_at,
+                    ..stored.clone()
+                },
+                adopted,
+                "every other column is the row as given"
+            );
+
+            // A second insert of the key, with other values, writes nothing.
+            let mut again = adopted.clone();
+            again.backup_name = "again".to_owned();
+            again.size_bytes = 1;
+            again.status = BackupStatus::Failed;
+            assert!(!engine.insert_backup_row(&again).await.expect("insert"));
+            // The id under another account: the unique `backup_id`.
+            let mut elsewhere = adopted.clone();
+            elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+            elsewhere.backup_arn = extenddb_storage::util::backup_arn(
+                REGION,
+                OTHER_ACCOUNT,
+                "Music",
+                &adopted.backup_id,
+            );
+            assert!(!engine.insert_backup_row(&elsewhere).await.expect("insert"));
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&elsewhere))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+                Some(stored.clone()),
+                "the refused inserts changed nothing"
+            );
+            let claimed = engine.claim_backup(&adopted).await.err();
+            assert!(
+                matches!(claimed, Some(StorageError::AlreadyExists(_))),
+                "{claimed:?}"
+            );
+
+            // Over a CREATING row a live claim holds.
+            let creating = row(ACCOUNT, "Music", "job");
+            let claim = engine.claim_backup(&creating).await.expect("claim");
+            let mut over = creating.clone();
+            over.status = BackupStatus::Available;
+            assert!(!engine.insert_backup_row(&over).await.expect("insert"));
+            let job_row = engine
+                .read_backup_row(&arn_of(&creating))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job_row.status, BackupStatus::Creating);
+            assert_eq!(job_row.owner_generation, claim.generation());
+
+            // Read and listed like a created row.
+            let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+                rows.into_iter().map(|r| r.backup_arn).collect()
+            };
+            let available: Vec<BackupRow> = engine
+                .list_backup_rows(Some(BackupStatus::Available), &store())
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(available, std::slice::from_ref(&stored));
+            let creating_rows: Vec<BackupRow> = engine
+                .list_backup_rows(Some(BackupStatus::Creating), &store())
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                arns(creating_rows),
+                std::slice::from_ref(&creating.backup_arn)
+            );
+            for table in [None, Some("Music")] {
+                let listed: Vec<BackupRow> = engine
+                    .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(
+                    listed.contains(&stored),
+                    "{table:?}: {:?}",
+                    arns(listed.clone())
+                );
+            }
+            drop(claim);
         }
 
         /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat
@@ -5721,6 +5913,47 @@ mod restore_tests {
             assert_eq!(holder, "purge on host-d");
             taker.release().await.expect("release");
             assert!(!check().await.expect("check"));
+        }
+
+        /// The maintenance claim's beat queues behind the engine write lock,
+        /// and its bound starts once the beat holds it: a writer of this
+        /// process holding the lock three bounds long delays the beat, which
+        /// then confirms the claim; the claim says its beat parks before its
+        /// bound. A beat on a claim taken over answers `Lost` within the
+        /// bound.
+        #[tokio::test]
+        async fn the_maintenance_claims_beat_is_bounded_from_the_write_lock() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let claim = engine
+                .maintenance_claim("purge on host-a", stale)
+                .await
+                .expect("claim");
+            assert!(claim.heartbeat_parks_before_its_bound());
+            let bound = Duration::from_millis(200);
+            let writer = engine.write_lock.lock().await;
+            let started = std::time::Instant::now();
+            let (beat, ()) = tokio::join!(claim.heartbeat_within(bound), async move {
+                tokio::time::sleep(3 * bound).await;
+                drop(writer);
+            });
+            assert!(
+                matches!(beat, Some(Ok(Heartbeat::Confirmed))),
+                "the beat parked on the lock confirms once it holds it: {beat:?}"
+            );
+            assert!(started.elapsed() >= 3 * bound, "{:?}", started.elapsed());
+
+            sqlx::query("UPDATE backup_maintenance SET owner_generation = owner_generation + 1")
+                .execute(&engine.pool)
+                .await
+                .expect("take over");
+            assert!(
+                matches!(
+                    claim.heartbeat_within(bound).await,
+                    Some(Ok(Heartbeat::Lost))
+                ),
+                "a claim taken over is lost"
+            );
         }
 
         /// An engine that holds the serve lock (a command that opened the

@@ -800,7 +800,7 @@ The management API is available at `/management/*` on the running extenddb serve
 
 Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
 
-**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history. For sensitive environments, leave out `--password` and set the `EXTENDDB_PASSWORD` environment variable instead, with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD`, which keeps the password out of shell history. `extenddb manage` reads the password from `EXTENDDB_PASSWORD`. `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have no environment variable.
+**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history. For sensitive environments, leave out `--password` and set the `EXTENDDB_PASSWORD` environment variable instead, with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD`, which keeps the password out of shell history. `extenddb manage` reads the password from `EXTENDDB_PASSWORD`, and it prints a warning on stderr when it gets `--password`. `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have no environment variable.
 
 ### List admin users
 

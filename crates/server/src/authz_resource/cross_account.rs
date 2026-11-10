@@ -42,6 +42,10 @@
 //! caller's included, is refused with [`MIXED_ACCOUNTS`] whichever accounts
 //! they are.
 //!
+//! An account segment that is not 12 ASCII digits gets the answers for an
+//! account that does not exist, without a catalog lookup (measured
+//! 2026-11-06; see [`account_in_catalog`]).
+//!
 //! An account exists here when this deployment's catalog holds it. Fields the
 //! service reads as a name rather than an ARN (`ListStreams` `TableName`,
 //! `RestoreTableToPointInTime` `SourceTableName`, the `ImportTable` table name,
@@ -208,12 +212,16 @@ pub(crate) fn refusal(
 /// a catalog store knows no other account. A lookup failure fails the request
 /// (it is refused either way) with the authorization layer's internal error.
 ///
-/// An empty account field names no account the catalog can hold, so it is
-/// answered without a lookup. Cassandra refuses an empty partition key, and
-/// the lookup would fail the request with that internal error where every
-/// other backend answers that the account is not held.
+/// An account segment that is not 12 ASCII digits is not looked up: the
+/// management API creates no such account, on PostgreSQL one that carries
+/// U+0000 cannot be bound, and Cassandra refuses the empty one as a partition
+/// key, so the lookup would fail the request with an internal error. The
+/// service answers it as an account that does not exist (measured 2026-11-06
+/// with `1234` and U+0000, `12345678901x`, 11 and 13 digits, in `TableArn`,
+/// `SourceTableArn`, `ResourceArn`, `StreamArn`, `BackupArn` and the
+/// control-plane `TableName`).
 async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, DynamoDbError> {
-    if account.is_empty() {
+    if !extenddb_core::arn::is_account_id(account) {
         return Ok(false);
     }
     let Some(store) = state.catalog_store.as_ref() else {

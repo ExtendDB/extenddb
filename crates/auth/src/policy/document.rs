@@ -143,6 +143,9 @@ impl fmt::Display for PolicyParseError {
 
 impl std::error::Error for PolicyParseError {}
 
+/// The size limit `from_json` applies to every document it parses.
+pub(super) const MAX_POLICY_BYTES: usize = 6_144;
+
 impl PolicyDocument {
     /// Parse a policy document from a JSON string.
     ///
@@ -156,7 +159,7 @@ impl PolicyDocument {
     /// Returns `PolicyParseError` if the JSON is malformed or contains
     /// invalid policy constructs (e.g., both Action and `NotAction`).
     pub fn from_json(json: &str) -> Result<Self, PolicyParseError> {
-        Self::from_json_with_size_limit(json, 6_144)
+        Self::from_json_with_size_limit(json, MAX_POLICY_BYTES)
     }
 
     /// Parse a policy document with an explicit size limit.
@@ -197,12 +200,16 @@ impl PolicyDocument {
     /// # Errors
     ///
     /// Returns `PolicyParseError` if `from_json` rejects the document, its
-    /// `Version` is not `2012-10-17` or `2008-10-17`, or a statement `Sid` is
-    /// outside the service's charset.
+    /// `Version` is not `2012-10-17` or `2008-10-17`, a statement `Sid` is
+    /// outside the service's charset, or a pattern or condition value holds a
+    /// `${...}` reference IAM refuses ([`super::variable_syntax`]).
     pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
+        super::variable_syntax::validate_identity_before_parse(json, MAX_POLICY_BYTES)?;
         let doc = Self::from_json(json)?;
         super::variables::validate_version(json)?;
+        super::variable_syntax::validate_identity_legacy(&doc)?;
         validate_statement_sids(&doc.statements)?;
+        super::variable_syntax::validate_identity_after_sid(&doc)?;
         Ok(doc)
     }
 }
