@@ -71,10 +71,13 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 /// empty), `arn:aws:iam::<account>:` (empty resource), `<role ARN>:x` and
 /// `arn:aws:dynamodb:*`.
 ///
-/// On the request path a value with a variable reaches this only with six
-/// fields: a value that holds `${` and has fewer than five written `:` fails
-/// its condition closed before it is matched
-/// ([`super::variables::arn_value_lacks_fields`]).
+/// On the request path a value with a variable reaches this with six fields,
+/// or, when it is expanded, with one field if its references hold every `:`
+/// it has, as `${x, '}:::::'}` does. Its condition fails closed before it is
+/// matched when it has fewer than five written `:`, each `${` ending at the
+/// next `}` ([`super::variables::arn_value_lacks_fields`]), and, when it is
+/// expanded, when its references as the evaluator reads them leave one to
+/// four written `:` ([`super::variables::expanded_arn_value_is_short`]).
 ///
 /// Not measured: how the service evaluates a pattern of two to five fields
 /// whose first field holds a wildcard, such as `*:aws:iam:*` or `ar?:aws:iam`.
@@ -194,16 +197,25 @@ pub fn is_unmeasured_short_pattern(value: &str) -> bool {
 
 /// Whether the Arn condition value `value` makes its condition fail closed at
 /// evaluation, whatever the request: a `Deny` holding it applies and an
-/// `Allow` holding it does not grant.
+/// `Allow` holding it does not grant. `expanded` is whether the evaluator
+/// expands the value's policy variables, which it does in a `2012-10-17`
+/// document.
 ///
 /// That holds for a value that has no meaning as an ARN pattern, and for one
 /// whose evaluation on the live service was not measured:
 ///
 /// - a value that holds `${` and has fewer than five `:` written outside its
 ///   `${...}` references ([`super::variables::arn_value_lacks_fields`]);
+/// - when `expanded`, a value that holds `${` and whose expansion has two to
+///   five fields ([`super::variables::expanded_arn_value_is_short`]), such
+///   as `arn:aws:iam::${aws:PrincipalAccount, '}:'}`;
 /// - a value whose first field holds no `${` and does not match `arn` under
 ///   `*` and `?` wildcards, `""` included, since no ARN starts that way;
 /// - a value that [`is_unmeasured_short_pattern`] reports.
+///
+/// The second kind applies only when `expanded`: a value compared as written
+/// splits on every `:`, and when the first kind does not report it, it has at
+/// least five `:` and so six fields.
 ///
 /// A first field that holds `${` is left to the matcher. `${x, '}:::::'}`
 /// matches nothing in a document of either `Version`: expanded with `x`
@@ -217,12 +229,14 @@ pub fn is_unmeasured_short_pattern(value: &str) -> bool {
 /// `arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}` (a variable in
 /// the account field), `${x, '}:::::'}` (a variable in the first field) or an
 /// empty partition, keep evaluating as written, so a policy stored before the
-/// check loads and decides as it did. The first two kinds can occur in a role
-/// trust policy too, whose write check accepts every value of six fields.
+/// check loads and decides as it did. The first three kinds can occur in a
+/// role trust policy too, whose write check accepts every value of six
+/// fields.
 #[must_use]
-pub fn fails_closed_at_evaluation(value: &str) -> bool {
+pub fn fails_closed_at_evaluation(value: &str, expanded: bool) -> bool {
     let first = value.split(':').next().unwrap_or_default();
     super::variables::arn_value_lacks_fields(value)
+        || (expanded && super::variables::expanded_arn_value_is_short(value))
         || (!first.contains("${") && !wildcard_match(first, "arn"))
         || is_unmeasured_short_pattern(value)
 }
@@ -316,16 +330,23 @@ pub fn invalid_trust_arn_value(conditions: &[Condition]) -> Option<(&str, &str)>
 /// The first Arn condition value in a role trust policy statement's parsed
 /// conditions that fails the statement closed at evaluation, with its
 /// condition key, or `None`: a value [`invalid_trust_arn_value`] reports, or
-/// one [`fails_closed_at_evaluation`] reports.
+/// one [`fails_closed_at_evaluation`] reports. `version_2012` is whether the
+/// trust policy's `Version` is `2012-10-17`, where the evaluator expands the
+/// values of the Arn operators.
 ///
 /// The trust write check accepts a value of the second kind when it has six
 /// fields, such as `ARN:aws:iam::123456789012:user/x`, as IAM accepted that
-/// shape in a trust policy (2026-10-30). Such a value fails its statement
-/// closed on every AssumeRole call, so the AssumeRole warning names it too.
+/// shape in a trust policy (2026-10-30), or
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`. Such a value fails its
+/// statement closed on every AssumeRole call, so the AssumeRole warning names
+/// it too.
 #[must_use]
-pub fn fail_closed_trust_arn_value(conditions: &[Condition]) -> Option<(&str, &str)> {
+pub fn fail_closed_trust_arn_value(
+    conditions: &[Condition],
+    version_2012: bool,
+) -> Option<(&str, &str)> {
     first_arn_value(conditions, |v| {
-        !is_valid_trust_arn_value(v) || fails_closed_at_evaluation(v)
+        !is_valid_trust_arn_value(v) || fails_closed_at_evaluation(v, version_2012)
     })
 }
 

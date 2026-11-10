@@ -410,8 +410,25 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         "*:aws:iam:*",
         "ar?:aws:iam",
     ] {
-        assert!(fails_closed_at_evaluation(v), "{v:?}");
+        for expanded in [true, false] {
+            assert!(fails_closed_at_evaluation(v, expanded), "{v:?} {expanded}");
+        }
         // Each is one the write check refuses.
+        assert!(
+            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
+                .is_err(),
+            "{v:?}"
+        );
+    }
+    // Values whose expansion has two to five fields fail closed only where
+    // they are expanded. The write check refuses each.
+    for v in [
+        "arn:aws:iam::${aws:PrincipalAccount, '}:'}",
+        "*:${x, '}::::'}",
+        "arn:aws:iam::${}:}",
+    ] {
+        assert!(fails_closed_at_evaluation(v, true), "{v:?}");
+        assert!(!fails_closed_at_evaluation(v, false), "{v:?}");
         assert!(
             PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
                 .is_err(),
@@ -428,10 +445,13 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         "arn:aws:IAM::123456789012:root",
         "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}",
         "arn:aws:iam::123456789012:user/${aws:username}",
-        // A first field that holds a variable is left to the matcher.
+        // A first field that holds a variable is left to the matcher. Its
+        // references hold every `:`, so its expansion has one field.
         "${x, '}:::::'}",
     ] {
-        assert!(!fails_closed_at_evaluation(v), "{v:?}");
+        for expanded in [true, false] {
+            assert!(!fails_closed_at_evaluation(v, expanded), "{v:?} {expanded}");
+        }
     }
 }
 
@@ -500,18 +520,30 @@ fn a_trust_value_that_fails_closed_at_evaluation_is_found() {
     let first_field =
         parse_conditions(&json!({"ArnNotEquals": {"aws:PrincipalArn": value}})).unwrap();
     assert_eq!(invalid_trust_arn_value(&first_field), None);
-    assert_eq!(
-        fail_closed_trust_arn_value(&first_field),
-        Some(("aws:PrincipalArn", value))
-    );
     let short = parse_conditions(&json!({"ArnLike": {"aws:SourceArn": "arn:aws:iam:*"}})).unwrap();
-    assert_eq!(
-        fail_closed_trust_arn_value(&short),
-        Some(("aws:SourceArn", "arn:aws:iam:*"))
-    );
     let full = parse_conditions(
         &json!({"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::123456789012:user/x"}}),
     )
     .unwrap();
-    assert_eq!(fail_closed_trust_arn_value(&full), None);
+    for version_2012 in [true, false] {
+        assert_eq!(
+            fail_closed_trust_arn_value(&first_field, version_2012),
+            Some(("aws:PrincipalArn", value))
+        );
+        assert_eq!(
+            fail_closed_trust_arn_value(&short, version_2012),
+            Some(("aws:SourceArn", "arn:aws:iam:*"))
+        );
+        assert_eq!(fail_closed_trust_arn_value(&full, version_2012), None);
+    }
+    // A value whose expansion has five fields has six fields at write, and
+    // fails closed only in a `2012-10-17` trust policy, where it expands.
+    let quoted = "arn:aws:iam::${aws:PrincipalAccount, '}:'}";
+    let expands = parse_conditions(&json!({"ArnLike": {"aws:PrincipalArn": quoted}})).unwrap();
+    assert_eq!(invalid_trust_arn_value(&expands), None);
+    assert_eq!(
+        fail_closed_trust_arn_value(&expands, true),
+        Some(("aws:PrincipalArn", quoted))
+    );
+    assert_eq!(fail_closed_trust_arn_value(&expands, false), None);
 }

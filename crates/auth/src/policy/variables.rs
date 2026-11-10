@@ -476,30 +476,62 @@ pub fn expand_condition_value(
     ConditionValue::Expanded { text, tokens }
 }
 
+/// The number of `:` in the plain text of `parts`, outside every reference.
+fn written_colons(parts: &[Part<'_>]) -> usize {
+    parts
+        .iter()
+        .map(|part| match part {
+            Part::Text(text) => text.matches(':').count(),
+            Part::Ref(..) => 0,
+        })
+        .sum()
+}
+
 /// Whether the `Arn*` condition value `value` contains `${` and has fewer
 /// than five `:` written outside its `${...}` references, as
-/// `${aws:ResourceTag/owner}` has none. Only a written `:` separates ARN
-/// fields here, so such a value cannot have the six fields of an ARN. The IAM
-/// policy simulator refuses a policy with such a value (`InvalidInput`) and
-/// IAM Access Analyzer reports `MISSING_ARN_FIELD` (measured 2026-10-28).
+/// `${aws:ResourceTag/owner}` has none, with each `${` ending at the next `}`
+/// ([`legacy_parts`]). Only a written `:` separates ARN fields here, so such
+/// a value cannot have the six fields of an ARN. The IAM policy simulator
+/// refuses a policy with such a value (`InvalidInput`) and IAM Access
+/// Analyzer reports `MISSING_ARN_FIELD` (measured 2026-10-28).
 ///
-/// The condition fails closed on such a value before it is matched, so the
-/// short value rule of [`super::arn_value::arn_condition_match_tokens`]
-/// applies only to a value with no variable. The identity policy write check
+/// The condition fails closed on such a value before it is matched. It also
+/// fails closed on an expanded value that [`expanded_arn_value_is_short`]
+/// reports. So the short value rule of
+/// [`super::arn_value::arn_condition_match_tokens`] applies only to a value
+/// with no variable. The identity policy write check
 /// ([`super::arn_value::is_valid_identity_arn_value`]) counts fields on every
 /// `:`, a variable's own included, and rejects every value this reports, so
 /// the two counts agree on every value an identity policy write accepts.
 #[must_use]
 pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
-    value.contains("${")
-        && legacy_parts(value)
-            .iter()
-            .map(|part| match part {
-                Part::Text(text) => text.matches(':').count(),
-                Part::Ref(..) => 0,
-            })
-            .sum::<usize>()
-            < 5
+    value.contains("${") && written_colons(&legacy_parts(value)) < 5
+}
+
+/// Whether the `Arn*` condition value `value` contains `${` and its
+/// references, read as the evaluator reads them when it expands the value
+/// ([`parts`]), leave one to four `:` written outside them. The expanded
+/// value then has two to five fields.
+///
+/// This happens when a quoted default holds a `}` and a `:`. In
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, each `${` ending at the next
+/// `}` leaves five written `:` ([`arn_value_lacks_fields`] does not report
+/// it), and the evaluator reads the reference up to its last `}`, so the
+/// value expands to the five fields `arn:aws:iam::<account>`. How IAM
+/// evaluates a pattern of two to five fields that holds a variable was not
+/// measured, so the condition fails closed on such a value
+/// ([`super::arn_value::fails_closed_at_evaluation`]). A value whose
+/// references hold every `:`, such as `${x, '}:::::'}`, expands to one field
+/// and is not reported: it matches nothing, as the IAM policy simulator
+/// answered (issue #834).
+///
+/// The identity policy write check rejects every value this reports. A `${`
+/// after the fifth `:` would leave those five `:` written, so the value has a
+/// `${` in one of the first five fields that the write check splits on every
+/// `:`, and the write check rejects a value with a `${` in any of them.
+#[must_use]
+pub(super) fn expanded_arn_value_is_short(value: &str) -> bool {
+    value.contains("${") && (1..5).contains(&written_colons(&parts(value)))
 }
 
 /// Match an expanded `Resource` or `NotResource` pattern against an ARN value

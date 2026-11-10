@@ -200,8 +200,9 @@ pub enum ConditionMatch {
     /// [`super::arn_value::fails_closed_at_evaluation`] reports: one that
     /// contains `${` and cannot have the six fields of an ARN, which IAM
     /// refuses in a document of any `Version`, one whose first field holds no
-    /// `${` and does not match `arn`, or a short pattern whose evaluation by
-    /// IAM was not measured. The statement fails closed.
+    /// `${` and does not match `arn`, or one whose evaluation by IAM was not
+    /// measured: a value whose expansion in a `2012-10-17` document has two
+    /// to five fields, or a short pattern. The statement fails closed.
     Unresolvable,
 }
 
@@ -217,15 +218,18 @@ pub enum ConditionMatch {
 /// fails closed here although it matches nothing whatever the other key
 /// holds; a `Resource` pattern of that shape does not. Where the value is not
 /// expanded it is compared as written and reads no key. It also returns
-/// `Unresolvable`, whatever `version_2012` says, when a value of an `Arn*`
-/// operator, with or without a set qualifier or `IfExists`, is one that
-/// [`super::arn_value::fails_closed_at_evaluation`] reports: it contains `${`
-/// and has fewer than five `:` written outside its `${...}` references, such
-/// as `${aws:ResourceTag/owner}`, its first field holds no `${` and does not
-/// match `arn`, such as `""`, or it is a short pattern with a wildcard in its
-/// first field, such as `*:aws:iam:*`. Otherwise returns `Match` or `NoMatch` from
-/// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
-/// as in [`evaluate_condition_with`].
+/// `Unresolvable` when a value of an `Arn*` operator, with or without a set
+/// qualifier or `IfExists`, is one that
+/// [`super::arn_value::fails_closed_at_evaluation`] reports. Whatever
+/// `version_2012` says, that is a value that contains `${` and has fewer than
+/// five `:` written outside its `${...}` references, such as
+/// `${aws:ResourceTag/owner}`, one whose first field holds no `${` and does
+/// not match `arn`, such as `""`, and a short pattern with a wildcard in its
+/// first field, such as `*:aws:iam:*`. When the value is expanded, it is also
+/// a value whose expansion has two to five fields, such as
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`. Otherwise returns `Match` or
+/// `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// `version_2012` is as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
     version_2012: bool,
@@ -245,10 +249,13 @@ pub fn evaluate_condition_match(
     // IAM evaluates it there was not measured), and the short wildcard
     // pattern was not measured. A first field that holds a variable is left
     // to the matcher, which gives the simulator's answer for
-    // `${x, '}:::::'}`. Failing closed makes a
-    // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
-    // fields whatever the document's `Version`, so the rule does not read
-    // `version_2012`.
+    // `${x, '}:::::'}`. How IAM evaluates an expanded value of two to five
+    // fields was not measured either. Failing closed makes a `Deny` apply and
+    // keeps an `Allow` from granting. IAM checks the value's fields whatever
+    // the document's `Version`, so those rules do not read `version_2012`.
+    // Only an expanded value can expand to two to five fields, so that rule
+    // reads whether the value is expanded.
+    let expanded = expands_variables(&condition.operator, version_2012);
     if matches!(
         base_operator(&condition.operator),
         ConditionOperator::ArnEquals
@@ -258,7 +265,7 @@ pub fn evaluate_condition_match(
     ) && condition
         .values
         .iter()
-        .any(|v| super::arn_value::fails_closed_at_evaluation(v))
+        .any(|v| super::arn_value::fails_closed_at_evaluation(v, expanded))
     {
         return ConditionMatch::Unresolvable;
     }

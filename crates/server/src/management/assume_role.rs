@@ -256,11 +256,13 @@ fn warn_on_stored_trust_arn_value(trust_policy: &Value, role_name: &str, account
 /// The first Arn condition value in a stored trust policy that fails its
 /// statement closed at evaluation (`arn_value::fail_closed_trust_arn_value`),
 /// with its key, read statement by statement as [`evaluate_conditions`] reads
-/// it ([`trust_conditions`]), or `None`.
+/// it ([`trust_conditions`]) under the policy's `Version`
+/// ([`trust_policy_is_version_2012`]), or `None`.
 fn stored_trust_arn_value(trust_policy: &Value) -> Option<(String, String)> {
+    let version_2012 = trust_policy_is_version_2012(trust_policy);
     statements_vec(trust_policy)?.iter().find_map(|stmt| {
         let conds = trust_conditions(&stmt["Condition"]).ok()?;
-        fail_closed_trust_arn_value(&conds).map(|(k, v)| (k.to_owned(), v.to_owned()))
+        fail_closed_trust_arn_value(&conds, version_2012).map(|(k, v)| (k.to_owned(), v.to_owned()))
     })
 }
 
