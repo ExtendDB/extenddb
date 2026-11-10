@@ -50,6 +50,30 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// The table name a request's metrics are recorded under, or `None` when the
+/// request names no valid table.
+///
+/// The request's `TableName` as sent is not trusted: a request that fails
+/// validation can carry any string, control characters included, and every
+/// reader of the metrics would get it as a dimension value (issue #728). A
+/// table ARN is reduced to its table name, so a table has one dimension value
+/// however the request named it. A name that breaks the table name rules
+/// gives `None`, and the request's metrics carry no table.
+pub(crate) fn metric_table_name(
+    input: &Value,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Option<String> {
+    let sent = input.get("TableName")?.as_str()?;
+    let name = if sent.starts_with("arn:") {
+        extenddb_core::arn::parse(sent)?.table
+    } else {
+        sent.to_owned()
+    };
+    extenddb_core::validation::validate_table_name(&name, limits)
+        .is_ok()
+        .then_some(name)
+}
+
 /// Decide how a `TableKeyInfo` lookup result feeds request authorization.
 ///
 /// A present table yields its key info. A missing table yields `None`: the
@@ -618,5 +642,60 @@ mod tests {
             matches!(err, DynamoDbError::UnknownOperationException(_)),
             "Expected UnknownOperationException, got: {err:?}"
         );
+    }
+
+    fn metric_name_of(table_name: Value) -> Option<String> {
+        metric_table_name(
+            &json!({ "TableName": table_name }),
+            &extenddb_core::limits::LimitsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn metric_table_name_keeps_a_valid_name() {
+        assert_eq!(
+            metric_name_of(json!("Orders_v2.prod-1")).as_deref(),
+            Some("Orders_v2.prod-1")
+        );
+    }
+
+    #[test]
+    fn metric_table_name_reduces_a_table_arn_to_its_name() {
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders/index/ByDate",
+        ] {
+            assert_eq!(
+                metric_name_of(json!(arn)).as_deref(),
+                Some("Orders"),
+                "{arn}"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_table_name_drops_a_name_that_breaks_the_rules() {
+        // The values issue #728 found in the metrics table after rejected
+        // CreateTable calls, a name too short, and ARNs that name no table.
+        for sent in [
+            "x\";DROP TABLE tables;--".to_owned(),
+            "a\u{0}b".to_owned(),
+            "ééé".to_owned(),
+            "a".repeat(256),
+            "ab".to_owned(),
+            String::new(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/".to_owned(),
+            "arn:aws:s3:::bucket".to_owned(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/a;b".to_owned(),
+        ] {
+            assert_eq!(metric_name_of(json!(sent)), None, "{sent:?}");
+        }
+    }
+
+    #[test]
+    fn metric_table_name_is_none_without_a_string_table_name() {
+        assert_eq!(metric_name_of(json!(42)), None);
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        assert_eq!(metric_table_name(&json!({}), &limits), None);
     }
 }

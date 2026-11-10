@@ -77,6 +77,11 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 /// M-2: `ServiceUnavailable` is a system error (503), not a user error.
 /// M-3: `TransactionConflict` metric maps to `TransactionConflictException` (OCC
 /// conflict on individual items), not `TransactionCanceledException`.
+///
+/// `UserErrors` carries no table name: CloudWatch reports it per account and
+/// Region only, and a 4xx is often a request whose `TableName` broke the
+/// rules. `table_name` is the name `request_helpers::metric_table_name`
+/// checked, used by the metrics that carry one.
 pub(crate) fn record_error_metrics(
     metrics: &extenddb_core::metrics::MetricsCollector,
     error: &DynamoDbError,
@@ -88,15 +93,89 @@ pub(crate) fn record_error_metrics(
             metrics.record_system_error(table_name, operation);
         }
         DynamoDbError::ConditionalCheckFailedException(..) => {
-            metrics.record_user_error(table_name, operation);
+            metrics.record_user_error(None, operation);
             metrics.record_conditional_check_failure(table_name, operation);
         }
         DynamoDbError::TransactionConflictException(_) => {
-            metrics.record_user_error(table_name, operation);
+            metrics.record_user_error(None, operation);
             metrics.record_transaction_conflict(operation);
         }
         _ => {
-            metrics.record_user_error(table_name, operation);
+            metrics.record_user_error(None, operation);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extenddb_core::metrics::{
+        Dimension, MetricName, MetricsCollector, MetricsQuery, TimeWindow,
+    };
+
+    use super::*;
+
+    /// The dimensions of every snapshot of `metric` in `collector`.
+    fn dimensions_of(collector: &MetricsCollector, metric: MetricName) -> Vec<Vec<Dimension>> {
+        collector
+            .query(&MetricsQuery {
+                metric: Some(metric),
+                window: Some(TimeWindow::AllTime),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|s| s.dimensions)
+            .collect()
+    }
+
+    fn has_table(dimensions: &[Dimension]) -> bool {
+        dimensions
+            .iter()
+            .any(|d| matches!(d, Dimension::TableName(_)))
+    }
+
+    #[test]
+    fn user_errors_carry_no_table_name() {
+        let collector = MetricsCollector::new();
+        for error in [
+            DynamoDbError::ValidationException("bad".to_owned()),
+            DynamoDbError::ResourceNotFoundException("missing".to_owned()),
+            DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            DynamoDbError::TransactionConflictException("conflict".to_owned()),
+        ] {
+            record_error_metrics(&collector, &error, Some("Orders"), "PutItem");
+        }
+        let user_errors = dimensions_of(&collector, MetricName::UserErrors);
+        assert_eq!(user_errors.len(), 1, "{user_errors:?}");
+        assert!(!has_table(&user_errors[0]), "{user_errors:?}");
+    }
+
+    #[test]
+    fn table_scoped_error_metrics_keep_the_checked_table_name() {
+        let collector = MetricsCollector::new();
+        record_error_metrics(
+            &collector,
+            &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            Some("Orders"),
+            "PutItem",
+        );
+        record_error_metrics(
+            &collector,
+            &DynamoDbError::InternalServerError("boom".to_owned()),
+            Some("Orders"),
+            "PutItem",
+        );
+        for metric in [
+            MetricName::ConditionalCheckFailedRequests,
+            MetricName::SystemErrors,
+        ] {
+            let dims = dimensions_of(&collector, metric);
+            assert_eq!(dims.len(), 1, "{metric:?}: {dims:?}");
+            assert!(
+                dims[0]
+                    .iter()
+                    .any(|d| matches!(d, Dimension::TableName(t) if t == "Orders")),
+                "{metric:?}: {dims:?}"
+            );
         }
     }
 }
