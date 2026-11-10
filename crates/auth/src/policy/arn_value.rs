@@ -201,22 +201,29 @@ pub fn is_unmeasured_short_pattern(value: &str) -> bool {
 ///
 /// - a value that holds `${` and has fewer than five `:` written outside its
 ///   `${...}` references ([`super::variables::arn_value_lacks_fields`]);
-/// - a value whose first field does not match `arn` under `*` and `?`
-///   wildcards, `""` included, since no ARN starts that way;
+/// - a value whose first field holds no `${` and does not match `arn` under
+///   `*` and `?` wildcards, `""` included, since no ARN starts that way;
 /// - a value that [`is_unmeasured_short_pattern`] reports.
+///
+/// A first field that holds `${` is left to the matcher. `${x, '}:::::'}`
+/// matches nothing in a document of either `Version`: expanded with `x`
+/// absent it is the one field `}:::::`, and as written its first field is
+/// `${x, '}`. So `ArnNotLike` with it holds, which is what the IAM policy
+/// simulator answered for both `Version` values (issue #834).
 ///
 /// An identity policy write rejects each of these, so in an identity policy,
 /// boundary or session policy one can only be stored from before the write
 /// check. The other values that the write check rejects, such as
 /// `arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}` (a variable in
-/// the account field) or an empty partition, keep evaluating as written, so a
-/// policy stored before the check loads and decides as it did. The first two
-/// kinds can occur in a role trust policy too, whose write check accepts
-/// every value of six fields.
+/// the account field), `${x, '}:::::'}` (a variable in the first field) or an
+/// empty partition, keep evaluating as written, so a policy stored before the
+/// check loads and decides as it did. The first two kinds can occur in a role
+/// trust policy too, whose write check accepts every value of six fields.
 #[must_use]
 pub fn fails_closed_at_evaluation(value: &str) -> bool {
+    let first = value.split(':').next().unwrap_or_default();
     super::variables::arn_value_lacks_fields(value)
-        || !wildcard_match(value.split(':').next().unwrap_or_default(), "arn")
+        || (!first.contains("${") && !wildcard_match(first, "arn"))
         || is_unmeasured_short_pattern(value)
 }
 

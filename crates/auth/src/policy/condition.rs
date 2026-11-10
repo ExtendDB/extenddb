@@ -199,9 +199,9 @@ pub enum ConditionMatch {
     /// cannot resolve, or has an `Arn*` value that
     /// [`super::arn_value::fails_closed_at_evaluation`] reports: one that
     /// contains `${` and cannot have the six fields of an ARN, which IAM
-    /// refuses in a document of any `Version`, one whose first field does not
-    /// match `arn`, or a short pattern whose evaluation by IAM was not
-    /// measured. The statement fails closed.
+    /// refuses in a document of any `Version`, one whose first field holds no
+    /// `${` and does not match `arn`, or a short pattern whose evaluation by
+    /// IAM was not measured. The statement fails closed.
     Unresolvable,
 }
 
@@ -221,9 +221,9 @@ pub enum ConditionMatch {
 /// operator, with or without a set qualifier or `IfExists`, is one that
 /// [`super::arn_value::fails_closed_at_evaluation`] reports: it contains `${`
 /// and has fewer than five `:` written outside its `${...}` references, such
-/// as `${aws:ResourceTag/owner}`, its first field does not match `arn`, such
-/// as `""`, or it is a short pattern with a wildcard in its first field, such
-/// as `*:aws:iam:*`. Otherwise returns `Match` or `NoMatch` from
+/// as `${aws:ResourceTag/owner}`, its first field holds no `${` and does not
+/// match `arn`, such as `""`, or it is a short pattern with a wildcard in its
+/// first field, such as `*:aws:iam:*`. Otherwise returns `Match` or `NoMatch` from
 /// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
 /// as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
@@ -243,7 +243,9 @@ pub fn evaluate_condition_match(
     // IAM's identity policy write check refuses a value whose first field is
     // not `arn` (a role trust policy write accepts one of six fields, and how
     // IAM evaluates it there was not measured), and the short wildcard
-    // pattern was not measured. Failing closed makes a
+    // pattern was not measured. A first field that holds a variable is left
+    // to the matcher, which gives the simulator's answer for
+    // `${x, '}:::::'}`. Failing closed makes a
     // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
     // fields whatever the document's `Version`, so the rule does not read
     // `version_2012`.

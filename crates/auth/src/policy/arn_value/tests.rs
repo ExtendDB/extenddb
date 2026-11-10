@@ -428,6 +428,8 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         "arn:aws:IAM::123456789012:root",
         "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}",
         "arn:aws:iam::123456789012:user/${aws:username}",
+        // A first field that holds a variable is left to the matcher.
+        "${x, '}:::::'}",
     ] {
         assert!(!fails_closed_at_evaluation(v), "{v:?}");
     }
