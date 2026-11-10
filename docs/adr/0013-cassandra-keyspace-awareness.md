@@ -1,4 +1,4 @@
-# ADR-0003: Dynamic Keyspace Construction
+# ADR-0013: Dynamic Keyspace Construction
 
 - Status: Accepted
 - Date: 2026-06-04

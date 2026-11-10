@@ -9,6 +9,18 @@ WORKDIR /src
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake=3.25.1-1 \
  && rm -rf /var/lib/apt/lists/*
+# cargo-auditable embeds in the binary the list of crates Cargo resolved for
+# the build, so the image SBOM lists the Rust dependencies as well as the OS
+# packages. The list can include resolved crates that are not linked. The
+# crate is pinned by a recorded checksum and built --locked.
+RUN curl -fsSL -o /tmp/cargo-auditable.crate \
+      https://static.crates.io/crates/cargo-auditable/cargo-auditable-0.7.7.crate \
+ && echo "ccdd489bc94d1338cd04389a842e00661300331ec915fb376b4810ef7d480b5d  /tmp/cargo-auditable.crate" \
+      | sha256sum --check --strict - \
+ && mkdir /tmp/cargo-auditable \
+ && tar -xzf /tmp/cargo-auditable.crate -C /tmp/cargo-auditable --strip-components=1 \
+ && cargo install --locked --path /tmp/cargo-auditable \
+ && rm -rf /tmp/cargo-auditable /tmp/cargo-auditable.crate
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN test -n "${VCS_REF}" \
@@ -18,7 +30,7 @@ RUN test -n "${VCS_REF}" \
  && EXTENDDB_GIT_HASH="${VCS_REF}" \
     EXTENDDB_BUILD_TIME="${BUILD_DATE}" \
     AWS_LC_SYS_USE_SYSTEM=0 \
-    cargo build --locked --release \
+    cargo auditable build --locked --release \
       -p extenddb --no-default-features --features postgres
 
 FROM public.ecr.aws/debian/debian:bookworm-slim@sha256:8eeeb3e089a27d34c398a5580fe479b71a457cba535f59d85e52a303610ec583 AS runtime

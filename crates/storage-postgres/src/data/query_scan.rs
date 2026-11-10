@@ -41,18 +41,18 @@ use crate::PostgresEngine;
 /// `ORDER BY` repeated the first page's items and skipped the rest.
 fn build_pagination_where(
     param_idx: u32,
-    sk_info_val: Option<(&str, ScalarAttributeType)>,
+    range_keys: &[(&str, ScalarAttributeType)],
     base_sk_info: &Option<(String, ScalarAttributeType)>,
     is_index: bool,
     is_lsi: bool,
     forward: bool,
 ) -> String {
-    let cols = order_by_columns(sk_info_val, base_sk_info.as_ref(), is_index, is_lsi);
+    let cols = order_by_columns(range_keys, base_sk_info.as_ref(), is_index, is_lsi);
     if cols.is_empty() {
         return String::new();
     }
     let cmp = if forward { ">" } else { "<" };
-    let last = param_idx + u32::try_from(cols.len()).expect("at most three cursor columns");
+    let last = param_idx + u32::try_from(cols.len()).expect("at most six cursor columns");
     let params = (param_idx..last)
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>();
@@ -67,18 +67,22 @@ fn build_pagination_where(
 /// page cursor compares, in order. Empty for a base-table Scan, whose rows are
 /// ordered by the primary key clause the caller writes.
 ///
+/// `range_keys` is every RANGE attribute of the queried key schema, in
+/// key-schema order; an index can declare up to four, ordered
+/// lexicographically over all of them.
+///
 /// - Base table with a sort key: the sort key.
 /// - LSI: the index sort key, then the base sort key (every row shares the
 ///   queried partition key, so the base sort key alone identifies a row).
-/// - GSI with a sort key: the index sort key, then the FULL base primary key.
-///   Rows in a GSI partition are unique on (index SK, base PK, base SK), not
-///   on (index SK, base SK): many base partitions can project the same index
-///   SK and the same base SK, and comparing base SK alone made a page-two
-///   query return nothing whenever the rows sharing an index SK also shared a
-///   base SK.
+/// - GSI with a sort key: the index sort key columns, then the FULL base
+///   primary key. Rows in a GSI partition are unique on (index SK, base PK,
+///   base SK), not on (index SK, base SK): many base partitions can project
+///   the same index SK and the same base SK, and comparing base SK alone made
+///   a page-two query return nothing whenever the rows sharing an index SK
+///   also shared a base SK.
 /// - Hash-only index: the full base primary key.
 fn order_by_columns(
-    sk_info_val: Option<(&str, ScalarAttributeType)>,
+    range_keys: &[(&str, ScalarAttributeType)],
     base_sk_info: Option<&(String, ScalarAttributeType)>,
     is_index: bool,
     is_lsi: bool,
@@ -91,20 +95,24 @@ fn order_by_columns(
         }
     };
     let base_sk = base_sk_info.map(|(_, t)| collated(&format!("base_{}", sk_column(*t)), *t));
-    let mut cols = Vec::with_capacity(3);
-    if let Some((_, sk_type)) = sk_info_val {
-        cols.push(collated(sk_column(sk_type), sk_type));
-        if !is_index {
-            return cols;
-        }
-        if !is_lsi {
+    let mut cols = Vec::with_capacity(range_keys.len() + 2);
+    if range_keys.is_empty() {
+        if is_index {
             cols.push("base_pk COLLATE \"C\"".to_owned());
+            cols.extend(base_sk);
         }
-        cols.extend(base_sk);
-    } else if is_index {
-        cols.push("base_pk COLLATE \"C\"".to_owned());
-        cols.extend(base_sk);
+        return cols;
     }
+    for (i, &(_, sk_type)) in range_keys.iter().enumerate() {
+        cols.push(collated(&sk_column_n(i, sk_type), sk_type));
+    }
+    if !is_index {
+        return cols;
+    }
+    if !is_lsi {
+        cols.push("base_pk COLLATE \"C\"".to_owned());
+    }
+    cols.extend(base_sk);
     cols
 }
 
@@ -157,51 +165,55 @@ impl PostgresEngine {
         let mut sql = format!("SELECT item_data FROM {ddb_table} WHERE pk = $1");
         let mut param_idx: u32 = 2;
 
-        // Sort key condition SQL fragment (first RANGE key).
-        let sk_sql_info = if let (Some(sk_cond), Some((_, sk_type))) =
-            (&key_condition.sk_condition, sk_info_val)
+        // Each RANGE condition applies to the column of the attribute it
+        // names. On a multi-RANGE index the non-equality condition can name a
+        // later RANGE attribute and the first one is an equality in
+        // `extra_sk_conditions`. A sort-key condition that names no RANGE
+        // attribute applies to the first one.
+        let range_column = |path: &[extenddb_core::expression::PathElement]| -> Option<(usize, ScalarAttributeType)> {
+            let name = match path.first() {
+                Some(extenddb_core::expression::PathElement::Attribute(name)) => {
+                    match name.strip_prefix('#') {
+                        Some(ref_name) => maps.names.get(ref_name)?.clone(),
+                        None => name.clone(),
+                    }
+                }
+                _ => return None,
+            };
+            all_sks
+                .iter()
+                .position(|(sk_name, _)| *sk_name == name)
+                .map(|pos| (pos, all_sks[pos].1))
+        };
+
+        // Sort key condition SQL fragment, and the type its values bind as.
+        let sk_cond_type = if let Some(sk_cond) = &key_condition.sk_condition
+            && let Some((pos, sk_type)) = range_column(sk_cond.path())
+                .or_else(|| sk_info_val.map(|(_, sk_type)| (0, sk_type)))
         {
-            Some(build_sk_sql(sk_cond, sk_column(sk_type), &mut param_idx))
+            let info = build_sk_sql(sk_cond, &sk_column_n(pos, sk_type), &mut param_idx);
+            sql.push_str(&info.fragment);
+            Some(sk_type)
         } else {
             None
         };
 
-        if let Some(ref info) = sk_sql_info {
-            sql.push_str(&info.fragment);
-        }
-
-        // Extra RANGE key equality conditions (multi-RANGE key schemas).
-        // Each extra SK condition is an equality on an additional RANGE attribute.
-        let mut extra_sk_col_indices: Vec<(usize, ScalarAttributeType)> = Vec::new();
-        for (path, _value) in &key_condition.extra_sk_conditions {
-            let attr_name = match path.first() {
-                Some(extenddb_core::expression::PathElement::Attribute(name)) => {
-                    if let Some(ref_name) = name.strip_prefix('#') {
-                        if let Some(resolved) = maps.names.get(ref_name) {
-                            resolved.clone()
-                        } else {
-                            tracing::warn!(name_ref = %ref_name, "unresolved expression attribute name in extra SK condition, skipping");
-                            continue;
-                        }
-                    } else {
-                        name.clone()
-                    }
-                }
-                _ => continue,
-            };
-            // Find which RANGE key index this attribute corresponds to
-            if let Some(pos) = all_sks
-                .iter()
-                .position(|(sk_name, _)| *sk_name == attr_name)
-            {
-                // Skip index 0 — that's the primary SK handled above
-                if pos > 0 {
-                    let (_, sk_type) = all_sks[pos];
-                    let col = sk_column_n(pos, sk_type);
-                    let _ = write!(sql, " AND {col} = ${param_idx}");
-                    param_idx += 1;
-                    extra_sk_col_indices.push((pos, sk_type));
-                }
+        // RANGE equalities that are not the sort-key condition, each with the
+        // value it binds. A name that is not a RANGE attribute has no column
+        // and is skipped.
+        let mut extra_sk_binds: Vec<(ScalarAttributeType, &extenddb_core::expression::Expr)> =
+            Vec::new();
+        for (path, value) in &key_condition.extra_sk_conditions {
+            if let Some((pos, sk_type)) = range_column(path) {
+                let col = sk_column_n(pos, sk_type);
+                let collate = if sk_type == ScalarAttributeType::S {
+                    " COLLATE \"C\""
+                } else {
+                    ""
+                };
+                let _ = write!(sql, " AND {col}{collate} = ${param_idx}");
+                param_idx += 1;
+                extra_sk_binds.push((sk_type, value));
             }
         }
 
@@ -223,7 +235,7 @@ impl PostgresEngine {
         if exclusive_start_key.is_some() {
             let pagination_sql = build_pagination_where(
                 param_idx,
-                sk_info_val,
+                &all_sks,
                 &base_sk_info,
                 index_name.is_some(),
                 is_lsi,
@@ -238,7 +250,7 @@ impl PostgresEngine {
         // is a row comparison the key index can seek on. String columns carry
         // COLLATE "C" for DynamoDB's UTF-8 byte order.
         let order_cols = order_by_columns(
-            sk_info_val,
+            &all_sks,
             base_sk_info.as_ref(),
             index_name.is_some(),
             is_lsi,
@@ -334,8 +346,9 @@ impl PostgresEngine {
             &pk_text,
             key_condition,
             maps,
-            sk_info_val,
-            &extra_sk_col_indices,
+            sk_cond_type,
+            &extra_sk_binds,
+            &all_sks,
             exclusive_start_key,
             &pagination_binds,
             &self.data_pool,
@@ -611,11 +624,11 @@ mod tests {
     #[test]
     fn base_table_cursor_is_a_single_comparison() {
         assert_eq!(
-            build_pagination_where(3, Some(("sk", S)), &None, false, false, true),
+            build_pagination_where(3, &[("sk", S)], &None, false, false, true),
             " AND sk_s COLLATE \"C\" > $3"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("sk", N)), &None, false, false, false),
+            build_pagination_where(3, &[("sk", N)], &None, false, false, false),
             " AND sk_n < $3"
         );
     }
@@ -623,14 +636,14 @@ mod tests {
     #[test]
     fn forward_gsi_cursor_is_a_row_comparison_over_the_full_base_key() {
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, true),
+            build_pagination_where(3, &[("gsk", S)], &base_s(), true, false, true),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4, $5)"
         );
         // Numeric index sort key with a numeric base sort key: no collation on either.
         assert_eq!(
             build_pagination_where(
                 3,
-                Some(("gsk", N)),
+                &[("gsk", N)],
                 &Some(("bsk".to_owned(), N)),
                 true,
                 false,
@@ -646,7 +659,7 @@ mod tests {
         // the exact mirror of its forward one, including among items sharing
         // an index sort key (measured 2026-09-17).
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &base_s(), true, false, false),
+            build_pagination_where(3, &[("gsk", S)], &base_s(), true, false, false),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4, $5)"
         );
     }
@@ -654,11 +667,11 @@ mod tests {
     #[test]
     fn gsi_on_a_hash_only_base_table_uses_base_pk_as_the_tie_breaker() {
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &None, true, false, true),
+            build_pagination_where(3, &[("gsk", S)], &None, true, false, true),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\") > ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("gsk", S)), &None, true, false, false),
+            build_pagination_where(3, &[("gsk", S)], &None, true, false, false),
             " AND (sk_s COLLATE \"C\", base_pk COLLATE \"C\") < ($3, $4)"
         );
     }
@@ -666,11 +679,11 @@ mod tests {
     #[test]
     fn lsi_cursor_is_a_row_comparison_in_both_directions() {
         assert_eq!(
-            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, true),
+            build_pagination_where(3, &[("lsk", S)], &base_s(), true, true, true),
             " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, Some(("lsk", S)), &base_s(), true, true, false),
+            build_pagination_where(3, &[("lsk", S)], &base_s(), true, true, false),
             " AND (sk_s COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4)"
         );
     }
@@ -678,15 +691,15 @@ mod tests {
     #[test]
     fn hash_only_index_cursor_is_a_row_comparison_over_the_base_key() {
         assert_eq!(
-            build_pagination_where(3, None, &base_s(), true, false, true),
+            build_pagination_where(3, &[], &base_s(), true, false, true),
             " AND (base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") > ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, None, &None, true, false, true),
+            build_pagination_where(3, &[], &None, true, false, true),
             " AND base_pk COLLATE \"C\" > $3"
         );
         assert_eq!(
-            build_pagination_where(3, None, &None, false, false, true),
+            build_pagination_where(3, &[], &None, false, false, true),
             ""
         );
     }
@@ -698,15 +711,15 @@ mod tests {
         // after (p5, p4) asked for keys above p4, returned p5 again, and
         // then ended with p0..p3 never delivered.
         assert_eq!(
-            build_pagination_where(3, None, &None, true, false, false),
+            build_pagination_where(3, &[], &None, true, false, false),
             " AND base_pk COLLATE \"C\" < $3"
         );
         assert_eq!(
-            build_pagination_where(3, None, &base_s(), true, false, false),
+            build_pagination_where(3, &[], &base_s(), true, false, false),
             " AND (base_pk COLLATE \"C\", base_sk_s COLLATE \"C\") < ($3, $4)"
         );
         assert_eq!(
-            build_pagination_where(3, None, &Some(("bsk".to_owned(), N)), true, false, false),
+            build_pagination_where(3, &[], &Some(("bsk".to_owned(), N)), true, false, false),
             " AND (base_pk COLLATE \"C\", base_sk_n) < ($3, $4)"
         );
     }
@@ -731,9 +744,9 @@ mod tests {
             (None, None, true, false),
         ];
         for (sk, base, is_index, is_lsi) in shapes {
-            let cols = order_by_columns(sk, base.as_ref(), is_index, is_lsi);
-            let fwd = build_pagination_where(1, sk, &base, is_index, is_lsi, true);
-            let rev = build_pagination_where(1, sk, &base, is_index, is_lsi, false);
+            let cols = order_by_columns(sk.as_slice(), base.as_ref(), is_index, is_lsi);
+            let fwd = build_pagination_where(1, sk.as_slice(), &base, is_index, is_lsi, true);
+            let rev = build_pagination_where(1, sk.as_slice(), &base, is_index, is_lsi, false);
             let params = (1..=cols.len())
                 .map(|i| format!("${i}"))
                 .collect::<Vec<_>>();
@@ -756,6 +769,35 @@ mod tests {
                 "reverse {sk:?} {base:?}"
             );
         }
-        assert!(order_by_columns(None, None, false, false).is_empty());
+        assert!(order_by_columns(&[], None, false, false).is_empty());
+    }
+
+    #[test]
+    fn multi_range_gsi_orders_and_resumes_over_every_range_attribute() {
+        // A GSI with RANGE attributes a (S), b (N), c (S) orders on all three
+        // in key-schema order before the base key, and its cursor compares
+        // the same columns. Ordering on the first one alone left ties on `a`
+        // in base-key order.
+        let range_keys = [("a", S), ("b", N), ("c", S)];
+        assert_eq!(
+            order_by_columns(&range_keys, base_s().as_ref(), true, false),
+            vec![
+                "sk_s COLLATE \"C\"",
+                "sk2_n",
+                "sk3_s COLLATE \"C\"",
+                "base_pk COLLATE \"C\"",
+                "base_sk_s COLLATE \"C\"",
+            ]
+        );
+        assert_eq!(
+            build_pagination_where(4, &range_keys, &base_s(), true, false, true),
+            " AND (sk_s COLLATE \"C\", sk2_n, sk3_s COLLATE \"C\", base_pk COLLATE \"C\", \
+             base_sk_s COLLATE \"C\") > ($4, $5, $6, $7, $8)"
+        );
+        assert_eq!(
+            build_pagination_where(4, &range_keys, &base_s(), true, false, false),
+            " AND (sk_s COLLATE \"C\", sk2_n, sk3_s COLLATE \"C\", base_pk COLLATE \"C\", \
+             base_sk_s COLLATE \"C\") < ($4, $5, $6, $7, $8)"
+        );
     }
 }

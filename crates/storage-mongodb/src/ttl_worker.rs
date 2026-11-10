@@ -10,7 +10,10 @@ use bson::{Document, doc};
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_core::types::{KeySchemaElement, Projection, ProjectionType, UserIdentity};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{DataEngine, MetadataEngine, StreamEngine, TableEngine, WorkerStore};
+use extenddb_storage::{
+    CancellationToken, DataEngine, MetadataEngine, StreamEngine, TableEngine, WorkerStore,
+    sleep_or_shutdown,
+};
 use futures::TryStreamExt;
 
 use crate::MongoEngine;
@@ -27,11 +30,16 @@ const GSI_BACKFILL_BATCH: i64 = 500;
 /// without busy-spinning.
 const CONTROL_PLANE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<MetricsCollector>) {
+/// Retry pending TTL indexes and delete expired items every
+/// [`SCAN_INTERVAL`], until `shutdown` fires.
+pub(crate) async fn ttl_cleanup_worker(
+    storage: Arc<MongoEngine>,
+    metrics: Arc<MetricsCollector>,
+    shutdown: CancellationToken,
+) {
     let region_arc: Arc<str> = Arc::from(storage.region.as_str());
 
-    loop {
-        tokio::time::sleep(SCAN_INTERVAL).await;
+    while sleep_or_shutdown(&shutdown, SCAN_INTERVAL).await {
         retry_pending_indexes(&storage).await;
         sweep_expired_items(&storage, &metrics, &region_arc).await;
     }
@@ -40,10 +48,13 @@ pub(crate) async fn ttl_cleanup_worker(storage: Arc<MongoEngine>, metrics: Arc<M
 /// Defense-in-depth stream-record deletion. A MongoDB TTL index on
 /// `stream_records.created_at` already deletes records ~1 minute after
 /// created_at + 24h; this loop covers the case where that index is
-/// missing (init predates the schema change) or lagging.
-pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
-    loop {
-        tokio::time::sleep(STREAM_CLEANUP_INTERVAL).await;
+/// missing (init predates the schema change) or lagging. Returns once
+/// `shutdown` fires.
+pub(crate) async fn stream_record_cleanup_worker(
+    storage: Arc<MongoEngine>,
+    shutdown: CancellationToken,
+) {
+    while sleep_or_shutdown(&shutdown, STREAM_CLEANUP_INTERVAL).await {
         match StreamEngine::cleanup_expired_stream_records(&*storage, STREAM_RETENTION_HOURS).await
         {
             Ok(0) => {}
@@ -76,26 +87,14 @@ pub(crate) async fn stream_record_cleanup_worker(storage: Arc<MongoEngine>) {
 /// says the table has no indexes; an invalidated in-flight observation
 /// cannot publish that stale no-index result.
 ///
-/// Every `heartbeat_interval` the loop also runs the backup sweep
-/// ([`MongoEngine::sweep_stale_backup_claims`]), so a claim or restore target
-/// left by a process that died is removed within about
-/// `stale_after + heartbeat_interval + GSI_BACKFILL_INTERVAL` without a restart
-/// of this one. The sweep removes only state whose heartbeat stopped, so it is
-/// safe while other processes share the catalog.
-pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
-    let mut last_backup_sweep = std::time::Instant::now();
-    loop {
-        tokio::time::sleep(GSI_BACKFILL_INTERVAL).await;
-
-        if last_backup_sweep.elapsed() >= storage.backup_liveness.heartbeat_interval {
-            last_backup_sweep = std::time::Instant::now();
-            match storage.sweep_stale_backup_claims().await {
-                Ok(sweep) if sweep.is_empty() => {}
-                Ok(sweep) => tracing::warn!("periodic backup sweep: {sweep}"),
-                Err(e) => tracing::warn!("periodic backup sweep failed: {e}"),
-            }
-        }
-
+/// A restore target whose load stopped before its hand-over is not this
+/// worker's: its job record keeps a stale heartbeat, and the backup
+/// reconciler acts on it, by its kind: a legacy (in-catalog) record is
+/// failed and its target removed; a store-backed (`manifest`) record is
+/// taken over and its load resumed, and the hand-over comes from the resume.
+/// Returns once `shutdown` fires, at its next pause between cycles.
+pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
+    while sleep_or_shutdown(&shutdown, GSI_BACKFILL_INTERVAL).await {
         let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
         let cursor = match indexes_coll
             .find(doc! {
@@ -119,6 +118,9 @@ pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>) {
         };
 
         for job in jobs {
+            if shutdown.is_cancelled() {
+                return;
+            }
             if let Err(e) = run_gsi_backfill_job(&storage, &job).await {
                 tracing::warn!(
                     "GSI backfill worker: job failed for index_id={}: {e}",
@@ -287,9 +289,11 @@ async fn restore_backfill_is_ready(
 }
 
 /// Complete restored tables after every restored GSI/LSI has been populated.
-/// The restore request records `restore_backfill_pending` only after the base
-/// `$out` copy succeeds, so this remains safe to retry after a process restart
-/// or a client disconnect during index backfill.
+/// `restore_backfill_pending` is set only once every base document is in
+/// place: by the legacy copy after its `$out` succeeds, and by a store-backed
+/// restore's `finish_restore` after its count check (`hand_over_to_backfill`),
+/// so this remains safe to retry after a process restart or a client
+/// disconnect during index backfill.
 async fn finish_ready_restores(storage: &MongoEngine) {
     let tables_coll = storage.catalog_db.collection::<Document>("tables");
     let mut cursor = match tables_coll
@@ -551,10 +555,10 @@ fn build_ttl_condition(
 
 /// Background poller that flips tables out of the transient `CREATING` state
 /// once their scheduled `status_transition_at` has passed. See
-/// [`crate::worker_store`] for how rows enter `CREATING`.
-pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>) {
-    loop {
-        tokio::time::sleep(CONTROL_PLANE_POLL_INTERVAL).await;
+/// [`crate::worker_store`] for how rows enter `CREATING`. Returns once
+/// `shutdown` fires.
+pub(crate) async fn control_plane_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
+    while sleep_or_shutdown(&shutdown, CONTROL_PLANE_POLL_INTERVAL).await {
         match WorkerStore::process_control_plane_transitions(&*storage).await {
             Ok(t) if t.is_empty() => {}
             Ok(transitions) => {
