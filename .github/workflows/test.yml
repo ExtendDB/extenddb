@@ -64,6 +64,9 @@ jobs:
       # AWS_ACCESS_KEY_ID in dev mode, and a test of that warning would see
       # these).
       - run: cargo test --locked --workspace --exclude extenddb-backup-store
+      # The same crates with point-in-time recovery on: the shared item-history
+      # checks on SQLite, the engine's operations and the write hooks.
+      - run: cargo test --locked -p extenddb-storage -p extenddb-storage-sqlite -p extenddb-engine --features extenddb-storage-sqlite/pitr,extenddb-engine/pitr
       - run: cargo test --locked -p extenddb-backup-store
         env:
           EXTENDDB_TEST_S3_REQUIRED: "1"

@@ -40,3 +40,7 @@ jobs:
       # `devtools/backup-kill-points.sh` runs by hand on a build with the
       # feature; no other job builds it.
       - run: cargo clippy --all-targets --features extenddb-engine/backup-test-hooks -- -D warnings
+      # Point-in-time recovery (the `pitr` features), off in every other
+      # build: the engine's operations, the item-history stores and their
+      # write hooks on SQLite and PostgreSQL.
+      - run: cargo clippy --all-targets --features extenddb/pitr,extenddb-storage-sqlite/pitr,extenddb-storage-postgres/pitr -- -D warnings
