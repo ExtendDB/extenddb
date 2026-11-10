@@ -230,6 +230,8 @@ jobs:
         env:
           EXTENDDB_BINARY: ./target/release/extenddb
           EXTENDDB_TEST_MONGODB_URI: mongodb://127.0.0.1:27023/?replicaSet=rs0&directConnection=true
+          # The sync cells edit backup_index documents with mongosh in it.
+          EXTENDDB_TEST_MONGODB_CONTAINER: extenddb-runtests-mongo-27023
         run: python3 -m pytest tests/test_backup_job.py -v -rP -p no:cacheprovider
       - name: Stop the job suite's replica set
         if: always()
@@ -247,8 +249,8 @@ jobs:
     timeout-minutes: 40
     needs: build-mongodb
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install Python dependencies
