@@ -333,11 +333,12 @@ Import/export file paths are validated:
 
 ### Backup and Recovery
 
-extenddb stores all state in PostgreSQL. Use standard PostgreSQL tools for backup and recovery:
+Back the databases up with the backend's own tools (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry names each backend's databases), and keep table backups in a backup store whose access you restrict (the [Backup and Restore manual](14-backup-and-restore.md#securing-the-store)). On PostgreSQL the catalog and data databases are one copy: dump both with the server stopped (the admin guide's Data Recovery entry restores the dumps), or, when both databases are on one PostgreSQL server, take a base backup of that server and restore it with PostgreSQL's own procedure (the design guide allows the two databases on different PostgreSQL instances, which one base backup does not cover). With the default database names, and `umask 077` so that only the owner can read the files:
 
 ```bash
+umask 077
 pg_dump extenddb_catalog > catalog_backup.sql
-pg_dump extenddb_catalog_data > data_backup.sql
+pg_dump extenddb > data_backup.sql
 ```
 
 Encryption keys are stored in the catalog database. A catalog backup includes the encryption key needed to decrypt access key secrets.

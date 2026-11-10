@@ -281,6 +281,7 @@ docs/
 | [Admin Guide](docs/manuals/05-admin-guide.md) | Server lifecycle, configuration, IAM management |
 | [Security Model](docs/manuals/10-security-model.md) | Threat model, authentication, authorization |
 | [Deployment Guide](docs/manuals/11-deployment-guide.md) | Self-hosted, multi-cloud, air-gapped deployments |
+| [Backup and Restore](docs/manuals/14-backup-and-restore.md) | Backup strategy, recovery figures, restore drill, catalog-loss recovery |
 | [Differences from DynamoDB](docs/differences-from-dynamodb.md) | Behavioral differences and unsupported operations |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and solutions |
 | [Verifying Container Images](docs/verifying-images.md) | Build provenance and SBOM attestations for the published images |
