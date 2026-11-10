@@ -4,8 +4,9 @@
 //! Direct storage-trait integration tests, ported from the original
 //! extenddb-cassandra-plugin repository (its tests/rust suite). They exercise
 //! the Cassandra engine's trait implementations directly against a live node
-//! at 127.0.0.1:9042 — no HTTP server in between — and skip themselves when
-//! no Cassandra is reachable (see helpers::skip_without_cassandra).
+//! at the contact point in `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` (default
+//! 127.0.0.1:9042) — no HTTP server in between — and skip themselves when no
+//! Cassandra is reachable (see helpers::skip_without_cassandra).
 //!
 //! One binary, one module per area, sharing tests/common/mod.rs, which is the
 //! in-tree descendant of the plug-in repo's helpers.rs.
@@ -25,16 +26,22 @@ mod authorization_store;
 mod backup_engine;
 #[path = "direct/cassandra_engine.rs"]
 mod cassandra_engine;
+#[path = "direct/concurrent_account_creation.rs"]
+mod concurrent_account_creation;
 #[path = "direct/delete_item.rs"]
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/keyspace_migrations.rs"]
+mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
 #[path = "direct/policies.rs"]
 mod policies;
+#[path = "direct/pool_size.rs"]
+mod pool_size;
 #[path = "direct/put_get_item.rs"]
 mod put_get_item;
 #[path = "direct/query.rs"]
@@ -45,6 +52,10 @@ mod roles;
 mod scan;
 #[path = "direct/settings_store.rs"]
 mod settings_store;
+#[path = "direct/snapshot_engine.rs"]
+mod snapshot_engine;
+#[path = "direct/stream_ownership.rs"]
+mod stream_ownership;
 #[path = "direct/streams.rs"]
 mod streams;
 #[path = "direct/table_engine.rs"]
@@ -53,6 +64,20 @@ mod table_engine;
 mod transact_get_items;
 #[path = "direct/transact_write_items.rs"]
 mod transact_write_items;
+#[path = "direct/transact_write_rollback_after_commit.rs"]
+mod transact_write_rollback_after_commit;
+#[path = "direct/transact_write_stream_batch_limit.rs"]
+mod transact_write_stream_batch_limit;
+#[path = "direct/transact_write_stream_images.rs"]
+mod transact_write_stream_images;
+#[path = "direct/transact_write_stream_records.rs"]
+mod transact_write_stream_records;
+#[path = "direct/transact_write_stream_sequence.rs"]
+mod transact_write_stream_sequence;
+#[path = "direct/transact_write_stream_size_sweep.rs"]
+mod transact_write_stream_size_sweep;
+#[path = "direct/transact_write_stream_tables.rs"]
+mod transact_write_stream_tables;
 #[path = "direct/transaction_ledger.rs"]
 mod transaction_ledger;
 #[path = "direct/users.rs"]

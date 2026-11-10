@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-09-16
+Last updated: 2026-11-09
 
 ## Categories
 
@@ -55,7 +55,7 @@ Last updated: 2026-09-16
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
 | S-1 | Multi-instance safety: no lease table prevents multiple extenddb instances sharing one PostgreSQL database | — | High | P25 review |
-| S-2 | `--password` flag visible in process listings (`ps aux`) | `bin/cmd_manage.rs` | Low | P12b |
+| S-2 | `--password` flag visible in process listings (`ps aux`) and shell history. `extenddb manage` prints a warning on stderr when the flag is used. With the flag omitted, it reads `EXTENDDB_PASSWORD`. The subcommand flags `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have the same exposure, no environment variable and no warning (#916) | `crates/app/src/cmd_manage.rs` | Low | P12b |
 | S-3 | Release tarballs not GPG-signed — blocked on key ownership, public key distribution, CI secrets management | `devtools/build-release` | Medium | P28 |
 
 ## Testing
@@ -90,7 +90,6 @@ See `docs/dynamodb-limits.md` for the full catalog. The following are the highes
 |---|-------|---------------|----------|--------|
 | L-2 | Expression aggregate size (attribute names/values, 2 MB total) | 2 MB | Low | P42 |
 | L-3 | Batch/transaction aggregate request size | 4–16 MB | Low | P42 |
-| L-4 | GetRecords max per call | 1,000 records | Low | P42 |
 | L-5 | Shard iterator lifetime | 15 minutes | Medium | P42 |
 | L-6 | Tag count per resource | 50 | Low | P42 |
 | L-7 | Tag key/value length limits | 128/256 chars | Low | P42 |

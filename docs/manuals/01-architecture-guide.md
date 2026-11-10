@@ -4,24 +4,35 @@
 
 ## Overview
 
-extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (currently PostgreSQL).
+extenddb (ExtendDB) is a standalone DynamoDB-compatible API server written in Rust. It receives DynamoDB wire protocol
+requests over HTTP/HTTPS, authenticates and authorizes them via SigV4 and a local IAM policy engine, executes operation
+logic in a backend-agnostic engine, and delegates persistence to a pluggable storage backend (PostgreSQL, SQLite,
+MongoDB, or Apache Cassandra).
 
-extenddb runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are needed — local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and applications point their AWS SDKs at extenddb and get identical DynamoDB behavior.
+extenddb runs as a daemon process, logging to syslog. It is designed for any environment where DynamoDB semantics are 
+needed: local development, CI pipelines, self-hosted production, multi-cloud, or air-gapped deployments. Developers and
+applications point their AWS SDKs at extenddb and get identical DynamoDB behavior.
 
 ## Cargo Workspace
 
-The project is structured as a Cargo workspace with 7 crates. Crate boundaries enforce dependency rules at compile time.
+The project is structured as a Cargo workspace with 13 crates. Crate boundaries enforce dependency rules at compile time.
 
 ```
 extenddb/
 ├── crates/
-│   ├── core/              Pure sync Rust: types, expressions, validation, errors
-│   ├── engine/            Async operation handlers (PutItem, Query, etc.)
-│   ├── storage/           Storage trait definitions and backend-agnostic utilities
-│   ├── storage-postgres/  PostgreSQL backend implementation
-│   ├── auth/              AuthProvider trait, SigV4 verification, IAM policy engine
-│   ├── server/            HTTP server (axum), management API, web console
-│   └── bin/               CLI entry point, config loading, daemon lifecycle
+│   ├── app/                Application/CLI library the bin crate dispatches to
+│   ├── auth/               AuthProvider trait, SigV4 verification, IAM policy engine
+│   ├── bin/                CLI entry point, config loading, daemon lifecycle
+│   ├── cache/              Stale-while-revalidate cache used by the auth and server layers
+│   ├── config/             Configuration types and loading
+│   ├── core/               Pure sync Rust: types, expressions, validation, errors
+│   ├── engine/             Async operation handlers (PutItem, Query, etc.)
+│   ├── server/             HTTP server (axum), management API, web console
+│   ├── storage/            Storage trait definitions and backend-agnostic utilities
+│   ├── storage-cassandra/  Cassandra backend implementation (experimental)
+│   ├── storage-mongodb/    MongoDB backend implementation
+│   ├── storage-postgres/   PostgreSQL backend implementation (default)
+│   └── storage-sqlite/     SQLite backend implementation (embedded)
 ```
 
 ## Crate Dependency Graph
@@ -34,11 +45,14 @@ bin ──→ server ──→ engine ──→ core
  │        ├──→ auth ──→ core
  │        └──→ storage
  │
- ├──→ storage-postgres ──→ storage ──→ core
+ ├──→ storage-{postgres,sqlite,mongodb,cassandra} ──→ storage ──→ core
  └──→ core
 ```
 
-Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains pure sync Rust — types, expression parsing and evaluation, input validation, capacity calculation, and error types. Every other crate depends on `core`.
+Exactly one `storage-*` backend is linked per binary, selected by mutually exclusive Cargo features at build time.
+
+Key principle: `core` depends on nothing in the workspace and has no async runtime. It contains pure sync Rust: types,
+expression parsing and evaluation, input validation, capacity calculation, and error types. Every other crate depends on `core`.
 
 ## Crate Roles
 
@@ -68,7 +82,7 @@ The `dispatch` function routes `X-Amz-Target` operation names to handlers.
 
 ### storage
 
-Trait definitions for the storage layer. Thirteen required storage traits partition backend responsibilities:
+Trait definitions for the storage layer. The required storage traits partition backend responsibilities:
 
 - **TableEngine**: Table lifecycle (create, delete, describe, list, update)
 - **DataEngine**: Item CRUD (put, get, update, delete, query, scan, batch, transact)
@@ -86,9 +100,14 @@ Trait definitions for the storage layer. Thirteen required storage traits partit
 Two further traits are optional and belong to vector search: **VectorSearchEngine**, which a backend hands over through `as_vector_search` or declines by returning `None`, and **VectorIndexBuild**, the storage primitives the shared build lifecycle drives. A backend that implements neither refuses every vector operation and is otherwise unaffected.
 - **Bootstrapper**: Initial database setup
 
-Traits use `BoxFuture` for object safety. A binary serves exactly one backend, installed from its thin `main` via `set_backend`. The `ServerRuntimeHooks` trait allows backends to spawn backend-specific workers (PostgreSQL spawns 7).
+Traits use `BoxFuture` for object safety. A binary serves exactly one backend, installed from its thin `main` via `set_backend`. The `ServerRuntimeHooks` trait allows backends to spawn backend-specific workers.
 
-### storage-postgres
+### Storage backends
+
+Each backend implements the storage traits for one database. A built ExtendDB binary links exactly one. PostgreSQL
+is the default and reference backend; Apache Cassandra is experimental; MongoDB and SQLite are also available.
+
+#### storage-postgres
 
 PostgreSQL implementation of all storage traits using `sqlx`. Features:
 
@@ -99,6 +118,20 @@ PostgreSQL implementation of all storage traits using `sqlx`. Features:
 - Transactions use `SELECT FOR UPDATE` on existing items, a reserved unique key on missing items, and single-transaction commits
 - Stream records stored in a dedicated table with background cleanup
 - All queries parameterized (no dynamic SQL construction)
+
+#### storage-cassandra
+
+Cassandra implementation of the storage traits using `cdrs-tokio`. Experimental.
+Features:
+
+- A catalog keyspace for metadata and a keyspace per account for items, under a configurable `keyspace_prefix`
+- Items stored as JSON, keyed by Cassandra partition and clustering columns
+- GSI/LSI implemented as separate index tables (see ADR-0016)
+- Transactions use a lightweight-transaction (LWT) two-phase commit, with a background worker to recover abandoned transactions (see ADR-0017)
+- Streams and TTL run from background workers, with a durable TTL expiration queue (see ADR-0010, ADR-0018)
+
+> **Note:** Cassandra has no multi-row ACID primitive. Some multi-entity operations trade all-or-nothing atomicity for
+> the integrity that LWT provides (see ADR-0012, ADR-0021).
 
 ### auth
 
@@ -153,7 +186,7 @@ expect.
    (skipped entirely in `--foreground` mode, so no run directory is needed and
    the root filesystem can be read-only)
 4. Initialize logging — syslog when daemonized, stderr in `--foreground`
-5. Connect to PostgreSQL (catalog + data databases)
+5. Connect to the storage backend
 6. Verify catalog version matches binary expectation
 7. Start axum server on the pre-bound socket
 
@@ -163,7 +196,7 @@ still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
 8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. On SIGTERM/SIGINT: drain connections (5s timeout), end the running backup jobs through their failure path (30s), stop the background tasks (5s, then abort) and give up the serving registration, exit
 
 ## Catalog Model
 
@@ -172,15 +205,18 @@ extenddb uses a dual-database architecture:
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
 - **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
-The catalog version is 0.0.4 on PostgreSQL, SQLite, and Cassandra. PostgreSQL and SQLite store it in the `settings` table under the key `catalog_version` and check it at startup; Cassandra has no startup check (see the Upgrade Manual).
-The MongoDB backend tracks its own catalog version, 0.0.2. <!-- version-literal-ok: MongoDB's backend has its own catalog version, deliberately not the compiled-in constant the documentation guard checks -->
-A mismatch between the compiled-in version and the stored one prevents a PostgreSQL or SQLite server from starting; run `extenddb migrate` to upgrade.
+On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
+A server that refuses its catalog prints the status and the command that resolves it; for pending migrations that is `extenddb migrate --yes`.
 
 ## Pluggable Architecture
 
 ### Storage
 
-Storage backends implement thirteen traits (see **storage** section above). The traits use `BoxFuture` for object safety. A binary serves exactly one backend: the thin `bin` crate installs it via `set_backend` before any subcommand runs, and the config file's `backend` key is validated against the installed name rather than selecting it. PostgreSQL, SQLite and MongoDB backends are implemented, selected by mutually exclusive Cargo features at build time.
+Storage backends implement the storage traits (see **storage** section above). The traits use `BoxFuture` for object safety.
+A built ExtendDB binary serves exactly one backend. The thin `bin` crate installs the selected backend via `set_backend`
+before any subcommand runs, and the config file's `backend` key is validated against the installed name rather than
+selecting it. The PostgreSQL, SQLite, MongoDB, and Cassandra backends are selected as mutually exclusive Cargo features
+at build time.
 
 ### Authentication
 
@@ -190,7 +226,7 @@ Auth providers implement the `AuthProvider` trait using `#[async_trait]` for obj
 
 ### Authentication
 
-SigV4 signature verification follows the AWS specification. Credentials are stored encrypted (AES-256-GCM) in PostgreSQL. Access key prefixes distinguish long-term (`VDAK`) from temporary (`VDSK`) credentials.
+SigV4 signature verification follows the AWS specification. Credentials are stored encrypted (AES-256-GCM) in the storage backend. Access key prefixes distinguish long-term (`AKIA`) from temporary (`ASIA`) credentials.
 
 ### Authorization
 
@@ -211,7 +247,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- 8-hour session expiry
+- Sessions end 8 hours after login, however active they are, when the session cookie also expires
 
 ### Input Validation
 
@@ -224,28 +260,29 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts, version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies for users, groups, and roles (JSON editor with template)
-- **Metrics dashboard**: Real-time and historical operation metrics with interactive charts
+- **Metrics dashboard**: Real-time and historical operation metrics for every account, with interactive charts (admin only)
 - **Settings viewer**: Read-only display of runtime settings and static configuration (admin only)
 - **Documentation browser**: All project manuals rendered as HTML, with PDF download (`/console/docs`)
 
 ### Architecture
 
-The console uses the `ManagementStore` trait for all data access — it never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
+The console reads all data through four of the traits that `CatalogStore` combines (`ManagementStore`, `PasswordHashStore`, `SettingsStore` and `RateLimitStore`) and never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
 
 ### Authentication Model
 
-- Session-based authentication with 8-hour expiry
+- Session-based authentication; sessions end 8 hours after login, however active they are, when the session cookie also expires
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
+- Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
-- Login rate limiting with account lockout on excessive failures
+- Login rate limiting per user and source address, shared with the management API (see the security model manual)
 
 ### Unauthenticated Routes
 
@@ -262,7 +299,11 @@ Configuration precedence: CLI flags > environment variables > config file > defa
 
 ## DynamoDB Streams
 
-extenddb implements DynamoDB Streams for change data capture. Stream records are captured atomically with data writes inside the same PostgreSQL transaction. Both the DynamoDB API and Streams API are served on the same port.
+Extenddb implements DynamoDB Streams for change data capture. On the PostgreSQL, SQLite and MongoDB backends, stream records
+are captured atomically with the data writes that produce them, inside the same transaction. On the Cassandra backend, an
+item mutation and the related stream record creation are generally non-atomic (TTL-enabled tables are the exception). A
+failure between the two can leave the item written with no stream record. Unlike Amazon DynamoDB, with ExtendDB both the
+DynamoDB API and Streams API are served on the same port.
 
 Supported operations: `ListStreams`, `DescribeStream`, `GetShardIterator`, `GetRecords`.
 
@@ -270,14 +311,14 @@ Stream records are retained for 24 hours. A background worker cleans up expired 
 
 ## Deployment Models
 
-extenddb is a single-binary server that connects to PostgreSQL. Deployment options include:
+extenddb is a single-binary server that connects to a storage backend. Deployment options include:
 
 - **Single-node**: extenddb + PostgreSQL on the same host (development, small workloads)
 - **Separated**: extenddb on an application server, PostgreSQL on a dedicated database server or managed service (RDS, Aurora, Cloud SQL)
 - **Containerized**: Docker/Kubernetes with PostgreSQL as a sidecar or external service
 - **Air-gapped**: No internet connectivity required; all functionality is self-contained
 
-PostgreSQL provides the durability, replication, and backup capabilities. Use standard PostgreSQL HA tools (streaming replication, Patroni, managed services) for production availability.
+The storage backend provides durability, replication, and backup. Use that backend's standard HA tooling for production availability.
 
 ---
 

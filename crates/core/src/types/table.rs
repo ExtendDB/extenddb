@@ -303,6 +303,14 @@ pub struct GsiDescription {
     pub item_count: i64,
     #[serde(rename = "IndexArn")]
     pub index_arn: String,
+    /// Derived by `TableDescription::prepare_for_response` from
+    /// `warm_throughput_record`; backends leave this `None`.
+    #[serde(rename = "WarmThroughput", skip_serializing_if = "Option::is_none")]
+    pub warm_throughput: Option<super::WarmThroughputDescription>,
+    /// What the backend stored for this index, if a client ever set it. Not a
+    /// wire member; see [`super::WarmThroughputRecord`]. Nothing acts on it.
+    #[serde(skip)]
+    pub warm_throughput_record: Option<super::WarmThroughputRecord>,
 }
 
 /// Local secondary index description returned in responses.
@@ -336,6 +344,12 @@ pub struct GsiInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    #[serde(
+        rename = "WarmThroughput",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// Local secondary index definition for `CreateTable` requests.
@@ -615,6 +629,15 @@ pub const VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE: &str = "One or more parame
 pub const VECTOR_INDEX_COUNT_LIMIT_CREATE: &str =
     "One or more parameter values were invalid: VectorIndex count exceeds the per-table limit of 5";
 
+/// A second online GSI change while one is still being built.
+///
+/// The service answers an UpdateTable that creates a GSI, or deletes a GSI other
+/// than the one building, while a GSI on the table is `CREATING` with this
+/// LimitExceededException; the same sentence it uses for two index actions in
+/// one request.
+pub const ONLINE_INDEX_LIMIT: &str = "Subscriber limit exceeded: Only 1 online index can be \
+     created or deleted simultaneously per table";
+
 /// Per-table vector index limit exceeded on `UpdateTable`.
 ///
 /// Measured 2026-08-13: reported as a `LimitExceededException`, not a
@@ -813,6 +836,46 @@ impl TableDescription {
         } else if let Some(summary) = self.restore_summary.as_mut() {
             summary.restore_in_progress = true;
         }
+        self.populate_warm_throughput(super::epoch_seconds_now());
+    }
+
+    /// Derive the `WarmThroughput` member of the table and of each global
+    /// secondary index from the stored records (see
+    /// [`super::WarmThroughputRecord::describe_for`] for the measured rules).
+    /// Local secondary indexes carry none. Reached through
+    /// [`Self::prepare_for_response`]; `now` is epoch seconds.
+    pub fn populate_warm_throughput(&mut self, now: f64) {
+        let pay_per_request = self
+            .billing_mode_summary
+            .as_ref()
+            .is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest);
+        let table_defaults = super::WarmThroughputDefaults::for_billing(
+            pay_per_request,
+            self.provisioned_throughput.read_capacity_units,
+            self.provisioned_throughput.write_capacity_units,
+        );
+        self.warm_throughput = super::WarmThroughputRecord::describe_for(
+            self.warm_throughput_record.as_ref(),
+            self.table_status == TableStatus::Creating,
+            table_defaults,
+            now,
+        );
+        for gsi in self.global_secondary_indexes.iter_mut().flatten() {
+            let (rcu, wcu) = gsi.provisioned_throughput.as_ref().map_or((0, 0), |pt| {
+                (pt.read_capacity_units, pt.write_capacity_units)
+            });
+            let defaults = super::WarmThroughputDefaults::for_billing(pay_per_request, rcu, wcu);
+            // An index created with its table is CREATING while the table is;
+            // one added by UpdateTable is CREATING while it backfills.
+            let creating =
+                self.table_status == TableStatus::Creating || gsi.index_status == "CREATING";
+            gsi.warm_throughput = super::WarmThroughputRecord::describe_for(
+                gsi.warm_throughput_record.as_ref(),
+                creating,
+                defaults,
+                now,
+            );
+        }
     }
 
     /// Populate `TableThroughputModeSummary` as an exact mirror of
@@ -892,6 +955,14 @@ pub struct TableDescription {
     pub on_demand_throughput: Option<OnDemandThroughput>,
     #[serde(rename = "RestoreSummary", skip_serializing_if = "Option::is_none")]
     pub restore_summary: Option<RestoreSummary>,
+    /// Derived by [`Self::prepare_for_response`] from `warm_throughput_record`,
+    /// the billing mode and the provisioned units; backends leave this `None`.
+    #[serde(rename = "WarmThroughput", skip_serializing_if = "Option::is_none")]
+    pub warm_throughput: Option<super::WarmThroughputDescription>,
+    /// What the backend stored for the table, if a client ever set it. Not a
+    /// wire member; see [`super::WarmThroughputRecord`]. Nothing acts on it.
+    #[serde(skip)]
+    pub warm_throughput_record: Option<super::WarmThroughputRecord>,
 }
 
 /// Details of a restore reported on the restored table's description.
@@ -954,6 +1025,8 @@ pub struct CreateTableInput {
     pub table_class: Option<String>,
     #[serde(rename = "OnDemandThroughput")]
     pub on_demand_throughput: Option<OnDemandThroughput>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// `CreateTable` response body.
@@ -1054,6 +1127,8 @@ pub struct CreateGsiAction {
         skip_serializing_if = "Option::is_none"
     )]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// Delete an existing GSI from a table.
@@ -1063,14 +1138,33 @@ pub struct DeleteGsiAction {
     pub index_name: String,
 }
 
-/// Update provisioned throughput on an existing GSI.
+/// Update an existing GSI.
 ///
-/// Recognized by the deserializer but not yet implemented — the engine
-/// returns a clear "not yet supported" error.
+/// `WarmThroughput` is stored and reported (see [`super::WarmThroughputRecord`]).
+/// `ProvisionedThroughput` and `OnDemandThroughput` are recognized by the
+/// deserializer but an update of either is not yet implemented: they are read
+/// as opaque values only so that the engine refuses an `Update` carrying
+/// either, with or without `WarmThroughput`, instead of accepting it and
+/// dropping the member.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UpdateGsiAction {
     #[serde(rename = "IndexName")]
     pub index_name: String,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
+    #[serde(rename = "ProvisionedThroughput", default)]
+    pub provisioned_throughput: Option<serde_json::Value>,
+    #[serde(rename = "OnDemandThroughput", default)]
+    pub on_demand_throughput: Option<serde_json::Value>,
+}
+
+impl UpdateGsiAction {
+    /// Whether the action carries `ProvisionedThroughput` or
+    /// `OnDemandThroughput`, which ExtendDB does not apply to an index.
+    #[must_use]
+    pub fn carries_throughput(&self) -> bool {
+        self.provisioned_throughput.is_some() || self.on_demand_throughput.is_some()
+    }
 }
 
 /// `UpdateTable` request body.
@@ -1101,6 +1195,13 @@ pub struct UpdateTableInput {
     /// unaffected.
     #[serde(rename = "VectorIndexUpdates", default)]
     pub vector_index_updates: Option<Vec<VectorIndexUpdate>>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
+    /// Accepted so that a request carrying it is recognised: `UpdateTable`
+    /// does not act on it (as before), but a table-level `WarmThroughput`
+    /// beside it is refused with the service's sentence.
+    #[serde(rename = "SSESpecification", default)]
+    pub sse_specification: Option<serde_json::Value>,
 }
 
 /// `UpdateTable` response body.

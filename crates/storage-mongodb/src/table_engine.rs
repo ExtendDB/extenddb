@@ -129,15 +129,21 @@ impl MongoEngine {
             .await
     }
 
-    /// Create a restore target with provenance present in its first catalog
-    /// document, so backup deletion cannot observe an ownerless target.
+    /// Create a restore target with its provenance and its RUNNING job
+    /// record in its first catalog document, so nothing ever observes an
+    /// unregistered or unowned target. When the registration carries a
+    /// session, the document is inserted in that session's transaction and
+    /// the transaction is committed right after the insert, before the
+    /// target's collections and indexes are created; a transaction the
+    /// server aborted for a write conflict is reported as `Transient`, with
+    /// nothing created, so the caller re-runs it.
     pub(crate) async fn create_table_for_restore(
         &self,
         account_id: &str,
         input: CreateTableInput,
-        provenance: &crate::backup_engine::RestoreProvenance<'_>,
+        registration: &mut crate::backup_engine::RestoreRegistration<'_>,
     ) -> Result<TableDescription, StorageError> {
-        self.create_table_impl_inner(account_id, input, true, Some(provenance))
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
             .await
     }
 
@@ -146,7 +152,7 @@ impl MongoEngine {
         account_id: &str,
         input: CreateTableInput,
         defer_active: bool,
-        restore: Option<&crate::backup_engine::RestoreProvenance<'_>>,
+        restore: Option<&mut crate::backup_engine::RestoreRegistration<'_>>,
     ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
 
@@ -218,6 +224,12 @@ impl MongoEngine {
         // table return ResourceNotFound, matching DynamoDB and the postgres
         // backend.
         let delay_secs = self.control_plane_delay_seconds().await;
+        // WarmThroughput as sent, reported back and acted on by nothing.
+        // UPDATING for the same delay the CREATING to ACTIVE flip takes.
+        let (warm_record, warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+            input.warm_throughput.as_ref(),
+            delay_secs,
+        )?;
         let (table_status, status_transition_at): (&str, bson::Bson) = if defer_active {
             // Restore path: enter CREATING with no scheduled transition. The
             // caller flips the table to ACTIVE (or schedules the transition)
@@ -254,29 +266,102 @@ impl MongoEngine {
             "table_class": table_class_bson,
             "sse_specification": sse_spec_bson,
             "on_demand_throughput": on_demand_bson,
+            "warm_throughput": warm_bson,
         };
-        if let Some(provenance) = restore {
-            provenance.insert_into(&mut table_doc);
+        if let Some(registration) = restore.as_deref() {
+            registration.insert_into(&mut table_doc);
         }
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
-        if let Err(e) = tables_coll.insert_one(table_doc).await {
-            if !e.to_string().contains("E11000") {
+        let for_restore = restore.is_some();
+        let mut restore = restore;
+        let inserted = match restore
+            .as_deref_mut()
+            .and_then(|registration| registration.session.as_deref_mut())
+        {
+            Some(session) => tables_coll.insert_one(table_doc).session(session).await,
+            None => tables_coll.insert_one(table_doc).await,
+        };
+        // A manifest record's first heartbeat is rewritten with the server's
+        // clock in the same transaction (nothing for a legacy one).
+        let inserted = match inserted {
+            Ok(_) => match restore.as_deref_mut() {
+                Some(registration) => {
+                    registration
+                        .stamp_server_clock(&tables_coll, &table_id)
+                        .await
+                }
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        };
+        let mut session = restore.and_then(|registration| registration.session.as_deref_mut());
+        if let Err(e) = inserted {
+            if let Some(session) = session {
+                let _ = session.abort_transaction().await;
+            }
+            if crate::data_engine::is_duplicate_key(&e) {
+                return Err(self
+                    .name_taken_error(&tables_coll, account_id, &input.table_name, for_restore)
+                    .await);
+            }
+            if crate::data_engine::is_transient_write_conflict(&e) {
+                return Err(StorageError::Transient(format!(
+                    "the registration of {} lost a write conflict: {e}",
+                    input.table_name
+                )));
+            }
+            return Err(StorageError::Internal(e.to_string()));
+        }
+        // The registration's first heartbeat on the server's clock: an insert
+        // cannot carry `$$NOW`, so the inserted record holds the process's
+        // clock for the length of this transaction and this pipeline update,
+        // in the same transaction, replaces it before anything commits. Every
+        // heartbeat the reconciler ever reads is therefore on the database's
+        // clock, and a host whose clock is behind the server's by more than
+        // `stale_job_after_secs` cannot make another server list its new
+        // restore dead.
+        if for_restore {
+            let stamped = {
+                let update = tables_coll.update_one(
+                    doc! {
+                        "_id": { "account_id": account_id, "table_name": &input.table_name },
+                        "table_id": &table_id,
+                    },
+                    vec![doc! { "$set": {
+                        crate::backup_catalog::RESTORE_JOB_HEARTBEAT: "$$NOW",
+                    } }],
+                );
+                match session.as_deref_mut() {
+                    Some(session) => update.session(session).await,
+                    None => update.await,
+                }
+            };
+            if let Err(e) = stamped {
+                if let Some(session) = session {
+                    let _ = session.abort_transaction().await;
+                }
+                if crate::data_engine::is_transient_write_conflict(&e) {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} lost a write conflict: {e}",
+                        input.table_name
+                    )));
+                }
                 return Err(StorageError::Internal(e.to_string()));
             }
-            return Err(self
-                .name_taken_error(
-                    &tables_coll,
-                    account_id,
-                    &input.table_name,
-                    restore.is_some(),
-                )
-                .await);
         }
-        // A restore releases its backup claim as soon as the target document,
-        // which carries the provenance, exists.
-        if let Some(inserted) = restore.and_then(|provenance| provenance.inserted) {
-            inserted.notify_one();
+        // The registration's transaction ends here, before any collection is
+        // created, so an aborted one leaves nothing behind.
+        if let Some(session) = session {
+            match self.commit_write_transaction(session, None).await? {
+                crate::data_engine::CommitOutcome::Committed => {}
+                crate::data_engine::CommitOutcome::RerunBody => {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} was aborted at commit",
+                        input.table_name
+                    )));
+                }
+            }
         }
 
         // Create the data collection with appropriate indexes
@@ -351,6 +436,11 @@ impl MongoEngine {
 
                 let index_status = if defer_active { "CREATING" } else { "ACTIVE" };
                 let backfill_mode = if defer_active { Some("restore") } else { None };
+                let (gsi_warm_record, gsi_warm_bson) =
+                    crate::warm_throughput::warm_record_bson_for_create(
+                        gsi.warm_throughput.as_ref(),
+                        delay_secs,
+                    )?;
                 let mut index_doc = doc! {
                     "_id": { "table_id": &table_id, "index_name": &gsi.index_name },
                     "index_id": &index_id,
@@ -359,6 +449,7 @@ impl MongoEngine {
                     "projection": projection_bson,
                     "index_status": index_status,
                     "provisioned_throughput": index_pt_bson.unwrap_or(bson::Bson::Null),
+                    "warm_throughput": gsi_warm_bson,
                 };
                 if let Some(mode) = backfill_mode {
                     index_doc.insert("backfill_mode", mode);
@@ -395,6 +486,8 @@ impl MongoEngine {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn_val,
+                    warm_throughput: None,
+                    warm_throughput_record: gsi_warm_record,
                 });
             }
             Some(descs)
@@ -504,6 +597,24 @@ impl MongoEngine {
             }
         }
 
+        // A restore target's DDL is complete here: the data collection, its
+        // unique key index and every GSI and LSI metadata document and data
+        // collection exist. The record was committed before any of them (the
+        // registration's transaction ends at the catalog insert), so the
+        // record carries `restore_job.ddl_done = false` until this write,
+        // and the reconciler's resume refuses a record left unmarked by an
+        // owner that died in between (`restore_target_ready`), rather than
+        // resuming into a target that is missing its indexes.
+        if for_restore {
+            tables_coll
+                .update_one(
+                    doc! { "table_id": &table_id },
+                    doc! { "$set": { crate::backup_catalog::RESTORE_JOB_DDL_DONE: true } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         // Derive the SSEDescription from the SSESpecification, mirroring the
         // postgres backend (table_helpers.rs:329-346). The specification's
         // `Enabled: true` becomes a KMS-status ENABLED description with a
@@ -557,6 +668,7 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput: input.on_demand_throughput,
+            warm_throughput_record: warm_record,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.
@@ -879,6 +991,11 @@ impl MongoEngine {
             }
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        self.store_warm_throughput_updates(account_id, &input)
+            .await?;
+
         if clear_provisioned_throughput {
             let table_doc = tables_coll
                 .find_one(doc! {
@@ -977,6 +1094,10 @@ impl MongoEngine {
                     // Live writes during the backfill window sync through
                     // sync_indexes (upserts) so the eventual state is
                     // convergent regardless of interleaving.
+                    let (_, gsi_warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_seconds().await,
+                    )?;
                     let index_doc = doc! {
                         "_id": { "table_id": &desc.table_id, "index_name": &create.index_name },
                         "index_id": &index_id,
@@ -985,6 +1106,7 @@ impl MongoEngine {
                         "projection": projection_bson,
                         "index_status": "CREATING",
                         "provisioned_throughput": pt_bson.unwrap_or(bson::Bson::Null),
+                        "warm_throughput": gsi_warm_bson,
                     };
 
                     self.catalog_db
@@ -1362,6 +1484,20 @@ impl MongoEngine {
         &self,
         doc: &Document,
     ) -> Result<TableDescription, StorageError> {
+        self.doc_to_table_description_in(doc, None).await
+    }
+
+    /// Build the description from a `tables` document. When `session` is a
+    /// snapshot session (see `snapshot_engine`), the index documents are read
+    /// through it so they come from the same snapshot as `doc`. (The body is
+    /// the former `doc_to_table_description`, long before the session
+    /// parameter; splitting it is not part of the snapshot change.)
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn doc_to_table_description_in(
+        &self,
+        doc: &Document,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<TableDescription, StorageError> {
         let id_doc = doc
             .get_document("_id")
             .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
@@ -1466,14 +1602,34 @@ impl MongoEngine {
         // Fetch indexes
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         use futures::TryStreamExt;
-        let index_cursor = indexes_coll
-            .find(doc! { "_id.table_id": &table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let index_docs: Vec<Document> = index_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let index_filter = doc! { "_id.table_id": &table_id };
+        let index_docs: Vec<Document> = match session {
+            Some(session) => {
+                let mut cursor = indexes_coll
+                    .find(index_filter)
+                    .read_concern(mongodb::options::ReadConcern::snapshot())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?;
+                let mut docs = Vec::new();
+                while let Some(d) = cursor
+                    .next(&mut *session)
+                    .await
+                    .transpose()
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?
+                {
+                    docs.push(d);
+                }
+                docs
+            }
+            None => indexes_coll
+                .find(index_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        };
 
         let mut gsis = Vec::new();
         let mut lsis = Vec::new();
@@ -1548,6 +1704,10 @@ impl MongoEngine {
                         index_size_bytes: 0,
                         item_count: 0,
                         index_arn: idx_arn,
+                        warm_throughput: None,
+                        warm_throughput_record: crate::warm_throughput::warm_record_from_doc(
+                            idx_doc,
+                        ),
                     });
                 }
                 "LSI" => {
@@ -1644,6 +1804,7 @@ impl MongoEngine {
             table_class_summary,
             on_demand_throughput,
             restore_summary,
+            warm_throughput_record: crate::warm_throughput::warm_record_from_doc(doc),
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.

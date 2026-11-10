@@ -1,4 +1,4 @@
-# ADR-0008: DynamoDB Streams Implementation on Cassandra
+# ADR-0018: DynamoDB Streams Implementation on Cassandra
 
 - Status: Draft
 - Date: 2026-06-25
