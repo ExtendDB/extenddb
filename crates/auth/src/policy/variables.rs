@@ -513,7 +513,9 @@ pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
 /// ([`parts`]), leave one to four `:` written outside them. The expanded
 /// value then has two to five fields.
 ///
-/// This happens when a quoted default holds a `}` and a `:`. In
+/// This happens when a reference holds a `}` followed by a `:`, inside the
+/// quotes of a default or as the first character of the reference text, as
+/// in `${}:}`. In
 /// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, each `${` ending at the next
 /// `}` leaves five written `:` ([`arn_value_lacks_fields`] does not report
 /// it), and the evaluator reads the reference up to its last `}`, so the

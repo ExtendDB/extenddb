@@ -239,10 +239,15 @@ fn check_session_policy(session_policy: &Value) -> Result<(), String> {
 
 /// A stored trust policy can hold an Arn condition value that fails its
 /// statement closed at evaluation: one stored before the trust write check,
-/// which that check now rejects, or a six-field value whose first field does
-/// not match `arn`, which the check accepts as IAM does. Log the role so an
-/// operator can find the policy and rewrite it. The value is read as the
-/// evaluator reads it ([`stored_trust_arn_value`]).
+/// which that check now rejects, or a value the check accepts that
+/// `arn_value::fails_closed_at_evaluation` reports under the policy's
+/// `Version`. Such a value is a six-field value whose first field holds no
+/// `${` and does not match `arn`, a value with `${` and fewer than five `:`
+/// written outside its references, or, in a `2012-10-17` trust policy, a
+/// value whose expansion has two to five fields, or six fields and a first
+/// field that holds `${`. Log the role so an operator can find the policy and
+/// rewrite it. The value is read as the evaluator reads it
+/// ([`stored_trust_arn_value`]).
 fn warn_on_stored_trust_arn_value(trust_policy: &Value, role_name: &str, account_id: &str) {
     if let Some((key, value)) = stored_trust_arn_value(trust_policy) {
         tracing::warn!(
