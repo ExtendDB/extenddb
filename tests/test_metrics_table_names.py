@@ -14,9 +14,9 @@ valid, a table ARN is reduced to its name, ``UserErrors`` carries none
 
 The test sends the rejected requests, a successful ListBackups that names a
 table of its own by its ARN, a successful BatchWriteItem with an extra
-top-level ``TableName``, and last a successful PutItem on that table. Once the
-metrics flush has written the PutItem's row, the earlier requests have been
-flushed too.
+top-level ``TableName``, and last a successful PutItem on that table. It waits
+for the PutItem's and the ListBackups' rows, then reads once more after the
+flush has had time to write the rest of its rows (see ``flushed``).
 
 Prerequisites:
   - extenddb running on EXTENDDB_TEST_ENDPOINT
@@ -42,6 +42,8 @@ from raw_signed_request import signed_post
 # intervals to reach the metrics table.
 FLUSH_DEADLINE_SECONDS = 180
 POLL_SECONDS = 5
+# How long after the last awaited row the fixture reads again; see `flushed`.
+SETTLE_SECONDS = 5
 
 pytestmark = pytest.mark.slow
 
@@ -154,25 +156,40 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
             },
         )
         assert resp.status_code == 200, f"BatchWriteItem: {resp.status_code} {resp.text}"
-        # Last, so its row reaching the metrics means the others have too.
+        # Last, so its row reaching the metrics means the earlier requests'
+        # minute buckets have been flushed too.
         dynamodb_client.put_item(TableName=sentinel, Item={"pk": {"S": "1"}})
 
-        def put_item_flushed(data: dict[str, Any]) -> bool:
-            return any(
+        def sentinel_rows_flushed(data: dict[str, Any]) -> bool:
+            put_item = any(
                 _dimension(m, "TableName") == sentinel
                 for m in _rows(data, "ConsumedWriteCapacityUnits", "PutItem")
             )
+            # Under the bare name or, if the ARN were not reduced, the ARN, so
+            # that a regression fails the ARN test rather than this wait.
+            list_backups = any(
+                _dimension(m, "TableName") in (sentinel, arn)
+                for m in _rows(data, "SuccessfulRequestLatency", "ListBackups")
+            )
+            return put_item and list_backups
 
         deadline = time.monotonic() + FLUSH_DEADLINE_SECONDS
         while True:
             data = _admin_metrics(endpoint_url, window="LastHour")
-            if put_item_flushed(data) or time.monotonic() > deadline:
+            if sentinel_rows_flushed(data) or time.monotonic() > deadline:
                 break
             time.sleep(POLL_SECONDS)
-        assert put_item_flushed(data), (
-            f"the metrics flush did not persist the PutItem on {sentinel} within "
-            f"{FLUSH_DEADLINE_SECONDS}s"
+        assert sentinel_rows_flushed(data), (
+            f"the metrics flush did not persist the PutItem and ListBackups rows "
+            f"for {sentinel} within {FLUSH_DEADLINE_SECONDS}s"
         )
+        # The flush writes one statement per row, in no fixed order, so a read
+        # can land partway through it. The rows with no table name (the
+        # BatchWriteItem's, the rejected CreateTables') cannot be waited for by
+        # name on a shared server. Writing this test's rows takes milliseconds,
+        # so a read after SETTLE_SECONDS sees the whole flush.
+        time.sleep(SETTLE_SECONDS)
+        data = _admin_metrics(endpoint_url, window="LastHour")
         yield (*INVALID_NAMES, refused_valid, decoy), sentinel, data
     finally:
         dynamodb_client.delete_table(TableName=sentinel)

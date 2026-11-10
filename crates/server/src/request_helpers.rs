@@ -53,10 +53,10 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
 /// Operations whose input has a top-level `TableName` member: every operation
 /// the engine dispatches whose input shape has one in botocore 1.43.125's
 /// `dynamodb` and `dynamodbstreams` models (`ListStreams` is the Streams one).
-/// Any other operation ignores a `TableName` it is sent, so its metrics must
-/// not take one from the request either: a `BatchWriteItem` with an extra
-/// `TableName` would otherwise record its metrics under a table it never
-/// touched.
+/// Any other operation ignores or refuses a `TableName` it is sent, so its
+/// metrics must not take one from the request either: a `BatchWriteItem` with
+/// an extra `TableName` would otherwise record its metrics under a table it
+/// never touched.
 const TABLE_NAME_OPERATIONS: &[&str] = &[
     "CreateBackup",
     "CreateTable",
@@ -761,7 +761,32 @@ mod tests {
                 "{operation}"
             );
         }
-        for &operation in super::TABLE_NAME_OPERATIONS {
+        let mut listed = super::TABLE_NAME_OPERATIONS.to_vec();
+        listed.sort_unstable();
+        // Spelled out, not read from the constant, so a dropped, misspelt or
+        // added entry fails here.
+        let expected = [
+            "CreateBackup",
+            "CreateTable",
+            "DeleteItem",
+            "DeleteTable",
+            "DescribeContinuousBackups",
+            "DescribeTable",
+            "DescribeTimeToLive",
+            "GetItem",
+            "ListBackups",
+            "ListStreams",
+            "PutItem",
+            "Query",
+            "Scan",
+            "SearchVectors",
+            "UpdateContinuousBackups",
+            "UpdateItem",
+            "UpdateTable",
+            "UpdateTimeToLive",
+        ];
+        assert_eq!(listed, expected);
+        for operation in expected {
             assert_eq!(
                 metric_table_name(operation, &input, &limits).as_deref(),
                 Some("Orders"),
