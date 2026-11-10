@@ -8,7 +8,9 @@ The BatchWriteItem API reference has DynamoDB reject the whole batch, with a
 duplicate keys, an item over 400 KB, a table that does not exist). None of the
 batch's requests is applied, wherever the faulty request sits: the checks run
 for the whole batch before the first write, so a valid request listed ahead of
-the faulty one is not applied either.
+the faulty one is not applied either. A put whose global secondary index key
+has the wrong type or is an empty string is rejected the same way, although
+the reference does not list that fault.
 
 Each test checks the error code and the message. The messages are the ones
 the service answered to these batches (us-east-1, 2026-11-10, two sends
@@ -39,6 +41,15 @@ KEY_MISMATCH = "The provided key element does not match the schema"
 TABLE_NOT_FOUND = "Requested resource not found"
 DUPLICATE_KEYS = "Provided list of item keys contains duplicates"
 ITEM_TOO_LARGE = "Item size has exceeded the maximum allowed size"
+GSI_KEY_TYPE_MISMATCH = (
+    "One or more parameter values were invalid: Type mismatch for Index Key g "
+    "Expected: S Actual: N IndexName: by-g"
+)
+GSI_KEY_EMPTY = (
+    "One or more parameter values are not valid. A value specified for a "
+    "secondary index key is not supported. The AttributeValue for a key "
+    "attribute cannot contain an empty string value. IndexName: by-g, IndexKey: g"
+)
 
 
 @pytest.fixture(scope="module")
@@ -53,8 +64,28 @@ def table_b(dynamodb_client):
         yield name
 
 
-def _put(pk: str) -> dict:
-    return {"PutRequest": {"Item": {"pk": {"S": pk}}}}
+@pytest.fixture(scope="module")
+def table_with_gsi(dynamodb_client):
+    """Keyed on pk (S), with a global secondary index by-g keyed on g (S)."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "by-g",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    ) as name:
+        yield name
+
+
+def _put(pk: str, **attributes) -> dict:
+    return {"PutRequest": {"Item": {"pk": {"S": pk}, **attributes}}}
 
 
 def _put_with_wrong_key_type() -> dict:
@@ -75,6 +106,14 @@ def _put_over_the_item_size_limit(pk: str) -> dict:
 def _delete_with_an_extra_key_attribute(pk: str) -> dict:
     """A delete whose key carries an attribute that is not part of the key."""
     return {"DeleteRequest": {"Key": {"pk": {"S": pk}, "extra": {"S": "x"}}}}
+
+
+def _put_with_a_number_gsi_key(pk: str) -> dict:
+    return _put(pk, g={"N": "1"})
+
+
+def _put_with_an_empty_gsi_key(pk: str) -> dict:
+    return _put(pk, g={"S": ""})
 
 
 def _exists(client, table: str, pk: str) -> bool:
@@ -187,3 +226,27 @@ def test_valid_put_before_an_oversized_item_or_a_malformed_delete_is_not_applied
     assert code == "ValidationException"
     assert message == expected_message
     assert not _exists(dynamodb_client, table_a, pk)
+
+
+@pytest.mark.parametrize(
+    ("faulty_request", "expected_message"),
+    [
+        (_put_with_a_number_gsi_key, GSI_KEY_TYPE_MISMATCH),
+        (_put_with_an_empty_gsi_key, GSI_KEY_EMPTY),
+    ],
+    ids=["gsi_key_as_a_number", "gsi_key_as_an_empty_string"],
+)
+def test_valid_put_before_a_faulty_gsi_key_is_not_applied(
+    dynamodb_client, table_with_gsi, faulty_request, expected_message
+):
+    pk = f"valid-{uuid.uuid4().hex[:8]}"
+    faulty_pk = f"faulty-{uuid.uuid4().hex[:8]}"
+
+    code, message = _rejected(
+        dynamodb_client,
+        {table_with_gsi: [_put(pk, g={"S": "ok"}), faulty_request(faulty_pk)]},
+    )
+
+    assert code == "ValidationException"
+    assert message == expected_message
+    assert not _exists(dynamodb_client, table_with_gsi, pk)

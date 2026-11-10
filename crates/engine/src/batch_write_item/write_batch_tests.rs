@@ -4,7 +4,10 @@
 //! `write_batch` against a `DataEngine` double: what is checked before the
 //! first write.
 
-use extenddb_core::types::{Projection, ProjectionType, VectorIndexKeyInfo};
+use extenddb_core::types::{
+    AttributeDefinition, IndexInfo, IndexType, KeyType, Projection, ProjectionType,
+    ScalarAttributeType, VectorIndexKeyInfo,
+};
 use serde_json::{Value, json};
 
 use super::scripted::{
@@ -220,4 +223,119 @@ async fn a_delete_with_an_extra_key_attribute_rejects_the_batch_before_any_write
         "The provided key element does not match the schema",
     )
     .await;
+}
+
+// --- secondary index keys ----------------------------------------------------
+
+fn key_element(attribute_name: &str, key_type: KeyType) -> KeySchemaElement {
+    KeySchemaElement {
+        attribute_name: attribute_name.to_owned(),
+        key_type,
+    }
+}
+
+fn index(index_name: &str, index_type: IndexType, key_schema: Vec<KeySchemaElement>) -> IndexInfo {
+    IndexInfo {
+        index_name: index_name.to_owned(),
+        index_id: format!("id-{index_name}"),
+        index_type,
+        key_schema,
+        projection: Projection {
+            projection_type: ProjectionType::All,
+            non_key_attributes: None,
+        },
+    }
+}
+
+/// A table with a global secondary index `by-g` keyed by a string `g`, and a
+/// local secondary index `by-l` whose sort key is a string `l`.
+fn indexed_table(name: &str) -> TableKeyInfo {
+    let mut table = table(name);
+    for attribute_name in ["g", "l"] {
+        table.attribute_definitions.push(AttributeDefinition {
+            attribute_name: attribute_name.to_owned(),
+            attribute_type: ScalarAttributeType::S,
+        });
+    }
+    table.global_secondary_indexes = vec![index(
+        "by-g",
+        IndexType::Gsi,
+        vec![key_element("g", KeyType::Hash)],
+    )];
+    table.local_secondary_indexes = vec![index(
+        "by-l",
+        IndexType::Lsi,
+        vec![
+            key_element("pk", KeyType::Hash),
+            key_element("l", KeyType::Range),
+        ],
+    )];
+    table.has_lsi = true;
+    table
+}
+
+/// The storage layer also checks the index keys, inside `put_item`, so a
+/// check left to it alone would write `t/a` before the 400. The service
+/// answered this message and applied nothing (us-east-1, 2026-11-10).
+#[tokio::test]
+async fn a_global_secondary_index_key_of_the_wrong_type_rejects_the_batch_before_any_write() {
+    let item = json!({"pk": {"S": "b"}, "g": {"N": "1"}});
+
+    rejected_before_any_write(
+        indexed_table("t"),
+        json!({"PutRequest": {"Item": item}}),
+        "One or more parameter values were invalid: Type mismatch for Index Key g Expected: S \
+         Actual: N IndexName: by-g",
+    )
+    .await;
+}
+
+/// The service answered this message and applied nothing (us-east-1,
+/// 2026-11-10).
+#[tokio::test]
+async fn an_empty_global_secondary_index_key_rejects_the_batch_before_any_write() {
+    let item = json!({"pk": {"S": "b"}, "g": {"S": ""}});
+
+    rejected_before_any_write(
+        indexed_table("t"),
+        json!({"PutRequest": {"Item": item}}),
+        "One or more parameter values are not valid. A value specified for a secondary index \
+         key is not supported. The AttributeValue for a key attribute cannot contain an empty \
+         string value. IndexName: by-g, IndexKey: g",
+    )
+    .await;
+}
+
+/// A local secondary index key goes through the same check. The service's
+/// answer to this batch was not measured, so the test pins only that the
+/// batch is refused with a 400 before any write.
+#[tokio::test]
+async fn a_local_secondary_index_key_of_the_wrong_type_rejects_the_batch_before_any_write() {
+    let data = Scripted::new(vec![]);
+    let faulty = json!({"PutRequest": {"Item": {"pk": {"S": "b"}, "l": {"N": "1"}}}});
+    let items = json!({"t": [put("a"), faulty]});
+
+    let err = rejected(run(&data, items, &["t"], vec![Ok(indexed_table("t"))]).await);
+
+    assert!(
+        matches!(err, DynamoDbError::ValidationException(_)),
+        "{err:?}"
+    );
+    assert_eq!(err.status_code(), 400);
+    assert!(data.writes().is_empty(), "wrote {:?}", data.writes());
+}
+
+/// Index keys of the declared type, and an item without them, are written.
+#[tokio::test]
+async fn valid_secondary_index_keys_are_written() {
+    let data = Scripted::new(vec![]);
+    let with_keys = json!({"PutRequest": {"Item": {
+        "pk": {"S": "b"}, "g": {"S": "x"}, "l": {"S": "y"}
+    }}});
+    let items = json!({"t": [put("a"), with_keys]});
+
+    let out = answered(run(&data, items, &["t"], vec![Ok(indexed_table("t"))]).await);
+
+    assert_eq!(out.body["UnprocessedItems"], json!({}));
+    assert_eq!(data.writes(), ["t/a", "t/b"]);
 }

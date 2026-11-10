@@ -16,8 +16,9 @@ use extenddb_core::types::{
     TableKeyInfo, WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    AttributeNameRequestForm, validate_attribute_name_sizes, validate_batch_item_keys,
-    validate_batch_key_only, validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    AttributeNameRequestForm, IndexKeyRef, validate_attribute_name_sizes, validate_batch_item_keys,
+    validate_batch_key_only, validate_index_keys, validate_item_nesting_depth, validate_item_size,
+    validate_key_sizes,
 };
 
 use extenddb_storage::DataEngine;
@@ -120,10 +121,11 @@ pub async fn handle_batch_write_item(
 /// ahead of the table lookups, and the limit on the request size by the HTTP
 /// layer.
 /// The writes run only after the checks, so a write that cannot be applied now
-/// never leaves a later request unchecked, and no request fault is found after
-/// a request has been applied. A storage error that a replay does not clear
-/// (see `is_deferrable`) can still fail the batch after earlier requests were
-/// applied.
+/// never leaves a later request unchecked. A request fault is found after a
+/// request has been applied only on a secondary index added after the lookup,
+/// whose keys the storage layer checks at write time. A storage error that a
+/// replay does not clear (see `is_deferrable`) can still fail the batch after
+/// earlier requests were applied.
 async fn write_batch(
     data: &dyn DataEngine,
     limits: &LimitsConfig,
@@ -173,12 +175,16 @@ async fn write_batch(
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that
     // does not match the schema, duplicate keys and an item over the size
-    // limit, wherever the faulty request sits. `check_batch_counts` finds too
-    // many requests and the HTTP layer finds a request over the size limit,
-    // both before this function runs. So a deferral below never hides a
-    // request fault, and a batch rejected for a request fault has no applied
-    // request. A storage error that a replay does not clear (see
-    // `is_deferrable`) still fails the batch after earlier requests were
+    // limit, wherever the faulty request sits. It also finds a secondary
+    // index key of the wrong type and an empty one, which the page does not
+    // list: the service rejected such a batch with nothing applied (measured
+    // 2026-11-10 in us-east-1 on a global secondary index).
+    // `check_batch_counts` finds too many requests and the HTTP layer finds a
+    // request over the size limit, both before this function runs. So a
+    // deferral below never hides a request fault, and a batch rejected for a
+    // request fault has no applied request, except for a fault on an index
+    // added after the lookup. A storage error that a replay does not clear
+    // (see `is_deferrable`) still fails the batch after earlier requests were
     // applied.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
@@ -422,6 +428,12 @@ fn check_batch(
 }
 
 /// Validate one write request against its table.
+///
+/// A put's secondary index keys are checked against the global and local
+/// secondary indexes in `key_info`: a key of the wrong type or an empty string
+/// or binary key rejects the batch here, before the first write. The storage
+/// layer runs the same check again in `put_item` against the indexes it reads
+/// at write time, which also covers an index added after the lookup.
 fn validate_request(
     wr: &WriteRequest,
     key_info: &TableKeyInfo,
@@ -441,6 +453,11 @@ fn validate_request(
             &key_info.vector_indexes,
             &key_info.attribute_definitions,
         )?;
+        validate_index_keys(
+            &put.item,
+            &secondary_index_keys(key_info),
+            &key_info.attribute_definitions,
+        )?;
     } else if let Some(del) = &wr.delete_request {
         validate_batch_key_only(
             &del.key,
@@ -449,6 +466,20 @@ fn validate_request(
         )?;
     }
     Ok(())
+}
+
+/// The name and key schema of each global and local secondary index of the
+/// table.
+fn secondary_index_keys(key_info: &TableKeyInfo) -> Vec<IndexKeyRef<'_>> {
+    key_info
+        .global_secondary_indexes
+        .iter()
+        .chain(&key_info.local_secondary_indexes)
+        .map(|idx| IndexKeyRef {
+            index_name: &idx.index_name,
+            key_schema: &idx.key_schema,
+        })
+        .collect()
 }
 
 /// Validate that no two write requests in the same table target the same key.
