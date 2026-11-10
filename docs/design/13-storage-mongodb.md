@@ -373,7 +373,9 @@ Simple collation is used whenever the tuple contains a string component.
 }
 ```
 
-Unique index on `shard_id`. Four shards per stream-enabled table.
+Unique index on `shard_id`, and an index on `(table_id, shard_id)`, by which
+every streamed write and every stream read finds a table's shards in shard id
+order. Four shards per stream-enabled table.
 
 `shard_id` embeds `table_id` (a UUID) rather than `table_name`. Table
 names are only unique per-account; a name-derived scheme would let one
