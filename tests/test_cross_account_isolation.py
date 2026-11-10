@@ -356,27 +356,29 @@ class TestConsoleIsolation:
         return session
 
     def test_alice_console_does_not_show_bob_account(self):
-        """Alice's console session does not list bob's account."""
+        """Alice's console session does not list bob's account: the account
+        list is for admins and redirects her to the dashboard."""
         session = self._console_login(self.alice_acct, "alice", "AlicePass123!")
         resp = session.get(
             f"{self.endpoint}/console/accounts",
             allow_redirects=False,
             timeout=30,
         )
-        assert resp.status_code == 200
-        assert self.alice_acct in resp.text
+        assert resp.status_code == 303
+        assert resp.headers.get("location") == "/console"
         assert self.bob_acct not in resp.text
 
     def test_bob_console_does_not_show_alice_account(self):
-        """Bob's console session does not list alice's account."""
+        """Bob's console session does not list alice's account: the account
+        list is for admins and redirects him to the dashboard."""
         session = self._console_login(self.bob_acct, "bob", "BobPass456!")
         resp = session.get(
             f"{self.endpoint}/console/accounts",
             allow_redirects=False,
             timeout=30,
         )
-        assert resp.status_code == 200
-        assert self.bob_acct in resp.text
+        assert resp.status_code == 303
+        assert resp.headers.get("location") == "/console"
         assert self.alice_acct not in resp.text
 
 
@@ -519,16 +521,18 @@ class TestStreamAccountScoping:
         assert get_records_error(old_format(missing_shard)) == err
 
         # A token in the current format that names account A's stream ARN.
-        # Authorization pins the stream ARN to account B, and the engine looks
-        # the stream up in account B, where it does not exist, so the request
-        # fails the same way for a real and a made-up shard.
+        # GetShardIterator refuses a StreamArn in another account, so account B
+        # is never issued a token naming A's stream. This one is refused as an
+        # invalid iterator before authorization, the same way for a real and a
+        # made-up shard, and the stream ARN it carries is never rewritten to
+        # account B.
         def current_format(shard_id: str) -> str:
             return base64.b64encode(
                 f"{shard_id}|AFTER_SEQUENCE_NUMBER||{int(time.time())}|{arn}".encode()
             ).decode()
 
         err = get_records_error(current_format(target_shard))
-        assert err["Code"] == "ResourceNotFoundException", err
+        assert err == {"Code": "ValidationException", "Message": "Invalid ShardIterator"}, err
         assert get_records_error(current_format(missing_shard)) == err
 
         # An iterator that does not decode gets DynamoDB's verbatim answer.
@@ -583,9 +587,9 @@ class TestStreamAccountScoping:
             "unauthenticated /console/metrics-data should redirect to console login"
         )
 
-        # 2. With a valid console session, the route returns metrics JSON
+        # 2. With an admin console session, the route returns metrics JSON
         #    (per-table dimensions), gated by the session cookie rather than
-        #    admin Basic auth.
+        #    admin Basic auth. An IAM-user session gets 403.
         s = requests.Session()
         # The harness sets REQUESTS_CA_BUNDLE/SSL_CERT_FILE, which overrides
         # session.verify; disable env trust and pass verify=False per request so

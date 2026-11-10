@@ -18,17 +18,23 @@
 //!   does not carry `key`.
 //! - `${*}`, `${?}`, `${$}`: a literal `*`, `?` or `$`.
 //!
-//! In a `Resource` or `NotResource` pattern the text written in the policy
-//! keeps `*` and `?` as wildcards, while text that comes from a variable
-//! value, a default or an escape is matched literally, so a tag value or an
-//! escaped `*` cannot widen a pattern. A variable whose key the request does
-//! not carry, with no default, makes the pattern match nothing. Both rules
-//! were measured with the IAM policy simulator (issue #533). A variable whose
-//! key the service populates but the context cannot resolve (a key listed in
+//! In a `Resource` or `NotResource` pattern, and in a `StringLike`, `ArnLike`
+//! or `ArnEquals` condition value, the text written in the policy keeps `*`
+//! and `?` as wildcards, while text that comes from a variable value, a
+//! default or an escape is matched literally, so a tag value or an escaped
+//! `*` cannot widen a pattern. A variable whose key the request does not
+//! carry, with no default, makes the pattern or value match nothing. Both
+//! rules were measured with the IAM policy simulator (issues #533 and #534).
+//! In a `Resource` or `NotResource` pattern, and in a condition value that is
+//! expanded, a variable whose key the service populates but the context
+//! cannot resolve (an `aws:RequestTag/<name>` that the request names under two
+//! spellings with different values, or a key listed in
 //! `context::FAIL_CLOSED_GLOBAL_KEYS`) leaves the match unknown, and the
-//! evaluator fails closed on it as it does on such a key in a condition.
-//! Only a document whose `Version` is `2012-10-17` expands variables; the
-//! caller decides that with [`PolicyDocument::expands_policy_variables`].
+//! evaluator fails closed on it as it does on such a key in a condition. Only
+//! a document whose `Version` is `2012-10-17` expands variables, in patterns
+//! and in condition values alike; a `2008-10-17` document, or one with no
+//! `Version`, compares the text as written. The caller decides that with
+//! [`PolicyDocument::expands_policy_variables`].
 //!
 //! ARN matching here follows the same field rule as
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
@@ -41,16 +47,16 @@
 
 use super::context::ConditionContext;
 use super::document::{PolicyDocument, PolicyParseError};
-use super::matcher::arn_match;
+use super::matcher::{arn_match, wildcard_match};
 use serde_json::Value;
 
 impl PolicyDocument {
     /// Whether `${key}` policy variables in `Resource` and `NotResource`
-    /// patterns are expanded.
+    /// patterns and in condition values are expanded.
     ///
     /// IAM expands them only in a `2012-10-17` document; a `2008-10-17`
-    /// document, or one with no `Version`, matches the pattern as written.
-    /// Measured with the IAM policy simulator (issue #533).
+    /// document, or one with no `Version`, matches the pattern or value as
+    /// written. Measured with the IAM policy simulator (issues #533 and #534).
     #[must_use]
     pub fn expands_policy_variables(&self) -> bool {
         self.version.as_deref() == Some("2012-10-17")
@@ -87,7 +93,7 @@ const COLON: u16 = 0x3A;
 
 /// One unit of an expanded pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Token {
+pub enum Token {
     /// `*` written in the policy text: matches zero or more UTF-16 code units.
     Star,
     /// `?` written in the policy text: matches exactly one UTF-16 code unit.
@@ -174,15 +180,14 @@ enum Part<'a> {
     Ref(&'a str, Reference<'a>),
 }
 
-/// Split `value` into plain text and `${...}` references. A `${` with no
-/// closing `}` is plain text, as before.
+/// Split `value` into plain text and `${...}` references, read by
+/// [`parse_reference`]. A `${` with no closing `}` is plain text, as before.
 ///
-/// With `iam_syntax` the text between the braces is read by
-/// [`parse_reference`]. Without it the whole text, as written, is the key
-/// name, which is how a condition value was read before the default form:
-/// nothing is trimmed, and `${key, 'default'}` names the key
-/// `key, 'default'`, which no request carries.
-fn parts(value: &str, iam_syntax: bool) -> Vec<Part<'_>> {
+/// Every caller reads a pattern or value that is expanded, in a `2012-10-17`
+/// document and, for a condition value, under a string or ARN operator. A
+/// value that is not expanded is compared as written and is not split
+/// ([`expand_condition_value`]).
+fn parts(value: &str) -> Vec<Part<'_>> {
     let mut out = Vec::new();
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -191,16 +196,7 @@ fn parts(value: &str, iam_syntax: bool) -> Vec<Part<'_>> {
         match after_start.find('}') {
             Some(end) => {
                 let raw = &rest[start..start + 3 + end];
-                let inner = &after_start[..end];
-                let reference = if iam_syntax {
-                    parse_reference(inner)
-                } else {
-                    Reference::Key {
-                        name: inner,
-                        default: None,
-                    }
-                };
-                out.push(Part::Ref(raw, reference));
+                out.push(Part::Ref(raw, parse_reference(&after_start[..end])));
                 rest = &after_start[end + 1..];
             }
             None => {
@@ -263,7 +259,7 @@ fn resolve<'a>(
 fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Result<Vec<Token>, Missing> {
     let mut tokens = Vec::with_capacity(pattern.len());
     let mut unresolvable = false;
-    for part in parts(pattern, true) {
+    for part in parts(pattern) {
         match part {
             Part::Text(text) => tokens.extend(text.encode_utf16().map(Token::written)),
             Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Unit(u16::from(byte))),
@@ -322,60 +318,165 @@ pub fn resource_pattern_is_unresolvable(
 }
 
 /// The key names the `${key}` and `${key, 'default'}` variables in `value`
-/// read, in the order [`expand_condition_value`] reads them with the same
-/// `iam_syntax`.
+/// read, in the order [`expand_condition_value`] reads them.
 ///
-/// With `iam_syntax` the default is not part of the name, so a caller that
-/// asks the context about each name sees the key behind
-/// `${aws:RequestTag/env, 'x'}` as it sees the one behind
-/// `${aws:RequestTag/env}`. Without it the name is the text between the
-/// braces as written. The `${*}`, `${?}` and `${$}` escapes name no key, and
-/// neither does a `${` with no closing brace, as both expand to themselves.
-pub fn variable_key_names(value: &str, iam_syntax: bool) -> impl Iterator<Item = &str> {
-    parts(value, iam_syntax)
-        .into_iter()
-        .filter_map(|part| match part {
-            Part::Ref(_, Reference::Key { name, .. }) => Some(name),
-            Part::Text(_) | Part::Ref(_, Reference::Escape(_)) => None,
-        })
+/// The default is not part of the name, and the name is trimmed as
+/// [`parse_reference`] trims it, so a caller that asks the context about each
+/// name sees the key behind `${aws:RequestTag/env, 'x'}` as it sees the one
+/// behind `${aws:RequestTag/env}`. The `${*}`, `${?}` and `${$}` escapes name
+/// no key, and neither does a `${` with no closing brace, as both expand to
+/// themselves. The caller asks only for a value that is expanded; a value
+/// that is not expanded reads no key.
+pub fn variable_key_names(value: &str) -> impl Iterator<Item = &str> {
+    parts(value).into_iter().filter_map(|part| match part {
+        Part::Ref(_, Reference::Key { name, .. }) => Some(name),
+        Part::Text(_) | Part::Ref(_, Reference::Escape(_)) => None,
+    })
+}
+
+/// A condition value after policy variable expansion for one request.
+///
+/// The `StringLike` and `ArnLike` operators, and `ArnEquals`, which IAM
+/// evaluates as `ArnLike` (PR #471), read `*` and `?` as wildcards only where
+/// the policy wrote them: a `*` or `?` that came from a variable value, a
+/// default or an escape is matched literally, the same rule as a `Resource`
+/// pattern. Measured with the IAM policy simulator (issue #534): `StringLike`
+/// `a${*}` matches `a*` and not `abc`, `a${?}` matches `a?` and not `ab`, and
+/// `ArnLike` `.../user/a${*}` matches `.../user/a*` and not `.../user/abc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionValue {
+    /// The value as written: it has no `${`, or the document does not expand
+    /// variables. Every `*` and `?` is a wildcard for the Like and Arn
+    /// operators.
+    Literal(String),
+    /// The value with its variables, defaults and escapes expanded.
+    Expanded {
+        /// The expanded text, compared by `StringEquals`, `StringNotEquals`
+        /// and their `IgnoreCase` forms. Only the string and ARN operators
+        /// expand a value, so no other operator receives this variant, and the
+        /// Like and Arn operators match `tokens`.
+        text: String,
+        /// The expanded text with the `*` and `?` the policy wrote marked as
+        /// wildcards, matched by `StringLike`, `StringNotLike` and the four
+        /// Arn operators.
+        tokens: Vec<Token>,
+    },
+    /// A variable left nothing to compare: a `${key}` with no default named a
+    /// key the request does not carry, or a variable named a multivalued key
+    /// the request carries or a key the context reports unresolvable, with or
+    /// without a default. The value matches nothing: a positive operator is
+    /// false against it and a negative operator true (measured: `StringEquals`
+    /// `${aws:username}` with no `aws:username` does not match the literal
+    /// text `${aws:username}`, and `StringNotEquals` with the same value
+    /// matches `alice`). A condition whose value names an unresolvable key
+    /// fails closed before the value is compared
+    /// (`condition::evaluate_condition_match`).
+    Unresolved,
+}
+
+impl ConditionValue {
+    /// The text the value compares as, `None` for an unresolved variable.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Literal(text) | Self::Expanded { text, .. } => Some(text),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Whether the value, read as a `StringLike` pattern, matches `value`.
+    #[must_use]
+    pub fn wildcard_matches(&self, value: &str) -> bool {
+        match self {
+            Self::Literal(pattern) => wildcard_match(pattern, value),
+            Self::Expanded { tokens, .. } => {
+                let units: Vec<u16> = value.encode_utf16().collect();
+                match_tokens(tokens, &units)
+            }
+            Self::Unresolved => false,
+        }
+    }
+
+    /// Whether the value, read as an `ArnLike` pattern, matches `value`.
+    #[must_use]
+    pub fn arn_matches(&self, value: &str) -> bool {
+        match self {
+            Self::Literal(pattern) => arn_match(pattern, value),
+            Self::Expanded { tokens, .. } => arn_match_tokens(tokens, value),
+            Self::Unresolved => false,
+        }
+    }
 }
 
 /// Expand variables in a condition value.
 ///
-/// `${key}` is replaced by its value, and with `iam_syntax` so is
-/// `${key, 'default'}`; a variable whose key the request does not carry,
-/// with no default, is left as written, and so are the `${*}`, `${?}` and
-/// `${$}` escapes, as before. A variable whose key the context reports
-/// unresolvable is also left as written, with or without a default: the
-/// service would have a value for the key, so the default is not used, and
-/// the caller fails the condition closed instead of comparing the text
-/// (`condition::evaluate_condition_match`, which finds the key through
-/// [`variable_key_names`]).
-///
-/// The caller passes `iam_syntax` only where IAM reads the default form: in
-/// a `2012-10-17` document and under a string or ARN operator. Elsewhere the
-/// text between the braces is the key name as written ([`parts`]), so
-/// `${key, 'default'}` stays as written, and `${key}` expands as it did
-/// before the default form was read.
+/// With `expand` false (a `2008-10-17` document, or one with no `Version`, or
+/// an operator other than a string or ARN one), or when `value` has no `${`,
+/// the value is compared as written: `${aws:username}` is the
+/// eleven-character text and `${*}` the four-character text (measured, issue
+/// #534). Otherwise `${key}` and `${key, 'default'}` are replaced by their
+/// value, `${*}`, `${?}` and `${$}` by `*`, `?` and `$` (the result is not
+/// expanded again: `a${$}{x}` is the text `a${x}`), and a variable whose key
+/// the request does not carry, with no default, makes the value
+/// [`ConditionValue::Unresolved`]. So does a variable whose key the context
+/// reports unresolvable, with or without a default: the service would have a
+/// value for the key, so the default is not used, and the caller fails the
+/// condition closed before comparing (`condition::evaluate_condition_match`,
+/// which finds the key through [`variable_key_names`]). The text between the
+/// braces is read as [`parse_reference`] reads it, trimmed of the code points
+/// up to U+0020.
 #[must_use]
 pub fn expand_condition_value(
     value: &str,
-    iam_syntax: bool,
+    expand: bool,
     context: &impl ConditionContext,
-) -> String {
-    if !value.contains("${") {
-        return value.to_owned();
+) -> ConditionValue {
+    if !expand || !value.contains("${") {
+        return ConditionValue::Literal(value.to_owned());
     }
-    let mut result = String::with_capacity(value.len());
-    for part in parts(value, iam_syntax) {
+    let mut text = String::with_capacity(value.len());
+    let mut tokens = Vec::with_capacity(value.len());
+    for part in parts(value) {
         match part {
-            Part::Text(text) | Part::Ref(text, Reference::Escape(_)) => result.push_str(text),
-            Part::Ref(raw, Reference::Key { name, default }) => {
-                result.push_str(resolve(name, default, context).unwrap_or(raw));
+            Part::Text(written) => {
+                text.push_str(written);
+                tokens.extend(written.encode_utf16().map(Token::written));
+            }
+            Part::Ref(_, Reference::Escape(byte)) => {
+                text.push(char::from(byte));
+                tokens.push(Token::Unit(u16::from(byte)));
+            }
+            Part::Ref(_, Reference::Key { name, default }) => {
+                // `Missing::Absent` and `Missing::Unresolvable` both leave
+                // nothing to compare, so the value matches nothing.
+                let Ok(resolved) = resolve(name, default, context) else {
+                    return ConditionValue::Unresolved;
+                };
+                text.push_str(resolved);
+                tokens.extend(resolved.encode_utf16().map(Token::Unit));
             }
         }
     }
-    result
+    ConditionValue::Expanded { text, tokens }
+}
+
+/// Whether the `Arn*` condition value `value` contains `${` and has fewer
+/// than five `:` written outside its `${...}` references, as
+/// `${aws:ResourceTag/owner}` has none. Only a written `:` separates ARN
+/// fields here, so such a value cannot have the six fields of an ARN. The IAM
+/// policy simulator refuses a policy with such a value (`InvalidInput`) and
+/// IAM Access Analyzer reports `MISSING_ARN_FIELD` (measured 2026-10-28).
+#[must_use]
+pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
+    value.contains("${")
+        && parts(value)
+            .iter()
+            .map(|part| match part {
+                Part::Text(text) => text.matches(':').count(),
+                Part::Ref(..) => 0,
+            })
+            .sum::<usize>()
+            < 5
 }
 
 /// Match an expanded ARN pattern against an ARN value with the field rule of

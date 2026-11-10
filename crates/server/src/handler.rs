@@ -108,6 +108,7 @@ pub(crate) async fn handle_request(
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
+    let item_authorizer;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -140,6 +141,9 @@ pub(crate) async fn handle_request(
             Ok(ki) => authorized_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
         }
+        // The engine authorizes each PartiQL statement through it.
+        item_authorizer =
+            crate::item_authz::for_request(&state, identity, &account_id, source_ip, user_agent);
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
@@ -147,6 +151,7 @@ pub(crate) async fn handle_request(
     // Dispatch
     let ctx = OperationContext {
         storage: state.storage.clone(),
+        backup: state.backup_runtime.clone(),
         limits: state.limits.clone(),
         region: state.region.clone(),
         account_id,
@@ -157,6 +162,7 @@ pub(crate) async fn handle_request(
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
         ),
+        item_authorizer: Some(item_authorizer),
     };
 
     let table_name = extract_table_name(&input);

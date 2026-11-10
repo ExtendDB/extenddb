@@ -138,11 +138,37 @@ pub trait AdminStore: Send + Sync {
 
     /// Verify an admin password. Returns `None` if the admin does not exist,
     /// `Some(true)` if the password matches, `Some(false)` if it does not.
+    /// An unknown name returns `None` without a bcrypt check. Every login
+    /// path then runs the IAM user step, which runs one bcrypt check for any
+    /// name, so a login runs one check whether or not an admin has the name.
     fn verify_admin_password(
         &self,
         admin_name: &str,
         password: &str,
     ) -> BoxFuture<'_, OpResult<Option<bool>>>;
+}
+
+// ── Password hashes ────────────────────────────────────────────────────
+
+/// Reads the stored password hash of a console principal.
+///
+/// The console reads the hash once at login, verifies the password against
+/// it, and binds the session to that hash. Every later console request reads
+/// the hash again and ends the session when the principal is gone or its hash
+/// differs. Implementations must return the latest acknowledged value: the
+/// read must see any password change or deletion that has already returned
+/// to its caller, on any server sharing the catalog.
+pub trait PasswordHashStore: Send + Sync {
+    /// The stored password hash of an admin, or `None` if the admin does not exist.
+    fn get_admin_password_hash(&self, admin_name: &str) -> BoxFuture<'_, OpResult<Option<String>>>;
+
+    /// The stored console password hash of an IAM user, or `None` if the user
+    /// does not exist or has no console password.
+    fn get_user_password_hash(
+        &self,
+        account_id: &str,
+        user_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<String>>>;
 }
 
 // ── Management store (IAM) ─────────────────────────────────────────────
@@ -206,7 +232,11 @@ pub trait ManagementStore: Send + Sync {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Option<UserDetail>>>;
 
-    /// Verify an IAM user's console password.
+    /// Verify an IAM user's console password. Returns `false` for a wrong
+    /// password, an unknown user and a user without a console password.
+    /// Implementations check through
+    /// [`crate::password::verify_stored_password`] in all three cases, so
+    /// that they run the same bcrypt work.
     fn verify_iam_user_password(
         &self,
         account_id: &str,
