@@ -233,7 +233,7 @@ All defaults match real DynamoDB limits. Override only for testing edge cases.
 | `level` | `info` | Initial log level (overridden by runtime setting) |
 | `format` | `pretty` | Log format: `pretty` or `json` |
 
-Logging always goes to syslog (facility: daemon, ident: extenddb).
+The server logs to syslog (facility: daemon, ident: extenddb) when it runs as a daemon, and to stderr with `--foreground`.
 
 ### Environment Variable Overrides
 
@@ -255,7 +255,7 @@ Managed via `extenddb settings set`. Changes take effect within 30 seconds witho
 |---------|---------|-------------|
 | `log_level` | `info` | Log level: trace, debug, info, warn, error |
 | `control_plane_delay_seconds` | `0.25` | Delay for table status transitions, in seconds (0 = instant). PostgreSQL and SQLite write 0.25 into the catalog when it is created; MongoDB and Cassandra use 0.25 when the setting is absent. On PostgreSQL and SQLite a value below 1 makes DeleteTable remove the table in the request; on PostgreSQL, if a session holds a lock on the table's data (a reader, an open write transaction, an index build), DeleteTable returns `DELETING` instead (after at most about a second), the drop finishes in the background within about a second of that session's release, and a CreateTable of the same name is refused until then. |
-| `allow_credential_import` | `true` | Whether `import-access-key` is allowed |
+| `allow_credential_import` | `false` | Whether `import-access-key` is allowed. Only `true` enables it |
 | `vector_backfill_batch_delay_ms` | `0` | **Test-oriented.** Milliseconds to pause between batches while a vector index backfills. Zero in production. A test sets it so a write is guaranteed to land while the index is still building. The pause is outside the batch transaction, so writes are still accepted throughout, but it does extend the per-table propagation hold: no index on that table advances while the build runs, GSIs included, and the accepted range goes up to 60 s per batch. |
 | `vector_allocation_phase_delay_ms` | `0` | **Test-oriented.** Milliseconds to hold a new vector index in the resource-allocation phase (`CREATING` with `Backfilling: false`) before the scan starts. Zero in production. Without it the phase lasts only from the `UpdateTable` transaction, which inserts the row as `CREATING` with `Backfilling: false`, until the detached build task flips the flag, which is a window no client can time reliably rather than one that cannot exist. |
 
@@ -359,7 +359,9 @@ Account IDs must be 12-digit numeric strings (matching AWS format). If `--accoun
     delete-access-key --account-id 123456789012 \
     --user-name alice --access-key-id AKIAEXTENDDB...
 
-# Import existing credentials
+# Import existing credentials (refused unless allow_credential_import is true)
+./target/release/extenddb settings --config extenddb.toml set \
+    allow_credential_import true
 ./target/release/extenddb manage --user admin --password <pw> \
     import-access-key --account-id 123456789012 --user-name alice \
     --access-key-id AKIAIOSFODNN7EXAMPLE \
@@ -893,7 +895,7 @@ Sessions end 8 hours after login. Click "Logout" to end immediately. Deleting an
 
 ### Syslog
 
-All server logging goes to syslog (facility: daemon, ident: extenddb).
+The server logs to syslog (facility: daemon, ident: extenddb) when it runs as a daemon, and to stderr with `--foreground`.
 
 **Linux:**
 
@@ -926,14 +928,14 @@ log show --predicate 'processImagePath ENDSWITH "extenddb" AND messageType >= 16
 
 ### Audit Logging
 
-Management and settings operations are logged at WARN level:
+The server logs some management operations, and the settings changes made through the management API, at WARN level. [Security Model: Logging](10-security-model.md#logging) lists them.
 
 ```bash
 # View audit entries
 journalctl -t extenddb | grep 'extenddb::audit'
 ```
 
-Targets: `extenddb::audit::manage` (management ops), `extenddb::audit::settings` (settings changes).
+Targets: `extenddb::audit::manage` (some management operations), `extenddb::audit::settings` (settings changes made through the management API).
 
 ### Metrics
 

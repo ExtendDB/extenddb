@@ -237,7 +237,7 @@ ExtendDB exposes runtime settings that have no DynamoDB equivalent:
 | `limits.allow_multipart_table_keys` | `false` | Enable multi-part base table key extension |
 | `log_level` | `info` | Runtime log level (trace, debug, info, warn, error) |
 | `sqlx_log_level` | `warn` | Separate log level for sqlx query traces |
-| `allow_credential_import` | `true` | Allow importing credentials via the management API |
+| `allow_credential_import` | `false` | Allow importing credentials via the management API. Only `true` enables it |
 
 ## Web Console
 
