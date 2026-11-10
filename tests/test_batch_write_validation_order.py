@@ -10,6 +10,10 @@ batch's requests is applied, wherever the faulty request sits: the checks run
 for the whole batch before the first write, so a valid request listed ahead of
 the faulty one is not applied either.
 
+Each test checks the error code and the message. The messages are the ones
+the service answered to these batches (us-east-1, 2026-11-10, two sends
+each).
+
 The tests need no contention: a valid request first and a faulty one second
 is enough to tell a handler that checks the whole batch from one that checks
 each request just before it writes it.
@@ -30,6 +34,11 @@ ABSENT_TABLE = f"extenddb-absent-{uuid.uuid4().hex[:12]}"
 # The server visits the tables of one batch in an unspecified order, so a
 # cross-table batch is sent several times, each time with fresh keys.
 ROUNDS = 8
+
+KEY_MISMATCH = "The provided key element does not match the schema"
+TABLE_NOT_FOUND = "Requested resource not found"
+DUPLICATE_KEYS = "Provided list of item keys contains duplicates"
+ITEM_TOO_LARGE = "Item size has exceeded the maximum allowed size"
 
 
 @pytest.fixture(scope="module")
@@ -75,22 +84,24 @@ def _exists(client, table: str, pk: str) -> bool:
     return "Item" in resp
 
 
-def _rejected(client, request_items: dict) -> str:
-    """Send the batch, require a ClientError and return its code."""
+def _rejected(client, request_items: dict) -> tuple[str, str]:
+    """Send the batch, require a 400 and return its error code and message."""
     with pytest.raises(ClientError) as exc_info:
         client.batch_write_item(RequestItems=request_items)
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
-    return exc_info.value.response["Error"]["Code"]
+    error = exc_info.value.response["Error"]
+    return error["Code"], error["Message"]
 
 
 def test_valid_put_before_an_invalid_put_is_not_applied(dynamodb_client, table_a):
     pk = f"valid-{uuid.uuid4().hex[:8]}"
 
-    code = _rejected(
+    code, message = _rejected(
         dynamodb_client, {table_a: [_put(pk), _put_with_wrong_key_type()]}
     )
 
     assert code == "ValidationException"
+    assert message == KEY_MISMATCH
     assert not _exists(dynamodb_client, table_a, pk)
 
 
@@ -98,11 +109,12 @@ def test_valid_delete_before_an_invalid_put_is_not_applied(dynamodb_client, tabl
     pk = f"keep-{uuid.uuid4().hex[:8]}"
     dynamodb_client.put_item(TableName=table_a, Item={"pk": {"S": pk}})
 
-    code = _rejected(
+    code, message = _rejected(
         dynamodb_client, {table_a: [_delete(pk), _put_with_wrong_key_type()]}
     )
 
     assert code == "ValidationException"
+    assert message == KEY_MISMATCH
     assert _exists(dynamodb_client, table_a, pk)
 
 
@@ -112,12 +124,13 @@ def test_valid_put_in_one_table_with_an_invalid_put_in_another_is_not_applied(
     for _ in range(ROUNDS):
         pk = f"valid-{uuid.uuid4().hex[:8]}"
 
-        code = _rejected(
+        code, message = _rejected(
             dynamodb_client,
             {table_a: [_put(pk)], table_b: [_put_with_wrong_key_type()]},
         )
 
         assert code == "ValidationException"
+        assert message == KEY_MISMATCH
         assert not _exists(dynamodb_client, table_a, pk)
 
 
@@ -127,11 +140,12 @@ def test_valid_put_with_a_put_to_a_missing_table_is_not_applied(
     for _ in range(ROUNDS):
         pk = f"valid-{uuid.uuid4().hex[:8]}"
 
-        code = _rejected(
+        code, message = _rejected(
             dynamodb_client, {table_a: [_put(pk)], ABSENT_TABLE: [_put(pk)]}
         )
 
         assert code == "ResourceNotFoundException"
+        assert message == TABLE_NOT_FOUND
         assert not _exists(dynamodb_client, table_a, pk)
 
 
@@ -142,29 +156,34 @@ def test_valid_put_with_duplicate_keys_in_another_table_is_not_applied(
         pk = f"valid-{uuid.uuid4().hex[:8]}"
         dup = f"dup-{uuid.uuid4().hex[:8]}"
 
-        code = _rejected(
+        code, message = _rejected(
             dynamodb_client,
             {table_a: [_put(pk)], table_b: [_put(dup), _put(dup)]},
         )
 
         assert code == "ValidationException"
+        assert message == DUPLICATE_KEYS
         assert not _exists(dynamodb_client, table_a, pk)
 
 
 @pytest.mark.parametrize(
-    "faulty_request",
-    [_put_over_the_item_size_limit, _delete_with_an_extra_key_attribute],
+    ("faulty_request", "expected_message"),
+    [
+        (_put_over_the_item_size_limit, ITEM_TOO_LARGE),
+        (_delete_with_an_extra_key_attribute, KEY_MISMATCH),
+    ],
     ids=["item_over_400_kb", "delete_with_an_extra_key_attribute"],
 )
 def test_valid_put_before_an_oversized_item_or_a_malformed_delete_is_not_applied(
-    dynamodb_client, table_a, faulty_request
+    dynamodb_client, table_a, faulty_request, expected_message
 ):
     pk = f"valid-{uuid.uuid4().hex[:8]}"
     faulty_pk = f"faulty-{uuid.uuid4().hex[:8]}"
 
-    code = _rejected(
+    code, message = _rejected(
         dynamodb_client, {table_a: [_put(pk), faulty_request(faulty_pk)]}
     )
 
     assert code == "ValidationException"
+    assert message == expected_message
     assert not _exists(dynamodb_client, table_a, pk)
