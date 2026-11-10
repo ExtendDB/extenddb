@@ -203,24 +203,30 @@ The CI jobs run the suite with `filesystem`.
 
 **The cross-backend restore matrix** is `devtools/backup-restore-matrix`:
 one cell per invocation (`--source <sqlite|postgres|mongodb> --target
-<sqlite|postgres|mongodb|cassandra>`, plus `--duplicate-key` or `--vector`),
-each starting a source and a target server from the per-backend release
-binaries (`--bin-<backend>`, defaulting to
+<sqlite|postgres|mongodb|cassandra>`, plus `--duplicate-key`, `--vector` or
+`--adopt-store`), each starting a source and a target server from the
+per-backend release binaries (`--bin-<backend>`, defaulting to
 `target/rel-<backend>/release/extenddb`) against PostgreSQL at
 `127.0.0.1:55432`, MongoDB at `127.0.0.1:27117` and Cassandra at
 `127.0.0.1:9042`; its MongoDB and Cassandra cells need `pymongo` and
-`cassandra-driver` (`requirements-matrix.txt`). The nightly workflow
-`.github/workflows/matrix-nightly.yml` builds the four binaries, starts the
-three services and runs the twelve plain cells, the four duplicate-key
-cells and the eight vector cells; `workflow_dispatch` runs it on demand. The
-same workflow runs the restore kill points of every backend in four jobs
-(`restore-kill-points-<backend>`), each building its backend's binary with
-`extenddb-app/backup-test-hooks` and starting its backend as the matrix job
-does, through `devtools/backup-kill-points.py restore <backend> <point>
---bin <binary> --work <dir>` (the Cassandra job builds a plain SQLite binary
-too, the `--source-bin` whose backup the Cassandra target restores); every
-point ends ACTIVE with the exact base and GSI counts, except the
-tampered-file point, whose target is removed.
+`cassandra-driver` (`requirements-matrix.txt`). A cell copies the source's
+backup prefix under the target's root and adopts it with `extenddb backup
+sync` on the target (with the target's server stopped when it is SQLite);
+`--adopt-store` points the target's store at the source's root instead,
+adopts the root with `backup sync --adopt-store` and checks that the
+source's server then reports the store owned by another catalog. The
+nightly workflow `.github/workflows/matrix-nightly.yml` builds the four
+binaries, starts the three services and runs the twelve plain cells, the
+four duplicate-key cells, the eight vector cells and two `--adopt-store`
+cells (SQLite to PostgreSQL and back); `workflow_dispatch` runs it on
+demand. The same workflow runs the restore kill points of every backend in
+four jobs (`restore-kill-points-<backend>`), each building its backend's
+binary with `extenddb-app/backup-test-hooks` and starting its backend as
+the matrix job does, through `devtools/backup-kill-points.py restore
+<backend> <point> --bin <binary> --work <dir>` (the Cassandra job builds a
+plain SQLite binary too, the `--source-bin` whose backup the Cassandra
+target restores); every point ends ACTIVE with the exact base and GSI
+counts, except the tampered-file point, whose target is removed.
 
 The `run-tests` script automatically:
 - Performs health check on the target endpoint
