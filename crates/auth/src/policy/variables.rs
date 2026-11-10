@@ -36,14 +36,15 @@
 //! `Version`, compares the text as written. The caller decides that with
 //! [`PolicyDocument::expands_policy_variables`].
 //!
-//! ARN matching here follows the same field rule as
+//! `Resource` and `NotResource` matching here follows the same field rule as
 //! [`super::matcher::arn_match`]: the first five `:` separate fields, the
 //! resource field keeps its own `:` and `/`, and both sides need the same
-//! number of fields. Only a `:` written in the policy text separates fields;
-//! a `:` inside a variable value is matched as a character of its field
-//! (measured: a region-field value `us-east-1:123456789012` matches no table
-//! ARN). `*` and `?` count UTF-16 code units, as in
-//! [`super::matcher::wildcard_match`] (#581).
+//! number of fields. An `Arn*` condition value follows the field rules of
+//! [`super::arn_value::arn_condition_match_tokens`] instead. In both, only a
+//! `:` written in the policy text separates fields; a `:` inside a variable
+//! value is matched as a character of its field (measured: a region-field
+//! value `us-east-1:123456789012` matches no table ARN). `*` and `?` count
+//! UTF-16 code units, as in [`super::matcher::wildcard_match`] (#581).
 
 use super::context::ConditionContext;
 use super::document::{PolicyDocument, PolicyParseError};
@@ -108,7 +109,7 @@ pub enum Token {
 impl Token {
     /// The token for a UTF-16 code unit of the policy text, where `*`, `?`
     /// and `:` keep their meaning.
-    fn written(unit: u16) -> Self {
+    pub(super) fn written(unit: u16) -> Self {
         match unit {
             STAR => Self::Star,
             QUESTION => Self::Question,
@@ -398,11 +399,19 @@ impl ConditionValue {
     }
 
     /// Whether the value, read as an `ArnLike` pattern, matches `value`.
+    ///
+    /// A value as written and an expanded one follow the same field rules
+    /// ([`super::arn_value::arn_condition_match_tokens`]): every character of
+    /// a value as written is written in the policy, and in an expanded value
+    /// the text from a variable, a default or an escape is matched
+    /// literally, so it adds neither a wildcard nor a field separator.
     #[must_use]
     pub fn arn_matches(&self, value: &str) -> bool {
         match self {
-            Self::Literal(pattern) => arn_match(pattern, value),
-            Self::Expanded { tokens, .. } => arn_match_tokens(tokens, value),
+            Self::Literal(pattern) => super::arn_value::arn_condition_match(pattern, value),
+            Self::Expanded { tokens, .. } => {
+                super::arn_value::arn_condition_match_tokens(tokens, value)
+            }
             Self::Unresolved => false,
         }
     }
@@ -466,6 +475,13 @@ pub fn expand_condition_value(
 /// fields here, so such a value cannot have the six fields of an ARN. The IAM
 /// policy simulator refuses a policy with such a value (`InvalidInput`) and
 /// IAM Access Analyzer reports `MISSING_ARN_FIELD` (measured 2026-10-28).
+///
+/// The condition fails closed on such a value before it is matched, so the
+/// short value rule of [`super::arn_value::arn_condition_match_tokens`]
+/// applies only to a value with no variable. The identity policy write check
+/// ([`super::arn_value::is_valid_identity_arn_value`]) counts fields on every
+/// `:`, a variable's own included, and rejects every value this reports, so
+/// the two counts agree on every value an identity policy write accepts.
 #[must_use]
 pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
     value.contains("${")
@@ -479,8 +495,8 @@ pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
             < 5
 }
 
-/// Match an expanded ARN pattern against an ARN value with the field rule of
-/// [`arn_match`].
+/// Match an expanded `Resource` or `NotResource` pattern against an ARN value
+/// with the field rule of [`arn_match`].
 fn arn_match_tokens(pattern: &[Token], value: &str) -> bool {
     if pattern == [Token::Star] {
         return true;
@@ -498,7 +514,7 @@ fn arn_match_tokens(pattern: &[Token], value: &str) -> bool {
 
 /// Split at the first five `:` written in the policy text, so the resource
 /// field keeps its own `:` and a `:` from a variable value stays in its field.
-fn split_fields(pattern: &[Token]) -> Vec<&[Token]> {
+pub(super) fn split_fields(pattern: &[Token]) -> Vec<&[Token]> {
     let mut fields = Vec::with_capacity(6);
     let mut rest = pattern;
     while fields.len() < 5 {
@@ -518,7 +534,7 @@ fn split_fields(pattern: &[Token]) -> Vec<&[Token]> {
 /// value: the algorithm of `matcher::wildcard_match`, which counts what `?`
 /// and `*` match in UTF-16 code units (#581), with `Star` and `Question` as
 /// the wildcards.
-fn match_tokens(p: &[Token], v: &[u16]) -> bool {
+pub(super) fn match_tokens(p: &[Token], v: &[u16]) -> bool {
     let (plen, vlen) = (p.len(), v.len());
     let mut pi = 0;
     let mut vi = 0;

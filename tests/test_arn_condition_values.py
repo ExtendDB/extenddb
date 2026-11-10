@@ -7,8 +7,9 @@ pull request for issue #665.
 
 - Identity policies (CreatePolicy, PutRolePolicy) reject an Arn condition value
   whose first ``:`` field does not match ``arn``, whose partition or service
-  field is empty, or whose service, region or account field holds ``/`` or
-  ``${``, with MalformedPolicyDocument "The policy failed legacy parsing".
+  field is empty, whose partition, service, region or account field holds
+  ``/`` or ``${``, or whose service field holds an upper-case letter, with
+  MalformedPolicyDocument "The policy failed legacy parsing".
   They accepted the values in IDENTITY_ACCEPTED, including values shorter
   than an ARN.
 - Role trust policies (CreateRole, UpdateAssumeRolePolicy) reject a value that
@@ -56,6 +57,9 @@ IDENTITY_REJECTED = [
     "arn:aws:iam:role/extenddb-test-665-e1",
     "arn:aws:iam:*:role/extenddb-test-665-e1",
     "arn:aws:iam::${aws:PrincipalAccount}:user/alice",
+    "arn:aws/x:iam::123456789012:root",
+    "arn:${aws:username}:iam::123456789012:root",
+    "arn:aws:IAM::123456789012:root",
 ]
 
 IDENTITY_ACCEPTED = [

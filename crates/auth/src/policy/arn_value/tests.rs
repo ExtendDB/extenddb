@@ -5,6 +5,7 @@ use serde_json::json;
 
 use super::*;
 use crate::policy::document::{PolicyDocument, parse_conditions};
+use crate::policy::variables::arn_value_lacks_fields;
 
 /// Accepted by `CreatePolicy` (twice under each of `ArnEquals`, `ArnNotEquals`,
 /// `ArnLike`, `ArnNotLike`, `ForAnyValue:ArnLike`, `ArnNotLikeIfExists`) or
@@ -59,6 +60,10 @@ const IDENTITY_REJECTED: &[&str] = &[
     "b*",
     "foo:*",
     "foo:aws:iam::123456789012:user/alice",
+    // `PutRolePolicy`, 2026-10-30 21:13 round, twice each.
+    "arn:aws/x:iam::123456789012:root",
+    "arn:${aws:username}:iam::123456789012:root",
+    "arn:aws:IAM::123456789012:root",
 ];
 
 /// Accepted by `UpdateAssumeRolePolicy` in a trust policy, 2026-10-30.
@@ -159,6 +164,101 @@ fn matcher_matches_what_the_service_matched() {
             "pattern {pattern:?}"
         );
     }
+}
+
+/// `pattern` as tokens: each `(text, written)` part is written in the policy
+/// when `written` is true and comes from a variable's value when it is false.
+fn tokens(parts: &[(&str, bool)]) -> Vec<Token> {
+    parts
+        .iter()
+        .flat_map(|(text, written)| {
+            text.encode_utf16().map(move |u| {
+                if *written {
+                    Token::written(u)
+                } else {
+                    Token::Unit(u)
+                }
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn token_matcher_matches_a_written_pattern_as_the_service_matched() {
+    for (pattern, expected) in MATCH_MEASURED {
+        assert_eq!(
+            arn_condition_match_tokens(&tokens(&[(pattern, true)]), ROLE_ARN),
+            *expected,
+            "pattern {pattern:?}"
+        );
+    }
+}
+
+#[test]
+fn a_substituted_star_or_colon_is_a_character_of_its_field() {
+    // Written in full, `arn:aws:iam::*:role/...` matches any account and
+    // `arn:aws:iam:*` every iam ARN.
+    assert!(arn_condition_match(
+        "arn:aws:iam::*:role/extenddb-test-665-e1",
+        ROLE_ARN
+    ));
+    assert!(arn_condition_match("arn:aws:iam:*", ROLE_ARN));
+    // A `*` from a variable in the account field is the character `*`.
+    let star = tokens(&[
+        ("arn:aws:iam::", true),
+        ("*", false),
+        (":role/extenddb-test-665-e1", true),
+    ]);
+    assert!(!arn_condition_match_tokens(&star, ROLE_ARN));
+    // A `:` from a variable does not split `aws:iam` into two fields, so the
+    // pattern has three fields and its partition field is `aws:iam`.
+    let colon = tokens(&[("arn:", true), ("aws:iam", false), (":*", true)]);
+    assert!(!arn_condition_match_tokens(&colon, ROLE_ARN));
+    // A `*` from a variable is no bare `*` either.
+    assert!(!arn_condition_match_tokens(&[Token::Unit(0x2A)], ROLE_ARN));
+    assert!(!arn_condition_match_tokens(&[Token::Star], ROLE_ARN));
+}
+
+#[test]
+fn identity_check_rejects_every_value_that_lacks_written_fields() {
+    // Every value of one to four of these pieces joined by `:`: each value
+    // `arn_value_lacks_fields` reports must fail the write check, so the two
+    // field counts agree on every value a write accepts.
+    const PIECES: [&str; 8] = [
+        "arn",
+        "aws",
+        "",
+        "*",
+        "${a}",
+        "${a:b}",
+        "${a:b:c:d:e}",
+        "x/y",
+    ];
+    let mut values = vec![String::new()];
+    let mut layer = vec![String::new()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for prefix in &layer {
+            for piece in PIECES {
+                let v = if prefix.is_empty() {
+                    piece.to_owned()
+                } else {
+                    format!("{prefix}:{piece}")
+                };
+                next.push(v);
+            }
+        }
+        values.extend(next.iter().cloned());
+        layer = next;
+    }
+    let mut reported = 0;
+    for v in &values {
+        if arn_value_lacks_fields(v) {
+            reported += 1;
+            assert!(!is_valid_identity_arn_value(v), "{v:?}");
+        }
+    }
+    assert!(reported > 100, "{reported}");
 }
 
 #[test]

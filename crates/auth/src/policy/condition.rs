@@ -552,16 +552,19 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         }
         ConditionOperator::Bool => bool_matches(context_value, policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
-        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
-        // case sensitive, and both sides need the same number of fields,
-        // except that a bare `*` pattern matches any six-field value
-        // (`arn_match` returns before it compares fields; derived, since the
-        // simulator refuses `*` against an ARN). The rows measured with
-        // simulate-custom-policy are in the description of PR #471. The
-        // context value is an ARN here (checked above). The pattern is the
-        // expanded value with the wildcards the policy wrote, so a `*` or `?`
-        // that came from a variable value, a default or an escape is matched
-        // literally (`ConditionValue::arn_matches`).
+        // as ArnNotLike: `*` and `?` match in every ARN field and matching is
+        // case sensitive (simulate-custom-policy, rows in the description of
+        // PR #471). The field rules are those of
+        // `arn_value::arn_condition_match_tokens`, measured on a live role
+        // session on 2026-10-30 (issue #665): a six-field pattern compares
+        // every field, a pattern of two to five fields starting `arn`
+        // compares only the fields it has, and a one-field pattern (bare `*`
+        // included) matches nothing, so the negative operators hold for it.
+        // The context value is an ARN here (checked above). The pattern is
+        // the expanded value with the wildcards and field separators the
+        // policy wrote, so a `*`, `?` or `:` that came from a variable value,
+        // a default or an escape is matched literally
+        // (`ConditionValue::arn_matches`).
         ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
             value.arn_matches(context_value)
         }

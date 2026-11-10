@@ -10,12 +10,14 @@
 //! is written. Identity policies and role trust policies are checked
 //! differently. The rules come from measurements on live IAM on 2026-10-30,
 //! whose rows are in the description of the pull request for issue #665. One
-//! evaluation question was not measured, and [`arn_condition_match`] names it.
+//! evaluation question was not measured, and [`arn_condition_match_tokens`]
+//! names it.
 
 use serde_json::Value;
 
 use super::document::{Condition, ConditionOperator, PolicyParseError, Statement, base_operator};
 use super::matcher::wildcard_match;
+use super::variables::{Token, match_tokens, split_fields};
 
 /// Code and message the live service returns when an identity policy or a
 /// permissions boundary holds an Arn condition value that
@@ -52,18 +54,37 @@ pub fn is_arn_operator_name(name: &str) -> bool {
     )
 }
 
-/// Whether the Arn condition policy value `pattern` matches the context ARN
-/// `arn`, as the live service matches them.
+/// The first field a pattern of two to five fields needs to match anything:
+/// the text `arn`.
+const ARN_FIELD: [Token; 3] = [Token::Unit(0x61), Token::Unit(0x72), Token::Unit(0x6E)];
+
+/// Whether the Arn condition policy value `pattern`, as written, matches the
+/// context ARN `arn`, as the live service matches them: every `*` and `?` in
+/// `pattern` is a wildcard and every `:` a field separator. The rules are
+/// those of [`arn_condition_match_tokens`].
+#[must_use]
+pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
+    let tokens: Vec<Token> = pattern.encode_utf16().map(Token::written).collect();
+    arn_condition_match_tokens(&tokens, arn)
+}
+
+/// Whether the Arn condition policy value `pattern`, in the tokens of
+/// [`super::variables::ConditionValue`], matches the context ARN `arn`, as the
+/// live service matches them.
 ///
-/// Both sides are split on `:` into at most six fields, so the resource field
-/// keeps any further `:`. A six-field pattern matches when each of its fields
-/// matches the same field of the ARN, with `*` and `?` wildcards in every
-/// field and a case-sensitive comparison. A pattern of two to five fields
-/// matches only when its first field is exactly `arn`; the fields it has are
-/// compared the same way and the fields it lacks do not constrain the ARN, so
-/// `arn:aws:iam:*` matches every ARN of the `iam` service in the `aws`
-/// partition. A one-field pattern matches nothing, `*` included. The negative
-/// operators negate this: `ArnNotEquals` with `*` holds for every ARN.
+/// Only a `*` or `?` the policy wrote is a wildcard, and only a `:` it wrote
+/// separates fields, so text that came from a variable, a default or an
+/// escape is matched as characters of its field (issue #534, PR #541). The
+/// pattern is split at its first five written `:` and the ARN at its first
+/// five `:`, so the resource field keeps any further `:`. A six-field pattern
+/// matches when each of its fields matches the same field of the ARN, with
+/// the wildcards matching in every field and a case-sensitive comparison. A
+/// pattern of two to five fields matches only when its first field is
+/// exactly `arn`; the fields it has are compared the same way and the fields
+/// it lacks do not constrain the ARN, so `arn:aws:iam:*` matches every ARN of
+/// the `iam` service in the `aws` partition. A one-field pattern matches
+/// nothing, `*` included. The negative operators negate this: `ArnNotEquals`
+/// with `*` holds for every ARN.
 ///
 /// Measured twice per probe with a role session whose `aws:PrincipalArn` was
 /// `arn:aws:iam::<account>:role/<name>`. Matched: `arn:aws:iam:*`,
@@ -74,28 +95,33 @@ pub fn is_arn_operator_name(name: &str) -> bool {
 /// empty), `arn:aws:iam::<account>:` (empty resource), `<role ARN>:x` and
 /// `arn:aws:dynamodb:*`.
 ///
+/// On the request path a value with a variable reaches this only with six
+/// fields: a value that holds `${` and has fewer than five written `:` fails
+/// its condition closed before it is matched
+/// ([`super::variables::arn_value_lacks_fields`]).
+///
 /// Not measured: how the service evaluates a pattern of two to five fields
 /// whose first field holds a wildcard, such as `*:aws:iam:*` or `ar?:aws:iam`.
 /// Identity policy writes accept such a pattern (measured), and this matcher
 /// treats it as matching nothing. The one measured pattern of that kind, `*:*`,
 /// matched nothing.
 #[must_use]
-pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
-    let p_fields: Vec<&str> = pattern.splitn(6, ':').collect();
+pub fn arn_condition_match_tokens(pattern: &[Token], arn: &str) -> bool {
     let v_fields: Vec<&str> = arn.splitn(6, ':').collect();
     if v_fields.len() != 6 {
         return false;
     }
+    let p_fields = split_fields(pattern);
     let present_fields_match = || {
-        p_fields
-            .iter()
-            .zip(v_fields.iter())
-            .all(|(p, v)| wildcard_match(p, v))
+        p_fields.iter().zip(&v_fields).all(|(p, v)| {
+            let units: Vec<u16> = v.encode_utf16().collect();
+            match_tokens(p, &units)
+        })
     };
     match p_fields.len() {
         1 => false,
         6 => present_fields_match(),
-        _ => p_fields[0] == "arn" && present_fields_match(),
+        _ => p_fields[0] == &ARN_FIELD[..] && present_fields_match(),
     }
 }
 
@@ -106,9 +132,10 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 ///
 /// The value is split on `:` into at most six fields. It is rejected when the
 /// first field does not match `arn` under `*` and `?` wildcards (case
-/// sensitive), when the partition or service field is present and empty, or
-/// when the service, region or account field holds `/` or the start of a
-/// policy variable (`${`). A policy variable's own `:` splits it across
+/// sensitive), when the partition or service field is present and empty,
+/// when the partition, service, region or account field holds `/` or the
+/// start of a policy variable (`${`), or when the service field holds an
+/// upper-case ASCII letter. A policy variable's own `:` splits it across
 /// fields, so `arn:aws:iam::${aws:PrincipalAccount}:user/alice` puts `${aws`
 /// in the account field; a variable in the resource field is accepted.
 ///
@@ -119,8 +146,19 @@ pub fn arn_condition_match(pattern: &str, arn: &str) -> bool {
 /// Each rejection above was measured, twice per value, among them `arn:`,
 /// `arn::` and `arn:aws:` (an empty partition or service in a value of fewer
 /// than six fields), `${` in the service and in the region field, and values
-/// under the `ForAllValues:` operator forms. A whole-value variable such as
-/// `${aws:PrincipalArn}` is rejected too, because its first field is `${aws`.
+/// under the `ForAllValues:` operator forms. The partition and upper-case
+/// rows were measured at `PutRolePolicy` on 2026-10-30 (the 21:13 round)
+/// with `arn:aws/x:iam::<account>:root`, `arn:${aws:username}:iam::<account>:root`
+/// and `arn:aws:IAM::<account>:root`; a service field with another mix of
+/// cases was not sent. A whole-value variable such as `${aws:PrincipalArn}`
+/// is rejected too, because its first field is `${aws`.
+///
+/// Every value that holds `${` and has fewer than five `:` written outside
+/// its `${...}` references ([`super::variables::arn_value_lacks_fields`]) is
+/// rejected here: an accepted value that holds `${` has five `:` before its
+/// first `${`, and those are written ones. So on every value this accepts,
+/// counting the fields on every `:` and counting them on the written `:`
+/// give six fields or the same number.
 #[must_use]
 pub fn is_valid_identity_arn_value(value: &str) -> bool {
     let fields: Vec<&str> = value.splitn(6, ':').collect();
@@ -130,10 +168,16 @@ pub fn is_valid_identity_arn_value(value: &str) -> bool {
     if fields.get(1).is_some_and(|f| f.is_empty()) || fields.get(2).is_some_and(|f| f.is_empty()) {
         return false;
     }
+    if fields
+        .get(2)
+        .is_some_and(|f| f.bytes().any(|b| b.is_ascii_uppercase()))
+    {
+        return false;
+    }
     !fields
         .iter()
         .take(5)
-        .skip(2)
+        .skip(1)
         .any(|f| f.contains('/') || f.contains("${"))
 }
 
