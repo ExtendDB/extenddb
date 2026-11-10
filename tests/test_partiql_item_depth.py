@@ -10,7 +10,10 @@ UpdateItem give the same value. An UPDATE meets the item check only once its
 condition holds and its SET applies: on a missing item it fails its condition,
 and a SET through a path the item does not have answers the update's own
 message. A SET of a shallow parameter through a path that takes a stored value
-past the limit meets the same item check. A SET of a key attribute is refused
+past the limit meets the same item check: in ExecuteStatement, as the
+statement's ValidationError entry in BatchExecuteStatement, as a ValidationError
+reason in ExecuteTransaction, and ahead of the size check when the statement
+also sets a 409,500-byte parameter. A SET of a key attribute is refused
 ahead of all of this, and a 32-level value the statement does not store (an
 if_not_exists value the item does not take, a value only in the WHERE clause)
 is accepted. In ExecuteTransaction two members on one item are refused first;
@@ -38,6 +41,7 @@ from conftest import wait_for_active
 ITEM_CHECK = "Nesting Levels have exceeded supported limits"
 NESTED = f"{ITEM_CHECK}: Attributes in the item have nested levels beyond supported limit"
 BAD_PATH = "The document path provided in the update expression is invalid for update"
+SIZE_TO_UPDATE = "Item size to update has exceeded the maximum allowed size"
 CONDITION_FAILED = "The conditional request failed"
 CANCELLED = "Transaction cancelled, please refer cancellation reasons for specific reasons"
 ITEM_REASON = {"Code": "ValidationError", "Message": ITEM_CHECK}
@@ -56,6 +60,19 @@ UNSTORED_DEEP_VALUE = pytest.mark.xfail(
     reason="ExtendDB refuses a 32-level parameter the statement does not store",
     raises=ClientError,
     strict=True,
+)
+
+# The PostgreSQL and SQLite storage layers size updates the way the service
+# does. The MongoDB layer applies no limit to updates, and the Cassandra layer
+# sizes every update against a fixed 409,600 bytes (see
+# docs/differences-from-dynamodb.md) and words the refusal "Item size has
+# exceeded the maximum allowed size" (validate_item_size in
+# crates/core/src/validation/mod.rs). The case that needs the size refusal is
+# skipped on those two backends, as in tests/test_partiql_item_size.py.
+refused_for_size_on_default_backends_only = pytest.mark.skipif(
+    os.environ.get("EXTENDDB_TEST_BACKEND", "") in {"mongodb", "cassandra"},
+    reason="updates are sized against a fixed limit (Cassandra) or not at all (MongoDB); "
+    "see docs/differences-from-dynamodb.md",
 )
 
 
@@ -262,20 +279,57 @@ class TestPartiqlUpdate:
 
 
 class TestPartiqlUpdateThroughADeepPath:
-    """A SET of a shallow parameter at a path 30 maps deep (measured 2026-11-10)."""
+    """A SET of a shallow parameter at a path 30 maps deep, on an item that holds
+    ``x`` and 30 maps in ``m``: in ExecuteStatement, as a BatchExecuteStatement
+    member and as an ExecuteTransaction member, and beside a SET of a
+    409,500-byte parameter (measured 2026-11-10)."""
+
+    @staticmethod
+    def deep_set(table: str, key: str, levels: int) -> dict:
+        """The UPDATE that sets ``levels`` maps at 30 keys below ``m``."""
+        return {
+            "Statement": f"UPDATE \"{table}\" SET m" + ".n" * 30 + " = ? WHERE pk = ?",
+            "Parameters": [deep(levels), {"S": key}],
+        }
+
+    @staticmethod
+    def x_set(table: str, key: str) -> dict:
+        return {
+            "Statement": f"UPDATE \"{table}\" SET x = ? WHERE pk = ?",
+            "Parameters": [{"S": "y"}, {"S": key}],
+        }
+
+    @staticmethod
+    def fresh(client, table: str) -> str:
+        """The key of a fresh item that holds ``x`` and 30 maps in ``m``."""
+        key = f"deep-path-{uuid.uuid4().hex[:8]}"
+        client.put_item(
+            TableName=table, Item={"pk": {"S": key}, "x": {"S": "x"}, "m": deep(30)}
+        )
+        return key
+
+    @staticmethod
+    def unchanged(key: str) -> dict:
+        return {"pk": {"S": key}, "x": {"S": "x"}, "m": deep(30)}
 
     def set_leaf(self, client, table: str, key: str, levels: int):
+        return client.execute_statement(**self.deep_set(table, key, levels))
+
+    def set_big_beside(self, client, table: str, key: str, depth: int, big_first: bool):
+        """SET a 409,500-byte ``big`` and SET 2 maps at ``depth`` keys below ``m``,
+        as two SET clauses in the order ``big_first`` gives."""
+        clauses = ["big = ?", "m" + ".n" * depth + " = ?"]
+        params = [{"S": "a" * 409_500}, deep(2)]
+        if not big_first:
+            clauses, params = clauses[::-1], params[::-1]
         return client.execute_statement(
-            Statement=f"UPDATE \"{table}\" SET m" + ".n" * 30 + " = ? WHERE pk = ?",
-            Parameters=[deep(levels), {"S": key}],
+            Statement=f"UPDATE \"{table}\" SET {clauses[0]} SET {clauses[1]} WHERE pk = ?",
+            Parameters=[*params, {"S": key}],
         )
 
     @pytest.fixture
     def deep_item(self, dynamodb_client, table) -> str:
-        """The key of a fresh item whose ``m`` holds 30 maps."""
-        key = f"deep-path-{uuid.uuid4().hex[:8]}"
-        dynamodb_client.put_item(TableName=table, Item={"pk": {"S": key}, "m": deep(30)})
-        return key
+        return self.fresh(dynamodb_client, table)
 
     def test_a_value_that_brings_the_item_to_the_limit_is_applied(
         self, dynamodb_client, table, deep_item
@@ -291,6 +345,55 @@ class TestPartiqlUpdateThroughADeepPath:
             == ITEM_CHECK
         )
         assert stored_item(dynamodb_client, table, deep_item)["m"] == deep(30)
+
+    def test_a_batch_member_past_the_limit_fails_only_that_statement(
+        self, dynamodb_client, table, deep_item
+    ):
+        other = self.fresh(dynamodb_client, table)
+        resp = dynamodb_client.batch_execute_statement(
+            Statements=[self.x_set(table, other), self.deep_set(table, deep_item, 2)]
+        )
+        assert [entry.get("Error") for entry in resp["Responses"]] == [
+            None,
+            {"Code": "ValidationError", "Message": ITEM_CHECK},
+        ]
+        assert stored_item(dynamodb_client, table, other)["x"] == {"S": "y"}
+        assert stored_item(dynamodb_client, table, deep_item) == self.unchanged(deep_item)
+
+    def test_a_transaction_member_past_the_limit_cancels_the_transaction(
+        self, dynamodb_client, table, deep_item
+    ):
+        other = self.fresh(dynamodb_client, table)
+        statements = [self.x_set(table, other), self.deep_set(table, deep_item, 2)]
+        assert cancellation(dynamodb_client, statements) == [{"Code": "None"}, ITEM_REASON]
+        assert stored_item(dynamodb_client, table, other) == self.unchanged(other)
+        assert stored_item(dynamodb_client, table, deep_item) == self.unchanged(deep_item)
+
+    @pytest.mark.parametrize("big_first", [True, False], ids=["big_first", "deep_first"])
+    def test_a_large_parameter_beside_the_deep_set_meets_the_item_check(
+        self, dynamodb_client, table, deep_item, big_first
+    ):
+        assert (
+            validation_message(
+                lambda: self.set_big_beside(dynamodb_client, table, deep_item, 30, big_first)
+            )
+            == ITEM_CHECK
+        )
+        assert stored_item(dynamodb_client, table, deep_item) == self.unchanged(deep_item)
+
+    @refused_for_size_on_default_backends_only
+    def test_the_large_parameter_beside_a_set_at_28_keys_is_refused_for_its_size(
+        self, dynamodb_client, table, deep_item
+    ):
+        # The control for the test above: m keeps 30 maps, so only the size of
+        # the updated item is past a limit.
+        assert (
+            validation_message(
+                lambda: self.set_big_beside(dynamodb_client, table, deep_item, 28, True)
+            )
+            == SIZE_TO_UPDATE
+        )
+        assert stored_item(dynamodb_client, table, deep_item) == self.unchanged(deep_item)
 
 
 class TestPartiqlDeleteAndSelect:
