@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 6's read of `access_keys` when its `$group` state is larger
+//! Migration 10's read of `access_keys` when its `$group` state is larger
 //! than the server's memory limit for `$group`. The test lowers the limits
 //! of the classic and the slot-based engine to 100 KB and sets them back at
 //! the end. They are the server's, so the test is alone in its binary: the
@@ -12,7 +12,7 @@
 mod migrations_support;
 
 use bson::{Bson, Document, doc};
-use extenddb_storage::migrations::CatalogStatus;
+use extenddb_storage::migrations::{CatalogStatus, MigrationId};
 use futures::{FutureExt, TryStreamExt};
 use migrations_support::{Deployment, fixture, server};
 
@@ -90,12 +90,12 @@ fn check_not_left_lowered(values: &[Bson]) {
 }
 
 /// 3,000 keys, and a second copy of 20 of them for the same user: migration
-/// 6's `$group` holds more than 100 KB, and its read spills. The migration
+/// 10's `$group` holds more than 100 KB, and its read spills. The migration
 /// applies, and each of the 20 IDs keeps the copy a lookup read.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_6_reads_a_collection_whose_group_spills_to_disk() {
+async fn migration_10_reads_a_collection_whose_group_spills_to_disk() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "spill6").await;
+    let d = Deployment::new(&uri, "spill10").await;
     let saved = limits(&d.client).await;
     check_not_left_lowered(&saved);
     fixture::load(&d, &fixture::read("0.1.14")).await;
@@ -156,7 +156,12 @@ async fn migration_6_reads_a_collection_whose_group_spills_to_disk() {
         std::panic::resume_unwind(panic);
     }
 
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     for (i, read) in (0..SHARED).zip(&read_before) {
         let left: Vec<Document> = keys
             .find(doc! { "access_key_id": key_id(i) })
@@ -172,8 +177,8 @@ async fn migration_6_reads_a_collection_whose_group_spills_to_disk() {
         .catalog_ledger()
         .await
         .into_iter()
-        .find(|row| row.id == 6)
-        .expect("migration 6's row")
+        .find(|row| row.id == MigrationId::UniqueAccessKeyIds.number())
+        .expect("migration 10's row")
         .notes;
     assert_eq!(notes.lines().count(), SHARED as usize, "{notes}");
     d.drop_databases().await;

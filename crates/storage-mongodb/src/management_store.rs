@@ -1746,7 +1746,7 @@ impl ManagementStore for MongoCatalogStore {
             })
             .await
             .map_err(|e| {
-                // The unique index on access_key_id (migration 6) refuses a
+                // The unique index on access_key_id (migration 10) refuses a
                 // generated ID that another key holds. PostgreSQL and SQLite
                 // answer the same collision with an internal error.
                 if is_duplicate_key(&e) {

@@ -43,7 +43,7 @@ mod m0005_drop_continuous_backups;
 mod m0006_backup_catalog_index;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0006_unique_access_key_ids;
+mod m0010_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -185,8 +185,8 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             convergent: true,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
-                &m0006_unique_access_key_ids::UniqueAccessKeyIds,
-                m0006_unique_access_key_ids::SOURCE,
+                &m0010_unique_access_key_ids::UniqueAccessKeyIds,
+                m0010_unique_access_key_ids::SOURCE,
             )],
         },
     }
