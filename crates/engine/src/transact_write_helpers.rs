@@ -278,8 +278,9 @@ pub(crate) const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token
 /// `ReturnConsumedCapacity`, so this fingerprint decides its replays too.
 ///
 /// Versions before this change hashed the items alone. A retry replays only
-/// when its fingerprint equals the stored one, and a token expires after 10
-/// minutes, so for 10 minutes after an upgrade or a downgrade:
+/// when its fingerprint equals the stored one. A token stored before an
+/// upgrade or a downgrade therefore answers as follows while the backend
+/// keeps it:
 /// - A token stored for a request with neither field, or with both set to
 ///   `NONE`, has the same fingerprint in both versions. An identical retry
 ///   replays in both directions.
@@ -290,6 +291,9 @@ pub(crate) const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token
 ///   or `SIZE` answers `IdempotentParameterMismatchException` to every retry
 ///   on an earlier version. This includes an identical retry and a retry
 ///   without the field.
+///
+/// PostgreSQL, SQLite and MongoDB keep a token for 10 minutes. Cassandra
+/// keeps it with no expiry.
 ///
 /// The keyed hash prevents an attacker from crafting a
 /// different request body that produces the same fingerprint for a given token.
