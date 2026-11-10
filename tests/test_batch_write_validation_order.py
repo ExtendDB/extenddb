@@ -10,7 +10,8 @@ batch's requests is applied, wherever the faulty request sits: the checks run
 for the whole batch before the first write, so a valid request listed ahead of
 the faulty one is not applied either. A put whose global secondary index key
 has the wrong type or is an empty string is rejected the same way, although
-the reference does not list that fault.
+the reference does not list that fault. When a table's requests hold two
+faults, the service reports the first one in list order.
 
 Each test checks the error code and the message. The messages are the ones
 the service answered to these batches (us-east-1, 2026-11-10, two sends
@@ -114,6 +115,13 @@ def _put_with_a_number_gsi_key(pk: str) -> dict:
 
 def _put_with_an_empty_gsi_key(pk: str) -> dict:
     return _put(pk, g={"S": ""})
+
+
+def _put_with_a_number_table_key(_pk: str) -> dict:
+    """The put of `_put_with_wrong_key_type`, with the key argument that the
+    other faulty puts of a parameter list take. Its partition key is the
+    number 1."""
+    return _put_with_wrong_key_type()
 
 
 def _exists(client, table: str, pk: str) -> bool:
@@ -245,6 +253,49 @@ def test_valid_put_before_a_faulty_gsi_key_is_not_applied(
     code, message = _rejected(
         dynamodb_client,
         {table_with_gsi: [_put(pk, g={"S": "ok"}), faulty_request(faulty_pk)]},
+    )
+
+    assert code == "ValidationException"
+    assert message == expected_message
+    assert not _exists(dynamodb_client, table_with_gsi, pk)
+
+
+# A valid put, then two faulty puts in one table, in both orders. The service
+# answered with the fault of the first faulty put in list order and applied
+# nothing.
+@pytest.mark.parametrize(
+    ("faulty_requests", "expected_message"),
+    [
+        pytest.param(
+            [_put_with_a_number_gsi_key, _put_with_a_number_table_key],
+            GSI_KEY_TYPE_MISMATCH,
+            id="gsi_key_as_a_number_then_table_key_as_a_number",
+        ),
+        pytest.param(
+            [_put_with_a_number_table_key, _put_with_a_number_gsi_key],
+            KEY_MISMATCH,
+            id="table_key_as_a_number_then_gsi_key_as_a_number",
+        ),
+        pytest.param(
+            [_put_with_an_empty_gsi_key, _put_with_a_number_table_key],
+            GSI_KEY_EMPTY,
+            id="empty_gsi_key_then_table_key_as_a_number",
+        ),
+        pytest.param(
+            [_put_with_a_number_table_key, _put_with_an_empty_gsi_key],
+            KEY_MISMATCH,
+            id="table_key_as_a_number_then_empty_gsi_key",
+        ),
+    ],
+)
+def test_two_faulty_puts_report_the_first_in_list_order(
+    dynamodb_client, table_with_gsi, faulty_requests, expected_message
+):
+    pk = f"valid-{uuid.uuid4().hex[:8]}"
+    faulty = [build(f"faulty-{uuid.uuid4().hex[:8]}") for build in faulty_requests]
+
+    code, message = _rejected(
+        dynamodb_client, {table_with_gsi: [_put(pk, g={"S": "ok"}), *faulty]}
     )
 
     assert code == "ValidationException"
