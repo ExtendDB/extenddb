@@ -76,6 +76,14 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         // values are validated afterwards (#618), so the other operations, and
         // UpdateItem's key, would store and look up `0E126` as a key of its own.
         if i32::try_from(explicit_exp).is_err() {
+            // The exponent of the normalized form `0.d * 10^n` is the point
+            // offset plus one, and DynamoDB computes it in 64 bits, where
+            // i64::MAX + 1 wraps to a negative exponent: `0E9223372036854775807`
+            // is an underflow, while `0E9223372036854775806` and
+            // `0.0E9223372036854775807` are overflows.
+            if normalized_exponent_exceeds_i64(point_offset) {
+                return Err(underflow_err());
+            }
             check_magnitude(point_offset)?;
         }
         return Ok("0".to_owned());
@@ -89,10 +97,6 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         return Ok("0".to_owned());
     }
 
-    if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(too_many_digits_err());
-    }
-
     // The exponent for the normalized form:
     // value = all_digits_as_integer * 10^point_offset
     //       = significant_as_integer * 10^point_offset  (leading zeros don't change value)
@@ -101,7 +105,25 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
 
     // Magnitude: the number is sig_trimmed * 10^exp, so its order of magnitude
     // is sig_trimmed.len() - 1 + exp
-    check_magnitude(digit_count(sig_trimmed) - 1 + exp)?;
+    let magnitude_exp = digit_count(sig_trimmed) - 1 + exp;
+
+    // DynamoDB reports an overflow before it counts the digits when the
+    // exponent of the normalized form, the magnitude plus one, is above
+    // i64::MAX. Measured with `1234567890123456789012345678901234567890` as
+    // the digits: `E9223372036854775768` (an order of magnitude of i64::MAX),
+    // `E9223372036854775769` (i64::MAX + 1) and `E9223372036854775807`
+    // (i64::MAX + 39) are overflows, and `E9223372036854775767` is too many
+    // digits. The one-digit `1E9223372036854775807` (i64::MAX) and
+    // `10E9223372036854775807` (i64::MAX + 1) are overflows as well.
+    if normalized_exponent_exceeds_i64(magnitude_exp) {
+        return Err(overflow_err());
+    }
+
+    if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
+        return Err(too_many_digits_err());
+    }
+
+    check_magnitude(magnitude_exp)?;
 
     // The magnitude is in range and `sig_trimmed` has at most 38 digits, so
     // `exp` is between MIN_EXPONENT - 37 and MAX_EXPONENT and fits in an i32.
@@ -123,6 +145,16 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
 fn digit_count(digits: &str) -> i128 {
     // A `usize` always fits in an `i128`.
     i128::try_from(digits.len()).unwrap_or(i128::MAX)
+}
+
+/// Whether the exponent of the normalized form `0.d * 10^n`, which is the
+/// given order of magnitude plus one, is above `i64::MAX`. `DynamoDB` answers
+/// such a nonzero value with an overflow before it counts the digits, and such
+/// a zero with an underflow. Measured with forty digits at orders of magnitude
+/// of `i64::MAX`, `i64::MAX + 1` and `i64::MAX + 39`, with one and two digits
+/// at `i64::MAX` and `i64::MAX + 1`, and with the zero `0E9223372036854775807`.
+fn normalized_exponent_exceeds_i64(magnitude_exp: i128) -> bool {
+    magnitude_exp + 1 > i128::from(i64::MAX)
 }
 
 /// Refuse an order of magnitude outside `DynamoDB`'s supported range.
@@ -514,6 +546,46 @@ mod tests {
             "0.0E-2147483648",
         ] {
             assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
+        }
+    }
+
+    // DynamoDB's answers to the values in the next two tests were measured
+    // with PutItem in us-east-1 on 2026-11-09, each value sent twice with the
+    // same answer both times.
+    const TOO_MANY_DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
+
+    #[test]
+    fn zero_with_exponent_at_i64_max_is_an_underflow() {
+        // The exponent of a zero's normalized form is its point offset plus
+        // one, computed in 64 bits: at i64::MAX the sum wraps to a negative
+        // exponent. A fraction digit lowers the point offset before the sum.
+        assert_refused("0E9223372036854775807", UNDERFLOW);
+        for n in ["0E9223372036854775806", "0.0E9223372036854775807"] {
+            assert_refused(n, OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn magnitude_at_i64_max_is_an_overflow_before_the_digit_count() {
+        // Forty digits with the order of magnitude at i64::MAX: the overflow
+        // is reported before the digits are counted. With the exponent one
+        // lower, the digit count is reported.
+        assert_refused(
+            "1234567890123456789012345678901234567890E9223372036854775768",
+            OVERFLOW,
+        );
+        assert_refused(
+            "1234567890123456789012345678901234567890E9223372036854775767",
+            TOO_MANY_DIGITS,
+        );
+        // The same digits with the order of magnitude at i64::MAX + 1 and at
+        // i64::MAX + 39. Measured on 2026-11-10, each value sent twice with
+        // the same answer both times.
+        for n in [
+            "1234567890123456789012345678901234567890E9223372036854775769",
+            "1234567890123456789012345678901234567890E9223372036854775807",
+        ] {
+            assert_refused(n, OVERFLOW);
         }
     }
 }
