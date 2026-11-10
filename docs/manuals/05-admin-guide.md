@@ -338,7 +338,7 @@ Account IDs must be 12-digit numeric strings (matching AWS format). If `--accoun
 ./target/release/extenddb manage --user admin --password <pw> \
     list-users --account-id 123456789012
 
-# Delete (cascades: removes keys, memberships, tags, policies)
+# Delete (also removes its keys, memberships, tags, policies and boundary)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-user --account-id 123456789012 --user-name alice
 ```
@@ -385,7 +385,7 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
     remove-group-member --account-id 123456789012 \
     --group-name developers --user-name alice
 
-# Delete
+# Delete (also removes its policies and memberships)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-group --account-id 123456789012 --group-name developers
 ```
@@ -413,7 +413,7 @@ Access key prefixes: `AKIAEXTENDDB` (long-lived), `ASIAEXTENDDB` (temporary/Assu
     --caller-arn arn:aws:iam::123456789012:user/alice \
     --session-name test-session
 
-# Delete
+# Delete (also removes its policies, boundary, tags and sessions)
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-role --account-id 123456789012 --role-name data-reader
 ```
@@ -476,7 +476,10 @@ What a trust-policy `Deny` does not do:
 
 ### Policies
 
-Inline policies can be attached to users, groups, and roles:
+Inline policies can be attached to users, groups, and roles. The user, group
+or role must exist: a policy or permissions boundary put on a name with no
+principal is refused with HTTP 404 (`IAM user not found`, `IAM group not found`
+or `IAM role not found`), as IAM answers `NoSuchEntity`.
 
 ```bash
 # User policy

@@ -323,6 +323,46 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: a deleted principal or account leaves nothing behind
+
+**What changed.** Deleting a user, group, role or account now removes
+everything it owns, on every backend:
+
+- A user's access keys, group memberships, tags, inline policies and
+  permissions boundary. Before, SQLite and PostgreSQL kept its inline policies
+  and boundary, and MongoDB and Cassandra kept its boundary and, on MongoDB,
+  its tags.
+- A group's inline policies and memberships. Before, every backend kept its
+  inline policies, and MongoDB and Cassandra kept its memberships.
+- A role's inline policies, boundary, tags and sessions. Before, every backend
+  kept its inline policies and boundary, and MongoDB and Cassandra kept its
+  tags and sessions.
+- On MongoDB and Cassandra, an account's users, groups, roles and all they
+  own. Before, only the account record (and on Cassandra its backups) was
+  removed, and the rest stayed in the catalog.
+
+A user, group or role created later with the same name got what the deleted
+one left, and so its permissions. Now creating a user, group or role also
+removes anything stored under its name, and creating an account on MongoDB or
+Cassandra removes anything stored under its id, so records an earlier release
+left behind are cleared when the name or id is used again. On MongoDB and
+Cassandra a user, access key, session or role of an account that no longer
+exists is treated as unknown.
+
+The management API and the console also refuse an inline policy or
+permissions boundary put on a user, group or role that does not exist, with
+HTTP 404 and `IAM user not found` (or `group`, `role`), where they answered
+204 and stored it under the name. On MongoDB, `create-account` refuses an
+account ID that is already in use with `Account already exists`, as the other
+backends do; before, it created a second account with that ID.
+
+**Who is affected.** A script that attaches a policy or boundary before it
+creates the principal now gets HTTP 404 and must create the principal first.
+A deployment that relied on a deleted principal's policies coming back when it
+was created again must attach them again. No catalog migration is required.
+
+---
+
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 
 **What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` checks the source table and then returns `PointInTimeRecoveryUnavailableException`. Authorization of `RestoreTableToPointInTime` checks the item actions on the target table before the restore action on the source, as the service does, so a caller with no policy is denied naming `dynamodb:Scan` on the target table, where earlier builds named `dynamodb:RestoreTableToPointInTime` on the source table. A table that does not exist is `TableNotFoundException` on all three operations, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.

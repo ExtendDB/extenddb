@@ -848,6 +848,8 @@ Account IDs must be 12-digit numeric strings (matching AWS account ID format):
 
 Accounts with existing tables cannot be deleted. Delete all tables first.
 
+Deleting an account also deletes its users, groups and roles with everything they hold, so their access keys and sessions stop working and its users cannot log in. An account created later with the same ID starts empty.
+
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-account --account-id 123456789012
@@ -874,7 +876,7 @@ A default self-service policy is automatically attached, allowing the user to ma
 
 ### Delete an IAM user
 
-Deleting a user also removes their access keys, group memberships, tags, and policies (via CASCADE).
+Deleting a user also removes its access keys, group memberships, tags, inline policies and permissions boundary. A user created later with the same name starts with only the default `SelfServicePolicy`.
 
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \
@@ -983,6 +985,8 @@ Every import is logged to syslog (access key ID, account, user — never the sec
 
 ### Delete a group
 
+Deleting a group also removes its inline policies and its memberships. A group created later with the same name starts with no policies and no members.
+
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \
     delete-group --account-id 123456789012 --group-name developers
@@ -990,7 +994,7 @@ Every import is logged to syslog (access key ID, account, user — never the sec
 
 ### Put a user policy
 
-Creates or replaces a named policy on an IAM user. The policy document must be valid JSON with `Version` and `Statement` fields.
+Creates or replaces a named policy on an IAM user. The policy document must be valid JSON with `Version` and `Statement` fields. The user must exist; a policy put on a user that does not exist is refused with HTTP 404 `IAM user not found`. The same holds for group and role policies and for permissions boundaries.
 
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \
@@ -1100,6 +1104,8 @@ Creates or replaces a named policy on an IAM user. The policy document must be v
 ```
 
 ### Delete a role
+
+Deleting a role also removes its inline policies, permissions boundary, tags and sessions: credentials issued by `assume-role` stop working. A role created later with the same name starts with none of them.
 
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \
