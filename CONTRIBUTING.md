@@ -82,6 +82,22 @@ cargo clippy -- -W clippy::pedantic -W clippy::unwrap_used -W clippy::expect_use
 - Address all clippy warnings or add `#[allow(...)]` with a justification comment.
 - Avoid `.unwrap()` and `.expect()` in library crates — use `?` or explicit error handling.
 
+### Dependencies between workspace crates
+
+A crate depends on another workspace crate with `{ workspace = true }`. The
+root `[workspace.dependencies]` pins each workspace crate to the workspace
+version exactly (`=X.Y.Z`), because the crates publish to crates.io together
+([ADR-0029](docs/adr/0029-crates-io-packaging.md)). Declare a dev-dependency
+on a workspace crate by path with no version, for example
+`extenddb-storage = { path = "../storage", features = ["test-util"] }`, so
+that cargo drops it from the published manifest. The `package` job of the
+Test workflow checks both rules. To run the same check locally, on a tree
+with uncommitted changes too (the script needs Python 3.11 or later):
+
+```bash
+cargo package --workspace --no-verify --locked --allow-dirty && devtools/check-crate-packages
+```
+
 ## When you need an ADR or an RFC
 
 ExtendDB uses two lightweight processes to keep core decisions reviewable:

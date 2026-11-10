@@ -1,7 +1,12 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
-resolver = "2"
+# Resolver 3 prefers dependency versions whose rust-version fits ours. The
+# published crates use it too. (With resolver 2, cargo writes
+# `resolver = "2"` into each of them.) Without `--locked`, `cargo install`
+# then resolves for Rust 1.88 and does not fail on a dependency that needs a
+# newer Rust.
+resolver = "3"
 members = [
     "crates/core",
     "crates/cache",
@@ -24,22 +29,32 @@ version = "0.1.14"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+repository = "https://github.com/ExtendDB/extenddb"
+homepage = "https://extenddb.org/"
 
 [workspace.dependencies]
-# Internal crates
-extenddb-core = { path = "crates/core" }
-extenddb-cache = { path = "crates/cache" }
-extenddb-backup-store = { path = "crates/backup-store" }
-extenddb-engine = { path = "crates/engine" }
-extenddb-storage = { path = "crates/storage" }
-extenddb-config = { path = "crates/config" }
-extenddb-storage-cassandra = { path = "crates/storage-cassandra" }
-extenddb-storage-mongodb = { path = "crates/storage-mongodb" }
-extenddb-storage-postgres = { path = "crates/storage-postgres" }
-extenddb-storage-sqlite = { path = "crates/storage-sqlite" }
-extenddb-auth = { path = "crates/auth" }
-extenddb-server = { path = "crates/server" }
-extenddb-app = { path = "crates/app" }
+# Internal crates. crates.io needs a version on each of them. Each version is
+# an exact pin to the workspace version, because the crates change their APIs
+# between patch releases. A crate of one release must never resolve against a
+# crate of another. A release bump changes each pin together with `version`
+# above. A pin left at the old version makes every cargo command that
+# resolves dependencies fail, and `devtools/check-crate-packages` fails on a
+# pin that is not exact.
+# Internal dev-dependencies are declared by path in each crate instead, with
+# no version, so that cargo drops them from the published manifests.
+extenddb-core = { path = "crates/core", version = "=0.1.14" }
+extenddb-cache = { path = "crates/cache", version = "=0.1.14" }
+extenddb-backup-store = { path = "crates/backup-store", version = "=0.1.14" }
+extenddb-engine = { path = "crates/engine", version = "=0.1.14" }
+extenddb-storage = { path = "crates/storage", version = "=0.1.14" }
+extenddb-config = { path = "crates/config", version = "=0.1.14" }
+extenddb-storage-cassandra = { path = "crates/storage-cassandra", version = "=0.1.14" }
+extenddb-storage-mongodb = { path = "crates/storage-mongodb", version = "=0.1.14" }
+extenddb-storage-postgres = { path = "crates/storage-postgres", version = "=0.1.14" }
+extenddb-storage-sqlite = { path = "crates/storage-sqlite", version = "=0.1.14" }
+extenddb-auth = { path = "crates/auth", version = "=0.1.14" }
+extenddb-server = { path = "crates/server", version = "=0.1.14" }
+extenddb-app = { path = "crates/app", version = "=0.1.14" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -70,7 +85,13 @@ urlencoding = { version = "2.1" }
 moka = { version = "0.12", features = ["future"] }
 
 # Database
-cdrs-tokio = { version = "9.0", features = ["derive"] }
+# cdrs-tokio stays on 9.0.x and cassandra-protocol on 4.0.x. cassandra-protocol
+# 4.1.0 moved its public BigInt to num-bigint 0.5, while bigdecimal 0.4 uses
+# num-bigint 0.4. extenddb-storage-cassandra then fails to compile. The pins
+# keep a fresh resolution, such as `cargo install` without `--locked`, on
+# versions that build.
+cdrs-tokio = { version = "~9.0.2", features = ["derive"] }
+cassandra-protocol = "~4.0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "json", "time", "uuid", "bigdecimal", "derive"] }
 # SQLite's C API, for the online backup API that sqlx does not expose. The
 # version is the one sqlx-sqlite depends on: the crate declares

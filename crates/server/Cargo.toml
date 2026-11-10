@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "HTTP layer of the ExtendDB server, which serves the DynamoDB wire protocol. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 mongodb-test-hooks = []
@@ -60,11 +63,11 @@ syslog-tracing = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-extenddb-cache = { workspace = true, features = ["test-util"] }
+extenddb-cache = { path = "../cache", features = ["test-util"] }
 # The login tests count bcrypt checks with `count_verifications` against an
 # in-memory SQLite catalog.
-extenddb-storage = { workspace = true, features = ["test-util"] }
-extenddb-storage-sqlite = { workspace = true }
+extenddb-storage = { path = "../storage", features = ["test-util"] }
+extenddb-storage-sqlite = { path = "../storage-sqlite" }
 sqlx = { workspace = true, features = ["sqlite"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
