@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
+hyper-util = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -66,5 +67,7 @@ extenddb-cache = { workspace = true, features = ["test-util"] }
 extenddb-storage = { workspace = true, features = ["test-util"] }
 extenddb-storage-sqlite = { workspace = true }
 sqlx = { workspace = true, features = ["sqlite"] }
+# Self-signed certificates for the TLS listener tests.
+rcgen = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

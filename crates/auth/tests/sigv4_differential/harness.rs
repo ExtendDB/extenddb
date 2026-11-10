@@ -21,6 +21,11 @@ use extenddb_core::error::DynamoDbError;
 
 use crate::capture;
 
+/// The region the server `authenticate` runs is deployed as. The server
+/// refuses a request whose credential scope names another region, as the
+/// service refuses a scope for a region other than the endpoint's.
+pub const SERVER_REGION: &str = "us-east-1";
+
 /// The account both keys belong to.
 const ACCOUNT_ID: &str = "123456789012";
 const USER_NAME: &str = "differential-user";
@@ -425,9 +430,10 @@ impl Authorization {
     }
 }
 
-/// The authentication call the HTTP layer makes for a DynamoDB request.
+/// The authentication call the HTTP layer makes for a DynamoDB request, on a
+/// server deployed as `SERVER_REGION`.
 pub fn authenticate(wire: &Wire) -> Result<AuthIdentity, DynamoDbError> {
-    let provider = BuiltinAuthProvider::new(MemoryStore);
+    let provider = BuiltinAuthProvider::new(MemoryStore, SERVER_REGION);
     futures::executor::block_on(provider.authenticate(&wire.header_map(), &wire.body))
 }
 
@@ -453,8 +459,9 @@ pub enum Refusal {
     /// `InvalidSignatureException`: the signature, the credential scope or a
     /// signed part does not match.
     Signature,
-    /// `UnrecognizedClientException`: the session token is missing or is not
-    /// the key's, or `X-Amz-Date` is outside the skew window (#805).
+    /// `UnrecognizedClientException`: the session token is missing, is not
+    /// the key's or is sent with a long-term key, or `X-Amz-Date` is outside
+    /// the skew window (#805).
     Client,
     /// `IncompleteSignature`: a part the check needs is missing.
     Incomplete,
@@ -471,21 +478,60 @@ impl Refusal {
     }
 }
 
-// The start of the message each check refuses with. Checks that return the
-// same error are told apart by their messages.
+// The message each check refuses with, or its start. Checks that return the
+// same error are told apart by their messages; `Message` says how a test
+// compares each one.
 
 /// The signature differs from the one the server computes.
 pub const SIGNATURE_MISMATCH: &str =
     "The request signature we calculated does not match the signature you provided.";
+/// The credential scope names a region other than `SERVER_REGION`. The
+/// server checks the scope's region and service together, before it looks
+/// the key up or compares the signature, and reports each complaint as a
+/// sentence ending with a space, region first; the message does not name
+/// the region.
+pub const WRONG_REGION: &str = "Credential should be scoped to a valid region. ";
 /// The credential scope names a service other than `dynamodb`.
 pub const WRONG_SERVICE: &str = "Credential should be scoped to correct service: 'dynamodb'.";
 /// The credential scope's date differs from the date in `X-Amz-Date`.
 pub const SCOPE_DATE_MISMATCH: &str =
     "Date in Credential scope does not match YYYYMMDD from ISO-8601 version of date from HTTP";
-/// The session token is missing or is not the key's.
+/// The session key's token is missing. The server answers the same message
+/// for a key the store does not hold or holds inactive.
 pub const INVALID_TOKEN: &str = "The security token included in the request is invalid.";
+/// A token is sent that is not the key's: another token with the session
+/// key, or any token with the long-term key. The server reports it after the
+/// signature is compared, with the same words as `INVALID_TOKEN` and no
+/// trailing period, as the service does. This text is the start of
+/// `INVALID_TOKEN`, so a test that expects either message compares the whole
+/// message, with `Message::Exact`.
+pub const WRONG_TOKEN: &str = "The security token included in the request is invalid";
 /// `X-Amz-Date` is missing.
 pub const MISSING_DATE: &str = "Authorization header requires existence of 'X-Amz-Date' header";
+
+/// How a test compares the message the server refused with against the one
+/// it expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// The whole message. Used where the expected text is also the start of
+    /// another answer, so a prefix comparison would accept both: `WRONG_TOKEN`
+    /// starts `INVALID_TOKEN`, and `WRONG_REGION` starts the answer for a
+    /// scope wrong in both its region and its service.
+    Exact(&'static str),
+    /// The start of the message, which names the check that refused the
+    /// request. The rest of the message carries details the test does not
+    /// pin.
+    Prefix(&'static str),
+}
+
+impl Message {
+    pub fn matches(self, message: &str) -> bool {
+        match self {
+            Self::Exact(expected) => message == expected,
+            Self::Prefix(expected) => message.starts_with(expected),
+        }
+    }
+}
 
 fn is_principal_of(identity: &AuthIdentity, key: Key) -> bool {
     match (identity, key) {
@@ -544,18 +590,16 @@ pub fn check_accepted_as(signed: &Signed, wire: &Wire) -> Result<(), String> {
 }
 
 /// Check that the server refuses `wire` with the error `expected` names and a
-/// message starting with `message`, which names the check that refused it.
-pub fn check_refused(wire: &Wire, expected: Refusal, message: &str) -> Result<(), String> {
+/// message `message` matches, which names the check that refused it.
+pub fn check_refused(wire: &Wire, expected: Refusal, message: Message) -> Result<(), String> {
     match authenticate(wire) {
         Ok(identity) => Err(format!(
-            "verified as {identity:?}, expected {expected:?} starting {message:?}\nheaders: {:?}",
+            "verified as {identity:?}, expected {expected:?} with {message:?}\nheaders: {:?}",
             wire.headers
         )),
-        Err(err) if Refusal::of(&err) == Some(expected) && err.message().starts_with(message) => {
-            Ok(())
-        }
+        Err(err) if Refusal::of(&err) == Some(expected) && message.matches(err.message()) => Ok(()),
         Err(err) => Err(format!(
-            "refused with {err:?}, expected {expected:?} starting {message:?}"
+            "refused with {err:?}, expected {expected:?} with {message:?}"
         )),
     }
 }
