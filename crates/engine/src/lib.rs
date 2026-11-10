@@ -8,6 +8,12 @@
 //! `DynamoDB`-format error responses.
 
 mod backup;
+pub use backup::{
+    BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
+    OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
+    StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
+    check_configured_store, maintenance, read_identity_bounded, reconciler, store_identity,
+};
 mod batch_get_item;
 mod batch_write_item;
 pub mod capacity_helpers;
@@ -20,17 +26,22 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
+mod item_authorizer;
 mod legacy_filter;
 mod list_tables;
+#[cfg(feature = "partiql")]
+mod partiql;
 mod put_item;
 mod query;
 mod read_helpers;
 mod request_limits;
 mod scan;
 mod search_vectors;
+mod start_key;
 pub mod stream_capture;
 mod streams;
 mod tagging;
@@ -41,6 +52,9 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
+#[cfg(feature = "partiql")]
+use partiql::PartiqlExecutor;
 
 pub use batch_get_item::handle_batch_get_item;
 pub use batch_write_item::handle_batch_write_item;
@@ -53,6 +67,7 @@ pub use describe_limits::handle_describe_limits;
 pub use describe_table::handle_describe_table;
 pub use get_item::handle_get_item;
 pub use import_export::{handle_export_table, handle_import_table};
+pub use item_authorizer::{ItemAccess, ItemAuthorization, ItemAuthorizer};
 pub use list_tables::handle_list_tables;
 pub use put_item::handle_put_item;
 pub use query::handle_query;
@@ -124,7 +139,23 @@ pub fn is_known_operation(operation: &str) -> bool {
             | "DescribeContinuousBackups"
             | "UpdateContinuousBackups"
             | "RestoreTableToPointInTime"
+    ) || is_known_partiql_operation(operation)
+}
+
+/// PartiQL operations, known only when the `partiql` feature is on. With the
+/// feature off this is always false, so the server answers them with
+/// `UnknownOperationException`.
+#[cfg(feature = "partiql")]
+fn is_known_partiql_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
     )
+}
+
+#[cfg(not(feature = "partiql"))]
+fn is_known_partiql_operation(_operation: &str) -> bool {
+    false
 }
 use serde::Serialize;
 
@@ -341,6 +372,9 @@ pub type AuthorizedKeyInfo = std::collections::HashMap<String, Option<TableKeyIn
 /// the discussion file and principal reviewer approval.
 pub struct OperationContext {
     pub storage: Arc<dyn extenddb_storage::StorageEngine>,
+    /// The process's job slots and configured backup store, which the backup
+    /// operations read.
+    pub backup: Arc<BackupRuntime>,
     pub limits: Arc<LimitsConfig>,
     pub region: Arc<str>,
     pub account_id: Arc<str>,
@@ -365,6 +399,10 @@ pub struct OperationContext {
     /// read. When unset (e.g. unit tests), the engine falls back to direct
     /// storage lookups.
     pub table_key_info_lookup: Option<Arc<dyn extenddb_storage::TableKeyInfoLookup>>,
+    /// Authorizes the item reads and writes a request names inside its body
+    /// (the statements of the PartiQL operations), which the server does not
+    /// authorize before dispatch. `None` refuses every such read and write.
+    pub item_authorizer: Option<Arc<dyn ItemAuthorizer>>,
 }
 
 impl OperationContext {
@@ -524,6 +562,12 @@ pub async fn dispatch(
         "RestoreTableToPointInTime" => backup::handle_restore_table_to_point_in_time(body, ctx)
             .await
             .map(DispatchResult::body_only),
+        #[cfg(feature = "partiql")]
+        "ExecuteStatement" => ctx.execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "BatchExecuteStatement" => ctx.batch_execute_statement(body).await,
+        #[cfg(feature = "partiql")]
+        "ExecuteTransaction" => ctx.execute_transaction(body).await,
         _ => Err(DynamoDbError::UnknownOperationException(String::new())),
     }
 }

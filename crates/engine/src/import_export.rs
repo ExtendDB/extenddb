@@ -139,7 +139,11 @@ pub async fn handle_import_table(
             error_count += 1;
             continue;
         }
-        if let Err(e) = validate_attribute_name_sizes(&item, &ctx.limits) {
+        if let Err(e) = validate_attribute_name_sizes(
+            &item,
+            &ctx.limits,
+            extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+        ) {
             tracing::warn!(error = %e, "import: skipping item with oversized attribute name");
             error_count += 1;
             continue;
@@ -347,7 +351,18 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         // member; nothing to resolve.
         table_throughput_mode: None,
         provisioned_throughput: tcp.provisioned_throughput.clone(),
-        global_secondary_indexes: tcp.global_secondary_indexes.clone(),
+        // TableCreationParameters has no table-level WarmThroughput, and an
+        // imported index's is cleared the same way: ImportTable does not run
+        // CreateTable's validation, so a value kept here would be stored
+        // unchecked. Imported tables and indexes report the defaults.
+        global_secondary_indexes: tcp.global_secondary_indexes.clone().map(|gsis| {
+            gsis.into_iter()
+                .map(|gsi| extenddb_core::types::GsiInput {
+                    warm_throughput: None,
+                    ..gsi
+                })
+                .collect()
+        }),
         local_secondary_indexes: None,
         vector_indexes: None,
         stream_specification: None,
@@ -356,6 +371,7 @@ fn create_table_input_from_params(tcp: &TableCreationParameters) -> CreateTableI
         deletion_protection_enabled: None,
         table_class: None,
         on_demand_throughput: None,
+        warm_throughput: None,
     }
 }
 
@@ -395,7 +411,11 @@ async fn wait_for_table_active(
 /// the service's message (measured live, `live-r2/arn-kinds-live.json`). An
 /// unparseable `TableArn` is refused earlier, before authorization, by
 /// `authz_resource::validate_operation_arns`.
-fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
+///
+/// `RestoreTableToPointInTime` reads its `SourceTableArn` through this too,
+/// with no check before authorization: an index ARN there is refused here
+/// with the same message (measured on DynamoDB).
+pub(crate) fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {
             table, sub: None, ..
@@ -452,5 +472,41 @@ mod export_arn_tests {
                 other => panic!("expected ValidationException for {arn}, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod import_warm_throughput_tests {
+    use super::*;
+
+    /// An imported index's WarmThroughput is not stored, as the table's is
+    /// not: a value CreateTable refuses (-7) cannot reach the catalog.
+    #[test]
+    fn an_imported_gsi_warm_throughput_is_cleared() {
+        let tcp: TableCreationParameters = serde_json::from_value(serde_json::json!({
+            "TableName": "t",
+            "AttributeDefinitions": [
+                { "AttributeName": "pk", "AttributeType": "S" },
+                { "AttributeName": "g", "AttributeType": "S" }
+            ],
+            "KeySchema": [{ "AttributeName": "pk", "KeyType": "HASH" }],
+            "BillingMode": "PROVISIONED",
+            "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "gsi",
+                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
+                "Projection": { "ProjectionType": "ALL" },
+                "ProvisionedThroughput": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
+                "WarmThroughput": { "ReadUnitsPerSecond": -7, "WriteUnitsPerSecond": 0 }
+            }]
+        }))
+        .expect("parameters");
+        let input = create_table_input_from_params(&tcp);
+        assert_eq!(input.warm_throughput, None);
+        let gsis = input.global_secondary_indexes.expect("the index is kept");
+        assert_eq!(gsis.len(), 1);
+        assert_eq!(gsis[0].index_name, "gsi");
+        assert_eq!(gsis[0].warm_throughput, None);
+        assert!(gsis[0].provisioned_throughput.is_some());
     }
 }

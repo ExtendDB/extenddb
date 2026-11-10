@@ -94,9 +94,11 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         );
     }
 
-    // Validate backend is supported and get catalog version (fail fast before binding port)
+    // Fail fast, before binding the port, when no backend is installed.
     let backend = &app_config.storage.backend;
-    let catalog_version = extenddb_storage::operations::catalog_version()?;
+    extenddb_storage::backend_name()
+        .ok_or_else(|| anyhow::anyhow!("no storage backend installed"))?;
+    let catalog_version = extenddb_storage::migrations::binary_catalog_label();
 
     let port = args.port.unwrap_or(app_config.server.port);
 
@@ -172,6 +174,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         backend,
         config::redact_password(app_config.storage.connection_config()),
     );
+    let banner_line3 = format!(
+        "  {}",
+        extenddb_server::backup_store::banner_line(
+            &app_config.backup,
+            app_config.storage.database_file().as_deref(),
+        )
+    );
     let mut warnings = app_config.storage.startup_warnings();
     warnings.extend(app_config.server.startup_warnings());
     let startup_warnings = render_startup_warnings(&warnings);
@@ -179,11 +188,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         eprint!("{wordmark}");
         eprintln!("{banner_line1}");
         eprintln!("{banner_line2}");
+        eprintln!("{banner_line3}");
         eprint!("{startup_warnings}");
     } else {
         print!("{wordmark}");
         println!("{banner_line1}");
         println!("{banner_line2}");
+        println!("{banner_line3}");
         print!("{startup_warnings}");
     }
     if cfg!(feature = "dev-mode") {
@@ -263,18 +274,40 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         }
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let mut params = ServeParams::new(app_config, std_listener, pid_file, build)
+        .with_log_target(if args.foreground {
+            LogTarget::Stderr
+        } else {
+            LogTarget::Syslog
+        })
+        .with_dev_mode(cfg!(feature = "dev-mode"));
+    if config_exists {
+        params = params.with_config_path(&args.config);
+    }
+    // The runtime is ended with a bound (`run_then_shut_down`): a backup
+    // store check abandoned on a mount that has stopped answering leaves a
+    // blocking thread parked there, and a plain drop of the runtime would
+    // join it, holding the process open after the drain until SIGKILL.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(extenddb_server::serve(
-            ServeParams::new(app_config, std_listener, pid_file, build)
-                .with_log_target(if args.foreground {
-                    LogTarget::Stderr
-                } else {
-                    LogTarget::Syslog
-                })
-                .with_dev_mode(cfg!(feature = "dev-mode")),
-        ))
+        .build()?;
+    let result = crate::run_then_shut_down(runtime, extenddb_server::serve(params));
+    // `serve` has printed the refusal; end with its code, which `migrate`
+    // and `verify` use for the same status.
+    if let Err(e) = &result
+        && let Some(refusal) = e.downcast_ref::<extenddb_server::CatalogRefusal>()
+    {
+        std::process::exit(i32::from(refusal.exit_code));
+    }
+    // `serve` stopped through its shutdown path, which removed the PID file,
+    // and has logged why.
+    if let Err(e) = &result
+        && e.downcast_ref::<extenddb_server::RegistrationLost>()
+            .is_some()
+    {
+        std::process::exit(1);
+    }
+    result
 }
 
 /// The five wordmark rows (figlet slant), without trailing newlines.

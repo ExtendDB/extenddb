@@ -77,6 +77,26 @@ store's callers honour; this README is the record of what the store does.
 - `put` returns the stored object's metadata (bytes written and, on S3, the
   ETag with quotes stripped; a multipart ETag is not an MD5) so a manifest
   can be written from the put alone.
+- `put_if_absent` creates the object only if no object is under the key and
+  returns `None`, leaving the existing object untouched, if one is; of two
+  concurrent calls on one key exactly one stores its body. The filesystem
+  store writes and syncs its temporary as `put` does (created
+  `O_CREAT | O_EXCL`) and then `link`s it to the key, which fails if
+  anything is there, so the object appears complete or not at all; the root
+  must therefore be on a filesystem that supports hard links (some CIFS and
+  FUSE mounts do not, and the call fails there with `EPERM`, which the
+  server reports as the store having failed validation, with the `link`
+  error in the log line). The S3
+  store sends `PutObject` (or `CompleteMultipartUpload` for a body over one
+  part) with `If-None-Match: *`: a 412 is the key present, and a 409
+  `ConditionalRequestConflict` from a concurrent conditional write is
+  re-sent after a short back-off, up to eight times. An S3-compatible
+  server that ignores `If-None-Match` on `PutObject` turns the call into a
+  plain put, last writer wins; moto 5.2 honours it (the conformance suite's
+  race cell checks that exactly one of eight concurrent callers stores its
+  body), other servers have not been run. The caller that depends on the
+  guarantee re-reads the object after its call and compares, which is what
+  catches a server that lost the race silently.
 - The S3 store takes credentials from the AWS SDK's default chain (the
   `s3` module doc names its members, among them `credential_process`,
   which runs a command named in the shared config file, and the SSO
