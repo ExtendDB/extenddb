@@ -634,16 +634,11 @@ impl ManagementStore for MongoCatalogStore {
                     OpError::Internal("Database error".to_owned())
                 })?;
 
-            let Some(user_doc) = doc else {
-                return Ok(false);
-            };
-
-            let Some(hash) = user_doc.get_str("password_hash").ok() else {
-                return Ok(false);
-            };
-
-            let hash = hash.to_owned();
-            extenddb_storage::password::verify_password(password, hash).await
+            // `None` when the user is absent or has no console password, which
+            // still runs one bcrypt check (see `verify_stored_password`), as a
+            // wrong password does.
+            let hash = doc.and_then(|d| d.get_str("password_hash").ok().map(str::to_owned));
+            extenddb_storage::password::verify_stored_password(password, hash).await
         })
     }
 

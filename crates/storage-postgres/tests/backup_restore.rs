@@ -57,6 +57,8 @@ struct Scratch {
     db: PgPool,
     catalog: PgPool,
     admin: PgPool,
+    /// The catalog's URL, for a second engine on the same catalog.
+    catalog_url: String,
     db_names: [String; 2],
     _guard: DbGuard,
     _serial: tokio::sync::MutexGuard<'static, ()>,
@@ -216,7 +218,7 @@ async fn scratch_with_pool(pool_size: u32) -> Scratch {
     }
     let engine = PostgresEngine::new(
         &PostgresConfig {
-            connection_string: catalog_url,
+            connection_string: catalog_url.clone(),
             pool_size,
             max_item_size_bytes: 400_000,
         },
@@ -229,6 +231,7 @@ async fn scratch_with_pool(pool_size: u32) -> Scratch {
         db,
         catalog,
         admin,
+        catalog_url,
         db_names: [catalog_name, data_name],
         _guard: guard,
         _serial: serial,
@@ -718,6 +721,14 @@ async fn indexed_source_with(s: &Scratch, name: &str, items: usize) -> String {
         .create_table(ACCOUNT, input)
         .await
         .expect("create the source table");
+    put_indexed_items(s, name, &desc, items).await;
+    desc.table_id
+}
+
+/// Write `items` items through PutItem into the table `indexed_source`
+/// created (`desc` its description): every item has `pk` and `sk`, every
+/// second one `g` (the GSI's key), every third one `l` (the LSI's).
+async fn put_indexed_items(s: &Scratch, name: &str, desc: &TableDescription, items: usize) {
     let key_info = TableKeyInfo {
         table_name: name.to_owned(),
         account_id: ACCOUNT.to_owned(),
@@ -749,7 +760,6 @@ async fn indexed_source_with(s: &Scratch, name: &str, items: usize) -> String {
             .await
             .expect("put");
     }
-    desc.table_id
 }
 
 /// `(index_name, index_id)` of a table's secondary indexes, by name.
@@ -2722,18 +2732,28 @@ async fn a_definition_read_that_loses_its_connection_is_transient() {
 
 // --- the catalog index -----------------------------------------------------------
 
+/// A catalog row for a backup of `table` in `account` minted now, with the
+/// manifest fixture's source table, in the `catalog_index` module's store.
+fn catalog_index_row(
+    account: &str,
+    table: &str,
+    name: &str,
+) -> extenddb_storage::backup_catalog::BackupRow {
+    catalog_index::row(account, table, name)
+}
+
 mod catalog_index {
     use extenddb_core::backup_format::BackupArn;
     use extenddb_storage::BackupCatalog;
     use extenddb_storage::backup_catalog::{
-        BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreTargetKey, StatusFields,
-        StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
+        BackupRow, BackupStatus, DeleteStart, Heartbeat, JobStatus, RestoreTargetKey, StaleClock,
+        StatusFields, StoreIdentity, StoreKind, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
     };
     use futures::TryStreamExt;
 
     use super::*;
 
-    fn store() -> StoreIdentity {
+    pub(super) fn store() -> StoreIdentity {
         StoreIdentity {
             store_kind: StoreKind::Filesystem,
             store_root: "/var/lib/extenddb/backups".to_owned(),
@@ -2743,7 +2763,7 @@ mod catalog_index {
 
     /// A row for a backup of `table` in `account` minted now, with the
     /// manifest fixture's source table.
-    fn row(account: &str, table: &str, name: &str) -> BackupRow {
+    pub(super) fn row(account: &str, table: &str, name: &str) -> BackupRow {
         let backup_id = extenddb_storage::util::new_backup_id();
         let backup_arn = extenddb_storage::util::backup_arn(REGION, account, table, &backup_id);
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
@@ -2790,7 +2810,12 @@ mod catalog_index {
             uuid::Uuid::parse_str(&s.engine.catalog_id().await.expect("id")).is_ok(),
             "the catalog has an id from the migration"
         );
-        assert!(!s.engine.check_maintenance_claim().await.expect("check"));
+        assert!(
+            !s.engine
+                .check_maintenance_claim(std::time::Duration::from_secs(300))
+                .await
+                .expect("check")
+        );
         let row = row(ACCOUNT, "Music", "nightly");
         assert_eq!(backup_lock_holder(&s, &row.backup_id).await, None);
         let claim = s.engine.claim_backup(&row).await.expect("claim");
@@ -2873,6 +2898,7 @@ mod catalog_index {
             size_bytes: Some(1234),
             item_count: Some(5),
             failure_reason: None,
+            source_table_details_json: None,
             completed: true,
         };
         assert_eq!(
@@ -2970,6 +2996,29 @@ mod catalog_index {
             );
             return;
         }
+        waits_for_the_row_lock_and_then_sees_the_registration(false).await;
+    }
+
+    /// `forget_available_backup_row` runs under the same lock: the outright
+    /// removal waits in the `SELECT ... FOR UPDATE` while a registration
+    /// holds the row, then answers `InUse` and leaves the row AVAILABLE.
+    /// Without the lock it would wait in its `DELETE` instead, and then
+    /// remove the row the committed registration reads.
+    #[tokio::test]
+    async fn forget_available_backup_row_waits_for_the_row_lock_and_then_sees_the_registration() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP forget_available_backup_row_waits_for_the_row_lock_and_then_sees_the_registration: no PostgreSQL"
+            );
+            return;
+        }
+        waits_for_the_row_lock_and_then_sees_the_registration(true).await;
+    }
+
+    /// The two cells above: `start_backup_delete`, or with `remove`
+    /// `forget_available_backup_row`, against a registration holding the
+    /// row's lock.
+    async fn waits_for_the_row_lock_and_then_sees_the_registration(remove: bool) {
         let s = scratch().await;
         let row = row(ACCOUNT, "Music", "nightly");
         let key = row.key();
@@ -3023,7 +3072,24 @@ mod catalog_index {
         let engine = s.engine.clone();
         let deleting = tokio::spawn(async move {
             let key = key;
-            engine.start_backup_delete(&key).await
+            if remove {
+                engine
+                    .forget_available_backup_row(&key)
+                    .await
+                    .map(|answer| match answer {
+                        extenddb_storage::backup_catalog::ForgetRow::Removed => {
+                            DeleteStart::Deleting
+                        }
+                        extenddb_storage::backup_catalog::ForgetRow::InUse(table) => {
+                            DeleteStart::InUse(table)
+                        }
+                        extenddb_storage::backup_catalog::ForgetRow::Status(status) => {
+                            DeleteStart::Status(status)
+                        }
+                    })
+            } else {
+                engine.start_backup_delete(&key).await
+            }
         });
         // The delete is waiting on the registration's transaction, in its
         // `SELECT ... FOR UPDATE` (scoped to this database and that statement:
@@ -3044,7 +3110,7 @@ mod catalog_index {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "start_backup_delete did not wait for the row lock"
+                "the delete step (remove: {remove}) did not wait for the row lock"
             );
             assert!(
                 !deleting.is_finished(),
@@ -3064,7 +3130,7 @@ mod catalog_index {
             .await
             .expect("the delete finishes once the lock is released")
             .expect("task")
-            .expect("start_backup_delete");
+            .expect("the delete step");
         assert_eq!(answer, DeleteStart::InUse("lk_target".to_owned()));
         assert_eq!(
             s.engine
@@ -3468,6 +3534,11 @@ mod catalog_index {
             DeleteStart::InUse("del_target".to_owned())
         );
         assert_eq!(
+            s.engine.forget_available_backup_row(&key).await.unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+            "the outright removal keeps the in-use rule"
+        );
+        assert_eq!(
             s.engine
                 .read_backup_row(&arn_of(&row))
                 .await
@@ -3493,6 +3564,57 @@ mod catalog_index {
             DeleteStart::Status(BackupStatus::Deleting),
             "a retry finds the row DELETING"
         );
+        assert_eq!(
+            s.engine.forget_available_backup_row(&key).await.unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+            "only an AVAILABLE row is removed outright"
+        );
+        // An AVAILABLE row goes outright, read and listed nowhere, with no
+        // tombstone; a second removal finds no row.
+        let mut adopted = catalog_index_row(ACCOUNT, "Music", "adopted");
+        adopted.status = BackupStatus::Available;
+        assert!(s.engine.insert_backup_row(&adopted).await.expect("insert"));
+        assert_eq!(
+            s.engine
+                .forget_available_backup_row(&adopted.key())
+                .await
+                .unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::Removed
+        );
+        assert!(
+            s.engine
+                .read_backup_row(&arn_of(&adopted))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for status in [None, Some(BackupStatus::Available)] {
+            let listed: Vec<BackupRow> = s
+                .engine
+                .list_backup_rows(status, &adopted.store)
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+                "{status:?}"
+            );
+        }
+        let by_account: Vec<BackupRow> = s
+            .engine
+            .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !by_account
+                .iter()
+                .any(|r| r.backup_arn == adopted.backup_arn)
+        );
+        assert!(matches!(
+            s.engine.forget_available_backup_row(&adopted.key()).await,
+            Err(StorageError::Validation(m)) if m.contains("Backup not found")
+        ));
         assert!(
             !s.engine.remove_backup_row(&key).await.unwrap(),
             "DELETING is not a tombstone"
@@ -3853,6 +3975,1629 @@ mod catalog_index {
         .expect("record");
         assert_eq!(record.0, "DONE");
         assert!(record.1.is_some());
+        s.cleanup().await;
+    }
+
+    /// `read_store_ids`: the distinct ids of the rows for a root, of every
+    /// status, scoped to the kind and the root.
+    #[tokio::test]
+    async fn read_store_ids_lists_the_distinct_ids_of_a_root() {
+        if base_conn().is_none() {
+            eprintln!("SKIP read_store_ids_lists_the_distinct_ids_of_a_root: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let root = &store().store_root;
+        assert!(
+            s.engine
+                .read_store_ids(StoreKind::Filesystem, root)
+                .await
+                .expect("ids")
+                .is_empty()
+        );
+        let first = row(ACCOUNT, "Music", "a");
+        let _c1 = s.engine.claim_backup(&first).await.expect("claim");
+        let second = row(ACCOUNT, "Music", "b");
+        let c2 = s.engine.claim_backup(&second).await.expect("claim");
+        c2.set_status(
+            JobStatus::Creating,
+            JobStatus::Failed,
+            &StatusFields::default(),
+        )
+        .await
+        .expect("fail");
+        assert_eq!(
+            s.engine
+                .read_store_ids(StoreKind::Filesystem, root)
+                .await
+                .expect("ids"),
+            ["store-1"],
+            "two rows of one store, of two statuses, are one id"
+        );
+        let mut other = row(ACCOUNT, "Songs", "c");
+        other.store.store_id = "store-2".to_owned();
+        let _c3 = s.engine.claim_backup(&other).await.expect("claim");
+        assert_eq!(
+            s.engine
+                .read_store_ids(StoreKind::Filesystem, root)
+                .await
+                .expect("ids"),
+            ["store-1", "store-2"]
+        );
+        assert!(
+            s.engine
+                .read_store_ids(StoreKind::S3, root)
+                .await
+                .expect("ids")
+                .is_empty(),
+            "another kind at the same root is another store"
+        );
+        assert!(
+            s.engine
+                .read_store_ids(StoreKind::Filesystem, "/elsewhere")
+                .await
+                .expect("ids")
+                .is_empty()
+        );
+        s.cleanup().await;
+    }
+
+    /// `insert_backup_row`: the row lands as given, unowned, with
+    /// `completed_at` and `heartbeat_at` on the database's clock; a second
+    /// insert, an insert over a CREATING row a claim holds, and an insert of
+    /// the id under another account (the unique `backup_id`) answer `false`
+    /// and change nothing; a claim over the inserted row is refused; the row
+    /// is read and listed like a created one.
+    #[tokio::test]
+    async fn insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP insert_backup_row_inserts_an_unowned_row_only_when_absent: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let mut adopted = catalog_index_row(ACCOUNT, "Music", "adopted");
+        adopted.status = BackupStatus::Available;
+        adopted.size_bytes = 1234;
+        adopted.item_count = 5;
+        // Ignored: the insert sets these three itself.
+        adopted.owner_generation = 99;
+        adopted.completed_at = None;
+        adopted.heartbeat_at = 0.0;
+        // A year before the id's instant: the two clock columns must be
+        // the database's clock at the insert, not the row's `created_at`.
+        adopted.created_at -= 365.0 * 86_400.0;
+        assert!(s.engine.insert_backup_row(&adopted).await.expect("insert"));
+        let stored = s
+            .engine
+            .read_backup_row(&arn_of(&adopted))
+            .await
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+        let completed_at = stored.completed_at.expect("completed_at is set");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs_f64();
+        for at in [completed_at, stored.heartbeat_at] {
+            assert!(
+                (at - now).abs() < 60.0,
+                "{at} is not the insert's instant {now}"
+            );
+        }
+        assert_eq!(
+            BackupRow {
+                owner_generation: 99,
+                completed_at: None,
+                heartbeat_at: 0.0,
+                ..stored.clone()
+            },
+            adopted,
+            "every other column is the row as given"
+        );
+
+        // A second insert of the key, with other values, writes nothing.
+        let mut again = adopted.clone();
+        again.backup_name = "again".to_owned();
+        again.size_bytes = 1;
+        again.status = BackupStatus::Failed;
+        assert!(!s.engine.insert_backup_row(&again).await.expect("insert"));
+        // The id under another account: the unique `backup_id`.
+        let mut elsewhere = adopted.clone();
+        elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+        elsewhere.backup_arn =
+            extenddb_storage::util::backup_arn(REGION, OTHER_ACCOUNT, "Music", &adopted.backup_id);
+        assert!(
+            !s.engine
+                .insert_backup_row(&elsewhere)
+                .await
+                .expect("insert")
+        );
+        assert!(
+            s.engine
+                .read_backup_row(&arn_of(&elsewhere))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+            Some(stored.clone()),
+            "the refused inserts changed nothing"
+        );
+        let claimed = s.engine.claim_backup(&adopted).await.err();
+        assert!(
+            matches!(claimed, Some(StorageError::AlreadyExists(_))),
+            "{claimed:?}"
+        );
+
+        // Over a CREATING row a live claim holds.
+        let creating = row(ACCOUNT, "Music", "job");
+        let claim = s.engine.claim_backup(&creating).await.expect("claim");
+        let mut over = creating.clone();
+        over.status = BackupStatus::Available;
+        assert!(!s.engine.insert_backup_row(&over).await.expect("insert"));
+        let job_row = s
+            .engine
+            .read_backup_row(&arn_of(&creating))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job_row.status, BackupStatus::Creating);
+        assert_eq!(job_row.owner_generation, claim.generation());
+
+        // Read and listed like a created row.
+        let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+            rows.into_iter().map(|r| r.backup_arn).collect()
+        };
+        let available: Vec<BackupRow> = s
+            .engine
+            .list_backup_rows(Some(BackupStatus::Available), &store())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(available, std::slice::from_ref(&stored));
+        let creating_rows: Vec<BackupRow> = s
+            .engine
+            .list_backup_rows(Some(BackupStatus::Creating), &store())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            arns(creating_rows),
+            std::slice::from_ref(&creating.backup_arn)
+        );
+        for table in [None, Some("Music")] {
+            let listed: Vec<BackupRow> = s
+                .engine
+                .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                listed.contains(&stored),
+                "{table:?}: {:?}",
+                arns(listed.clone())
+            );
+        }
+        drop(claim);
+        s.cleanup().await;
+    }
+
+    /// The maintenance claim: taken once, refused to a second holder naming
+    /// the first, heartbeated, released; a holder whose session ended and
+    /// whose heartbeat is older than the stale window is dead, so its claim
+    /// is not reported held and is taken over, and its handle finds the claim
+    /// lost.
+    /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is
+    /// older than the window is removed outright; one with a live owner, one
+    /// that is not CREATING, and one that is gone are left, answering
+    /// `false`.
+    #[tokio::test]
+    async fn a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_dead_creating_row_is_removed_and_a_live_or_moved_one_is_kept: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let stale = std::time::Duration::from_secs(300);
+        let age = |backup_id: String| {
+            let catalog = s.catalog.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE backup_index SET heartbeat_at = now() - interval '10 minutes' \
+                     WHERE backup_id = $1",
+                )
+                .bind(backup_id)
+                .execute(&catalog)
+                .await
+                .expect("age");
+            }
+        };
+        let creating = row(ACCOUNT, "Music", "a");
+        let key = creating.key();
+        let claim = s.engine.claim_backup(&creating).await.expect("claim");
+        assert!(
+            !s.engine
+                .remove_dead_creating_backup_row(&key, stale)
+                .await
+                .unwrap(),
+            "a live owner keeps its row"
+        );
+        age(creating.backup_id.clone()).await;
+        assert!(
+            s.engine
+                .remove_dead_creating_backup_row(&key, stale)
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.engine
+                .read_backup_row(&arn_of(&creating))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !s.engine
+                .remove_dead_creating_backup_row(&key, stale)
+                .await
+                .unwrap(),
+            "gone"
+        );
+        drop(claim);
+
+        let available = row(ACCOUNT, "Music", "b");
+        let claim = s.engine.claim_backup(&available).await.expect("claim");
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default(),
+            )
+            .await
+            .expect("available");
+        age(available.backup_id.clone()).await;
+        assert!(
+            !s.engine
+                .remove_dead_creating_backup_row(&available.key(), stale)
+                .await
+                .unwrap(),
+            "only a CREATING row"
+        );
+        assert_eq!(
+            s.engine
+                .read_backup_row(&arn_of(&available))
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            BackupStatus::Available
+        );
+        drop(claim);
+        s.cleanup().await;
+    }
+
+    /// `list_backup_rows_older_than` compares the named column with the
+    /// database's `now()`: a FAILED row whose heartbeat is older than the age
+    /// but whose completion is not is listed on the heartbeat clock and not
+    /// on the completed clock (the two columns are told apart by waiting
+    /// between the last heartbeat and the FAILED write, on the database's
+    /// clock); a row crosses the window by waiting; a row of another store,
+    /// another status, or with `completed_at` unset on the completed clock
+    /// is not listed.
+    #[tokio::test]
+    async fn rows_older_than_are_listed_on_the_named_clock() {
+        if base_conn().is_none() {
+            eprintln!("SKIP rows_older_than_are_listed_on_the_named_clock: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let age = std::time::Duration::from_secs(1);
+        let engine = &s.engine;
+        let list = move |status: BackupStatus, store: StoreIdentity, clock: StaleClock| async move {
+            let rows: Vec<BackupRow> = engine
+                .list_backup_rows_older_than(status, &store, clock, age)
+                .try_collect()
+                .await
+                .expect("list");
+            rows.into_iter().map(|r| r.backup_name).collect::<Vec<_>>()
+        };
+        // `aged`: heartbeat now, then FAILED after the age has passed, so its
+        // heartbeat is older than the age and its completion is not.
+        let aged = row(ACCOUNT, "Music", "aged");
+        let aged_claim = s.engine.claim_backup(&aged).await.expect("claim");
+        // `fresh`: FAILED at once; both columns within the age.
+        let fresh = row(ACCOUNT, "Music", "fresh");
+        let fresh_claim = s.engine.claim_backup(&fresh).await.expect("claim");
+        let failed = StatusFields {
+            failure_reason: Some("the test's".to_owned()),
+            completed: true,
+            ..StatusFields::default()
+        };
+        assert_eq!(
+            fresh_claim
+                .set_status(JobStatus::Creating, JobStatus::Failed, &failed)
+                .await
+                .unwrap(),
+            WriteOutcome::Matched
+        );
+        // `open`: FAILED without a completion stamp (`completed: false`).
+        let open = row(ACCOUNT, "Music", "open");
+        let open_claim = s.engine.claim_backup(&open).await.expect("claim");
+        assert_eq!(
+            open_claim
+                .set_status(
+                    JobStatus::Creating,
+                    JobStatus::Failed,
+                    &StatusFields {
+                        failure_reason: Some("the test's".to_owned()),
+                        ..StatusFields::default()
+                    }
+                )
+                .await
+                .unwrap(),
+            WriteOutcome::Matched
+        );
+        // `creating`: stays CREATING with its heartbeat ageing.
+        let creating = row(ACCOUNT, "Music", "creating");
+        let _creating_claim = s.engine.claim_backup(&creating).await.expect("claim");
+        // `elsewhere`: FAILED at once, in another store.
+        let mut elsewhere = row(ACCOUNT, "Music", "elsewhere");
+        elsewhere.store.store_id = "store-2".to_owned();
+        let elsewhere_claim = s.engine.claim_backup(&elsewhere).await.expect("claim");
+        assert_eq!(
+            elsewhere_claim
+                .set_status(JobStatus::Creating, JobStatus::Failed, &failed)
+                .await
+                .unwrap(),
+            WriteOutcome::Matched
+        );
+
+        // Nothing is older than the age yet, on either clock.
+        assert_eq!(
+            list(BackupStatus::Failed, store(), StaleClock::Heartbeat).await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            list(BackupStatus::Failed, store(), StaleClock::Completed).await,
+            Vec::<String>::new()
+        );
+
+        tokio::time::sleep(age + std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            aged_claim
+                .set_status(JobStatus::Creating, JobStatus::Failed, &failed)
+                .await
+                .unwrap(),
+            WriteOutcome::Matched
+        );
+        // Heartbeat clock: every FAILED row of the store heartbeated before
+        // the wait (`open` has no completion but has a heartbeat); not the
+        // CREATING row, not the other store's.
+        assert_eq!(
+            list(BackupStatus::Failed, store(), StaleClock::Heartbeat).await,
+            ["aged", "fresh", "open"]
+        );
+        // Completed clock: `aged` completed just now, `open` never.
+        assert_eq!(
+            list(BackupStatus::Failed, store(), StaleClock::Completed).await,
+            ["fresh"]
+        );
+        assert_eq!(
+            list(BackupStatus::Creating, store(), StaleClock::Heartbeat).await,
+            ["creating"]
+        );
+        let mut other = store();
+        other.store_id = "store-2".to_owned();
+        assert_eq!(
+            list(BackupStatus::Failed, other, StaleClock::Heartbeat).await,
+            ["elsewhere"]
+        );
+        // `aged` crosses the completed window by waiting.
+        tokio::time::sleep(age + std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            list(BackupStatus::Failed, store(), StaleClock::Completed).await,
+            ["aged", "fresh"]
+        );
+        s.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP the_maintenance_claim_excludes_a_second_holder_and_expires_when_stale: \
+                 no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let stale = std::time::Duration::from_secs(300);
+        let check = || s.engine.check_maintenance_claim(stale);
+        assert!(!check().await.expect("check"));
+        let first = s
+            .engine
+            .maintenance_claim("purge on host-a", stale)
+            .await
+            .expect("claim");
+        assert_ne!(first.generation(), UNOWNED_GENERATION);
+        assert!(check().await.expect("check"), "a live claim is held");
+        match s.engine.maintenance_claim("purge on host-b", stale).await {
+            Err(StorageError::AlreadyExists(m)) => {
+                assert!(m.contains("purge on host-a"), "{m}");
+            }
+            Err(other) => panic!("a second holder is refused with AlreadyExists: {other:?}"),
+            Ok(_) => panic!("a second holder is refused"),
+        }
+        assert_eq!(
+            first.heartbeat().await.expect("heartbeat"),
+            Heartbeat::Confirmed
+        );
+        first.release().await.expect("release");
+        assert!(!check().await.expect("check"), "released");
+        first.release().await.expect("a second release is a no-op");
+
+        // A dead holder: its session ended (the handle dropped) and its
+        // heartbeat aged past the window.
+        let dead = s
+            .engine
+            .maintenance_claim("purge on host-c", stale)
+            .await
+            .expect("claim");
+        let dead_generation = dead.generation();
+        drop(dead);
+        // The drop closes the holder's session; the backend reaps it a
+        // moment later. Wait for the exclusive lock to be gone, so the check
+        // below is answered by the heartbeat arm alone and not by a lock
+        // still being released.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let exclusive: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND mode = \
+                 'ExclusiveLock' AND database = (SELECT oid FROM pg_database WHERE datname = \
+                 current_database())",
+            )
+            .fetch_one(&s.catalog)
+            .await
+            .expect("pg_locks");
+            if exclusive == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped holder's session still holds the lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // The heartbeat arm: the lock is free (the session ended with the
+        // handle) and the row's heartbeat is young, so the jobs still see
+        // the claim held, as they must for a command that died a moment ago
+        // or lost its claim while its row is young.
+        assert!(
+            check().await.expect("check"),
+            "a dead session's row is held by its heartbeat until it ages"
+        );
+        sqlx::query("UPDATE backup_maintenance SET heartbeat_at = now() - interval '10 minutes'")
+            .execute(&s.catalog)
+            .await
+            .expect("age");
+        assert!(!check().await.expect("check"), "a stale claim is not held");
+        let taker = s
+            .engine
+            .maintenance_claim("purge on host-d", stale)
+            .await
+            .expect("a dead holder's claim is taken over");
+        assert_ne!(taker.generation(), dead_generation);
+        assert!(check().await.expect("check"));
+        let holder: String = sqlx::query_scalar("SELECT holder FROM backup_maintenance")
+            .fetch_one(&s.catalog)
+            .await
+            .expect("holder");
+        assert_eq!(holder, "purge on host-d");
+        // A holder whose session is still open is alive whatever its
+        // heartbeat says: the lock is the proof of life on this backend.
+        sqlx::query("UPDATE backup_maintenance SET heartbeat_at = now() - interval '10 minutes'")
+            .execute(&s.catalog)
+            .await
+            .expect("age");
+        assert!(
+            matches!(
+                s.engine.maintenance_claim("purge on host-e", stale).await,
+                Err(StorageError::AlreadyExists(_))
+            ),
+            "a live session keeps the claim"
+        );
+        assert!(
+            check().await.expect("check"),
+            "the jobs' check sees a live session's claim held through the lock, whatever the \
+             row's heartbeat says"
+        );
+        // The check holds no lock past its statement: after it, the only
+        // advisory lock in the catalog is the holder's exclusive one, so no
+        // pooled connection carries a shared lock a dropped request left.
+        let modes: Vec<String> = sqlx::query_scalar(
+            "SELECT mode FROM pg_locks WHERE locktype = 'advisory' AND database = \
+             (SELECT oid FROM pg_database WHERE datname = current_database()) ORDER BY mode",
+        )
+        .fetch_all(&s.catalog)
+        .await
+        .expect("pg_locks");
+        assert_eq!(
+            modes,
+            ["ExclusiveLock"],
+            "the holder's lock and nothing else"
+        );
+        assert_eq!(
+            taker.heartbeat().await.expect("heartbeat"),
+            Heartbeat::Confirmed
+        );
+        assert!(check().await.expect("check"), "the heartbeat refreshed it");
+        // The row's generation moved under the live holder (a takeover by
+        // another writer): the holder's next heartbeat matches no row and
+        // reports the claim lost, and its release leaves the other's row.
+        sqlx::query("UPDATE backup_maintenance SET owner_generation = owner_generation + 1")
+            .execute(&s.catalog)
+            .await
+            .expect("move the generation");
+        assert_eq!(
+            taker.heartbeat().await.expect("heartbeat"),
+            Heartbeat::Lost,
+            "a heartbeat under a moved generation reports the claim lost"
+        );
+        taker.release().await.expect("release");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_maintenance")
+            .fetch_one(&s.catalog)
+            .await
+            .expect("count");
+        assert_eq!(
+            rows, 1,
+            "a release by a holder that lost the claim leaves the row"
+        );
+        assert!(
+            check().await.expect("check"),
+            "the lock is free and the row young: held by the heartbeat arm"
+        );
+        sqlx::query("DELETE FROM backup_maintenance")
+            .execute(&s.catalog)
+            .await
+            .expect("clear");
+        assert!(!check().await.expect("check"));
+        s.cleanup().await;
+    }
+
+    /// `check_maintenance_claim` holds the claim's key shared for one
+    /// statement, and a take that lands inside it finds the exclusive lock
+    /// refused with no holder, so the take tries again on its claim
+    /// connection. Held across every try, the shared lock makes the take
+    /// refuse, naming no holder (there is no row). With the lock step given
+    /// a long span, a shared lock released once the claim connection has
+    /// made a failed try (seen in `pg_stat_activity`) is taken by a later
+    /// try.
+    #[tokio::test]
+    async fn a_maintenance_take_tries_again_past_a_checks_shared_lock() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_maintenance_take_tries_again_past_a_checks_shared_lock: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let stale = std::time::Duration::from_secs(300);
+        const SHARED: &str =
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended('backup_maintenance', $1))";
+
+        let mut check = s.catalog.begin().await.expect("begin");
+        sqlx::query(SHARED)
+            .bind(RESTORE_LOCK_SEED)
+            .execute(&mut *check)
+            .await
+            .expect("the check's shared lock");
+        let started = std::time::Instant::now();
+        match s.engine.maintenance_claim("purge on host-a", stale).await {
+            Err(StorageError::AlreadyExists(m)) => {
+                assert!(m.contains("another maintenance command"), "{m}");
+            }
+            Err(other) => panic!("refused otherwise: {other:?}"),
+            Ok(_) => panic!("taken beside a held shared lock"),
+        }
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the take tried once: {:?}",
+            started.elapsed()
+        );
+        check.rollback().await.expect("rollback");
+
+        let mut check = s.catalog.begin().await.expect("begin");
+        sqlx::query(SHARED)
+            .bind(RESTORE_LOCK_SEED)
+            .execute(&mut *check)
+            .await
+            .expect("the check's shared lock");
+        let tried = std::sync::atomic::AtomicBool::new(false);
+        let (taken, ()) = tokio::join!(
+            async {
+                let taken = s
+                    .engine
+                    .maintenance_lock_for_tests(10_000, std::time::Duration::from_millis(1))
+                    .await;
+                tried.store(true, std::sync::atomic::Ordering::SeqCst);
+                taken
+            },
+            async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let failed_try: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                         WHERE pid <> pg_backend_pid() AND datname = current_database() \
+                         AND query LIKE 'SELECT pg_try_advisory_lock(%')",
+                    )
+                    .fetch_one(&s.catalog)
+                    .await
+                    .expect("activity");
+                    if failed_try
+                        || tried.load(std::sync::atomic::Ordering::SeqCst)
+                        || std::time::Instant::now() > deadline
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                check.rollback().await.expect("rollback");
+            }
+        );
+        assert!(
+            taken.expect("the lock step"),
+            "a later try took the lock once the check's statement ended"
+        );
+        s.cleanup().await;
+    }
+
+    /// Purge's wait (`wait_for_quiet`) over this catalog, on a real claim.
+    /// A FAILED restore record whose target is still CREATING (the state a
+    /// stop between the FAILED write and the target's removal leaves) is
+    /// returned by the zero-window dead-job listing with the RUNNING
+    /// records; it is the reconciler's duty, not a running job, so the wait
+    /// is quiet at its first read and runs no duty itself: the target is
+    /// left CREATING for the server. A FAILED backup row whose heartbeat is
+    /// within the window (a job that has not yet seen its claim lost may
+    /// still write under its prefix) holds the wait to its limit, which
+    /// names it; once the heartbeat has aged past the window it does not.
+    #[tokio::test]
+    async fn the_wait_passes_a_failed_record_and_holds_on_a_failed_row_with_a_live_heartbeat() {
+        use extenddb_engine::HeldClaim;
+        use extenddb_engine::maintenance::{Interrupt, Wait, WaitOutcome, wait_for_quiet};
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP the_wait_passes_a_failed_record_and_holds_on_a_failed_row_with_a_live_heartbeat: \
+                 no PostgreSQL"
+            );
+            return;
+        }
+        let stale = std::time::Duration::from_secs(300);
+        let s = scratch().await;
+        indexed_source(&s, "wq_src").await;
+        let backup = s
+            .engine
+            .create(ACCOUNT, "wq_src", "b", JobPermit::detached())
+            .await
+            .expect("backup");
+        let desc = restore(&s, "wq_dst", &backup.backup_arn)
+            .await
+            .expect("restore");
+        sqlx::query(
+            "UPDATE tables SET table_status = 'CREATING', status_transition_at = NULL \
+             WHERE table_id = $1",
+        )
+        .bind(&desc.table_id)
+        .execute(&s.catalog)
+        .await
+        .expect("the target back to CREATING");
+        sqlx::query(
+            "UPDATE table_restores SET status = 'FAILED', completed_at = NOW() - INTERVAL '1 hour' \
+             WHERE table_id = $1",
+        )
+        .bind(&desc.table_id)
+        .execute(&s.catalog)
+        .await
+        .expect("the record FAILED an hour ago");
+        let listed = s
+            .engine
+            .list_dead_restore_jobs(std::time::Duration::ZERO)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(
+            listed[0].status,
+            JobStatus::Failed,
+            "the zero-window listing returns the FAILED record the wait reads"
+        );
+
+        let claim = s
+            .engine
+            .maintenance_claim("purge on host-a", stale)
+            .await
+            .expect("claim");
+        let held = HeldClaim::start(claim, std::time::Duration::from_secs(1));
+        let limit = std::time::Duration::from_secs(3);
+        let wait = Wait {
+            owner_window: stale,
+            limit,
+            poll: std::time::Duration::from_millis(200),
+        };
+        let announced: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());
+        let announce = |jobs: &[String]| announced.lock().unwrap().push(jobs.to_vec());
+        let (_tx, mut interrupt) = Interrupt::new();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            wait_for_quiet(&s.engine, &store(), &held, wait, &mut interrupt, announce).await,
+            WaitOutcome::Quiet,
+            "a FAILED restore record is the reconciler's duty, not a running job"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "quiet at the first read: {:?}",
+            started.elapsed()
+        );
+        assert!(announced.lock().unwrap().is_empty());
+        assert_eq!(
+            table_status(&s, "wq_dst").await.as_deref(),
+            Some("CREATING"),
+            "the wait runs no duty: the target is left for the server's reconciler"
+        );
+        assert_eq!(
+            job_status(&s, &desc.table_id).await.as_deref(),
+            Some("FAILED")
+        );
+
+        // A FAILED backup row of the store whose heartbeat is this moment's.
+        let failed = row(ACCOUNT, "Music", "f");
+        let job = s.engine.claim_backup(&failed).await.expect("claim");
+        job.set_status(
+            JobStatus::Creating,
+            JobStatus::Failed,
+            &StatusFields {
+                failure_reason: Some("the test's".to_owned()),
+                ..StatusFields::default()
+            },
+        )
+        .await
+        .expect("failed");
+        drop(job);
+        let started = std::time::Instant::now();
+        let expected = vec![format!(
+            "the FAILED backup {} has a live owner (heartbeat within stale_job_after_secs)",
+            failed.backup_arn
+        )];
+        assert_eq!(
+            wait_for_quiet(&s.engine, &store(), &held, wait, &mut interrupt, announce).await,
+            WaitOutcome::Busy(expected.clone()),
+            "a FAILED row with a live heartbeat holds the wait and is named"
+        );
+        assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+        assert_eq!(*announced.lock().unwrap(), vec![expected]);
+        // Aged past the window on the catalog's clock: a dead owner.
+        sqlx::query(
+            "UPDATE backup_index SET heartbeat_at = now() - interval '10 minutes' \
+             WHERE backup_id = $1",
+        )
+        .bind(&failed.backup_id)
+        .execute(&s.catalog)
+        .await
+        .expect("age");
+        assert_eq!(
+            wait_for_quiet(&s.engine, &store(), &held, wait, &mut interrupt, announce).await,
+            WaitOutcome::Quiet,
+            "a FAILED row whose heartbeat has aged is not waited on"
+        );
+        held.release().await.expect("release");
+        assert!(
+            !s.engine
+                .check_maintenance_claim(stale)
+                .await
+                .expect("check")
+        );
+        s.cleanup().await;
+    }
+
+    /// The factory (`create_server_components`) starts the GSI queue workers
+    /// for a server only. Components opened `beside_server` (`backup list`,
+    /// the purge's dry run) leave a pending index write where it is, for
+    /// the server that owns the catalog; components opened as a server
+    /// apply it.
+    #[tokio::test]
+    async fn components_opened_beside_a_server_apply_no_pending_index_write() {
+        use extenddb_storage::server_components::ServerComponentsOptions;
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP components_opened_beside_a_server_apply_no_pending_index_write: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        indexed_source_with(&s, "gq_src", 0).await;
+        // An asynchronous index: from here a write queues its index update
+        // in `gsi_pending` for a worker, instead of applying it in its own
+        // transaction.
+        sqlx::query("UPDATE settings SET value = '50' WHERE key = 'index_propagation_delay_ms'")
+            .execute(&s.catalog)
+            .await
+            .expect("an asynchronous index");
+        let pending = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM gsi_pending")
+                .fetch_one(&s.db)
+                .await
+                .expect("count gsi_pending")
+        };
+        assert_eq!(pending().await, 0);
+        let desc = s
+            .engine
+            .describe_table(
+                ACCOUNT,
+                DescribeTableInput {
+                    table_name: "gq_src".to_owned(),
+                },
+            )
+            .await
+            .expect("describe");
+        put_indexed_items(&s, "gq_src", &desc, 1).await;
+        assert_eq!(pending().await, 1, "the write queued its index update");
+
+        // The factory reads the encryption key `init` writes.
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('encryption_key', 'test-key') \
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .execute(&s.catalog)
+        .await
+        .expect("encryption key");
+        // Installed once per process; a second install is refused and that
+        // is fine.
+        let _ = extenddb_storage::set_backend(extenddb_storage_postgres::backend());
+        let config = extenddb_storage_postgres::PostgresStorageConfig {
+            connection_string: s.catalog_url.clone(),
+            pool_size: 10,
+            catalog_pool_size: Some(10),
+        };
+        let open = |beside_server: bool| {
+            let mut options = ServerComponentsOptions::default();
+            options.release = "test";
+            options.beside_server = beside_server;
+            extenddb_storage::create_server_components(&config, REGION, options)
+        };
+
+        let beside = open(true).await.expect("open beside a server");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            pending().await,
+            1,
+            "components opened beside a server start no worker: the row is left for the server"
+        );
+        drop(beside);
+
+        let server = open(false).await.expect("open as a server");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pending().await != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a server's workers apply the pending row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        drop(server);
+        s.cleanup().await;
+    }
+
+    /// `maintenance_claim` itself (its six tries 2 ms apart) takes the lock
+    /// past a check's shared lock that ends before the tries do: the shared
+    /// lock is held until the take's first try has failed (seen in
+    /// `pg_stat_activity`) and then released, and a later try takes the lock.
+    /// With one try in place of six the take would be refused with no holder
+    /// to name.
+    #[tokio::test]
+    async fn a_maintenance_take_passes_a_shared_lock_shorter_than_its_span() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_maintenance_take_passes_a_shared_lock_shorter_than_its_span: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let stale = std::time::Duration::from_secs(300);
+        let mut check = s.catalog.begin().await.expect("begin");
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock_shared(hashtextextended('backup_maintenance', $1))",
+        )
+        .bind(RESTORE_LOCK_SEED)
+        .execute(&mut *check)
+        .await
+        .expect("the check's shared lock");
+        let tried = std::sync::atomic::AtomicBool::new(false);
+        let (taken, ()) = tokio::join!(
+            async {
+                let taken = s.engine.maintenance_claim("purge on host-a", stale).await;
+                tried.store(true, std::sync::atomic::Ordering::SeqCst);
+                taken
+            },
+            async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let failed_try: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                         WHERE pid <> pg_backend_pid() AND datname = current_database() \
+                         AND query LIKE 'SELECT pg_try_advisory_lock(%')",
+                    )
+                    .fetch_one(&s.catalog)
+                    .await
+                    .expect("activity");
+                    if failed_try
+                        || tried.load(std::sync::atomic::Ordering::SeqCst)
+                        || std::time::Instant::now() > deadline
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                check.rollback().await.expect("rollback");
+            }
+        );
+        let claim = taken.expect("a later try of the take passed the check's shared lock");
+        assert!(
+            s.engine
+                .check_maintenance_claim(stale)
+                .await
+                .expect("check"),
+            "the take holds the claim"
+        );
+        claim.release().await.expect("release");
+        s.cleanup().await;
+    }
+
+    /// `release` unlocks the advisory lock before it closes the session, so a
+    /// `check_maintenance_claim` on another connection right after the
+    /// release reads the claim free, every time: a CreateBackup sent the
+    /// moment a purge exits is not refused. Twenty rounds, with no wait
+    /// between the release and the check.
+    #[tokio::test]
+    async fn a_released_claim_reads_free_at_once() {
+        if base_conn().is_none() {
+            eprintln!("SKIP a_released_claim_reads_free_at_once: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let stale = std::time::Duration::from_secs(300);
+        for round in 0..20 {
+            let claim = s
+                .engine
+                .maintenance_claim("purge on host-a", stale)
+                .await
+                .expect("claim");
+            assert!(
+                s.engine
+                    .check_maintenance_claim(stale)
+                    .await
+                    .expect("check")
+            );
+            claim.release().await.expect("release");
+            assert!(
+                !s.engine
+                    .check_maintenance_claim(stale)
+                    .await
+                    .expect("check"),
+                "round {round}: the claim reads held right after its release"
+            );
+        }
+        s.cleanup().await;
+    }
+
+    /// The purge's wait set reads RUNNING restore records by status alone:
+    /// a record whose heartbeat is ahead of the server's clock (coordinator
+    /// skew, a backward clock step) or in this statement's instant is
+    /// listed by `list_running_restore_jobs`, where the dead-job listing
+    /// under a zero window, which compares the heartbeat with `now()`, does
+    /// not list it.
+    #[tokio::test]
+    async fn running_restores_are_listed_by_status_whatever_their_heartbeat() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP running_restores_are_listed_by_status_whatever_their_heartbeat: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        indexed_source(&s, "rr_target").await;
+        let target_id = table_id_of(&s, "rr_target").await.unwrap();
+        sqlx::query(
+            "INSERT INTO table_restores (table_id, source_backup_arn, source_table_arn, \
+             restore_date_time, status, kind, owner_generation, heartbeat_at) \
+             VALUES ($1, $2, 'arn:aws:dynamodb:us-east-1:123456789012:table/Music', now(), \
+             'RUNNING', 'legacy', 7, now() + INTERVAL '60 seconds')",
+        )
+        .bind(&target_id)
+        .bind(&row(ACCOUNT, "Music", "nightly").backup_arn)
+        .execute(&s.catalog)
+        .await
+        .expect("a RUNNING record stamped ahead of the clock");
+        let running = s
+            .engine
+            .list_running_restore_jobs()
+            .await
+            .expect("list running");
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].target.table_name, "rr_target");
+        assert_eq!(running[0].status, JobStatus::Running);
+        assert!(
+            s.engine
+                .list_dead_restore_jobs(std::time::Duration::ZERO)
+                .await
+                .expect("list dead")
+                .is_empty(),
+            "the age-based listing misses a heartbeat ahead of the clock"
+        );
+        sqlx::query("UPDATE table_restores SET status = 'DONE' WHERE table_id = $1")
+            .bind(&target_id)
+            .execute(&s.catalog)
+            .await
+            .expect("settle");
+        assert!(
+            s.engine
+                .list_running_restore_jobs()
+                .await
+                .expect("list running")
+                .is_empty()
+        );
+        s.cleanup().await;
+    }
+}
+
+// --- the store identity file, over two engines on one catalog ----------------------
+
+/// The identity checks of a configured store (`extenddb_engine::store_identity`)
+/// run against this catalog and real filesystem stores: two instances of one
+/// catalog starting against one empty root, and two instances with
+/// host-local roots under one `store_root` label.
+/// The catalog methods the store-backed backup job and the reconciler call:
+/// the takeover of a dead owner's row, the age listings on the database's
+/// clock, the AVAILABLE write's `source_table_details_json`, the claim
+/// session's settings.
+mod backup_job {
+    use std::time::Duration;
+
+    use extenddb_core::backup_format::BackupArn;
+    use extenddb_storage::BackupCatalog;
+    use extenddb_storage::backup_catalog::{
+        BackupRow, BackupStatus, JobStatus, StatusFields, WriteOutcome,
+    };
+
+    use super::catalog_index::row as new_row;
+    use super::*;
+
+    fn arn_of(row: &BackupRow) -> BackupArn {
+        BackupArn::parse(&row.backup_arn).unwrap()
+    }
+
+    async fn stored(s: &Scratch, row: &BackupRow) -> BackupRow {
+        s.engine
+            .read_backup_row(&arn_of(row))
+            .await
+            .expect("read")
+            .expect("the row exists")
+    }
+
+    /// Wait until no session holds the backup's advisory lock (the server
+    /// releases it a moment after the holding connection closes).
+    async fn await_lock_free(s: &Scratch, backup_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while backup_lock_holder(s, backup_id).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the advisory lock outlived its session"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `claim_dead_backup`: refused while the owner's session holds the
+    /// lock, refused while the row's heartbeat is within the stale window
+    /// though the lock is free (an owner that died a moment ago), taken over
+    /// once the heartbeat is older than the window on the database's clock
+    /// (the window is crossed by waiting, not by dating the row), with a
+    /// fresh generation and `heartbeat_at` as the dead owner left it; the
+    /// successor's AVAILABLE write carries the manifest's `source_table`
+    /// into the row; a row that is no longer CREATING is not taken over.
+    #[tokio::test]
+    async fn claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP claim_dead_backup_takes_over_a_stale_row_and_refuses_a_live_one: no \
+                 PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let window = Duration::from_secs(1);
+        let row = new_row(ACCOUNT, "Music", "nightly");
+        let key = row.key();
+        let owner = s.engine.claim_backup(&row).await.expect("claim");
+        // Alive: its session holds the lock.
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "a row whose owner holds the lock was taken over"
+        );
+        assert_eq!(stored(&s, &row).await.owner_generation, owner.generation());
+        // The owner's session ends (a crash): the lock goes, the heartbeat
+        // stays as written. Within the window the row is not yet dead.
+        drop(owner);
+        await_lock_free(&s, &row.backup_id).await;
+        let left = stored(&s, &row).await;
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "a row whose heartbeat is within the stale window was taken over"
+        );
+        assert_eq!(
+            backup_lock_holder(&s, &row.backup_id).await,
+            None,
+            "a refused takeover left its lock session behind"
+        );
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+        let successor = s
+            .engine
+            .claim_dead_backup(&key, window)
+            .await
+            .expect("takeover")
+            .expect("a stale CREATING row is taken over");
+        assert_ne!(successor.generation(), left.owner_generation);
+        let taken = stored(&s, &row).await;
+        assert_eq!(taken.status, BackupStatus::Creating);
+        assert_eq!(taken.owner_generation, successor.generation());
+        assert_eq!(
+            taken.heartbeat_at, left.heartbeat_at,
+            "the takeover refreshed heartbeat_at"
+        );
+        assert!(
+            backup_lock_holder(&s, &row.backup_id).await.is_some(),
+            "the successor holds the lock"
+        );
+        // A second taker is refused by the lock while the successor lives.
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("second takeover attempt")
+                .is_none()
+        );
+        // The successor's writes go through: the manifest's source table
+        // replaces the row's, the FAILED write's `None` leaves it.
+        let manifest_source = serde_json::json!({"table_name": "Music", "item_count": 42});
+        let fields = StatusFields {
+            size_bytes: Some(10),
+            item_count: Some(42),
+            source_table_details_json: Some(manifest_source.clone()),
+            completed: true,
+            ..StatusFields::default()
+        };
+        assert_eq!(
+            successor
+                .set_status(JobStatus::Creating, JobStatus::Available, &fields)
+                .await
+                .expect("write"),
+            WriteOutcome::Matched
+        );
+        let available = stored(&s, &row).await;
+        assert_eq!(available.status, BackupStatus::Available);
+        assert_eq!(available.source_table_details_json, manifest_source);
+        assert_eq!(available.item_count, 42);
+        drop(successor);
+        await_lock_free(&s, &row.backup_id).await;
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+        assert!(
+            s.engine
+                .claim_dead_backup(&key, window)
+                .await
+                .expect("takeover attempt")
+                .is_none(),
+            "an AVAILABLE row was taken over"
+        );
+        // A row that is gone.
+        assert!(
+            s.engine
+                .claim_dead_backup(&new_row(ACCOUNT, "Music", "other").key(), window)
+                .await
+                .expect("takeover attempt")
+                .is_none()
+        );
+        s.cleanup().await;
+    }
+
+    /// An owner whose claim session the server ended (`pg_terminate_backend`)
+    /// gets `Unknown` from its next status write, not an error, and its
+    /// re-read shows the row as it is: the fence the job and the reconciler
+    /// act on. Once the heartbeat is stale the row is a successor's.
+    #[tokio::test]
+    async fn a_terminated_claim_session_reports_unknown_and_the_row_is_reread() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP a_terminated_claim_session_reports_unknown_and_the_row_is_reread: no \
+                 PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let row = new_row(ACCOUNT, "Music", "nightly");
+        let owner = s.engine.claim_backup(&row).await.expect("claim");
+        let pid = backup_lock_holder(&s, &row.backup_id)
+            .await
+            .expect("the claim session holds the lock");
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("terminate");
+        assert!(terminated);
+        await_lock_free(&s, &row.backup_id).await;
+        let outcome = owner
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields {
+                    size_bytes: Some(1),
+                    completed: true,
+                    ..StatusFields::default()
+                },
+            )
+            .await
+            .expect("a lost connection is an outcome, not an error");
+        assert_eq!(outcome, WriteOutcome::Unknown);
+        // The re-read runs on the pool, not the dead session.
+        let read = owner.read().await.expect("re-read");
+        assert_eq!(read.status, JobStatus::Creating);
+        assert_eq!(read.owner_generation, owner.generation());
+        // The heartbeat on the dead session is an error the caller treats as
+        // `Lost`.
+        assert!(owner.heartbeat().await.is_err());
+        s.cleanup().await;
+    }
+
+    /// The claim session asks the server for TCP keepalives
+    /// (`CLAIM_KEEPALIVES`), read back from the session with `SHOW`: idle
+    /// 30 s, then a probe every 10 s, three unanswered, so a vanished host
+    /// loses its lock after about a minute (design 4(e)). The literals, not
+    /// the constant, so a constant at the server's defaults (7200 s idle)
+    /// fails here.
+    #[tokio::test]
+    async fn the_claim_session_sets_tcp_keepalives() {
+        if base_conn().is_none() {
+            eprintln!("SKIP the_claim_session_sets_tcp_keepalives: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let names = [
+            "tcp_keepalives_idle",
+            "tcp_keepalives_interval",
+            "tcp_keepalives_count",
+        ];
+        let values = extenddb_storage_postgres::claim_session_settings(
+            &s.catalog,
+            "backup:keepalive-test",
+            &names,
+        )
+        .await
+        .expect("open a claim session")
+        .expect("the lock is free");
+        assert_eq!(values, ["30", "10", "3"]);
+        assert_eq!(
+            extenddb_storage_postgres::CLAIM_KEEPALIVES,
+            [
+                ("tcp_keepalives_idle", 30),
+                ("tcp_keepalives_interval", 10),
+                ("tcp_keepalives_count", 3),
+            ]
+        );
+        // A pooled connection has the server's defaults, not the claim's.
+        let pooled: String = sqlx::query_scalar("SHOW tcp_keepalives_idle")
+            .fetch_one(&s.catalog)
+            .await
+            .expect("show");
+        assert_ne!(
+            pooled, "30",
+            "the test server's default is the claim's value"
+        );
+        s.cleanup().await;
+    }
+}
+
+mod store_identity {
+    use std::sync::Arc;
+
+    use extenddb_backup_store::{BackupStore, FilesystemStore, byte_stream_from};
+    use extenddb_core::backup_format::BackupArn;
+    use extenddb_engine::StoreIdentityFile;
+    use extenddb_engine::store_identity::{STORE_IDENTITY_KEY, StoreProblem, establish, recheck};
+    use extenddb_storage::BackupCatalog;
+    use extenddb_storage::backup_catalog::{JobStatus, StatusFields, StoreKind};
+
+    use super::*;
+
+    /// A private root: `tempfile` creates directories with the umask applied
+    /// to 0777, which the store refuses.
+    fn private_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        dir
+    }
+
+    async fn second_engine(s: &Scratch) -> PostgresEngine {
+        PostgresEngine::new(
+            &PostgresConfig {
+                connection_string: s.catalog_url.clone(),
+                pool_size: 4,
+                max_item_size_bytes: 400_000,
+            },
+            REGION,
+        )
+        .await
+        .expect("a second engine on the same catalog")
+    }
+
+    async fn read_file(store: &dyn BackupStore) -> StoreIdentityFile {
+        use futures::TryStreamExt;
+        let bytes: Vec<u8> = store
+            .get(STORE_IDENTITY_KEY)
+            .await
+            .expect("the file")
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk);
+                Ok(acc)
+            })
+            .await
+            .expect("read");
+        StoreIdentityFile::parse(&bytes).expect("parses")
+    }
+
+    /// Two instances of one catalog started against one empty root end with
+    /// one id in the file, and a row either writes carries it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_instances_on_one_empty_root_end_with_one_id() {
+        if base_conn().is_none() {
+            eprintln!("SKIP two_instances_on_one_empty_root_end_with_one_id: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let other = second_engine(&s).await;
+        let root = private_root();
+        let store_a: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root.path()).await.unwrap());
+        let store_b: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root.path()).await.unwrap());
+        let label = root.path().canonicalize().unwrap().display().to_string();
+        let (a, b) = tokio::join!(
+            establish(
+                &*store_a,
+                StoreKind::Filesystem,
+                &label,
+                &s.engine,
+                "postgres",
+                false
+            ),
+            establish(
+                &*store_b,
+                StoreKind::Filesystem,
+                &label,
+                &other,
+                "postgres",
+                false
+            ),
+        );
+        let (a, b) = (a.expect("instance a"), b.expect("instance b"));
+        assert_eq!(a, b, "both instances use one id");
+        let file = read_file(&*store_a).await;
+        assert_eq!(file.store_id, a.store_id);
+        assert_eq!(file.catalog_id, s.engine.catalog_id().await.unwrap());
+        assert_eq!(file.backend, "postgres");
+        // A row written under the identity carries it, and both instances
+        // read it back as the root's one id.
+        let mut row = super::catalog_index_row(ACCOUNT, "Music", "nightly");
+        row.store = a.clone();
+        let claim = s.engine.claim_backup(&row).await.expect("claim");
+        drop(claim);
+        for engine in [&s.engine, &other] {
+            assert_eq!(
+                engine
+                    .read_store_ids(StoreKind::Filesystem, &label)
+                    .await
+                    .unwrap(),
+                std::slice::from_ref(&a.store_id)
+            );
+            recheck(&*store_a, &a, engine, "postgres", false)
+                .await
+                .expect("still healthy");
+        }
+        s.cleanup().await;
+    }
+
+    /// Two instances of one catalog with host-local filesystem roots under
+    /// one `store_root` label: the second, whose root has no file while the
+    /// catalog has rows for the label, is unhealthy; with the first's file
+    /// copied to it the manifest probe marks it unhealthy, because the
+    /// newest AVAILABLE backup's manifest is not in its root.
+    #[tokio::test]
+    async fn host_local_roots_under_one_label_leave_the_second_instance_unhealthy() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP host_local_roots_under_one_label_leave_the_second_instance_unhealthy: \
+                 no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let other = second_engine(&s).await;
+        let root_a = private_root();
+        let root_b = private_root();
+        let store_a: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root_a.path()).await.unwrap());
+        let store_b: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root_b.path()).await.unwrap());
+        // One label for both: the path both hosts configured.
+        let label = "/var/lib/extenddb/backups";
+
+        // The first instance creates the file and an AVAILABLE backup with its
+        // manifest in its own root.
+        let a = establish(
+            &*store_a,
+            StoreKind::Filesystem,
+            label,
+            &s.engine,
+            "postgres",
+            false,
+        )
+        .await
+        .expect("instance a");
+        let mut row = super::catalog_index_row(ACCOUNT, "Music", "nightly");
+        row.store = a.clone();
+        let claim = s.engine.claim_backup(&row).await.expect("claim");
+        let arn = BackupArn::parse(&row.backup_arn).unwrap();
+        store_a
+            .put(
+                &format!("{}extenddb-manifest.json", arn.store_prefix()),
+                byte_stream_from(b"{}".to_vec()),
+            )
+            .await
+            .expect("manifest");
+        claim
+            .set_status(
+                JobStatus::Creating,
+                JobStatus::Available,
+                &StatusFields::default(),
+            )
+            .await
+            .expect("available");
+        recheck(&*store_a, &a, &s.engine, "postgres", false)
+            .await
+            .expect("a is healthy");
+
+        // The second instance: its root has no file and the catalog has rows
+        // for the label.
+        let err = establish(
+            &*store_b,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StoreProblem::FileMissingWithRows(vec![a.store_id.clone()])
+        );
+        assert!(
+            store_b.head(STORE_IDENTITY_KEY).await.unwrap().is_none(),
+            "nothing was created over the rows"
+        );
+
+        // The operator copies the first's file to the second root: the ids
+        // agree and the probe finds the manifest missing.
+        let file = read_file(&*store_a).await;
+        store_b
+            .put(STORE_IDENTITY_KEY, byte_stream_from(file.to_bytes()))
+            .await
+            .unwrap();
+        let err = establish(
+            &*store_b,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StoreProblem::ManifestMissing {
+                backup_arn: row.backup_arn.clone(),
+            }
+        );
+        // The first instance is unaffected.
+        recheck(&*store_a, &a, &s.engine, "postgres", false)
+            .await
+            .expect("a stays healthy");
+        // A shared root (the second instance pointed at the first's
+        // directory) passes.
+        let shared: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root_a.path()).await.unwrap());
+        let b = establish(
+            &*shared,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .expect("a shared root is healthy");
+        assert_eq!(b, a);
+        s.cleanup().await;
+    }
+
+    /// A root whose file names another catalog is unhealthy for this one
+    /// until an operator changes the file; the first catalog's instance is
+    /// unaffected.
+    #[tokio::test]
+    async fn a_root_owned_by_another_catalog_is_unhealthy() {
+        if base_conn().is_none() {
+            eprintln!("SKIP a_root_owned_by_another_catalog_is_unhealthy: no PostgreSQL");
+            return;
+        }
+        let s = scratch().await;
+        let root = private_root();
+        let store: Arc<dyn BackupStore> =
+            Arc::new(FilesystemStore::open(root.path()).await.unwrap());
+        let label = root.path().canonicalize().unwrap().display().to_string();
+        let foreign = StoreIdentityFile {
+            format_version: 1,
+            store_id: "s-foreign".to_owned(),
+            catalog_id: "another-catalog".to_owned(),
+            backend: "sqlite".to_owned(),
+            created_at_ms: 0,
+            ephemeral_catalog: false,
+        };
+        store
+            .put(STORE_IDENTITY_KEY, byte_stream_from(foreign.to_bytes()))
+            .await
+            .unwrap();
+        let err = establish(
+            &*store,
+            StoreKind::Filesystem,
+            &label,
+            &s.engine,
+            "postgres",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StoreProblem::ForeignCatalog {
+                file_catalog_id: "another-catalog".to_owned(),
+                catalog_id: s.engine.catalog_id().await.unwrap(),
+            }
+        );
         s.cleanup().await;
     }
 }

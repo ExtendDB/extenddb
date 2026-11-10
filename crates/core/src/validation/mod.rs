@@ -1,11 +1,26 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 pub mod number;
+pub mod restorable_item;
 pub mod vector_item;
+pub mod warm_throughput;
 
+pub use restorable_item::{
+    RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
+    SHOWN_VALUE_BYTES, validate_restorable_item,
+};
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
+};
+pub use warm_throughput::{
+    DELETE_GSI_WITH_WARM_THROUGHPUT, DELETION_PROTECTION_MUST_BE_ONLY_OPERATION,
+    INDEX_CHANGE_WITH_STREAM_CHANGE, ON_DEMAND_THROUGHPUT_NEEDS_BILLING_MODE,
+    SSE_MUST_BE_ONLY_OPERATION, TABLE_CLASS_MUST_BE_ONLY_OPERATION,
+    WARM_THROUGHPUT_MUST_BE_ONLY_OPERATION, WarmThroughputSubject,
+    validate_create_table_warm_throughput, validate_created_gsi_warm_throughput,
+    validate_warm_throughput_is_only_operation, validate_warm_throughput_on_create,
+    validate_warm_throughput_on_update,
 };
 
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
@@ -126,6 +141,7 @@ pub fn validate_create_table(
     ))?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    validate_create_table_warm_throughput(input)?;
     Ok(())
 }
 
@@ -1989,7 +2005,7 @@ pub fn validate_select_projection(
     }
     if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
         ));
     }
     Ok(())
@@ -2266,6 +2282,15 @@ pub const UPDATE_LIST_INDEX_TARGET_COST: usize = 1;
 /// `finished` is the whole finished item; `actions` are the statement's clauses
 /// with `#name` placeholders still in place, resolved here through `maps`.
 ///
+/// An update translated from a PartiQL `UPDATE` (`maps.finished_item_sizing`)
+/// is sized by the finished item alone, as
+/// [`validate_transact_update_item_size`] sizes a transacted Update: at a
+/// three-byte key, `UPDATE ... SET p = ?` writes a finished item of exactly
+/// 409,600 bytes that `UpdateItem` with `SET p = :p` refuses, two `SET`
+/// clauses or an `if_not_exists` add nothing, and one byte more is refused
+/// with the update wording, in `ExecuteStatement` and `BatchExecuteStatement`
+/// alike (measured us-east-1, 2026-11-04).
+///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the update wording when
@@ -2276,6 +2301,9 @@ pub fn validate_update_item_size(
     maps: &crate::expression::ExpressionMaps,
     max_bytes: usize,
 ) -> Result<(), DynamoDbError> {
+    if maps.finished_item_sizing {
+        return validate_transact_update_item_size(finished, max_bytes);
+    }
     let statement = if maps.legacy_attribute_updates {
         legacy_update_statement_size(finished, actions, maps)?
     } else {
@@ -2870,6 +2898,7 @@ mod tests {
             deletion_protection_enabled: None,
             table_class: None,
             on_demand_throughput: None,
+            warm_throughput: None,
         }
     }
 
@@ -3113,6 +3142,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3145,6 +3175,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3173,6 +3204,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3207,6 +3239,7 @@ mod tests {
                 read_capacity_units: 5,
                 write_capacity_units: 5,
             }),
+            warm_throughput: None,
         }]);
         let err = validate_create_table(&input, &limits).unwrap_err();
         assert!(
@@ -3235,6 +3268,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3280,6 +3314,7 @@ mod tests {
                     write_capacity_units: write,
                 }
             }),
+            warm_throughput: None,
         }]);
         input
     }
@@ -3329,6 +3364,7 @@ mod tests {
                 key_schema: vec![make_ks("gsi_pk", KeyType::Hash)],
                 projection: include(0..gsi_end),
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input.local_secondary_indexes = Some(vec![crate::types::LsiInput {
                 index_name: "my-lsi".to_owned(),
@@ -4355,7 +4391,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
         );
         assert!(
             validate_select_projection(
@@ -4475,6 +4511,7 @@ mod tests {
                 non_key_attributes: non_key,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         input.global_secondary_indexes = Some(vec![gsi(None)]);
@@ -4514,6 +4551,7 @@ mod tests {
                     non_key_attributes: non_key,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input
         };
@@ -4798,6 +4836,21 @@ mod update_size_tests {
         let mut finished = Item::new();
         finished.insert("p".to_owned(), s("0123456789"));
         assert!(validate_update_item_size(&finished, &actions, &maps, 5).is_err());
+    }
+
+    #[test]
+    fn a_partiql_update_is_sized_by_its_finished_item_alone() {
+        // The 33-byte statement of the test above is refused at 32 as an
+        // UpdateItem. Translated from a PartiQL UPDATE, only the finished item
+        // ({p: 10 bytes}, 11 bytes) counts.
+        let (actions, mut maps) = build("SET p = :v", &[("v", s("0123456789"))]);
+        maps.finished_item_sizing = true;
+        let mut finished = Item::new();
+        finished.insert("p".to_owned(), s("0123456789"));
+
+        assert!(validate_update_item_size(&finished, &actions, &maps, 11).is_ok());
+        let err = validate_update_item_size(&finished, &actions, &maps, 10).unwrap_err();
+        assert_eq!(err.to_string(), ITEM_SIZE_TO_UPDATE_EXCEEDED);
     }
 
     #[test]

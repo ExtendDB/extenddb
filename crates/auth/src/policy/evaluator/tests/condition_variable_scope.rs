@@ -3,9 +3,10 @@
 
 //! Where a condition value reads the `${key, 'default'}` form and a trimmed
 //! key name: only in a `2012-10-17` document and under a string or ARN
-//! operator. Elsewhere the text between the braces is the key name as
-//! written, as it was before the default form was read, so the default form
-//! is compared as written and `${key}` expands as before.
+//! operator, the places where a condition value expands variables at all.
+//! Elsewhere the value is not expanded and is compared as written, the
+//! default form and `${key}` alike (`condition_variables.rs`,
+//! `condition_variables_operators.rs`).
 //!
 //! The tests named after rows repeat cases measured with the IAM policy
 //! simulator on 2026-11-03, `dynamodb:GetItem`, two samples per row with the
@@ -14,9 +15,10 @@
 //! in a `2008-10-17` document, the set qualifier and `IfExists` wrapping a
 //! numeric operator, and the unresolvable key follow from the rows and were
 //! not measured. Row N4b is not repeated: IAM reads a `Bool` value written as
-//! a variable as `false`, which ExtendDB does not do for either form. Row N6
-//! (`IpAddress`) is not repeated either: ExtendDB refuses a document whose
-//! `IpAddress` value is not a CIDR, so such a value never reaches evaluation.
+//! a variable as `false`, which `condition_variables_operators.rs` covers with
+//! cells N2a to N2e. Row N6 (`IpAddress`) is not repeated either: ExtendDB
+//! refuses a document whose `IpAddress` value is not a CIDR, so such a value
+//! never reaches evaluation.
 
 use super::*;
 use serde_json::{Value, json};
@@ -292,8 +294,8 @@ fn a_defaulted_unresolvable_key_fails_closed_only_where_the_default_form_is_read
     // Deny fails closed.
     let p = deny_if(Some("2012-10-17"), "StringEquals", TEAM, value);
     assert_eq!(get(&p, &ctx), AuthzDecision::Deny);
-    // Elsewhere the value names the key `aws:PrincipalOrgID, 'blue'`, which
-    // the request does not carry, and is compared as written.
+    // Elsewhere the value is not expanded, reads no key, and is compared as
+    // written.
     let p = deny_if(Some("2008-10-17"), "StringEquals", TEAM, value);
     assert_eq!(get(&p, &ctx), AuthzDecision::Allow);
     let p = deny_if(

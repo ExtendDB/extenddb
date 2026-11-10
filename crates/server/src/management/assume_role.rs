@@ -378,11 +378,11 @@ async fn evaluate_trust_policy(
     )
 }
 
-/// Whether a trust policy's `Version` is `2012-10-17`. Its condition values
-/// then read the `${key, 'default'}` form and trim the key name, as an
-/// identity policy's do (`condition::evaluate_condition_with`); in a
-/// `2008-10-17` trust policy, or one with no `Version`, the text between the
-/// braces is the key name as written.
+/// Whether a trust policy's `Version` is `2012-10-17`. Only then do its
+/// condition values expand policy variables, as an identity policy's do
+/// (`condition::evaluate_condition_with`); a `2008-10-17` trust policy, or
+/// one with no `Version`, compares `${...}` as literal text (measured with
+/// AssumeRole on fresh roles, issue #534).
 fn trust_policy_is_version_2012(trust_policy: &Value) -> bool {
     trust_policy.get("Version").and_then(Value::as_str) == Some("2012-10-17")
 }
@@ -770,17 +770,8 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     if json_has_char_above_latin1(trust_policy) {
         return Err("Trust policy must not contain a character above U+00FF".to_owned());
     }
-    // Measured on live IAM CreateRole: a Sid is accepted only when it is empty
-    // or entirely ASCII letters and digits; a hyphen, underscore, space, dot or
-    // non-ASCII character is rejected with MalformedPolicyDocument. Identity
-    // PutUserPolicy applies the same rule (see validate_statement_sids).
-    for stmt in &statements {
-        if let Some(sid) = stmt.get("Sid").and_then(serde_json::Value::as_str)
-            && !sid.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            return Err("Trust policy Sid must be ASCII letters and digits only".to_owned());
-        }
-    }
+    trust_variable_order::validate_trust_variables(trust_policy, &statements)?;
+    trust_variable_order::validate_trust_sids(&statements)?;
     for stmt in &statements {
         validate_trust_statement(stmt)?;
     }
@@ -805,33 +796,28 @@ fn non_null(v: Option<&Value>) -> Option<&Value> {
     v.filter(|v| !v.is_null())
 }
 
-fn validate_trust_statement(stmt: &Value) -> Result<(), String> {
+fn validate_trust_effect(stmt: &Value) -> Result<(), String> {
     match stmt.get("Effect").and_then(Value::as_str) {
-        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
-        Some(e) => return Err(format!("invalid Effect: {e}")),
-        None => return Err("statement is missing Effect".to_owned()),
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => Ok(()),
+        Some(e) => Err(format!("invalid Effect: {e}")),
+        None => Err("statement is missing Effect".to_owned()),
     }
+}
+
+fn validate_trust_statement(stmt: &Value) -> Result<(), String> {
+    validate_trust_effect(stmt)?;
 
     if non_null(stmt.get("NotPrincipal")).is_some() {
-        return Err("NotPrincipal is not allowed in a trust policy".to_owned());
+        return Err(trust_variable_order::NOT_PRINCIPAL.to_owned());
     }
     match non_null(stmt.get("Principal")) {
-        None => return Err("statement is missing Principal".to_owned()),
+        None => return Err(trust_variable_order::MISSING_PRINCIPAL.to_owned()),
         Some(p) => validate_trust_principal(p)?,
     }
 
-    match (
-        non_null(stmt.get("Action")),
-        non_null(stmt.get("NotAction")),
-    ) {
-        (None, None) => return Err("statement is missing Action".to_owned()),
-        (Some(_), Some(_)) => return Err("statement has both Action and NotAction".to_owned()),
-        (Some(a), None) | (None, Some(a)) => validate_trust_actions(a)?,
-    }
+    validate_trust_actions(trust_variable_order::trust_action_field(stmt)?)?;
 
-    if non_null(stmt.get("Resource")).is_some() || non_null(stmt.get("NotResource")).is_some() {
-        return Err("Resource is not allowed in a trust policy".to_owned());
-    }
+    trust_variable_order::validate_trust_no_resource(stmt)?;
 
     if let Some(cond) = non_null(stmt.get("Condition")) {
         validate_trust_condition(cond)?;
@@ -1047,6 +1033,14 @@ async fn fetch_caller_created_at(
         }
     }
 }
+
+mod trust_variable_order;
+
+#[cfg(test)]
+mod trust_version_tests;
+
+#[cfg(test)]
+mod trust_variable_tests;
 
 #[cfg(test)]
 mod tests {

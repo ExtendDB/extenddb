@@ -83,3 +83,46 @@ def describe_stream_not_found_message(stream_arn: str) -> str:
     """What DescribeStream answers for a stream ARN that names no stream of the
     caller's account (measured 2026-10-24): the ARN, and no trailing period."""
     return f"Requested resource not found: Stream: {stream_arn} not found"
+
+
+def make_raw_client(endpoint_url: str | None, service_name: str = "dynamodb"):
+    """A boto3 client with SDK parameter validation off and retries off, so the
+    service, not the SDK, decides what a request is answered with. Used by the
+    tests that send names and ARNs the SDK's model would refuse client-side."""
+    kwargs: dict = {
+        "service_name": service_name,
+        "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        "config": botocore.config.Config(
+            parameter_validation=False, retries={"max_attempts": 0}
+        ),
+    }
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+        if endpoint_url.startswith("https://"):
+            ca_cert = os.environ.get("EXTENDDB_CA_CERT", "")
+            kwargs["verify"] = ca_cert if ca_cert else False
+    return boto3.client(**kwargs)
+
+
+MEMBER_PATTERN = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
+
+
+def assert_validation(exc, message: str) -> None:
+    """A 400 ValidationException with exactly this message."""
+    resp = exc.response
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
+    assert resp["Error"]["Code"] == "ValidationException", resp["Error"]
+    assert resp["Error"]["Message"] == message, resp["Error"]["Message"]
+
+
+def assert_member_pattern(exc, location: str, value: str) -> None:
+    """The service's one-constraint member pattern sentence, byte for byte.
+
+    The offending value is rendered inside ``Value '...'`` with a U+0000 as the
+    raw character (the JSON body carries ``\\u0000``, which the SDK decodes).
+    """
+    assert_validation(
+        exc,
+        f"1 validation error detected: Value '{value}' at '{location}' "
+        f"failed to satisfy constraint: {MEMBER_PATTERN}",
+    )

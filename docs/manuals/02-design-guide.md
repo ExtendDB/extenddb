@@ -11,9 +11,9 @@ examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
 - **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Data** (the `extenddb` PostgreSQL database for the default catalog `extenddb_catalog`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
-On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
+On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`, and its name under `data_database_name`. This allows the catalog and data databases to live on different PostgreSQL instances.
 
 ### Catalog Tables
 
@@ -40,6 +40,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
+| `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
 
 ### Data Tables
 
@@ -135,6 +136,8 @@ Credential lookups (access key ID → decrypted secret) go through each server's
 ### Record Capture
 
 Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same PostgreSQL transaction as the data write.
+
+On PostgreSQL the record waits in `stream_pending`, with no sequence number, until the write commits. GetRecords and a `LATEST` shard iterator first number one batch of the committed records of the shard they read, in the order the writes stored them: 1,000 records, or fewer once the records hold 1 MiB of JSON text. Every 250 ms a background worker numbers up to 10,000 committed records of each shard that has some, and skips a shard that another transaction numbers, so the records of a shard that nobody reads are numbered too. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past, and that consumer would never receive the record. A read returns the records whose writes committed before it started, except in three cases: more records of the shard wait for their numbers than one batch takes, another transaction numbers the shard for longer than one second, or the read's numbering fails, which the server logs as a warning. The records left waiting get higher numbers than any the read returned, from a later read or the worker, and a later read returns them. In the same three cases a `LATEST` iterator can return records whose writes committed before it was taken. The order needs `stream_seq` and `stream_pending_id_seq` to keep a cache of one value per session, which migration 7 sets; a larger cache lets a record take a number below one a consumer has read.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 

@@ -179,6 +179,23 @@ impl StorageConfig {
         self.config.startup_warnings()
     }
 
+    /// The local file the database lives in, when the backend's database is
+    /// one file on this host ([`extenddb_storage::config::StorageConfig::database_file`]).
+    #[must_use]
+    pub fn database_file(&self) -> Option<PathBuf> {
+        self.config.database_file()
+    }
+
+    /// [`Self::database_file`] with the reason a location names no usable
+    /// file ([`extenddb_storage::config::StorageConfig::database_location`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    pub fn database_location(&self) -> Result<Option<PathBuf>, String> {
+        self.config.database_location()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
     pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
@@ -423,9 +440,13 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     validated(config.try_deserialize()?)
 }
 
-/// The cross-field checks a deserialized config still has to pass.
-fn validated(config: AppConfig) -> anyhow::Result<AppConfig> {
+/// The cross-field checks a deserialized config still has to pass, and the
+/// paths made absolute while the working directory is still the shell's.
+fn validated(mut config: AppConfig) -> anyhow::Result<AppConfig> {
     config.backup.validate().map_err(|e| anyhow::anyhow!(e))?;
+    if let Ok(cwd) = std::env::current_dir() {
+        config.backup.make_paths_absolute(&cwd);
+    }
     Ok(config)
 }
 

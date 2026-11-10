@@ -32,6 +32,9 @@ mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0009_warm_throughput;
 mod postcheck;
 
 use std::time::Duration;
@@ -116,6 +119,23 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 StoreKind::Catalog,
                 &m0006_backup_catalog_index::BackupCatalogIndex,
                 m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "SQLite runs one writer at a time, so its stream records commit in the order of \
+             their sequence numbers",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "the restore progress of a store-backed restore is on table_restores (file_index, \
+             items_applied) on SQLite; the table is PostgreSQL's data database's",
+        ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0009_warm_throughput::WarmThroughput,
+                m0009_warm_throughput::SOURCE,
             )],
         },
     }
