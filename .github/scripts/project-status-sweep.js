@@ -8,7 +8,10 @@
  *
  *   Todo         issue with no assignee and no trusted open linked PR
  *   In Progress  issue assigned or with a trusted open linked PR; any PR that
- *                is a draft or has an outstanding changes-requested verdict
+ *                is a draft
+ *   Changes requested
+ *                ready PR with a changes-requested verdict from a reviewer
+ *                who has not been asked to review again: waits on the author
  *   Needs review PR that is ready (not a draft) and waits on a reviewer: no
  *                review from another person yet, or its changes-requested
  *                reviewers have all been asked to review again
@@ -24,7 +27,7 @@
  * It never touches:
  *   - closed or merged items (the board's built-in workflows set Done)
  *   - draft (board-only), inaccessible and archived items
- *   - a card whose Status is not one of the four above (e.g. Done, Blocked)
+ *   - a card whose Status is not one of the five above (e.g. Done, Blocked)
  *   - a card whose "Auto status" field is "Off" (a permanent hold)
  *   - a card a person moved by hand, until the issue, the PR, or the issue's
  *     trusted linked PR changes again. "By hand" is read from the item's
@@ -54,7 +57,7 @@ const HOLD_FIELD = 'Auto status';
 const HOLD_OFF = 'Off';
 const HEARTBEAT_PREFIX = 'Board sweep:';
 // Statuses the sweep manages, lowest to highest.
-const MANAGED = ['Todo', 'In Progress', 'Needs review', 'Review'];
+const MANAGED = ['Todo', 'In Progress', 'Changes requested', 'Needs review', 'Review'];
 const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const REVIEW_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED']);
 // Built-in board workflows that also set Status and would fight the sweep.
@@ -206,7 +209,9 @@ function prStatus(pr) {
   const blocking = verdicts.filter(
     (r) => r.state === 'CHANGES_REQUESTED' && !requested.has(r.author.login),
   );
-  if (blocking.length > 0) return 'In Progress';
+  // A reviewer asked for changes and the author has not asked them back yet:
+  // the ball is with the author.
+  if (blocking.length > 0) return 'Changes requested';
   // Every changes-requested reviewer was asked to look again: the ball is
   // back with a reviewer.
   if (verdicts.some((r) => r.state === 'CHANGES_REQUESTED')) return 'Needs review';
