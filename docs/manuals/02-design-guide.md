@@ -128,7 +128,7 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`. Each access key record stores the encrypted secret and a unique nonce.
 
-Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
+Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The server reads the encryption key that decrypts secrets once, at startup. extenddb never changes the key. A change made by hand in the `settings` table takes effect at the next restart. See Credential Storage in the Security Model, and Caching Design below.
 
 ## DynamoDB Streams Internals
 
@@ -190,7 +190,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
 | `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
-| `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
+| `encryption_key` | `Arc<str>` loaded at startup | Never: read at startup, so a change made by hand takes a restart | Decryption key for access key secrets. extenddb generates it once and never changes it |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
 

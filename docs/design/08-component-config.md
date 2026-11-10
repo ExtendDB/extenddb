@@ -120,7 +120,7 @@ statement_timeout_secs = 30
 [auth]
 provider = "builtin"     # "none" | "builtin" | "aws_iam" | future: "azure_ad"
 region = "us-east-1"     # Region for SigV4 validation
-# The credential encryption key is not a setting: `extenddb init` generates it
+# The credential encryption key is not read from this file: `extenddb init` generates it
 # and stores it in the catalog `settings` table (see docs/manuals/10-security-model.md).
 credential_cache_ttl_secs = 300
 policy_cache_ttl_secs = 300
