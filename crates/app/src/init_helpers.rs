@@ -18,7 +18,19 @@ use rustls::pki_types::{CertificateDer, pem::PemObject};
 /// the requested names, we check that the existing certificate already covers
 /// them and fail with an actionable error if it does not.
 pub fn generate_tls_cert_if_needed(bind_addr: &str, extra_sans: &[String]) -> anyhow::Result<()> {
-    let tls_dir = extenddb_config::expand_tilde("~/.extenddb/tls");
+    generate_tls_cert_in(
+        &extenddb_config::expand_tilde("~/.extenddb/tls"),
+        bind_addr,
+        extra_sans,
+    )
+}
+
+/// [`generate_tls_cert_if_needed`] with the TLS directory as a parameter.
+fn generate_tls_cert_in(
+    tls_dir: &str,
+    bind_addr: &str,
+    extra_sans: &[String],
+) -> anyhow::Result<()> {
     let cert_path = format!("{tls_dir}/cert.pem");
     let key_path = format!("{tls_dir}/key.pem");
 
@@ -39,7 +51,7 @@ pub fn generate_tls_cert_if_needed(bind_addr: &str, extra_sans: &[String]) -> an
     }
 
     println!("--- Generating self-signed TLS certificate...");
-    std::fs::create_dir_all(&tls_dir)
+    std::fs::create_dir_all(tls_dir)
         .map_err(|e| anyhow::anyhow!("Failed to create TLS directory {tls_dir}: {e}"))?;
 
     // Build SAN list: always include localhost and 127.0.0.1, plus the
@@ -74,15 +86,16 @@ pub fn generate_tls_cert_if_needed(bind_addr: &str, extra_sans: &[String]) -> an
 
     std::fs::write(&cert_path, cert.pem())
         .map_err(|e| anyhow::anyhow!("Failed to write certificate: {e}"))?;
-    std::fs::write(&key_path, key_pair.serialize_pem())
-        .map_err(|e| anyhow::anyhow!("Failed to write private key: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("Failed to set key file permissions: {e}"))?;
+    // A key.pem left by an earlier run may have been readable by others, and a
+    // descriptor opened then would read a new key written into the same file.
+    // Remove it so the new key goes into a new file, as init does for the config.
+    match std::fs::remove_file(&key_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("Failed to remove the old private key: {e}")),
     }
+    write_owner_only(&key_path, key_pair.serialize_pem().as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to write private key: {e}"))?;
 
     println!("    Certificate: {cert_path}");
     println!("    Private key: {key_path}");
@@ -247,9 +260,10 @@ backend = "{backend}"
 [server]
 bind_addr = "{bind_addr}"
 # port = 18443                   # HTTPS port
-# region = "us-east-1"           # AWS region for ARN generation
+# region = "us-east-1"           # AWS region for ARN generation; requests must be signed for this region
 # run_dir = "{run_dir}"          # Directory for PID file
 # throttling_enabled = false     # Enable provisioned throughput throttling
+# request_timeout_secs = 30      # Close a connection whose headers or body stall this long (1 to 86400)
 
 [server.tls]
 # TLS is mandatory. The server refuses to start with enabled = false.
@@ -300,6 +314,44 @@ key_path = "{tls_key}"
 # max_import_item_count = 10000000
 # max_export_item_count = 10000000
 
+# [backup]
+# Backup and restore jobs. stale_job_after_secs must be at least three
+# heartbeat periods, the larger of heartbeat_interval_secs and the 15 s the
+# in-catalog jobs heartbeat at (45 at the least); pool_size is raised to
+# at least 2 * max_concurrent_jobs + 10 on PostgreSQL; max_concurrent_jobs
+# is at most 1024.
+# data_file_target_bytes = 67108864    # Uncompressed bytes per data file (minimum 32 MiB)
+# heartbeat_interval_secs = 15         # Job heartbeat timer
+# stale_job_after_secs = 300           # Heartbeat age after which a job's owner is dead
+# failed_row_retention_secs = 604800   # FAILED tombstones kept for the operator (7 days)
+# reconcile_interval_secs = 60         # Reconciler cycle
+# max_concurrent_jobs = 4              # Backup and restore jobs running at once on this instance
+# spool_path = "/var/lib/extenddb/spool" # Restore download area for an S3 store; required
+#                                        # with an S3 store except on file-backed SQLite, where
+#                                        # it defaults to backup-spool/ beside the database file
+
+# [backup.store]
+# Where CreateBackup writes its backups on PostgreSQL, SQLite and MongoDB
+# (CreateBackup answers CREATING and a job of the server uploads; Cassandra
+# writes in-catalog backups with or without a store), and where restores and
+# deletes of store-backed backups read. Absent on file-backed SQLite: a filesystem
+# store at backups/ beside the database file. Absent on PostgreSQL, MongoDB,
+# Cassandra and an in-memory SQLite database: no store, and CreateBackup
+# writes in-catalog backups with a deprecation warning. kind = "disabled"
+# opts out on any backend. Instances that share a catalog must share one
+# store root (an S3 bucket and prefix, or a shared mount).
+# kind = "filesystem"                  # "filesystem" | "s3" | "disabled"
+# [backup.store.filesystem]
+# path = "/var/lib/extenddb/backups"   # Must exist, owned by the extenddb user, mode 0700
+# [backup.store.s3]
+# bucket = "my-extenddb-backups"
+# prefix = "extenddb/"                 # Optional key prefix
+# region = "us-east-1"                 # Optional; the AWS SDK's chain otherwise
+# endpoint = "http://127.0.0.1:9000"   # Optional, for an S3-compatible server
+# force_path_style = true              # Required with an http:// endpoint
+# upload_part_size_bytes = 8388608     # 5 MiB to 5 GiB
+# max_concurrent_uploads = 4
+
 # [import]
 # paths = []                     # Allowed directories for import operations
 
@@ -315,32 +367,43 @@ key_path = "{tls_key}"
     Ok(())
 }
 
-/// Write `contents` to `path` so that no other user can read it at any point:
-/// a new file is created 0600, and an existing one is narrowed to 0600 before
-/// it is truncated and rewritten. The config can carry the PostgreSQL
-/// connection string's password and the Cassandra application password.
+/// Write `contents` to a new file at `path` with mode 0600 throughout. The
+/// write fails if `path` exists, so callers remove an existing file first, as
+/// init does for the config and the TLS key. The config can carry the
+/// `PostgreSQL` connection string's password and the Cassandra application
+/// password, and the TLS key file holds the server's private key.
 fn write_owner_only(path: &str, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    open_owner_only(path)?.write_all(contents)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if std::path::Path::new(path).exists() {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
+        use std::os::unix::fs::PermissionsExt;
+        // The umask can narrow `mode` further; this pins the result at 0600.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Create `path` for writing with mode 0600, so other users have no access
+/// before any byte is written. The open fails if `path` exists, also when it
+/// is a symlink: a file that existed may be open in another user's process,
+/// and a symlink would put the contents where it points.
+fn open_owner_only(path: &str) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        // `mode` applies only when the file is created, and the umask can only
-        // narrow it; this pins the result for both paths.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .open(path)
     }
     #[cfg(not(unix))]
     {
-        std::fs::File::create(path)?.write_all(contents)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     }
 }
 
@@ -356,12 +419,9 @@ mod write_owner_only_tests {
             & 0o777
     }
 
-    /// The config is 0600 from creation, and an existing world-readable one
-    /// is narrowed before the new contents (with a password) are written.
-    #[test]
-    fn the_config_is_never_readable_by_others() {
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "extenddb-write-owner-only-{}-{}",
+            "extenddb-write-owner-only-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -369,6 +429,68 @@ mod write_owner_only_tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A new file is 0600 as soon as it exists, before any byte of the TLS key
+    /// or the config is written to it.
+    #[test]
+    fn a_new_file_is_owner_only_before_any_bytes_are_written() {
+        let dir = scratch_dir("open");
+        let control = dir.join("control");
+        std::fs::File::create(&control).expect("control file");
+        let group_and_other_bits = mode(&control) & 0o077;
+        if group_and_other_bits == 0 {
+            // The umask removes every group and other bit (umask 077 does), so
+            // a plain create is 0600 too and this test cannot tell them apart.
+            eprintln!("skipped: under this umask a plain create has no group or other bits");
+            std::fs::remove_dir_all(&dir).expect("cleanup");
+            return;
+        }
+        let path = dir.join("key.pem");
+
+        let file = super::open_owner_only(path.to_str().expect("utf-8 path")).expect("create");
+        assert_eq!(file.metadata().expect("metadata").len(), 0);
+        assert_eq!(mode(&path), 0o600);
+
+        drop(file);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A key.pem left without its cert.pem and readable by others is replaced
+    /// by a new 0600 file, so a descriptor opened on the old file still reads
+    /// only the old contents.
+    #[test]
+    fn a_left_over_key_is_replaced_by_a_new_owner_only_file() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = scratch_dir("tls");
+        let key = dir.join("key.pem");
+        std::fs::write(&key, b"old").expect("old key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mut old = std::fs::File::open(&key).expect("open old key");
+        let old_ino = old.metadata().expect("metadata").ino();
+
+        super::generate_tls_cert_in(dir.to_str().expect("utf-8 path"), "127.0.0.1", &[])
+            .expect("generate");
+
+        assert_ne!(std::fs::metadata(&key).expect("metadata").ino(), old_ino);
+        assert_eq!(mode(&key), 0o600);
+        let mut seen = String::new();
+        old.read_to_string(&mut seen).expect("read old descriptor");
+        assert_eq!(seen, "old");
+
+        drop(old);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// The config is 0600 from creation. A write to a path that exists fails
+    /// and leaves that file as it was, so the new contents (with a password)
+    /// never go into a file that was readable by others.
+    #[test]
+    fn the_config_is_never_readable_by_others() {
+        let dir = scratch_dir("config");
         let path = dir.join("e.toml");
         let p = path.to_str().expect("utf-8 path");
 
@@ -377,9 +499,30 @@ mod write_owner_only_tests {
         assert_eq!(std::fs::read(&path).expect("read"), b"first");
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        super::write_owner_only(p, b"password = \"s\"").expect("overwrite");
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(std::fs::read(&path).expect("read"), b"password = \"s\"");
+        let err = super::write_owner_only(p, b"password = \"s\"").expect_err("existing file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(mode(&path), 0o644);
+        assert_eq!(std::fs::read(&path).expect("read"), b"first");
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A symlink at the path is not followed: the write fails, and the file
+    /// the symlink points to keeps its contents and its mode.
+    #[test]
+    fn a_symlink_at_the_path_is_not_followed() {
+        let dir = scratch_dir("symlink");
+        let target = dir.join("target");
+        std::fs::write(&target, b"other").expect("target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let link = dir.join("key.pem");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = super::write_owner_only(link.to_str().expect("utf-8 path"), b"secret")
+            .expect_err("symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).expect("read"), b"other");
+        assert_eq!(mode(&target), 0o644);
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }

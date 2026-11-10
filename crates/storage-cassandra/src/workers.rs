@@ -427,7 +427,8 @@ async fn gsi_apply_index(
 ) -> Result<(), extenddb_storage::error::StorageError> {
     use crate::data::ddl::all_sort_key_info;
     use crate::data::index::{
-        delete_index_row_multi, insert_index_row_multi, item_has_index_keys, project_item_for_index,
+        delete_index_row_multi, insert_index_row_multi, item_has_index_keys,
+        project_item_for_index, same_index_row,
     };
     use cdrs_tokio::consistency::Consistency;
     use cdrs_tokio::query::BatchQueryBuilder;
@@ -437,10 +438,27 @@ async fn gsi_apply_index(
     let idx_sks = all_sort_key_info(&idx.key_schema, &context.attribute_definitions);
     let base_sks = all_sort_key_info(&context.base_key_schema, &context.attribute_definitions);
 
+    // The entry's stamp is the base-row version its write committed, so a
+    // later version's tombstone beats an earlier version's insert on the index
+    // table even when the worker applies the entries in the other order.
     let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+    if let Some(stamp) = context.index_stamp {
+        batch = batch.with_timestamp(stamp);
+    }
 
-    if let Some(old) = old_item
-        && item_has_index_keys(old, &idx.key_schema)
+    let old_indexed = old_item.filter(|old| item_has_index_keys(old, &idx.key_schema));
+    let new_indexed = new_item.filter(|new| item_has_index_keys(new, &idx.key_schema));
+    // Same rule as sync_indexes: one row deleted and re-inserted at one
+    // timestamp ends up deleted, so an unchanged index row is only rewritten.
+    let same_row = match (old_indexed, new_indexed) {
+        (Some(old), Some(new)) => {
+            same_index_row(old, new, &idx.key_schema, &context.base_key_schema)
+        }
+        _ => false,
+    };
+
+    if let Some(old) = old_indexed
+        && !same_row
     {
         delete_index_row_multi(
             &mut batch,
@@ -451,12 +469,11 @@ async fn gsi_apply_index(
             &context.base_key_schema,
             &idx_sks,
             &base_sks,
+            None,
         )?;
     }
 
-    if let Some(new) = new_item
-        && item_has_index_keys(new, &idx.key_schema)
-    {
+    if let Some(new) = new_indexed {
         let projected = project_item_for_index(
             new,
             &idx.key_schema,
@@ -473,6 +490,7 @@ async fn gsi_apply_index(
             &context.base_key_schema,
             &idx_sks,
             &base_sks,
+            None,
         )?;
     }
 
@@ -497,11 +515,14 @@ async fn gsi_apply_index(
 /// same way: drop+recreate the data table and rerun the backfill. Once
 /// `shutdown` fires it takes no further index, and it returns only after the
 /// backfills it started have ended, so the server's stop covers them too.
+///
+/// It scans every account keyspace, or only `only_keyspace` when one is given.
 pub(crate) async fn poll_gsi_backfill_recovery(
     engine: Arc<CassandraEngine>,
     notify: Arc<tokio::sync::Notify>,
     stale_threshold: Duration,
     scan_interval: Duration,
+    only_keyspace: Option<String>,
     shutdown: CancellationToken,
 ) {
     let mut backfills = tokio::task::JoinSet::new();
@@ -514,13 +535,16 @@ pub(crate) async fn poll_gsi_backfill_recovery(
         // Collect the backfills that have ended.
         while backfills.try_join_next().is_some() {}
 
-        let keyspaces = match list_account_keyspaces(&engine).await {
+        let mut keyspaces = match list_account_keyspaces(&engine).await {
             Ok(ks) => ks,
             Err(e) => {
                 tracing::warn!("gsi_recovery: list keyspaces failed: {e}");
                 continue;
             }
         };
+        if let Some(only) = &only_keyspace {
+            keyspaces.retain(|account_ks| account_ks == only);
+        }
 
         for account_ks in &keyspaces {
             if shutdown.is_cancelled() {
@@ -545,28 +569,62 @@ pub(crate) async fn poll_gsi_backfill_recovery(
 }
 
 /// The GSI backfill recovery worker `serve` runs, with the stale threshold
-/// and scan interval given, until `shutdown` fires; for tests.
+/// and scan interval given, until `shutdown` fires; for tests. It scans only
+/// the keyspace of `account_id`: the tests of one binary share one catalog,
+/// and a worker that scanned every keyspace would also run the backfills of
+/// the indexes other tests create.
 #[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]
 #[must_use]
 pub fn spawn_gsi_backfill_recovery_for_tests(
     engine: Arc<CassandraEngine>,
+    account_id: &str,
     stale_threshold: Duration,
     scan_interval: Duration,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let notify = engine.gsi_backfill_notify.clone();
+    let keyspace = engine.account_keyspace(account_id);
     tokio::spawn(poll_gsi_backfill_recovery(
         engine,
         notify,
         stale_threshold,
         scan_interval,
+        Some(keyspace),
         shutdown,
     ))
 }
 
-/// Rerun the stale backfills of `account_ks`, each in a task of
-/// `backfills` that stops once `shutdown` fires.
+/// One pass of the GSI backfill recovery over the keyspace of `account_id`,
+/// returning once the backfills it started have ended; for tests.
+///
+/// # Errors
+///
+/// The error that ended the pass, after its backfills have ended.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub async fn recover_stale_gsi_backfills_for_tests(
+    engine: &Arc<CassandraEngine>,
+    account_id: &str,
+    stale_threshold: Duration,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    let mut backfills = tokio::task::JoinSet::new();
+    let pass = recover_stale_backfills(
+        engine,
+        &engine.account_keyspace(account_id),
+        stale_threshold,
+        &CancellationToken::new(),
+        &mut backfills,
+    )
+    .await;
+    while backfills.join_next().await.is_some() {}
+    pass
+}
+
+/// Rerun the stale backfills of the indexes of tables in `account_ks`, each
+/// in a task of `backfills` that stops once `shutdown` fires. An index of a
+/// table in another account's keyspace is left to the pass over that
+/// keyspace.
 async fn recover_stale_backfills(
     engine: &Arc<CassandraEngine>,
     account_ks: &str,
@@ -616,28 +674,12 @@ async fn recover_stale_backfills(
         let proj_json: String =
             crate::cassandra_util::get_column(&row, "projection", "gsi_recovery")?;
 
-        let index_key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-            match serde_json::from_str(&ks_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("gsi_recovery: bad key_schema for {index_name}: {e}");
-                    continue;
-                }
-            };
-        let projection: extenddb_core::types::Projection = match serde_json::from_str(&proj_json) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("gsi_recovery: bad projection for {index_name}: {e}");
-                continue;
-            }
-        };
-
-        // Fetch base table key_schema + attribute_definitions.
+        // Fetch the base table's account, key_schema and attribute_definitions.
         let base_row =
             match crate::cassandra_util::query_optional::<extenddb_storage::error::StorageError>(
                 &engine.session,
                 &format!(
-                    "SELECT key_schema, attribute_definitions \
+                    "SELECT account_id, key_schema, attribute_definitions \
                  FROM {catalog_ks}.tables WHERE table_id = ? ALLOW FILTERING"
                 ),
                 cdrs_tokio::query_values!(table_id.as_str()),
@@ -657,6 +699,34 @@ async fn recover_stale_backfills(
                     continue;
                 }
             };
+
+        // The catalog holds the indexes of every account. Another account's
+        // index is recovered by the pass over its own keyspace; recovering it
+        // here would create its data table in this keyspace and run a
+        // backfill of a base table this keyspace does not hold. It is
+        // skipped before its definition is parsed, so a malformed row is
+        // reported by its owner's pass alone.
+        let owner: String =
+            crate::cassandra_util::get_column(&base_row, "account_id", "gsi_recovery_base")?;
+        if engine.account_keyspace(&owner) != account_ks {
+            continue;
+        }
+
+        let index_key_schema: Vec<extenddb_core::types::KeySchemaElement> =
+            match serde_json::from_str(&ks_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("gsi_recovery: bad key_schema for {index_name}: {e}");
+                    continue;
+                }
+            };
+        let projection: extenddb_core::types::Projection = match serde_json::from_str(&proj_json) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("gsi_recovery: bad projection for {index_name}: {e}");
+                continue;
+            }
+        };
 
         let base_ks_json: String =
             crate::cassandra_util::get_column(&base_row, "key_schema", "gsi_recovery_base")?;

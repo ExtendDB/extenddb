@@ -4,8 +4,9 @@
 //! Direct storage-trait integration tests, ported from the original
 //! extenddb-cassandra-plugin repository (its tests/rust suite). They exercise
 //! the Cassandra engine's trait implementations directly against a live node
-//! at 127.0.0.1:9042 — no HTTP server in between — and skip themselves when
-//! no Cassandra is reachable (see helpers::skip_without_cassandra).
+//! at the contact point in `EXTENDDB_TEST_CASSANDRA_CONTACT_POINT` (default
+//! 127.0.0.1:9042) — no HTTP server in between — and skip themselves when no
+//! Cassandra is reachable (see helpers::skip_without_cassandra).
 //!
 //! One binary, one module per area, sharing tests/common/mod.rs, which is the
 //! in-tree descendant of the plug-in repo's helpers.rs.
@@ -39,6 +40,8 @@ mod keyspace_migrations;
 mod metadata_engine;
 #[path = "direct/policies.rs"]
 mod policies;
+#[path = "direct/pool_size.rs"]
+mod pool_size;
 #[path = "direct/put_get_item.rs"]
 mod put_get_item;
 #[path = "direct/query.rs"]
@@ -51,6 +54,10 @@ mod scan;
 mod settings_store;
 #[path = "direct/snapshot_engine.rs"]
 mod snapshot_engine;
+#[path = "direct/stream_disable.rs"]
+mod stream_disable;
+#[path = "direct/stream_endings.rs"]
+mod stream_endings;
 #[path = "direct/stream_ownership.rs"]
 mod stream_ownership;
 #[path = "direct/streams.rs"]

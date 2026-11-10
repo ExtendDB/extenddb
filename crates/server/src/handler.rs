@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
 use extenddb_engine::OperationContext;
 use serde_json::Value;
@@ -48,14 +48,31 @@ pub(crate) async fn handle_request(
     }
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // SP-WIRE-007: body limit exceeded → 413
-    let Ok(body) = body else {
-        return error_response(
-            &DynamoDbError::RequestEntityTooLargeException(
-                "Request size has exceeded the maximum allowed size".to_owned(),
-            ),
-            &request_id,
-        );
+    // A repeated `host` or `authorization` header was refused before routing
+    // (see `repeated_headers`), so each is read as one value from here on.
+
+    // SP-WIRE-007: body limit exceeded → 413. Any other failure to read the
+    // body is the body timeout (the client stopped sending) → 408.
+    let body = match body {
+        Ok(body) => body,
+        Err(axum::extract::rejection::BytesRejection::FailedToBufferBody(
+            axum::extract::rejection::FailedToBufferBody::LengthLimitError(_),
+        )) => {
+            return error_response(
+                &DynamoDbError::RequestEntityTooLargeException(
+                    "Request size has exceeded the maximum allowed size".to_owned(),
+                ),
+                &request_id,
+            );
+        }
+        Err(_) => {
+            return (
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                [(axum::http::header::CONNECTION, "close")],
+                "request body was not received within the server's request timeout",
+            )
+                .into_response();
+        }
     };
 
     // Extract operation from X-Amz-Target
@@ -108,6 +125,7 @@ pub(crate) async fn handle_request(
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;
+    let item_authorizer;
     {
         if state.catalog_store.is_none() {
             tracing::error!("Authorization required but catalog_store is not configured");
@@ -140,6 +158,9 @@ pub(crate) async fn handle_request(
             Ok(ki) => authorized_key_info = ki,
             Err(e) => return error_response(&e, &request_id),
         }
+        // The engine authorizes each PartiQL statement through it.
+        item_authorizer =
+            crate::item_authz::for_request(&state, identity, &account_id, source_ip, user_agent);
     }
     #[allow(clippy::cast_precision_loss)]
     let authz_us = authz_start.elapsed().as_micros() as f64;
@@ -147,6 +168,7 @@ pub(crate) async fn handle_request(
     // Dispatch
     let ctx = OperationContext {
         storage: state.storage.clone(),
+        backup: state.backup_runtime.clone(),
         limits: state.limits.clone(),
         region: state.region.clone(),
         account_id,
@@ -157,6 +179,7 @@ pub(crate) async fn handle_request(
         table_key_info_lookup: Some(
             state.table_key_info_cache.clone() as Arc<dyn extenddb_storage::TableKeyInfoLookup>
         ),
+        item_authorizer: Some(item_authorizer),
     };
 
     let table_name = extract_table_name(&input);

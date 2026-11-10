@@ -14,12 +14,11 @@ mod migrations_support;
 use std::collections::BTreeMap;
 
 use bson::{Document, doc};
-use extenddb_storage::migrations::{CatalogStatus, MigrationBackend};
+use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, MigrationId};
 use extenddb_storage_mongodb::migrations::{Definitions, MongoMigrations, describe_store};
 use migrations_support::{Deployment, fixture, server};
 use serde_json::Value;
 
-const CATALOG_EXPECTED: &str = include_str!("../migrations/catalog/0001_baseline.expected.json");
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
 const STATES: [&str; 4] = ["0.1.12", "0.1.13", "0.1.14", "dotted-ttl"];
 
@@ -136,9 +135,7 @@ fn golden(name: &str, value: &Value) {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install() {
     let Some(uri) = server() else { return };
-    let mut expected_catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).unwrap();
-    // Migration 5 drops continuous_backups, which migration 1 creates.
-    expected_catalog.remove("continuous_backups");
+    let expected_catalog = migrations_support::expected_catalog();
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).unwrap();
     let fresh = Deployment::new(&uri, "freshkeys").await;
     fresh.create().await;
@@ -164,12 +161,18 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 6, "{state}");
+        assert_eq!(pending.len(), 10, "{state}");
         let report = d.migrate().await.expect("migrate");
-        assert_eq!((report.from, report.to), (None, Some(5)), "{state}");
+        assert_eq!(
+            (report.from, report.to),
+            (None, Some(MigrationId::LATEST.number())),
+            "{state}"
+        );
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 5 },
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            },
             "{state}"
         );
 
@@ -215,6 +218,55 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
         assert_eq!(keys, fresh_keys, "{state}");
         let history = Deployment::documents(&d.catalog(), "schema_history").await;
         assert_eq!(history.len(), 1, "{state}");
+        d.drop_databases().await;
+    }
+}
+
+/// The indexes of the data database's `stream_shards`, by name, with their
+/// keys.
+async fn stream_shards_indexes(d: &Deployment) -> BTreeMap<String, Document> {
+    use futures::TryStreamExt;
+    let models: Vec<mongodb::IndexModel> = d
+        .data()
+        .collection::<Document>("stream_shards")
+        .list_indexes()
+        .await
+        .expect("list the stream_shards indexes")
+        .try_collect()
+        .await
+        .expect("read the stream_shards indexes");
+    models
+        .into_iter()
+        .map(|m| (m.options.and_then(|o| o.name).unwrap_or_default(), m.keys))
+        .collect()
+}
+
+/// The `{table_id, shard_id}` index on `stream_shards`, which no release
+/// before 1.0 created: every released data database has only the unique
+/// `shard_id` index, and the `migrate --yes` that adopts it adds the index
+/// with migration 1's data step. A second run applies nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_adds_the_stream_shards_table_index_to_every_released_data_database() {
+    let Some(uri) = server() else { return };
+    for state in STATES {
+        let d = Deployment::new(&uri, "shardindex").await;
+        fixture::load(&d, &fixture::read(state)).await;
+        let before = stream_shards_indexes(&d).await;
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["_id_", "shard_id_1"],
+            "{state}"
+        );
+        d.migrate().await.expect("migrate");
+        let after = stream_shards_indexes(&d).await;
+        assert_eq!(
+            after.get("table_id_1_shard_id_1"),
+            Some(&doc! { "table_id": 1, "shard_id": 1 }),
+            "{state}: {after:?}"
+        );
+        let again = d.migrate().await.expect("second migrate");
+        assert!(again.applied.is_empty(), "{state}: {again:?}");
+        assert_eq!(stream_shards_indexes(&d).await, after, "{state}");
         d.drop_databases().await;
     }
 }
@@ -285,6 +337,101 @@ async fn migration_2_rewrites_the_released_policies_as_the_golden_file_records()
     golden(
         "0002_resource_tag_condition_keys",
         &serde_json::json!({ "policies": policies, "notes": notes }),
+    );
+    d.drop_databases().await;
+}
+
+/// Migration 6's body on the oldest released catalog holding three restore
+/// registrations: a finished restore (ACTIVE), one handed to the index
+/// backfill worker at the stop (CREATING with `restore_backfill_pending`),
+/// and one the stop interrupted (CREATING). Each gets its job record, the
+/// first two DONE and completed at the table's creation, the third RUNNING
+/// with the epoch heartbeat and generation 0, which the committed golden
+/// file pins with the ledger row's notes. A reconverge runs the body again
+/// and changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_backfills_the_released_restore_registrations_as_the_golden_file_records() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "golden6").await;
+    fixture::load(&d, &fixture::read("0.1.12")).await;
+    let tables = d.catalog().collection::<Document>("tables");
+    let created = bson::DateTime::from_millis(1_700_000_000_000);
+    for (name, status, handed) in [
+        ("golden6_done", "ACTIVE", false),
+        ("golden6_handed", "CREATING", true),
+        ("golden6_interrupted", "CREATING", false),
+    ] {
+        let mut table = doc! {
+            "_id": { "account_id": "123456789012", "table_name": name },
+            "table_id": format!("golden6-{name}"),
+            "table_status": status,
+            "creation_date_time": created,
+            "restore_source_backup_arn":
+                "arn:aws:dynamodb:us-east-1:123456789012:table/src/backup/01700000000000-0000000a",
+            "restore_operation_id": "old-operation",
+            "restore_heartbeat_at": created,
+        };
+        if handed {
+            table.insert("restore_backfill_pending", true);
+        }
+        tables.insert_one(table).await.unwrap();
+    }
+    d.migrate().await.expect("migrate");
+    let registrations = || async {
+        let mut found: Vec<Value> = Vec::new();
+        for t in Deployment::documents(&d.catalog(), "tables").await {
+            if !t.contains_key("restore_source_backup_arn") {
+                continue;
+            }
+            let job = t.get_document("restore_job").expect("a job record");
+            let earlier: Vec<&str> = ["restore_operation_id", "restore_heartbeat_at"]
+                .into_iter()
+                .filter(|f| t.contains_key(*f))
+                .collect();
+            found.push(serde_json::json!({
+                "table": t.get_document("_id").unwrap().get_str("table_name").unwrap(),
+                "table_status": t.get_str("table_status").unwrap(),
+                "status": job.get_str("status").unwrap(),
+                "kind": job.get_str("kind").unwrap(),
+                "owner_generation": job.get_i64("owner_generation").unwrap(),
+                "heartbeat_at": job.get_datetime("heartbeat_at").unwrap().timestamp_millis(),
+                "completed_at_creation": job
+                    .get_datetime("completed_at")
+                    .ok()
+                    .map(|at| Some(at) == t.get_datetime("creation_date_time").ok()),
+                "earlier_fields": earlier,
+            }));
+        }
+        found.sort_by_key(|v| v["table"].as_str().unwrap().to_owned());
+        found
+    };
+    let found = registrations().await;
+    let catalog_id = d.setting("catalog_id").await.expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(&catalog_id).is_ok(), "{catalog_id}");
+    let rows = d.catalog_ledger().await;
+    let row = rows
+        .iter()
+        .find(|r| r.id == MigrationId::BackupCatalogIndex.number())
+        .expect("migration 6's row");
+    let notes: Vec<&str> = row.notes.lines().collect();
+    golden(
+        "0006_backup_catalog_index",
+        &serde_json::json!({ "registrations": found, "notes": notes }),
+    );
+
+    let reconverged = d.reconverge().await.expect("reconverge");
+    assert!(
+        reconverged
+            .applied
+            .iter()
+            .any(|step| step.id == row.id && step.notes.is_empty()),
+        "{reconverged:?}"
+    );
+    assert_eq!(registrations().await, found);
+    assert_eq!(
+        d.setting("catalog_id").await,
+        Some(catalog_id),
+        "the catalog id is kept"
     );
     d.drop_databases().await;
 }
@@ -401,7 +548,12 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
             .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
         "{report:?}"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 5 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert_eq!(
         documents(Deployment::documents(&d.catalog(), "iam_policies").await),
         before

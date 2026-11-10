@@ -373,7 +373,9 @@ Simple collation is used whenever the tuple contains a string component.
 }
 ```
 
-Unique index on `shard_id`. Four shards per stream-enabled table.
+Unique index on `shard_id`, and an index on `(table_id, shard_id)`, by which
+every streamed write and every stream read finds a table's shards in shard id
+order. Four shards per stream-enabled table.
 
 `shard_id` embeds `table_id` (a UUID) rather than `table_name`. Table
 names are only unique per-account; a name-derived scheme would let one
@@ -837,6 +839,13 @@ opens the engine, and refuses a catalog with pending migrations or with a
 breaking migration this binary does not know, as on every backend.
 [ADR-0023](../adr/0023-catalog-migrations.md) records the design.
 
+The factory registers and reads the status before it builds the engine
+or starts the startup key repair, so a server that refuses has written
+nothing but its registration, which it deletes. A command that opens
+the catalog beside a server (`ServerComponentsOptions::beside_server`:
+`extenddb backup list`, the purge's dry run) starts no repair; the
+server does.
+
 ## 6. Crate Structure
 
 ```
@@ -994,7 +1003,6 @@ uuid.workspace = true
 base64.workspace = true
 rand.workspace = true
 bcrypt.workspace = true
-aes-gcm.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
