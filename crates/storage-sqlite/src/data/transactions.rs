@@ -162,6 +162,23 @@ impl SqliteEngine {
             });
         }
 
+        // Item history for every member at one instant, so a reconstruct
+        // holds all of the transaction or none of it.
+        #[cfg(feature = "pitr")]
+        {
+            let commit_time = std::time::SystemTime::now();
+            for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
+                crate::pitr::capture_in_tx(
+                    &mut tx,
+                    op_key_info(op),
+                    old_item.as_ref(),
+                    new_item.as_ref(),
+                    commit_time,
+                )
+                .await?;
+            }
+        }
+
         // Capture stream records after all writes are staged.
         for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
             let capture = match op {

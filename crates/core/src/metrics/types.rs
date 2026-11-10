@@ -193,6 +193,8 @@ pub enum QuerySource {
     TtlSweeper,
     /// Background: stream record cleanup.
     StreamCleanup,
+    /// Background: point-in-time recovery history retention.
+    PitrRetention,
     /// Background: idempotency token cleanup.
     IdempotencyCleanup,
     /// Background: metrics flush.
@@ -228,6 +230,7 @@ impl std::fmt::Display for QuerySource {
             Self::PollGsiDelay => f.write_str("PollGsiDelay"),
             Self::TtlSweeper => f.write_str("TtlSweeper"),
             Self::StreamCleanup => f.write_str("StreamCleanup"),
+            Self::PitrRetention => f.write_str("PitrRetention"),
             Self::IdempotencyCleanup => f.write_str("IdempotencyCleanup"),
             Self::MetricsFlush => f.write_str("MetricsFlush"),
             Self::MetricsPrune => f.write_str("MetricsPrune"),

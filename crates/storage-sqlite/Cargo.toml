@@ -16,6 +16,9 @@ memory = []
 # Compiles the snapshot page-size setter the consistency test uses and the
 # shared conformance check. Production builds do not compile them.
 test-hooks = ["extenddb-storage/test-hooks"]
+# Point-in-time recovery item history: the store and the write hook. Off by
+# default; the migration that creates the tables applies either way.
+pitr = ["extenddb-storage/pitr"]
 
 [dependencies]
 extenddb-core = { workspace = true }

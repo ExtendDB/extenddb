@@ -17,6 +17,9 @@ test-util = []
 # Compiles the `snapshot_conformance` check that each backend's tests run
 # against a real database. Production builds do not compile it.
 test-hooks = []
+# The item-history store trait of point-in-time recovery. Off by default; the
+# engine and the SQL backends enable it with their own `pitr` features.
+pitr = []
 
 [dependencies]
 async-trait = { workspace = true }
@@ -39,3 +42,8 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` for the retention worker's test, whose first sweep runs an
+# hour after start.
+tokio = { workspace = true, features = ["test-util"] }
