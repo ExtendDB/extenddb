@@ -111,9 +111,9 @@ jobs:
   # --no-verify writes the packages without compiling them, in seconds, and
   # runs no build script. devtools/check-crate-packages then checks the pins,
   # the LICENSE and NOTICE files, the metadata and crates.io's size limits.
-  # Compiling each package from its tarball takes minutes. That build belongs
-  # to the crates.io release workflow (follow-up work), before the upload, and
-  # not to each PR.
+  # Compiling each package from its tarball takes minutes. That build runs in
+  # the verify job of release-crates.yml, before the upload, and not on each
+  # PR.
   package:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 10
