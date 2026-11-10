@@ -55,7 +55,7 @@ use sqlx::postgres::PgConnectOptions;
 
 pub use backend::{PostgresMigrations, PostgresStores};
 pub use commands::{PostgresCatalogMigrations, resolve};
-pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, ServingRegistration};
+pub use locks::{KEEPALIVE_INTERVAL, MigrationLock, SERVE_APPLICATION, ServingRegistration};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Column, Definitions, Index, compare, describe};
 pub use registrar::ServerRegistration;
@@ -127,6 +127,46 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0005_drop_continuous_backups.sql"
             )],
         },
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0006_backup_catalog_index.sql"
+            )],
+        },
+        MigrationId::StreamPending => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0007_stream_pending.sql"
+            )],
+        },
+        MigrationId::RestoreProgress => Migration::Applies {
+            // A new table is additive by CONTRIBUTING's step 4, but declaring
+            // `Kind::Additive` needs the old-binary job, which does not exist
+            // yet (the paragraph after step 4; `refuse_additive` in
+            // `crates/bin` pins it).
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0008_restore_progress.sql"
+            )],
+        },
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0009_warm_throughput.sql"
+            )],
+        },
     }
 }
 
@@ -148,7 +188,11 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         MigrationId::Baseline
         | MigrationId::ResourceTagConditionKeys
         | MigrationId::SortKeyDefinitions
-        | MigrationId::DropContinuousBackups => RunsIn::Transaction,
+        | MigrationId::DropContinuousBackups
+        | MigrationId::BackupCatalogIndex
+        | MigrationId::StreamPending
+        | MigrationId::RestoreProgress
+        | MigrationId::WarmThroughput => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }
