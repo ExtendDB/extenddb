@@ -82,6 +82,49 @@ pub(super) async fn delete_principal_attachments(
     Ok(())
 }
 
+/// Delete the failed logins recorded under a user's sign-in name,
+/// `account_id/user_name`, inside the caller's transaction.
+///
+/// `login_attempts` is keyed by the name a login gave, not by the user, so a
+/// user created with the name of a deleted one would otherwise start with the
+/// deleted user's failures and could be refused with 429 on its first correct
+/// password. A user's delete and its create both call this: the create also
+/// clears failures recorded against the name while no user had it.
+pub(super) async fn delete_login_history(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+    user_name: &str,
+) -> OpResult<()> {
+    sqlx::query("DELETE FROM login_attempts WHERE principal = ?")
+        .bind(format!("{account_id}/{user_name}"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete user {user_name}'s login attempts: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    Ok(())
+}
+
+/// Delete the failed logins recorded under every sign-in name of an account,
+/// `account_id/<anything>`, inside the caller's transaction. A prefix
+/// comparison, not `LIKE`, so no character of the name is a wildcard.
+pub(super) async fn delete_account_login_history(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+) -> OpResult<()> {
+    let prefix = format!("{account_id}/");
+    sqlx::query("DELETE FROM login_attempts WHERE substr(principal, 1, length(?1)) = ?1")
+        .bind(&prefix)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete account {account_id}'s login attempts: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    Ok(())
+}
+
 impl SqliteCatalogStore {
     pub(crate) async fn put_policy_impl(
         &self,

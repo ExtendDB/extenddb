@@ -9,7 +9,7 @@ use extenddb_storage::management_store::{OpError, OpResult, UserDetail, UserList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
-use super::policies::{begin_write, delete_principal_attachments, finish};
+use super::policies::{begin_write, delete_login_history, delete_principal_attachments, finish};
 
 impl SqliteCatalogStore {
     pub(crate) async fn create_user_impl(
@@ -67,6 +67,7 @@ impl SqliteCatalogStore {
             // A user deleted before deletes removed these could have left its
             // inline policies and boundary under this name.
             delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+            delete_login_history(&mut tx, account_id, user_name).await?;
 
             sqlx::query(
                 "INSERT INTO iam_policies \
@@ -108,7 +109,8 @@ impl SqliteCatalogStore {
             if deleted.rows_affected() == 0 {
                 return Err(OpError::NotFound("IAM user not found".to_owned()));
             }
-            delete_principal_attachments(&mut tx, account_id, "user", user_name).await
+            delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+            delete_login_history(&mut tx, account_id, user_name).await
         }
         .await;
         finish(tx, result, "delete_user").await

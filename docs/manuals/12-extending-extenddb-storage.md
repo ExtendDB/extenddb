@@ -398,14 +398,17 @@ an inline policy or boundary grants it permissions, an access key or role
 session signs in as it, and a membership puts it in a group. So:
 
 - Deleting a user, group or role must also delete everything it owns: a
-  user's access keys, group memberships, tags, inline policies and boundary;
-  a group's inline policies and memberships; a role's inline policies,
-  boundary, tags and sessions. On PostgreSQL and SQLite the foreign keys
-  cover all of it except inline policies and boundaries, which name their
-  principal by `(principal_type, principal_name)` and are deleted in the same
-  transaction as the principal.
+  user's access keys, group memberships, tags, inline policies, boundary and
+  failed logins; a group's inline policies and memberships; a role's inline
+  policies, boundary, tags and sessions. On PostgreSQL and SQLite the foreign
+  keys cover all of it except inline policies and boundaries, which name their
+  principal by `(principal_type, principal_name)`, and failed logins, which the
+  `RateLimitStore` records under the sign-in name `account_id/user_name`. Those
+  are deleted in the same transaction as the principal. A user left with the
+  failures of a deleted one is refused with 429 on its first correct password.
 - Account deletion must cascade to all child resources (users, groups, roles,
-  policies, boundaries, access keys, memberships, tags, sessions).
+  policies, boundaries, access keys, memberships, tags, sessions), and delete
+  the failed logins recorded under any sign-in name `account_id/...`.
 - Creating a user, group or role must delete what is stored under its name
   before it exists (rows an older release's delete left behind), and only
   after its own insert succeeded, so that a create refused as a duplicate

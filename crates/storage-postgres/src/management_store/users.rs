@@ -6,7 +6,7 @@
 use extenddb_storage::management_store::{OpError, OpResult, UserDetail};
 
 use super::database_error;
-use super::policies::delete_principal_attachments;
+use super::policies::{delete_login_history, delete_principal_attachments};
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -52,6 +52,7 @@ impl PostgresCatalogStore {
         // A user deleted before deletes removed these could have left its
         // inline policies and boundary under this name.
         delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+        delete_login_history(&mut tx, account_id, user_name).await?;
 
         // Seed default self-service policy.
         let self_service_policy = serde_json::json!({
@@ -113,6 +114,7 @@ impl PostgresCatalogStore {
             }
         }
         delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+        delete_login_history(&mut tx, account_id, user_name).await?;
         tx.commit().await.map_err(|e| {
             tracing::error!("delete_user commit: {e}");
             OpError::Internal("Database error".to_owned())

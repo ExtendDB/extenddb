@@ -876,7 +876,7 @@ A default self-service policy is automatically attached, allowing the user to ma
 
 ### Delete an IAM user
 
-Deleting a user also removes its access keys, group memberships, tags, inline policies and permissions boundary. A user created later with the same name starts with only the default `SelfServicePolicy`.
+Deleting a user also removes its access keys, group memberships, tags, inline policies, permissions boundary and failed login attempts. A user created later with the same name starts with only the default `SelfServicePolicy`, and is not refused for the failed logins of the deleted one.
 
 ```bash
 ./target/release/extenddb manage --user admin --password <pw> \

@@ -356,6 +356,11 @@ everything it owns, on every backend:
 - On MongoDB and Cassandra, an account's users, groups, roles and all they
   own. Before, only the account record (and on Cassandra its backups) was
   removed, and the rest stayed in the catalog.
+- A user's failed login attempts, which the login rate limit counts by
+  sign-in name (`account_id/user_name`), and on an account's delete those of
+  every sign-in name in the account. Before, every backend kept them until they
+  aged out, so a user created with the name within the 15-minute window could
+  be refused with HTTP 429 on its first correct password.
 
 A user, group or role created later with the same name got what the deleted
 one left, and so its permissions. Now creating a user, group or role also

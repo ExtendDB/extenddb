@@ -42,7 +42,9 @@ fn now_bson() -> BsonDateTime {
 /// removes them. A record left behind would belong to the next principal
 /// created with the same name: an inline policy or boundary would grant it
 /// permissions, an access key or a role session would sign in as it, and a
-/// membership would put it in a group.
+/// membership would put it in a group. A user's failed logins are keyed by
+/// its sign-in name, `account_id/user_name`, and would count against the next
+/// user's first logins.
 fn principal_dependents(
     account_id: &str,
     principal_type: &str,
@@ -69,6 +71,10 @@ fn principal_dependents(
                 "iam_user_tags",
                 doc! { "account_id": account_id, "user_name": principal_name },
             ),
+            (
+                "failed_logins",
+                doc! { "principal": format!("{account_id}/{principal_name}") },
+            ),
         ],
         "group" => vec![
             ("iam_policies", attached),
@@ -91,6 +97,19 @@ fn principal_dependents(
         ],
         other => unreachable!("principal type {other}"),
     }
+}
+
+/// `text` with every regular-expression metacharacter escaped, for a pattern
+/// that must match it literally.
+fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if r"\^$.|?*+()[]{}/-".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The filter of a principal's own document: `{account_id, <name_field>}`.
@@ -138,10 +157,17 @@ impl MongoCatalogStore {
     /// Delete every IAM record of an account: its users, groups and roles and
     /// all they own. Each principal's own document goes last.
     async fn delete_account_iam(&self, what: &str, account_id: &str) -> OpResult<()> {
-        let records: Vec<(&str, Document)> = ACCOUNT_IAM_COLLECTIONS
+        let mut records: Vec<(&str, Document)> = ACCOUNT_IAM_COLLECTIONS
             .iter()
             .map(|collection| (*collection, doc! { "account_id": account_id }))
             .collect();
+        // Failed logins carry no `account_id`; they are keyed by sign-in name,
+        // `account_id/user_name`. An anchored prefix match on the escaped id,
+        // so no character of it is read as a pattern.
+        records.push((
+            "failed_logins",
+            doc! { "principal": { "$regex": format!("^{}/", escape_regex(account_id)) } },
+        ));
         self.delete_records(what, &records).await
     }
 

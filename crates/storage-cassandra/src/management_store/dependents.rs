@@ -111,6 +111,16 @@ impl CassandraCatalogStore {
                     what,
                 )
                 .await?;
+                // Failed logins are keyed by sign-in name, the partition key,
+                // and would count against the next user of this name.
+                let sign_in = format!("{account_id}/{principal_name}");
+                execute::<OpError>(
+                    session,
+                    &format!("DELETE FROM {ks}.login_attempts WHERE principal = ?"),
+                    query_values!(sign_in.as_str()),
+                    what,
+                )
+                .await?;
             }
             "group" => {
                 // iam_group_members is written with IF NOT EXISTS.
@@ -412,6 +422,31 @@ impl CassandraCatalogStore {
                 .await?;
             self.delete_principal_row(account_id, principal_type, name)
                 .await?;
+        }
+
+        // Failed logins under any sign-in name of the account, including names
+        // no user had. The partition key cannot be matched by prefix, so the
+        // distinct names are read and filtered here, as the attempt cleanup
+        // reads them; the table holds only recent attempts.
+        let prefix = format!("{account_id}/");
+        for principal in self
+            .select_texts(
+                &format!("SELECT DISTINCT principal FROM {ks}.login_attempts"),
+                query_values!(),
+                "principal",
+                what,
+            )
+            .await?
+            .into_iter()
+            .filter(|p| p.starts_with(&prefix))
+        {
+            execute::<OpError>(
+                self.session(),
+                &format!("DELETE FROM {ks}.login_attempts WHERE principal = ?"),
+                query_values!(principal.as_str()),
+                what,
+            )
+            .await?;
         }
         Ok(())
     }
