@@ -2996,6 +2996,29 @@ mod catalog_index {
             );
             return;
         }
+        waits_for_the_row_lock_and_then_sees_the_registration(false).await;
+    }
+
+    /// `forget_available_backup_row` runs under the same lock: the outright
+    /// removal waits in the `SELECT ... FOR UPDATE` while a registration
+    /// holds the row, then answers `InUse` and leaves the row AVAILABLE.
+    /// Without the lock it would wait in its `DELETE` instead, and then
+    /// remove the row the committed registration reads.
+    #[tokio::test]
+    async fn forget_available_backup_row_waits_for_the_row_lock_and_then_sees_the_registration() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP forget_available_backup_row_waits_for_the_row_lock_and_then_sees_the_registration: no PostgreSQL"
+            );
+            return;
+        }
+        waits_for_the_row_lock_and_then_sees_the_registration(true).await;
+    }
+
+    /// The two cells above: `start_backup_delete`, or with `remove`
+    /// `forget_available_backup_row`, against a registration holding the
+    /// row's lock.
+    async fn waits_for_the_row_lock_and_then_sees_the_registration(remove: bool) {
         let s = scratch().await;
         let row = row(ACCOUNT, "Music", "nightly");
         let key = row.key();
@@ -3049,7 +3072,24 @@ mod catalog_index {
         let engine = s.engine.clone();
         let deleting = tokio::spawn(async move {
             let key = key;
-            engine.start_backup_delete(&key).await
+            if remove {
+                engine
+                    .forget_available_backup_row(&key)
+                    .await
+                    .map(|answer| match answer {
+                        extenddb_storage::backup_catalog::ForgetRow::Removed => {
+                            DeleteStart::Deleting
+                        }
+                        extenddb_storage::backup_catalog::ForgetRow::InUse(table) => {
+                            DeleteStart::InUse(table)
+                        }
+                        extenddb_storage::backup_catalog::ForgetRow::Status(status) => {
+                            DeleteStart::Status(status)
+                        }
+                    })
+            } else {
+                engine.start_backup_delete(&key).await
+            }
         });
         // The delete is waiting on the registration's transaction, in its
         // `SELECT ... FOR UPDATE` (scoped to this database and that statement:
@@ -3070,7 +3110,7 @@ mod catalog_index {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "start_backup_delete did not wait for the row lock"
+                "the delete step (remove: {remove}) did not wait for the row lock"
             );
             assert!(
                 !deleting.is_finished(),
@@ -3090,7 +3130,7 @@ mod catalog_index {
             .await
             .expect("the delete finishes once the lock is released")
             .expect("task")
-            .expect("start_backup_delete");
+            .expect("the delete step");
         assert_eq!(answer, DeleteStart::InUse("lk_target".to_owned()));
         assert_eq!(
             s.engine
@@ -3494,6 +3534,11 @@ mod catalog_index {
             DeleteStart::InUse("del_target".to_owned())
         );
         assert_eq!(
+            s.engine.forget_available_backup_row(&key).await.unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+            "the outright removal keeps the in-use rule"
+        );
+        assert_eq!(
             s.engine
                 .read_backup_row(&arn_of(&row))
                 .await
@@ -3519,6 +3564,57 @@ mod catalog_index {
             DeleteStart::Status(BackupStatus::Deleting),
             "a retry finds the row DELETING"
         );
+        assert_eq!(
+            s.engine.forget_available_backup_row(&key).await.unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+            "only an AVAILABLE row is removed outright"
+        );
+        // An AVAILABLE row goes outright, read and listed nowhere, with no
+        // tombstone; a second removal finds no row.
+        let mut adopted = catalog_index_row(ACCOUNT, "Music", "adopted");
+        adopted.status = BackupStatus::Available;
+        assert!(s.engine.insert_backup_row(&adopted).await.expect("insert"));
+        assert_eq!(
+            s.engine
+                .forget_available_backup_row(&adopted.key())
+                .await
+                .unwrap(),
+            extenddb_storage::backup_catalog::ForgetRow::Removed
+        );
+        assert!(
+            s.engine
+                .read_backup_row(&arn_of(&adopted))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for status in [None, Some(BackupStatus::Available)] {
+            let listed: Vec<BackupRow> = s
+                .engine
+                .list_backup_rows(status, &adopted.store)
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+                "{status:?}"
+            );
+        }
+        let by_account: Vec<BackupRow> = s
+            .engine
+            .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !by_account
+                .iter()
+                .any(|r| r.backup_arn == adopted.backup_arn)
+        );
+        assert!(matches!(
+            s.engine.forget_available_backup_row(&adopted.key()).await,
+            Err(StorageError::Validation(m)) if m.contains("Backup not found")
+        ));
         assert!(
             !s.engine.remove_backup_row(&key).await.unwrap(),
             "DELETING is not a tombstone"
@@ -3943,6 +4039,150 @@ mod catalog_index {
                 .expect("ids")
                 .is_empty()
         );
+        s.cleanup().await;
+    }
+
+    /// `insert_backup_row`: the row lands as given, unowned, with
+    /// `completed_at` and `heartbeat_at` on the database's clock; a second
+    /// insert, an insert over a CREATING row a claim holds, and an insert of
+    /// the id under another account (the unique `backup_id`) answer `false`
+    /// and change nothing; a claim over the inserted row is refused; the row
+    /// is read and listed like a created one.
+    #[tokio::test]
+    async fn insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+        if base_conn().is_none() {
+            eprintln!(
+                "SKIP insert_backup_row_inserts_an_unowned_row_only_when_absent: no PostgreSQL"
+            );
+            return;
+        }
+        let s = scratch().await;
+        let mut adopted = catalog_index_row(ACCOUNT, "Music", "adopted");
+        adopted.status = BackupStatus::Available;
+        adopted.size_bytes = 1234;
+        adopted.item_count = 5;
+        // Ignored: the insert sets these three itself.
+        adopted.owner_generation = 99;
+        adopted.completed_at = None;
+        adopted.heartbeat_at = 0.0;
+        // A year before the id's instant: the two clock columns must be
+        // the database's clock at the insert, not the row's `created_at`.
+        adopted.created_at -= 365.0 * 86_400.0;
+        assert!(s.engine.insert_backup_row(&adopted).await.expect("insert"));
+        let stored = s
+            .engine
+            .read_backup_row(&arn_of(&adopted))
+            .await
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+        let completed_at = stored.completed_at.expect("completed_at is set");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs_f64();
+        for at in [completed_at, stored.heartbeat_at] {
+            assert!(
+                (at - now).abs() < 60.0,
+                "{at} is not the insert's instant {now}"
+            );
+        }
+        assert_eq!(
+            BackupRow {
+                owner_generation: 99,
+                completed_at: None,
+                heartbeat_at: 0.0,
+                ..stored.clone()
+            },
+            adopted,
+            "every other column is the row as given"
+        );
+
+        // A second insert of the key, with other values, writes nothing.
+        let mut again = adopted.clone();
+        again.backup_name = "again".to_owned();
+        again.size_bytes = 1;
+        again.status = BackupStatus::Failed;
+        assert!(!s.engine.insert_backup_row(&again).await.expect("insert"));
+        // The id under another account: the unique `backup_id`.
+        let mut elsewhere = adopted.clone();
+        elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+        elsewhere.backup_arn =
+            extenddb_storage::util::backup_arn(REGION, OTHER_ACCOUNT, "Music", &adopted.backup_id);
+        assert!(
+            !s.engine
+                .insert_backup_row(&elsewhere)
+                .await
+                .expect("insert")
+        );
+        assert!(
+            s.engine
+                .read_backup_row(&arn_of(&elsewhere))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+            Some(stored.clone()),
+            "the refused inserts changed nothing"
+        );
+        let claimed = s.engine.claim_backup(&adopted).await.err();
+        assert!(
+            matches!(claimed, Some(StorageError::AlreadyExists(_))),
+            "{claimed:?}"
+        );
+
+        // Over a CREATING row a live claim holds.
+        let creating = row(ACCOUNT, "Music", "job");
+        let claim = s.engine.claim_backup(&creating).await.expect("claim");
+        let mut over = creating.clone();
+        over.status = BackupStatus::Available;
+        assert!(!s.engine.insert_backup_row(&over).await.expect("insert"));
+        let job_row = s
+            .engine
+            .read_backup_row(&arn_of(&creating))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job_row.status, BackupStatus::Creating);
+        assert_eq!(job_row.owner_generation, claim.generation());
+
+        // Read and listed like a created row.
+        let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+            rows.into_iter().map(|r| r.backup_arn).collect()
+        };
+        let available: Vec<BackupRow> = s
+            .engine
+            .list_backup_rows(Some(BackupStatus::Available), &store())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(available, std::slice::from_ref(&stored));
+        let creating_rows: Vec<BackupRow> = s
+            .engine
+            .list_backup_rows(Some(BackupStatus::Creating), &store())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            arns(creating_rows),
+            std::slice::from_ref(&creating.backup_arn)
+        );
+        for table in [None, Some("Music")] {
+            let listed: Vec<BackupRow> = s
+                .engine
+                .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                listed.contains(&stored),
+                "{table:?}: {:?}",
+                arns(listed.clone())
+            );
+        }
+        drop(claim);
         s.cleanup().await;
     }
 
@@ -5150,9 +5390,17 @@ mod store_identity {
                 StoreKind::Filesystem,
                 &label,
                 &s.engine,
-                "postgres"
+                "postgres",
+                false
             ),
-            establish(&*store_b, StoreKind::Filesystem, &label, &other, "postgres"),
+            establish(
+                &*store_b,
+                StoreKind::Filesystem,
+                &label,
+                &other,
+                "postgres",
+                false
+            ),
         );
         let (a, b) = (a.expect("instance a"), b.expect("instance b"));
         assert_eq!(a, b, "both instances use one id");
@@ -5174,7 +5422,7 @@ mod store_identity {
                     .unwrap(),
                 std::slice::from_ref(&a.store_id)
             );
-            recheck(&*store_a, &a, engine, "postgres")
+            recheck(&*store_a, &a, engine, "postgres", false)
                 .await
                 .expect("still healthy");
         }
@@ -5214,6 +5462,7 @@ mod store_identity {
             label,
             &s.engine,
             "postgres",
+            false,
         )
         .await
         .expect("instance a");
@@ -5236,15 +5485,22 @@ mod store_identity {
             )
             .await
             .expect("available");
-        recheck(&*store_a, &a, &s.engine, "postgres")
+        recheck(&*store_a, &a, &s.engine, "postgres", false)
             .await
             .expect("a is healthy");
 
         // The second instance: its root has no file and the catalog has rows
         // for the label.
-        let err = establish(&*store_b, StoreKind::Filesystem, label, &other, "postgres")
-            .await
-            .unwrap_err();
+        let err = establish(
+            &*store_b,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err,
             StoreProblem::FileMissingWithRows(vec![a.store_id.clone()])
@@ -5261,9 +5517,16 @@ mod store_identity {
             .put(STORE_IDENTITY_KEY, byte_stream_from(file.to_bytes()))
             .await
             .unwrap();
-        let err = establish(&*store_b, StoreKind::Filesystem, label, &other, "postgres")
-            .await
-            .unwrap_err();
+        let err = establish(
+            &*store_b,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err,
             StoreProblem::ManifestMissing {
@@ -5271,16 +5534,23 @@ mod store_identity {
             }
         );
         // The first instance is unaffected.
-        recheck(&*store_a, &a, &s.engine, "postgres")
+        recheck(&*store_a, &a, &s.engine, "postgres", false)
             .await
             .expect("a stays healthy");
         // A shared root (the second instance pointed at the first's
         // directory) passes.
         let shared: Arc<dyn BackupStore> =
             Arc::new(FilesystemStore::open(root_a.path()).await.unwrap());
-        let b = establish(&*shared, StoreKind::Filesystem, label, &other, "postgres")
-            .await
-            .expect("a shared root is healthy");
+        let b = establish(
+            &*shared,
+            StoreKind::Filesystem,
+            label,
+            &other,
+            "postgres",
+            false,
+        )
+        .await
+        .expect("a shared root is healthy");
         assert_eq!(b, a);
         s.cleanup().await;
     }
@@ -5305,6 +5575,7 @@ mod store_identity {
             catalog_id: "another-catalog".to_owned(),
             backend: "sqlite".to_owned(),
             created_at_ms: 0,
+            ephemeral_catalog: false,
         };
         store
             .put(STORE_IDENTITY_KEY, byte_stream_from(foreign.to_bytes()))
@@ -5316,6 +5587,7 @@ mod store_identity {
             &label,
             &s.engine,
             "postgres",
+            false,
         )
         .await
         .unwrap_err();

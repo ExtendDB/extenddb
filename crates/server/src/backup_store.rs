@@ -41,7 +41,11 @@
 //! refusal of `open` or `validate` a startup error, and an identity failure
 //! an unhealthy store (reported on `/health`, its rows' restores and deletes
 //! refused naming the kind and the category, rechecked each cycle). A
-//! command that found no store learns why from [`NotConfigured`].
+//! command that found no store learns why from [`NotConfigured`]. `backup
+//! sync` ([`Caller::SyncCommand`]) is the one exception to the leniency: a
+//! defaulted root whose identity file names another catalog is configured
+//! and unhealthy for it, so that `--adopt-store` can adopt the root a
+//! catalog re-created by `destroy` and `init` finds.
 //!
 //! A filesystem store's `validate` and identity check run here, before the
 //! listener, bounded by [`LOCAL_CHECK_TIMEOUT`]: a root on a local disk
@@ -64,6 +68,16 @@
 //! store refuse meanwhile as they do while it is unhealthy. A `validate`
 //! refusal that is not a transport failure (a missing or denied bucket) then
 //! makes the store unhealthy rather than stopping startup.
+//!
+//! A SQLite catalog with no database file (`:memory:`, the `sqlite-memory`
+//! build's default) is new at every start, `catalog_id` included. Its
+//! store's checks write `ephemeral_catalog: true` in an identity file they
+//! create and adopt a root whose file another in-memory catalog wrote
+//! (`extenddb_engine::store_identity`'s module doc), and its startup sync
+//! is pending: the server runs it before it serves when the filesystem
+//! store's check passed here, and the reconciler runs it after the first
+//! check that passes otherwise (`extenddb_engine::sync::startup_sync`). A
+//! root a durable catalog owns stays unhealthy there as anywhere.
 //!
 //! Transport failures (the store unreachable: no region, no credentials, a
 //! refused connection) and failures of the identity check or the manifest
@@ -113,6 +127,13 @@ pub enum Caller {
     /// the directory neither created nor locked; the checks run as a
     /// server's do.
     Command,
+    /// `backup sync`: as `Command`, except that a defaulted root whose
+    /// identity file names another catalog stays configured, unhealthy,
+    /// while the catalog has no rows for it, where `Command` and `Server`
+    /// take the warning path (module doc): it is the root a catalog
+    /// re-created by `destroy` and `init` finds, and `--adopt-store` is the
+    /// command that adopts it.
+    SyncCommand,
     /// A command that reads beside a server (`backup list`, the purge's dry
     /// run): as `Command`, and no check of the store runs, so a root is left
     /// as it is found (neither the default directory nor an identity file is
@@ -148,22 +169,22 @@ impl std::fmt::Display for NotConfigured {
         match self {
             Self::Absent => f.write_str(
                 "no backup store is configured: [backup.store] is absent and this backend has \
-                 no default root, so there are no store-backed backups to list or purge",
+                 no default root, so there are no store-backed backups to list, purge or sync",
             ),
             Self::Disabled => f.write_str(
                 "no backup store is configured: [backup.store] is disabled, so there are no \
-                 store-backed backups to list or purge",
+                 store-backed backups to list, purge or sync",
             ),
             Self::DefaultRootMissing(root) => write!(
                 f,
                 "the default root {} does not exist yet: no server has run with this database \
-                 file, so there are no store-backed backups to list or purge",
+                 file, so there are no store-backed backups to list, purge or sync",
                 root.display()
             ),
             Self::DefaultRootUnusable { root, problem } => write!(
                 f,
                 "the default root {root} failed its check ({problem}) and the catalog has no \
-                 rows for it, so there are no store-backed backups to list or purge; the \
+                 rows for it, so there are no store-backed backups to list, purge or sync; the \
                  warning above says how to fix the root"
             ),
         }
@@ -383,7 +404,16 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         (StoreKind::S3, Some(s3)) => (s3.bucket.clone(), s3.prefix.clone()),
         _ => (opened.root.clone(), String::new()),
     };
-    let configured = |store: ConfiguredStore| store.with_manifest_names(bucket, key_prefix);
+    // A SQLite database with no file is in memory: its catalog is new at
+    // every start, so the store's checks mark the identity file they write
+    // and adopt a root another in-memory catalog owned, and the startup
+    // sync is pending (module doc).
+    let ephemeral_catalog = backend == "sqlite" && database_file.is_none();
+    let configured = |store: ConfiguredStore| {
+        store
+            .with_manifest_names(bucket, key_prefix)
+            .with_ephemeral_catalog(ephemeral_catalog)
+    };
 
     // The spool and its lock: configuration errors on every backend.
     let (spool, spool_lock) = match (resolved.spool_path, caller) {
@@ -391,7 +421,9 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             let (spool, lock) = take_spool(&path)?;
             (Some(spool), Some(lock))
         }
-        (Some(_), Caller::Command | Caller::ReadOnlyCommand) | (None, _) => (None, None),
+        (Some(_), Caller::Command | Caller::SyncCommand | Caller::ReadOnlyCommand) | (None, _) => {
+            (None, None)
+        }
     };
     let spool_line = spool
         .as_ref()
@@ -431,7 +463,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     // here (`run_local_checks`). A `validate` refusal is a configuration
     // error; a store condition or the identity check's failure degrades the
     // store; on the defaulted root without rows either is the warning.
-    let outcome = match run_local_checks(&*opened.store, kind, &opened.root, catalog, backend).await
+    let outcome = match run_local_checks(
+        &*opened.store,
+        kind,
+        &opened.root,
+        catalog,
+        backend,
+        ephemeral_catalog,
+    )
+    .await
     {
         LocalChecks::Done(outcome) => outcome,
         LocalChecks::Refused(e) => {
@@ -483,7 +523,12 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             opened.root,
             identity.store_id
         ),
-        Err(problem) if defaulted && !default_root_has_rows(catalog, &opened.root).await => {
+        Err(problem)
+            if defaulted
+                && !(caller == Caller::SyncCommand
+                    && matches!(problem, StoreProblem::ForeignCatalog { .. }))
+                && !default_root_has_rows(catalog, &opened.root).await =>
+        {
             let problem = problem.to_string();
             warn_default_root_unusable(&opened.root, &problem);
             return Ok(StoreSetup::without_store(
@@ -494,21 +539,55 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
                 },
             ));
         }
-        Err(problem) => tracing::error!(
-            "backup store: {kind} {} is unhealthy: {problem}; the server starts, restore and \
-             delete of a backup in the store are refused, /health reports the backup_store \
-             component unhealthy, and the check runs again each reconciler cycle{}",
-            opened.root,
-            rows_note(defaulted)
-        ),
+        Err(problem) => {
+            // The `backup sync` exception configures a defaulted root
+            // another catalog owns whether or not this catalog has rows for
+            // it; the clause says which.
+            let note = if defaulted
+                && caller == Caller::SyncCommand
+                && matches!(problem, StoreProblem::ForeignCatalog { .. })
+                && !default_root_has_rows(catalog, &opened.root).await
+            {
+                SYNC_EXCEPTION_NOTE
+            } else {
+                rows_note(defaulted)
+            };
+            if caller == Caller::Server {
+                tracing::error!(
+                    "backup store: {kind} {} is unhealthy: {problem}; the server starts, restore \
+                     and delete of a backup in the store are refused, /health reports the \
+                     backup_store component unhealthy, and the check runs again each reconciler \
+                     cycle{note}",
+                    opened.root,
+                );
+            } else if caller == Caller::SyncCommand
+                && matches!(problem, StoreProblem::ForeignCatalog { .. })
+            {
+                // `backup sync`'s own line: a root another catalog owns is
+                // the state `--adopt-store` acts on, so the line is a
+                // warning; the command's output names the owner and says
+                // whether it adopted the root or refused.
+                tracing::warn!(
+                    "backup store: {kind} {} is owned by another catalog: {problem}{note}",
+                    opened.root,
+                );
+            } else {
+                // A command's own line: no server starts, and the command
+                // says what it does with an unhealthy store.
+                tracing::error!(
+                    "backup store: {kind} {} is unhealthy: {problem}{note}",
+                    opened.root,
+                );
+            }
+        }
     }
-    let configured = configured(ConfiguredStore::new(
-        kind,
-        opened.root,
-        opened.store,
-        spool,
-        outcome,
-    ));
+    let configured = configured(
+        ConfiguredStore::new(kind, opened.root, opened.store, spool, outcome)
+            // Its health is settled here, so the flag changes no check; it
+            // tells a command's refusal that the root is the shared default
+            // one.
+            .defaulted(defaulted),
+    );
     Ok(StoreSetup::with_store(runtime, configured, spool_lock))
 }
 
@@ -525,7 +604,8 @@ enum LocalChecks {
 }
 
 /// A filesystem store's startup checks: `validate`, then
-/// [`store_identity::establish`], bounded by [`LOCAL_CHECK_TIMEOUT`] so a
+/// [`store_identity::establish`] (which, for an in-memory catalog, adopts a
+/// root another in-memory catalog owned), bounded by [`LOCAL_CHECK_TIMEOUT`] so a
 /// root on a mount that stops answering after `open` does not hold the
 /// listener. The store's synchronous filesystem calls run on the blocking
 /// pool, so the bound fires whichever call stalls; a timed-out check leaves
@@ -536,11 +616,13 @@ async fn run_local_checks<C: BackupCatalog + ?Sized>(
     root: &str,
     catalog: &C,
     backend: &str,
+    ephemeral_catalog: bool,
 ) -> LocalChecks {
     let checks = async {
         match store.validate().await {
             Ok(()) => LocalChecks::Done(
-                store_identity::establish(store, kind, root, catalog, backend).await,
+                store_identity::establish(store, kind, root, catalog, backend, ephemeral_catalog)
+                    .await,
             ),
             // A store condition, not a configuration error: the probe write
             // or the root's resolution failed (module doc).
@@ -583,6 +665,14 @@ fn rows_note(defaulted: bool) -> &'static str {
     }
 }
 
+/// The clause of the unhealthy line under the `backup sync` exception
+/// ([`Caller::SyncCommand`]): a defaulted root another catalog owns, with
+/// no rows of this catalog.
+const SYNC_EXCEPTION_NOTE: &str = " (the default root beside the database file, which every \
+     database file in that directory shares; the catalog has no backup rows for it, and it is \
+     configured for `backup sync`, so --adopt-store can adopt it from the catalog its \
+     extenddb-store.json names)";
+
 /// The warning for a defaulted root whose creation, `open`, `validate` or
 /// identity check failed while the catalog has no rows for it: the store is
 /// left unconfigured, as the module doc says.
@@ -592,9 +682,11 @@ fn warn_default_root_unusable(root: &str, problem: &str) {
          backup rows for it, so the store is unconfigured and CreateBackup writes in-catalog \
          backups. Fix the root (it must be owned by this user with mode 0700, under directories \
          owned by root or this user that others cannot write to, and its extenddb-store.json, \
-         if any, must name this catalog: a catalog re-created by `destroy` and `init` needs the \
-         old file removed or a new root), configure [backup.store] to choose another, or set \
-         kind = \"disabled\" to silence this"
+         if any, must name this catalog: a catalog re-created by `destroy` and `init` adopts the \
+         root and its backups with `extenddb backup sync --adopt-store`, once no server of the \
+         catalog the file names runs, and the root is shared by every database file in its \
+         directory), configure [backup.store] to choose another, or set kind = \"disabled\" to \
+         silence this"
     );
 }
 
@@ -967,6 +1059,12 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
             unused()
         }
+        fn insert_backup_row<'a>(
+            &'a self,
+            _row: &'a BackupRow,
+        ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+            unused()
+        }
         fn claim_dead_backup<'a>(
             &'a self,
             _key: &'a BackupKey,
@@ -1056,6 +1154,13 @@ mod tests {
             &'a self,
             _key: &'a BackupKey,
         ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+            unused()
+        }
+        fn forget_available_backup_row<'a>(
+            &'a self,
+            _key: &'a BackupKey,
+        ) -> BoxedFuture<'a, Result<extenddb_storage::backup_catalog::ForgetRow, StorageError>>
+        {
             unused()
         }
         fn remove_dead_creating_backup_row<'a>(
@@ -1293,6 +1398,62 @@ mod tests {
             "{why:?}"
         );
         assert!(why.to_string().contains("no rows for it"), "{why}");
+        // `backup sync` is the exception: the same root is a configured,
+        // unhealthy store for it, which `--adopt-store` adopts; a purge
+        // takes the warning path as the server does.
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::SyncCommand,
+        )
+        .await
+        .unwrap();
+        assert_eq!(setup.not_configured, None);
+        assert_eq!(
+            setup
+                .runtime
+                .configured_store()
+                .expect("configured for sync")
+                .health()
+                .category(),
+            Some("owned by another catalog")
+        );
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::Command,
+        )
+        .await
+        .unwrap();
+        assert!(setup.runtime.configured_store().is_none());
+        // The exception is for a root another catalog owns only: another
+        // failure of the defaulted root takes the warning path for sync too.
+        std::fs::write(root.join(store_identity::STORE_IDENTITY_KEY), b"not json").unwrap();
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::SyncCommand,
+        )
+        .await
+        .unwrap();
+        assert!(setup.runtime.configured_store().is_none());
+        assert!(
+            matches!(&setup.not_configured, Some(NotConfigured::DefaultRootUnusable { problem, .. })
+                if problem.contains("could not be read")),
+            "{:?}",
+            setup.not_configured
+        );
+        std::fs::write(
+            root.join(store_identity::STORE_IDENTITY_KEY),
+            foreign.to_bytes(),
+        )
+        .unwrap();
         // The same file over rows for the root: a configured, unhealthy
         // store (`owned by another catalog`), not the warning.
         let setup = configure_described(
@@ -1427,7 +1588,14 @@ mod tests {
         // fails here instead of hanging.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            run_local_checks(&stalled, StoreKind::Filesystem, "/r", &catalog, "test"),
+            run_local_checks(
+                &stalled,
+                StoreKind::Filesystem,
+                "/r",
+                &catalog,
+                "test",
+                false,
+            ),
         )
         .await
         .expect("the checks return at their bound");
@@ -1442,7 +1610,8 @@ mod tests {
             context: "write probe /r/.put-validate.tmp".to_owned(),
             source: std::io::Error::from_raw_os_error(28),
         }));
-        let outcome = run_local_checks(&io, StoreKind::Filesystem, "/r", &catalog, "test").await;
+        let outcome =
+            run_local_checks(&io, StoreKind::Filesystem, "/r", &catalog, "test", false).await;
         let LocalChecks::Done(Err(problem)) = outcome else {
             panic!("an I/O failure of the probe degrades the store");
         };
@@ -1452,8 +1621,15 @@ mod tests {
         let denied = FakeStore(Validate::Fails(|| {
             StoreError::PermissionDenied("/r has mode 0755".to_owned())
         }));
-        let outcome =
-            run_local_checks(&denied, StoreKind::Filesystem, "/r", &catalog, "test").await;
+        let outcome = run_local_checks(
+            &denied,
+            StoreKind::Filesystem,
+            "/r",
+            &catalog,
+            "test",
+            false,
+        )
+        .await;
         assert!(matches!(
             outcome,
             LocalChecks::Refused(StoreError::PermissionDenied(_))

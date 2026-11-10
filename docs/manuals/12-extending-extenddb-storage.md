@@ -288,8 +288,8 @@ The `storage-postgres` crate provides the default implementation:
 ### Database Architecture
 
 extenddb uses a dual-database architecture:
-- **Catalog database** (`extenddb`) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
-- **Data database** (`extenddb_data`) — DynamoDB items and index rows
+- **Catalog database** (`extenddb_catalog` by default) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
+- **Data database** (`extenddb` by default, the catalog's name without `_catalog`) — DynamoDB items and index rows
 
 ### Migrations
 
