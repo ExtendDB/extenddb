@@ -87,7 +87,9 @@ async fn a_user_or_role_of_a_deleted_account_grants_nothing() {
     let s = Scratch::new().await;
     let store = &s.store;
     store.create_account(ACCOUNT, "acct").await.unwrap();
-    let hash = bcrypt::hash("correct horse", 4).unwrap();
+    // Generated, not written in the source.
+    let password = uuid::Uuid::new_v4().to_string();
+    let hash = bcrypt::hash(&password, 4).unwrap();
     store
         .create_user(ACCOUNT, "alice", Some(&hash))
         .await
@@ -103,7 +105,7 @@ async fn a_user_or_role_of_a_deleted_account_grants_nothing() {
     );
     assert!(
         store
-            .verify_iam_user_password(ACCOUNT, "alice", "correct horse")
+            .verify_iam_user_password(ACCOUNT, "alice", &password)
             .await
             .unwrap()
     );
@@ -131,7 +133,7 @@ async fn a_user_or_role_of_a_deleted_account_grants_nothing() {
     );
     assert!(
         !store
-            .verify_iam_user_password(ACCOUNT, "alice", "correct horse")
+            .verify_iam_user_password(ACCOUNT, "alice", &password)
             .await
             .unwrap()
     );

@@ -33,7 +33,9 @@ mod tests {
         let store = crate::helpers::create_catalog_store(&engine, &config);
         let account = unique_test_account();
         store.create_account(&account, "acct").await.unwrap();
-        let hash = bcrypt::hash("correct horse", 4).unwrap();
+        // Generated, not written in the source.
+        let password = uuid::Uuid::new_v4().to_string();
+        let hash = bcrypt::hash(&password, 4).unwrap();
         store
             .create_user(&account, "alice", Some(&hash))
             .await
@@ -49,7 +51,7 @@ mod tests {
         );
         assert!(
             store
-                .verify_iam_user_password(&account, "alice", "correct horse")
+                .verify_iam_user_password(&account, "alice", &password)
                 .await
                 .unwrap()
         );
@@ -83,7 +85,7 @@ mod tests {
         );
         assert!(
             !store
-                .verify_iam_user_password(&account, "alice", "correct horse")
+                .verify_iam_user_password(&account, "alice", &password)
                 .await
                 .unwrap()
         );
