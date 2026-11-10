@@ -33,6 +33,10 @@ vector_indexes raw_vidx
   vector_attribute: {"AttributeName": "v\u0001\u0002\u0001\u0002"}
   search_schema: [{"AttributeName": "t\u0001\u0002\u0002", "SearchSchemaElementType": "HASH"}]
   projection: {"ProjectionType": "ALL"}
+backup_index plain_store_backup
+  source_table_details_json: {"key_schema": [{"KeyType": "HASH", "AttributeName": "pk"}], "table_name": "plain_tbl", "attribute_definitions": [{"AttributeName": "pk", "AttributeType": "S"}]}
+backup_index raw_store_backup
+  source_table_details_json: {"table_id": "00000000-0000-4000-8000-000000000006", "key_schema": [{"KeyType": "HASH", "AttributeName": "a\u0001\u0002\u0001\u0002z"}], "table_name": "raw_tbl", "attribute_definitions": [{"AttributeName": "a\u0001\u0002\u0001\u0002z", "AttributeType": "S"}, {"AttributeName": "g\u0001\u0002\u0002k", "AttributeType": "S"}], "global_secondary_indexes": [{"IndexName": "raw_gsi", "KeySchema": [{"KeyType": "HASH", "AttributeName": "g\u0001\u0002\u0002k"}], "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n\u0001\u0002\u0001\u0002"]}}]}
 gsi_pending 00000000-0000-4000-8000-000000000006
   index_context: {"index": {"index_id": "00000000-0000-4000-8000-000000000016", "key_schema": [{"KeyType": "HASH", "AttributeName": "g\u0001\u0002\u0002k"}], "projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["n\u0001\u0002\u0001\u0002"]}}, "base_key_schema": [{"KeyType": "HASH", "AttributeName": "a\u0001\u0002\u0001\u0002z"}], "attribute_definitions": [{"AttributeName": "a\u0001\u0002\u0001\u0002z", "AttributeType": "S"}, {"AttributeName": "g\u0001\u0002\u0002k", "AttributeType": "S"}]}
   new_item: {"a\u0001\u0001z": {"S": "x"}, "g\u0001\u0002k": {"S": "y"}}
@@ -47,5 +51,6 @@ backups.vector_indexes: 1 document rewritten
 backup_definitions.definition: 1 document rewritten
 vector_indexes.vector_attribute: 1 document rewritten
 vector_indexes.search_schema: 1 document rewritten
+backup_index.source_table_details_json: 1 document rewritten
 data notes:
 gsi_pending.index_context: 1 document rewritten

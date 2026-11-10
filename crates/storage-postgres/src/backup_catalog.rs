@@ -39,6 +39,13 @@
 //! [`extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL`] (15 s), the
 //! constant every backend runs at until `[backup] heartbeat_interval_secs`
 //! reaches the jobs in a later release.
+//!
+//! `backup_index.source_table_details_json` is the manifest's source table,
+//! whose key schema, attribute definitions and indexes carry attribute
+//! names. It is stored through the escape of `catalog_json`, as the other
+//! catalog documents that carry names are: `claim_backup` and `set_status`
+//! write it through `escape_json`, and every read reverses the escape in
+//! `row_from_tuple`.
 
 use std::time::Duration;
 
@@ -61,6 +68,7 @@ use crate::backup_engine::{
     ClaimSession, RESTORE_HEARTBEAT, backup_lock_key, generation_column, restore_lock_key,
     try_claim, try_claim_with,
 };
+use crate::catalog_json::{escape_json, unescape_json};
 use crate::create_table::RestoreSource;
 
 /// The name of a CREATING restore target registered from `backup_arn`, if
@@ -167,7 +175,7 @@ fn row_from_tuple(t: RowTuple) -> Result<BackupRow, StorageError> {
         created_at,
         completed_at,
         failure_reason,
-        source_table_details_json,
+        source_table_details_json: unescape_json(source_table_details_json),
         owner_generation: u64::try_from(owner_generation).unwrap_or_default(),
         heartbeat_at,
     })
@@ -270,7 +278,7 @@ impl JobClaim for PostgresBackupClaim {
             .bind(fields.failure_reason.as_deref())
             .bind(fields.completed)
             .bind(from.as_str())
-            .bind(fields.source_table_details_json.as_ref())
+            .bind(fields.source_table_details_json.clone().map(escape_json))
             .execute(session.connection())
             .await;
             match written {
@@ -520,7 +528,7 @@ impl BackupCatalog for PostgresEngine {
             .bind(row.size_bytes)
             .bind(row.item_count)
             .bind(row.created_at)
-            .bind(&row.source_table_details_json)
+            .bind(escape_json(row.source_table_details_json.clone()))
             .bind(generation_column(session.generation()))
             .execute(session.connection())
             .await

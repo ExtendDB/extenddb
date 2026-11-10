@@ -12,9 +12,10 @@ mod migrations_support;
 
 use std::fmt::Write as _;
 
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, DescribeTableInput};
 use extenddb_storage::migrations::{CatalogStatus, MigrationId, Runner};
-use extenddb_storage::{LegacyBackupReader, TableEngine};
+use extenddb_storage::{BackupCatalog, LegacyBackupReader, TableEngine};
 use extenddb_storage_postgres::migrations::PostgresMigrations;
 use extenddb_storage_postgres::{PostgresConfig, PostgresEngine};
 use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, golden, notes, skip};
@@ -31,6 +32,7 @@ const RAW_VECTOR: &str = "v\u{1}\u{1}";
 const RAW_HASH: &str = "t\u{1}\u{2}";
 const RAW_TABLE_ID: &str = "00000000-0000-4000-8000-000000000006";
 const RAW_INDEX_ID: &str = "00000000-0000-4000-8000-000000000016";
+const REGION: &str = "us-east-1";
 
 /// An engine on the scratch catalog.
 async fn engine(s: &Scratch) -> PostgresEngine {
@@ -149,6 +151,64 @@ async fn seed_raw_names(catalog: &PgPool, data: &PgPool) {
     .unwrap();
 }
 
+/// The backup id and the ARN of the store-backed backup of `raw_tbl` that
+/// `seed_raw_backup_index` writes.
+fn raw_store_backup_arn() -> (String, String) {
+    let backup_id = extenddb_storage::util::new_backup_id();
+    let arn = extenddb_storage::util::backup_arn(REGION, ACCOUNT, "raw_tbl", &backup_id);
+    (backup_id, arn)
+}
+
+/// Two `backup_index` rows (migration 6's table), written by SQL as a
+/// release before migration 10 wrote them: the source table of a backup of
+/// `raw_tbl`, with the raw names, and one of a table whose names hold
+/// neither character, which the rewrite leaves as it is.
+async fn seed_raw_backup_index(catalog: &PgPool, backup_id: &str, arn: &str) {
+    let raw = json!({"table_name": "raw_tbl", "table_id": RAW_TABLE_ID,
+        "key_schema": [{"AttributeName": RAW_KEY, "KeyType": "HASH"}],
+        "attribute_definitions": [{"AttributeName": RAW_KEY, "AttributeType": "S"},
+            {"AttributeName": RAW_GSI_KEY, "AttributeType": "S"}],
+        "global_secondary_indexes": [{"IndexName": "raw_gsi",
+            "KeySchema": [{"AttributeName": RAW_GSI_KEY, "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": [RAW_PROJECTED]}}]});
+    let plain = json!({"table_name": "plain_tbl",
+        "key_schema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "attribute_definitions": [{"AttributeName": "pk", "AttributeType": "S"}]});
+    for (id, table, arn, name, source) in [
+        (
+            backup_id,
+            "raw_tbl",
+            arn.to_owned(),
+            "raw_store_backup",
+            raw,
+        ),
+        (
+            "01JPLAINBACKUP0000000000000",
+            "plain_tbl",
+            "arn:plain_store_backup".to_owned(),
+            "plain_store_backup",
+            plain,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO backup_index (account_id, backup_id, table_name, backup_arn, \
+             backup_name, status, store_kind, store_root, store_id, created_at, \
+             source_table_details_json, owner_generation, heartbeat_at) VALUES ($1, $2, $3, $4, \
+             $5, 'AVAILABLE', 'filesystem', '/srv/extenddb-backups', 'store-1', now(), $6, 0, \
+             now())",
+        )
+        .bind(ACCOUNT)
+        .bind(id)
+        .bind(table)
+        .bind(&arn)
+        .bind(name)
+        .bind(&source)
+        .execute(catalog)
+        .await
+        .unwrap();
+    }
+}
+
 /// Each row's documents as `jsonb::text`, under a label, sorted by byte
 /// order.
 async fn dump_documents(pool: &PgPool, sql: &str, out: &mut String) {
@@ -171,6 +231,9 @@ async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them
     s.migrate_through(MigrationId::DropContinuousBackups).await;
     let (catalog, data) = (s.catalog().await, s.data().await);
     seed_raw_names(&catalog, &data).await;
+    s.migrate_through(MigrationId::BackupCatalogIndex).await;
+    let (backup_id, store_backup_arn) = raw_store_backup_arn();
+    seed_raw_backup_index(&catalog, &backup_id, &store_backup_arn).await;
     s.migrate_through(MigrationId::AttributeNameEscape).await;
 
     let mut out = String::new();
@@ -191,6 +254,9 @@ async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them
          vector_attribute::text, 'search_schema: ' || coalesce(search_schema::text, 'NULL'), \
          'projection: ' || projection::text] FROM vector_indexes \
          ORDER BY index_name COLLATE \"C\"",
+        "SELECT 'backup_index ' || backup_name, ARRAY['source_table_details_json: ' || \
+         source_table_details_json::text] FROM backup_index \
+         ORDER BY backup_name COLLATE \"C\"",
     ] {
         dump_documents(&catalog, sql, &mut out).await;
     }
@@ -249,6 +315,21 @@ async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them
     assert_eq!(
         definition.global_secondary_indexes[0].key_schema[0].attribute_name,
         RAW_GSI_KEY
+    );
+    let row = engine
+        .read_backup_row(&BackupArn::parse(&store_backup_arn).expect("a backup ARN"))
+        .await
+        .expect("read the backup_index row")
+        .expect("the row exists");
+    let details = &row.source_table_details_json;
+    assert_eq!(details["key_schema"][0]["AttributeName"], RAW_KEY);
+    assert_eq!(
+        details["global_secondary_indexes"][0]["KeySchema"][0]["AttributeName"],
+        RAW_GSI_KEY
+    );
+    assert_eq!(
+        details["global_secondary_indexes"][0]["Projection"]["NonKeyAttributes"][0],
+        RAW_PROJECTED
     );
     drop(engine);
     catalog.close().await;

@@ -20,8 +20,10 @@
 //! `tables.attribute_definitions`, `indexes.key_schema`, `indexes.projection`,
 //! `backups.key_schema`, `backups.attribute_definitions`,
 //! `backups.vector_indexes`, `backup_definitions.definition`,
-//! `vector_indexes.vector_attribute`, `vector_indexes.search_schema` and
-//! `vector_indexes.projection`. The data body rewrites
+//! `vector_indexes.vector_attribute`, `vector_indexes.search_schema`,
+//! `vector_indexes.projection` and `backup_index.source_table_details_json`
+//! (the source table of a store-backed backup, which migration 6 adds).
+//! The data body rewrites
 //! `gsi_pending.index_context`: a server stopped with queued index updates
 //! leaves their rows, and the next server applies them with the names in
 //! them. The item documents are not rewritten.
@@ -59,6 +61,7 @@ pub(crate) const CATALOG_DOCUMENTS: &[(&str, &[&str])] = &[
     ("backups", &["key_schema", "attribute_definitions", "vector_indexes"]),
     ("backup_definitions", &["definition"]),
     ("vector_indexes", &["vector_attribute", "search_schema", "projection"]),
+    ("backup_index", &["source_table_details_json"]),
 ];
 
 /// The data database's documents that carry attribute names.

@@ -27,8 +27,9 @@
 //! `tables.attribute_definitions`, `indexes.key_schema`, `indexes.projection`,
 //! `backups.key_schema`, `backups.attribute_definitions`,
 //! `backups.vector_indexes`, `backup_definitions.definition`,
-//! `vector_indexes.vector_attribute`, `vector_indexes.search_schema` and
-//! `vector_indexes.projection`; in the data database
+//! `vector_indexes.vector_attribute`, `vector_indexes.search_schema`,
+//! `vector_indexes.projection` and `backup_index.source_table_details_json`;
+//! in the data database
 //! `gsi_pending.index_context`. Releases before catalog migration 10
 //! (`attribute_name_escape`) stored these documents raw, and a raw name that
 //! holds U+0001 followed by U+0001 or U+0002 would read back as a different
