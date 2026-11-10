@@ -42,10 +42,10 @@ use std::time::Duration;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary, TableDescription};
 use extenddb_storage::backup_catalog::{
-    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
+    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, WriteOutcome, new_generation,
+    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -196,16 +196,17 @@ fn row_from_doc(doc: &Document) -> Result<BackupRow, StorageError> {
     })
 }
 
-/// The fields of `row` the claim's insert sets, status CREATING; the
-/// generation and the heartbeat are added by the caller.
-fn row_fields(row: &BackupRow) -> Result<Document, StorageError> {
+/// The fields of `row` an insert sets, with `status` (the claim's CREATING,
+/// or the row's own for `insert_backup_row`); the generation, the heartbeat
+/// and any completion are added by the caller.
+fn row_fields(row: &BackupRow, status: BackupStatus) -> Result<Document, StorageError> {
     let source = bson::to_bson(&row.source_table_details_json)
         .map_err(|e| StorageError::Internal(format!("serialize source_table_details_json: {e}")))?;
     Ok(doc! {
         "table_name": &row.table_name,
         "backup_arn": &row.backup_arn,
         "backup_name": &row.backup_name,
-        "status": BackupStatus::Creating.as_str(),
+        "status": status.as_str(),
         "store_kind": row.store.store_kind.as_str(),
         "store_root": &row.store.store_root,
         "store_id": &row.store.store_id,
@@ -609,8 +610,14 @@ impl MongoEngine {
 
     /// DeleteBackup's first step as one session transaction: `$inc` the
     /// row's `lock_seq` (the lock), read the status, run the in-use rule,
-    /// write DELETING. A transaction that lost a write conflict is re-run.
-    async fn start_backup_delete_tx(&self, key: &BackupKey) -> Result<DeleteStart, StorageError> {
+    /// write DELETING, or, with `remove`, delete the row
+    /// (`forget_available_backup_row`; `Deleting` then means removed). A
+    /// transaction that lost a write conflict is re-run.
+    async fn start_backup_delete_tx(
+        &self,
+        key: &BackupKey,
+        remove: bool,
+    ) -> Result<DeleteStart, StorageError> {
         let index = self.backup_index();
         let mut session = self.client.start_session().await.map_err(internal)?;
         let tx_options = self.write_transaction_options();
@@ -640,14 +647,22 @@ impl MongoEngine {
                 }
                 let mut filter = key_filter(key);
                 filter.insert("status", BackupStatus::Available.as_str());
-                index
-                    .update_one(
-                        filter,
-                        doc! { "$set": { "status": BackupStatus::Deleting.as_str() } },
-                    )
-                    .session(&mut session)
-                    .await
-                    .map_err(TxErr::from)?;
+                if remove {
+                    index
+                        .delete_one(filter)
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                } else {
+                    index
+                        .update_one(
+                            filter,
+                            doc! { "$set": { "status": BackupStatus::Deleting.as_str() } },
+                        )
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                }
                 Ok(DeleteStart::Deleting)
             }
             .await;
@@ -667,8 +682,12 @@ impl MongoEngine {
             }
         }
         Err(StorageError::Internal(format!(
-            "DeleteBackup of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting \
-             attempts",
+            "{} of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting attempts",
+            if remove {
+                "The backup sync --prune-missing removal"
+            } else {
+                "DeleteBackup"
+            },
             key.backup_arn
         )))
     }
@@ -841,7 +860,7 @@ impl BackupCatalog for MongoEngine {
             // server's clock on the heartbeat; an existing row never matches
             // the filter (every row carries a generation), so the upsert's
             // insert hits the unique index and the claim is refused.
-            let mut set = row_fields(row)?;
+            let mut set = row_fields(row, BackupStatus::Creating)?;
             set.insert("owner_generation", generation_field(generation));
             set.insert("heartbeat_at", "$$NOW");
             let set = literal_set(set);
@@ -871,6 +890,38 @@ impl BackupCatalog for MongoEngine {
                 key: row.key(),
                 generation,
             }) as Box<dyn JobClaim>)
+        })
+    }
+
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            // The claim's upsert, unowned: an existing row never matches the
+            // filter (every row carries a generation, this one 0), so the
+            // upsert's insert hits a unique index, (`account_id`,
+            // `backup_id`) or `backup_id`, and nothing is written.
+            let mut filter = key_filter(&row.key());
+            filter.insert("owner_generation", doc! { "$exists": false });
+            let mut set = row_fields(row, row.status)?;
+            if let Some(reason) = &row.failure_reason {
+                set.insert("failure_reason", reason);
+            }
+            set.insert("owner_generation", generation_field(UNOWNED_GENERATION));
+            set.insert("heartbeat_at", "$$NOW");
+            set.insert("completed_at", "$$NOW");
+            let set = literal_set(set);
+            match self
+                .backup_index()
+                .update_one(filter, vec![doc! { "$set": set }])
+                .upsert(true)
+                .await
+            {
+                Ok(result) => Ok(result.upserted_id.is_some()),
+                Err(e) if is_duplicate_key(&e) => Ok(false),
+                Err(e) => Err(internal(e)),
+            }
         })
     }
 
@@ -968,7 +1019,20 @@ impl BackupCatalog for MongoEngine {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
-        Box::pin(self.start_backup_delete_tx(key))
+        Box::pin(self.start_backup_delete_tx(key, false))
+    }
+
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
+        Box::pin(async move {
+            Ok(match self.start_backup_delete_tx(key, true).await? {
+                DeleteStart::Deleting => ForgetRow::Removed,
+                DeleteStart::InUse(table) => ForgetRow::InUse(table),
+                DeleteStart::Status(status) => ForgetRow::Status(status),
+            })
+        })
     }
 
     fn set_backup_deleted<'a>(
@@ -1115,8 +1179,8 @@ impl BackupCatalog for MongoEngine {
             // provenance keeps the source backup in use, whatever the
             // collection drops do, and the target counts as removed: a drop
             // that fails then is logged, naming the collections, and leaves
-            // them for `backup sync` (no record remains for a later cycle to
-            // retry from).
+            // them in the data database (no record remains for a later cycle
+            // to retry from, and no sweep removes them yet).
             let removed = self
                 .tables()
                 .find_one_and_delete(doc! {
@@ -1143,7 +1207,8 @@ impl BackupCatalog for MongoEngine {
                 tracing::error!(
                     "the restore target {} (account {}) was removed from the catalog, but \
                      dropping its data collection {} or the index collections of table id {} \
-                     failed; they are left in the data database for `backup sync` to sweep: {e}",
+                     failed; they are left in the data database, where nothing removes them, \
+                     and can be dropped by hand: {e}",
                     key.table_name,
                     key.account_id,
                     crate::data::data_collection_name(&key.table_id),
@@ -1553,7 +1618,7 @@ mod tests {
     #[test]
     fn a_row_round_trips_through_its_document() {
         let row = row();
-        let mut doc = row_fields(&row).unwrap();
+        let mut doc = row_fields(&row, row.status).unwrap();
         doc.insert("account_id", &row.account_id);
         doc.insert("backup_id", &row.backup_id);
         doc.insert("owner_generation", generation_field(row.owner_generation));
@@ -1566,7 +1631,7 @@ mod tests {
     #[test]
     fn a_document_with_an_unknown_store_kind_or_status_is_internal() {
         let row = row();
-        let mut doc = row_fields(&row).unwrap();
+        let mut doc = row_fields(&row, row.status).unwrap();
         doc.insert("account_id", &row.account_id);
         doc.insert("backup_id", &row.backup_id);
         doc.insert("owner_generation", 7_i64);

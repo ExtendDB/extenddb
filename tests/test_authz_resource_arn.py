@@ -621,6 +621,35 @@ class TestExplicitDenyOnResourceArn:
         self._assert_denied(lambda: d.restore_table_to_point_in_time(
             SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr"))
 
+    def test_restore_to_point_in_time_noperm_denial_names_scan_on_target(self, table):
+        # Measured on DynamoDB 2026-10-22 (issue #446): a caller with no policy
+        # and an index SourceTableArn is denied on dynamodb:Scan on the target
+        # table, because the service checks the target's item actions before
+        # the restore action on the source.
+        target_arn = table["table_arn"] + "-pitr446"
+        d = self._ddb({"Version": "2012-10-17", "Statement": []})
+        msg = self._denial_message(lambda: d.restore_table_to_point_in_time(
+            SourceTableArn=table["index_arn"], TargetTableName=table["name"] + "-pitr446",
+            UseLatestRestorableTime=True))
+        assert msg.startswith(f"User: arn:aws:iam::{self.account_id}:user/"), msg
+        assert msg.endswith(
+            f" is not authorized to perform: dynamodb:Scan on resource: {target_arn} "
+            "because no identity-based policy allows the dynamodb:Scan action"
+        ), msg
+
+    def test_restore_to_point_in_time_index_source_is_invalid_after_authorization(self, table):
+        # Measured on DynamoDB 2026-10-22 (issue #446): the same request from a
+        # caller allowed dynamodb:* passes authorization and is refused because
+        # the source ARN names an index, not a table.
+        d = self._ddb(ALLOW_ALL)
+        with pytest.raises(ClientError) as exc:
+            d.restore_table_to_point_in_time(
+                SourceTableArn=table["index_arn"], TargetTableName=table["name"] + "-pitr446",
+                UseLatestRestorableTime=True)
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == (
+            "ValidationException", "Invalid Request: Table ARN is invalid."), err
+
     def test_export_deny_table_blocks(self, table):
         d = self._ddb(_allow_all_deny("ExportTableToPointInTime", table["table_arn"]))
         self._assert_denied(lambda: d.export_table_to_point_in_time(

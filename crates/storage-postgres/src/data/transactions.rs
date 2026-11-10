@@ -14,7 +14,7 @@ use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
 use extenddb_storage::{
-    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
+    IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
     transact_key_check_pass, transact_op_empty_literal_checks, transact_op_key_checks,
 };
 
@@ -24,8 +24,8 @@ use super::index::{
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    insert_item_if_absent_in_tx, record_cancelled_token, upsert_item_in_tx,
-    write_stream_record_in_tx,
+    insert_item_if_absent_in_tx, record_cancelled_token, stream_record_shard_in_tx,
+    upsert_item_in_tx, write_stream_record_to_shard_in_tx,
 };
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
@@ -260,26 +260,56 @@ impl PostgresEngine {
             });
         }
 
-        // Write stream records atomically within the transaction (BLOCKER #1 fix).
-        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
-            let capture = match op {
-                TransactWriteOp::Put { stream, .. }
-                | TransactWriteOp::Delete { stream, .. }
-                | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
-                TransactWriteOp::ConditionCheck { .. } => None,
+        // Write stream records atomically within the transaction (BLOCKER #1 fix),
+        // in shard id order. Each record locks its shard's row FOR KEY SHARE,
+        // and a disable locks the stream's open rows FOR UPDATE in shard id
+        // order (`close_stream_shards`). In request order, a transaction with
+        // items on shard 2 and then shard 0 would hold shard 2 and wait for
+        // shard 0. A close that held shard 0 would wait for shard 2. This code
+        // chooses the shard of every record first. It then sorts the records
+        // by shard id, byte by byte, as the close sorts the rows. Two records
+        // on one shard keep their request order.
+        let mut records: Vec<(String, usize)> = Vec::new();
+        for (i, (op, (old_item, new_item))) in ops.iter().zip(op_items.iter()).enumerate() {
+            if transact_op_stream(op).is_none() {
+                continue;
+            }
+            let shard = match stream_record_shard_in_tx(
+                &mut tx,
+                transact_op_key_info(op),
+                old_item.as_ref(),
+                new_item.as_ref(),
+            )
+            .await
+            {
+                Ok(shard) => shard,
+                Err(e) => {
+                    return Err(after_token_error(
+                        &self.data_pool,
+                        Some(tx),
+                        idempotency,
+                        e,
+                        ops.len(),
+                    )
+                    .await);
+                }
             };
-            if let Some(capture) = capture
-                && let Err(e) = write_stream_record_in_tx(
+            if let Some(shard) = shard {
+                records.push((shard, i));
+            }
+        }
+        records.sort();
+        for (shard, i) in &records {
+            let op = &ops[*i];
+            let (old_item, new_item) = &op_items[*i];
+            if let Some(capture) = transact_op_stream(op)
+                && let Err(e) = write_stream_record_to_shard_in_tx(
                     &mut tx,
-                    match op {
-                        TransactWriteOp::Put { key_info, .. }
-                        | TransactWriteOp::Delete { key_info, .. }
-                        | TransactWriteOp::Update { key_info, .. }
-                        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-                    },
+                    transact_op_key_info(op),
                     capture,
                     old_item.as_ref(),
                     new_item.as_ref(),
+                    shard,
                 )
                 .await
             {
@@ -532,16 +562,6 @@ fn lock_key<'a>(op: &'a TransactWriteOp<'_>) -> (&'a str, Vec<Cow<'a, str>>) {
     (&key_info.table_id, values)
 }
 
-/// The table metadata of a transactional write operation.
-fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
-    match op {
-        TransactWriteOp::Put { key_info, .. }
-        | TransactWriteOp::Delete { key_info, .. }
-        | TransactWriteOp::Update { key_info, .. }
-        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-    }
-}
-
 /// Extract the table name from a transactional write operation.
 fn transact_op_table_name<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     match op {
@@ -559,6 +579,27 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
         | TransactWriteOp::Delete { key_info, .. }
         | TransactWriteOp::Update { key_info, .. }
         | TransactWriteOp::ConditionCheck { key_info, .. } => &key_info.table_id,
+    }
+}
+
+/// The table metadata of a transactional write operation.
+fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
+/// The stream capture of a transactional write operation, if its table has an
+/// enabled stream. A `ConditionCheck` writes nothing and records nothing.
+fn transact_op_stream<'a>(op: &'a TransactWriteOp<'_>) -> Option<&'a StreamCapture> {
+    match op {
+        TransactWriteOp::Put { stream, .. }
+        | TransactWriteOp::Delete { stream, .. }
+        | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
+        TransactWriteOp::ConditionCheck { .. } => None,
     }
 }
 

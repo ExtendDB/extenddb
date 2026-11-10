@@ -2098,6 +2098,76 @@ fn arn_of(row: &BackupRow) -> BackupArn {
     BackupArn::parse(&row.backup_arn).unwrap()
 }
 
+/// Delete `rows` from `backups_by_arn` and their entries from the status
+/// index and the two listings, whatever their status, so a test that wrote
+/// rows outside a claim leaves none in the shared catalog keyspace.
+async fn remove_index_rows(engine: &CassandraEngine, rows: &[&BackupRow]) {
+    let catalog = engine.catalog_keyspace();
+    for row in rows {
+        let created_at = (row.created_at * 1_000.0).round() as i64;
+        for (cql, values) in [
+            (
+                format!(
+                    "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ?"
+                ),
+                cdrs_tokio::query_values!(row.account_id.as_str(), row.backup_arn.as_str()),
+            ),
+            (
+                format!(
+                    "DELETE FROM {catalog}.backups_by_account \
+                     WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    row.account_id.as_str(),
+                    created_at,
+                    row.backup_arn.as_str()
+                ),
+            ),
+            (
+                format!(
+                    "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? \
+                     AND table_name = ? AND created_at = ? AND backup_arn = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    row.account_id.as_str(),
+                    row.table_name.as_str(),
+                    created_at,
+                    row.backup_arn.as_str()
+                ),
+            ),
+        ] {
+            engine
+                .session()
+                .query_with_values(&cql, values)
+                .await
+                .expect("remove a backup row");
+        }
+        for status in [
+            BackupStatus::Creating,
+            BackupStatus::Available,
+            BackupStatus::Deleting,
+            BackupStatus::Deleted,
+            BackupStatus::Failed,
+        ] {
+            engine
+                .session()
+                .query_with_values(
+                    &format!(
+                        "DELETE FROM {catalog}.backup_index_by_status \
+                         WHERE store_root = ? AND backup_status = ? AND backup_arn = ?"
+                    ),
+                    cdrs_tokio::query_values!(
+                        row.store.store_root.as_str(),
+                        status.as_str(),
+                        row.backup_arn.as_str()
+                    ),
+                )
+                .await
+                .expect("remove a status entry");
+        }
+    }
+}
+
 /// Run `cql` with `values` as a lightweight transaction and assert it applied.
 async fn apply(engine: &CassandraEngine, cql: &str, values: cdrs_tokio::query::QueryValues) {
     let result =
@@ -2396,6 +2466,11 @@ async fn test_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::InUse("DelTarget".to_owned())
     );
     assert_eq!(
+        engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::InUse("DelTarget".to_owned()),
+        "the outright removal keeps the in-use rule"
+    );
+    assert_eq!(
         engine
             .read_backup_row(&arn_of(&row))
             .await
@@ -2425,6 +2500,60 @@ async fn test_start_backup_delete_checks_the_status_and_the_in_use_rule_under_th
         DeleteStart::Status(BackupStatus::Deleting),
         "a retry finds the row DELETING"
     );
+    assert_eq!(
+        engine.forget_available_backup_row(&key).await.unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+        "only an AVAILABLE row is removed outright"
+    );
+    // An AVAILABLE row goes outright, read and listed nowhere, with no
+    // tombstone; a second removal finds no row.
+    let mut adopted = index_row(&account_id, "Music", "adopted", &store);
+    adopted.status = BackupStatus::Available;
+    assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+    assert_eq!(
+        engine
+            .forget_available_backup_row(&adopted.key())
+            .await
+            .unwrap(),
+        extenddb_storage::backup_catalog::ForgetRow::Removed
+    );
+    assert!(
+        engine
+            .read_backup_row(&arn_of(&adopted))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for status in [None, Some(BackupStatus::Available)] {
+        let listed: Vec<BackupRow> = engine
+            .list_backup_rows(status, &adopted.store)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+            "{status:?}"
+        );
+    }
+    let by_account: Vec<BackupRow> = engine
+        .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(
+        !by_account
+            .iter()
+            .any(|r| r.backup_arn == adopted.backup_arn)
+    );
+    assert_eq!(
+        raw_index_entries(&engine, &adopted).await,
+        0,
+        "the list and status entries went with the row"
+    );
+    assert!(matches!(
+        engine.forget_available_backup_row(&adopted.key()).await,
+        Err(StorageError::Validation(m)) if m.contains("Backup not found")
+    ));
     assert!(
         !engine.remove_backup_row(&key).await.unwrap(),
         "DELETING is not a tombstone"
@@ -3709,6 +3838,59 @@ async fn test_the_in_catalog_create_heartbeats_its_row_while_the_items_copy() {
         .expect("delete backup");
 }
 
+/// How many of `row`'s three index entries (`backups_by_account`,
+/// `backups_by_table`, `backup_index_by_status` under its status) are in
+/// the tables, read directly: every listing re-reads the authoritative row
+/// and skips an entry whose row is gone, so only a direct read sees one.
+async fn raw_index_entries(engine: &CassandraEngine, row: &BackupRow) -> usize {
+    let catalog = engine.catalog_keyspace();
+    let created_at = (row.created_at * 1_000.0).round() as i64;
+    let mut found = 0;
+    for (cql, values) in [
+        (
+            format!(
+                "SELECT backup_arn FROM {catalog}.backups_by_account \
+                 WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(row.account_id.as_str(), created_at, row.backup_arn.as_str()),
+        ),
+        (
+            format!(
+                "SELECT backup_arn FROM {catalog}.backups_by_table WHERE account_id = ? \
+                 AND table_name = ? AND created_at = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(
+                row.account_id.as_str(),
+                row.table_name.as_str(),
+                created_at,
+                row.backup_arn.as_str()
+            ),
+        ),
+        (
+            format!(
+                "SELECT backup_arn FROM {catalog}.backup_index_by_status \
+                 WHERE store_root = ? AND backup_status = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(
+                row.store.store_root.as_str(),
+                row.status.as_str(),
+                row.backup_arn.as_str()
+            ),
+        ),
+    ] {
+        let rows = extenddb_storage_cassandra::cassandra_util::query_rows_quorum::<StorageError>(
+            &engine.session_arc(),
+            &cql,
+            values,
+            "index entry",
+        )
+        .await
+        .expect("read an index entry");
+        found += rows.len();
+    }
+    found
+}
+
 #[cfg(feature = "test-hooks")]
 /// Items of `backup_arn`'s payload in `account_id`'s keyspace, all buckets.
 async fn payload_item_count(engine: &CassandraEngine, account_id: &str, backup_arn: &str) -> i64 {
@@ -4888,6 +5070,608 @@ async fn test_read_store_ids_lists_the_distinct_ids_of_a_root() {
             .expect("ids")
             .is_empty()
     );
+}
+
+/// `insert_backup_row`: the row lands as given, unowned, with `completed_at`
+/// and `heartbeat_at` on the coordinator's clock, its status entry and both
+/// list rows written (`list_backup_rows` reads the first, the account and
+/// table listings the others); a second insert and an insert over a CREATING
+/// row a claim holds answer `false` and change nothing; a claim over the
+/// inserted row is refused. The rule is per ARN spelling: the same id under
+/// another region is another row.
+#[tokio::test]
+async fn test_insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let mut adopted = index_row(&account_id, "Music", "adopted", &store);
+    adopted.status = BackupStatus::Available;
+    adopted.size_bytes = 1234;
+    adopted.item_count = 5;
+    // Ignored: the insert sets these three itself.
+    adopted.owner_generation = 99;
+    adopted.completed_at = None;
+    adopted.heartbeat_at = 0.0;
+    // A year before the id's instant: the two clock columns must be
+    // the database's clock at the insert, not the row's `created_at`.
+    adopted.created_at -= 365.0 * 86_400.0;
+    assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+    let stored = engine
+        .read_backup_row(&arn_of(&adopted))
+        .await
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+    let completed_at = stored.completed_at.expect("completed_at is set");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64();
+    for at in [completed_at, stored.heartbeat_at] {
+        assert!(
+            (at - now).abs() < 60.0,
+            "{at} is not the insert's instant {now}"
+        );
+    }
+    assert!(
+        (stored.created_at - adopted.created_at).abs() < 1e-3,
+        "{} is the row's created_at {}",
+        stored.created_at,
+        adopted.created_at
+    );
+    assert_eq!(
+        BackupRow {
+            owner_generation: 99,
+            completed_at: None,
+            heartbeat_at: 0.0,
+            created_at: adopted.created_at,
+            ..stored.clone()
+        },
+        adopted,
+        "every other column is the row as given"
+    );
+
+    // A second insert of the key, with other values, writes nothing.
+    let mut again = adopted.clone();
+    again.backup_name = "again".to_owned();
+    again.size_bytes = 1;
+    again.status = BackupStatus::Failed;
+    assert!(!engine.insert_backup_row(&again).await.expect("insert"));
+    assert_eq!(
+        engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+        Some(stored.clone()),
+        "the refused inserts changed nothing"
+    );
+    let claimed = engine.claim_backup(&adopted).await.err();
+    assert!(
+        matches!(claimed, Some(StorageError::AlreadyExists(_))),
+        "{claimed:?}"
+    );
+
+    // Over a CREATING row a live claim holds.
+    let creating = index_row(&account_id, "Music", "job", &store);
+    let claim = engine.claim_backup(&creating).await.expect("claim");
+    let mut over = creating.clone();
+    over.status = BackupStatus::Available;
+    assert!(!engine.insert_backup_row(&over).await.expect("insert"));
+    let job_row = engine
+        .read_backup_row(&arn_of(&creating))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job_row.status, BackupStatus::Creating);
+    assert_eq!(job_row.owner_generation, claim.generation());
+
+    // Read and listed like a created row.
+    let arns =
+        |rows: Vec<BackupRow>| -> Vec<String> { rows.into_iter().map(|r| r.backup_arn).collect() };
+    let available: Vec<BackupRow> = engine
+        .list_backup_rows(Some(BackupStatus::Available), &store)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(available, std::slice::from_ref(&stored));
+    let creating_rows: Vec<BackupRow> = engine
+        .list_backup_rows(Some(BackupStatus::Creating), &store)
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        arns(creating_rows),
+        std::slice::from_ref(&creating.backup_arn)
+    );
+    for table in [None, Some("Music")] {
+        let listed: Vec<BackupRow> = engine
+            .list_account_backup_rows(&account_id, table, &TimeBounds::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            listed.contains(&stored),
+            "{table:?}: {:?}",
+            arns(listed.clone())
+        );
+    }
+    drop(claim);
+
+    // Cassandra indexes no backup id: another spelling of the ARN inserts.
+    let mut respelled = adopted.clone();
+    respelled.backup_arn =
+        BackupArn::new("aws", "eu-west-1", &account_id, "Music", &adopted.backup_id)
+            .unwrap()
+            .to_arn_string();
+    assert!(engine.insert_backup_row(&respelled).await.expect("insert"));
+    assert!(
+        engine
+            .read_backup_row(&arn_of(&respelled))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    remove_index_rows(&engine, &[&adopted, &respelled, &creating]).await;
+}
+
+/// Delete the three index entries of `row` and keep its `backups_by_arn`
+/// row: the state an insert leaves when it stops, or its batch fails,
+/// between the two writes.
+async fn drop_index_entries(engine: &CassandraEngine, row: &BackupRow) {
+    let catalog = engine.catalog_keyspace();
+    let created_at = (row.created_at * 1_000.0).round() as i64;
+    for (cql, values) in [
+        (
+            format!(
+                "DELETE FROM {catalog}.backups_by_account \
+                 WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(row.account_id.as_str(), created_at, row.backup_arn.as_str()),
+        ),
+        (
+            format!(
+                "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? \
+                 AND table_name = ? AND created_at = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(
+                row.account_id.as_str(),
+                row.table_name.as_str(),
+                created_at,
+                row.backup_arn.as_str()
+            ),
+        ),
+        (
+            format!(
+                "DELETE FROM {catalog}.backup_index_by_status \
+                 WHERE store_root = ? AND backup_status = ? AND backup_arn = ?"
+            ),
+            cdrs_tokio::query_values!(
+                row.store.store_root.as_str(),
+                row.status.as_str(),
+                row.backup_arn.as_str()
+            ),
+        ),
+    ] {
+        engine
+            .session()
+            .query_with_values(&cql, values)
+            .await
+            .expect("remove an index entry");
+    }
+}
+
+/// Which of the three listings return `row`: the store's status listing
+/// (`list_backup_rows`), the account listing and the table listing.
+async fn listed_in(engine: &CassandraEngine, row: &BackupRow) -> [bool; 3] {
+    let by_status: Vec<BackupRow> = engine
+        .list_backup_rows(Some(row.status), &row.store)
+        .try_collect()
+        .await
+        .expect("status listing");
+    let mut listed = [by_status.iter().any(|r| r.backup_arn == row.backup_arn); 3];
+    for (slot, table) in [(1, None), (2, Some(row.table_name.as_str()))] {
+        let rows: Vec<BackupRow> = engine
+            .list_account_backup_rows(&row.account_id, table, &TimeBounds::default())
+            .try_collect()
+            .await
+            .expect("account listing");
+        listed[slot] = rows.iter().any(|r| r.backup_arn == row.backup_arn);
+    }
+    listed
+}
+
+/// An insert that stopped between its row and its index entries leaves an
+/// AVAILABLE row no listing returns. The next insert of the same row (the
+/// next sync of the same verified prefix) finds the row its own, writes the
+/// entries and answers `true`; an insert with other values still answers
+/// `false` and writes nothing.
+#[tokio::test]
+async fn test_insert_backup_row_completes_an_insert_that_stopped_before_its_entries() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let mut row = index_row(&account_id, "Music", "torn", &store);
+    row.status = BackupStatus::Available;
+    row.size_bytes = 77;
+    row.item_count = 3;
+    assert!(engine.insert_backup_row(&row).await.expect("insert"));
+    drop_index_entries(&engine, &row).await;
+    assert_eq!(
+        listed_in(&engine, &row).await,
+        [false; 3],
+        "the torn state: the row is listed nowhere"
+    );
+
+    assert!(
+        engine.insert_backup_row(&row).await.expect("insert"),
+        "the second insert of the same row completes the first"
+    );
+    assert_eq!(listed_in(&engine, &row).await, [true; 3]);
+    let stored = engine
+        .read_backup_row(&arn_of(&row))
+        .await
+        .unwrap()
+        .expect("the row exists");
+    assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+
+    let mut other = row.clone();
+    other.size_bytes = 1;
+    drop_index_entries(&engine, &row).await;
+    assert!(
+        !engine.insert_backup_row(&other).await.expect("insert"),
+        "a row with other values is one that existed"
+    );
+    assert_eq!(listed_in(&engine, &row).await, [false; 3]);
+    remove_index_rows(&engine, &[&row]).await;
+}
+
+/// An insert at an ARN an earlier release's in-catalog backup holds (a
+/// `backups_by_arn` row with no store kind, which the index read does not
+/// return) answers `false` and writes no list or status entry: the
+/// `NotMatched` arm's serial read finds no index row, and that is not this
+/// insert's row.
+#[tokio::test]
+async fn test_an_insert_over_an_in_catalog_backup_answers_false_and_writes_no_entry() {
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let mut row = index_row(&account_id, "Music", "legacy", &store);
+    row.status = BackupStatus::Available;
+    let catalog = engine.catalog_keyspace();
+    engine
+        .session()
+        .query_with_values(
+            &format!(
+                "INSERT INTO {catalog}.backups_by_arn (account_id, backup_arn, backup_id, \
+                 backup_name, table_name, backup_status) VALUES (?, ?, ?, ?, ?, 'AVAILABLE')"
+            ),
+            cdrs_tokio::query_values!(
+                row.account_id.as_str(),
+                row.backup_arn.as_str(),
+                row.backup_id.as_str(),
+                "legacy",
+                "Music"
+            ),
+        )
+        .await
+        .expect("an in-catalog backup's row");
+    let inserted = engine.insert_backup_row(&row).await.expect("insert");
+    let entries = raw_index_entries(&engine, &row).await;
+    remove_index_rows(&engine, &[&row]).await;
+    assert!(
+        !inserted,
+        "an insert over an in-catalog backup answered true"
+    );
+    assert_eq!(
+        entries, 0,
+        "an insert over an in-catalog backup wrote entries"
+    );
+}
+
+/// An insert whose answer is lost is settled by a serial read: one whose
+/// transaction ran finds its row and answers `true` with its entries
+/// written; one whose transaction never ran finds no row, sends it once
+/// more and answers `true`; one that finds a row a claim holds answers
+/// `false` and changes nothing; two lost answers with no row are an error
+/// and leave no row.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_an_unknown_insert_outcome_is_settled_by_a_serial_read() {
+    use extenddb_storage_cassandra::test_hooks::{ProgressWriteFault, fail_insert_writes};
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let available = |name: &str| {
+        let mut row = index_row(&account_id, "Music", name, &store);
+        row.status = BackupStatus::Available;
+        row
+    };
+
+    // The transaction ran; its answer was lost.
+    let landed = available("landed");
+    fail_insert_writes(&landed.backup_arn, &[ProgressWriteFault::Landed]);
+    assert!(engine.insert_backup_row(&landed).await.expect("insert"));
+    assert_eq!(listed_in(&engine, &landed).await, [true; 3]);
+
+    // The transaction never ran: the write is sent once more.
+    let lost = available("lost");
+    fail_insert_writes(&lost.backup_arn, &[ProgressWriteFault::Lost]);
+    assert!(engine.insert_backup_row(&lost).await.expect("insert"));
+    assert_eq!(listed_in(&engine, &lost).await, [true; 3]);
+    let stored = engine.read_backup_row(&arn_of(&lost)).await.unwrap();
+    assert_eq!(stored.map(|r| r.owner_generation), Some(UNOWNED_GENERATION));
+
+    // A row a claim holds is there: the insert is refused and changes nothing.
+    let creating = index_row(&account_id, "Music", "job", &store);
+    let claim = engine.claim_backup(&creating).await.expect("claim");
+    let mut over = creating.clone();
+    over.status = BackupStatus::Available;
+    fail_insert_writes(&over.backup_arn, &[ProgressWriteFault::Lost]);
+    assert!(!engine.insert_backup_row(&over).await.expect("insert"));
+    let job_row = engine
+        .read_backup_row(&arn_of(&creating))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (job_row.status, job_row.owner_generation),
+        (BackupStatus::Creating, claim.generation())
+    );
+    assert!(
+        !listed_in(&engine, &over).await[0],
+        "no AVAILABLE status entry"
+    );
+    drop(claim);
+
+    // Two lost answers and no row: an unknown outcome is an error.
+    let unknown = available("unknown");
+    fail_insert_writes(
+        &unknown.backup_arn,
+        &[ProgressWriteFault::Lost, ProgressWriteFault::Lost],
+    );
+    let failed = engine
+        .insert_backup_row(&unknown)
+        .await
+        .expect_err("two lost answers and no row");
+    assert!(
+        matches!(&failed, StorageError::Internal(m) if m.contains("unknown outcome")),
+        "{failed}"
+    );
+    assert_eq!(
+        engine.read_backup_row(&arn_of(&unknown)).await.unwrap(),
+        None
+    );
+    remove_index_rows(&engine, &[&landed, &lost, &creating, &unknown]).await;
+}
+
+/// A failed batch of index entries is sent once more; one that fails twice
+/// is an error that leaves the row unlisted, and the next insert of the row
+/// writes the entries.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_failed_index_entry_batch_is_sent_once_more() {
+    use extenddb_storage_cassandra::test_hooks::fail_index_entry_batches;
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let available = |name: &str| {
+        let mut row = index_row(&account_id, "Music", name, &store);
+        row.status = BackupStatus::Available;
+        row
+    };
+
+    let once = available("once");
+    fail_index_entry_batches(&once.backup_arn, 1);
+    assert!(engine.insert_backup_row(&once).await.expect("insert"));
+    assert_eq!(listed_in(&engine, &once).await, [true; 3]);
+
+    let twice = available("twice");
+    fail_index_entry_batches(&twice.backup_arn, 2);
+    let failed = engine
+        .insert_backup_row(&twice)
+        .await
+        .expect_err("a batch that fails twice");
+    assert!(
+        matches!(&failed, StorageError::Internal(m) if m.contains("index entry batch")),
+        "{failed}"
+    );
+    assert!(
+        engine
+            .read_backup_row(&arn_of(&twice))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(listed_in(&engine, &twice).await, [false; 3]);
+    assert!(engine.insert_backup_row(&twice).await.expect("insert"));
+    assert_eq!(listed_in(&engine, &twice).await, [true; 3]);
+    remove_index_rows(&engine, &[&once, &twice]).await;
+}
+
+/// A removal whose answer is lost is settled by a serial read: one whose
+/// transaction ran finds no row and answers `Removed` with the entries
+/// removed; one whose transaction never ran finds the row, runs once more and
+/// answers `Removed`; a lost answer on every attempt is an error that leaves
+/// the row AVAILABLE and listed.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_an_unknown_forget_outcome_is_settled_by_a_serial_read() {
+    use extenddb_storage::backup_catalog::ForgetRow;
+    use extenddb_storage_cassandra::test_hooks::{ProgressWriteFault, fail_forget_writes};
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let adopted = |name: &str| {
+        let mut row = index_row(&account_id, "Music", name, &store);
+        row.status = BackupStatus::Available;
+        row
+    };
+
+    for (name, fault) in [
+        ("landed", ProgressWriteFault::Landed),
+        ("lost", ProgressWriteFault::Lost),
+    ] {
+        let row = adopted(name);
+        assert!(engine.insert_backup_row(&row).await.expect("insert"));
+        fail_forget_writes(&row.backup_arn, &[fault]);
+        assert_eq!(
+            engine
+                .forget_available_backup_row(&row.key())
+                .await
+                .unwrap(),
+            ForgetRow::Removed,
+            "{name}"
+        );
+        assert_eq!(
+            engine.read_backup_row(&arn_of(&row)).await.unwrap(),
+            None,
+            "{name}"
+        );
+        assert_eq!(raw_index_entries(&engine, &row).await, 0, "{name}");
+    }
+
+    let unknown = adopted("unknown");
+    assert!(engine.insert_backup_row(&unknown).await.expect("insert"));
+    fail_forget_writes(&unknown.backup_arn, &[ProgressWriteFault::Lost; 3]);
+    let failed = engine
+        .forget_available_backup_row(&unknown.key())
+        .await
+        .expect_err("a lost answer on every attempt");
+    assert!(
+        matches!(&failed, StorageError::Internal(m) if m.contains("unknown outcome")),
+        "{failed}"
+    );
+    assert_eq!(
+        engine
+            .read_backup_row(&arn_of(&unknown))
+            .await
+            .unwrap()
+            .map(|r| r.status),
+        Some(BackupStatus::Available)
+    );
+    assert_eq!(listed_in(&engine, &unknown).await, [true; 3]);
+    remove_index_rows(&engine, &[&unknown]).await;
+}
+
+/// A removal whose entry batch fails after the row is gone answers `Removed`:
+/// the row is read and listed nowhere, the entries it left are skipped by
+/// every listing, and a second removal finds no row.
+#[cfg(feature = "test-hooks")]
+#[tokio::test]
+async fn test_a_forget_whose_entry_removal_fails_answers_removed() {
+    use extenddb_storage::backup_catalog::ForgetRow;
+    use extenddb_storage_cassandra::test_hooks::fail_index_entry_removals;
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let mut row = index_row(&account_id, "Music", "orphaned", &store);
+    row.status = BackupStatus::Available;
+    assert!(engine.insert_backup_row(&row).await.expect("insert"));
+    fail_index_entry_removals(&row.backup_arn, 1);
+    assert_eq!(
+        engine
+            .forget_available_backup_row(&row.key())
+            .await
+            .unwrap(),
+        ForgetRow::Removed
+    );
+    assert_eq!(engine.read_backup_row(&arn_of(&row)).await.unwrap(), None);
+    assert_eq!(
+        raw_index_entries(&engine, &row).await,
+        3,
+        "the failed batch left the entries"
+    );
+    assert_eq!(
+        listed_in(&engine, &row).await,
+        [false; 3],
+        "every listing skips an entry whose row is gone"
+    );
+    assert!(matches!(
+        engine.forget_available_backup_row(&row.key()).await,
+        Err(StorageError::Validation(m)) if m.contains("Backup not found")
+    ));
+    remove_index_rows(&engine, &[&row]).await;
+}
+
+/// The in-use rule runs before the removal's write and clears a registration
+/// whose target is no longer being restored: a row whose `active_restores`
+/// still names a finished (ACTIVE) target is removed at once. Without the
+/// rule the write's `active_restores = null` condition refuses every attempt
+/// and the removal answers `InUse` naming the finished table.
+#[tokio::test]
+async fn test_a_forget_clears_a_finished_restores_registration_and_removes_the_row() {
+    use extenddb_storage::backup_catalog::ForgetRow;
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let account = TestAccount::new(&engine, "extenddb_ttl_test").await;
+    let account_id = account.account_id.clone();
+    let store = unique_store();
+    let mut row = index_row(&account_id, "Music", "finished", &store);
+    row.status = BackupStatus::Available;
+    assert!(engine.insert_backup_row(&row).await.expect("insert"));
+    let finished = create_active_table(
+        &engine,
+        &account_id,
+        CreateTableInput {
+            table_name: "FinishedTarget".to_owned(),
+            key_schema: vec![ks("id", KeyType::Hash)],
+            attribute_definitions: vec![attr("id", ScalarAttributeType::S)],
+            billing_mode: Some(BillingMode::PayPerRequest),
+            ..Default::default()
+        },
+    )
+    .await;
+    apply(
+        &engine,
+        &format!(
+            "UPDATE {}.backups_by_arn SET active_restores[?] = ? \
+             WHERE account_id = ? AND backup_arn = ? IF EXISTS",
+            engine.catalog_keyspace()
+        ),
+        cdrs_tokio::query_values!(
+            finished.table_id.as_str(),
+            "FinishedTarget",
+            account_id.as_str(),
+            row.backup_arn.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        engine
+            .forget_available_backup_row(&row.key())
+            .await
+            .unwrap(),
+        ForgetRow::Removed
+    );
+    assert_eq!(engine.read_backup_row(&arn_of(&row)).await.unwrap(), None);
+    assert_eq!(raw_index_entries(&engine, &row).await, 0);
 }
 
 /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat is older

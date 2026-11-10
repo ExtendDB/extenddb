@@ -17,7 +17,7 @@ This guide covers deploying extenddb in various environments beyond local develo
 extenddb is a single Rust binary that connects to a storage backend. All durable state lives in the backend; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
 - Multiple extenddb instances can share one backend catalog (with caveats — see Multi-Instance below)
-- The backend's own HA, backup, and replication tools provide durability
+- The backend's own HA, backup, and replication tools provide durability; with `[backup.store]` configured (file-backed SQLite has one by default), table backups go to the store on PostgreSQL, SQLite and MongoDB; without one, and always on Cassandra, they are in-catalog backups inside the database; the [Backup and Restore manual](14-backup-and-restore.md) covers both
 - extenddb can run anywhere the storage backend is reachable
 
 ## Deployment Models
@@ -210,7 +210,7 @@ extenddb init \
 - [ ] Set `auth.provider = "builtin"` in `extenddb.toml`
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
-- [ ] Disable credential import if not needed: `extenddb settings set allow_credential_import false`
+- [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
 
 ### Transport
 
@@ -229,12 +229,13 @@ extenddb init \
 - [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
-- [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
+- [ ] Set up automated backups that copy the catalog and data databases as one copy: a base backup with WAL archiving or managed service snapshots of the instance (either covers one instance, so only when both databases are on one PostgreSQL instance), or `pg_dump` of both with the server stopped, under `umask 077` (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry)
+- [ ] Configure `[backup.store]` (S3 for production) per the [Backup and Restore manual](14-backup-and-restore.md)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
 
 ### Monitoring
 
-- [ ] Poll `/metrics` for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
+- [ ] Poll `/metrics` with an admin user's credentials (HTTP Basic auth) for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
 - [ ] Monitor extenddb process with systemd, supervisord, or equivalent
@@ -272,7 +273,10 @@ RestartSec=5
 # large items it reads (the admin guide's [backup] max_concurrent_jobs row
 # gives the figures). It costs the request path a few percent (3.5 to 9.2%
 # on GetItem, Query and Scan on SQLite, about 2% on PostgreSQL (the scans,
-# 2.1%)), so the line is left to the operator:
+# 2.1%)), so the line is left to the operator. On SQLite it also lowers
+# the peak of a restore of tables whose items are larger than a few
+# hundred bytes, of any attribute types (the Backup and Restore manual
+# gives the figures):
 #Environment=MALLOC_ARENA_MAX=1
 
 [Install]
@@ -291,7 +295,7 @@ Run one extenddb instance per catalog. Multiple instances behind a load balancer
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
 - `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation. It does report the backup store: `components.backup_store` is `unhealthy` and `status` is `degraded` while the configured store cannot be reached or fails its identity check, with HTTP 200 kept, so a store outage never drains a replica.
-- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch that only `backup purge` resolves. Point every instance at one root before the first backup. Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
+- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch. No command in this release clears that state: `backup purge`, plain `backup sync` and `--prune-missing` all refuse while the store is unhealthy. What does clear it is a catalog restored from a copy taken before the split, or one directory's rows deleted from the catalog by hand and its backups copied into the other directory, as the [Backup and Restore manual](14-backup-and-restore.md#configuration) describes. Point every instance at one root before the first backup. Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
 
 On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
