@@ -78,6 +78,16 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// Seconds a connection may take to deliver its request headers, and
+    /// seconds a request body may go without delivering data, before the
+    /// server closes the connection. Bounds how long a stalled or malicious
+    /// client can hold a connection open. Default 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ServerConfig {
@@ -89,6 +99,7 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 }
@@ -184,6 +195,16 @@ impl StorageConfig {
     #[must_use]
     pub fn database_file(&self) -> Option<PathBuf> {
         self.config.database_file()
+    }
+
+    /// [`Self::database_file`] with the reason a location names no usable
+    /// file ([`extenddb_storage::config::StorageConfig::database_location`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    pub fn database_location(&self) -> Result<Option<PathBuf>, String> {
+        self.config.database_location()
     }
 
     /// Get a reference to the underlying trait object for factory calls.

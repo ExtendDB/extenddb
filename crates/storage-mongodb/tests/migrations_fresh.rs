@@ -493,6 +493,66 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     d.drop_databases().await;
 }
 
+/// A data database migrated by a build whose migration 1 did not create the
+/// `{table_id, shard_id}` index on `stream_shards`: its ledgers record every
+/// migration, so `migrate --yes` applies nothing, and `migrate --yes
+/// --reconverge` runs migration 1's data step again, which creates the index
+/// and leaves the ledger rows as they are.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconverge_adds_the_stream_shards_table_index_to_a_migrated_data_database() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "shardrerun").await;
+    d.create().await;
+    let shards = d.data().collection::<Document>("stream_shards");
+    let names = || async {
+        shards
+            .list_index_names()
+            .await
+            .expect("stream_shards index names")
+    };
+    assert!(names().await.iter().any(|n| n == "table_id_1_shard_id_1"));
+    shards
+        .drop_index("table_id_1_shard_id_1")
+        .await
+        .expect("drop the index, as a build without it left the store");
+    let before = d.catalog_ledger().await;
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
+    let again = d.migrate().await.expect("migrate");
+    assert!(again.applied.is_empty(), "{again:?}");
+    assert!(!names().await.iter().any(|n| n == "table_id_1_shard_id_1"));
+
+    let reconverged = d.reconverge().await.expect("reconverge");
+    assert!(
+        reconverged
+            .applied
+            .iter()
+            .any(|step| step.id == 1 && step.store_name == d.target.data),
+        "{reconverged:?}"
+    );
+    let indexes: Vec<Document> = {
+        use futures::TryStreamExt;
+        shards
+            .list_indexes()
+            .await
+            .expect("list the stream_shards indexes")
+            .map_ok(|m| m.keys)
+            .try_collect()
+            .await
+            .expect("read the stream_shards indexes")
+    };
+    assert!(
+        indexes.contains(&doc! { "table_id": 1, "shard_id": 1 }),
+        "{indexes:?}"
+    );
+    assert_eq!(d.catalog_ledger().await, before);
+    d.drop_databases().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn forget_clears_an_unreleased_id_and_migrate_applies_it_again() {
     let Some(uri) = server() else { return };

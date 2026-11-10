@@ -10,7 +10,7 @@ Migration 9, `warm_throughput`, adds a nullable `warm_throughput` column to the 
 
 Migration 10, `unique_access_key_ids`, gives the MongoDB `access_keys` collection a unique index on the access key ID (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)); it does not apply on the other backends.
 
-Configure `[backup.store]` before the release that stops creating in-catalog backups. From this release CreateBackup writes to the configured store on PostgreSQL, SQLite and MongoDB, and is asynchronous there as on the service: the response is `CREATING` and the backup becomes `AVAILABLE` once the upload ends, so a client that deletes a backup it just created has to poll DescribeBackup first (the previous release returned `AVAILABLE`). A store-backed backup is listed, described, deleted and restored like any other. `RestoreTableFromBackup` of a backup in the configured store runs the restore job from the store on every backend (PostgreSQL, SQLite, MongoDB and Cassandra); in-catalog backups, those of the previous release included, restore as before. An S3 store needs `spool_path` set (the restore's download area) on PostgreSQL, MongoDB and Cassandra, and that must be a directory of its own, not the database directory; a filesystem store needs no spool. Migration 8 adds the `restore_progress` table to the PostgreSQL data database; run `extenddb migrate --yes` before starting the new binary. The progress rows of a restore in flight live in the data database, so a data database restored from a dump taken before migration 8 has none of them and no `restore_progress` table: the new binary refuses to serve it until `extenddb migrate --yes` has run again, and its reconciler then finds no progress for the restore and resumes it from its first data file into the (empty) target, or `FAILED`s it as `target_not_empty` if the target already holds items, in which case `extenddb backup remove-target --account <account> <table>` (the admin guide's `backup` section) removes the target and its record and the backup restores again. The same `target_not_empty` state is what a server stopped inside a restore's first data file on MongoDB, or inside its first batch of 10,000 items or 32 MiB on Cassandra, leaves on restart, since both record progress after the write; the command is the remedy there too. `backup remove-target` writes the catalog, so on SQLite the server is stopped for it, as for `purge`. The previous binary resumes no restore (a store-backed restore in flight at a rollback is lost with the catalog rows, as the rollback paragraph below says). Quiesce restores before a downgrade. `kind = "disabled"` is no longer needed to keep a deployment able to restore the backups it takes. Without a store CreateBackup writes the in-catalog format and logs a deprecation warning naming `[backup.store]` on each call; a later release's CreateBackup refuses without one. Cassandra writes the in-catalog format with or without a store. `kind = "disabled"` under `[backup.store]` is the opt-out that keeps a deployment on the in-catalog format on purpose and silences the warning. On file-backed SQLite an absent section is a filesystem store at `backups/` beside the database file, created `0700` at startup; that root must be owned by the extenddb user with mode `0700`, under directories owned by root or that user which others cannot write to. A default root that breaks the rule (a database file in a group-writable directory, say), or whose `extenddb-store.json` names another catalog (a catalog re-created by `destroy` and `init` under the old root), is logged at startup as a warning (`backup store: the default root ... failed its check`) and leaves the store unconfigured, not unhealthy, so the upgrade never stops a server that never configured backups and CreateBackup keeps working on it; the same root configured explicitly is a startup error or an unhealthy store. The warning applies only while the catalog has no backup rows for the default root (an upgrade, a fresh deployment, a catalog re-created by `destroy` and `init`): once a server has written rows for it, the default root is handled as a configured one, so its backups never vanish behind a warning (a failed identity check is an unhealthy store, reported on `/health`; a root that can no longer be opened is a startup error naming it). Instances that share a catalog must share one store root, an S3 bucket and prefix or a shared mount: a second instance pointed at a host-local directory under the same configured path starts with the store unhealthy (`/health` reports `backup_store` unhealthy; the admin guide's `[backup.store]` section says what the identity file and the manifest probe check). `extenddb destroy` leaves the store; `extenddb backup purge --confirm` is what deletes its backups, and a catalog re-created with `init` needs the old root's `extenddb-store.json` removed or a new root, since the file names the old catalog.
+Configure `[backup.store]` before the release that stops creating in-catalog backups. The [Backup and Restore manual](14-backup-and-restore.md) covers choosing and securing a store, the recovery figures, the restore drill, catalog-loss recovery and what to do with in-catalog backups; this section says what the upgrade changes. From this release CreateBackup writes to the configured store on PostgreSQL, SQLite and MongoDB, and is asynchronous there as on the service: the response is `CREATING` and the backup becomes `AVAILABLE` once the upload ends, so a client that deletes a backup it just created has to poll DescribeBackup first (the previous release returned `AVAILABLE`). A store-backed backup is listed, described, deleted and restored like any other. `RestoreTableFromBackup` of a backup in the configured store runs the restore job from the store on every backend (PostgreSQL, SQLite, MongoDB and Cassandra); in-catalog backups, those of the previous release included, restore as before. An S3 store needs `spool_path` set (the restore's download area) on PostgreSQL, MongoDB and Cassandra, and that must be a directory of its own, not the database directory; a filesystem store needs no spool. Migration 8 adds the `restore_progress` table to the PostgreSQL data database; run `extenddb migrate --yes` before starting the new binary. The progress rows of a restore in flight live in the data database, so a data database restored from a dump taken before migration 8 has none of them and no `restore_progress` table: the new binary refuses to serve it until `extenddb migrate --yes` has run again, and its reconciler then finds no progress for the restore and resumes it from its first data file into the (empty) target, or `FAILED`s it as `target_not_empty` if the target already holds items, in which case `extenddb backup remove-target --account <account> <table>` (the admin guide's `backup` section) removes the target and its record and the backup restores again. The same `target_not_empty` state is what a server stopped inside a restore's first data file on MongoDB, or inside its first batch of 10,000 items or 32 MiB on Cassandra, leaves on restart, since both record progress after the write; the command is the remedy there too. `backup remove-target` writes the catalog, so on SQLite the server is stopped for it, as for `purge`. The previous binary resumes no restore (a store-backed restore in flight at a rollback is lost with the catalog rows, as the rollback paragraph below says). Quiesce restores before a downgrade. `kind = "disabled"` is no longer needed to keep a deployment able to restore the backups it takes. Without a store CreateBackup writes the in-catalog format and logs a deprecation warning naming `[backup.store]` on each call; a later release's CreateBackup refuses without one. Cassandra writes the in-catalog format with or without a store. `kind = "disabled"` under `[backup.store]` is the opt-out that keeps a deployment on the in-catalog format on purpose and silences the warning. On file-backed SQLite an absent section is a filesystem store at `backups/` beside the database file, created `0700` at startup; that root must be owned by the extenddb user with mode `0700`, under directories owned by root or that user which others cannot write to. A default root that breaks the rule (a database file in a group-writable directory, say), or whose `extenddb-store.json` names another catalog (a catalog re-created by `destroy` and `init` under the old root), is logged at startup as a warning (`backup store: the default root ... failed its check`) and leaves the store unconfigured, not unhealthy, so the upgrade never stops a server that never configured backups and CreateBackup keeps working on it; the same root configured explicitly is a startup error or an unhealthy store. The warning applies only while the catalog has no backup rows for the default root (an upgrade, a fresh deployment, a catalog re-created by `destroy` and `init`): once a server has written rows for it, the default root is handled as a configured one, so its backups never vanish behind a warning (a failed identity check is an unhealthy store, reported on `/health`; a root that can no longer be opened is a startup error naming it). Instances that share a catalog must share one store root, and a catalog re-created with `init` finds the old root's `extenddb-store.json` naming the old catalog: the [Backup and Restore manual](14-backup-and-restore.md) gives both rules and the recovery with `extenddb backup sync --adopt-store`.
 
 A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
 
@@ -53,7 +53,7 @@ A backup of a table that holds an `N` value the wire did not validate, or an att
 
 Migration 6 adds the catalog index of backups kept in a backup store, turns each restore registration into a restore job record, adds the maintenance claim record (`backup_maintenance`) and writes the catalog's random id (`settings.catalog_id`). On SQLite and PostgreSQL the index is the `backup_index` table and the job record is new columns of `table_restores`; on MongoDB the index is the `backup_index` collection and the job record a `restore_job` field of each restore target's `tables` document; on Cassandra the index is new columns of `backups_by_arn` and the `backup_index_by_status` table, and the job record new `restore_*` columns of `tables`. Stop every server built before this migration before running `extenddb migrate --yes`: such a server neither reads the index nor marks the restore registrations it writes, so a restore it ran during the upgrade would be owned by nobody. A restore in flight at that stop is left as a RUNNING job record whose owner is dead; the first reconciler pass of the new server (within `backup.reconcile_interval_secs`, default 60 s) marks it FAILED and removes its CREATING target, so the name is free again and the table has to be restored anew. On Cassandra the backfill reads `tables` with a filtered scan and writes each registration with a lightweight transaction, which takes seconds on a catalog of ordinary size. On Cassandra and MongoDB, which have no transaction around a body, every write of the migration is safe to send again: a `migrate --yes` that fails part way leaves migration 6 unrecorded, `serve` keeps refusing the catalog, and the next `migrate --yes` runs the body again and finishes.
 
-A rollback to the previous binary needs two things: the catalog restored from the pre-upgrade backup (the previous binary refuses a catalog carrying migration 6, exit status 4), and the `[backup]` section removed from the configuration file, which the previous binary refuses as an unknown field before it reaches the catalog (`unknown field 'backup'`). The pre-upgrade backup predates every backup this release wrote to the store, so a restored catalog has no `backup_index` row for them while the store keeps their bytes under its root; the previous binary serves neither (it does not read the store), and a later release's `backup sync --adopt-store` re-adopts them (the store's identity file names the pre-rollback catalog, so the re-upgraded catalog finds the store unhealthy until it is adopted; PR 10). In-catalog backups taken after it are lost with the rows, as before.
+A rollback to the previous binary needs two things: the catalog restored from the pre-upgrade backup (the previous binary refuses a catalog carrying migration 6, exit status 4), and the `[backup]` section removed from the configuration file, which the previous binary refuses as an unknown field before it reaches the catalog (`unknown field 'backup'`). The pre-upgrade backup predates every backup this release wrote to the store, so a restored catalog has no `backup_index` row for them while the store keeps their bytes under its root; the previous binary serves neither (it does not read the store). After the upgrade is run again, `extenddb backup sync --adopt-store` gives them rows: the store's identity file names the pre-rollback catalog, so the re-upgraded catalog finds the store owned by another catalog until the command makes it the owner (on SQLite's default root the server instead logs a warning and leaves the store unconfigured, so `/health` has no `backup_store` component until then), and the command then adopts every backup under the root. On SQLite `backup sync`, with or without its options, takes the serve lock as `backup purge` does, so the server is stopped while it runs; on PostgreSQL, MongoDB and Cassandra it runs beside the servers under the maintenance claim. In-catalog backups taken after it are lost with the rows, as before.
 
 ## Writing a New Migration
 
@@ -72,11 +72,16 @@ extenddb stop --config extenddb.toml
 2. **Back up the databases** (PostgreSQL; for SQLite see [SQLite](#sqlite) below, for Cassandra see the [rollback procedure](#rollback-procedure))
 
 ```bash
-pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
-pg_dump -h <host> -U <admin> <data-db> > data_backup_$(date +%Y%m%d).sql
+umask 077
+d=$(date +%Y%m%d)
+pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$d.sql \
+  && pg_dump -h <host> -U <admin> <data-db> > data_backup_$d.sql \
+  && test -s catalog_backup_$d.sql && test -s data_backup_$d.sql && echo "both dumps written"
 ```
 
-`pg_dump` refuses to dump a server of a newer major version than itself ("aborting because of server version mismatch"); use the client of the server's version.
+The catalog dump holds the encryption key and the application role's password, so `umask 077` creates both files readable by their owner alone.
+
+`pg_dump` refuses to dump a server of a newer major version than itself ("aborting because of server version mismatch"), exits 1 and leaves its file empty; use the client of the server's version. Go on only when the command prints "both dumps written": `psql` restores an empty file without an error.
 
 3. **Build the new version**
 
@@ -179,17 +184,27 @@ SQLite deployments follow the same sequence, backing up the database files as [S
 The upgrade is not reversible in place when it applies a breaking migration, and every migration in this release is breaking (see [The Catalog Status](#the-catalog-status)). If an upgrade fails or must be undone (PostgreSQL; for SQLite see [SQLite](#sqlite) below):
 
 1. Stop the server
-2. Restore the catalog from the backup, connected as `<admin>` to the `postgres` database:
+2. Restore both databases from the backups into new databases, connected as `<admin>` to the `postgres` database, with the upgraded databases renamed aside rather than dropped:
 
 ```bash
-psql -h <host> -U <admin> -d postgres -c "DROP DATABASE <catalog-db>;"
+psql -h <host> -U <admin> -d postgres -c "ALTER DATABASE <catalog-db> RENAME TO <catalog-db>_before_rollback;"
+psql -h <host> -U <admin> -d postgres -c "ALTER DATABASE <data-db> RENAME TO <data-db>_before_rollback;"
 psql -h <host> -U <admin> -d postgres -c "CREATE DATABASE <catalog-db> OWNER <owner>;"
-psql -h <host> -U <admin> -d <catalog-db> -f catalog_backup_YYYYMMDD.sql
+psql -h <host> -U <admin> -d postgres -c "CREATE DATABASE <data-db> OWNER <owner>;"
+psql -h <host> -U <admin> -d <catalog-db> -v ON_ERROR_STOP=1 -f catalog_backup_YYYYMMDD.sql
+psql -h <host> -U <admin> -d <data-db> -v ON_ERROR_STOP=1 -f data_backup_YYYYMMDD.sql
 ```
 
-To discard data written after the upgrade as well, restore `<data-db>` from its dump the same way.
+`-v ON_ERROR_STOP=1` makes `psql` stop at the first error, with exit 3; go on only when both restores exited 0. The catalog and data databases are one copy, so restore both; every write made after the dumps is lost. A catalog restored alone beside the newer data database is a catalog older than the tables; the Backup and Restore manual's [catalog restore](14-backup-and-restore.md#the-catalog-is-restored-from-a-database-backup) section says what that gives.
 
 3. Rebuild the previous version and start it
+4. Once the previous version has read every table, drop the renamed databases:
+
+```bash
+psql -h <host> -U <admin> -d postgres -c "DROP DATABASE <catalog-db>_before_rollback;" -c "DROP DATABASE <data-db>_before_rollback;"
+```
+
+Until then they hold the upgraded copy: if a restore fails, drop the new, partly restored database and rename the old one back.
 
 This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
 
@@ -228,6 +243,7 @@ The upgrade is not reversible in place: a 0.0.3 PostgreSQL or SQLite binary refu
 
 ```bash
 extenddb stop --config extenddb.toml
+umask 077
 pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
 export EXTENDDB_PG_PASSWORD='<admin password>'
 extenddb migrate --config extenddb.toml --pg-user <admin>          # exit 3, prints the plan
@@ -332,6 +348,40 @@ The first release, so all 0.0.2 deployments were fresh installs.
 Catalog upgrades change the schema; behavior changes alter how the running server
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
+
+### Streams: disabling closes the shards, enabling creates a new stream
+
+**What changed.** `UpdateTable` with `StreamEnabled: false` now closes the
+stream's shards (each gets an `EndingSequenceNumber`), and `StreamEnabled: true`
+afterwards creates a new stream with a new ARN and four new shard ids, as on
+DynamoDB. Before this release a disable left the shards open and a re-enable
+kept the same ARN. Each stream's shard ids carry its identity, so the change
+needs no catalog migration of its own. On MongoDB its one new index comes with
+migration 1 (below).
+
+**Servers of the earlier release.** A server of the earlier release must not
+run against the migrated catalog, because this release carries breaking
+migrations (see [The Catalog Status](#the-catalog-status)). Such a server does
+not know closed shards. It writes records past a shard's
+`EndingSequenceNumber`, and it re-enables a disabled stream under its old ARN
+instead of creating a new one.
+A stream that the earlier release disabled keeps its four shards open under
+the new release. The first `UpdateTable` that sets a `StreamSpecification` on
+the table closes them: an enable, or a disable, which the server refuses as
+before.
+
+**MongoDB.** Migration 1 creates the `{table_id: 1, shard_id: 1}` index on the
+data database's `stream_shards`: `extenddb init` runs it on a new deployment,
+and `extenddb migrate --yes` runs it on a 0.1.x deployment.
+A deployment that a build without the index has already migrated gets it from
+`extenddb migrate --yes --reconverge`, which runs migration 1 again.
+
+**Rollback.** Going back to the earlier release means restoring the
+pre-upgrade database as in [Rollback Procedure](#rollback-procedure); the
+earlier release does not read the closed shards' ending numbers or the labelled
+shard ids the new release writes.
+
+---
 
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 
@@ -449,6 +499,22 @@ migration is required.
 7. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`. The IAM policy simulator refuses a `2012-10-17` policy whose value has fewer, such as `${aws:ResourceTag/blockedPrincipal}`, and ExtendDB now fails that condition closed in a document of any `Version`, since IAM checks a value's fields whatever the `Version`. A `Deny` with it applies to every request its action, resource and other conditions match, and an `Allow` with it grants nothing. Before, the substituted ARN was compared as a whole, so such a `Deny` applied only to the principal the tag named, and an `Allow` written with `ArnNotLike` granted every other principal. Only the `ArnLike` `Deny` and the `ArnNotLike` `Allow` in `2012-10-17` documents were sent to the simulator; the `ArnEquals` and `ArnNotEquals` forms, the forms with a set qualifier or `IfExists`, and `2008-10-17` and no-`Version` policies follow the same rule without a measurement. To compare a principal with an ARN stored whole in a tag, use `StringEquals`, which compares the expanded text in a `2012-10-17` document.
 
 **Who is affected.** Any deployment with a stored policy whose condition values contain `${`: user, group and role policies, permissions boundaries, session policies and role trust policies. Search the stored policies for `${` (`extenddb manage list-user-policies`, `list-group-policies` and `list-role-policies` print inline policies, `get-user-boundary` and `get-role-boundary` permissions boundaries, and `list-roles` trust policies) and check each match against the cases above before upgrading. The shapes that change are a variable in a `2008-10-17` or no-`Version` document, an escape, a variable under `StringLike`, `ArnLike` or `ArnEquals`, a string or ARN value with a variable that has no default and whose key a request may not carry, a numeric, date, `Bool` or `Null` value written as a variable, and an `Arn*` value that contains `${` and has fewer than five written `:`. No catalog migration is required.
+
+---
+
+### v0.1.15: IAM policy variable references are checked at write and read quoted defaults as IAM does
+
+**What changed.** Policy writes now refuse a `${...}` reference that IAM refuses, and evaluation reads a quoted default as IAM reads it (issue #834). Both were measured on IAM on 2026-11-09 and 2026-11-10. No catalog migration is required.
+
+- A policy write refuses a reference in a condition value or in a `Resource` or `NotResource` pattern that no `}` closes, such as `a${`, `a$${` or `a${aws:username, '}'`, and one whose text is not an escape, a key name, or a key name, a `,` and one quoted default, such as `a${}`, `a${'x'}`, `a${a,b}`, `a${aws user}`, `a${aws:username, 'x' 'y'}` or `a${a$b, 'x'}`. This covers inline user, group and role policies, user and role permissions boundaries, the console policy form, create role and the console role form. A session policy passed to AssumeRole is not checked. The management API answers 400 and the console forms show the error on the page. The text carries `MalformedPolicyDocument`, IAM's message and the value: `Syntax errors in policy.` for an identity policy with `Version` `2012-10-17`, `Variable declaration is not well-formed.`, `The policy failed legacy parsing`, or a `Resource ... must be in ARN format` or `Partition ... is not valid` message for one with `Version` `2008-10-17`, and `Policy contains one or more invalid variable declarations` for a role trust policy with `Version` `2012-10-17`. A trust policy with `Version` `2008-10-17` or none stores such a value and refuses it in an `Arn*` value only when no `}` follows the `${`, with `value used for ARN condition is incorrect type`. In an identity policy with `Version` `2008-10-17`, an `IpAddress` or `NotIpAddress` value with `${` gets ExtendDB's malformed CIDR message, as before, where IAM answers `The policy failed legacy parsing`. Values IAM accepts are still accepted, including `a${}}` and `a${aws:username, '}x'}`.
+- In a reference that a write accepts, a `}` inside the quotes of a default no longer ends the reference, a doubled `''` in a default stands for one `'`, and an escape with a default is the escape. With no `aws:username` in the request, `StringEquals` with `a${aws:username, '}x'}` now matches `a}x`, and with `aws:username` `bob` it matches `abob`; before, it matched neither. With no `aws:username`, `a${aws:username, 'x''y'}` matches `ax'y`, and `a${*, 'x'}` matches `a*` and not `ax`.
+
+**Who is affected.** A deployment with a stored policy, permissions boundary, session policy or role trust policy whose condition values or `Resource` or `NotResource` patterns contain `${` and either a `'` inside the braces or an escape followed by a `,`.
+
+- A stored value that holds a reference the write now refuses keeps its decision: it is read as before, with each `${` ending at the next `}`. Writing an identity policy, boundary or trust policy with the same text again is now refused.
+- A stored value with a quoted `}`, a doubled `''` in a default, or an escape with a default now decides as IAM does. An `Allow` with `a${aws:username, '}x'}` that granted nothing now grants for `a}x` and for `a` followed by the caller's user name, and a `Deny` with `a${*, 'x'}` that applied to `ax` now applies to `a*` instead.
+
+Before upgrading, search the stored documents for `${` with `extenddb manage list-user-policies`, `list-group-policies`, `list-role-policies`, `get-user-boundary`, `get-role-boundary` and `list-roles`, and check each match that has a `'` after the `${`.
 
 ---
 
