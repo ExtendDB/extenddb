@@ -13,7 +13,7 @@ UnprocessedItems writes each item once.
 On the MongoDB backend the stream sequence counter is drawn inside the
 write's transaction, so concurrent writers on one table conflict on the
 counter even when they write different keys. These tests fail on a server
-that reports that conflict as an error instead of retrying it.
+that answers 500 InternalServerError for that conflict.
 """
 
 from __future__ import annotations
@@ -144,9 +144,10 @@ def _error_code(e: ClientError) -> str:
     return f"{e.response['ResponseMetadata']['HTTPStatusCode']} {e.response['Error']['Code']}"
 
 
-def _resend_unavailable(call, **kwargs):
-    """Return `call(**kwargs)`, sending it again after each 503
-    ServiceUnavailable answer, up to UNAVAILABLE_RESENDS times.
+def _resend_unavailable(call, **kwargs) -> tuple[dict, int]:
+    """Return the answer of `call(**kwargs)` and the number of resends. It
+    sends the write again after each 503 ServiceUnavailable answer, up to
+    UNAVAILABLE_RESENDS times.
 
     A 503 here means the write did not commit within the server's retry
     budget and nothing was applied, so a resend cannot apply it twice. Any
@@ -154,7 +155,7 @@ def _resend_unavailable(call, **kwargs):
     """
     for attempt in range(UNAVAILABLE_RESENDS + 1):
         try:
-            return call(**kwargs)
+            return call(**kwargs), attempt
         except ClientError as e:
             if e.response["Error"]["Code"] != "ServiceUnavailable" or attempt == UNAVAILABLE_RESENDS:
                 raise
@@ -210,24 +211,27 @@ def test_racing_puts_and_deletes_on_a_stream_table_all_succeed(
     tests/test_concurrency.py does, so a busy host does not fail the test. A
     500, any other error, a 503 after the last resend, and a stream record
     count that differs from the writes that changed an item still fail it.
+    The assertion messages give the number of writes that answered 200 only
+    after a resend.
     """
     prefix = f"churn-{uuid.uuid4().hex[:8]}-"
 
-    def body(i: int) -> tuple[list[str], int]:
+    def body(i: int) -> tuple[list[str], int, int]:
         failures: list[str] = []
         records = 0
+        resent = 0
         for n in range(OPS_PER_WRITER):
             key = {"pk": {"S": f"{prefix}{(i + n) % KEYS}"}}
             try:
                 if n % 2 == 0:
-                    _resend_unavailable(
+                    _, resends = _resend_unavailable(
                         raw_client.put_item,
                         TableName=stream_table,
                         Item={**key, "w": {"S": f"w{i}-{n}"}},
                     )
                     records += 1
                 else:
-                    r = _resend_unavailable(
+                    r, resends = _resend_unavailable(
                         raw_client.delete_item,
                         TableName=stream_table,
                         Key=key,
@@ -236,16 +240,27 @@ def test_racing_puts_and_deletes_on_a_stream_table_all_succeed(
                     # A delete of an item that does not exist writes no record.
                     if r.get("Attributes"):
                         records += 1
+                if resends:
+                    resent += 1
             except ClientError as e:
                 failures.append(_error_code(e))
-        return failures, records
+        return failures, records, resent
 
     out = _run_writers(WRITERS, body)
-    failures = [f for fails, _ in out for f in fails]
-    assert not failures, f"{len(failures)} of {WRITERS * OPS_PER_WRITER} writes failed: {sorted(set(failures))}"
-    want = sum(records for _, records in out)
+    failures = [f for fails, _, _ in out for f in fails]
+    # No bound on this number: how many writes need a resend depends on the
+    # load on the host.
+    resent_writes = sum(resent for _, _, resent in out)
+    resent_note = (
+        f"{resent_writes} of {WRITERS * OPS_PER_WRITER} writes answered 200 only after a resend"
+    )
+    assert not failures, (
+        f"{len(failures)} of {WRITERS * OPS_PER_WRITER} writes failed: "
+        f"{sorted(set(failures))}; {resent_note}"
+    )
+    want = sum(records for _, records, _ in out)
     got = _wait_for_record_count(dynamodb_client, streams_client, stream_table, prefix, want)
-    assert got == want, f"stream records {got}, writes that changed an item {want}"
+    assert got == want, f"stream records {got}, writes that changed an item {want}; {resent_note}"
 
 
 def test_batch_writes_racing_puts_on_a_stream_table_never_fail(
