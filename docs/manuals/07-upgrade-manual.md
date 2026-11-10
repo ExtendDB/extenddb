@@ -482,6 +482,38 @@ migration is required.
 
 ---
 
+### v0.1.15: access key import is refused unless `allow_credential_import` is `true`
+
+**What changed.** `extenddb manage import-access-key`, and the management API
+route it calls, `POST /management/accounts/{id}/users/{name}/access-keys/import`,
+import a key only when the runtime setting `allow_credential_import` is `true`.
+When the catalog has no row for the setting, the server refuses the import with
+HTTP 403 and `Credential import is disabled (allow_credential_import = false)`.
+Before this release the server allowed the import when the row was missing. No
+release writes the row, so every deployment that never set it accepted imports.
+An import stores an access key ID and secret that the caller chooses. With the
+feature off by default, only deployments that turn it on accept caller-chosen
+keys. The console settings page already showed `false` as the default. The
+setting does not affect keys imported before the upgrade, or the credentials a
+dev-mode server seeds at startup.
+
+**Who is affected.** Deployments that import access keys and never set
+`allow_credential_import`. A deployment that set it to `true` or `false` keeps
+its behavior.
+
+**Migration.** Before upgrading, enable the setting on each deployment that
+imports keys:
+
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+
+The command writes the row to the catalog. The server reads the row on each
+import, so the command works with the earlier release and needs no restart. No
+catalog migration is required.
+
+---
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,

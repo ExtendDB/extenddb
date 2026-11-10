@@ -212,6 +212,8 @@ export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 eval $(python3 devtools/provision-test-credentials)
+# The access key import tests need import enabled. devtools/run-tests sets it.
+./target/release/extenddb settings --config extenddb.toml set allow_credential_import true
 pytest tests/ -v
 ```
 

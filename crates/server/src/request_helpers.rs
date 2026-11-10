@@ -108,6 +108,14 @@ pub(crate) async fn authorize_request(
     source_ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
+    // A table name, index name or ARN that the service refuses, in TableName
+    // or in any other field that carries one (RequestItems, TransactItems, the
+    // restore and import names, the stream, backup and tag ARNs), is refused
+    // here, before the key info and resource tag lookups below and before the
+    // developer-mode return, the cross-account refusal and the ARN shape
+    // checks (see `table_name_gate`).
+    crate::table_name_gate::check_table_name_chars(operation, input, account_id)?;
+
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 

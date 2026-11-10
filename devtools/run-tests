@@ -402,6 +402,11 @@ if $NEEDS_INTEGRATION && [[ "$TARGET" != "real-dynamodb" ]]; then
         if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set throttling_enabled true 2>/dev/null; then
             echo "  ✓ throttling_enabled set to true"
         fi
+        # Access key import is refused unless this is true. Set once here, before
+        # any suite starts, so no test changes it while parallel workers run.
+        if "$BINARY" settings --config "$CONFIG_FOR_SETTINGS" set allow_credential_import true 2>/dev/null; then
+            echo "  ✓ allow_credential_import set to true"
+        fi
     fi
 
     # Import/export paths. The Python tests write fixtures via tempfile, which
