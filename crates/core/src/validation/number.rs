@@ -549,9 +549,9 @@ mod tests {
         }
     }
 
-    // DynamoDB's answers to the values in the next two tests were measured
+    // DynamoDB's answers to the values in the next three tests were measured
     // with PutItem in us-east-1 on 2026-11-09, each value sent twice with the
-    // same answer both times.
+    // same answer both times, except the values marked with another date.
     const TOO_MANY_DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
 
     #[test]
@@ -560,6 +560,7 @@ mod tests {
         // one, computed in 64 bits: at i64::MAX the sum wraps to a negative
         // exponent. A fraction digit lowers the point offset before the sum.
         assert_refused("0E9223372036854775807", UNDERFLOW);
+        // `0E9223372036854775806` was measured on 2026-10-27.
         for n in ["0E9223372036854775806", "0.0E9223372036854775807"] {
             assert_refused(n, OVERFLOW);
         }
@@ -586,6 +587,46 @@ mod tests {
             "1234567890123456789012345678901234567890E9223372036854775807",
         ] {
             assert_refused(n, OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn magnitude_below_i64_min_is_an_underflow_before_the_digit_count() {
+        // More than 38 digits with the exponent of the normalized form
+        // `0.d * 10^n` below i64::MIN: the underflow is reported before the
+        // digits are counted. Each fraction zero before the digits lowers
+        // that exponent by one. Under the smallest exponent, one zero puts
+        // forty digits at i64::MIN - 1, two at i64::MIN - 2 and forty at
+        // i64::MIN - 40; under the next exponent, two zeros reach i64::MIN - 1
+        // as well. The answer is the same with 39 digits and with a minus
+        // sign. Measured on 2026-11-10, each value sent twice with the same
+        // answer both times.
+        let forty_zeros = "0".repeat(40);
+        let forty_below =
+            format!(".{forty_zeros}1234567890123456789012345678901234567891E-9223372036854775808");
+        for n in [
+            ".01234567890123456789012345678901234567891E-9223372036854775808",
+            ".001234567890123456789012345678901234567891E-9223372036854775807",
+            ".001234567890123456789012345678901234567891E-9223372036854775808",
+            forty_below.as_str(),
+            ".0123456789012345678901234567890123456789E-9223372036854775808",
+            "-.01234567890123456789012345678901234567891E-9223372036854775808",
+        ] {
+            assert_refused(n, UNDERFLOW);
+        }
+        // At i64::MIN, reached with no fraction zero under the smallest
+        // exponent, one under the next and two under the one after, and at
+        // i64::MIN + 40, with the digits before the point, the digit count is
+        // reported. The same holds with 39 digits and with a minus sign.
+        for n in [
+            ".1234567890123456789012345678901234567891E-9223372036854775808",
+            ".01234567890123456789012345678901234567891E-9223372036854775807",
+            ".001234567890123456789012345678901234567891E-9223372036854775806",
+            "1234567890123456789012345678901234567891E-9223372036854775808",
+            ".123456789012345678901234567890123456789E-9223372036854775808",
+            "-.1234567890123456789012345678901234567891E-9223372036854775808",
+        ] {
+            assert_refused(n, TOO_MANY_DIGITS);
         }
     }
 }
