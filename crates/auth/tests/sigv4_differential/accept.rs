@@ -5,7 +5,7 @@
 //! the server's canonical request for each is the one `aws-sigv4` signed.
 
 use crate::corpus::{self, ENDPOINTS, REGIONS, SDK_HEADERS};
-use crate::harness::{Key, Shape, Tally, check_accepted, sign};
+use crate::harness::{Key, SERVER_REGION, Shape, Tally, check_accepted, sign};
 use crate::mutate::{MARGIN, SKEW_WINDOW};
 
 fn accept(shape: &Shape, what: &str, tally: &mut Tally, category: &'static str) {
@@ -36,23 +36,27 @@ fn client_shapes_verify() {
     tally.report("client_shapes_verify");
 }
 
-/// A request signed for each region verifies.
+/// A request signed for the server's region verifies. The server refuses a
+/// request signed for any other region in `REGIONS`;
+/// `reject::every_other_region_is_refused_by_the_region_check` checks those.
 #[test]
-fn every_region_verifies() {
+fn the_servers_region_verifies() {
+    assert!(
+        REGIONS.contains(&SERVER_REGION),
+        "the server's region is a region clients sign for"
+    );
     let mut tally = Tally::default();
     for key in Key::ALL {
-        for region in REGIONS {
-            let mut shape = corpus::base(key, corpus::PUT_ITEM.to_vec());
-            (*region).clone_into(&mut shape.region);
-            accept(
-                &shape,
-                &format!("{key:?} in {region}"),
-                &mut tally,
-                "accepted: region",
-            );
-        }
+        let mut shape = corpus::base(key, corpus::PUT_ITEM.to_vec());
+        SERVER_REGION.clone_into(&mut shape.region);
+        accept(
+            &shape,
+            &format!("{key:?} in {SERVER_REGION}"),
+            &mut tally,
+            "accepted: the server's region",
+        );
     }
-    tally.report("every_region_verifies");
+    tally.report("the_servers_region_verifies");
 }
 
 /// Each endpoint, with Host taken from the URI and with Host set by the

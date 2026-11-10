@@ -73,9 +73,10 @@ pub fn parse_authorization(header: &str) -> Result<ParsedAuthorization, DynamoDb
     // Credential = access_key/date/region/service/aws4_request
     let parts: Vec<&str> = credential.splitn(5, '/').collect();
     if parts.len() != 5 || parts[4] != "aws4_request" {
-        return Err(incomplete(
-            "Credential must follow the format: AKID/date/region/service/aws4_request",
-        ));
+        // Measured 2026-09-16: the service names the rule and echoes the value.
+        return Err(incomplete(&format!(
+            "Credential must have exactly 5 slash-delimited elements, e.g. keyid/date/region/service/term, got '{credential}'"
+        )));
     }
 
     Ok(ParsedAuthorization {
