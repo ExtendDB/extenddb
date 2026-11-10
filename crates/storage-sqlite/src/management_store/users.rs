@@ -9,7 +9,7 @@ use extenddb_storage::management_store::{OpError, OpResult, UserDetail, UserList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
-use super::policies::delete_principal_attachments;
+use super::policies::{begin_write, delete_principal_attachments, finish};
 
 impl SqliteCatalogStore {
     pub(crate) async fn create_user_impl(
@@ -19,43 +19,6 @@ impl SqliteCatalogStore {
         password_hash: Option<&str>,
     ) -> OpResult<()> {
         let user_arn = format!("arn:aws:iam::{account_id}:user/{user_name}");
-
-        // D1: every writer holds the write lock, acquired before the
-        // transaction begins so the lock never waits on a pool connection.
-        let _writer = self.lock_writes().await;
-        let mut tx = self
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| {
-                tracing::error!("create_user begin: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-
-        sqlx::query(
-            "INSERT INTO iam_users (account_id, user_name, user_arn, password_hash) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(account_id)
-        .bind(user_name)
-        .bind(&user_arn)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                OpError::AlreadyExists("IAM user already exists".to_owned())
-            } else if is_fk_violation(&e) {
-                OpError::NotFound("Account not found".to_owned())
-            } else {
-                tracing::error!("create_user: {e}");
-                OpError::Internal("Database error".to_owned())
-            }
-        })?;
-
-        // A user deleted before deletes removed these could have left its
-        // inline policies and boundary under this name.
-        delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
 
         // Seed a default self-service policy so the user can manage its own
         // access keys and password without an administrator attaching one
@@ -70,64 +33,85 @@ impl SqliteCatalogStore {
                     "iam:ListAccessKeys",
                     "iam:ChangePassword"
                 ],
-                "Resource": user_arn,
+                "Resource": &user_arn,
             }]
         })
         .to_string();
 
-        sqlx::query(
-            "INSERT INTO iam_policies \
-             (account_id, principal_type, principal_name, policy_name, policy_document) \
-             VALUES (?, 'user', ?, 'SelfServicePolicy', ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(account_id)
-        .bind(user_name)
-        .bind(&self_service_policy)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            tracing::error!("seed self-service policy: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
+        // D1: every writer holds the write lock, acquired before the
+        // transaction begins so the lock never waits on a pool connection.
+        let _writer = self.lock_writes().await;
+        let mut tx = begin_write(self.pool(), "create_user").await?;
+        let result: OpResult<()> = async {
+            sqlx::query(
+                "INSERT INTO iam_users (account_id, user_name, user_arn, password_hash) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(user_name)
+            .bind(&user_arn)
+            .bind(password_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    OpError::AlreadyExists("IAM user already exists".to_owned())
+                } else if is_fk_violation(&e) {
+                    OpError::NotFound("Account not found".to_owned())
+                } else {
+                    tracing::error!("create_user: {e}");
+                    OpError::Internal("Database error".to_owned())
+                }
+            })?;
 
-        tx.commit().await.map_err(|e| {
-            tracing::error!("create_user commit: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
-        Ok(())
+            // A user deleted before deletes removed these could have left its
+            // inline policies and boundary under this name.
+            delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+
+            sqlx::query(
+                "INSERT INTO iam_policies \
+                 (account_id, principal_type, principal_name, policy_name, policy_document) \
+                 VALUES (?, 'user', ?, 'SelfServicePolicy', ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(account_id)
+            .bind(user_name)
+            .bind(&self_service_policy)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("seed self-service policy: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(())
+        }
+        .await;
+        finish(tx, result, "create_user").await
     }
 
     pub(crate) async fn delete_user_impl(&self, account_id: &str, user_name: &str) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
-        let mut tx = self
-            .pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_user begin: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        // The foreign keys remove the user's access keys, tags and group
-        // memberships. Its inline policies and boundary have none.
-        let result = sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
-            .bind(account_id)
-            .bind(user_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_user: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        if result.rows_affected() == 0 {
-            return Err(OpError::NotFound("IAM user not found".to_owned()));
+        let mut tx = begin_write(self.pool(), "delete_user").await?;
+        let result: OpResult<()> = async {
+            // The foreign keys remove the user's access keys, tags and group
+            // memberships. Its inline policies and boundary have none.
+            let deleted =
+                sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
+                    .bind(account_id)
+                    .bind(user_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("delete_user: {e}");
+                        OpError::Internal("Database error".to_owned())
+                    })?;
+            if deleted.rows_affected() == 0 {
+                return Err(OpError::NotFound("IAM user not found".to_owned()));
+            }
+            delete_principal_attachments(&mut tx, account_id, "user", user_name).await
         }
-        delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
-        tx.commit().await.map_err(|e| {
-            tracing::error!("delete_user commit: {e}");
-            OpError::Internal("Database error".to_owned())
-        })?;
-        Ok(())
+        .await;
+        finish(tx, result, "delete_user").await
     }
 
     pub(crate) async fn list_users_impl(&self, account_id: &str) -> OpResult<Vec<UserListEntry>> {

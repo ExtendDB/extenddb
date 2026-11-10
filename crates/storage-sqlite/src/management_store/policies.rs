@@ -9,6 +9,46 @@ use time::OffsetDateTime;
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::parse_timestamp;
 
+/// Begin the `BEGIN IMMEDIATE` transaction a principal's create or delete
+/// runs in. The caller holds the write lock (D1).
+pub(super) async fn begin_write<'a>(
+    pool: &'a sqlx::SqlitePool,
+    what: &str,
+) -> OpResult<sqlx::Transaction<'a, sqlx::Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
+        tracing::error!("{what} begin: {e}");
+        OpError::Internal("Database error".to_owned())
+    })
+}
+
+/// Commit `tx` when `result` is `Ok`, and roll it back otherwise, so the
+/// connection goes back to the pool with no transaction open.
+///
+/// Dropping a SQLite transaction only queues its rollback, and a
+/// `BEGIN IMMEDIATE` on that connection before the rollback ran fails with
+/// "attempted to call begin_with at non-zero transaction depth".
+pub(super) async fn finish<T>(
+    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    result: OpResult<T>,
+    what: &str,
+) -> OpResult<T> {
+    match result {
+        Ok(value) => {
+            tx.commit().await.map_err(|e| {
+                tracing::error!("{what} commit: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(value)
+        }
+        Err(e) => {
+            if let Err(rollback) = tx.rollback().await {
+                tracing::error!("{what} rollback: {rollback}");
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Delete the inline policies and the permissions boundary stored under a
 /// principal's name, inside the caller's transaction.
 ///
