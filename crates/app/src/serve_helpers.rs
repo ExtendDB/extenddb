@@ -482,10 +482,22 @@ mod tls_key_permission_tests {
 
         assert!(warning.contains("Another user (uid "), "{warning}");
         if process_in_group(meta.gid()) {
-            assert!(warning.contains("`chmod o-rwx`"), "{warning}");
+            assert!(
+                warning.contains(&format!(
+                    "`chmod o-rwx` on the file; this server reads it through its group (gid {})",
+                    meta.gid()
+                )),
+                "{warning}"
+            );
         } else {
-            assert!(warning.contains("`chmod 640`"), "{warning}");
-            assert!(warning.contains("`chgrp "), "{warning}");
+            // The key goes to this server's group, not the key's own group,
+            // which this server is not in.
+            // SAFETY: getegid has no preconditions and cannot fail.
+            let egid = unsafe { libc::getegid() };
+            assert!(
+                warning.contains(&format!("`chgrp {egid}` and then `chmod 640`")),
+                "{warning}"
+            );
             assert!(!warning.contains("chmod o-rwx"), "{warning}");
         }
         assert!(!warning.contains("chmod 600"), "{warning}");
