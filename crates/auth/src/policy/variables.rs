@@ -45,7 +45,11 @@
 //! ARN). `*` and `?` count UTF-16 code units, as in
 //! [`super::matcher::wildcard_match`] (#581).
 
+use std::borrow::Cow;
+
 use super::context::ConditionContext;
+
+pub(super) mod reference;
 use super::document::{PolicyDocument, PolicyParseError};
 use super::matcher::{arn_match, wildcard_match};
 use serde_json::Value;
@@ -125,6 +129,10 @@ enum Reference<'a> {
     Key {
         name: &'a str,
         default: Option<&'a str>,
+        /// Whether a doubled `''` in the default stands for one `'`: true
+        /// for a value a policy write accepts ([`reference::parse`]), false
+        /// for one only a stored document holds.
+        doubled_quotes: bool,
     },
     /// `${*}`, `${?}` or `${$}`.
     Escape(u8),
@@ -133,43 +141,14 @@ enum Reference<'a> {
 /// Trim the code points up to U+0020 from both ends of `text`, the set Java's
 /// `String.trim` removes.
 ///
-/// IAM trims this set around a variable's key name and its quoted default,
-/// in both forms and in the escapes (measured with the IAM policy simulator:
+/// IAM trims this set around a variable's key name in both forms and around
+/// the escapes; a quoted default is trimmed of Java whitespace only
+/// ([`reference`]) (measured with the IAM policy simulator:
 /// space, tab, newline, U+000B, U+000C, U+000D, U+0001 and U+001F are
 /// trimmed; U+0085, U+00A0 and U+3000 are not, so a key name written with
 /// one of them names a key the request does not carry).
 fn trim_up_to_space(text: &str) -> &str {
     text.trim_matches(|c: char| c <= ' ')
-}
-
-/// Parse the text between `${` and `}`.
-///
-/// The text is trimmed with [`trim_up_to_space`] first. Then `*`, `?` and
-/// `$` are the escapes, and `name, 'default'` is the default form, where the
-/// name and the quoted default are trimmed again and the text inside the
-/// quotes is kept as written. Anything else, including a `,` whose right
-/// side is not single-quoted, is taken as the key name.
-fn parse_reference(inner: &str) -> Reference<'_> {
-    let inner = trim_up_to_space(inner);
-    match inner {
-        "*" => return Reference::Escape(b'*'),
-        "?" => return Reference::Escape(b'?'),
-        "$" => return Reference::Escape(b'$'),
-        _ => {}
-    }
-    if let Some((name, default)) = inner.split_once(',') {
-        let default = trim_up_to_space(default);
-        if default.len() >= 2 && default.starts_with('\'') && default.ends_with('\'') {
-            return Reference::Key {
-                name: trim_up_to_space(name),
-                default: Some(&default[1..default.len() - 1]),
-            };
-        }
-    }
-    Reference::Key {
-        name: inner,
-        default: None,
-    }
 }
 
 /// One piece of a policy string: plain text, or a `${...}` reference with its
@@ -180,33 +159,29 @@ enum Part<'a> {
     Ref(&'a str, Reference<'a>),
 }
 
-/// Split `value` into plain text and `${...}` references, read by
-/// [`parse_reference`]. A `${` with no closing `}` is plain text, as before.
+/// Split `value` into plain text and `${...}` references. A value a policy
+/// write accepts is read by IAM's grammar ([`reference`]). A value that holds
+/// a reference the write refuses is read as before: each `${` closes at the
+/// next `}`, and a `${` with no later `}` is plain text.
 ///
 /// Every caller reads a pattern or value that is expanded, in a `2012-10-17`
 /// document and, for a condition value, under a string or ARN operator. A
 /// value that is not expanded is compared as written and is not split
 /// ([`expand_condition_value`]).
 fn parts(value: &str) -> Vec<Part<'_>> {
-    let mut out = Vec::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        out.push(Part::Text(&rest[..start]));
-        let after_start = &rest[start + 2..];
-        match after_start.find('}') {
-            Some(end) => {
-                let raw = &rest[start..start + 3 + end];
-                out.push(Part::Ref(raw, parse_reference(&after_start[..end])));
-                rest = &after_start[end + 1..];
-            }
-            None => {
-                out.push(Part::Text(&rest[start..]));
-                rest = "";
-            }
-        }
+    if reference::has_invalid_reference(value) {
+        reference::split(value, |after| after.find('}'), reference::legacy)
+    } else {
+        reference::split(value, reference::reference_end, reference::parse)
     }
-    out.push(Part::Text(rest));
-    out
+}
+
+/// [`parts`] as before the grammar: each `${` closes at the next `}`. IAM
+/// counts the fields of an Arn value this way (measured on a `2008-10-17`
+/// trust policy write on 2026-11-09: `${x, ':}:::::` is accepted and
+/// `${x, ':::::}` is refused).
+fn legacy_parts(value: &str) -> Vec<Part<'_>> {
+    reference::split(value, |after| after.find('}'), reference::legacy)
 }
 
 /// Why a variable has no text to substitute.
@@ -233,8 +208,16 @@ enum Missing {
 fn resolve<'a>(
     name: &str,
     default: Option<&'a str>,
+    doubled_quotes: bool,
     context: &'a impl ConditionContext,
-) -> Result<&'a str, Missing> {
+) -> Result<Cow<'a, str>, Missing> {
+    let default = default.map(|d| {
+        if doubled_quotes {
+            unescape_default(d)
+        } else {
+            Cow::Borrowed(d)
+        }
+    });
     let values = context.resolve_key(name);
     if values.is_none() && context.is_unresolvable_key(name) {
         return Err(Missing::Unresolvable);
@@ -246,8 +229,20 @@ fn resolve<'a>(
         };
     }
     match values {
-        Some(values) => Ok(values.first().copied().unwrap_or("")),
+        Some(values) => Ok(Cow::Borrowed(values.first().copied().unwrap_or(""))),
         None => default.ok_or(Missing::Absent),
+    }
+}
+
+/// A quoted default as IAM substitutes it: a doubled `''` is one `'`
+/// (measured with the IAM policy simulator on 2026-11-09: the defaults
+/// `'x''y'`, `''''`, `'x'''` and `'''x'` match the tag values `x'y`, `'`,
+/// `x'` and `'x`).
+fn unescape_default(default: &str) -> Cow<'_, str> {
+    if default.contains("''") {
+        Cow::Owned(default.replace("''", "'"))
+    } else {
+        Cow::Borrowed(default)
     }
 }
 
@@ -263,13 +258,18 @@ fn expand_tokens(pattern: &str, context: &impl ConditionContext) -> Result<Vec<T
         match part {
             Part::Text(text) => tokens.extend(text.encode_utf16().map(Token::written)),
             Part::Ref(_, Reference::Escape(byte)) => tokens.push(Token::Unit(u16::from(byte))),
-            Part::Ref(_, Reference::Key { name, default }) => {
-                match resolve(name, default, context) {
-                    Ok(value) => tokens.extend(value.encode_utf16().map(Token::Unit)),
-                    Err(Missing::Unresolvable) => unresolvable = true,
-                    Err(Missing::Absent) => return Err(Missing::Absent),
-                }
-            }
+            Part::Ref(
+                _,
+                Reference::Key {
+                    name,
+                    default,
+                    doubled_quotes,
+                },
+            ) => match resolve(name, default, doubled_quotes, context) {
+                Ok(value) => tokens.extend(value.encode_utf16().map(Token::Unit)),
+                Err(Missing::Unresolvable) => unresolvable = true,
+                Err(Missing::Absent) => return Err(Missing::Absent),
+            },
         }
     }
     if unresolvable {
@@ -320,8 +320,8 @@ pub fn resource_pattern_is_unresolvable(
 /// The key names the `${key}` and `${key, 'default'}` variables in `value`
 /// read, in the order [`expand_condition_value`] reads them.
 ///
-/// The default is not part of the name, and the name is trimmed as
-/// [`parse_reference`] trims it, so a caller that asks the context about each
+/// The default is not part of the name, and the name is trimmed as [`parts`]
+/// trims it, so a caller that asks the context about each
 /// name sees the key behind `${aws:RequestTag/env, 'x'}` as it sees the one
 /// behind `${aws:RequestTag/env}`. The `${*}`, `${?}` and `${$}` escapes name
 /// no key, and neither does a `${` with no closing brace, as both expand to
@@ -423,8 +423,8 @@ impl ConditionValue {
 /// value for the key, so the default is not used, and the caller fails the
 /// condition closed before comparing (`condition::evaluate_condition_match`,
 /// which finds the key through [`variable_key_names`]). The text between the
-/// braces is read as [`parse_reference`] reads it, trimmed of the code points
-/// up to U+0020.
+/// braces is read as [`parts`] reads it, the key name trimmed of the code
+/// points up to U+0020.
 #[must_use]
 pub fn expand_condition_value(
     value: &str,
@@ -446,13 +446,20 @@ pub fn expand_condition_value(
                 text.push(char::from(byte));
                 tokens.push(Token::Unit(u16::from(byte)));
             }
-            Part::Ref(_, Reference::Key { name, default }) => {
+            Part::Ref(
+                _,
+                Reference::Key {
+                    name,
+                    default,
+                    doubled_quotes,
+                },
+            ) => {
                 // `Missing::Absent` and `Missing::Unresolvable` both leave
                 // nothing to compare, so the value matches nothing.
-                let Ok(resolved) = resolve(name, default, context) else {
+                let Ok(resolved) = resolve(name, default, doubled_quotes, context) else {
                     return ConditionValue::Unresolved;
                 };
-                text.push_str(resolved);
+                text.push_str(&resolved);
                 tokens.extend(resolved.encode_utf16().map(Token::Unit));
             }
         }
@@ -469,7 +476,7 @@ pub fn expand_condition_value(
 #[must_use]
 pub(super) fn arn_value_lacks_fields(value: &str) -> bool {
     value.contains("${")
-        && parts(value)
+        && legacy_parts(value)
             .iter()
             .map(|part| match part {
                 Part::Text(text) => text.matches(':').count(),
