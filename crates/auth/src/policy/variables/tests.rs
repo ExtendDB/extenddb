@@ -95,13 +95,33 @@ fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
 
 // --- parse_reference ---
 
+/// The reading `parts` gives the text between `${` and `}`: IAM's grammar for
+/// a reference a write accepts, the reading before it for one the write
+/// refuses. `doubled_quotes` is not compared.
+fn parse_reference(inner: &str) -> Reference<'_> {
+    let read = if reference::has_invalid_reference(&format!("${{{inner}}}")) {
+        reference::legacy(inner)
+    } else {
+        reference::parse(inner)
+    };
+    match read {
+        Reference::Key { name, default, .. } => Reference::Key {
+            name,
+            default,
+            doubled_quotes: false,
+        },
+        escape => escape,
+    }
+}
+
 #[test]
 fn parse_plain_key() {
     assert_eq!(
         parse_reference("aws:username"),
         Reference::Key {
             name: "aws:username",
-            default: None
+            default: None,
+            doubled_quotes: false,
         }
     );
 }
@@ -117,7 +137,8 @@ fn parse_default_form_with_and_without_space() {
             parse_reference(inner),
             Reference::Key {
                 name: "aws:username",
-                default: Some("anon")
+                default: Some("anon"),
+                doubled_quotes: false,
             },
             "{inner}"
         );
@@ -132,6 +153,7 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
     let plain = Reference::Key {
         name: "aws:username",
         default: None,
+        doubled_quotes: false,
     };
     for inner in [" aws:username ", "aws:username ", " aws:username"] {
         assert_eq!(parse_reference(inner), plain, "{inner:?}");
@@ -139,6 +161,7 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
     let defaulted = Reference::Key {
         name: "aws:username",
         default: Some("anon"),
+        doubled_quotes: false,
     };
     for inner in [
         " aws:username , 'anon'",
@@ -152,7 +175,8 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
         parse_reference("aws:username, ' anon '"),
         Reference::Key {
             name: "aws:username",
-            default: Some(" anon ")
+            default: Some(" anon "),
+            doubled_quotes: false,
         }
     );
 }
@@ -167,7 +191,8 @@ fn parse_trims_code_points_up_to_space_and_no_others() {
             parse_reference(&inner),
             Reference::Key {
                 name: "aws:username",
-                default: None
+                default: None,
+                doubled_quotes: false,
             },
             "{c:?}"
         );
@@ -178,7 +203,8 @@ fn parse_trims_code_points_up_to_space_and_no_others() {
             parse_reference(&inner),
             Reference::Key {
                 name: &inner,
-                default: None
+                default: None,
+                doubled_quotes: false,
             },
             "{c:?}"
         );
@@ -199,7 +225,8 @@ fn parse_comma_without_quotes_is_key_text() {
         parse_reference("a, b"),
         Reference::Key {
             name: "a, b",
-            default: None
+            default: None,
+            doubled_quotes: false,
         }
     );
 }
@@ -633,4 +660,7 @@ fn arn_value_lacks_fields_counts_only_colons_written_outside_references() {
     ));
     // No variable: the value is compared as written.
     assert!(!arn_value_lacks_fields("user/alice"));
+    // Each `${` ends at the next `}`, quoted or not, as IAM counts fields.
+    assert!(!arn_value_lacks_fields("${x, '}:::::'}"));
+    assert!(arn_value_lacks_fields("${x, ':::::}"));
 }
