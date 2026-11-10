@@ -2332,7 +2332,7 @@ impl RestoreEngine for Fake {
             }
             // Take one error from the budget, if any is left: a
             // compare-exchange loop, since `fetch_update` is deprecated on
-            // current stable and its replacement is not on 1.91.1.
+            // current stable and its replacement is unstable on 1.91.1.
             let mut left = self.count_errors.load(std::sync::atomic::Ordering::Acquire);
             while let Some(next) = left.checked_sub(1) {
                 match self.count_errors.compare_exchange(
