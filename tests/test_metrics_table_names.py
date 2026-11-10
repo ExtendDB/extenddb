@@ -7,13 +7,16 @@ A request that fails validation can carry any string as its ``TableName``.
 The metrics used to record that string as a dimension value, so after
 rejected CreateTable calls the metrics table held names such as
 ``x";DROP TABLE tables;--`` and ``a`` U+0000 ``b``. The metrics now carry a
-table name only when it is valid, ``UserErrors`` carries none (CloudWatch
-reports it per account and Region), and ``SuccessfulRequestLatency`` counts
-successful requests only.
+table name only when the operation has a ``TableName`` member and the name is
+valid, a table ARN is reduced to its name, ``UserErrors`` carries none
+(CloudWatch reports it per account and Region), and
+``SuccessfulRequestLatency`` counts successful requests only.
 
-The test sends the rejected requests, then a successful PutItem on a table of
-its own. Once the metrics flush has written that table's rows, the earlier
-requests have been flushed too, and none of their names may appear.
+The test sends the rejected requests, a successful ListBackups that names a
+table of its own by its ARN, a successful BatchWriteItem with an extra
+top-level ``TableName``, and last a successful PutItem on that table. Once the
+metrics flush has written the PutItem's row, the earlier requests have been
+flushed too.
 
 Prerequisites:
   - extenddb running on EXTENDDB_TEST_ENDPOINT
@@ -27,10 +30,12 @@ import time
 import uuid
 from typing import Any
 
+import boto3
 import pytest
 import requests
 
 from conftest import wait_for_active, wait_for_deleted
+from raw_signed_request import signed_post
 
 # The flush worker persists a data point once it is older than the worker's
 # 60-second interval, at the next tick, so a point can take up to two
@@ -77,18 +82,50 @@ def _table_names(data: dict[str, Any]) -> set[str]:
     }
 
 
+def _dimension(metric: dict[str, Any], key: str) -> str | None:
+    for d in metric["dimensions"]:
+        if isinstance(d, dict) and key in d:
+            return d[key]
+    return None
+
+
+def _rows(data: dict[str, Any], metric: str, operation: str) -> list[dict[str, Any]]:
+    return [
+        m
+        for m in data["metrics"]
+        if m["metric"] == metric and _dimension(m, "Operation") == operation
+    ]
+
+
+def _raw_post(endpoint: str, operation: str, body: dict[str, Any]) -> requests.Response:
+    """A signed request boto3 would not send, as the fixture's client's caller."""
+    creds = boto3.Session().get_credentials().get_frozen_credentials()
+    return signed_post(
+        endpoint,
+        creds.access_key,
+        creds.secret_key,
+        os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        operation,
+        body,
+        session_token=creds.token,
+    )
+
+
 @pytest.fixture(scope="module")
 def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
-    """Rejected requests, then a successful PutItem, persisted by the flush.
+    """The test's requests, persisted by the flush.
 
-    Yields the names the rejected requests carried and the metrics an admin
-    reads once the PutItem's table is in them.
+    Yields the names that must not appear, the test table's name, and the
+    metrics an admin reads once the last request's row is in them.
     """
     suffix = uuid.uuid4().hex[:8]
     sentinel = f"metrics-names-ok-{suffix}"
     # A valid name on a CreateTable that fails for another reason: before the
     # fix it gave a UserErrors and a SuccessfulRequestLatency row under it.
     refused_valid = f"metrics-names-refused-{suffix}"
+    # A valid name sent as an extra top-level TableName on a BatchWriteItem,
+    # which has no such member and writes to the test table.
+    decoy = f"metrics-names-decoy-{suffix}"
 
     for name in INVALID_NAMES:
         with pytest.raises(dynamodb_client_no_validation.exceptions.ClientError):
@@ -104,32 +141,52 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
     dynamodb_client.create_table(TableName=sentinel, **KEY)
     try:
         wait_for_active(dynamodb_client, sentinel)
+        arn = dynamodb_client.describe_table(TableName=sentinel)["Table"]["TableArn"]
+        dynamodb_client.list_backups(TableName=arn)
+        resp = _raw_post(
+            endpoint_url,
+            "BatchWriteItem",
+            {
+                "RequestItems": {
+                    sentinel: [{"PutRequest": {"Item": {"pk": {"S": "batch"}}}}]
+                },
+                "TableName": decoy,
+            },
+        )
+        assert resp.status_code == 200, f"BatchWriteItem: {resp.status_code} {resp.text}"
+        # Last, so its row reaching the metrics means the others have too.
         dynamodb_client.put_item(TableName=sentinel, Item={"pk": {"S": "1"}})
+
+        def put_item_flushed(data: dict[str, Any]) -> bool:
+            return any(
+                _dimension(m, "TableName") == sentinel
+                for m in _rows(data, "ConsumedWriteCapacityUnits", "PutItem")
+            )
 
         deadline = time.monotonic() + FLUSH_DEADLINE_SECONDS
         while True:
             data = _admin_metrics(endpoint_url, window="LastHour")
-            if sentinel in _table_names(data) or time.monotonic() > deadline:
+            if put_item_flushed(data) or time.monotonic() > deadline:
                 break
             time.sleep(POLL_SECONDS)
-        assert sentinel in _table_names(data), (
-            f"the metrics flush did not persist {sentinel} within "
+        assert put_item_flushed(data), (
+            f"the metrics flush did not persist the PutItem on {sentinel} within "
             f"{FLUSH_DEADLINE_SECONDS}s"
         )
-        yield (*INVALID_NAMES, refused_valid), data
+        yield (*INVALID_NAMES, refused_valid, decoy), sentinel, data
     finally:
         dynamodb_client.delete_table(TableName=sentinel)
         wait_for_deleted(dynamodb_client, sentinel)
 
 
 def test_rejected_requests_leave_no_table_name_in_the_metrics(flushed) -> None:
-    sent, data = flushed
+    sent, _, data = flushed
     leaked = _table_names(data) & set(sent)
-    assert not leaked, f"metrics recorded table names of rejected requests: {leaked!r}"
+    assert not leaked, f"metrics recorded table names they must not: {leaked!r}"
 
 
 def test_user_errors_carry_no_table_name(flushed) -> None:
-    _, data = flushed
+    _, _, data = flushed
     user_errors = [m for m in data["metrics"] if m["metric"] == "UserErrors"]
     assert user_errors, "the rejected requests recorded no UserErrors"
     with_table = [
@@ -138,3 +195,13 @@ def test_user_errors_carry_no_table_name(flushed) -> None:
         if any(isinstance(d, dict) and "TableName" in d for d in m["dimensions"])
     ]
     assert not with_table, f"UserErrors with a TableName: {with_table}"
+
+
+def test_a_table_named_by_its_arn_is_reported_under_its_name(flushed) -> None:
+    _, sentinel, data = flushed
+    listed = _rows(data, "SuccessfulRequestLatency", "ListBackups")
+    assert sentinel in {_dimension(m, "TableName") for m in listed}, (
+        f"no SuccessfulRequestLatency for ListBackups under {sentinel}: {listed}"
+    )
+    arns = sorted(n for n in _table_names(data) if n.startswith("arn:"))
+    assert not arns, f"metrics recorded table ARNs as table names: {arns}"

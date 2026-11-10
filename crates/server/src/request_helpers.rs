@@ -50,19 +50,53 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Operations whose input has a top-level `TableName` member: every operation
+/// the engine dispatches whose input shape has one in botocore 1.43.125's
+/// `dynamodb` and `dynamodbstreams` models (`ListStreams` is the Streams one).
+/// Any other operation ignores a `TableName` it is sent, so its metrics must
+/// not take one from the request either: a `BatchWriteItem` with an extra
+/// `TableName` would otherwise record its metrics under a table it never
+/// touched.
+const TABLE_NAME_OPERATIONS: &[&str] = &[
+    "CreateBackup",
+    "CreateTable",
+    "DeleteItem",
+    "DeleteTable",
+    "DescribeContinuousBackups",
+    "DescribeTable",
+    "DescribeTimeToLive",
+    "GetItem",
+    "ListBackups",
+    "ListStreams",
+    "PutItem",
+    "Query",
+    "Scan",
+    "SearchVectors",
+    "UpdateContinuousBackups",
+    "UpdateItem",
+    "UpdateTable",
+    "UpdateTimeToLive",
+];
+
 /// The table name a request's metrics are recorded under, or `None` when the
 /// request names no valid table.
 ///
-/// The request's `TableName` as sent is not trusted: a request that fails
-/// validation can carry any string, control characters included, and every
-/// reader of the metrics would get it as a dimension value (issue #728). A
-/// table ARN is reduced to its table name, so a table has one dimension value
-/// however the request named it. A name that breaks the table name rules
-/// gives `None`, and the request's metrics carry no table.
+/// The name comes from the request's top-level `TableName`, and only for an
+/// operation whose input has that member ([`TABLE_NAME_OPERATIONS`]). A table
+/// ARN is reduced to its table name, so a table has one dimension value however
+/// the request named it. The result must pass the table name rules
+/// (`validate_table_name`); a request that fails validation can carry any
+/// string, control characters included, and every reader of the metrics would
+/// get it as a dimension value (issue #728). Otherwise the result is `None`,
+/// and the request's metrics carry no table.
 pub(crate) fn metric_table_name(
+    operation: &str,
     input: &Value,
     limits: &extenddb_core::limits::LimitsConfig,
 ) -> Option<String> {
+    if !TABLE_NAME_OPERATIONS.contains(&operation) {
+        return None;
+    }
     let sent = input.get("TableName")?.as_str()?;
     let name = if sent.starts_with("arn:") {
         extenddb_core::arn::parse(sent)?.table
@@ -646,6 +680,7 @@ mod tests {
 
     fn metric_name_of(table_name: Value) -> Option<String> {
         metric_table_name(
+            "PutItem",
             &json!({ "TableName": table_name }),
             &extenddb_core::limits::LimitsConfig::default(),
         )
@@ -696,6 +731,42 @@ mod tests {
     fn metric_table_name_is_none_without_a_string_table_name() {
         assert_eq!(metric_name_of(json!(42)), None);
         let limits = extenddb_core::limits::LimitsConfig::default();
-        assert_eq!(metric_table_name(&json!({}), &limits), None);
+        assert_eq!(metric_table_name("PutItem", &json!({}), &limits), None);
+    }
+
+    /// An operation whose input has no top-level `TableName` member records no
+    /// table, whatever valid name the request adds; one that has it keeps it.
+    #[test]
+    fn metric_table_name_reads_table_name_only_where_the_operation_has_it() {
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        let input = json!({ "TableName": "Orders" });
+        for operation in [
+            "BatchWriteItem",
+            "BatchGetItem",
+            "TransactWriteItems",
+            "TransactGetItems",
+            "ExecuteStatement",
+            "BatchExecuteStatement",
+            "ExecuteTransaction",
+            "ListTables",
+            "TagResource",
+            "DescribeBackup",
+            "RestoreTableFromBackup",
+            "ImportTable",
+            "NotAnOperation",
+        ] {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits),
+                None,
+                "{operation}"
+            );
+        }
+        for &operation in super::TABLE_NAME_OPERATIONS {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits).as_deref(),
+                Some("Orders"),
+                "{operation}"
+            );
+        }
     }
 }

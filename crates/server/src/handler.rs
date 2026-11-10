@@ -168,8 +168,10 @@ pub(crate) async fn handle_request(
     };
 
     let table_name = extract_table_name(&input);
-    // Metrics carry only a valid table name, never the string as sent.
-    let metric_table = metric_table_name(&input, &state.limits);
+    // The table the metrics are recorded under: the request's `TableName` only
+    // when the operation has that member and the name passes the table name
+    // rules, with a table ARN reduced to its name. See `metric_table_name`.
+    let metric_table = metric_table_name(&operation, &input, &state.limits);
 
     // --- Throttle segment ---
     let throttle_start = std::time::Instant::now();

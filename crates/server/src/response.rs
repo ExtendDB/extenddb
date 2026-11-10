@@ -80,8 +80,10 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 ///
 /// `UserErrors` carries no table name: CloudWatch reports it per account and
 /// Region only, and a 4xx is often a request whose `TableName` broke the
-/// rules. `table_name` is the name `request_helpers::metric_table_name`
-/// checked, used by the metrics that carry one.
+/// rules. A failed condition counts in `ConditionalCheckFailedRequests` and not
+/// in `UserErrors`, as CloudWatch's metrics page says. `table_name` is the name
+/// `request_helpers::metric_table_name` checked, used by the metrics that carry
+/// one.
 pub(crate) fn record_error_metrics(
     metrics: &extenddb_core::metrics::MetricsCollector,
     error: &DynamoDbError,
@@ -93,7 +95,6 @@ pub(crate) fn record_error_metrics(
             metrics.record_system_error(table_name, operation);
         }
         DynamoDbError::ConditionalCheckFailedException(..) => {
-            metrics.record_user_error(None, operation);
             metrics.record_conditional_check_failure(table_name, operation);
         }
         DynamoDbError::TransactionConflictException(_) => {
@@ -139,7 +140,6 @@ mod tests {
         for error in [
             DynamoDbError::ValidationException("bad".to_owned()),
             DynamoDbError::ResourceNotFoundException("missing".to_owned()),
-            DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
             DynamoDbError::TransactionConflictException("conflict".to_owned()),
         ] {
             record_error_metrics(&collector, &error, Some("Orders"), "PutItem");
@@ -147,6 +147,23 @@ mod tests {
         let user_errors = dimensions_of(&collector, MetricName::UserErrors);
         assert_eq!(user_errors.len(), 1, "{user_errors:?}");
         assert!(!has_table(&user_errors[0]), "{user_errors:?}");
+    }
+
+    /// A failed condition counts in `ConditionalCheckFailedRequests` only.
+    #[test]
+    fn a_failed_condition_is_not_a_user_error() {
+        let collector = MetricsCollector::new();
+        record_error_metrics(
+            &collector,
+            &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            Some("Orders"),
+            "PutItem",
+        );
+        assert!(dimensions_of(&collector, MetricName::UserErrors).is_empty());
+        assert_eq!(
+            dimensions_of(&collector, MetricName::ConditionalCheckFailedRequests).len(),
+            1
+        );
     }
 
     #[test]
