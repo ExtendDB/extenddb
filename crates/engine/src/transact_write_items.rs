@@ -15,7 +15,8 @@ use crate::request_limits;
 use crate::serialize_output;
 use crate::stream_capture;
 use crate::transact_write_helpers::{
-    PreparedOp, compute_fingerprint, validate_client_request_token, validate_no_key_updates,
+    IDEMPOTENT_MISMATCH_MESSAGE, PreparedOp, compute_fingerprint, validate_client_request_token,
+    validate_no_key_updates,
 };
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
@@ -220,9 +221,7 @@ pub async fn handle_transact_write_items(
         }
         Err(extenddb_storage::error::StorageError::IdempotentMismatch) => {
             return Err(DynamoDbError::IdempotentParameterMismatchException(
-                "Specified idempotent token was used with different request parameters \
-                 within the idempotency window"
-                    .to_owned(),
+                IDEMPOTENT_MISMATCH_MESSAGE.to_owned(),
             ));
         }
         Err(e) => return Err(storage_err_to_dynamo(e)),

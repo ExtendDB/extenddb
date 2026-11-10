@@ -260,6 +260,13 @@ pub(crate) fn validate_client_request_token(token: &str) -> Result<(), DynamoDbE
     Ok(())
 }
 
+/// The message of the `IdempotentParameterMismatchException` that a request
+/// answers when its token was used by a different request inside the
+/// idempotency window. `TransactWriteItems` and `ExecuteTransaction` both
+/// answer with it.
+pub(crate) const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token was used with \
+     different request parameters within the idempotency window";
+
 /// Compute a collision-resistant fingerprint of the transaction request.
 ///
 /// Uses HMAC-SHA256 keyed by the client request token over the JSON-serialized
