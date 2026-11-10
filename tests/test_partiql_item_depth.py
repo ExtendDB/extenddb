@@ -9,17 +9,19 @@ meets the item check, which answers a shorter message than PutItem and
 UpdateItem give the same value. An UPDATE meets the item check only once its
 condition holds and its SET applies: on a missing item it fails its condition,
 and a SET through a path the item does not have answers the update's own
-message. A SET of a key attribute is refused ahead of all of this, and a
-32-level value the statement does not store (an if_not_exists value the item
-does not take, a value only in the WHERE clause) is accepted. In
-ExecuteTransaction two members on one item are refused first; otherwise the
-item check cancels the transaction with a ValidationError reason at the
-member's position, beside each other member's own reason. A 33-level
+message. A SET of a shallow parameter through a path that takes a stored value
+past the limit meets the same item check. A SET of a key attribute is refused
+ahead of all of this, and a 32-level value the statement does not store (an
+if_not_exists value the item does not take, a value only in the WHERE clause)
+is accepted. In ExecuteTransaction two members on one item are refused first;
+otherwise the item check cancels the transaction with a ValidationError reason
+at the member's position, beside each other member's own reason. A 33-level
 parameter is refused by the parameter check in every form.
 
 Runs against real DynamoDB (EXTENDDB_TEST_ENDPOINT unset, AWS credentials) and
 against an extenddb server (EXTENDDB_TEST_ENDPOINT set) with identical
-assertions. Every expected value was measured on the service (2026-11-02).
+assertions. Every expected value was measured on the service (2026-11-02; the
+SET through a path 30 maps deep on 2026-11-10).
 Tables use the ``extenddb-measure-pqd-`` prefix and are deleted at the end.
 """
 
@@ -257,6 +259,38 @@ class TestPartiqlUpdate:
             Parameters=[deep(32)],
         )
         assert stored_item(dynamodb_client, table, stored)["y"] == {"N": "1"}
+
+
+class TestPartiqlUpdateThroughADeepPath:
+    """A SET of a shallow parameter at a path 30 maps deep (measured 2026-11-10)."""
+
+    def set_leaf(self, client, table: str, key: str, levels: int):
+        return client.execute_statement(
+            Statement=f"UPDATE \"{table}\" SET m" + ".n" * 30 + " = ? WHERE pk = ?",
+            Parameters=[deep(levels), {"S": key}],
+        )
+
+    @pytest.fixture
+    def deep_item(self, dynamodb_client, table) -> str:
+        """The key of a fresh item whose ``m`` holds 30 maps."""
+        key = f"deep-path-{uuid.uuid4().hex[:8]}"
+        dynamodb_client.put_item(TableName=table, Item={"pk": {"S": key}, "m": deep(30)})
+        return key
+
+    def test_a_value_that_brings_the_item_to_the_limit_is_applied(
+        self, dynamodb_client, table, deep_item
+    ):
+        assert self.set_leaf(dynamodb_client, table, deep_item, 1)["Items"] == []
+        assert stored_item(dynamodb_client, table, deep_item)["m"] == deep(31)
+
+    def test_a_value_that_takes_the_item_past_the_limit_meets_the_item_check(
+        self, dynamodb_client, table, deep_item
+    ):
+        assert (
+            validation_message(lambda: self.set_leaf(dynamodb_client, table, deep_item, 2))
+            == ITEM_CHECK
+        )
+        assert stored_item(dynamodb_client, table, deep_item)["m"] == deep(30)
 
 
 class TestPartiqlDeleteAndSelect:

@@ -11,12 +11,23 @@ supported limits``, and a TransactWriteItems Update is cancelled with a
 reported first. Measured on 2026-10-25 at 19:53 UTC and 2026-10-26 at 00:55
 UTC (us-east-1), each case twice.
 
+The item size checks come on either side of the depth check (measured on
+2026-11-10 from 19:28 to 19:37 UTC, us-east-1, each case twice). UpdateItem
+sizes its statement before the depth check: a statement over the 409,600-byte
+limit is refused with ``Item size to update has exceeded the maximum allowed
+size``, with the SET actions in either order. The updated item is sized after
+the depth check: when only the updated item is over the limit, the depth check
+answers, for UpdateItem in either SET order and for a TransactWriteItems
+Update.
+
 Depth below is counted in wrappers: a value with w wrappers has w + 1 levels.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 from botocore.exceptions import ClientError
@@ -192,3 +203,115 @@ def test_transact_update_up_to_the_limit_is_applied(dynamodb_client, table):
         "ExpressionAttributeNames": NAMES, "ExpressionAttributeValues": {":v": nmap(2)},
     }}])
     assert _stored_wrappers(dynamodb_client, table, key) == 31
+
+
+# The tests below that expect the size answer run on SQLite and PostgreSQL. The
+# MongoDB layer applies no item size limit on updates, and the Cassandra layer
+# sizes every update by the updated item with other wording, both documented in
+# docs/differences-from-dynamodb.md. With the backend unset (a run against the
+# service), they run.
+SIZED_UPDATES = pytest.mark.skipif(
+    os.environ.get("EXTENDDB_TEST_BACKEND", "") in {"mongodb", "cassandra"},
+    reason="UpdateItem is sized on the finished item (Cassandra) or unbounded (MongoDB); "
+    "see docs/differences-from-dynamodb.md",
+)
+SIZE_MESSAGE = "Item size to update has exceeded the maximum allowed size"
+GROW_NAMES = {**NAMES, "#g": "grow"}
+
+
+def _sets(first: str, other: str, depth_path: str = path(30)) -> list[str]:
+    sets = [other, f"{depth_path} = :v"]
+    return sets[::-1] if first == "depth" else sets
+
+
+def _put_large(client, table, sk, stored_bytes):
+    """An item under the size limit: m with 30 wrappers and a string of stored_bytes."""
+    key = {"pk": {"S": "nest"}, "sk": {"S": sk}}
+    client.put_item(TableName=table, Item={
+        **key, "x": {"S": "x"}, "m": nmap(30), "big": {"S": "a" * stored_bytes},
+    })
+    return key
+
+
+def _assert_unchanged(client, table, key, added):
+    item = client.get_item(TableName=table, Key=key, ConsistentRead=True)["Item"]
+    assert added not in item
+    assert wrappers(item["m"]) == 30
+
+
+@SIZED_UPDATES
+@pytest.mark.parametrize("first", ["size", "depth"])
+def test_a_statement_over_the_size_limit_is_refused_ahead_of_the_depth(
+    dynamodb_client, table, first,
+):
+    key = _put(dynamodb_client, table, f"statement-{first}-first", nmap(30))
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=table, Key=key, UpdateExpression="SET " + ", ".join(_sets(first, "#big = :big")),
+            ExpressionAttributeNames={**NAMES, "#big": "big"},
+            ExpressionAttributeValues={":v": nmap(2), ":big": {"S": "a" * 409_500}},
+        )
+    err = exc_info.value.response["Error"]
+    assert (err["Code"], err["Message"]) == ("ValidationException", SIZE_MESSAGE)
+    _assert_unchanged(dynamodb_client, table, key, "big")
+
+
+# (case, bytes stored, bytes the update adds, the SET action written first)
+UPDATED_ITEM_OVER = [
+    ("405000_8000_grow_first", 405_000, 8_000, "grow"),
+    ("405000_8000_depth_first", 405_000, 8_000, "depth"),
+    ("300000_120000_grow_first", 300_000, 120_000, "grow"),
+]
+
+
+@pytest.mark.parametrize(("case", "stored", "grow", "first"), UPDATED_ITEM_OVER,
+                         ids=[c[0] for c in UPDATED_ITEM_OVER])
+def test_an_updated_item_over_the_size_limit_meets_the_depth_check_first(
+    dynamodb_client, table, case, stored, grow, first,
+):
+    key = _put_large(dynamodb_client, table, f"updated-{case}", stored)
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=table, Key=key, UpdateExpression="SET " + ", ".join(_sets(first, "#g = :g")),
+            ExpressionAttributeNames=GROW_NAMES,
+            ExpressionAttributeValues={":v": nmap(2), ":g": {"S": "b" * grow}},
+        )
+    err = exc_info.value.response["Error"]
+    assert (err["Code"], err["Message"]) == ("ValidationException", MESSAGE)
+    _assert_unchanged(dynamodb_client, table, key, "grow")
+
+
+@SIZED_UPDATES
+def test_the_same_update_through_a_shallow_path_is_refused_for_its_size(dynamodb_client, table):
+    # The control for the test above: a SET at 28 keys keeps m at 30 wrappers,
+    # so only the size of the updated item is past a limit.
+    key = _put_large(dynamodb_client, table, "updated-shallow", 405_000)
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=table, Key=key,
+            UpdateExpression="SET " + ", ".join(_sets("grow", "#g = :g", path(28))),
+            ExpressionAttributeNames=GROW_NAMES,
+            ExpressionAttributeValues={":v": nmap(2), ":g": {"S": "b" * 8_000}},
+        )
+    err = exc_info.value.response["Error"]
+    assert (err["Code"], err["Message"]) == ("ValidationException", SIZE_MESSAGE)
+    _assert_unchanged(dynamodb_client, table, key, "grow")
+
+
+@pytest.mark.parametrize("first", ["grow", "depth"])
+def test_transact_update_of_an_item_over_the_size_limit_meets_the_depth_check_first(
+    dynamodb_client, table, first,
+):
+    key = _put_large(dynamodb_client, table, f"tx-updated-{first}-first", 405_000)
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.transact_write_items(TransactItems=[{"Update": {
+            "TableName": table, "Key": key,
+            "UpdateExpression": "SET " + ", ".join(_sets(first, "#g = :g")),
+            "ExpressionAttributeNames": GROW_NAMES,
+            "ExpressionAttributeValues": {":v": nmap(2), ":g": {"S": "b" * 8_000}},
+        }}])
+    resp = exc_info.value.response
+    assert resp["Error"]["Code"] == "TransactionCanceledException"
+    reasons = [(r.get("Code"), r.get("Message")) for r in resp["CancellationReasons"]]
+    assert reasons == [("ValidationError", MESSAGE)]
+    _assert_unchanged(dynamodb_client, table, key, "grow")
