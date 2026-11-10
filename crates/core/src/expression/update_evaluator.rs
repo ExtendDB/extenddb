@@ -94,6 +94,66 @@ pub fn apply_update_validated(
     vector_indexes: &[VectorIndexKeyInfo],
     attribute_definitions: &[AttributeDefinition],
 ) -> Result<(), DynamoDbError> {
+    apply_update_checked(
+        actions,
+        item,
+        maps,
+        vector_indexes,
+        attribute_definitions,
+        None,
+    )
+}
+
+/// Apply the actions of a standalone `UpdateItem`, validate the result as
+/// [`apply_update_validated`] does, and size the update as
+/// [`crate::validation::validate_update_item_size`] does.
+///
+/// The service sizes the statement before it checks the nesting depth of the
+/// updated item, and sizes the updated item after that check (measured
+/// us-east-1, 2026-11-10). An update whose statement is over the limit is
+/// refused for its size, whatever the depth. An update whose statement is
+/// within the limit and whose result nests too deep gets the depth refusal,
+/// even when the updated item is over the limit. Only these orders are
+/// measured, so the statement is sized ahead of the depth check only when that
+/// check refuses. The vector check keeps its place after the depth check and
+/// ahead of the size check. An update from a PartiQL `UPDATE` and the legacy
+/// `AttributeUpdates` form are not sized by their statement, and their checks
+/// run in the order of [`apply_update_validated`].
+///
+/// # Errors
+///
+/// The errors of [`apply_update_validated`], and `ValidationException` `Item
+/// size to update has exceeded the maximum allowed size` when the update is
+/// over `max_item_size_bytes`.
+pub fn apply_update_item_validated(
+    actions: &[UpdateAction],
+    item: &mut BTreeMap<String, AttributeValue>,
+    maps: &ExpressionMaps,
+    vector_indexes: &[VectorIndexKeyInfo],
+    attribute_definitions: &[AttributeDefinition],
+    max_item_size_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    apply_update_checked(
+        actions,
+        item,
+        maps,
+        vector_indexes,
+        attribute_definitions,
+        Some(max_item_size_bytes),
+    )?;
+    crate::validation::validate_update_item_size(item, actions, maps, max_item_size_bytes)
+}
+
+/// [`apply_update_validated`]. With `statement_limit`, a depth refusal gives
+/// way to the size refusal of a statement over that limit.
+fn apply_update_checked(
+    actions: &[UpdateAction],
+    item: &mut BTreeMap<String, AttributeValue>,
+    maps: &ExpressionMaps,
+    vector_indexes: &[VectorIndexKeyInfo],
+    attribute_definitions: &[AttributeDefinition],
+    statement_limit: Option<usize>,
+) -> Result<(), DynamoDbError> {
     // Snapshot only the vector-relevant attributes (the vector attribute and
     // the search-schema attributes of each index) rather than cloning the
     // whole item, which can be up to 400KB.
@@ -113,7 +173,12 @@ pub fn apply_update_validated(
         }
     }
     apply_update(actions, item, maps)?;
-    super::update_nesting::validate_written_nesting_depth(actions, item, maps)?;
+    if let Err(depth) = super::update_nesting::validate_written_nesting_depth(actions, item, maps) {
+        if let Some(max_bytes) = statement_limit {
+            crate::validation::validate_update_statement_size(actions, maps, max_bytes)?;
+        }
+        return Err(depth);
+    }
     crate::validation::validate_vector_write_changed(
         item,
         &before,

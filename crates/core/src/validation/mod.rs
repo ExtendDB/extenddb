@@ -2317,6 +2317,32 @@ pub fn validate_update_item_size(
     Ok(())
 }
 
+/// The statement half of [`validate_update_item_size`], for a standalone
+/// `UpdateItem` written as an expression. An update from a PartiQL `UPDATE`
+/// (`maps.finished_item_sizing`) and the legacy `AttributeUpdates` form
+/// (`maps.legacy_attribute_updates`) are not sized by their statement, and
+/// pass here.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the update wording when
+/// the statement figure exceeds `max_bytes`.
+pub(crate) fn validate_update_statement_size(
+    actions: &[crate::expression::UpdateAction],
+    maps: &crate::expression::ExpressionMaps,
+    max_bytes: usize,
+) -> Result<(), DynamoDbError> {
+    if maps.finished_item_sizing || maps.legacy_attribute_updates {
+        return Ok(());
+    }
+    if update_statement_size(actions, maps)? > max_bytes {
+        return Err(DynamoDbError::ValidationException(
+            ITEM_SIZE_TO_UPDATE_EXCEEDED.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The bytes the service charges the operand expression of a `SET` clause:
 /// value placeholders at their size, function calls, arithmetic operators and
 /// document paths at their fixed costs.

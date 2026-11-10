@@ -660,3 +660,139 @@ fn set_parenthesised_arithmetic() {
     apply("SET c = (c - :v)", &mut item, HashMap::new(), values).unwrap();
     assert_eq!(item.get("c"), Some(&AttributeValue::N("7".into())));
 }
+
+/// The size checks of a standalone `UpdateItem` on either side of the depth
+/// check (measured us-east-1, 2026-11-10).
+mod update_item_sizing {
+    use super::*;
+    use crate::validation::ITEM_SIZE_TO_UPDATE_EXCEEDED;
+
+    const LIMIT: usize = 409_600;
+    const DEPTH: &str = "Nesting Levels have exceeded supported limits";
+
+    fn nmap(wrappers: usize) -> AttributeValue {
+        let mut value = AttributeValue::S("leaf".to_owned());
+        for _ in 0..wrappers {
+            value = AttributeValue::M(BTreeMap::from([("k".to_owned(), value)]));
+        }
+        value
+    }
+
+    fn text(bytes: usize) -> AttributeValue {
+        AttributeValue::S("a".repeat(bytes))
+    }
+
+    /// An item whose `m` holds 30 wrappers, beside a string of `stored` bytes.
+    fn item(stored: usize) -> BTreeMap<String, AttributeValue> {
+        BTreeMap::from([
+            ("pk".to_owned(), AttributeValue::S("k1".to_owned())),
+            ("m".to_owned(), nmap(30)),
+            ("stored".to_owned(), text(stored)),
+        ])
+    }
+
+    /// `SET #added = :added` of `added` bytes and a SET of 2 wrappers at `depth`
+    /// keys below `m`, in the order `depth_first` gives.
+    fn update(
+        added: usize,
+        depth: usize,
+        depth_first: bool,
+    ) -> (Vec<UpdateAction>, ExpressionMaps) {
+        let deep = format!("#m{} = :v", ".k".repeat(depth));
+        let sets = if depth_first {
+            format!("SET {deep}, #added = :added")
+        } else {
+            format!("SET #added = :added, {deep}")
+        };
+        let maps = ExpressionMaps::new(
+            HashMap::from([
+                ("m".to_owned(), "m".to_owned()),
+                ("added".to_owned(), "added".to_owned()),
+            ]),
+            HashMap::from([("v".to_owned(), nmap(2)), ("added".to_owned(), text(added))]),
+        );
+        (parse_update(&tokenize(&sets).unwrap()).unwrap(), maps)
+    }
+
+    fn message(result: Result<(), DynamoDbError>) -> String {
+        match result {
+            Err(DynamoDbError::ValidationException(message)) => message,
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
+    }
+
+    /// The answer to the update on `item` as a standalone `UpdateItem`.
+    fn update_item(
+        mut item: BTreeMap<String, AttributeValue>,
+        added: usize,
+        depth: usize,
+        depth_first: bool,
+    ) -> String {
+        let (actions, maps) = update(added, depth, depth_first);
+        message(apply_update_item_validated(
+            &actions,
+            &mut item,
+            &maps,
+            &[],
+            &[],
+            LIMIT,
+        ))
+    }
+
+    #[test]
+    fn a_statement_over_the_limit_is_refused_for_its_size_ahead_of_the_depth() {
+        for depth_first in [false, true] {
+            assert_eq!(
+                update_item(item(0), 409_500, 30, depth_first),
+                ITEM_SIZE_TO_UPDATE_EXCEEDED
+            );
+        }
+    }
+
+    #[test]
+    fn an_updated_item_over_the_limit_meets_the_depth_check_first() {
+        for depth_first in [false, true] {
+            assert_eq!(update_item(item(405_000), 8_000, 30, depth_first), DEPTH);
+        }
+        assert_eq!(update_item(item(300_000), 120_000, 30, false), DEPTH);
+    }
+
+    #[test]
+    fn the_same_update_through_a_shallow_path_is_refused_for_its_size() {
+        assert_eq!(
+            update_item(item(405_000), 8_000, 28, false),
+            ITEM_SIZE_TO_UPDATE_EXCEEDED
+        );
+    }
+
+    #[test]
+    fn a_form_not_sized_by_its_statement_keeps_the_depth_refusal() {
+        // A PartiQL UPDATE and the legacy AttributeUpdates form: the statement
+        // is over the limit, and the answer is the one apply_update_validated
+        // gives.
+        for partiql in [true, false] {
+            let (actions, mut maps) = update(409_500, 30, false);
+            maps.finished_item_sizing = partiql;
+            maps.legacy_attribute_updates = !partiql;
+            let plain = message(apply_update_validated(
+                &actions,
+                &mut item(0),
+                &maps,
+                &[],
+                &[],
+            ));
+            assert_eq!(plain, DEPTH);
+            assert_eq!(
+                message(apply_update_item_validated(
+                    &actions,
+                    &mut item(0),
+                    &maps,
+                    &[],
+                    &[],
+                    LIMIT
+                )),
+                plain
+            );
+        }
+    }
+}

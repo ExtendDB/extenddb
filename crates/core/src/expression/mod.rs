@@ -44,5 +44,5 @@ pub use search_condition::{
     validate_search_condition_expression,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
-pub use update_evaluator::apply_update_validated;
+pub use update_evaluator::{apply_update_item_validated, apply_update_validated};
 pub use update_parser::{parse_update, parse_update_from};
