@@ -43,9 +43,9 @@
 //! `backup_index.source_table_details_json` is the manifest's source table,
 //! whose key schema, attribute definitions and indexes carry attribute
 //! names. It is stored through the escape of `catalog_json`, as the other
-//! catalog documents that carry names are: `claim_backup` and `set_status`
-//! write it through `escape_json`, and every read reverses the escape in
-//! `row_from_tuple`.
+//! catalog documents that carry names are: `claim_backup`, `set_status` and
+//! `insert_backup_row` write it through `escape_json`, and every read
+//! reverses the escape in `row_from_tuple`.
 
 use std::time::Duration;
 
@@ -581,7 +581,7 @@ impl BackupCatalog for PostgresEngine {
             .bind(row.item_count)
             .bind(row.created_at)
             .bind(&row.failure_reason)
-            .bind(&row.source_table_details_json)
+            .bind(escape_json(row.source_table_details_json.clone()))
             .bind(generation_column(UNOWNED_GENERATION))
             .execute(&self.pool)
             .await

@@ -606,3 +606,68 @@ async fn a_backup_index_row_keeps_names_that_hold_u0000_and_u0001() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].source_table_details_json, available);
 }
+
+#[tokio::test]
+async fn a_backup_index_row_that_sync_inserts_keeps_names_that_hold_u0000_and_u0001() {
+    let test = "a_backup_index_row_that_sync_inserts_keeps_names_that_hold_u0000_and_u0001";
+    if base_conn().is_none() {
+        return skip(test);
+    }
+    let s = scratch(test, Options::default()).await.expect("a scratch");
+    let table = "nul_synced";
+    let backup_id = extenddb_storage::util::new_backup_id();
+    let arn = extenddb_storage::util::backup_arn(REGION, ACCOUNT, table, &backup_id);
+    let row = BackupRow {
+        backup_id: backup_id.clone(),
+        account_id: ACCOUNT.to_owned(),
+        table_name: table.to_owned(),
+        backup_arn: arn.clone(),
+        backup_name: "nightly".to_owned(),
+        status: BackupStatus::Available,
+        store: StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/extenddb-backups".to_owned(),
+            store_id: "store-1".to_owned(),
+        },
+        size_bytes: 1234,
+        item_count: 3,
+        created_at: extenddb_storage::util::backup_creation_date_time(&backup_id).unwrap(),
+        completed_at: None,
+        failure_reason: None,
+        source_table_details_json: source_table(table),
+        owner_generation: 0,
+        heartbeat_at: 0.0,
+    };
+
+    // `extenddb backup sync` inserts the row of a store backup that has
+    // none, AVAILABLE and unowned, with the manifest's source table.
+    assert!(
+        s.engine
+            .insert_backup_row(&row)
+            .await
+            .expect("insert the row")
+    );
+    assert_stored_escaped(
+        &stored_backup_index(&s, table).await,
+        &[PK0, SK1, SK11, GK1, N0, NK, ZK],
+        "the inserted row",
+    );
+    let read = s
+        .engine
+        .read_backup_row(&BackupArn::parse(&arn).expect("a backup ARN"))
+        .await
+        .expect("read the row")
+        .expect("the row exists");
+    assert_eq!(read.status, BackupStatus::Available);
+    assert_eq!(
+        read.source_table_details_json,
+        row.source_table_details_json
+    );
+    let schema = read.source_table().expect("the source table");
+    let key_names: Vec<&str> = schema
+        .key_schema
+        .iter()
+        .map(|k| k.attribute_name.as_str())
+        .collect();
+    assert_eq!(key_names, [PK0, SK11]);
+}
