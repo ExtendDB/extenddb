@@ -8,6 +8,8 @@ use extenddb_storage::management_store::{GroupDetail, GroupListEntry, OpError, O
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
+use super::policies::delete_principal_attachments;
+
 impl SqliteCatalogStore {
     pub(crate) async fn create_group_impl(
         &self,
@@ -17,13 +19,20 @@ impl SqliteCatalogStore {
         let group_arn = format!("arn:aws:iam::{account_id}:group/{group_name}");
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                tracing::error!("create_group begin: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
         sqlx::query("INSERT INTO iam_groups (account_id, group_name, group_arn) VALUES (?, ?, ?)")
             .bind(account_id)
             .bind(group_name)
             .bind(&group_arn)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await
-            .map(|_| ())
             .map_err(|e| {
                 if is_unique_violation(&e) {
                     OpError::AlreadyExists("IAM group already exists".to_owned())
@@ -33,7 +42,14 @@ impl SqliteCatalogStore {
                     tracing::error!("create_group: {e}");
                     OpError::Internal("Database error".to_owned())
                 }
-            })
+            })?;
+        // A group deleted before deletes removed them could have left its
+        // inline policies under this name.
+        delete_principal_attachments(&mut tx, account_id, "group", group_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("create_group commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })
     }
 
     pub(crate) async fn delete_group_impl(
@@ -43,10 +59,20 @@ impl SqliteCatalogStore {
     ) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                tracing::error!("delete_group begin: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+        // The foreign keys remove the group's memberships. Its inline
+        // policies have none.
         let result = sqlx::query("DELETE FROM iam_groups WHERE account_id = ? AND group_name = ?")
             .bind(account_id)
             .bind(group_name)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!("delete_group: {e}");
@@ -55,6 +81,11 @@ impl SqliteCatalogStore {
         if result.rows_affected() == 0 {
             return Err(OpError::NotFound("IAM group not found".to_owned()));
         }
+        delete_principal_attachments(&mut tx, account_id, "group", group_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("delete_group commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
         Ok(())
     }
 

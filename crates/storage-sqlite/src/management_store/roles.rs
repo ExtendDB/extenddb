@@ -11,6 +11,8 @@ use extenddb_storage::management_store::{OpError, OpResult, RoleDetail, RoleList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
+use super::policies::delete_principal_attachments;
+
 /// Parse a stored JSON-text column into a `serde_json::Value`.
 fn parse_json(s: &str, ctx: &str) -> OpResult<serde_json::Value> {
     serde_json::from_str(s).map_err(|e| OpError::Internal(format!("{ctx} parse json: {e}")))
@@ -28,6 +30,14 @@ impl SqliteCatalogStore {
             .map_err(|e| OpError::Internal(format!("serialize trust policy: {e}")))?;
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                tracing::error!("create_role begin: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
         sqlx::query(
             "INSERT INTO iam_roles (account_id, role_name, role_arn, trust_policy) \
              VALUES (?, ?, ?, ?)",
@@ -36,9 +46,8 @@ impl SqliteCatalogStore {
         .bind(role_name)
         .bind(&role_arn)
         .bind(&trust)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
         .map_err(|e| {
             if is_unique_violation(&e) {
                 OpError::AlreadyExists("IAM role already exists".to_owned())
@@ -48,16 +57,33 @@ impl SqliteCatalogStore {
                 tracing::error!("create_role: {e}");
                 OpError::Internal("Database error".to_owned())
             }
+        })?;
+        // A role deleted before deletes removed them could have left its
+        // inline policies and boundary under this name.
+        delete_principal_attachments(&mut tx, account_id, "role", role_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("create_role commit: {e}");
+            OpError::Internal("Database error".to_owned())
         })
     }
 
     pub(crate) async fn delete_role_impl(&self, account_id: &str, role_name: &str) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                tracing::error!("delete_role begin: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+        // The foreign keys remove the role's tags and sessions. Its inline
+        // policies and boundary have none.
         let result = sqlx::query("DELETE FROM iam_roles WHERE account_id = ? AND role_name = ?")
             .bind(account_id)
             .bind(role_name)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!("delete_role: {e}");
@@ -66,6 +92,11 @@ impl SqliteCatalogStore {
         if result.rows_affected() == 0 {
             return Err(OpError::NotFound("IAM role not found".to_owned()));
         }
+        delete_principal_attachments(&mut tx, account_id, "role", role_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("delete_role commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
         Ok(())
     }
 

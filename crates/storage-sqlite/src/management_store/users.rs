@@ -9,6 +9,8 @@ use extenddb_storage::management_store::{OpError, OpResult, UserDetail, UserList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
+use super::policies::delete_principal_attachments;
+
 impl SqliteCatalogStore {
     pub(crate) async fn create_user_impl(
         &self,
@@ -50,6 +52,10 @@ impl SqliteCatalogStore {
                 OpError::Internal("Database error".to_owned())
             }
         })?;
+
+        // A user deleted before deletes removed these could have left its
+        // inline policies and boundary under this name.
+        delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
 
         // Seed a default self-service policy so the user can manage its own
         // access keys and password without an administrator attaching one
@@ -94,10 +100,20 @@ impl SqliteCatalogStore {
     pub(crate) async fn delete_user_impl(&self, account_id: &str, user_name: &str) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
+        let mut tx = self
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| {
+                tracing::error!("delete_user begin: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+        // The foreign keys remove the user's access keys, tags and group
+        // memberships. Its inline policies and boundary have none.
         let result = sqlx::query("DELETE FROM iam_users WHERE account_id = ? AND user_name = ?")
             .bind(account_id)
             .bind(user_name)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 tracing::error!("delete_user: {e}");
@@ -106,6 +122,11 @@ impl SqliteCatalogStore {
         if result.rows_affected() == 0 {
             return Err(OpError::NotFound("IAM user not found".to_owned()));
         }
+        delete_principal_attachments(&mut tx, account_id, "user", user_name).await?;
+        tx.commit().await.map_err(|e| {
+            tracing::error!("delete_user commit: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
         Ok(())
     }
 

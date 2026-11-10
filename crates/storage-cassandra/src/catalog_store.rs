@@ -240,6 +240,27 @@ impl CassandraCatalogStore {
         Ok(!rows.is_empty())
     }
 
+    /// [`Self::account_exists`] read at `LOCAL_QUORUM`, for the console's
+    /// quorum reads: an account delete, committed at quorum, is seen.
+    ///
+    /// Before account deletes removed them, a deleted account's users stayed
+    /// in the catalog; the console treats a user whose account is gone as
+    /// absent.
+    pub(crate) async fn account_exists_quorum(&self, account_id: &str) -> Result<bool, OpError> {
+        let query = format!(
+            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows_quorum(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id),
+            "account_exists_quorum",
+        )
+        .await?;
+        Ok(!rows.is_empty())
+    }
+
     /// Check if a user exists. Used to emulate foreign key checks.
     pub(crate) async fn user_exists(
         &self,

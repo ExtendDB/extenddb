@@ -31,6 +31,8 @@ mod concurrent_account_creation;
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
+#[path = "direct/iam_leftovers.rs"]
+mod iam_leftovers;
 #[path = "direct/index.rs"]
 mod index;
 #[path = "direct/keyspace_migrations.rs"]

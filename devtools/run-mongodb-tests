@@ -444,6 +444,20 @@ if $RUST_LIVE; then
         RC=1
     fi
 
+    # A deleted principal or account leaves nothing behind (#693, #694): the
+    # shared `iam_leftovers_conformance` check, and a deleted account's user
+    # and role granting nothing. Required, like the backup engine's.
+    echo ""
+    echo "=== MongoDB IAM delete live Rust tests (storage-mongodb, --ignored) ==="
+    if EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --lib -- \
+        --ignored --test-threads=1 management_store::live_tests::; then
+        echo "  ✓ MongoDB IAM delete live Rust tests passed"
+    else
+        echo "  ✗ MongoDB IAM delete live Rust tests failed"
+        RC=1
+    fi
+
 
     # The restore fence cells need the `test-hooks` feature (the GSI backfill
     # gate `bulk_load` honours is compiled only under it), and no other job

@@ -9,6 +9,41 @@ use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::is_fk_violation;
 
+/// Delete the inline policies and the permissions boundary stored under a
+/// principal's name, inside the caller's transaction.
+///
+/// `iam_policies` and `iam_permissions_boundaries` name their principal by
+/// `(principal_type, principal_name)` and have no foreign key to it, so the
+/// cascades that remove a principal's tags, access keys and memberships do not
+/// reach them. A principal's delete calls this so that a later principal with
+/// the same name does not get them, and a principal's create calls it so that
+/// rows a delete left behind before this existed are removed too.
+pub(super) async fn delete_principal_attachments(
+    conn: &mut sqlx::PgConnection,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> OpResult<()> {
+    for table in ["iam_policies", "iam_permissions_boundaries"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} \
+             WHERE account_id = $1 AND principal_type = $2 AND principal_name = $3"
+        ))
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            database_error(
+                &format!("delete {principal_type} {principal_name}'s rows in {table}"),
+                &e,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 impl PostgresCatalogStore {
     // ── Policies ───────────────────────────────────────────────────
 

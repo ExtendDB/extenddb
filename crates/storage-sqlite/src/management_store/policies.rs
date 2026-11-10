@@ -9,6 +9,39 @@ use time::OffsetDateTime;
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::parse_timestamp;
 
+/// Delete the inline policies and the permissions boundary stored under a
+/// principal's name, inside the caller's transaction.
+///
+/// `iam_policies` and `iam_permissions_boundaries` name their principal by
+/// `(principal_type, principal_name)` and have no foreign key to it, so the
+/// cascades that remove a principal's tags, access keys and memberships do not
+/// reach them. A principal's delete calls this so that a later principal with
+/// the same name does not get them, and a principal's create calls it so that
+/// rows a delete left behind before this existed are removed too.
+pub(super) async fn delete_principal_attachments(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> OpResult<()> {
+    for table in ["iam_policies", "iam_permissions_boundaries"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
+        ))
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete {principal_type} {principal_name}'s rows in {table}: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    }
+    Ok(())
+}
+
 impl SqliteCatalogStore {
     pub(crate) async fn put_policy_impl(
         &self,
