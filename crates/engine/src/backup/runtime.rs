@@ -1084,6 +1084,51 @@ pub async fn read_identity_bounded<C: BackupCatalog + ?Sized>(
     read
 }
 
+/// The store's check as a command that writes nothing runs it after its
+/// removals (`backup sync --forget-backup`): [`store_identity::read_identity`]
+/// (no identity file is created, and `validate`, which writes a probe file,
+/// does not run), the file's id compared with `known` when the command read
+/// one when it opened the store (a root replaced since is
+/// [`StoreProblem::IdMismatch`], as [`store_identity::recheck`] has it), then
+/// the manifest probe, every store call under
+/// [`ConfiguredStore::check_timeout`]. `Ok(None)` for a root with no file
+/// and no rows for it, left as it is: a server's next check creates the
+/// file.
+///
+/// # Errors
+///
+/// The problem that would make the store unhealthy
+/// ([`store_identity`]'s module doc), or the bound.
+pub async fn check_configured_store_read_only<C: BackupCatalog + ?Sized>(
+    store: &ConfiguredStore,
+    catalog: &C,
+    known: Option<&StoreIdentity>,
+) -> Result<Option<StoreIdentity>, StoreProblem> {
+    let via = store.calls("check");
+    let outcome = async {
+        let Some(identity) =
+            store_identity::read_identity(&via, store.kind, &store.root, catalog).await?
+        else {
+            return Ok(None);
+        };
+        if let Some(known) = known
+            && known.store_id != identity.store_id
+        {
+            return Err(StoreProblem::IdMismatch {
+                file_id: identity.store_id,
+                row_ids: vec![known.store_id.clone()],
+            });
+        }
+        store_identity::manifest_probe(&via, &identity, catalog).await?;
+        Ok(Some(identity))
+    }
+    .await;
+    if via.timed_out() {
+        return Err(via.did_not_finish_problem());
+    }
+    outcome
+}
+
 /// The configured store as the checks, a command's identity read, the
 /// deletion fence and the deletions call it (module doc): each call runs under `bound`, and a call
 /// that does not finish is a transport failure naming `what` and the bound.
