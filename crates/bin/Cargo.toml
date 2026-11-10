@@ -30,6 +30,14 @@ mongodb-test-hooks = [
 # requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a
 # production backend like `postgres` (enforced at compile time in `main.rs`).
 dev-mode = ["extenddb-app/dev-mode"]
+# Point-in-time recovery, off by default: the engine's operations and the
+# item-history store of the backend this build selects. A backend without a
+# store (Cassandra, MongoDB) keeps the unavailable answer.
+pitr = [
+    "extenddb-app/pitr",
+    "extenddb-storage-sqlite?/pitr",
+    "extenddb-storage-postgres?/pitr",
+]
 
 [dependencies]
 extenddb-app = { workspace = true }

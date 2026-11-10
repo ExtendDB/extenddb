@@ -17,6 +17,12 @@ backup-test-hooks = []
 # off, the three operations are not known and the server answers them with
 # UnknownOperationException exactly as before.
 partiql = ["extenddb-core/partiql"]
+# Point-in-time recovery capture and restore, off by default and incomplete.
+# With this off, the continuous-backup operations answer as they do now:
+# DescribeContinuousBackups reports recovery disabled, UpdateContinuousBackups
+# refuses an enable, and RestoreTableToPointInTime answers unavailable. The
+# item-history capture store and the restore reconstruct are built behind this gate.
+pitr = ["extenddb-storage/pitr"]
 
 [dependencies]
 extenddb-auth = { workspace = true }

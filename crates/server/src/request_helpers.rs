@@ -114,6 +114,9 @@ pub(crate) async fn authorize_request(
     // here, before the key info and resource tag lookups below and before the
     // developer-mode return, the cross-account refusal and the ARN shape
     // checks (see `table_name_gate`).
+    // The JSON types of members the service reads before every constraint
+    // check, TableName's included (`check_member_types`).
+    extenddb_engine::check_member_types(operation, input, &*state.storage)?;
     crate::table_name_gate::check_table_name_chars(operation, input, account_id)?;
 
     let table_name = extract_table_name(input);

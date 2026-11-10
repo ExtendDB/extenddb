@@ -177,6 +177,13 @@ pub struct PointInTimeRecoveryDescription {
     pub earliest_restorable_date_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_restorable_date_time: Option<f64>,
+    /// The retention in days, on a table whose recovery is enabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub recovery_period_in_days: Option<u8>,
+    /// The service sends this member, undocumented, beside
+    /// `RecoveryPeriodInDays` and equal to it (measured).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub point_in_time_recovery_window_days: Option<u8>,
 }
 
 #[cfg(test)]
