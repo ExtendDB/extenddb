@@ -333,7 +333,7 @@ Storage backends write stream records atomically with data writes when `stream` 
 - `ConditionFailed { old_item: Option<Item> }` — condition expression evaluated to false
 - `TransactionCanceled(Vec<CancellationReason>)` — transaction failed with per-item reasons
 - `IdempotentReplay` — idempotency token matched previous request
-- `IdempotentMismatch` — idempotency token exists with different operations
+- `IdempotentMismatch`: idempotency token exists with a different fingerprint (the items or a Return field)
 - `IndexNotFound` — secondary index does not exist
 - `Internal(String)` — backend-specific error
 
@@ -820,6 +820,22 @@ The token is scoped to `account_id`: a `ClientRequestToken` is unique per
 account in DynamoDB, so the same token value from two accounts never collides.
 If a request arrives with the same `(account_id, token)` but a different
 fingerprint, return `IdempotentParameterMismatchException`.
+
+The fingerprint (`compute_fingerprint` in
+`crates/engine/src/transact_write_helpers.rs`) is an HMAC-SHA256 keyed by the
+token. It hashes the request's `TransactItems` JSON, then its
+`ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`. Each of the two
+fields adds to the hashed input only when it is not `NONE`. The service treats
+an absent field as `NONE` and refuses a replay that changes either field. The
+stored value is the first 64 bits of the HMAC, as 16 hex characters. For a
+`TransactWriteItems` request, the fingerprint hashes the items as the request
+writes them. Some retries that the service replays therefore answer the
+mismatch in ExtendDB (see "Transactions" in
+`docs/differences-from-dynamodb.md`). ExtendDB translates an
+`ExecuteTransaction` write into a `TransactWriteItems` request before it
+computes the fingerprint. It builds the `TransactItems` from the parsed
+statements and copies the request's token and `ReturnConsumedCapacity`. The
+same fingerprint then decides the replays of the write.
 
 ## 10. Backend Plugin Architecture
 

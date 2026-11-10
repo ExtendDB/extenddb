@@ -196,6 +196,23 @@ alone, with the same wording. For PartiQL this holds in `ExecuteStatement`,
 | Warm throughput | Pre-provisions partitions to the requested read and write units; raising it is a long-running operation (`Status: UPDATING` for minutes, the previous values reported meanwhile); a request above the account's table maximum is `LimitExceededException` | Stored and reported with the same shape, defaults and validation so clients that read it (the Terraform AWS provider since 6.13.0) work: the previous values are reported with `Status: UPDATING` for `control_plane_delay_seconds` after a change, then the new values `ACTIVE`; a decrease is measured against the reported values, as on the service. Nothing acts on the values: no pre-warming and no scaling at the database level. The account maximum is not known to ExtendDB and is not enforced. A provisioned table whose warm throughput was never set, or was set on one side only, reports its new units at once after a capacity change, where the service reports the old units until the table is `ACTIVE`. Switching a table to `PAY_PER_REQUEST` stores 12000 read and 4000 write units where its warm throughput is lower, and the stored values stay after a switch back to `PROVISIONED`, as on the service; the response to the switch reads the new values with `Status: UPDATING` for `control_plane_delay_seconds`, where the service answers with the previous values and `Status: ACTIVE` |
 | Throttling | Always on; throttles requests that exceed provisioned/burst capacity. No setting to disable | Configurable via `throttling_enabled` runtime setting (default: `true`) |
 
+## Transactions
+
+ExtendDB decides whether a `TransactWriteItems` request, or an
+`ExecuteTransaction` write, with a known `ClientRequestToken` is a replay. It
+compares a fingerprint of the `TransactItems` JSON, `ReturnConsumedCapacity`
+and `ReturnItemCollectionMetrics` with the fingerprint stored for the token.
+For an `ExecuteTransaction` write, ExtendDB builds the `TransactItems` from the
+parsed statements. The service compares the parsed request.
+
+| Area | DynamoDB | ExtendDB |
+|------|----------|------|
+| `TransactWriteItems` token retry that changes only the spelling of a number (`1` and `1.0`) or the spacing of an expression | Replays it (measured 2026-10-24) | Answers `IdempotentParameterMismatchException`, because the fingerprint hashes the `TransactItems` JSON as the request writes it (measured on SQLite) |
+| `TransactWriteItems` token retry that names an attribute through an `ExpressionAttributeNames` alias, or adds `ReturnValuesOnConditionCheckFailure: NONE` inside an item | Replays it (measured 2026-10-24) | Answers `IdempotentParameterMismatchException`, for the same reason (measured on SQLite) |
+| `TransactWriteItems` token retry whose item lists the same attributes in another key order | Answers 200, as it does to an identical retry (measured 2026-11-10) | Replays in a build without the MongoDB backend, where serde_json writes map keys in sorted order. A build with the MongoDB backend keeps map keys in request order (bson enables serde_json's `preserve_order`), so the retry answers `IdempotentParameterMismatchException` *(from the code)* |
+| Unknown top-level field in `TransactWriteItems` | A raw signed request with the field answers 200 and writes the item (measured 2026-11-10) | Refused with `SerializationException` "Start of structure or map found where not expected: unknown field ..." (measured on SQLite) |
+| `ReturnItemCollectionMetrics: SIZE` on the first call, table without a local secondary index | `{"ItemCollectionMetrics": {}}` (measured 2026-11-10) | `{}`, without the key (measured on SQLite) |
+
 ## PartiQL
 
 ExtendDB implements `ExecuteStatement`, `BatchExecuteStatement`, and
