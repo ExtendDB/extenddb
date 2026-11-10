@@ -50,7 +50,7 @@ calls in an async function (top-level `await` is ESM-only).
 | `dbPath` | data dir | SQLite file location (file mode only). |
 | `port` | ephemeral | Fixed port instead of an OS-assigned one. |
 | `binary` | bundled | Path to an `extenddb` binary of this package's release, overriding the bundled one. |
-| `startupTimeoutMs` | `15000` | How long to wait for the binary's version check, and then for the server to become healthy. |
+| `startupTimeoutMs` | `15000` | The time budget of `start()`, shared by the binary's version check and the wait for the server to become healthy. A health probe in flight at the deadline can add up to 1 s. |
 
 The returned object carries `endpoint`, `port`, `credentials`, `region`,
 `storage`, and `stop()`, which shuts the server down and resolves when the

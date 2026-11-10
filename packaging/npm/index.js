@@ -14,6 +14,14 @@ const fs = require("node:fs");
 // version, and the launcher runs only a binary of the same release.
 const LAUNCHER_VERSION = require("./package.json").version;
 
+// What to point the "binary" option or EXTENDDB_BINARY at.
+const WANTED_BINARY =
+  `an extenddb ${LAUNCHER_VERSION} dev binary built from tag v${LAUNCHER_VERSION}`;
+
+// The longest delay setTimeout keeps (2^31-1 ms, about 24.8 days). Node runs
+// a longer delay after 1 ms.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 // AWS's documented example credential: the dev server seeds it as the
 // well-known default signing credential (dev-mode builds only).
 const DEFAULT_CREDENTIALS = {
@@ -34,25 +42,27 @@ const DEFAULT_DB_FILE = "data.db";
  * it with one of the launcher's release.
  *
  * Order: explicit option, EXTENDDB_BINARY env var, a platform package
- * (optionalDependencies, wired up by the release pipeline), then PATH.
+ * (optionalDependencies, wired up by the release pipeline), then PATH. It
+ * skips a candidate that names no file, and `skipped` lists that candidate so
+ * that the errors that follow can name it.
  *
- * @returns {{ path: string, source: string, fix: string }}
+ * @returns {{ path: string, source: string, fix: string,
+ *             skipped: Array<{ path: string, source: string }> }}
  */
 function resolveBinary(explicit) {
-  const wanted = `an extenddb ${LAUNCHER_VERSION} dev binary`;
   const candidates = [];
   if (explicit) {
     candidates.push({
       path: explicit,
       source: `the "binary" option`,
-      fix: `Pass the "binary" option ${wanted}.`,
+      fix: `Pass the "binary" option ${WANTED_BINARY}.`,
     });
   }
   if (process.env.EXTENDDB_BINARY) {
     candidates.push({
       path: process.env.EXTENDDB_BINARY,
       source: "EXTENDDB_BINARY",
-      fix: `Point EXTENDDB_BINARY at ${wanted}, or unset it to use the platform package.`,
+      fix: `Point EXTENDDB_BINARY at ${WANTED_BINARY}, or unset it to use the platform package.`,
     });
   }
   try {
@@ -68,8 +78,10 @@ function resolveBinary(explicit) {
   } catch {
     /* platform package not installed */
   }
+  const skipped = [];
   for (const c of candidates) {
-    if (fs.existsSync(c.path)) return c;
+    if (fs.existsSync(c.path)) return { ...c, skipped };
+    skipped.push({ path: c.path, source: c.source });
   }
   // Fall back to PATH; spawn() will surface ENOENT with this name.
   return {
@@ -78,8 +90,16 @@ function resolveBinary(explicit) {
     fix:
       `Install the launcher with its optional dependencies, which carry the platform ` +
       `binary (npm install @extenddb/dev@${LAUNCHER_VERSION}), or set EXTENDDB_BINARY ` +
-      `to ${wanted}.`,
+      `to ${WANTED_BINARY}.`,
+    skipped,
   };
+}
+
+/** One sentence for each candidate that resolveBinary skipped, or "". */
+function skippedNote(binary) {
+  return binary.skipped
+    .map((c) => ` The launcher skipped ${c.path} (from ${c.source}), which does not exist.`)
+    .join("");
 }
 
 /** Pick a free loopback port by binding port 0 and reading it back. */
@@ -94,8 +114,10 @@ function freePort() {
   });
 }
 
-function waitHealthy(endpoint, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+// Probe /health until it answers 200 or the clock passes `deadline` (a
+// Date.now() value). The function compares the deadline with the clock and
+// never gives it to a timer, so a deadline of any size works.
+function waitHealthy(endpoint, deadline, timeoutMs) {
   return new Promise((resolve, reject) => {
     const probe = () => {
       const req = http.get(`${endpoint}/health`, (res) => {
@@ -111,7 +133,9 @@ function waitHealthy(endpoint, timeoutMs) {
     };
     const retry = () => {
       if (Date.now() > deadline) {
-        return reject(new Error(`extenddb did not become healthy within ${timeoutMs}ms`));
+        return reject(
+          new Error(`extenddb did not become healthy within the ${timeoutMs}ms startup timeout`)
+        );
       }
       setTimeout(probe, 100);
     };
@@ -144,15 +168,14 @@ function resolveStorage(options) {
   return { sqlitePath: dbPath, description: dbPath };
 }
 
-function binaryNotFound() {
+function binaryNotFound(binary) {
   return new Error(
     `could not find or execute the extenddb dev binary (tried the "binary" ` +
       `option, EXTENDDB_BINARY, the @extenddb/${process.platform}-${process.arch} ` +
-      `platform package, then PATH). Note: on musl systems such as Alpine ` +
-      `(node:alpine), the prebuilt glibc binary fails with this same error even ` +
-      `when the file exists. If your platform has no working prebuilt package, ` +
-      `build one with: cargo build --release --no-default-features ` +
-      `--features sqlite,dev-mode -p extenddb, then set EXTENDDB_BINARY to it.`
+      `platform package, then PATH).${skippedNote(binary)} If your platform has ` +
+      `no working prebuilt package, build one from tag v${LAUNCHER_VERSION} with: ` +
+      `cargo build --release --no-default-features --features sqlite,dev-mode ` +
+      `-p extenddb, then set EXTENDDB_BINARY to it.`
   );
 }
 
@@ -163,16 +186,26 @@ function binaryNotFound() {
  * `extenddb version` prints `extenddb <release>` as its first line
  * (print_version in crates/app/src/lib.rs). It runs with the environment and
  * working directory `serve` gets, so the check runs the binary `serve` runs.
+ * It must finish by `deadline`, the Date.now() value at which start() gives up.
  */
-function checkBinaryVersion(binary, env, cwd, timeoutMs) {
+function checkBinaryVersion(binary, env, cwd, deadline, timeoutMs) {
   const shown = binary.source === "PATH" ? "on PATH" : `${binary.path} (from ${binary.source})`;
   return new Promise((resolve, reject) => {
-    // SIGKILL at the timeout: a binary that ignores SIGTERM must not keep
-    // start() waiting past it.
-    const opts = { env, cwd, timeout: timeoutMs, killSignal: "SIGKILL" };
-    execFile(binary.path, ["version"], opts, (err, stdout, stderr) => {
+    let timer;
+    let timedOut = false;
+    const child = execFile(binary.path, ["version"], { env, cwd }, (err, stdout, stderr) => {
+      clearTimeout(timer);
       let failure;
-      if (!err) {
+      if (err && err.code === "ENOENT") {
+        reject(binaryNotFound(binary));
+        return;
+      }
+      if (timedOut) {
+        // The timer fired. This holds even when `version` exited 0 and a child
+        // of it held the pipes until the timer closed them, so `serve` never
+        // starts after the deadline.
+        failure = `did not finish within the ${timeoutMs}ms startup timeout`;
+      } else if (!err) {
         const found = /^extenddb (\S+)\s*$/m.exec(stdout);
         if (found && found[1] === LAUNCHER_VERSION) {
           resolve();
@@ -183,19 +216,14 @@ function checkBinaryVersion(binary, env, cwd, timeoutMs) {
             new Error(
               `the extenddb binary ${shown} is release ${found[1]}, and this ` +
                 `@extenddb/dev launcher is release ${LAUNCHER_VERSION}: the launcher ` +
-                `runs only a binary of its own release. ${binary.fix}`
+                `runs only a binary of its own release.${skippedNote(binary)} ${binary.fix}`
             )
           );
           return;
         }
         failure = `printed no "extenddb <release>" line`;
-      } else if (err.code === "ENOENT") {
-        reject(binaryNotFound());
-        return;
       } else if (typeof err.code === "number") {
         failure = `exited with code ${err.code}`;
-      } else if (err.killed) {
-        failure = `did not finish within ${timeoutMs}ms`;
       } else if (err.signal) {
         failure = `was stopped by ${err.signal}`;
       } else {
@@ -208,11 +236,31 @@ function checkBinaryVersion(binary, env, cwd, timeoutMs) {
         new Error(
           `could not read the release of the extenddb binary ${shown}: "extenddb ` +
             `version" ${failure}. This @extenddb/dev launcher is release ` +
-            `${LAUNCHER_VERSION} and runs only a binary of its own release. ` +
-            `${binary.fix}${output ? `\n${output}` : ""}`
+            `${LAUNCHER_VERSION} and runs only a binary of its own release.` +
+            `${skippedNote(binary)} ${binary.fix}${output ? `\n${output}` : ""}`
         )
       );
     });
+    // The launcher's own timer: execFile's timeout option refuses a fraction,
+    // a string and Infinity, and fires after 1 ms for a value above 2^31-1.
+    // The launcher clamps the delay to what setTimeout keeps. A deadline of
+    // Infinity or NaN gets no timer, and a past deadline, -Infinity included,
+    // gets a delay of 0. At the deadline, close the pipes and
+    // SIGKILL the binary, as execFile does at its timeout. Then a binary that
+    // ignores SIGTERM, or a child of it that holds the pipes, cannot keep
+    // start() waiting.
+    const left = deadline - Date.now();
+    if (left < Infinity) {
+      timer = setTimeout(
+        () => {
+          timedOut = true;
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          child.kill("SIGKILL");
+        },
+        Math.min(Math.max(left, 0), MAX_TIMER_MS)
+      );
+    }
   });
 }
 
@@ -227,12 +275,22 @@ function checkBinaryVersion(binary, env, cwd, timeoutMs) {
  * @param {number} [options.port]    Fixed port (default: ephemeral).
  * @param {string} [options.binary]  Path to the extenddb dev binary, of the
  *   launcher's own release.
- * @param {number} [options.startupTimeoutMs]  Readiness timeout, and the
- *   bound on the binary's version check (default 15000).
+ * @param {number} [options.startupTimeoutMs]  The time budget of start(),
+ *   shared by the binary's version check and the wait for the server to
+ *   become healthy (default 15000). A health probe in flight at the deadline
+ *   can add up to 1 s.
  * @returns {Promise<{endpoint: string, port: number, credentials: object,
  *                    region: string, storage: string, stop: () => Promise<void>}>}
  */
 async function start(options = {}) {
+  // One deadline for the whole start. The version check and the health wait
+  // share it, so start() takes about one startupTimeoutMs: a health probe in
+  // flight at the deadline can add up to its 1 s timeout. Number() reads a
+  // numeric string such as "20000" as that many ms. A fraction, Infinity or a value
+  // above 2^31-1 works because start() compares the deadline with the clock
+  // and gives a timer only a clamped delay.
+  const timeoutMs = Number(options.startupTimeoutMs ?? 15000);
+  const deadline = Date.now() + timeoutMs;
   const binary = resolveBinary(options.binary);
   const port = options.port ?? (await freePort());
   const { sqlitePath, description } = resolveStorage(options);
@@ -245,7 +303,7 @@ async function start(options = {}) {
   // Zero-config: the dev binary needs no init and no config file. Run from a
   // scratch cwd so a stray extenddb.toml in the project cannot leak in.
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-"));
-  await checkBinaryVersion(binary, env, cwd, options.startupTimeoutMs ?? 15000);
+  await checkBinaryVersion(binary, env, cwd, deadline, timeoutMs);
   const child = spawn(binary.path, ["serve", "--foreground"], {
     env,
     cwd,
@@ -260,7 +318,7 @@ async function start(options = {}) {
   const spawned = new Promise((_, reject) => {
     child.on("error", (err) => {
       if (err.code === "ENOENT") {
-        reject(binaryNotFound());
+        reject(binaryNotFound(binary));
         return;
       }
       reject(err);
@@ -269,7 +327,8 @@ async function start(options = {}) {
       reject(new Error(`extenddb exited during startup (code ${code}): ${stderrTail}`))
     );
   });
-  await Promise.race([waitHealthy(endpoint, options.startupTimeoutMs ?? 15000), spawned]);
+  // The health wait gets the time the version check left.
+  await Promise.race([waitHealthy(endpoint, deadline, timeoutMs), spawned]);
   child.removeAllListeners("exit");
 
   let stopped = false;

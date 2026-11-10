@@ -22,7 +22,14 @@
 //      record each invocation) prove the other cases: a matching release
 //      starts the server, and another release, a failing `version` or output
 //      with no release stops the start before `serve` runs, with an error
-//      that names the releases it read and where the binary came from.
+//      that names the releases it read and where the binary came from. The
+//      other releases include one patch release either side and the release
+//      with a digit added or removed, so an exact match is what passes.
+//      With the fakes, startupTimeoutMs takes a fraction, a numeric string,
+//      Infinity and 2^32, and a numeric string counts as its number. One
+//      deadline bounds the version check and the
+//      health wait together. The error names a "binary" option or
+//      EXTENDDB_BINARY path that does not exist.
 
 "use strict";
 
@@ -137,17 +144,20 @@ async function createProbeTable(eb) {
 }
 
 // The body of a fake binary, run in its own process: it records its
-// arguments and working directory, answers `version` as `behaviour` says, and
-// for `serve` answers /health on the port the launcher names until SIGTERM.
+// arguments, working directory and pid, answers `version` as `behaviour`
+// says (after `versionDelayMs`), and for `serve` answers /health on the port
+// the launcher names (from `serveDelayMs` on) until SIGTERM.
 function fakeMain(behaviour, log) {
   const fs = require("node:fs");
   const http = require("node:http");
   const args = process.argv.slice(2);
-  fs.appendFileSync(log, `${JSON.stringify({ args, cwd: process.cwd() })}\n`);
+  fs.appendFileSync(log, `${JSON.stringify({ args, cwd: process.cwd(), pid: process.pid })}\n`);
   if (args[0] === "version") {
-    process.stdout.write(behaviour.stdout ?? "");
-    process.stderr.write(behaviour.stderr ?? "");
-    process.exitCode = behaviour.exit ?? 0;
+    setTimeout(() => {
+      process.stdout.write(behaviour.stdout ?? "");
+      process.stderr.write(behaviour.stderr ?? "");
+      process.exitCode = behaviour.exit ?? 0;
+    }, behaviour.versionDelayMs ?? 0);
     if (behaviour.hang) {
       // Ignore SIGTERM and never exit: only SIGKILL stops this process.
       process.on("SIGTERM", () => {});
@@ -155,9 +165,11 @@ function fakeMain(behaviour, log) {
     }
     return;
   }
-  http
-    .createServer((req, res) => res.end())
-    .listen(Number(process.env.EXTENDDB__SERVER__PORT), "127.0.0.1");
+  setTimeout(() => {
+    http
+      .createServer((req, res) => res.end())
+      .listen(Number(process.env.EXTENDDB__SERVER__PORT), "127.0.0.1");
+  }, behaviour.serveDelayMs ?? 0);
 }
 
 // Write a fake binary named `extenddb` into a directory of its own. Windows
@@ -188,6 +200,27 @@ function versionOutput(release) {
     `extenddb ${release}\ncatalog migration 7 (sqlite)\ncommit 0000000\n` +
     `built 2026-11-06T00:00:00Z\ntest-hooks disabled\n`
   );
+}
+
+// Releases next to `release` that a looser comparison accepts. A major.minor
+// comparison accepts one patch release either side. A prefix match accepts
+// the release with a digit added or removed.
+function nearReleases(release) {
+  const [major, minor, patch] = release.split(".").map(Number);
+  const near = [`${major}.${minor}.${patch + 1}`, `${release}0`, release.slice(0, -1)];
+  if (patch > 0) near.push(`${major}.${minor}.${patch - 1}`);
+  return near;
+}
+
+// An installed platform package comes before PATH. The scenarios that put a
+// fake on PATH therefore run only on a host without one, as in CI.
+function platformPackageInstalled() {
+  try {
+    require.resolve(`@extenddb/${process.platform}-${process.arch}/extenddb`);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function main() {
@@ -283,7 +316,7 @@ async function main() {
   }
 
   if (process.platform === "win32") {
-    console.log("launcher tests: 4 scenarios passed (scenarios 5 to 8 run fake binaries through their #! line)");
+    console.log("launcher tests: 4 scenarios passed (scenarios 5 to 11 run fake binaries through their #! line)");
     return;
   }
 
@@ -316,7 +349,10 @@ async function main() {
         assert.ok(err.message.includes("is release 0.0.1,"), err.message);
         assert.ok(err.message.includes(`launcher is release ${LAUNCHER_VERSION}:`), err.message);
         assert.ok(
-          err.message.includes(`Pass the "binary" option an extenddb ${LAUNCHER_VERSION} dev binary.`),
+          err.message.includes(
+            `Pass the "binary" option an extenddb ${LAUNCHER_VERSION} dev binary ` +
+              `built from tag v${LAUNCHER_VERSION}.`
+          ),
           err.message
         );
         return true;
@@ -328,13 +364,20 @@ async function main() {
       "serve must not run on a binary of another release"
     );
 
-    // The check refuses a newer release as well: it wants an exact match.
-    const newer = fakeBinary({ stdout: versionOutput("99.0.0") });
-    await assert.rejects(
-      () => start({ binary: newer.file, memory: true }),
-      /is release 99\.0\.0,/
-    );
-    assert.deepStrictEqual(newer.invocations().map((r) => r.args), [["version"]]);
+    // The check refuses a newer release as well, and the releases next to
+    // the launcher's: it wants an exact match.
+    for (const release of ["99.0.0", ...nearReleases(LAUNCHER_VERSION)]) {
+      const other = fakeBinary({ stdout: versionOutput(release) });
+      await assert.rejects(
+        () => start({ binary: other.file, memory: true }),
+        (err) => {
+          assert.ok(err.message.includes(`is release ${release},`), err.message);
+          return true;
+        },
+        `release ${release} must be refused`
+      );
+      assert.deepStrictEqual(other.invocations().map((r) => r.args), [["version"]]);
+    }
   }
 
   // 7. A `version` that fails, and one that prints no release, stop the
@@ -370,7 +413,12 @@ async function main() {
     });
     await assert.rejects(
       () => Promise.race([start({ binary: hanging.file, memory: true, startupTimeoutMs: 500 }), deadline]),
-      /"extenddb version" did not finish within 500ms\./
+      /"extenddb version" did not finish within the 500ms startup timeout\./
+    );
+    // A numeric string bounds start() as its number does.
+    await assert.rejects(
+      () => Promise.race([start({ binary: hanging.file, memory: true, startupTimeoutMs: "500" }), deadline]),
+      /"extenddb version" did not finish within the 500ms startup timeout\./
     );
     clearTimeout(guard);
   }
@@ -392,23 +440,20 @@ async function main() {
       viaEnv.stderr.includes(`${fake.file} (from EXTENDDB_BINARY) is release 0.0.1`),
       viaEnv.stderr
     );
-    assert.ok(viaEnv.stderr.includes("or unset it to use the platform package."), viaEnv.stderr);
+    assert.ok(
+      viaEnv.stderr.includes(
+        `Point EXTENDDB_BINARY at an extenddb ${LAUNCHER_VERSION} dev binary built from ` +
+          `tag v${LAUNCHER_VERSION}, or unset it to use the platform package.`
+      ),
+      viaEnv.stderr
+    );
     assert.deepStrictEqual(
       fake.invocations().map((r) => r.args),
       [["version"]],
       "serve must not run from the command line either"
     );
 
-    // An installed platform package comes before PATH, so the PATH half
-    // runs only where none is installed, as in CI.
-    let platformPackage = false;
-    try {
-      require.resolve(`@extenddb/${process.platform}-${process.arch}/extenddb`);
-      platformPackage = true;
-    } catch {
-      /* not installed */
-    }
-    if (!platformPackage) {
+    if (!platformPackageInstalled()) {
       // PATH holds the fake and node (for the fake's #! line), and nothing else.
       const pathEnv = {
         ...process.env,
@@ -421,14 +466,140 @@ async function main() {
         viaPath.stderr.includes("the extenddb binary on PATH is release 0.0.1"),
         viaPath.stderr
       );
-      assert.ok(viaPath.stderr.includes("or set EXTENDDB_BINARY to"), viaPath.stderr);
+      assert.ok(
+        viaPath.stderr.includes(
+          `or set EXTENDDB_BINARY to an extenddb ${LAUNCHER_VERSION} dev binary built from ` +
+            `tag v${LAUNCHER_VERSION}.`
+        ),
+        viaPath.stderr
+      );
       assert.deepStrictEqual(fake.invocations().map((r) => r.args), [["version"], ["version"]]);
     } else {
       console.log("scenario 8: an installed platform package comes before PATH; PATH half skipped");
     }
   }
 
-  console.log("launcher tests: 8 scenarios passed");
+  // 9. A fraction, a numeric string, Infinity and 2^32 each start a server.
+  //    For 2^32, the delay left at the version check is still above 2^31-1,
+  //    the longest delay that setTimeout keeps. The launcher clamps the
+  //    delay, so Node emits no Timeout warning.
+  {
+    const warnings = [];
+    const onWarning = (w) => warnings.push(w.name);
+    process.on("warning", onWarning);
+    const fake = fakeBinary({ stdout: versionOutput(LAUNCHER_VERSION) });
+    const values = [2500.5, "20000", Infinity, 2 ** 32];
+    for (const startupTimeoutMs of values) {
+      const label = typeof startupTimeoutMs === "string" ? `"${startupTimeoutMs}"` : startupTimeoutMs;
+      const eb = await start({ binary: fake.file, memory: true, startupTimeoutMs }).catch((err) => {
+        throw new Error(`startupTimeoutMs ${label}: ${err.message}`);
+      });
+      assert.strictEqual(await health(eb.endpoint), 200, `startupTimeoutMs ${label}`);
+      await eb.stop();
+    }
+    // Node emits a warning on a later tick: let any arrive before the check.
+    await new Promise((r) => setImmediate(r));
+    process.off("warning", onWarning);
+    assert.deepStrictEqual(warnings.filter((name) => name.startsWith("Timeout")), []);
+    assert.deepStrictEqual(
+      fake.invocations().map((r) => r.args[0]),
+      values.flatMap(() => ["version", "serve"])
+    );
+  }
+
+  // 10. One deadline bounds the whole start. Here `version` answers after
+  //     1 s and `serve` listens 1.5 s after it starts, so the server is
+  //     healthy no earlier than 2.5 s into start(). With a 2 s budget, the
+  //     health wait gets the time the version check left, and start() fails
+  //     close to 2 s. A health wait with a full budget of its own would see
+  //     the server healthy, and start() would succeed after about 2.5 s.
+  {
+    const fake = fakeBinary({
+      stdout: versionOutput(LAUNCHER_VERSION),
+      versionDelayMs: 1000,
+      serveDelayMs: 1500,
+    });
+    const began = Date.now();
+    await assert.rejects(
+      () => start({ binary: fake.file, memory: true, startupTimeoutMs: 2000 }),
+      /extenddb did not become healthy within the 2000ms startup timeout/
+    );
+    const took = Date.now() - began;
+    assert.ok(took < 2900, `start() took ${took}ms with startupTimeoutMs 2000`);
+    // start() does not stop a server that misses the deadline, so stop the
+    // fake here.
+    const serve = fake.invocations().find((r) => r.args[0] === "serve");
+    process.kill(serve.pid, "SIGKILL");
+  }
+
+  // 11. The launcher skips a "binary" option or EXTENDDB_BINARY that names
+  //     no file and falls back to the next source. The error that follows
+  //     names the skipped path.
+  {
+    const missing = path.join(os.tmpdir(), `extenddb-missing-${process.pid}`, "extenddb");
+    const skippedOption = `The launcher skipped ${missing} (from the "binary" option), which does not exist.`;
+    const skippedEnv = `The launcher skipped ${missing} (from EXTENDDB_BINARY), which does not exist.`;
+    const other = fakeBinary({ stdout: versionOutput("0.0.1") });
+    const saved = process.env.EXTENDDB_BINARY;
+    process.env.EXTENDDB_BINARY = other.file;
+    try {
+      await assert.rejects(
+        () => start({ binary: missing, memory: true }),
+        (err) => {
+          assert.ok(
+            err.message.includes(`${other.file} (from EXTENDDB_BINARY) is release 0.0.1`),
+            err.message
+          );
+          assert.ok(err.message.includes(skippedOption), err.message);
+          return true;
+        }
+      );
+    } finally {
+      process.env.EXTENDDB_BINARY = saved;
+    }
+
+    if (!platformPackageInstalled()) {
+      const run = (env) =>
+        spawnSync(process.execPath, [LAUNCHER, "start", "--memory"], {
+          env,
+          encoding: "utf8",
+          timeout: 30000,
+        });
+
+      // EXTENDDB_BINARY names no file, so the launcher runs the binary on PATH.
+      const viaPath = run({
+        ...process.env,
+        EXTENDDB_BINARY: missing,
+        PATH: [other.dir, path.dirname(process.execPath)].join(path.delimiter),
+      });
+      assert.strictEqual(viaPath.status, 1, viaPath.stderr);
+      assert.ok(
+        viaPath.stderr.includes("the extenddb binary on PATH is release 0.0.1"),
+        viaPath.stderr
+      );
+      assert.ok(viaPath.stderr.includes(skippedEnv), viaPath.stderr);
+      assert.deepStrictEqual(other.invocations().map((r) => r.args), [["version"], ["version"]]);
+
+      // With no binary on PATH either, the not-found error names the skipped
+      // path and the tag to build a binary from.
+      const empty = fs.mkdtempSync(path.join(os.tmpdir(), "extenddb-empty-path-"));
+      const notFound = run({ ...process.env, EXTENDDB_BINARY: missing, PATH: empty });
+      assert.strictEqual(notFound.status, 1, notFound.stderr);
+      assert.ok(
+        notFound.stderr.includes("could not find or execute the extenddb dev binary"),
+        notFound.stderr
+      );
+      assert.ok(notFound.stderr.includes(skippedEnv), notFound.stderr);
+      assert.ok(
+        notFound.stderr.includes(`build one from tag v${LAUNCHER_VERSION} with: cargo build`),
+        notFound.stderr
+      );
+    } else {
+      console.log("scenario 11: an installed platform package comes before PATH; PATH half skipped");
+    }
+  }
+
+  console.log("launcher tests: 11 scenarios passed");
 }
 
 main().catch((err) => {

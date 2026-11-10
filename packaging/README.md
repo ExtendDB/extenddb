@@ -63,7 +63,8 @@ Platform binaries ship as `optionalDependencies`
 (`@extenddb/<platform>-<arch>`), so `npm install` is copy-only: no compiler,
 no node-gyp, no postinstall downloads. On an unsupported platform the wrapper
 falls back to `EXTENDDB_BINARY` or `PATH`, and that binary must be the
-wrapper's release too.
+wrapper's release too. To use a binary that you build, build it from tag
+`v<release>`, where `<release>` is the wrapper's version.
 
 ## Testing
 
@@ -107,10 +108,11 @@ deliberate second step):
 1. Land the release state on `main` with the workspace version bumped and
    `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
    the tag. The tagged commit itself must carry the matching
-   `npm/package.json`. The launcher runs only a binary of its own release. On
-   a tag whose `package.json` lags the workspace version, the launcher tests
-   fail on every build leg. This is the same tag the container release consumes; the two
-   publish workflows are dispatched independently against it. When the
+   `npm/package.json`. The launcher runs only a binary of its own release.
+   On a tag whose `package.json` lags the workspace version, the launcher
+   tests would fail on every build leg. The publish gate refuses such a tag
+   before any build. This is the same tag the container release consumes; the
+   two publish workflows are dispatched independently against it. When the
    release ships a catalog migration, the same state raises
    `RELEASED_THROUGH` to the last migration and pastes the checksum lines the
    checksum test prints (CONTRIBUTING.md, "Adding a catalog migration"); the
@@ -147,9 +149,6 @@ required reviewers, and the token as `NPM_TOKEN`.
   spawned server survives it, holding its port and storage. `stop()` and
   normal process exit shut it down; after a hard kill, kill the `extenddb`
   process yourself.
-- The prebuilt Linux binaries are glibc builds. On musl systems (Alpine,
-  `node:alpine`) they fail to execute even though the file exists; build a
-  musl binary and point `EXTENDDB_BINARY` at it.
 - Two servers cannot share one database file: a second `start()` on the same
   path fails at startup with a lock error. Use distinct `dbPath`s or memory
   mode for parallel test workers.
