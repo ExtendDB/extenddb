@@ -11,7 +11,7 @@ use daemonize::Daemonize;
 
 #[cfg(unix)]
 use crate::serve_helpers::verify_daemon_started;
-use crate::serve_helpers::{check_config_permissions, narrow_tls_key_permissions};
+use crate::serve_helpers::{check_config_permissions, narrow_served_tls_key};
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
 use extenddb_server::{BuildInfo, LogTarget, ServeParams};
@@ -84,11 +84,8 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // config check above, a wider key is set to 0600 rather than refused.
     // Printed to stderr directly: tracing is set up only inside `serve`, and
     // before daemonizing stderr still reaches the invoking terminal.
-    if app_config.server.tls.enabled {
-        let key_path = config::expand_tilde(&app_config.server.tls.key_path);
-        if let Some(warning) = narrow_tls_key_permissions(&key_path) {
-            eprintln!("{warning}");
-        }
+    if let Some(warning) = narrow_served_tls_key(&app_config.server.tls) {
+        eprintln!("{warning}");
     }
 
     // D6: Auth is mandatory. Only "builtin" is supported.

@@ -123,40 +123,75 @@ pub fn check_config_permissions(config_path: &str) -> anyhow::Result<()> {
     }
 }
 
-/// Set the TLS private key at `key_path` to mode 0600 when group or other
-/// bits are set, and return the warning for the caller to print.
+/// How the key warnings name the key: by its setting, not its path. The TLS
+/// load error leaves the path out so that it stays out of logs that may be
+/// aggregated (docs/troubleshooting.md), and `serve --foreground` prints these
+/// warnings to the same stream.
+const TLS_KEY: &str = "TLS private key (server.tls.key_path)";
+
+/// The last sentence of each key warning: a key that was readable may already
+/// have been copied.
+const TLS_KEY_ROTATE: &str = "Other users could read it while its mode was wider; if that \
+     matters, replace the key and certificate (see \"TLS private key readable by other users\" \
+     in docs/troubleshooting.md).";
+
+/// [`narrow_tls_key_permissions`] on the key a server with this TLS section
+/// loads: `None` without a look at the key when the server loads none (TLS
+/// off, or a `dev-mode` build, which serves plain HTTP), and the key path with
+/// a leading `~` expanded otherwise.
+pub fn narrow_served_tls_key(tls: &extenddb_config::TlsConfig) -> Option<String> {
+    if !extenddb_config::serves_tls(tls) {
+        return None;
+    }
+    narrow_tls_key_permissions(&extenddb_config::expand_tilde(&tls.key_path))
+}
+
+/// Set the TLS private key at `key_path` to mode 0600 when other users can
+/// read it, and return the warning for the caller to print.
 ///
 /// `init` creates the key 0600, but an older `init` that stopped between
 /// writing the key and setting its mode left it at the umask mode, and an
 /// operator can copy a key in the same way. `serve` and the `init` path that
 /// keeps an existing key both call this.
 ///
-/// Returns `None` when the key is missing or already 0600 or narrower; a
-/// missing key is reported by whoever loads it. A key whose mode cannot be
-/// changed (a read-only mount, or a file another user owns) gets a warning
-/// with the manual fix rather than an error, because the process may still
-/// be able to read it and refusing to start would be a regression for those
-/// deployments.
+/// Returns `None` when the key is missing (whoever loads it reports that),
+/// when it is already 0600 or narrower, and when another user owns it and
+/// only that owner and its group can read it: that is a key the server reads
+/// through its group, a mode the owner chose and this server cannot change.
+///
+/// Narrowing a key this server owns removes group and other access, so a
+/// service that read it through its group can no longer read it; the warning
+/// says so. The mode change follows a symlink and applies to the file it
+/// names, unlike `init`'s writes, which refuse to write through a symlink.
+///
+/// A key whose mode cannot be changed gets a warning with advice for the
+/// cause rather than an error, because the process may still be able to read
+/// it and refusing to start would be a regression for those deployments.
 pub fn narrow_tls_key_permissions(key_path: &str) -> Option<String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let mode = std::fs::metadata(key_path).ok()?.permissions().mode() & 0o777;
+        let meta = std::fs::metadata(key_path).ok()?;
+        let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 == 0 {
+            return None;
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let other_owner = (meta.uid() != euid).then_some(meta.uid());
+        if other_owner.is_some() && mode & 0o007 == 0 {
             return None;
         }
         Some(
             match std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)) {
-                Ok(()) => format!(
-                    "WARNING: TLS private key {key_path} had permissions {mode:04o}, \
-                     which let other users read it; set it to 0600."
+                Ok(()) => narrowed_warning(
+                    mode,
+                    std::fs::metadata(key_path)
+                        .ok()
+                        .map(|m| m.permissions().mode() & 0o777),
                 ),
-                Err(e) => format!(
-                    "WARNING: TLS private key {key_path} has permissions {mode:04o}, \
-                     which let other users read it, and setting it to 0600 failed: {e}. \
-                     Fix it with: chmod 600 {key_path}"
-                ),
+                Err(e) => failed_warning(mode, other_owner, &e),
             },
         )
     }
@@ -167,10 +202,60 @@ pub fn narrow_tls_key_permissions(key_path: &str) -> Option<String> {
     }
 }
 
+/// The warning after a mode change that returned success, from the mode
+/// before it and the mode read back after it. Some filesystems accept a mode
+/// change and keep no mode (vfat mounted with `quiet`, some SMB and 9p
+/// mounts), so success is the mode read back, not the call's result.
+fn narrowed_warning(before: u32, after: Option<u32>) -> String {
+    match after {
+        Some(0o600) => format!(
+            "WARNING: {TLS_KEY} had permissions {before:04o}, which let other users read it. \
+             It is now 0600: group and other access were removed, so only its owner can read \
+             it. {TLS_KEY_ROTATE}"
+        ),
+        after => format!(
+            "WARNING: {TLS_KEY} has permissions {before:04o}, which let other users read it. \
+             Setting it to 0600 was accepted but did not take effect (its mode is now {}), so \
+             its filesystem does not keep file modes. Keep the key on a filesystem that does, \
+             or mount it with an owner-only mode. {TLS_KEY_ROTATE}",
+            after.map_or_else(|| "unknown".to_owned(), |m| format!("{m:04o}"))
+        ),
+    }
+}
+
+/// The warning when the mode change failed with `error`, with the fix for its
+/// cause. `other_owner` is the key's owner when another user owns it.
+fn failed_warning(mode: u32, other_owner: Option<u32>, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        return format!(
+            "WARNING: {TLS_KEY} has permissions {mode:04o}, which let other users read it, and \
+             it is on a read-only filesystem, so its mode cannot be changed here. Set the mode \
+             where the file is provided, for example `defaultMode: 0400` on a Kubernetes Secret \
+             volume. {TLS_KEY_ROTATE}"
+        );
+    }
+    if let Some(uid) = other_owner {
+        return format!(
+            "WARNING: {TLS_KEY} has permissions {mode:04o}, which let every user read it. Another \
+             user (uid {uid}) owns it, so this server cannot change its mode. Ask its owner to \
+             remove other access with `chmod o-rwx` on the file; group access, which this server \
+             may read it through, can stay. {TLS_KEY_ROTATE}"
+        );
+    }
+    format!(
+        "WARNING: {TLS_KEY} has permissions {mode:04o}, which let other users read it, and \
+         setting it to 0600 failed: {error}. Fix it with `chmod 600` on the file. \
+         {TLS_KEY_ROTATE}"
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tls_key_permission_tests {
-    use super::narrow_tls_key_permissions;
-    use std::os::unix::fs::PermissionsExt;
+    use super::{
+        TLS_KEY, TLS_KEY_ROTATE, failed_warning, narrow_served_tls_key, narrow_tls_key_permissions,
+        narrowed_warning,
+    };
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn mode(path: &std::path::Path) -> u32 {
         std::fs::metadata(path)
@@ -193,35 +278,71 @@ mod tls_key_permission_tests {
         dir
     }
 
-    /// A 0644 key is set to 0600, and the warning names the key and its old
-    /// mode. Its contents are untouched.
+    /// A key file in a scratch directory with mode `m`.
+    fn key_with_mode(dir: &std::path::Path, m: u32) -> std::path::PathBuf {
+        let key = dir.join("key.pem");
+        std::fs::write(&key, b"key").expect("key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(m)).expect("chmod");
+        key
+    }
+
+    fn euid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A 0644 key is set to 0600 with the whole warning: the old mode, that
+    /// group and other access were removed, and the rotation pointer. The
+    /// path is not in it. Its contents are untouched.
     #[test]
     fn a_key_readable_by_others_is_set_to_0600_with_a_warning() {
         let dir = scratch_dir("narrow");
-        let key = dir.join("key.pem");
-        std::fs::write(&key, b"key").expect("key");
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let key = key_with_mode(&dir, 0o644);
         let path = key.to_str().expect("utf-8 path");
 
         let warning = narrow_tls_key_permissions(path).expect("a warning");
 
         assert_eq!(mode(&key), 0o600);
-        assert!(warning.contains(path), "{warning}");
-        assert!(warning.contains("0644"), "{warning}");
-        assert!(warning.contains("set it to 0600"), "{warning}");
+        assert_eq!(
+            warning,
+            format!(
+                "WARNING: {TLS_KEY} had permissions 0644, which let other users read it. It is \
+                 now 0600: group and other access were removed, so only its owner can read it. \
+                 {TLS_KEY_ROTATE}"
+            )
+        );
+        assert!(!warning.contains(path), "{warning}");
         assert_eq!(std::fs::read(&key).expect("read"), b"key");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// Group bits alone are enough to narrow the key.
+    /// Group bits alone are enough to narrow a key this user owns.
     #[test]
     fn a_group_readable_key_is_set_to_0600() {
         let dir = scratch_dir("group");
-        let key = dir.join("key.pem");
-        std::fs::write(&key, b"key").expect("key");
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let key = key_with_mode(&dir, 0o640);
 
-        assert!(narrow_tls_key_permissions(key.to_str().expect("utf-8 path")).is_some());
+        let warning = narrow_tls_key_permissions(key.to_str().expect("utf-8 path"));
+
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("had permissions 0640,")),
+            "{warning:?}"
+        );
+        assert_eq!(mode(&key), 0o600);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A key reached through a symlink: the file it names is narrowed.
+    #[test]
+    fn a_symlinked_key_has_its_target_narrowed() {
+        let dir = scratch_dir("symlink");
+        let key = key_with_mode(&dir, 0o644);
+        let link = dir.join("link.pem");
+        std::os::unix::fs::symlink(&key, &link).expect("symlink");
+
+        assert!(narrow_tls_key_permissions(link.to_str().expect("utf-8 path")).is_some());
         assert_eq!(mode(&key), 0o600);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
@@ -257,32 +378,147 @@ mod tls_key_permission_tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// A key whose mode cannot be changed gets a warning with the manual fix,
-    /// not an error, and its mode stays as it was. `/etc/hosts` stands in for
-    /// a key another user owns: it is root's and 0644 on Linux and macOS.
-    #[test]
-    fn a_key_that_cannot_be_narrowed_gets_the_manual_fix() {
-        use std::os::unix::fs::MetadataExt;
+    /// The first of `candidates` that another user owns, with a mode that
+    /// `wanted` accepts, and that this user cannot change (not root).
+    fn file_of_another_user(candidates: &[&str], wanted: fn(u32) -> bool) -> Option<String> {
+        let euid = euid();
+        if euid == 0 {
+            return None;
+        }
+        candidates.iter().find_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            (meta.uid() != euid && wanted(meta.permissions().mode() & 0o777))
+                .then(|| (*path).to_owned())
+        })
+    }
 
-        let path = "/etc/hosts";
-        let Ok(meta) = std::fs::metadata(path) else {
-            eprintln!("skipped: no {path}");
+    /// A key another user owns that every user can read gets the advice to
+    /// remove other access only, not `chmod 600`, which would take the
+    /// group's access away. Its mode stays as it was. `/etc/hosts` stands in
+    /// for such a key: it is root's and 0644 on Linux and macOS.
+    #[test]
+    fn a_world_readable_key_of_another_user_gets_the_owner_advice() {
+        let Some(path) = file_of_another_user(&["/etc/hosts"], |m| m & 0o004 != 0) else {
+            eprintln!("skipped: no world-readable file of another user");
             return;
         };
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        if meta.uid() == euid || euid == 0 || meta.permissions().mode() & 0o077 == 0 {
-            // This user could change its mode, or it is already private, so it
-            // does not exercise the failure; never change a system file.
-            eprintln!("skipped: {path} is not a wider file owned by another user");
+        let before = mode(std::path::Path::new(&path));
+
+        let warning = narrow_tls_key_permissions(&path).expect("a warning");
+
+        assert!(warning.contains("Another user (uid "), "{warning}");
+        assert!(warning.contains("`chmod o-rwx`"), "{warning}");
+        assert!(!warning.contains("chmod 600"), "{warning}");
+        assert!(!warning.contains(&path), "{warning}");
+        assert_eq!(mode(std::path::Path::new(&path)), before);
+    }
+
+    /// A key another user owns that only its owner and group can read is the
+    /// layout where the server reads it through its group: no warning, and
+    /// no attempt to change it. `/etc/sudoers` (0440) and `/etc/shadow`
+    /// (0640) stand in for such a key.
+    #[test]
+    fn a_group_readable_key_of_another_user_is_left_alone() {
+        let Some(path) = file_of_another_user(&["/etc/sudoers", "/etc/shadow"], |m| {
+            m & 0o070 != 0 && m & 0o007 == 0
+        }) else {
+            eprintln!("skipped: no group-only file of another user");
             return;
+        };
+        let before = mode(std::path::Path::new(&path));
+
+        assert_eq!(narrow_tls_key_permissions(&path), None);
+        assert_eq!(mode(std::path::Path::new(&path)), before);
+    }
+
+    /// A mode change that returned success but left the key wide is reported
+    /// as not having taken effect, not as done.
+    #[test]
+    fn a_mode_change_the_filesystem_dropped_is_not_reported_as_done() {
+        let warning = narrowed_warning(0o644, Some(0o644));
+        assert!(
+            warning.contains("did not take effect (its mode is now 0644)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("It is now 0600"), "{warning}");
+        assert!(narrowed_warning(0o644, None).contains("its mode is now unknown"));
+    }
+
+    /// The advice follows the cause of a failed change: a read-only mount gets
+    /// the mount-time fix, another owner the owner's fix, and anything else
+    /// `chmod 600`.
+    #[test]
+    fn a_failed_change_gets_the_fix_for_its_cause() {
+        let read_only = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let warning = failed_warning(0o644, None, &read_only);
+        assert!(warning.contains("read-only filesystem"), "{warning}");
+        assert!(warning.contains("`defaultMode: 0400`"), "{warning}");
+        assert!(!warning.contains("chmod"), "{warning}");
+
+        let warning = failed_warning(0o644, Some(0), &denied);
+        assert!(warning.contains("Another user (uid 0)"), "{warning}");
+        assert!(!warning.contains("chmod 600"), "{warning}");
+
+        let warning = failed_warning(0o644, None, &denied);
+        assert!(
+            warning.contains("Fix it with `chmod 600` on the file."),
+            "{warning}"
+        );
+        for warning in [
+            failed_warning(0o644, None, &read_only),
+            failed_warning(0o644, Some(0), &denied),
+            failed_warning(0o644, None, &denied),
+        ] {
+            assert!(warning.contains("permissions 0644,"), "{warning}");
+            assert!(warning.ends_with(TLS_KEY_ROTATE), "{warning}");
         }
-        let before = meta.permissions().mode() & 0o777;
+    }
 
-        let warning = narrow_tls_key_permissions(path).expect("a warning");
+    /// `serve`'s check: the configured key, with `~` expanded, when the
+    /// server loads one, and no look at it when TLS is off or in a `dev-mode`
+    /// build, which serves plain HTTP.
+    #[test]
+    fn serve_narrows_the_key_it_loads_only() {
+        let dir = scratch_dir("served");
+        let key = key_with_mode(&dir, 0o644);
+        let tls = |key_path: String, enabled: bool| extenddb_config::TlsConfig {
+            enabled,
+            key_path,
+            ..extenddb_config::TlsConfig::default()
+        };
+        let absolute = key.to_str().expect("utf-8 path").to_owned();
 
-        assert!(warning.contains("setting it to 0600 failed"), "{warning}");
-        assert!(warning.contains("chmod 600 /etc/hosts"), "{warning}");
-        assert_eq!(mode(std::path::Path::new(path)), before);
+        assert_eq!(narrow_served_tls_key(&tls(absolute.clone(), false)), None);
+        assert_eq!(mode(&key), 0o644);
+
+        let served = narrow_served_tls_key(&tls(absolute.clone(), true));
+        if cfg!(feature = "dev-mode") {
+            assert_eq!(served, None);
+            assert_eq!(mode(&key), 0o644);
+        } else {
+            assert!(served.is_some());
+            assert_eq!(mode(&key), 0o600);
+        }
+
+        // The same key named from `~`: `~/` and one `..` per component of
+        // $HOME, then the path from `/`. Unexpanded, `~` is a directory name
+        // that does not exist, and there is no key to narrow.
+        if !cfg!(feature = "dev-mode")
+            && let Ok(home) = std::env::var("HOME")
+            && home.starts_with('/')
+        {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+            let ups = std::path::Path::new(&home)
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
+            let from_tilde = format!("~/{}{}", "../".repeat(ups), &absolute[1..]);
+
+            assert!(narrow_served_tls_key(&tls(from_tilde, true)).is_some());
+            assert_eq!(mode(&key), 0o600);
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

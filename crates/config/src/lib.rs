@@ -413,7 +413,14 @@ fn default_log_format() -> String {
 /// in dev-mode builds.
 #[must_use]
 pub fn is_tls_enabled(config: &AppConfig) -> bool {
-    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+    serves_tls(&config.server.tls)
+}
+
+/// [`is_tls_enabled`] for the TLS section alone: whether a server with this
+/// section loads its certificate and key.
+#[must_use]
+pub fn serves_tls(tls: &TlsConfig) -> bool {
+    tls.enabled && !cfg!(feature = "dev-mode")
 }
 
 /// Load `AppConfig` from a config file (optional) and environment variables.

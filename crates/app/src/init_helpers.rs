@@ -45,13 +45,14 @@ fn generate_tls_cert_in(
     }
 
     if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
-        ensure_cert_covers_sans(&cert_path, &key_path, &requested)?;
-        println!("--- TLS certificate already exists, skipping generation.");
         // The kept key may predate init creating it 0600, or have been copied
-        // in with the umask mode.
+        // in with the umask mode. Narrowed before the SAN check, which can
+        // refuse the run and would leave the key as it was.
         if let Some(warning) = crate::serve_helpers::narrow_tls_key_permissions(&key_path) {
             eprintln!("    {warning}");
         }
+        ensure_cert_covers_sans(&cert_path, &key_path, &requested)?;
+        println!("--- TLS certificate already exists, skipping generation.");
         return Ok(());
     }
 
@@ -507,6 +508,25 @@ mod write_owner_only_tests {
         assert_eq!(mode(&key), 0o600);
         assert_eq!(std::fs::read(&key).expect("key"), key_before);
         assert_eq!(std::fs::read(&cert).expect("cert"), cert_before);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A run that the SAN check refuses still narrows the key it keeps: the
+    /// existing certificate does not cover the new `--tls-san`, so init
+    /// fails, and the key it found is 0600 anyway.
+    #[test]
+    fn a_kept_key_is_narrowed_even_when_the_san_check_refuses_the_run() {
+        let dir = scratch_dir("kept-san");
+        let tls_dir = dir.to_str().expect("utf-8 path");
+        super::generate_tls_cert_in(tls_dir, "127.0.0.1", &[]).expect("first init");
+        let key = dir.join("key.pem");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let refused =
+            super::generate_tls_cert_in(tls_dir, "127.0.0.1", &["db.example.test".to_owned()]);
+
+        assert!(refused.is_err(), "the SAN check should refuse the run");
+        assert_eq!(mode(&key), 0o600);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

@@ -124,6 +124,22 @@ The error intentionally does not name the specific file to avoid leaking filesys
    ```
 4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
 
+### TLS private key readable by other users
+
+`WARNING: TLS private key (server.tls.key_path) had permissions <mode>, which let other users read it. …`
+
+**Cause:** `extenddb serve`, or `extenddb init` when it keeps an existing certificate, found the TLS private key readable by group or other users. An older `init` that stopped before it set the key's mode left it that way, as does a key copied in with the default umask. The warning names the setting rather than the file, as the TLS load error above does, and goes to stderr: the terminal that ran the command, or the log stream under `--foreground`.
+
+What the server did depends on the rest of the message:
+
+- **`It is now 0600: group and other access were removed`**: the server owns the key and narrowed it. If another service read the key through its group, it can no longer read it. If `server.tls.key_path` is a symlink, the file it points to was changed.
+- **`Another user (uid <n>) owns it`**: the key is readable by every user, and the server cannot change it. Have its owner remove other access with `chmod o-rwx <file>`. Group access can stay: a key another user owns that only its owner and group can read is a supported layout and gets no warning.
+- **`it is on a read-only filesystem`**: set the mode where the file is provided, for example `defaultMode: 0400` on a Kubernetes Secret volume.
+- **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
+- **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
+
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. If that matters, replace the key and certificate: delete both and run `extenddb init` again to generate a new self-signed pair, or generate one as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), then restart the server. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
+
 ### `Config file <path> has permissions <mode>, which is too open.`
 
 **Cause:** The config file has group or world-readable permissions. Since the config file may contain the encryption key for credential storage, it must be restricted to owner-only access.
