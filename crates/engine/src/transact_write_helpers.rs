@@ -402,17 +402,45 @@ mod tests {
         assert_ne!(fp(&a, "tok-1"), fp(&b, "tok-1"));
     }
 
+    /// A Return field is added to the hashed items, so a retry that sets the
+    /// field and changes the items is a mismatch, not a replay.
+    #[test]
+    fn fingerprint_differs_for_different_ops_with_total() {
+        let a: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t1"}}]});
+        let b: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t2"}}]});
+        let total =
+            |body| compute_fingerprint(body, "tok-1", ReturnConsumedCapacity::Total, NO_RICM);
+        assert_ne!(total(&a), total(&b));
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_ops_with_size() {
+        let a: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t1"}}]});
+        let b: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t2"}}]});
+        let size =
+            |body| compute_fingerprint(body, "tok-1", NO_RCC, ReturnItemCollectionMetrics::Size);
+        assert_ne!(size(&a), size(&b));
+    }
+
     #[test]
     fn fingerprint_differs_for_different_tokens() {
         let body: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t"}}]});
         assert_ne!(fp(&body, "tok-1"), fp(&body, "tok-2"));
     }
 
-    /// The value stored by versions that hashed `TransactItems` alone, for
-    /// this body and token. A request with neither Return field, or with both
-    /// set to NONE, must keep producing it so tokens stored before the upgrade
-    /// still replay.
+    /// The value stored for this body and token by 744ea291, whose fingerprint
+    /// hashed `TransactItems` alone. A request with neither Return field, or
+    /// with both set to NONE, must keep producing it so tokens stored before
+    /// the upgrade still replay.
     const PINNED_ITEMS_ONLY: &str = "ef18f4e7c37d6b12";
+
+    /// The values this version stores for this body and token when a Return
+    /// field is set. A later version must keep producing them so these tokens
+    /// replay after an upgrade, which fixes the suffix bytes and their order.
+    const PINNED_TOTAL: &str = "8fa51ffc1314a046";
+    const PINNED_INDEXES: &str = "ee2c3412f0fdbdf1";
+    const PINNED_SIZE: &str = "70eb830c93e9079f";
+    const PINNED_TOTAL_SIZE: &str = "e9957d3c7431e1d4";
 
     /// Keys are written in sorted order at every level so the serialized
     /// JSON is the same whether serde_json sorts map keys or preserves
@@ -425,6 +453,19 @@ mod tests {
     #[test]
     fn fingerprint_items_only_keeps_stored_value() {
         assert_eq!(fp(&pinned_body(), "tok-1"), PINNED_ITEMS_ONLY);
+    }
+
+    #[test]
+    fn fingerprint_with_return_fields_keeps_stored_values() {
+        let body = pinned_body();
+        let f = |rcc, ricm| compute_fingerprint(&body, "tok-1", rcc, ricm);
+        let total = ReturnConsumedCapacity::Total;
+        let indexes = ReturnConsumedCapacity::Indexes;
+        let size = ReturnItemCollectionMetrics::Size;
+        assert_eq!(f(total, NO_RICM), PINNED_TOTAL, "TOTAL");
+        assert_eq!(f(indexes, NO_RICM), PINNED_INDEXES, "INDEXES");
+        assert_eq!(f(NO_RCC, size), PINNED_SIZE, "SIZE");
+        assert_eq!(f(total, size), PINNED_TOTAL_SIZE, "TOTAL with SIZE");
     }
 
     #[test]
