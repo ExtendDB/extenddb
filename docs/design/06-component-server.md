@@ -341,6 +341,14 @@ schema that uses DynamoDB CloudWatch-style metric names and dimensions.
   (omitted in the in-memory fallback path).
 - `segments` (`Vec<OperationSegments>`): per-operation latency breakdown
   (auth / authz / throttle / dispatch / response in microseconds), in-memory only.
+  Requests are summed at record time into fixed per-operation time buckets
+  (1-second buckets for the last 5 minutes, 1-minute buckets for the last
+  24 hours), so a window covers at least its length and at most one bucket
+  width more, and memory does not grow with the request count. `LastMinute`
+  and `Last5Minutes` read the 1-second buckets; `LastHour` and `LastDay` read
+  the 1-minute buckets; `AllTime` returns the whole 24-hour ring. The table is
+  not a dimension of this breakdown. Operations with no request in the window
+  are omitted; results are sorted by operation name.
 - `source`: `"database"` when served from the persistent `MetricsStore`,
   `"memory"` when served from the in-process `MetricsCollector` fallback.
 
