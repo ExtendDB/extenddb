@@ -229,9 +229,12 @@ pub(super) async fn run_body(
     lookups: Vec<Result<TableKeyInfo, StorageError>>,
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: BatchWriteItemInput = serde_json::from_value(body).unwrap();
-    let tables: Vec<(&String, &Vec<WriteRequest>)> = order
+    let tables: Vec<(&str, &[WriteRequest])> = order
         .iter()
-        .map(|name| input.request_items.get_key_value(*name).unwrap())
+        .map(|name| {
+            let (name, reqs) = input.request_items.get_key_value(*name).unwrap();
+            (name.as_str(), reqs.as_slice())
+        })
         .collect();
     let region: Arc<str> = Arc::from("us-east-1");
     write_batch(

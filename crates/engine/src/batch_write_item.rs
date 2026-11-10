@@ -89,7 +89,11 @@ pub async fn handle_batch_write_item(
     // Read every table's key info before anything is written. A lookup that
     // failed is reported where `check_batch` reaches its table, so the first
     // fault reported is the one the checks reach first.
-    let tables: Vec<(&String, &Vec<WriteRequest>)> = input.request_items.iter().collect();
+    let tables: Vec<(&str, &[WriteRequest])> = input
+        .request_items
+        .iter()
+        .map(|(table_name, reqs)| (table_name.as_str(), reqs.as_slice()))
+        .collect();
     let mut lookups = Vec::with_capacity(tables.len());
     for (table_name, _) in &tables {
         lookups.push(ctx.table_key_info_uncached(table_name).await);
@@ -131,7 +135,7 @@ async fn write_batch(
     limits: &LimitsConfig,
     region: &Arc<str>,
     input: &BatchWriteItemInput,
-    tables: &[(&String, &Vec<WriteRequest>)],
+    tables: &[(&str, &[WriteRequest])],
     lookups: Vec<Result<TableKeyInfo, StorageError>>,
 ) -> Result<DispatchResult, DynamoDbError> {
     let key_infos = check_batch(tables, lookups, limits)?;
@@ -188,6 +192,9 @@ async fn write_batch(
     // applied.
     let mut unprocessed: HashMap<String, Vec<WriteRequest>> = HashMap::new();
     let mut applied = 0usize;
+    // The error of the last request that was not applied, for the warning
+    // logged once per batch below.
+    let mut last_error = String::new();
 
     'tables: for (table_index, ((table_name, reqs), key_info)) in
         tables.iter().zip(&key_infos).enumerate()
@@ -203,51 +210,59 @@ async fn write_batch(
             });
             let need_old_for_stream = stream.is_some();
 
-            let (item_or_key, item_wcu, written) = if let Some(put) = &wr.put_request {
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
-                let written = data
-                    .put_item(
-                        key_info,
-                        put.item.clone(),
-                        need_old_for_stream || want_index_cc,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
+            let (item_or_key, item_wcu, written) = match (&wr.put_request, &wr.delete_request) {
+                (Some(put), None) => {
+                    let item_wcu =
+                        capacity_helpers::write_capacity_units(item_size_bytes(&put.item));
+                    let written = data
+                        .put_item(
+                            key_info,
+                            put.item.clone(),
+                            need_old_for_stream || want_index_cc,
+                            None,
+                            &empty_maps,
+                            stream.as_ref(),
+                        )
+                        .await;
+                    (
+                        &put.item,
+                        item_wcu,
+                        written.map(|old| (old, Some(&put.item))),
                     )
-                    .await;
-                (
-                    &put.item,
-                    item_wcu,
-                    written.map(|old| (old, Some(&put.item))),
-                )
-            } else if let Some(del) = &wr.delete_request {
-                // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
-                // but old item size is not available here. Using key size as lower bound.
-                let item_wcu = capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
-                let written = data
-                    .delete_item(
-                        key_info,
-                        &del.key,
-                        need_old_for_stream || want_index_cc,
-                        None,
-                        &empty_maps,
-                        stream.as_ref(),
+                }
+                (None, Some(del)) => {
+                    // TODO(fidelity): DynamoDB charges WCU based on old item size for deletes,
+                    // but old item size is not available here. Using key size as lower bound.
+                    let item_wcu =
+                        capacity_helpers::write_capacity_units(item_size_bytes(&del.key));
+                    let written = data
+                        .delete_item(
+                            key_info,
+                            &del.key,
+                            need_old_for_stream || want_index_cc,
+                            None,
+                            &empty_maps,
+                            stream.as_ref(),
+                        )
+                        .await;
+                    (&del.key, item_wcu, written.map(|old| (old, None)))
+                }
+                (None, None) | (Some(_), Some(_)) => {
+                    unreachable!(
+                        "the shape check in `handle_batch_write_item` rejects this request"
                     )
-                    .await;
-                (&del.key, item_wcu, written.map(|old| (old, None)))
-            } else {
-                // Rejected by the shape check in `handle_batch_write_item`.
-                continue;
+                }
             };
 
             let (old_item, new_item) = match written {
                 Ok(outcome) => outcome,
                 Err(e) if is_deferrable(&e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         table = %table_name,
                         error = %e,
                         "BatchWriteItem: write not applied after {applied} committed; it is reported in UnprocessedItems if another request of the batch applies"
                     );
+                    last_error = e.to_string();
                     if matches!(e, StorageError::Connection(_)) {
                         // The backend is unreachable and the requests after
                         // this one would wait on it as well: leave them, and
@@ -258,7 +273,7 @@ async fn write_batch(
                         break 'tables;
                     }
                     unprocessed
-                        .entry(table_name.clone())
+                        .entry(table_name.to_owned())
                         .or_default()
                         .push(wr.clone());
                     continue;
@@ -275,7 +290,7 @@ async fn write_batch(
                 &mut all_icm,
             );
             total_wcu += item_wcu;
-            *per_table_wcu.entry(table_name.clone()).or_default() += item_wcu;
+            *per_table_wcu.entry(table_name.to_owned()).or_default() += item_wcu;
             if want_index_cc {
                 let (gsi, lsi) = capacity_helpers::index_write_units(
                     old_item.as_ref(),
@@ -283,11 +298,11 @@ async fn write_batch(
                     false,
                     key_info,
                 );
-                let g = per_table_gsi.entry(table_name.clone()).or_default();
+                let g = per_table_gsi.entry(table_name.to_owned()).or_default();
                 for (name, cu) in gsi {
                     *g.entry(name).or_default() += cu;
                 }
-                let l = per_table_lsi.entry(table_name.clone()).or_default();
+                let l = per_table_lsi.entry(table_name.to_owned()).or_default();
                 for (name, cu) in lsi {
                     *l.entry(name).or_default() += cu;
                 }
@@ -295,11 +310,24 @@ async fn write_batch(
         }
     }
 
-    if applied == 0 && !unprocessed.is_empty() {
-        tracing::warn!("BatchWriteItem: no request of the batch could be applied");
-        return Err(DynamoDbError::ServiceUnavailable(
-            "Service is temporarily unavailable".to_owned(),
-        ));
+    if !unprocessed.is_empty() {
+        let not_applied: usize = unprocessed.values().map(Vec::len).sum();
+        let outcome = if applied == 0 {
+            "no request applied and the batch answers 503"
+        } else {
+            "they are returned in UnprocessedItems"
+        };
+        tracing::warn!(
+            applied,
+            not_applied,
+            last_error = %last_error,
+            "BatchWriteItem: {not_applied} request(s) of the batch not applied; {outcome}"
+        );
+        if applied == 0 {
+            return Err(DynamoDbError::ServiceUnavailable(
+                "Service is temporarily unavailable".to_owned(),
+            ));
+        }
     }
 
     // With INDEXES, each per-table entry carries the arms the batch actually
@@ -366,6 +394,17 @@ async fn write_batch(
 /// would spin on it. An internal error keeps answering HTTP 500, which is
 /// what it answered before this handler deferred anything.
 ///
+/// The handler assumes that a deferred request was not applied. The client
+/// replays it, and the replay of a request that had committed would apply it
+/// a second time and write a second stream record. So a backend must return
+/// these errors only for a write that did not commit, and must report a
+/// commit of unknown outcome as `Internal`, which fails the batch with 500.
+/// MongoDB does so for an `UnknownTransactionCommitResult` that outlasts the
+/// commit retries. On SQLite, `map_sqlx_err` classes `sqlx::Error::Io` as
+/// `Transient`, but an I/O error at COMMIT, which can leave the write
+/// applied, is not deferred: `put_item` and `delete_item` map any error of
+/// the COMMIT to `Internal` without `map_sqlx_err`.
+///
 /// `TransactionConflict` is deferred because the service treats it that way.
 /// Measured on 2026-10-27 in us-east-1 with client retries off, while a
 /// TransactWriteItems held the items: a batch of two requests in which one
@@ -386,7 +425,7 @@ fn is_deferrable(e: &StorageError) -> bool {
 /// and in the tables that follow. These are the requests left unattempted
 /// when a connection error ends the batch.
 fn remaining_requests(
-    tables: &[(&String, &Vec<WriteRequest>)],
+    tables: &[(&str, &[WriteRequest])],
     table_index: usize,
     request_index: usize,
 ) -> HashMap<String, Vec<WriteRequest>> {
@@ -395,7 +434,7 @@ fn remaining_requests(
         let from = if i == table_index { request_index } else { 0 };
         let rest = &reqs[from..];
         if !rest.is_empty() {
-            out.insert((*table_name).clone(), rest.to_vec());
+            out.insert((*table_name).to_owned(), rest.to_vec());
         }
     }
     out
@@ -411,7 +450,7 @@ fn remaining_requests(
 /// faults is reported is not defined. The first fault rejects the whole
 /// batch.
 fn check_batch(
-    tables: &[(&String, &Vec<WriteRequest>)],
+    tables: &[(&str, &[WriteRequest])],
     lookups: Vec<Result<TableKeyInfo, StorageError>>,
     limits: &LimitsConfig,
 ) -> Result<Vec<TableKeyInfo>, DynamoDbError> {
@@ -581,11 +620,9 @@ mod tests {
 
     #[test]
     fn remaining_requests_start_at_the_failed_request_and_cover_later_tables() {
-        let t1 = "t1".to_owned();
-        let t2 = "t2".to_owned();
         let r1 = vec![put("a"), delete("b"), put("c")];
         let r2 = vec![put("d")];
-        let tables = vec![(&t1, &r1), (&t2, &r2)];
+        let tables = vec![("t1", r1.as_slice()), ("t2", r2.as_slice())];
 
         let rest = remaining_requests(&tables, 0, 1);
         assert_eq!(pks(&rest["t1"]), ["b", "c"]);
