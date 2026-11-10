@@ -5,10 +5,11 @@
 //! unsigned headers still verify, and each change `mutate` makes to it is
 //! refused.
 //!
-//! A generated request is a POST to `/` with no query string. Its header
-//! values are visible ASCII words joined by runs of spaces, never empty, and
-//! each header is sent once, except that the first unsigned header may be
-//! sent twice.
+//! A generated request is a POST to `/` with no query string, signed for the
+//! server's region (a request signed for another region is refused before
+//! its signature is compared; `reject` checks those). Its header values are
+//! visible ASCII words joined by runs of spaces, never empty, and each header
+//! is sent once, except that the first unsigned header may be sent twice.
 
 use std::cell::RefCell;
 
@@ -17,10 +18,8 @@ use proptest::prelude::*;
 use proptest::sample::select;
 use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestCaseError, TestRunner};
 
-use crate::corpus::{
-    self, ENDPOINTS, ITEM_TOKENS, REGIONS, SDK_HEADERS, TARGETS, UNSIGNED_HEADERS,
-};
-use crate::harness::{Key, Shape, Tally};
+use crate::corpus::{self, ENDPOINTS, ITEM_TOKENS, SDK_HEADERS, TARGETS, UNSIGNED_HEADERS};
+use crate::harness::{Key, SERVER_REGION, Shape, Tally};
 use crate::mutate::{self, MARGIN, SKEW_WINDOW};
 
 /// Requests generated per run.
@@ -79,7 +78,7 @@ fn shape() -> impl Strategy<Value = Shape> {
         prop_oneof![Just(Key::LongTerm), Just(Key::Session)],
         select(ENDPOINTS),
         any::<bool>(),
-        select(REGIONS),
+        Just(SERVER_REGION),
         select(TARGETS),
     );
     let signing = (any::<bool>(), any::<bool>(), -MAX_OFFSET..=MAX_OFFSET);

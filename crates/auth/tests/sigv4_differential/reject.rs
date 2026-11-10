@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A request changed after `aws-sigv4` signed it, in a part the signature
-//! covers, or signed for another service, is refused.
+//! covers, or signed for another region or another service, is refused.
 
 use extenddb_auth::sigv4::{parse, verify};
 use extenddb_core::error::DynamoDbError;
 
-use crate::corpus;
+use crate::corpus::{self, REGIONS};
 use crate::harness::{
-    Key, Refusal, SIGNATURE_MISMATCH, Tally, WRONG_SERVICE, check_accepted, check_refused,
-    server_canonical_request, sign,
+    Key, Message, Refusal, SERVER_REGION, SIGNATURE_MISMATCH, Tally, WRONG_REGION, WRONG_SERVICE,
+    check_accepted, check_refused, server_canonical_request, sign,
 };
 use crate::mutate;
 
@@ -75,11 +75,48 @@ fn a_16_mib_body_is_hashed_and_verified_and_one_byte_changed_is_refused() {
     let mut changed = signed.wire.clone();
     let middle = changed.body.len() / 2;
     changed.body[middle] ^= 0x01;
-    check_refused(&changed, Refusal::Signature, SIGNATURE_MISMATCH).unwrap();
+    check_refused(
+        &changed,
+        Refusal::Signature,
+        Message::Prefix(SIGNATURE_MISMATCH),
+    )
+    .unwrap();
     eprintln!(
         "a_16_mib_body_is_hashed_and_verified_and_one_byte_changed_is_refused: \
          accepted: 16 MiB body: 1, refused: one byte changed: 1"
     );
+}
+
+/// A request `aws-sigv4` signed for each region in `REGIONS` other than the
+/// server's. Its signature matches the credential scope it carries, so the
+/// region check is the only check that refuses it, and the refusal is the
+/// whole `WRONG_REGION` message: the service names no region, and the scope's
+/// service is right. `accept::the_servers_region_verifies` checks the
+/// server's own region.
+#[test]
+fn every_other_region_is_refused_by_the_region_check() {
+    let mut tally = Tally::default();
+    for key in Key::ALL {
+        for region in REGIONS.iter().filter(|region| **region != SERVER_REGION) {
+            let mut shape = corpus::base(key, corpus::PUT_ITEM.to_vec());
+            (*region).clone_into(&mut shape.region);
+            let signed = sign(&shape);
+            assert_eq!(
+                server_canonical_request(&signed.wire),
+                signed.canonical_request,
+                "{key:?} in {region}: the server builds the canonical request aws-sigv4 signed"
+            );
+            if let Err(err) = check_refused(
+                &signed.wire,
+                Refusal::Signature,
+                Message::Exact(WRONG_REGION),
+            ) {
+                panic!("{key:?} in {region}: {err}");
+            }
+            tally.add("refused: region");
+        }
+    }
+    tally.report("every_other_region_is_refused_by_the_region_check");
 }
 
 /// A request `aws-sigv4` signed for another service. Its signature matches
@@ -97,7 +134,11 @@ fn signed_for_another_service_is_refused_by_the_service_check() {
             signed.canonical_request,
             "{key:?}: the server builds the canonical request aws-sigv4 signed"
         );
-        if let Err(err) = check_refused(&signed.wire, Refusal::Signature, WRONG_SERVICE) {
+        if let Err(err) = check_refused(
+            &signed.wire,
+            Refusal::Signature,
+            Message::Prefix(WRONG_SERVICE),
+        ) {
             panic!("{key:?}, signed for s3: {err}");
         }
         tally.add("signed for another service");
