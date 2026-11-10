@@ -1,13 +1,20 @@
 name: Actions pinned
-# Fails when a workflow or composite action under .github uses an action from
-# another repository by a tag, a branch or anything other than a full
-# 40-character commit SHA. By convention the version goes in a trailing
-# comment. Local actions (./...) and docker:// images are not checked.
+# Each `uses` value that names another repository's action or reusable
+# workflow must name a full 40-character commit SHA. This workflow fails on a
+# tag, a branch or any other ref in a workflow or an action of this
+# repository. By convention the version goes in a trailing comment. Local
+# actions (./...) and docker:// images are not pinned values.
 #
-# The check reads `uses:` lines with grep. It does not see a step written in
-# YAML flow style ({uses: ...}), a value on the line after `uses:`, a space
-# before the colon, or a quoted key. It lists a YAML alias (`uses: *name`) and
-# a `uses:` line inside a run script as unpinned.
+# devtools/check-actions-pinned parses with PyYAML each workflow file in
+# .github/workflows and each action.yml or action.yaml in the repository. It
+# reads a value on the line after `uses:`, a step in flow style, a block
+# scalar, an anchor and an alias as YAML reads them. It opens symlinked files
+# through the link. It follows each local `uses: ./path` to the file that the
+# path names. It reads booleans by the YAML 1.2 rules that GitHub uses. It
+# fails when it finds no workflow file, when a file does not parse, and when a
+# local action is missing. Its self-test runs first.
+#
+# The check is advisory until `pinned` is a required status check on main.
 on:
   pull_request:
   merge_group:
@@ -32,20 +39,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check that every action reference is a commit SHA
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      # devtools/check-actions-pinned-requirements.txt pins PyYAML 6.0.3 by the
+      # hash of its CPython 3.11 x86_64 Linux wheel, the one file that this job
+      # installs. pip refuses any other file, builds nothing and installs no
+      # dependency.
+      - name: Install PyYAML
         run: |
-          set -euo pipefail
-          # Both exclusions match from the `uses:` key after grep's path:line:
-          # prefix, so text in a trailing comment cannot satisfy them. A value
-          # may be quoted.
-          key="^[^:]+:[0-9]+:[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[\"']?"
-          unpinned=$(grep -rnE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^[:space:]]' .github \
-              --include='*.yml' --include='*.yaml' \
-            | grep -vE "${key}(\./|docker://)" \
-            | grep -vE "${key}[^[:space:]@\"']+@[0-9a-f]{40}[\"']?([[:space:]]|\$)" || true)
-          if [ -n "$unpinned" ]; then
-            echo "These action references are not pinned to a full commit SHA:"
-            echo "$unpinned"
-            exit 1
-          fi
-          echo "Every action reference under .github is pinned to a commit SHA."
+          python -m pip install --require-hashes --only-binary=:all: --no-deps -r devtools/check-actions-pinned-requirements.txt
+
+      - name: Run the check's self-test
+        run: python devtools/check-actions-pinned --selftest
+
+      - name: Check that every action reference is a commit SHA
+        run: python devtools/check-actions-pinned
