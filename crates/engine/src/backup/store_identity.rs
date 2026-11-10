@@ -39,6 +39,37 @@
 //! An unhealthy store is not a startup refusal: the caller logs the problem,
 //! reports it on `/health`, refuses the operations that touch the store, and
 //! runs the check again each cycle until it passes.
+//!
+//! A root whose file names another catalog changes owner only by
+//! [`adopt`]: `extenddb backup sync --adopt-store`, under the maintenance
+//! claim, for a root any other catalog owns; and a server whose catalog is
+//! an in-memory SQLite database, for a root whose file another in-memory
+//! catalog wrote. Such a catalog, and with it its `catalog_id`, is new at
+//! every start, so the file it writes carries `ephemeral_catalog: true`
+//! ([`StoreIdentityFile::ephemeral_catalog`]), and [`establish`] in such a
+//! server adopts a root whose file carries the marker (the previous start's
+//! catalog, or another in-memory server's), and only such a root: one a
+//! durable catalog owns stays unhealthy there as anywhere. [`recheck`],
+//! which runs once the identity is known, never adopts, so two in-memory
+//! servers pointed at one root do not take it back and forth: the later
+//! start owns it and the earlier finds it owned by another catalog. Until
+//! that check, the previous owner acts on the root as its own, except that
+//! its deletion fence (`super::StoreFence`) re-reads the file before each
+//! deletion from the store and before a CreateBackup's first put, refuses
+//! when the file names another catalog, and marks the store unhealthy; a
+//! write already past the fence's read still lands. So every server of the
+//! catalog a file names is to be stopped before `--adopt-store` takes its
+//! root, and a new in-memory server started only after the old one has
+//! exited. The
+//! rewrite is a plain `put` (the store trait has no conditional replace),
+//! so two adopters race and the last writer wins. Each re-reads the file
+//! after its put, which detects another adopter's put that landed between
+//! the two, and `backup sync --adopt-store` reads the file once more after
+//! its sync, which detects one that landed during the sync; a put that
+//! lands after both reads is found by the loser's next check, which finds
+//! the store owned by another catalog. The audit line is written after the
+//! re-read with what it found, and an intent line before the put, so a put
+//! whose caller stopped waiting for it is on record too.
 
 use extenddb_backup_store::{BackupStore, StoreError, byte_stream_from};
 use extenddb_core::backup_format::{BackupArn, EXTENDDB_MANIFEST_FILE};
@@ -46,6 +77,8 @@ use extenddb_storage::BackupCatalog;
 use extenddb_storage::backup_catalog::{StoreIdentity, StoreKind};
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
+
+use super::maintenance::HeldClaim;
 
 /// The key of the identity file, at the root, under no `<account>/` prefix.
 pub const STORE_IDENTITY_KEY: &str = "extenddb-store.json";
@@ -72,11 +105,17 @@ pub struct StoreIdentityFile {
     pub backend: String,
     /// When the file was created, epoch milliseconds on the creating host.
     pub created_at_ms: u64,
+    /// Whether the owning catalog is an in-memory SQLite database, new at
+    /// every start of its server (module doc). Absent in a file an earlier
+    /// build wrote, which no in-memory catalog of that build could adopt
+    /// again, so it reads as `false`.
+    #[serde(default)]
+    pub ephemeral_catalog: bool,
 }
 
 impl StoreIdentityFile {
     /// A new identity for `catalog_id`.
-    fn new(catalog_id: &str, backend: &str) -> Self {
+    fn new(catalog_id: &str, backend: &str, ephemeral_catalog: bool) -> Self {
         Self {
             format_version: STORE_IDENTITY_FORMAT_VERSION,
             store_id: uuid::Uuid::new_v4().to_string(),
@@ -85,6 +124,7 @@ impl StoreIdentityFile {
             created_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            ephemeral_catalog,
         }
     }
 
@@ -259,6 +299,17 @@ impl From<StoreError> for StoreProblem {
 /// Read the identity file, or `None` when the root has none. At most
 /// [`STORE_IDENTITY_MAX_BYTES`] are read; a larger object is
 /// [`StoreProblem::FileUnreadable`].
+///
+/// # Errors
+///
+/// The store's error as a [`StoreProblem`], or a file that does not parse.
+pub async fn read_identity_file(
+    store: &dyn BackupStore,
+) -> Result<Option<StoreIdentityFile>, StoreProblem> {
+    read_file(store).await
+}
+
+/// [`read_identity_file`].
 async fn read_file(store: &dyn BackupStore) -> Result<Option<StoreIdentityFile>, StoreProblem> {
     let mut body = match store.get(STORE_IDENTITY_KEY).await {
         Ok(body) => body,
@@ -296,7 +347,11 @@ async fn row_ids<C: BackupCatalog + ?Sized>(
 /// The startup check: `validate` has passed; read the file, create it when
 /// the root is empty of both file and rows, compare it with the rows and
 /// with `catalog_id`, then probe the newest manifest. Returns the store's
-/// identity, the rows' and the file's.
+/// identity, the rows' and the file's. `backend` and `ephemeral_catalog`
+/// describe this catalog in a file the check writes; a catalog with
+/// `ephemeral_catalog` set (an in-memory SQLite database) also adopts a
+/// root whose file another such catalog wrote (module doc,
+/// [`AdoptRule::EphemeralOwner`]).
 ///
 /// # Errors
 ///
@@ -307,6 +362,7 @@ pub async fn establish<C: BackupCatalog + ?Sized>(
     root: &str,
     catalog: &C,
     backend: &str,
+    ephemeral_catalog: bool,
 ) -> Result<StoreIdentity, StoreProblem> {
     let catalog_id = catalog
         .catalog_id()
@@ -319,7 +375,7 @@ pub async fn establish<C: BackupCatalog + ?Sized>(
             return Err(StoreProblem::FileMissingWithRows(row_ids));
         }
         None => {
-            let ours = StoreIdentityFile::new(&catalog_id, backend);
+            let ours = StoreIdentityFile::new(&catalog_id, backend, ephemeral_catalog);
             let created = store
                 .put_if_absent(STORE_IDENTITY_KEY, byte_stream_from(ours.to_bytes()))
                 .await?
@@ -344,16 +400,42 @@ pub async fn establish<C: BackupCatalog + ?Sized>(
                      store id {}",
                     file.store_id
                 );
-            } else {
+            } else if file.catalog_id == catalog_id {
                 tracing::info!(
                     "backup store ({kind}) root already carried {STORE_IDENTITY_KEY} (store id \
                      {}), created by another instance of this catalog",
                     file.store_id
                 );
+            } else {
+                tracing::info!(
+                    "backup store ({kind}) root already carried {STORE_IDENTITY_KEY} (store id \
+                     {}), created by catalog {} while this check created it",
+                    file.store_id,
+                    file.catalog_id
+                );
             }
             file
         }
     };
+    if ephemeral_catalog && file.catalog_id != catalog_id && file.ephemeral_catalog {
+        return match adopt(
+            store,
+            kind,
+            root,
+            catalog,
+            backend,
+            ephemeral_catalog,
+            AdoptRule::EphemeralOwner,
+            None,
+        )
+        .await
+        {
+            Ok(Adoption::Adopted { identity, .. } | Adoption::AlreadyOwned(identity)) => {
+                Ok(identity)
+            }
+            Err(refusal) => Err(refusal.into_problem(&catalog_id)),
+        };
+    }
     let identity = compare(&file, &catalog_id, row_ids, kind, root)?;
     manifest_probe(store, &identity, catalog).await?;
     Ok(identity)
@@ -383,6 +465,366 @@ pub async fn read_identity<C: BackupCatalog + ?Sized>(
         Some(file) => compare(&file, &catalog_id, row_ids, kind, root).map(Some),
         None if !row_ids.is_empty() => Err(StoreProblem::FileMissingWithRows(row_ids)),
         None => Ok(None),
+    }
+}
+
+/// Which owners [`adopt`] takes a root from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptRule {
+    /// Any other catalog: `extenddb backup sync --adopt-store`, an
+    /// operator's decision.
+    Command,
+    /// Only a catalog whose file carries `ephemeral_catalog`: the startup of
+    /// a server whose own catalog is in memory (module doc).
+    EphemeralOwner,
+}
+
+impl AdoptRule {
+    /// The `action` of the audit line an adoption writes.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Command => "backup sync --adopt-store",
+            Self::EphemeralOwner => "startup adoption by an in-memory catalog",
+        }
+    }
+}
+
+/// What [`adopt`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Adoption {
+    /// The file named `previous_catalog_id` and now names this catalog; the
+    /// store passed the check that follows (`compare`, the manifest probe).
+    Adopted {
+        identity: StoreIdentity,
+        previous_catalog_id: String,
+    },
+    /// The file already named this catalog: nothing was written, and the
+    /// store passed the check as [`establish`] runs it.
+    AlreadyOwned(StoreIdentity),
+}
+
+/// Why [`adopt`] did not leave the root this catalog's and healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptRefusal {
+    /// The store could not be read or written, the file could not be
+    /// parsed, the catalog could not be read, or (the file already this
+    /// catalog's) the check found another problem.
+    Problem(StoreProblem),
+    /// The root has no identity file: there is no owner to take it from.
+    /// `row_ids` are the store ids this catalog's rows for the root carry:
+    /// with none, the root is a fresh one that the next check (plain sync's
+    /// included) gives a file; with some, the root lost its file under the
+    /// rows.
+    NoFile { row_ids: Vec<String> },
+    /// The rule is [`AdoptRule::EphemeralOwner`] and the file's catalog is
+    /// not an in-memory one.
+    DurableOwner { file_catalog_id: String },
+    /// This catalog's rows for the root carry an id other than the file's:
+    /// the adopted root would be unhealthy at once (an identity mismatch).
+    RowsCarryOtherIds {
+        file_id: String,
+        row_ids: Vec<String>,
+    },
+    /// After the put, the file names another catalog or holds another store
+    /// id: a concurrent adopter wrote after this one (last writer wins).
+    RaceLost {
+        file_catalog_id: String,
+        file_store_id: String,
+    },
+    /// The root, once this catalog's, would fail the check the server runs
+    /// on it (the manifest probe: this catalog's newest AVAILABLE row of
+    /// the root has no manifest under it); nothing was written, and the
+    /// file still names `file_catalog_id`.
+    Unusable {
+        file_catalog_id: String,
+        problem: StoreProblem,
+    },
+    /// The maintenance claim the command holds was found lost right before
+    /// the rewrite (the reason); nothing was written.
+    ClaimLost(String),
+}
+
+impl AdoptRefusal {
+    /// The store problem the refusal leaves, for a check that records one:
+    /// a root another catalog still owns is [`StoreProblem::ForeignCatalog`].
+    #[must_use]
+    pub fn into_problem(self, catalog_id: &str) -> StoreProblem {
+        match self {
+            Self::Problem(problem) | Self::Unusable { problem, .. } => problem,
+            Self::NoFile { row_ids } if !row_ids.is_empty() => {
+                StoreProblem::FileMissingWithRows(row_ids)
+            }
+            Self::NoFile { .. } => StoreProblem::FileUnreadable(format!(
+                "{STORE_IDENTITY_KEY} was removed while the root was being adopted; the next \
+                 check creates it"
+            )),
+            Self::DurableOwner { file_catalog_id }
+            | Self::RaceLost {
+                file_catalog_id, ..
+            } => StoreProblem::ForeignCatalog {
+                file_catalog_id,
+                catalog_id: catalog_id.to_owned(),
+            },
+            Self::RowsCarryOtherIds { file_id, row_ids } => {
+                StoreProblem::IdMismatch { file_id, row_ids }
+            }
+            Self::ClaimLost(reason) => StoreProblem::Catalog(reason),
+        }
+    }
+}
+
+impl std::fmt::Display for AdoptRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Problem(problem) => write!(f, "{problem}"),
+            Self::NoFile { row_ids } if row_ids.is_empty() => write!(
+                f,
+                "the root has no {STORE_IDENTITY_KEY}, so no catalog owns it and there is \
+                 nothing to adopt; plain sync creates the file"
+            ),
+            Self::NoFile { row_ids } => write!(
+                f,
+                "the root has no {STORE_IDENTITY_KEY}, and this catalog's rows for it carry \
+                 store id {}: the root lost its file under the rows, and there is no owner to \
+                 adopt it from",
+                row_ids.join(", ")
+            ),
+            Self::DurableOwner { file_catalog_id } => write!(
+                f,
+                "{STORE_IDENTITY_KEY} names catalog {file_catalog_id}, which is not an \
+                 in-memory catalog"
+            ),
+            Self::RowsCarryOtherIds { file_id, row_ids } => write!(
+                f,
+                "{STORE_IDENTITY_KEY} holds store id {file_id}, and this catalog's rows for the \
+                 root carry {}: adopting the root would leave it unhealthy (an identity \
+                 mismatch); nothing was written",
+                row_ids.join(", ")
+            ),
+            Self::RaceLost {
+                file_catalog_id,
+                file_store_id,
+            } => write!(
+                f,
+                "another writer replaced {STORE_IDENTITY_KEY} after this catalog's write: it \
+                 now names catalog {file_catalog_id} with store id {file_store_id}"
+            ),
+            Self::Unusable {
+                file_catalog_id,
+                problem,
+            } => write!(
+                f,
+                "the root would be unhealthy once this catalog owns it ({problem}); nothing was \
+                 written, and {STORE_IDENTITY_KEY} still names catalog {file_catalog_id}"
+            ),
+            Self::ClaimLost(reason) => write!(
+                f,
+                "stopped before the rewrite of {STORE_IDENTITY_KEY}: {reason}; nothing was \
+                 written"
+            ),
+        }
+    }
+}
+
+/// Make this catalog the root's owner: run the check [`establish`] runs on
+/// the root as it will be once this catalog owns it (`compare` with this
+/// catalog's rows, the manifest probe of its newest AVAILABLE row), then
+/// rewrite `extenddb-store.json`'s `catalog_id` (and `backend` and
+/// `ephemeral_catalog`, which describe the owner) with a plain `put`,
+/// keeping `store_id` and `created_at_ms`, and re-read the file. The check
+/// reads only this catalog's rows and the store, which the rewrite does not
+/// change, so its answer before the rewrite is its answer after it, and a
+/// root this catalog could not use is refused with nothing written
+/// ([`AdoptRefusal::Unusable`]). `rule` says which owners it takes the
+/// root from. The rewrite is logged under the `extenddb::audit` target with
+/// the old and the new catalog id. `claim`, the maintenance claim
+/// `--adopt-store` holds, is re-checked with a beat right before the
+/// rewrite, which is skipped when the claim is found lost
+/// ([`AdoptRefusal::ClaimLost`]); the startup adoption of an in-memory
+/// catalog holds none and passes `None`.
+///
+/// A file that already names this catalog is not written
+/// ([`Adoption::AlreadyOwned`]). Nothing is written when the root has no
+/// file, when the rule refuses the owner, when this catalog's rows for the
+/// root carry an id other than the file's, or when the check fails.
+///
+/// # Errors
+///
+/// [`AdoptRefusal`], each case with what was and was not written.
+#[allow(clippy::too_many_arguments)]
+pub async fn adopt<C: BackupCatalog + ?Sized>(
+    store: &dyn BackupStore,
+    kind: StoreKind,
+    root: &str,
+    catalog: &C,
+    backend: &str,
+    ephemeral_catalog: bool,
+    rule: AdoptRule,
+    claim: Option<&HeldClaim>,
+) -> Result<Adoption, AdoptRefusal> {
+    let catalog_id = catalog
+        .catalog_id()
+        .await
+        .map_err(|e| AdoptRefusal::Problem(StoreProblem::Catalog(e.to_string())))?;
+    let row_ids = catalog
+        .read_store_ids(kind, root)
+        .await
+        .map_err(|e| AdoptRefusal::Problem(StoreProblem::Catalog(e.to_string())))?;
+    let file = read_file(store)
+        .await
+        .map_err(|problem| AdoptRefusal::Problem(at_step("the first read of", problem)))?
+        .ok_or_else(|| AdoptRefusal::NoFile {
+            row_ids: row_ids.clone(),
+        })?;
+    if file.catalog_id == catalog_id {
+        if row_ids.len() > 1 {
+            return Err(AdoptRefusal::Problem(StoreProblem::MultipleRowIds(row_ids)));
+        }
+        let identity =
+            compare(&file, &catalog_id, row_ids, kind, root).map_err(AdoptRefusal::Problem)?;
+        manifest_probe(store, &identity, catalog)
+            .await
+            .map_err(|problem| AdoptRefusal::Problem(at_step("the manifest probe of", problem)))?;
+        return Ok(Adoption::AlreadyOwned(identity));
+    }
+    if rule == AdoptRule::EphemeralOwner && !file.ephemeral_catalog {
+        return Err(AdoptRefusal::DurableOwner {
+            file_catalog_id: file.catalog_id,
+        });
+    }
+    if row_ids.iter().any(|id| *id != file.store_id) {
+        return Err(AdoptRefusal::RowsCarryOtherIds {
+            file_id: file.store_id,
+            row_ids,
+        });
+    }
+    let ours = StoreIdentityFile {
+        catalog_id: catalog_id.clone(),
+        backend: backend.to_owned(),
+        ephemeral_catalog,
+        ..file.clone()
+    };
+    // The check of the root as this catalog's, before anything is written:
+    // the file's id with this catalog's rows (which carry it, or there are
+    // none), and the manifest of this catalog's newest AVAILABLE row.
+    let unusable = |problem: StoreProblem| match problem {
+        // The probe's `head` failed in transport: the store's problem, not
+        // the root's.
+        StoreProblem::Transport(_) => {
+            AdoptRefusal::Problem(at_step("the manifest probe before the rewrite of", problem))
+        }
+        problem => AdoptRefusal::Unusable {
+            file_catalog_id: file.catalog_id.clone(),
+            problem,
+        },
+    };
+    let identity = compare(&ours, &catalog_id, row_ids.clone(), kind, root).map_err(&unusable)?;
+    manifest_probe(store, &identity, catalog)
+        .await
+        .map_err(&unusable)?;
+    if let Some(claim) = claim {
+        claim.recheck().await.map_err(AdoptRefusal::ClaimLost)?;
+    }
+    tracing::info!(
+        target: "extenddb::audit",
+        action = rule.action(),
+        outcome = "rewriting",
+        store_kind = %kind,
+        store_root = %root,
+        store_id = %file.store_id,
+        previous_catalog_id = %file.catalog_id,
+        catalog_id = %catalog_id,
+        "rewriting {STORE_IDENTITY_KEY} to name this catalog"
+    );
+    store
+        .put(STORE_IDENTITY_KEY, byte_stream_from(ours.to_bytes()))
+        .await
+        .map_err(|e| {
+            AdoptRefusal::Problem(at_step(
+                "the rewrite (whose outcome is unknown; the audit log's intent line says it was \
+                 started) of",
+                e.into(),
+            ))
+        })?;
+    let reread = read_file(store)
+        .await
+        .map_err(|problem| {
+            AdoptRefusal::Problem(at_step("the re-read after the rewrite of", problem))
+        })?
+        .ok_or_else(|| AdoptRefusal::NoFile {
+            row_ids: row_ids.clone(),
+        })?;
+    let won = reread.catalog_id == catalog_id && reread.store_id == file.store_id;
+    tracing::info!(
+        target: "extenddb::audit",
+        action = rule.action(),
+        outcome = if won { "adopted" } else { "race lost" },
+        store_kind = %kind,
+        store_root = %root,
+        store_id = %file.store_id,
+        previous_catalog_id = %file.catalog_id,
+        catalog_id = %catalog_id,
+        file_catalog_id = %reread.catalog_id,
+        "rewrote {STORE_IDENTITY_KEY}; its re-read names catalog {}",
+        reread.catalog_id
+    );
+    if !won {
+        return Err(AdoptRefusal::RaceLost {
+            file_catalog_id: reread.catalog_id,
+            file_store_id: reread.store_id,
+        });
+    }
+    tracing::info!(
+        "backup store ({kind}) {root}: adopted from catalog {} (store id {})",
+        file.catalog_id,
+        identity.store_id
+    );
+    Ok(Adoption::Adopted {
+        identity,
+        previous_catalog_id: file.catalog_id,
+    })
+}
+
+/// [`adopt`] as `backup sync --adopt-store` runs it, on `configured`'s
+/// bounded calls ([`super::ConfiguredStore::calls`]): each store call under
+/// the store's check bound, so a store that stops answering ends the
+/// adoption at the call that did not finish, the refusal naming the step
+/// ([`at_step`]), while the catalog's reads and the claim's beat run beside
+/// the bound and are not cut by it.
+///
+/// # Errors
+///
+/// As [`adopt`].
+pub async fn adopt_configured<C: BackupCatalog + ?Sized>(
+    configured: &super::ConfiguredStore,
+    catalog: &C,
+    backend: &str,
+    claim: Option<&HeldClaim>,
+) -> Result<Adoption, AdoptRefusal> {
+    adopt(
+        &configured.calls("adoption's store call"),
+        configured.kind,
+        &configured.root,
+        catalog,
+        backend,
+        false,
+        AdoptRule::Command,
+        claim,
+    )
+    .await
+}
+
+/// A store problem of [`adopt`] with the step it stopped at, for a store
+/// that stopped answering (the command's bounded calls end the call that
+/// did not finish, and the refusal then names it): the transport failure's
+/// text gains `step` and the file's name; every other problem names its
+/// condition already.
+fn at_step(step: &str, problem: StoreProblem) -> StoreProblem {
+    match problem {
+        StoreProblem::Transport(text) => {
+            StoreProblem::Transport(format!("{step} {STORE_IDENTITY_KEY}: {text}"))
+        }
+        other => other,
     }
 }
 
@@ -420,7 +862,7 @@ fn compare(
 /// manifest is under the root. A root that lost its file while the catalog
 /// has no rows for it gets the file back, written with the identity's id
 /// (`put_if_absent`, so a file another instance wrote first wins and is then
-/// compared like any other).
+/// compared like any other). It never adopts (module doc).
 ///
 /// # Errors
 ///
@@ -430,6 +872,7 @@ pub async fn recheck<C: BackupCatalog + ?Sized>(
     identity: &StoreIdentity,
     catalog: &C,
     backend: &str,
+    ephemeral_catalog: bool,
 ) -> Result<(), StoreProblem> {
     let catalog_id = catalog
         .catalog_id()
@@ -444,7 +887,7 @@ pub async fn recheck<C: BackupCatalog + ?Sized>(
         None => {
             let ours = StoreIdentityFile {
                 store_id: identity.store_id.clone(),
-                ..StoreIdentityFile::new(&catalog_id, backend)
+                ..StoreIdentityFile::new(&catalog_id, backend, ephemeral_catalog)
             };
             store
                 .put_if_absent(STORE_IDENTITY_KEY, byte_stream_from(ours.to_bytes()))
@@ -524,13 +967,30 @@ mod tests {
 
     #[test]
     fn the_file_round_trips_and_refuses_other_shapes() {
-        let file = StoreIdentityFile::new("cat-1", "postgres");
+        let file = StoreIdentityFile::new("cat-1", "postgres", false);
         assert_eq!(file.format_version, 1);
         assert_eq!(file.catalog_id, "cat-1");
         assert_eq!(file.backend, "postgres");
         assert!(!file.store_id.is_empty());
         let parsed = StoreIdentityFile::parse(&file.to_bytes()).unwrap();
         assert_eq!(parsed, file);
+        // The marker round-trips, and a file without it (an earlier build's)
+        // reads as a durable catalog's.
+        let memory = StoreIdentityFile::new("cat-2", "sqlite", true);
+        assert!(
+            StoreIdentityFile::parse(&memory.to_bytes())
+                .unwrap()
+                .ephemeral_catalog
+        );
+        let earlier = serde_json::json!({
+            "format_version": 1, "store_id": "s", "catalog_id": "c", "backend": "sqlite",
+            "created_at_ms": 0
+        });
+        assert!(
+            !StoreIdentityFile::parse(earlier.to_string().as_bytes())
+                .unwrap()
+                .ephemeral_catalog
+        );
 
         let v2 = serde_json::json!({
             "format_version": 2, "store_id": "s", "catalog_id": "c", "backend": "b",
@@ -634,6 +1094,7 @@ mod tests {
             catalog_id: "c-1".to_owned(),
             backend: "sqlite".to_owned(),
             created_at_ms: 0,
+            ephemeral_catalog: false,
         };
         let ok = compare(&file, "c-1", vec![], StoreKind::Filesystem, "/r").unwrap();
         assert_eq!(ok.store_id, "s-1");

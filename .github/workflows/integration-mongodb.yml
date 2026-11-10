@@ -230,6 +230,8 @@ jobs:
         env:
           EXTENDDB_BINARY: ./target/release/extenddb
           EXTENDDB_TEST_MONGODB_URI: mongodb://127.0.0.1:27023/?replicaSet=rs0&directConnection=true
+          # The sync cells edit backup_index documents with mongosh in it.
+          EXTENDDB_TEST_MONGODB_CONTAINER: extenddb-runtests-mongo-27023
         run: python3 -m pytest tests/test_backup_job.py -v -rP -p no:cacheprovider
       - name: Stop the job suite's replica set
         if: always()

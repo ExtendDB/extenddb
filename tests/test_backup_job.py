@@ -48,19 +48,71 @@ The store-backed RestoreTableFromBackup job, on both deployments:
   backup remove-target` removes the target and its record, after which
   `DescribeTable` is `ResourceNotFoundException` and `DeleteBackup` succeeds.
 
+`extenddb backup sync`, on the SQLite, PostgreSQL and MongoDB deployments
+(MongoDB's row edits run `mongosh` in the replica set's container, which
+`EXTENDDB_TEST_MONGODB_CONTAINER` names; "beside a server" is PostgreSQL and
+MongoDB, whose commands take the maintenance claim):
+
+- after the catalog loses four rows, sync gives an AVAILABLE row to the one
+  whole prefix, and DescribeBackup, ListBackups and a restore of it work; a
+  prefix without its manifest, with a sidecar that does not match, moved
+  under another backup id, under `changelog/` or `exports/`, or with a
+  FAILED, DELETING or CREATING row is reported and not adopted, the row
+  left as it is (on SQLite, where sync takes the serve lock and refuses
+  beside a server, too: plain sync runs no dead-owner resolution);
+- (SQLite) plain sync after a SIGTERM mid-restore leaves the RUNNING record
+  to the next server start, which resumes the restore to ACTIVE;
+- a row whose manifest is gone is reported and stays AVAILABLE, and
+  `--prune-missing` removes the row and deletes no object; an empty root, a
+  root holding only the identity file and one with another store id each
+  make the store unhealthy, and sync and `--prune-missing` refuse with no
+  row changed and nothing written; so does a missing manifest behind the
+  newest AVAILABLE row, until the manifest is back;
+- a row-less prefix whose manifest the store cannot read is reported and
+  the run exits 1 as incomplete, its summary line saying so; once it can be
+  read, the next sync adopts it;
+- prefixes whose manifests a server of another region wrote are adopted
+  under this server's region: ListBackups names it, DescribeBackup answers
+  either spelling, and a restore and a DeleteBackup by the other region's
+  spelling work;
+- `--adopt-store` on a root whose file names another catalog refuses, with
+  nothing written, while this catalog's newest backup has no manifest under
+  it, and adopts the root once the manifest is back;
+- an identity file rewritten to name another catalog while a plain sync is
+  in its prefix loop ends the command with exit 1, naming that catalog;
+- (beside a server) while `--prune-missing` holds the maintenance claim, `backup
+  purge` and `--adopt-store` fail at once, and `--adopt-store` on a root
+  the catalog owns waits for a running job as `--prune-missing` does;
+- (beside a server) on host-local roots, `--prune-missing` on the host that
+  lacks a backup's bytes removes its row only, the other host keeps the
+  bytes, and a sync there adopts them again;
+- (beside a server) while purge holds the claim a plain sync fails at once;
+- (SQLite and PostgreSQL: a second MongoDB catalog needs a replica set of
+  its own) `--adopt-store` from a second catalog configured with the root makes that
+  catalog the owner, its server restores the adopted backup, and the first
+  catalog's server finds the store owned by another catalog;
+- an identity file rewritten to name a third catalog while an adopting sync
+  is in its prefix loop ends the command with exit 1, naming that catalog;
+- (PostgreSQL) a DeleteBackup on the first catalog's server, still running
+  with its last check healthy after the adoption, is refused by its
+  deletion fence and leaves the bytes, and the adopting catalog's store
+  stays healthy.
+
 The binary at `EXTENDDB_BINARY` decides which deployment runs: a SQLite build,
 a PostgreSQL build (with `EXTENDDB_TEST_PG_CONNECTION_STRING`) or a MongoDB
 build (with `EXTENDDB_TEST_MONGODB_URI`, a replica set of this suite's own: the
 catalog's database names are fixed, so each test destroys the previous test's
 catalog and initializes its own); the restore cells run on the SQLite and
-PostgreSQL deployments. Excluded from the backend-agnostic suite; run by name.
+PostgreSQL deployments. No Cassandra deployment runs this file. Excluded from the backend-agnostic suite; run by name.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -82,6 +134,7 @@ from test_backup_store_config import (
     _client,
     _Forwarder,
     _free_port,
+    _health,
     _moto_or_skip,
     _pg_build,
     _provision,
@@ -931,6 +984,45 @@ def test_sigterm_leaves_the_restore_running_and_it_finishes_after_restart(deploy
         server.stop()
 
 
+def test_plain_sync_on_sqlite_leaves_a_stopped_servers_restore_to_resume(deployment, tmp_path):
+    """SQLite: a SIGTERM while a store-backed restore runs leaves its record
+    RUNNING; plain `backup sync` then runs under the serve lock with no
+    dead-owner resolution, so it neither fails the restore nor removes its
+    target, and the next server start resumes the restore to ACTIVE with
+    every item."""
+    d = deployment
+    if d.backend != "sqlite":
+        pytest.skip("plain sync runs under the serve lock only on SQLite")
+    _add_backup_settings(d, RESTORE_BACKUP_SETTINGS)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _backed_up_table(d, ddb, creds, "plainsync")
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        status = ddb.describe_table(TableName=target)["Table"]["TableStatus"]
+        assert status == "CREATING", (
+            f"the restore finished ({status}) before the signal was sent; raise EXTENDDB_TEST_RESTORE_ITEMS"
+        )
+        server.proc.terminate()
+        assert server.wait_exit(timeout=60) == 0, server.log_text()[-4000:]
+    finally:
+        server.stop()
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "failed the restore" not in out and "removed abandoned restore target" not in out, out
+    assert "is failed rather than resumed" not in out, out
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        _wait_active(ddb, target, timeout=240)
+        assert _count(ddb, target) == RESTORE_ITEMS
+        log = server.log_text()
+        assert "taken over by this instance and resumed" in log, log[-4000:]
+    finally:
+        server.stop()
+
+
 def test_a_store_outage_mid_download_leaves_the_restore_running_and_it_completes(request, tmp_path, moto_bucket):
     """An S3 store (moto) reached through a TCP forwarder, with a spool: the
     forwarder is cut right after the restore's response, so the job's data
@@ -1541,3 +1633,1202 @@ def test_a_multi_part_key_table_restores_with_the_sources_item_set(deployment, t
         assert f" into {target} " in log and ": ACTIVE, " in log and ": FAILED (" not in log, log[-4000:]
     finally:
         server.stop()
+
+
+# --- extenddb backup sync -----------------------------------------------------------
+
+
+def _sync_cell(d: _Deployment) -> None:
+    """The sync cells drop and rewrite `backup_index` rows at the catalog:
+    with SQL on SQLite and PostgreSQL (`_catalog`), and on MongoDB with
+    `mongosh` in the replica set's container (`_mongosh`), which
+    `EXTENDDB_TEST_MONGODB_CONTAINER` names."""
+    if d.backend == "mongodb" and not _mongodb_container():
+        pytest.skip("EXTENDDB_TEST_MONGODB_CONTAINER is unset: the MongoDB row edits run mongosh in it")
+
+
+def _beside(d: _Deployment) -> bool:
+    """Whether the commands run beside a server, taking the maintenance
+    claim: every backend but SQLite, whose commands take the serve lock."""
+    return d.backend != "sqlite"
+
+
+def _mongodb_container() -> str:
+    return os.environ.get("EXTENDDB_TEST_MONGODB_CONTAINER", "").strip()
+
+
+def _mongosh(script: str):
+    """Run `script` with `mongosh` in the replica set's container against
+    the catalog database (`db`), and return the JSON it prints last."""
+    res = subprocess.run(
+        ["docker", "exec", _mongodb_container(), "mongosh", "--quiet", "--eval",
+         'db = db.getSiblingDB("extenddb_catalog");\n' + script],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    return json.loads(res.stdout.strip().splitlines()[-1])
+
+
+def _mongodb_row_filter(arn: str) -> str:
+    return json.dumps({"account_id": ACCOUNT, "backup_id": _backup_id(arn)})
+
+
+def _catalog(d: _Deployment, statement: str, params: tuple) -> int:
+    """Run one statement on the deployment's catalog and return its row count.
+    The statement uses `?` placeholders and `{now}` for the database's clock,
+    which become `%s` and `now()` on PostgreSQL."""
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            n = conn.execute(statement.format(now="strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"), params).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return n
+    import psycopg2
+
+    conn = psycopg2.connect(d.catalog)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(statement.format(now="now()").replace("?", "%s"), params)
+            n = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
+def _backup_id(arn: str) -> str:
+    return arn.rsplit("/", 1)[1]
+
+
+def _drop_row(d: _Deployment, arn: str) -> None:
+    """Delete the backup's `backup_index` row: the catalog lost it."""
+    if d.backend == "mongodb":
+        n = _mongosh(f"print(db.backup_index.deleteMany({_mongodb_row_filter(arn)}).deletedCount)")
+    else:
+        n = _catalog(d, "DELETE FROM backup_index WHERE account_id = ? AND backup_id = ?", (ACCOUNT, _backup_id(arn)))
+    assert n == 1, f"{n} backup_index rows match {arn}"
+
+
+def _set_status(d: _Deployment, arn: str, status: str, beat_age_secs: int = 0) -> None:
+    """Set the backup's row to `status`, its heartbeat `beat_age_secs` ago
+    and (except for CREATING) its completion now, on the database's clock:
+    a FAILED row inside its retention, a CREATING row whose owner beat just
+    now (or, aged, a CREATING row whose job died)."""
+    if d.backend == "mongodb":
+        completion = (
+            '{$unset: {completed_at: ""}}' if status == "CREATING" else "{$set: {completed_at: now}}"
+        )
+        n = _mongosh(
+            f"const now = new Date(); const filter = {_mongodb_row_filter(arn)};\n"
+            f"const n = db.backup_index.updateOne(filter, {{$set: {{status: {json.dumps(status)}, "
+            f"heartbeat_at: new Date(now.getTime() - {beat_age_secs * 1000})}}}}).matchedCount;\n"
+            f"db.backup_index.updateOne(filter, {completion});\nprint(n)"
+        )
+        assert n == 1, f"{n} backup_index rows match {arn}"
+        return
+    if beat_age_secs:
+        assert d.backend == "postgres", "an aged heartbeat is written on PostgreSQL and MongoDB"
+        n = _catalog(
+            d,
+            "UPDATE backup_index SET status = ?, completed_at = NULL, "
+            f"heartbeat_at = {{now}} - interval '{beat_age_secs} seconds' WHERE account_id = ? AND backup_id = ?",
+            (status, ACCOUNT, _backup_id(arn)),
+        )
+        assert n == 1, f"{n} backup_index rows match {arn}"
+        return
+    n = _catalog(
+        d,
+        "UPDATE backup_index SET status = ?, heartbeat_at = {now}, "
+        "completed_at = CASE WHEN ? = 'CREATING' THEN NULL ELSE {now} END "
+        "WHERE account_id = ? AND backup_id = ?",
+        (status, status, ACCOUNT, _backup_id(arn)),
+    )
+    assert n == 1, f"{n} backup_index rows match {arn}"
+
+
+def _rows(d: _Deployment) -> dict[str, str]:
+    """`extenddb backup list`: each row's ARN to its status."""
+    res = d.run("backup", "list")
+    assert res.returncode == 0, res.stdout + res.stderr
+    rows: dict[str, str] = {}
+    for line in res.stdout.splitlines():
+        m = re.match(r"^([A-Z]+)\s+\d{12}\s+\S+\s+\d+\s+\d+\s+(arn:\S+)\s", line)
+        if m:
+            rows[m.group(2)] = m.group(1)
+    return rows
+
+
+def _key_prefix(table: str, arn: str) -> str:
+    """The prefix as the store's keys, and sync's report, spell it."""
+    return f"{ACCOUNT}/{table}/{_backup_id(arn)}/"
+
+
+def _store_id(root: str) -> str:
+    with open(os.path.join(root, "extenddb-store.json")) as f:
+        return json.load(f)["store_id"]
+
+
+def _private_file(path: str, data: bytes) -> None:
+    """Write `path` 0600 with its missing parents 0700, as the store's own
+    objects are."""
+    parent = os.path.dirname(path)
+    missing = []
+    while not os.path.isdir(parent):
+        missing.append(parent)
+        parent = os.path.dirname(parent)
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+    with open(path, "wb") as f:
+        f.write(data)
+    os.chmod(path, 0o600)
+
+
+def test_sync_rebuilds_dropped_rows_and_adopts_only_verified_prefixes(deployment, tmp_path):
+    """The catalog loses the rows of four backups; `extenddb backup sync`
+    gives an AVAILABLE row to the one whose prefix is whole, after which
+    DescribeBackup (the manifest's name and item count), ListBackups and a
+    restore of it work. Not adopted, each reported with its reason and exit
+    0: the prefix whose manifest was removed, the prefix whose sidecar no
+    longer matches, a prefix moved under another backup id (its manifest
+    names the backup id it was written under), a file under the table's
+    `changelog/` and one under `exports/`, and the prefixes whose rows are
+    FAILED, DELETING and CREATING, whose rows sync reads and changes none.
+    On PostgreSQL plain sync takes the maintenance claim and waits for no
+    job; on SQLite it runs under the serve lock (it refuses while the
+    server runs) and runs no dead-owner resolution, so the DELETING and
+    CREATING rows a stopped server left stay for its next start. A second
+    sync adopts nothing."""
+    _sync_cell(deployment)
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, kept = _small_backed_up_table(ddb, "sync")
+        others: dict[str, str] = {}
+        for label in ("no-manifest", "bad-sidecar", "moved", "failed", "deleting", "creating"):
+            arn = ddb.create_backup(TableName=name, BackupName=label)["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn, timeout=60)
+            others[label] = arn
+        if d.backend == "sqlite":
+            # The serve lock held is the catalog refusal `serve` gives for
+            # it: exit 6, before any store or row is read.
+            for args in (("sync",), ("sync", "--prune-missing")):
+                beside = d.run("backup", *args)
+                assert beside.returncode == 6, beside.stdout + beside.stderr
+                assert "another extenddb process" in beside.stdout + beside.stderr, beside.stdout + beside.stderr
+                assert "=== extenddb backup sync" not in beside.stdout, beside.stdout
+            assert server.proc.poll() is None, "the server kept running"
+    finally:
+        server.stop()
+    root = d.root
+    store_id = _store_id(root)
+    for arn in (kept, others["no-manifest"], others["bad-sidecar"], others["moved"]):
+        _drop_row(d, arn)
+    os.remove(os.path.join(_prefix(d, name, others["no-manifest"]), "extenddb-manifest.json"))
+    with open(os.path.join(_prefix(d, name, others["bad-sidecar"]), "extenddb-manifest.sha256"), "w") as f:
+        f.write("0" * 64 + "  extenddb-manifest.json\n")
+    moved_id = _backup_id(others["moved"])
+    millis, suffix = moved_id.split("-")
+    moved_to = f"{int(millis) + 1:014d}-{suffix}"
+    os.rename(_prefix(d, name, others["moved"]), os.path.join(root, ACCOUNT, name, moved_to))
+    _private_file(os.path.join(root, ACCOUNT, name, "changelog", "000001.json"), b"{}\n")
+    _private_file(os.path.join(root, "exports", "01", "part-0.json"), b"{}\n")
+    _set_status(d, others["failed"], "FAILED")
+    _set_status(d, others["deleting"], "DELETING")
+    _set_status(d, others["creating"], "CREATING")
+
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    print(f"branch: {d.backend}\n{res.stdout}")
+    assert res.returncode == 0, out
+    assert f"Store:  filesystem {os.path.realpath(root)} (store id {store_id})" in res.stdout, res.stdout
+    took_claim = 'Took the maintenance claim as "extenddb backup sync on ' in res.stdout
+    assert took_claim == _beside(d), res.stdout
+    assert "Waiting for running jobs" not in res.stdout, res.stdout
+    adopted = res.stdout.split("--- Adopted", 1)[1].split("--- Skipped", 1)[0]
+    assert adopted.splitlines()[1:-1] == [f"  {kept}"], adopted
+    assert "1 backup(s) adopted" in res.stdout, res.stdout
+    skipped = res.stdout.split("--- Skipped (not adopted):", 1)[1].split("--- AVAILABLE rows", 1)[0]
+    expected = [
+        f"{_key_prefix(name, others['no-manifest'])}: not a complete backup: no manifest",
+        f"{_key_prefix(name, others['bad-sidecar'])}: not a complete backup: the sidecar does not match",
+        f"{ACCOUNT}/{name}/{moved_to}/: the manifest names {others['moved']}, whose account, table and backup id are "
+        "not the prefix's",
+        f"{ACCOUNT}/{name}/changelog/: reserved for the change-log archive",
+        "exports/: reserved for exports",
+        f"{_key_prefix(name, others['failed'])}: the catalog has a row for it (FAILED, store id {store_id})",
+        f"{_key_prefix(name, others['deleting'])}: the catalog has a row for it (DELETING, store id {store_id})",
+        f"{_key_prefix(name, others['creating'])}: the catalog has a row for it (CREATING, store id {store_id})",
+    ]
+    for line in expected:
+        assert f"  {line}" in skipped, f"{line!r} not in\n{skipped}"
+    assert len([line for line in skipped.splitlines() if line.startswith("  ")]) == len(expected), skipped
+    rows = _rows(d)
+    assert rows[kept] == "AVAILABLE", rows
+    for label in ("no-manifest", "bad-sidecar", "moved"):
+        assert others[label] not in rows, (label, rows)
+    assert rows[others["failed"]] == "FAILED", rows
+    assert rows[others["deleting"]] == "DELETING", rows
+    assert rows[others["creating"]] == "CREATING", rows
+    for label in ("deleting", "creating"):
+        assert os.path.isfile(os.path.join(_prefix(d, name, others[label]), "extenddb-manifest.json")), label
+    # Nothing under a skipped prefix was changed or removed.
+    assert os.path.isfile(os.path.join(_prefix(d, name, others["bad-sidecar"]), "extenddb-manifest.json"))
+    assert os.path.isfile(os.path.join(root, ACCOUNT, name, moved_to, "extenddb-manifest.json"))
+    assert os.path.isfile(os.path.join(root, ACCOUNT, name, "changelog", "000001.json"))
+
+    again = d.run("backup", "sync")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "0 backup(s) adopted" in again.stdout, again.stdout
+    assert f"  {_key_prefix(name, kept)}: the catalog has a row for it (AVAILABLE, store id {store_id})" in again.stdout
+
+    for label in ("failed", "deleting", "creating"):
+        if rows[others[label]] in ("FAILED", "DELETING", "CREATING"):
+            _set_status(d, others[label], "AVAILABLE")
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        details = ddb.describe_backup(BackupArn=kept)["BackupDescription"]
+        assert details["BackupDetails"]["BackupStatus"] == "AVAILABLE", details
+        assert details["BackupDetails"]["BackupName"] == "nightly", details
+        assert details["SourceTableDetails"]["TableName"] == name, details
+        assert details["SourceTableDetails"]["ItemCount"] == HAND_BUILT_ITEMS, details
+        listed = [s["BackupArn"] for s in ddb.list_backups(TableName=name)["BackupSummaries"]]
+        assert kept in listed, listed
+        for label in ("no-manifest", "bad-sidecar", "moved"):
+            with pytest.raises(ClientError) as gone:
+                ddb.describe_backup(BackupArn=others[label])
+            assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", (label, gone.value.response)
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=kept)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+    finally:
+        server.stop()
+
+
+def _with_root_moved_away(d: _Deployment):
+    """The store volume unmounted: the root renamed away and an empty
+    directory of the same path in its place; returns the restore callable."""
+    away = d.root + ".away"
+    os.rename(d.root, away)
+    os.mkdir(d.root, 0o700)
+
+    def restore() -> None:
+        shutil.rmtree(d.root)
+        os.rename(away, d.root)
+
+    return away, restore
+
+
+def _tree(root: str) -> list[str]:
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            path = os.path.join(dirpath, f)
+            with open(path, "rb") as fh:
+                out.append(f"{os.path.relpath(path, root)} {hashlib.sha256(fh.read()).hexdigest()}")
+    return sorted(out)
+
+
+def test_prune_missing_and_the_unhealthy_store_refusals(deployment, tmp_path):
+    """A row whose manifest is gone (not the newest AVAILABLE one): plain
+    sync reports it with the `--prune-missing` hint and leaves it AVAILABLE;
+    `--prune-missing` takes the maintenance claim and removes the row
+    outright (no tombstone, BackupNotFound), deleting no object: the rest of
+    its prefix stays. An unhealthy store refuses plain sync and
+    `--prune-missing`, exit 1, with no row changed and nothing written to the
+    root, for each shape an unmounted volume gives: an empty root under the
+    rows, a root holding only the identity file (the newest AVAILABLE row's
+    manifest absent), and a root whose identity file carries another store
+    id. Last, the newest AVAILABLE row's manifest
+    removed: the store is unhealthy (its manifest probe), so sync and
+    `--prune-missing` both refuse and the row stays AVAILABLE until the
+    manifest is put back, after which sync runs again. PostgreSQL runs the
+    commands beside its server; SQLite stops it (the serve lock)."""
+    _sync_cell(deployment)
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, older = _small_backed_up_table(ddb, "prune")
+        newest = ddb.create_backup(TableName=name, BackupName="second")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, newest, timeout=60)
+        if d.backend == "sqlite":
+            server.stop()
+        print(f"branch: {d.backend}, the server {'running' if _beside(d) else 'stopped'}")
+
+        os.remove(os.path.join(_prefix(d, name, older), "extenddb-manifest.json"))
+        res = d.run("backup", "sync")
+        assert res.returncode == 0, res.stdout + res.stderr
+        missing = res.stdout.split("--- AVAILABLE rows whose manifest is not in the store (the rows were AVAILABLE when the catalog was read):", 1)[1]
+        missing = missing.split("=== extenddb backup sync complete", 1)[0]
+        assert older in missing and newest not in missing, missing
+        assert "(left AVAILABLE; run with --prune-missing to remove the rows, which deletes no object)" in missing, missing
+        assert ("Took the maintenance claim" in res.stdout) == _beside(d), res.stdout
+        assert _rows(d)[older] == "AVAILABLE"
+        left_behind = _tree(_prefix(d, name, older))
+        assert left_behind, "the older prefix keeps its other objects"
+
+        res = d.run("backup", "sync", "--prune-missing")
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert 'Took the maintenance claim as "extenddb backup sync on ' in res.stdout, res.stdout
+        assert f"  {older}: removed: the row is gone, and no object was deleted" in res.stdout, res.stdout
+        assert "(1 removed)" in res.stdout, res.stdout
+        audit = [
+            line for line in out.splitlines()
+            if "extenddb::audit" in line and "removed an AVAILABLE row whose manifest is not under the root" in line
+        ]
+        assert len(audit) == 1 and older in audit[0] and "backup sync --prune-missing" in audit[0], out
+        rows = _rows(d)
+        assert older not in rows and rows[newest] == "AVAILABLE", rows
+        assert _tree(_prefix(d, name, older)) == left_behind, "prune deleted an object"
+        if _beside(d):
+            with pytest.raises(ClientError) as gone:
+                ddb.describe_backup(BackupArn=older)
+            assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", gone.value.response
+
+        before = _rows(d)
+        with open(os.path.join(d.root, "extenddb-store.json"), "rb") as f:
+            identity_file = f.read()
+        other_id = json.loads(identity_file)
+        other_id["store_id"] = str(uuid.uuid4())
+        shapes = {
+            "an empty root": None,
+            "the identity file alone": identity_file,
+            "another store id": (json.dumps(other_id, indent=2) + "\n").encode(),
+        }
+        for shape, content in shapes.items():
+            away, put_back = _with_root_moved_away(d)
+            try:
+                if content is not None:
+                    _private_file(os.path.join(d.root, "extenddb-store.json"), content)
+                tree = _tree(d.root)
+                for args in (("sync",), ("sync", "--prune-missing")):
+                    res = d.run("backup", *args)
+                    out = res.stdout + res.stderr
+                    assert res.returncode == 1, (shape, args, out)
+                    assert f"the filesystem backup store {os.path.realpath(d.root)} is unhealthy" in out, (shape, out)
+                    assert "sync changes no row while the store is unhealthy" in out, (shape, out)
+                    assert "Took the maintenance claim" not in out, (shape, out)
+                    assert _tree(d.root) == tree, f"{shape}: the command wrote to the root"
+                    print(f"{shape} {' '.join(args)}: {out.strip().splitlines()[-1]}")
+            finally:
+                put_back()
+            assert _rows(d) == before, shape
+
+        manifest = os.path.join(_prefix(d, name, newest), "extenddb-manifest.json")
+        os.rename(manifest, manifest + ".aside")
+        try:
+            for args in (("sync",), ("sync", "--prune-missing")):
+                res = d.run("backup", *args)
+                out = res.stdout + res.stderr
+                assert res.returncode == 1 and "is unhealthy" in out and "manifest" in out, out
+            assert _rows(d) == before
+        finally:
+            os.rename(manifest + ".aside", manifest)
+        res = d.run("backup", "sync")
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "0 backup(s) adopted" in res.stdout and "0 AVAILABLE row(s) whose manifest is gone" in res.stdout, res.stdout
+    finally:
+        server.stop()
+
+
+def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
+    """`backup sync --prune-missing` takes the maintenance claim and waits
+    for a CREATING row whose owner beat just now (the row edited at the
+    catalog, its heartbeat the database's now); while it waits, `backup
+    purge --confirm` and `backup sync --adopt-store` each fail within
+    seconds, exit 1, naming the one-at-a-time rule, and change nothing. The
+    first command, signalled, stops before any change and releases the
+    claim. `--adopt-store` on the root this catalog owns then takes the
+    claim and waits for the same live job ("Waiting for running jobs to
+    finish"), and a signal stops it before any change; after that a plain
+    sync and `--prune-missing` run. SQLite has
+    no second command to refuse: every writing command takes the serve lock
+    first, which the sync cell shows."""
+    _sync_cell(deployment)
+    d = deployment
+    if not _beside(d):
+        pytest.skip("on SQLite the serve lock refuses a second writing command before any claim is read")
+    import subprocess
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, busy = _small_backed_up_table(ddb, "claim")
+    finally:
+        server.stop()
+    _set_status(d, busy, "CREATING")
+    out_path = str(tmp_path / "first.out")
+    with open(out_path, "wb") as out:
+        first = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--prune-missing"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(out_path).read():
+            assert first.poll() is None, open(out_path).read()
+            assert time.monotonic() < deadline, open(out_path).read()
+            time.sleep(0.2)
+        assert busy in open(out_path).read() or name in open(out_path).read(), open(out_path).read()
+        for args in (("purge", "--confirm"), ("sync", "--adopt-store")):
+            started = time.monotonic()
+            res = d.run("backup", *args)
+            took = time.monotonic() - started
+            out = res.stdout + res.stderr
+            assert res.returncode == 1, (args, out)
+            assert "one maintenance command runs at a time" in out, (args, out)
+            assert took < 15, f"{args} took {took:.1f} s to refuse"
+            print(f"{' '.join(args)}: refused in {took:.1f} s")
+        assert first.poll() is None, "the first command stopped while the others ran"
+        first.send_signal(15)
+        assert first.wait(timeout=30) == 1
+        text = open(out_path).read()
+        assert "stopped before any change: SIGTERM received while waiting" in text, text
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait(timeout=10)
+    assert _rows(d)[busy] == "CREATING"
+    # `--adopt-store` on a root this catalog owns takes the claim and waits
+    # for the same live job before its sync, as `--prune-missing` does.
+    adopt_path = str(tmp_path / "adopt.out")
+    with open(adopt_path, "wb") as out:
+        adopting = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--adopt-store"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(adopt_path).read():
+            assert adopting.poll() is None, open(adopt_path).read()
+            assert time.monotonic() < deadline, open(adopt_path).read()
+            time.sleep(0.2)
+        text = open(adopt_path).read()
+        assert "there is nothing to adopt" in text and 'Took the maintenance claim as "extenddb backup sync on ' in text, text
+        assert "--- Adopted" not in text, text
+        adopting.send_signal(15)
+        assert adopting.wait(timeout=30) == 1
+        text = open(adopt_path).read()
+        assert "stopped before any change: SIGTERM received while waiting" in text, text
+    finally:
+        if adopting.poll() is None:
+            adopting.kill()
+            adopting.wait(timeout=10)
+    assert _rows(d)[busy] == "CREATING"
+    _set_status(d, busy, "AVAILABLE")
+    res = d.run("backup", "sync", "--prune-missing")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Took the maintenance claim" in res.stdout, res.stdout
+
+
+def _adopted_section(stdout: str) -> str:
+    return stdout.split("--- Adopted", 1)[1].split("--- Skipped", 1)[0]
+
+
+def _rows_present(d: _Deployment, arns: list[str]) -> int:
+    """How many of `arns` have a `backup_index` row, read at the catalog
+    (a command holding SQLite's serve lock does not stop the read)."""
+    ids = tuple(_backup_id(a) for a in arns)
+    if d.backend == "mongodb":
+        return _mongosh(
+            f"print(db.backup_index.countDocuments({{account_id: {json.dumps(ACCOUNT)}, "
+            f"backup_id: {{$in: {json.dumps(list(ids))}}}}}))"
+        )
+    marks = ", ".join("?" for _ in ids)
+    statement = f"SELECT count(*) FROM backup_index WHERE account_id = ? AND backup_id IN ({marks})"
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            return conn.execute(statement, (ACCOUNT, *ids)).fetchone()[0]
+        finally:
+            conn.close()
+    import psycopg2
+
+    conn = psycopg2.connect(d.catalog)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(statement.replace("?", "%s"), (ACCOUNT, *ids))
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_sigterm_during_the_prefix_loop_stops_sync_and_keeps_its_rows(deployment, tmp_path):
+    """Two backups whose rows the catalog lost sort first under the root,
+    followed by many copies of the first under later backup ids (each read
+    and skipped: its manifest names another backup id). SIGTERM once both
+    rows are back, while sync is still in the prefix loop: the command exits
+    1 saying it stopped, the rows it inserted stay AVAILABLE, no
+    missing-manifest section is examined, and the next sync runs at once
+    (on PostgreSQL it takes the claim the first released) and adopts
+    nothing more."""
+    _sync_cell(deployment)
+    d = deployment
+    import signal
+    import subprocess
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, first = _small_backed_up_table(ddb, "sigterm")
+        second = ddb.create_backup(TableName=name, BackupName="second")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, second, timeout=60)
+    finally:
+        server.stop()
+    for arn in (first, second):
+        _drop_row(d, arn)
+    src = _prefix(d, name, first)
+    millis, suffix = max(_backup_id(first), _backup_id(second)).split("-")
+    copies = 10000
+    for i in range(copies):
+        shutil.copytree(src, os.path.join(d.root, ACCOUNT, name, f"{int(millis) + 1 + i:014d}-{suffix}"),
+                        copy_function=os.link)
+    out_path = str(tmp_path / "sync.out")
+    with open(out_path, "wb") as out:
+        sync = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while _rows_present(d, [first, second]) < 2:
+            assert sync.poll() is None, open(out_path).read()[-4000:]
+            assert time.monotonic() < deadline, open(out_path).read()[-4000:]
+            time.sleep(0.05)
+        assert sync.poll() is None, "the sync ended before the signal"
+        sync.send_signal(signal.SIGTERM)
+        assert sync.wait(timeout=60) == 1, open(out_path).read()[-4000:]
+    finally:
+        if sync.poll() is None:
+            sync.kill()
+            sync.wait(timeout=10)
+    text = open(out_path).read()
+    print("\n".join(line for line in text.splitlines() if not line.startswith("  "))[-3000:])
+    assert "stopped: SIGTERM received. 2 backup(s) were adopted before the stop" in text, text[-4000:]
+    assert "  (not examined)" in text, text[-4000:]
+    assert "=== extenddb backup sync complete" not in text, text[-4000:]
+    rows = _rows(d)
+    assert rows[first] == "AVAILABLE" and rows[second] == "AVAILABLE", rows
+    started = time.monotonic()
+    res = d.run("backup", "sync")
+    took = time.monotonic() - started
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out[-4000:]
+    if _beside(d):
+        assert "Took the maintenance claim" in res.stdout, res.stdout[:2000]
+    assert _adopted_section(res.stdout).splitlines()[1:-1] == ["  (none)"], res.stdout[:2000]
+    assert f"0 backup(s) adopted, {copies + 2} prefix(es) skipped" in res.stdout, res.stdout[-2000:]
+    print(f"the next sync: exit 0 in {took:.1f} s")
+
+
+def test_prune_missing_on_a_host_local_root_deletes_no_object(deployment, tmp_path):
+    """Host-local roots on two instances of one catalog, one path: backups
+    K1 < K2 < K3, and the second host's root lacks K2 (its bytes are on the
+    first host), while it holds the newest, K3, so its store is healthy.
+    `--prune-missing` there removes K2's row outright and deletes nothing.
+    Back on the first host, the reconciler's cycles leave K2's prefix whole
+    (no tombstone names it), DescribeBackup answers BackupNotFound, and a
+    plain sync beside the server adopts K2 again, after which it is
+    AVAILABLE. A SQLite catalog has one instance, so the cell is
+    PostgreSQL's."""
+    _sync_cell(deployment)
+    d = deployment
+    if not _beside(d):
+        pytest.skip("host-local roots need two instances of one catalog")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, k1 = _small_backed_up_table(ddb, "hostlocal")
+        k2 = ddb.create_backup(TableName=name, BackupName="second")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, k2, timeout=60)
+        k3 = ddb.create_backup(TableName=name, BackupName="third")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, k3, timeout=60)
+    finally:
+        server.stop()
+    k2_tree = _tree(_prefix(d, name, k2))
+    host1 = d.root + ".host1"
+    os.rename(d.root, host1)
+    try:
+        shutil.copytree(host1, d.root)
+        shutil.rmtree(_prefix(d, name, k2))
+        res = d.run("backup", "sync", "--prune-missing")
+        out = res.stdout + res.stderr
+        print(out)
+        assert res.returncode == 0, out
+        assert f"  {k2}: removed: the row is gone, and no object was deleted" in res.stdout, out
+        rows = _rows(d)
+        assert k2 not in rows and rows[k1] == "AVAILABLE" and rows[k3] == "AVAILABLE", rows
+    finally:
+        shutil.rmtree(d.root, ignore_errors=True)
+        os.rename(host1, d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        time.sleep(5)  # several reconciler cycles (reconcile_interval_secs = 1)
+        assert _tree(_prefix(d, name, k2)) == k2_tree, "a deletion duty acted on K2's bytes"
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_backup(BackupArn=k2)
+        assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", gone.value.response
+        res = d.run("backup", "sync")
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert _adopted_section(res.stdout).splitlines()[1:-1] == [f"  {k2}"], res.stdout
+        details = ddb.describe_backup(BackupArn=k2)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "second", details
+    finally:
+        server.stop()
+
+
+def test_sync_is_refused_while_purge_holds_the_claim(deployment, tmp_path):
+    """Beside servers every sync takes the maintenance claim, so no sync
+    runs while purge does. A CREATING row whose job died after its manifest
+    (its prefix complete, its heartbeat an hour old) and a CREATING row whose
+    job beat just now: `purge --confirm` takes the claim and waits for the
+    live job, and while it holds the claim a plain sync fails at once (exit
+    1, one maintenance command at a time) and writes nothing. The job ends;
+    purge removes the dead row first and then fails to delete its prefix
+    (made read-only), reports it left and exits 1. The prefix is then a
+    complete backup with no row, which a later sync adopts and the next
+    purge deletes. SQLite runs both commands under the serve lock."""
+    _sync_cell(deployment)
+    d = deployment
+    if not _beside(d):
+        pytest.skip("on SQLite the serve lock orders sync and purge")
+    import subprocess
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, dead = _small_backed_up_table(ddb, "gap")
+        live = ddb.create_backup(TableName=name, BackupName="live")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, live, timeout=60)
+    finally:
+        server.stop()
+    _set_status(d, dead, "CREATING", beat_age_secs=3600)
+    _set_status(d, live, "CREATING")
+    dead_prefix = _prefix(d, name, dead)
+    os.chmod(dead_prefix, 0o500)
+    out_path = str(tmp_path / "purge.out")
+    with open(out_path, "wb") as out:
+        purge = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "purge", "--confirm"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(out_path).read():
+            assert purge.poll() is None, open(out_path).read()
+            assert time.monotonic() < deadline, open(out_path).read()
+            time.sleep(0.2)
+        before = _rows(d)
+        started = time.monotonic()
+        res = d.run("backup", "sync")
+        took = time.monotonic() - started
+        out = res.stdout + res.stderr
+        print(f"sync beside purge: exit {res.returncode} in {took:.1f} s: {out.strip().splitlines()[-1]}")
+        assert res.returncode == 1, out
+        assert "one maintenance command runs at a time" in out, out
+        assert "--- Adopted" not in res.stdout, out
+        assert took < 15, f"sync took {took:.1f} s to refuse"
+        assert _rows(d) == before
+        _set_status(d, live, "AVAILABLE")
+        assert purge.wait(timeout=90) == 1, open(out_path).read()
+        text = open(out_path).read()
+        print(text)
+        assert f"left: {dead}" in text, text
+    finally:
+        if purge.poll() is None:
+            purge.kill()
+            purge.wait(timeout=10)
+        os.chmod(dead_prefix, 0o700)
+    assert _rows(d) == {}, "purge removed both rows"
+    assert os.path.isfile(os.path.join(dead_prefix, "extenddb-manifest.json"))
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _adopted_section(res.stdout).splitlines()[1:-1] == [f"  {dead}"], res.stdout
+    res = d.run("backup", "purge", "--confirm")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert not os.path.exists(dead_prefix)
+
+
+@pytest.fixture()
+def other_catalog(request, tmp_path, deployment):
+    """A second catalog of the build's backend (its own `init`), whose
+    `[backup.store]` names the first deployment's root; its databases are
+    dropped after the test."""
+    _sync_cell(deployment)
+    if deployment.backend == "mongodb":
+        pytest.skip("a second MongoDB catalog needs a replica set of its own (the catalog database's name is fixed)")
+    base = os.path.join(os.path.realpath(str(tmp_path)), "other")
+    os.mkdir(base)
+    store = (
+        "[backup]\nreconcile_interval_secs = 1\n"
+        f'[backup.store]\nkind = "filesystem"\n[backup.store.filesystem]\npath = "{deployment.root}"\n'
+    )
+    if deployment.backend == "sqlite":
+        o = _SqliteDeployment(base)
+        _append(o.config, store)
+        yield _Deployment("sqlite", o.config, o.port, deployment.root, o.cert, base, o.db_path)
+        return
+    db_name = f"extenddb_test_{uuid.uuid4().hex[:8]}_catalog"
+    from urllib.parse import urlparse
+
+    parsed = urlparse(lh.PG_CONN)
+    env = {"db_name": db_name, "pg_host": parsed.hostname or "localhost", "pg_port": str(parsed.port or 5432)}
+    config = os.path.join(base, "extenddb.toml")
+    port = _free_port()
+    try:
+        result = lh._run_extenddb(
+            "init", *lh._init_args(env), config=config,
+            env_override={"EXTENDDB_ADMIN_PASSWORD": ADMIN_PASSWORD},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        lh._patch_config_port(config, port)
+        _append(config, store)
+        cert = os.path.join(os.path.expanduser("~/.extenddb/tls"), "cert.pem")
+        yield _Deployment("postgres", config, port, deployment.root, cert, base, f"{lh.PG_CONN}/{db_name}")
+    finally:
+        lh._run_extenddb("destroy", "--yes", *lh._pg_args(), config=config, check=False, timeout=30)
+        lh._drop_database(db_name)
+        lh._drop_database(db_name[: -len("_catalog")])
+
+
+def test_adopt_store_makes_this_catalog_the_owner(deployment, other_catalog, tmp_path):
+    """A second catalog configured with the first deployment's root: plain
+    sync refuses the root another catalog owns, naming `--adopt-store`, and
+    leaves the identity file as it was. `--adopt-store` takes the claim,
+    rewrites the file's owner (the store id and creation time kept), logs
+    the audit line and adopts the root's backup; the first catalog's
+    server finds the store owned by another catalog at its next check (on
+    PostgreSQL the server kept running beside the adoption; on SQLite it was
+    stopped for the serve lock and the check is its restart's), and its own
+    sync now refuses. The second catalog's server describes, lists and
+    restores the adopted backup."""
+    _sync_cell(deployment)
+    d, o = deployment, other_catalog
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "adopt")
+        if d.backend == "sqlite":
+            server.stop()
+        identity = os.path.join(d.root, "extenddb-store.json")
+        with open(identity) as f:
+            before = json.load(f)
+        res = o.run("backup", "sync")
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert "is owned by another catalog" in out and "run with --adopt-store to make this catalog its owner" in out, out
+        # A configured root: the sentence about the shared default root is
+        # not the operator's.
+        assert "The default root beside a SQLite database file" not in out, out
+        with open(identity) as f:
+            assert json.load(f) == before, "the refused sync changed the identity file"
+
+        res = o.run("backup", "sync", "--adopt-store")
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert 'Took the maintenance claim as "extenddb backup sync on ' in res.stdout, res.stdout
+        assert f"Adopted the root: extenddb-store.json named catalog {before['catalog_id']} and now names" in res.stdout
+        assert f"  {arn}" in res.stdout and "1 backup(s) adopted" in res.stdout, res.stdout
+        with open(identity) as f:
+            after = json.load(f)
+        assert after["catalog_id"] != before["catalog_id"], (before, after)
+        assert after["store_id"] == before["store_id"] and after["created_at_ms"] == before["created_at_ms"], (before, after)
+        assert after["backend"] == o.backend and after.get("ephemeral_catalog") is False, after
+        assert "extenddb::audit" in out and before["catalog_id"] in out and after["catalog_id"] in out, out
+
+        if d.backend == "sqlite":
+            server = _Server(d.config, str(tmp_path / "serve-previous-owner.log"))
+        health = _wait_health(
+            d.port,
+            lambda h: h.get("components", {}).get("backup_store", {}).get("reason") == "owned by another catalog",
+            server=server,
+        )
+        assert health["components"]["backup_store"]["status"] == "unhealthy", health
+        print(f"branch: {d.backend}: the previous owner's store: {health['components']['backup_store']}")
+    finally:
+        server.stop()
+    res = d.run("backup", "sync")
+    assert res.returncode == 1 and "is owned by another catalog" in res.stdout + res.stderr, res.stdout + res.stderr
+
+    server, ddb, creds = _started(o, str(tmp_path / "serve-other.log"))
+    try:
+        details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "nightly", details
+        assert arn in [s["BackupArn"] for s in ddb.list_backups()["BackupSummaries"]]
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+    finally:
+        server.stop()
+
+
+def test_the_previous_owner_deletes_nothing_under_an_adopted_root(deployment, other_catalog, tmp_path):
+    """The first catalog's server keeps running, its next check an hour
+    away (`reconcile_interval_secs = 3600`), while a second catalog adopts
+    its root with `--adopt-store`. Its `/health` still reports the store
+    healthy, as its last check left it; DeleteBackup of the adopted backup
+    there is refused as an unhealthy store's, its deletion fence having
+    re-read the identity file before the row was changed: the backup's
+    bytes stay whole and DescribeBackup there still answers AVAILABLE;
+    `/health`
+    then reports the store owned by another catalog at once. The second
+    catalog's server finds its store healthy and the backup AVAILABLE, and
+    restores it. SQLite stops the first server for the serve lock, so the
+    cell is PostgreSQL's."""
+    _sync_cell(deployment)
+    d, o = deployment, other_catalog
+    if d.backend != "postgres":
+        pytest.skip("the previous owner runs beside the adoption on PostgreSQL")
+    with open(d.config) as f:
+        text = f.read()
+    assert text.count("reconcile_interval_secs = 1\n") == 1, text
+    with open(d.config, "w") as f:
+        f.write(text.replace("reconcile_interval_secs = 1\n", "reconcile_interval_secs = 3600\n"))
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "fence")
+        before = _tree(_prefix(d, name, arn))
+        res = o.run("backup", "sync", "--adopt-store")
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"  {arn}" in res.stdout and "1 backup(s) adopted" in res.stdout, out
+        assert "Stop every such server before an adoption" in res.stdout, out
+        health = _health(d.port)
+        assert health["components"]["backup_store"]["status"] == "healthy", health
+        with pytest.raises(ClientError) as refused:
+            ddb.delete_backup(BackupArn=arn)
+        error = refused.value.response["Error"]
+        print(f"DeleteBackup on the previous owner: {error}")
+        assert error["Code"] == "ValidationException", error
+        assert "unhealthy (owned by another catalog)" in error["Message"], error
+        assert _tree(_prefix(d, name, arn)) == before, "the previous owner deleted bytes"
+        details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE", f"the refused request moved the row: {details}"
+        assert _rows(d)[arn] == "AVAILABLE"
+        component = _health(d.port)["components"]["backup_store"]
+        assert component["status"] == "unhealthy", component
+        assert component["reason"] == "owned by another catalog", component
+        log = server.log_text()
+        assert "refused before the row was changed; nothing was deleted" in log, log[-4000:]
+    finally:
+        server.stop()
+
+    server, ddb, creds = _started(o, str(tmp_path / "serve-other.log"))
+    try:
+        details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE", details
+        target = f"{name}-r"
+        ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+    finally:
+        server.stop()
+
+
+def test_a_prefix_the_store_cannot_read_leaves_the_sync_incomplete(deployment, tmp_path):
+    """A backup whose row the catalog lost, its manifest made unreadable
+    (mode 000): `extenddb backup sync` reports the prefix as one the store
+    could not be read for and exits 1 saying the run is incomplete, with no
+    row inserted. Once the mode is restored, the next sync adopts the
+    backup and exits 0."""
+    _sync_cell(deployment)
+    d = deployment
+    if os.geteuid() == 0:
+        pytest.skip("a mode-000 file is readable by root")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "unreadable")
+    finally:
+        server.stop()
+    _drop_row(d, arn)
+    manifest = os.path.join(_prefix(d, name, arn), "extenddb-manifest.json")
+    os.chmod(manifest, 0o000)
+    try:
+        res = d.run("backup", "sync")
+        out = res.stdout + res.stderr
+        print(f"branch: {d.backend}: {out.strip().splitlines()[-1]}")
+        assert res.returncode == 1, out
+        assert f"  {_key_prefix(name, arn)}: the store could not be read: " in res.stdout, out
+        assert "the run is incomplete: 1 prefix(es) were skipped for a store or catalog error" in out, out
+        assert "=== extenddb backup sync incomplete: 0 backup(s) adopted, 1 prefix(es) skipped," in res.stdout, out
+        assert "=== extenddb backup sync complete" not in res.stdout, out
+        assert _adopted_section(res.stdout).splitlines()[1:-1] == ["  (none)"], res.stdout
+        assert arn not in _rows(d)
+    finally:
+        os.chmod(manifest, 0o600)
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "=== extenddb backup sync complete: 1 backup(s) adopted" in res.stdout, out
+    assert _adopted_section(res.stdout).splitlines()[1:-1] == [f"  {arn}"], res.stdout
+    assert _rows(d)[arn] == "AVAILABLE"
+
+
+def _respell_manifest(prefix: str, region: str, other: str) -> None:
+    """Rewrite the prefix's manifest as a server of region `other` wrote
+    it (its backup ARN and source table ARN in that region), with a sidecar
+    that matches."""
+    path = os.path.join(prefix, "extenddb-manifest.json")
+    with open(path) as f:
+        manifest = json.load(f)
+    for key in ("backup_arn",):
+        assert f":{region}:" in manifest[key], manifest[key]
+        manifest[key] = manifest[key].replace(f":{region}:", f":{other}:", 1)
+    table_arn = manifest["source_table"]["table_arn"]
+    manifest["source_table"]["table_arn"] = table_arn.replace(f":{region}:", f":{other}:", 1)
+    data = json.dumps(manifest, indent=2).encode() + b"\n"
+    with open(path, "wb") as f:
+        f.write(data)
+    with open(os.path.join(prefix, "extenddb-manifest.sha256"), "w") as f:
+        f.write(f"{hashlib.sha256(data).hexdigest()}  extenddb-manifest.json\n")
+
+
+def test_sync_adopts_another_regions_prefix_under_this_servers_region(deployment, tmp_path):
+    """Two backups whose rows the catalog lost, their manifests rewritten as
+    a server of another region writes them (the prefix copied from such a
+    server): sync adopts both, exit 0, with a warning naming the manifest's
+    region, and the rows carry this server's region. ListBackups, with and
+    without `TableName`, lists them in this server's region; DescribeBackup
+    answers either spelling; a restore named by the other region's spelling
+    reaches ACTIVE with every item, and DeleteBackup by that spelling
+    deletes the backup. The manifests keep their spelling."""
+    _sync_cell(deployment)
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, first = _small_backed_up_table(ddb, "region")
+        second = ddb.create_backup(TableName=name, BackupName="second")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, second, timeout=60)
+    finally:
+        server.stop()
+    region = first.split(":")[3]
+    other = "us-west-2" if region != "us-west-2" else "eu-west-1"
+    for arn in (first, second):
+        _drop_row(d, arn)
+        _respell_manifest(_prefix(d, name, arn), region, other)
+    spelled = {arn: arn.replace(f":{region}:", f":{other}:", 1) for arn in (first, second)}
+
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    print(f"branch: {d.backend}\n{res.stdout}")
+    assert res.returncode == 0, out
+    note = f"whose manifest spells its ARN in region {other}, not this server's"
+    assert sorted(_adopted_section(res.stdout).splitlines()[1:-1]) == sorted(
+        f"  {a} ({note})" for a in (first, second)
+    ), out
+    warned = [line for line in out.splitlines() if "WARN" in line and "backup sync: adopted " in line]
+    assert len(warned) == 2 and all(note in line for line in warned), out
+    rows = _rows(d)
+    assert rows[first] == "AVAILABLE" and rows[second] == "AVAILABLE", rows
+    assert not any(f":{other}:" in arn for arn in rows), rows
+    for arn in (first, second):
+        with open(os.path.join(_prefix(d, name, arn), "extenddb-manifest.json")) as f:
+            assert json.load(f)["backup_arn"] == spelled[arn], "the manifest kept its spelling"
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+    try:
+        for kwargs in ({}, {"TableName": name}):
+            listed = sorted(s["BackupArn"] for s in ddb.list_backups(**kwargs)["BackupSummaries"])
+            assert set((first, second)) <= set(listed), (kwargs, listed)
+            assert not any(f":{other}:" in a for a in listed), (kwargs, listed)
+        for spelling in (first, spelled[first]):
+            details = ddb.describe_backup(BackupArn=spelling)["BackupDescription"]["BackupDetails"]
+            assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "nightly", details
+            print(f"DescribeBackup {spelling}: BackupArn {details['BackupArn']}")
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=spelled[first])["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+        deleted = ddb.delete_backup(BackupArn=spelled[second])["BackupDescription"]["BackupDetails"]
+        assert deleted["BackupStatus"] == "DELETED", deleted
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_backup(BackupArn=second)
+        assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", gone.value.response
+    finally:
+        server.stop()
+
+
+def _foreign_identity(d: _Deployment) -> dict:
+    """Rewrite the root's identity file to name a catalog that does not
+    exist (the root another catalog owned, a catalog since destroyed),
+    keeping the store id; returns the file as written."""
+    path = os.path.join(d.root, "extenddb-store.json")
+    with open(path) as f:
+        file = json.load(f)
+    file = dict(file, catalog_id=str(uuid.uuid4()))
+    staged = path + ".staged"
+    _private_file(staged, (json.dumps(file, indent=2) + "\n").encode())
+    os.rename(staged, path)
+    return file
+
+
+def test_adopt_store_checks_the_root_before_it_writes(deployment, tmp_path):
+    """A root whose identity file names another catalog over this catalog's
+    two backups. With the newest backup's manifest gone, `--adopt-store`
+    refuses, exit 1, saying the root would be unhealthy once this catalog
+    owns it and that nothing was written: the file is unchanged and no
+    audit line says a rewrite started. With the manifest back, the same
+    command adopts the root (the audit lines, the file naming this catalog
+    with the store id kept), syncs, and plain sync then runs."""
+    _sync_cell(deployment)
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, older = _small_backed_up_table(ddb, "adoptcheck")
+        newest = ddb.create_backup(TableName=name, BackupName="second")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, newest, timeout=60)
+    finally:
+        server.stop()
+    identity = os.path.join(d.root, "extenddb-store.json")
+    with open(identity) as f:
+        ours = json.load(f)
+    foreign = _foreign_identity(d)
+    with open(identity, "rb") as f:
+        foreign_bytes = f.read()
+    manifest = os.path.join(_prefix(d, name, newest), "extenddb-manifest.json")
+    os.rename(manifest, manifest + ".aside")
+    try:
+        res = d.run("backup", "sync", "--adopt-store")
+        out = res.stdout + res.stderr
+        print(f"branch: {d.backend}: {out.strip().splitlines()[-1]}")
+        assert res.returncode == 1, out
+        assert "the root would be unhealthy once this catalog owns it" in out, out
+        assert f"nothing was written, and extenddb-store.json still names catalog {foreign['catalog_id']}" in out, out
+        assert "rewriting extenddb-store.json to name this catalog" not in out, out
+        with open(identity, "rb") as f:
+            assert f.read() == foreign_bytes, "the refused adoption wrote the identity file"
+        assert _rows(d)[newest] == "AVAILABLE"
+    finally:
+        os.rename(manifest + ".aside", manifest)
+    res = d.run("backup", "sync", "--adopt-store")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert f"Adopted the root: extenddb-store.json named catalog {foreign['catalog_id']} and now names" in res.stdout, out
+    assert "extenddb::audit" in out and "rewriting extenddb-store.json to name this catalog" in out, out
+    with open(identity) as f:
+        after = json.load(f)
+    assert after["catalog_id"] == ours["catalog_id"] and after["store_id"] == ours["store_id"], (ours, after)
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_a_plain_sync_whose_root_is_adopted_during_it_ends_with_exit_1(deployment, tmp_path):
+    """A plain sync of a root this catalog owns, holding one backup whose
+    row the catalog lost and many copies of it under later backup ids (each
+    read and skipped). Once the backup's row is back and while the sync is
+    still in the prefix loop, the identity file is rewritten to name
+    another catalog, as an adopter's put would leave it. The sync's last
+    read of the file finds it: exit 1, naming the catalog and the store id,
+    and no `complete` line."""
+    _sync_cell(deployment)
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "plainrace")
+    finally:
+        server.stop()
+    _drop_row(d, arn)
+    src = _prefix(d, name, arn)
+    millis, suffix = _backup_id(arn).split("-")
+    copies = 10000
+    for i in range(copies):
+        shutil.copytree(src, os.path.join(d.root, ACCOUNT, name, f"{int(millis) + 1 + i:014d}-{suffix}"),
+                        copy_function=os.link)
+    with open(os.path.join(d.root, "extenddb-store.json")) as f:
+        store_id = json.load(f)["store_id"]
+    out_path = str(tmp_path / "sync.out")
+    with open(out_path, "wb") as out:
+        sync = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while _rows_present(d, [arn]) < 1:
+            assert sync.poll() is None, open(out_path).read()[-4000:]
+            assert time.monotonic() < deadline, open(out_path).read()[-4000:]
+            time.sleep(0.05)
+        foreign = _foreign_identity(d)
+        assert sync.poll() is None, "the sync ended before the rewrite"
+        assert sync.wait(timeout=180) == 1, open(out_path).read()[-4000:]
+    finally:
+        if sync.poll() is None:
+            sync.kill()
+            sync.wait(timeout=10)
+    text = open(out_path).read()
+    print("\n".join(line for line in text.splitlines() if not line.startswith("  "))[-3000:])
+    assert (
+        f"after the sync, extenddb-store.json names catalog {foreign['catalog_id']} (store id {store_id}): "
+        "another catalog adopted the root during the sync"
+    ) in text, text[-4000:]
+    assert "=== extenddb backup sync complete" not in text, text[-4000:]
+
+
+def test_an_adopter_whose_put_lands_during_the_sync_ends_it_with_exit_1(deployment, other_catalog, tmp_path):
+    """A second catalog adopts the first one's root with `--adopt-store`,
+    the root holding one backup and many copies of it under later backup
+    ids (each read and skipped: its manifest names another backup id). Once
+    the command has printed its adoption and while its sync is still in the
+    prefix loop, the identity file is rewritten to name a third catalog
+    under the same store id, as a second adopter's put would leave it. The
+    command's last read of the file finds it: exit 1, naming the third
+    catalog and the store id. The first server is stopped throughout."""
+    _sync_cell(deployment)
+    d, o = deployment, other_catalog
+    import subprocess
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, arn = _small_backed_up_table(ddb, "race")
+    finally:
+        server.stop()
+    src = _prefix(d, name, arn)
+    millis, suffix = _backup_id(arn).split("-")
+    copies = 10000
+    for i in range(copies):
+        shutil.copytree(src, os.path.join(d.root, ACCOUNT, name, f"{int(millis) + 1 + i:014d}-{suffix}"),
+                        copy_function=os.link)
+    identity = os.path.join(d.root, "extenddb-store.json")
+    with open(identity) as f:
+        before = json.load(f)
+    out_path = str(tmp_path / "adopt.out")
+    with open(out_path, "wb") as out:
+        adopting = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", o.config, "sync", "--adopt-store"],
+            cwd=o.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Adopted the root:" not in open(out_path).read():
+            assert adopting.poll() is None, open(out_path).read()[-4000:]
+            assert time.monotonic() < deadline, open(out_path).read()[-4000:]
+            time.sleep(0.05)
+        third = dict(before, catalog_id=str(uuid.uuid4()))
+        staged = identity + ".staged"
+        _private_file(staged, (json.dumps(third, indent=2) + "\n").encode())
+        os.rename(staged, identity)
+        assert "--- Adopted" not in open(out_path).read(), "the sync had ended before the rewrite"
+        assert adopting.poll() is None, "the command ended before the rewrite"
+        assert adopting.wait(timeout=180) == 1, open(out_path).read()[-4000:]
+    finally:
+        if adopting.poll() is None:
+            adopting.kill()
+            adopting.wait(timeout=10)
+    text = open(out_path).read()
+    print("\n".join(line for line in text.splitlines() if not line.startswith("  "))[-3000:])
+    assert (
+        f"after the sync, extenddb-store.json names catalog {third['catalog_id']} (store id {before['store_id']}): "
+        "another catalog adopted the root during the sync"
+    ) in text, text[-4000:]
+    assert f"  {arn}" in _adopted_section(text), text[-4000:]
+    assert "=== extenddb backup sync complete" not in text, text[-4000:]
