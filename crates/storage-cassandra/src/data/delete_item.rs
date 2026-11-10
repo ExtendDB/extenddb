@@ -297,9 +297,10 @@ impl CassandraEngine {
                 // index rows written afterwards carry that order (`data::version`).
                 // Deleting an absent item writes nothing.
                 let Some(old_item) = old_item_opt else {
-                    // The read above is at the driver's default consistency,
-                    // and a replica that missed the latest write reads as
-                    // absent. The fence catches a stale image but not a stale
+                    // The read above is at LOCAL_QUORUM. It sees every write that
+                    // was acknowledged before it, but not an LWT whose Paxos round
+                    // is still in progress, so it can read as absent. The fence
+                    // catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
                     // before the delete answers without writing. An item found
                     // there that a write stored before this delete began is
@@ -505,7 +506,7 @@ impl CassandraEngine {
                         return Err(StorageError::Internal(error.to_string()));
                     }
                 };
-                if let Err(error) = self.session.batch(built).await {
+                if let Err(error) = self.session.run_batch(built).await {
                     self.release_ttl_mutation_claim(key_info, key, ttl_claim)
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
@@ -590,9 +591,10 @@ impl CassandraEngine {
             } else {
                 // Ordinary delete without TTL: see the sort-key variant above.
                 let Some(old_item) = old_item_opt else {
-                    // The read above is at the driver's default consistency,
-                    // and a replica that missed the latest write reads as
-                    // absent. The fence catches a stale image but not a stale
+                    // The read above is at LOCAL_QUORUM. It sees every write that
+                    // was acknowledged before it, but not an LWT whose Paxos round
+                    // is still in progress, so it can read as absent. The fence
+                    // catches a stale image but not a stale
                     // absence, so the absence is confirmed at LOCAL_SERIAL
                     // before the delete answers without writing. An item found
                     // there that a write stored before this delete began is
@@ -788,7 +790,7 @@ impl CassandraEngine {
                         return Err(StorageError::Internal(error.to_string()));
                     }
                 };
-                if let Err(error) = self.session.batch(built).await {
+                if let Err(error) = self.session.run_batch(built).await {
                     self.release_ttl_mutation_claim(key_info, key, ttl_claim)
                         .await;
                     return Err(StorageError::Internal(format!("Batch execution: {error}")));
@@ -976,13 +978,9 @@ impl CassandraEngine {
                 ]),
             )
         };
-        let rows = crate::cassandra_util::query_rows_quorum(
-            &self.session,
-            &query,
-            values,
-            "base_row_owned_by",
-        )
-        .await?;
+        let rows =
+            crate::cassandra_util::query_rows(&self.session, &query, values, "base_row_owned_by")
+                .await?;
         let owner: Option<uuid::Uuid> = rows
             .first()
             .and_then(|row| row.get_by_name("prepared_txn_id").ok().flatten());
@@ -1004,10 +1002,10 @@ impl CassandraEngine {
         effects_timestamp_ms: i64,
     ) -> Result<(), StorageError> {
         let account_keyspace = self.account_keyspace(&key_info.account_id);
-        // Quorum: a stale replica omitting an index here would be read as
-        // "nothing to restore", and this is the last chance to restore it
-        // before the sealed owner is released.
-        let indexes = super::index::fetch_indexes_for_table_quorum(
+        // This is the last chance to restore an index before the sealed
+        // owner is released, so an index missing from this list is never
+        // restored.
+        let indexes = super::index::fetch_indexes_for_table(
             &key_info.table_id,
             &self.session,
             &self.catalog_keyspace(),
@@ -1053,7 +1051,7 @@ impl CassandraEngine {
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|error| StorageError::Internal(format!("Restore sync indexes: {error}")))?;
         self.gsi_queue.notify_workers();
@@ -1153,7 +1151,7 @@ impl CassandraEngine {
                 .build()
                 .map_err(|error| StorageError::Internal(error.to_string()))?;
             self.session
-                .batch(built)
+                .run_batch(built)
                 .await
                 .map_err(|error| StorageError::Internal(format!("TTL side effects: {error}")))?;
             if !indexes.is_empty() {
@@ -1664,7 +1662,7 @@ impl CassandraEngine {
             .build()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|e| StorageError::Internal(format!("delete secondary effects: {e}")))?;
 

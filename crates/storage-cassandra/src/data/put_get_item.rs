@@ -170,7 +170,7 @@ impl CassandraEngine {
         let built = batch
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
-        self.session.batch(built).await.map_err(|error| {
+        self.session.run_batch(built).await.map_err(|error| {
             StorageError::Internal(format!("put_restored_item_at batch: {error}"))
         })?;
         Ok(())
@@ -697,7 +697,7 @@ impl CassandraEngine {
         let built = batch
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
-        self.session.batch(built).await.map_err(|error| {
+        self.session.run_batch(built).await.map_err(|error| {
             StorageError::Internal(format!("put_item_if_not_exists batch: {error}"))
         })?;
 
@@ -707,19 +707,12 @@ impl CassandraEngine {
         Ok(None) // return_old is always None — item didn't exist
     }
 
-    /// Implementation of `DataEngine::get_item`.
-    /// Read an item at `LOCAL_QUORUM`.
+    /// Read an item at `LOCAL_QUORUM` for a TTL decision.
     ///
-    /// [`Self::get_item_impl`] reads at the driver's default consistency, which is
-    /// correct for an eventually-consistent `GetItem` but not for a TTL decision:
-    /// the expiration worker and the reconciliation outbox both treat `None` as
-    /// authoritative and act on it destructively — retiring queue work, or
-    /// dropping an outbox row — and a lagging replica reads as `None` for an item
-    /// that exists. Acting on that would leave the item with no expiration entry
-    /// and therefore never expiring.
-    ///
-    /// All TTL writes commit at `LOCAL_QUORUM`, so a `LOCAL_QUORUM` read
-    /// intersects them and cannot miss a committed item.
+    /// The expiration worker and the reconciliation outbox both treat `None`
+    /// as authoritative and act on it destructively: they retire queue work,
+    /// or drop an outbox row. All TTL writes commit at `LOCAL_QUORUM`, so a
+    /// `LOCAL_QUORUM` read intersects them and cannot miss a committed item.
     pub(crate) async fn get_item_quorum(
         &self,
         key_info: &TableKeyInfo,
@@ -756,13 +749,9 @@ impl CassandraEngine {
             )
         };
 
-        let rows = crate::cassandra_util::query_rows_quorum(
-            &self.session,
-            &query,
-            values,
-            "get_item_quorum",
-        )
-        .await?;
+        let rows =
+            crate::cassandra_util::query_rows(&self.session, &query, values, "get_item_quorum")
+                .await?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -770,6 +759,7 @@ impl CassandraEngine {
         item_data.map(json_to_item).transpose()
     }
 
+    /// Implementation of `DataEngine::get_item`, at `LOCAL_QUORUM`.
     pub(crate) async fn get_item_impl(
         &self,
         key_info: &TableKeyInfo,

@@ -122,7 +122,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
 
             // Quorum, so the console's quorum session check sees the deletion.
             let query = format!("DELETE FROM {catalog_keyspace}.admin_users WHERE admin_name = ?");
-            crate::cassandra_util::execute_quorum(
+            crate::cassandra_util::execute(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(admin_name.as_str()),
@@ -150,7 +150,7 @@ impl extenddb_storage::management_store::AdminStore for CassandraCatalogStore {
             let query = format!(
                 "UPDATE {catalog_keyspace}.admin_users SET password_hash = ? WHERE admin_name = ?"
             );
-            crate::cassandra_util::execute_quorum(
+            crate::cassandra_util::execute(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(password_hash.as_str(), admin_name.as_str()),

@@ -23,6 +23,8 @@ const FORBIDDEN: &[(&str, &str)] = &[
     (".exec(", "PolicySession::run"),
     (".exec_with_values(", "PolicySession::run"),
     (".exec_with_params(", "PolicySession::run"),
+    (".batch(", "PolicySession::run_batch"),
+    (".batch_with_params(", "PolicySession::run_batch"),
     ("StatementParamsBuilder::new(", "cassandra_util::params"),
     ("BatchQueryBuilder::new(", "cassandra_util::batch"),
     ("BatchQueryBuilder::default(", "cassandra_util::batch"),

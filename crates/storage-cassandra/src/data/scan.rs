@@ -309,7 +309,7 @@ impl crate::CassandraEngine {
         // exactly one row, and `token()` is independent of the queried table's
         // schema, so this needs neither the data table to exist nor a matching
         // row in it.
-        let rows = cassandra_util::query_rows::<StorageError>(
+        let rows = cassandra_util::system_read::<StorageError>(
             &self.session_arc(),
             "SELECT token(?) AS t FROM system.local",
             QueryValues::SimpleValues(vec![Value::from(pk_text.as_str())]),

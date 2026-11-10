@@ -296,7 +296,7 @@ pub async fn reconcile_pending_older_than(
                     };
 
                     let reconcile = match storage
-                        .fetch_table_key_info_quorum(&account_id, &table_name)
+                        .fetch_table_key_info(&account_id, &table_name)
                         .await
                     {
                         Ok(key_info) if key_info.table_id == table_id => {
@@ -325,7 +325,7 @@ pub async fn reconcile_pending_older_than(
                         "DELETE FROM {keyspace}.ttl_reconcile_pending \
                      WHERE worker_partition = ? AND id = ?"
                     );
-                    if let Err(error) = crate::cassandra_util::execute_quorum::<StorageError>(
+                    if let Err(error) = crate::cassandra_util::execute::<StorageError>(
                         &storage.session,
                         &delete,
                         cdrs_tokio::query_values!(
@@ -378,7 +378,7 @@ pub async fn reconcile_inflight_repairs_once(
     let mut observed = 0usize;
     let mut processed = 0usize;
     for keyspace in crate::workers::list_account_keyspaces(storage).await? {
-        let registry = match crate::cassandra_util::query_rows_quorum(
+        let registry = match crate::cassandra_util::query_rows(
             &storage.session,
             &format!("SELECT worker_partition FROM {keyspace}.ttl_repair_inflight_partitions"),
             cdrs_tokio::query::QueryValues::SimpleValues(Vec::new()),
@@ -433,7 +433,7 @@ pub async fn reconcile_inflight_repairs_once(
                  FROM {keyspace}.ttl_repair_inflight \
                  WHERE worker_partition = ? AND repair_id <= ? LIMIT 256"
             );
-            let mut rows = match crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let mut rows = match crate::cassandra_util::query_rows::<StorageError>(
                 &storage.session,
                 &page_query,
                 cdrs_tokio::query_values!(partition, cursor_bytes.clone()),
@@ -452,7 +452,7 @@ pub async fn reconcile_inflight_repairs_once(
             let exhausted_forward = rows.len() < 256;
             if exhausted_forward {
                 let remaining = 256 - rows.len();
-                match crate::cassandra_util::query_rows_quorum::<StorageError>(
+                match crate::cassandra_util::query_rows::<StorageError>(
                     &storage.session,
                     &wrap_query,
                     cdrs_tokio::query_values!(partition, cursor_bytes),
@@ -540,7 +540,7 @@ pub async fn reconcile_inflight_repairs_once(
                 };
 
                 let (reconcile, terminal) = match storage
-                    .fetch_table_key_info_quorum(&account_id, &table_name)
+                    .fetch_table_key_info(&account_id, &table_name)
                     .await
                 {
                     Ok(key_info) if key_info.table_id == table_id => {
@@ -576,19 +576,18 @@ pub async fn reconcile_inflight_repairs_once(
                                 "DELETE FROM {keyspace}.ttl_repair_inflight \
                                  WHERE worker_partition = ? AND repair_id = ?"
                             );
-                            if let Err(error) =
-                                crate::cassandra_util::execute_quorum::<StorageError>(
-                                    &storage.session,
-                                    &delete,
-                                    cdrs_tokio::query_values!(
-                                        partition,
-                                        cdrs_tokio::types::value::Bytes::new(
-                                            repair_id.as_bytes().to_vec()
-                                        )
-                                    ),
-                                    "retire obsolete TTL repair inflight marker",
-                                )
-                                .await
+                            if let Err(error) = crate::cassandra_util::execute::<StorageError>(
+                                &storage.session,
+                                &delete,
+                                cdrs_tokio::query_values!(
+                                    partition,
+                                    cdrs_tokio::types::value::Bytes::new(
+                                        repair_id.as_bytes().to_vec()
+                                    )
+                                ),
+                                "retire obsolete TTL repair inflight marker",
+                            )
+                            .await
                             {
                                 tracing::warn!(
                                     "TTL worker: obsolete inflight marker cleanup failed: {error}"

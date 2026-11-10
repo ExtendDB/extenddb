@@ -3,6 +3,7 @@
 
 //! DDL helpers for creating and dropping per-DynamoDB-table data tables in Cassandra.
 
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{
     AttributeDefinition, IndexInfo, IndexType, KeySchemaElement, ScalarAttributeType,
@@ -57,27 +58,6 @@ impl CassandraEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        self.fetch_table_key_info_with_consistency(account_id, table_name, false)
-            .await
-    }
-
-    /// Fetch table identity at `LOCAL_QUORUM` when absence or name reuse would
-    /// otherwise allow a durable repair obligation to be discarded.
-    pub(crate) async fn fetch_table_key_info_quorum(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> Result<TableKeyInfo, StorageError> {
-        self.fetch_table_key_info_with_consistency(account_id, table_name, true)
-            .await
-    }
-
-    async fn fetch_table_key_info_with_consistency(
-        &self,
-        account_id: &str,
-        table_name: &str,
-        quorum: bool,
-    ) -> Result<TableKeyInfo, StorageError> {
         let catalog_keyspace = format!("{}_catalog", self.keyspace_prefix);
 
         let query = format!(
@@ -85,18 +65,13 @@ impl CassandraEngine {
              FROM {catalog_keyspace}.tables WHERE account_id = ? AND table_name = ?"
         );
         let values = cdrs_tokio::query_values!(account_id, table_name);
-        let rows = if quorum {
-            crate::cassandra_util::query_rows_quorum(
-                &self.session,
-                &query,
-                values,
-                "fetch_table_key_info",
-            )
-            .await?
-        } else {
-            crate::cassandra_util::query_rows(&self.session, &query, values, "fetch_table_key_info")
-                .await?
-        };
+        let rows = crate::cassandra_util::query_rows(
+            &self.session,
+            &query,
+            values,
+            "fetch_table_key_info",
+        )
+        .await?;
 
         let row = rows
             .into_iter()
@@ -543,7 +518,7 @@ pub(crate) async fn backfill_gsi(
 
         if batch_has_rows {
             session
-                .batch(
+                .run_batch(
                     batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,

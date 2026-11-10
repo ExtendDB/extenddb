@@ -202,7 +202,7 @@ impl CassandraCatalogStore {
         .await?;
         // iam_users last: user is only gone once all dependent rows are cleaned up.
         // Quorum commit, so the console's quorum session check sees the deletion.
-        crate::cassandra_util::apply_lwt_quorum(
+        crate::cassandra_util::apply_lwt(
             &session,
             &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
             cdrs_tokio::query_values!(account_id, user_name),
@@ -421,7 +421,7 @@ impl CassandraCatalogStore {
         );
 
         // Quorum commit, so the console's quorum session check sees the new hash.
-        crate::cassandra_util::apply_lwt_quorum(
+        crate::cassandra_util::apply_lwt(
             self.session(),
             &update_query,
             cdrs_tokio::query_values!(password_hash, account_id, user_name),

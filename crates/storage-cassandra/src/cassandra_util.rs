@@ -35,7 +35,8 @@ pub enum Stmt {
     Lwt,
     /// A read at `LOCAL_SERIAL`, which sees every committed Paxos round.
     SerialRead,
-    /// `CREATE`, `ALTER` or `DROP`: `ONE`.
+    /// `CREATE`, `ALTER`, `DROP`, `GRANT` or `REVOKE`: `ONE`. Cassandra does
+    /// not use the client's consistency level for these statements.
     Ddl,
     /// A read of a node-local system table (`system.local`, `system.peers`,
     /// `system_schema`): `ONE`.
@@ -78,9 +79,35 @@ pub trait PolicySession {
     ) -> impl std::future::Future<
         Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
     > + Send;
+
+    /// Send `batch`. In a debug build, a batch whose levels are not the ones
+    /// [`batch`] sets ([`batch_level_error`]) panics.
+    ///
+    /// # Errors
+    /// Returns the driver's error if the batch fails.
+    fn run_batch(
+        &self,
+        batch: cdrs_tokio::query::QueryBatch,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send;
 }
 
 impl PolicySession for CassandraSession {
+    fn run_batch(
+        &self,
+        batch: cdrs_tokio::query::QueryBatch,
+    ) -> impl std::future::Future<
+        Output = Result<cdrs_tokio::frame::Envelope, cdrs_tokio::error::Error>,
+    > + Send {
+        debug_assert!(
+            batch_level_error(&batch).is_none(),
+            "batch: {}",
+            batch_level_error(&batch).unwrap_or_default()
+        );
+        self.batch(batch)
+    }
+
     fn run<Q: AsRef<str>>(
         &self,
         kind: Stmt,
@@ -102,7 +129,8 @@ impl PolicySession for CassandraSession {
 /// What is wrong with `query` as a statement of `kind`, or `None` when its
 /// CQL matches `kind`:
 ///
-/// - [`Stmt::Read`] and [`Stmt::SerialRead`]: a `SELECT`.
+/// - [`Stmt::Read`] and [`Stmt::SerialRead`]: a `SELECT` that does not read
+///   `system.*` or `system_schema.*`.
 /// - [`Stmt::SystemRead`]: a `SELECT` from `system.*` or `system_schema.*`.
 /// - [`Stmt::Write`]: an `INSERT`, `UPDATE`, `DELETE` or `BEGIN BATCH` with
 ///   no `IF` condition.
@@ -116,16 +144,23 @@ pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
     let words = cql_words(query);
     let first = words.first().map_or("", String::as_str);
     let conditional = words.iter().any(|word| word == "IF");
+    // Each node keeps its own copy of these keyspaces (LocalStrategy).
+    let system = words
+        .iter()
+        .skip_while(|word| *word != "FROM")
+        .nth(1)
+        .is_some_and(|table| table.starts_with("SYSTEM.") || table.starts_with("SYSTEM_SCHEMA."));
     match kind {
-        Stmt::Read | Stmt::SerialRead => (first != "SELECT").then_some("a read must be a SELECT"),
+        Stmt::Read | Stmt::SerialRead => {
+            if first != "SELECT" {
+                Some("a read must be a SELECT")
+            } else if system {
+                Some("a read of system.* or system_schema.* must use Stmt::SystemRead")
+            } else {
+                None
+            }
+        }
         Stmt::SystemRead => {
-            let system = words
-                .iter()
-                .skip_while(|word| *word != "FROM")
-                .nth(1)
-                .is_some_and(|table| {
-                    table.starts_with("SYSTEM.") || table.starts_with("SYSTEM_SCHEMA.")
-                });
             if first != "SELECT" {
                 Some("a system read must be a SELECT")
             } else if system {
@@ -154,6 +189,22 @@ pub fn shape_error(kind: Stmt, query: &str) -> Option<&'static str> {
         }
         Stmt::Ddl => (!matches!(first, "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE"))
             .then_some("DDL must be a CREATE, ALTER, DROP, GRANT or REVOKE"),
+    }
+}
+
+/// What is wrong with the levels of `batch`, or `None` when they are the
+/// ones [`batch`] sets: `LOCAL_QUORUM`, with `LOCAL_SERIAL` for a
+/// conditional batch.
+#[must_use]
+pub fn batch_level_error(batch: &cdrs_tokio::query::QueryBatch) -> Option<&'static str> {
+    use cdrs_tokio::consistency::Consistency;
+
+    if batch.request.consistency != Consistency::LocalQuorum {
+        Some("a batch must run at LOCAL_QUORUM; build it with cassandra_util::batch()")
+    } else if batch.request.serial_consistency != Some(Consistency::LocalSerial) {
+        Some("a batch must have LOCAL_SERIAL; build it with cassandra_util::batch()")
+    } else {
+        None
     }
 }
 
@@ -324,16 +375,6 @@ pub async fn query_rows<E: FromDbError>(
     rows_at(session, query, Stmt::Read, values, context).await
 }
 
-/// The same as [`query_rows`]. A later commit removes it.
-pub async fn query_rows_quorum<E: FromDbError>(
-    session: &Arc<CassandraSession>,
-    query: &str,
-    values: QueryValues,
-    context: &str,
-) -> Result<Vec<Row>, E> {
-    query_rows(session, query, values, context).await
-}
-
 /// Execute a query at `LOCAL_SERIAL` and return all rows: the read sees
 /// every Paxos round that committed, so a row an LWT wrote (a claim taken,
 /// a heartbeat refreshed) is read as written. For the reads whose answer
@@ -378,27 +419,6 @@ pub async fn execute<E: FromDbError>(
         E::db_error("Database error".to_owned())
     })?;
 
-    Ok(())
-}
-
-/// [`execute`], but the error names `context` and the driver's error, as
-/// before. A later commit removes it.
-///
-/// # Errors
-/// Returns an error if Cassandra does not acknowledge the statement at quorum.
-pub async fn execute_quorum<E: FromDbError>(
-    session: &Arc<CassandraSession>,
-    query: &str,
-    values: QueryValues,
-    context: &str,
-) -> Result<(), E> {
-    session
-        .run(Stmt::Write, query, values)
-        .await
-        .map_err(|error| {
-            tracing::error!("{context} quorum execute failed: {error}");
-            E::db_error(format!("{context}: {error}"))
-        })?;
     Ok(())
 }
 
@@ -552,20 +572,6 @@ pub async fn apply_lwt<E: FromDbError>(
     lwt_applied_flag(&result, context)
 }
 
-/// The same as [`apply_lwt`]. A later commit removes it.
-///
-/// # Errors
-/// Returns an error if Cassandra does not acknowledge the statement at quorum
-/// or the response cannot be parsed.
-pub async fn apply_lwt_quorum<E: FromDbError>(
-    session: &Arc<CassandraSession>,
-    query: &str,
-    values: QueryValues,
-    context: &str,
-) -> Result<bool, E> {
-    apply_lwt(session, query, values, context).await
-}
-
 /// The `[applied]` flag of an LWT response, `false` when the response has no row.
 fn lwt_applied_flag<E: FromDbError>(
     result: &cdrs_tokio::frame::Envelope,
@@ -587,7 +593,34 @@ fn lwt_applied_flag<E: FromDbError>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Stmt, batch, params, shape_error};
+    use super::{Stmt, batch, batch_level_error, params, shape_error};
+
+    fn one_insert(builder: cdrs_tokio::query::BatchQueryBuilder) -> cdrs_tokio::query::QueryBatch {
+        builder
+            .add_query(
+                "INSERT INTO ks.t (id) VALUES (1)",
+                QueryValues::SimpleValues(vec![]),
+            )
+            .build()
+            .expect("a batch")
+    }
+
+    #[test]
+    fn only_a_batch_from_batch_has_the_policy_levels() {
+        assert_eq!(batch_level_error(&one_insert(batch())), None);
+        assert!(
+            batch_level_error(&one_insert(cdrs_tokio::query::BatchQueryBuilder::new())).is_some()
+        );
+        assert!(batch_level_error(&one_insert(Default::default())).is_some());
+        assert!(
+            batch_level_error(&one_insert(
+                cdrs_tokio::query::BatchQueryBuilder::new()
+                    .with_consistency(Consistency::LocalQuorum)
+            ))
+            .is_some(),
+            "LOCAL_QUORUM without LOCAL_SERIAL"
+        );
+    }
 
     #[test]
     fn a_read_must_be_a_select() {
@@ -596,6 +629,22 @@ mod tests {
             None
         );
         assert_eq!(shape_error(Stmt::SerialRead, "select a from ks.t"), None);
+        assert_eq!(
+            shape_error(
+                Stmt::Read,
+                "SELECT role FROM system_auth.roles WHERE role = ?"
+            ),
+            None,
+            "system_auth is replicated, so it is not a SystemRead"
+        );
+        assert!(shape_error(Stmt::Read, "SELECT token(?) AS t FROM system.local").is_some());
+        assert!(
+            shape_error(
+                Stmt::SerialRead,
+                "SELECT table_name FROM system_schema.tables"
+            )
+            .is_some()
+        );
         assert!(shape_error(Stmt::Read, "UPDATE ks.t SET a = 1 WHERE pk = ?").is_some());
         assert!(shape_error(Stmt::SerialRead, "DELETE FROM ks.t WHERE pk = ?").is_some());
     }

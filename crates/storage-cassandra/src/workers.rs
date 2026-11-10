@@ -3,6 +3,7 @@
 
 //! Cassandra-specific background workers.
 
+use crate::cassandra_util::PolicySession as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -491,7 +492,7 @@ async fn gsi_apply_index(
         .build()
         .map_err(|e| extenddb_storage::error::StorageError::Internal(e.to_string()))?;
     if !built.request.queries.is_empty() {
-        engine.session.batch(built).await.map_err(|e| {
+        engine.session.run_batch(built).await.map_err(|e| {
             extenddb_storage::error::StorageError::Internal(format!("gsi_apply: {e}"))
         })?;
     }

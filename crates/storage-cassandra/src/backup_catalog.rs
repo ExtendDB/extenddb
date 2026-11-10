@@ -121,7 +121,7 @@ fn seconds_to_millis(seconds: f64) -> i64 {
 /// The coordinator's clock, in epoch milliseconds: the clock every heartbeat
 /// is stamped with, so a stale window is measured on it.
 pub(crate) async fn coordinator_now_millis(engine: &CassandraEngine) -> Result<i64, StorageError> {
-    let rows = crate::cassandra_util::query_rows::<StorageError>(
+    let rows = crate::cassandra_util::system_read::<StorageError>(
         &engine.session,
         "SELECT toTimestamp(now()) AS now FROM system.local",
         cdrs_tokio::query_values!(),
@@ -378,7 +378,7 @@ impl JobClaim for CassandraBackupClaim {
                  FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
                 self.engine.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.engine.session,
                 &query,
                 cdrs_tokio::query_values!(
@@ -450,7 +450,7 @@ impl CassandraEngine {
                 ),
             );
         self.session
-            .batch(
+            .run_batch(
                 batch
                     .build()
                     .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -469,7 +469,7 @@ impl CassandraEngine {
             "SELECT * FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -518,7 +518,7 @@ impl CassandraEngine {
                 ),
             );
         let sent = match batch.build() {
-            Ok(batch) => self.session.batch(batch).await.map(|_| ()),
+            Ok(batch) => self.session.run_batch(batch).await.map(|_| ()),
             Err(error) => Err(error),
         };
         if let Err(error) = sent {
@@ -541,7 +541,7 @@ impl CassandraEngine {
              WHERE store_root = ? AND backup_status = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(store.store_root.as_str(), status.as_str()),
@@ -651,7 +651,7 @@ impl CassandraEngine {
              FROM {}.tables WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, table_name),
@@ -844,7 +844,7 @@ impl JobClaim for CassandraRestoreClaim {
                  restore_failure_reason FROM {}.tables WHERE account_id = ? AND table_name = ?",
                 self.engine.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.engine.session,
                 &query,
                 cdrs_tokio::query_values!(
@@ -887,7 +887,7 @@ impl BackupCatalog for CassandraEngine {
                 "SELECT value FROM {}.settings WHERE key = 'catalog_id'",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(),
@@ -1012,7 +1012,7 @@ impl BackupCatalog for CassandraEngine {
                     ),
                 );
             self.session
-                .batch(
+                .run_batch(
                     batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -1523,7 +1523,7 @@ impl BackupCatalog for CassandraEngine {
             let scan = format!(
                 "SELECT account_id, backup_arn, active_restores FROM {catalog}.backups_by_arn"
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &scan,
                 cdrs_tokio::query_values!(),
@@ -1702,7 +1702,7 @@ impl BackupCatalog for CassandraEngine {
                      ALLOW FILTERING",
                     self.catalog_keyspace()
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status),
@@ -1786,7 +1786,7 @@ impl BackupCatalog for CassandraEngine {
                  ALLOW FILTERING",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(),
@@ -1956,7 +1956,7 @@ impl BackupCatalog for CassandraEngine {
                  WHERE account_id = ? AND table_name = ?",
                 self.catalog_keyspace()
             );
-            let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+            let rows = crate::cassandra_util::query_rows::<StorageError>(
                 &self.session,
                 &query,
                 cdrs_tokio::query_values!(key.account_id.as_str(), key.table_name.as_str()),
@@ -1995,7 +1995,7 @@ impl BackupCatalog for CassandraEngine {
                      ALLOW FILTERING",
                     self.catalog_keyspace()
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status.as_str()),
@@ -2071,7 +2071,7 @@ impl BackupCatalog for CassandraEngine {
                 BackupStatus::Deleted,
                 BackupStatus::Failed,
             ] {
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(store_root, status.as_str()),

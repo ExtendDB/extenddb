@@ -547,7 +547,7 @@ impl CassandraEngine {
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
         self.session
-            .batch(built)
+            .run_batch(built)
             .await
             .map_err(|error| StorageError::Internal(format!("occ_write batch: {error}")))?;
 

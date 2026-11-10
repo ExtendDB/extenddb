@@ -2185,7 +2185,7 @@ impl CassandraEngine {
             .build()
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         for batch in secondary_effect_batches(index_batch, stream_stmt) {
-            self.session.batch(batch).await.map_err(|e| {
+            self.session.run_batch(batch).await.map_err(|e| {
                 StorageError::Internal(format!("commit_secondary_effects batch: {e}"))
             })?;
         }

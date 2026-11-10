@@ -3,6 +3,7 @@
 
 //! `update_table` implementation for the Cassandra backend.
 
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::query::QueryValues;
 use cdrs_tokio::types::IntoRustByName;
@@ -567,7 +568,7 @@ impl CassandraEngine {
         if indexes_batch_has_statements
             && let Err(e) = self
                 .session
-                .batch(
+                .run_batch(
                     indexes_batch
                         .build()
                         .map_err(|e| StorageError::Internal(e.to_string()))?,

@@ -364,8 +364,8 @@ backend is experimental rather than production-ready.
   are known (observed as intermittent integration-test failures) and are being
   worked. Under concurrent load, outcomes may occasionally diverge from
   DynamoDB semantics.
-- **Single-datacenter writes per table.** Transaction and TTL lifecycle
-  operations use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
+- **Single-datacenter writes per table.** Reads, writes and lightweight
+  transactions use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
 - **Multi-node ExtendDB needs node-id configuration.** Running more than one

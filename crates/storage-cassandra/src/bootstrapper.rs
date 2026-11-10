@@ -329,7 +329,7 @@ impl CassandraBootstrapper {
             .held
             .request(
                 "Read the accounts",
-                crate::cassandra_util::query_rows_quorum::<extenddb_storage::error::StorageError>(
+                crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
                     &self.engine.session_arc(),
                     &format!("SELECT account_id FROM {keyspace}.accounts"),
                     cdrs_tokio::query_values!(),
@@ -699,16 +699,15 @@ impl Bootstrapper for CassandraBootstrapper {
         })
     }
 
-    /// Read at `LOCAL_QUORUM`, since `init` finishes a catalog this answers
-    /// `false` for: at `ONE` a replica that missed the admin user's write
-    /// would read as empty.
+    /// Read at `LOCAL_QUORUM`: `init` finishes a catalog this answers `false`
+    /// for, so a replica that missed the admin user's write must not answer.
     async fn has_admin_user(&self) -> OpResult<bool> {
         let keyspace = self.engine.catalog_keyspace();
         let rows = self
             .held
             .request(
                 "Read the admin users",
-                crate::cassandra_util::query_rows_quorum::<extenddb_storage::error::StorageError>(
+                crate::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
                     &self.engine.session_arc(),
                     &format!("SELECT admin_name FROM {keyspace}.admin_users LIMIT 1"),
                     cdrs_tokio::query_values!(),

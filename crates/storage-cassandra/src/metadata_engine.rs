@@ -52,9 +52,7 @@ impl CassandraEngine {
         let epoch_before = self
             .ttl_config_cache_epoch
             .load(std::sync::atomic::Ordering::Acquire);
-        let config = self
-            .ttl_config_for_table_at(account_id, table_name, false)
-            .await?;
+        let config = self.read_ttl_config(account_id, table_name).await?;
         let mut cache = self
             .ttl_config_cache
             .lock()
@@ -85,27 +83,26 @@ impl CassandraEngine {
             .remove(&(account_id.to_owned(), table_name.to_owned()));
     }
 
-    /// Read TTL configuration at `LOCAL_QUORUM` for an authoritative absence
-    /// decision. Durable repair records must not be discharged from a stale
-    /// replica that still reports TTL disabled or an old generation.
+    /// Read TTL configuration from the catalog, not from the cache that
+    /// [`Self::ttl_config_for_table`] serves, for an authoritative absence
+    /// decision. Durable repair records must not be discharged from a cached
+    /// value that still reports TTL disabled or an old generation.
     pub(crate) async fn ttl_config_for_table_quorum(
         &self,
         account_id: &str,
         table_name: &str,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
-        self.ttl_config_for_table_at(account_id, table_name, true)
-            .await
+        self.read_ttl_config(account_id, table_name).await
     }
 
-    /// One implementation for both consistencies, so the legacy null-generation
-    /// adoption cannot drift between them. An applied adoption LWT is already
-    /// authoritative (Paxos), so no re-read is needed in that arm at either
-    /// consistency; a lost adoption race re-reads to pick up the winner.
-    async fn ttl_config_for_table_at(
+    /// The catalog read behind both TTL configuration reads, so the legacy
+    /// null-generation adoption cannot drift between them. An applied
+    /// adoption LWT is already authoritative (Paxos), so no re-read is needed
+    /// in that arm; a lost adoption race re-reads to pick up the winner.
+    async fn read_ttl_config(
         &self,
         account_id: &str,
         table_name: &str,
-        quorum: bool,
     ) -> Result<Option<crate::data::ttl::TtlConfig>, StorageError> {
         let query = format!(
             "SELECT ttl_attribute, ttl_generation FROM {}.tables \
@@ -115,23 +112,13 @@ impl CassandraEngine {
         let read = |context: &'static str| {
             let query = query.clone();
             async move {
-                let rows = if quorum {
-                    crate::cassandra_util::query_rows_quorum(
-                        &self.session,
-                        &query,
-                        cdrs_tokio::query_values!(account_id, table_name),
-                        context,
-                    )
-                    .await?
-                } else {
-                    crate::cassandra_util::query_rows(
-                        &self.session,
-                        &query,
-                        cdrs_tokio::query_values!(account_id, table_name),
-                        context,
-                    )
-                    .await?
-                };
+                let rows = crate::cassandra_util::query_rows(
+                    &self.session,
+                    &query,
+                    cdrs_tokio::query_values!(account_id, table_name),
+                    context,
+                )
+                .await?;
                 Ok::<_, StorageError>(rows.into_iter().next())
             }
         };
