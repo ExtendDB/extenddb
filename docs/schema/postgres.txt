@@ -348,6 +348,8 @@ sequence stream_seq: bigint START 1 INCREMENT 1
 table extenddb_migrations
 table gsi_pending
 table idempotency_tokens
+table item_history
+table pitr_state
 table restore_progress
 table schema_history
 table stream_pending
@@ -373,6 +375,18 @@ column idempotency_tokens.account_id: text NOT NULL
 column idempotency_tokens.token: text NOT NULL
 column idempotency_tokens.fingerprint: text NOT NULL
 column idempotency_tokens.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column item_history.seq: bigint NOT NULL DEFAULT nextval('item_history_seq_seq'::regclass)
+column item_history.table_id: text NOT NULL
+column item_history.pk: text NOT NULL COLLATE "C"
+column item_history.sk: text NOT NULL COLLATE "C"
+column item_history.commit_time_us: bigint NOT NULL
+column item_history.item_data: jsonb
+column pitr_state.table_id: text NOT NULL
+column pitr_state.recovery_period_days: integer NOT NULL
+column pitr_state.enabled_at_us: bigint NOT NULL
+column pitr_state.pruned_to_us: bigint NOT NULL DEFAULT 0
+column pitr_state.pinned_at_us: bigint
+column pitr_state.pin_expires_us: bigint
 column restore_progress.table_id: text NOT NULL
 column restore_progress.file_index: bigint NOT NULL
 column restore_progress.items_applied: bigint NOT NULL
@@ -405,9 +419,13 @@ index gsi_pending_pkey: CREATE UNIQUE INDEX gsi_pending_pkey ON public.gsi_pendi
 index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (account_id, token)
 index idx_gsi_pending_claim: CREATE INDEX idx_gsi_pending_claim ON public.gsi_pending USING btree (worker_partition, ready_at, id)
 index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
+index idx_item_history_key: CREATE INDEX idx_item_history_key ON public.item_history USING btree (table_id, pk, sk, seq)
+index idx_item_history_table_seq: CREATE INDEX idx_item_history_table_seq ON public.item_history USING btree (table_id, seq)
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
 index idx_vector_index_holds_table: CREATE INDEX idx_vector_index_holds_table ON public.vector_index_holds USING btree (table_id)
+index item_history_pkey: CREATE UNIQUE INDEX item_history_pkey ON public.item_history USING btree (seq)
+index pitr_state_pkey: CREATE UNIQUE INDEX pitr_state_pkey ON public.pitr_state USING btree (table_id)
 index restore_progress_pkey: CREATE UNIQUE INDEX restore_progress_pkey ON public.restore_progress USING btree (table_id, file_index)
 index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
 index stream_pending_pkey: CREATE UNIQUE INDEX stream_pending_pkey ON public.stream_pending USING btree (shard_id, id)
@@ -417,6 +435,8 @@ index vector_index_holds_pkey: CREATE UNIQUE INDEX vector_index_holds_pkey ON pu
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint gsi_pending.gsi_pending_pkey: PRIMARY KEY (id)
 constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (account_id, token)
+constraint item_history.item_history_pkey: PRIMARY KEY (seq)
+constraint pitr_state.pitr_state_pkey: PRIMARY KEY (table_id)
 constraint restore_progress.restore_progress_pkey: PRIMARY KEY (table_id, file_index)
 constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
 constraint stream_pending.stream_pending_pkey: PRIMARY KEY (shard_id, id)
@@ -426,5 +446,6 @@ constraint stream_records.stream_records_shard_id_fkey: FOREIGN KEY (shard_id) R
 constraint stream_shards.stream_shards_pkey: PRIMARY KEY (shard_id)
 constraint vector_index_holds.vector_index_holds_pkey: PRIMARY KEY (table_id, index_id)
 sequence gsi_pending_id_seq: bigint START 1 INCREMENT 1
+sequence item_history_seq_seq: bigint START 1 INCREMENT 1
 sequence stream_pending_id_seq: bigint START 1 INCREMENT 1
 sequence stream_seq: bigint START 1 INCREMENT 1

@@ -168,6 +168,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0009_warm_throughput.cql"
             )],
         },
+        MigrationId::PointInTimeRecovery => Migration::NotApplicable(
+            "point-in-time recovery is not available on Cassandra; its restore answers \
+             PointInTimeRecoveryUnavailableException",
+        ),
     }
 }
 

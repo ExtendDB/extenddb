@@ -138,6 +138,15 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 m0009_warm_throughput::SOURCE,
             )],
         },
+        MigrationId::PointInTimeRecovery => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_point_in_time_recovery.sql"
+            )],
+        },
     }
 }
 
