@@ -287,6 +287,54 @@ def test_idempotent_replay_and_mismatch(dynamodb_client, ttable):
     )
 
 
+# A replay with the same token and statements is compared on
+# ReturnConsumedCapacity too, an absent field being NONE (measured 2026-11-10,
+# two sends each).
+
+_IDEMPOTENT_MISMATCH = (
+    "IdempotentParameterMismatchException",
+    "Specified idempotent token was used with different request parameters within the idempotency window",
+)
+
+
+def _insert_one(table):
+    pk = f"t5rcc-{uuid.uuid4().hex[:12]}"
+    return [{"Statement": f"INSERT INTO \"{table}\" VALUE {{'pk':'{pk}','sk':'s1','a':1}}"}]
+
+
+@pytest.mark.parametrize(
+    ("first", "replay"),
+    [
+        pytest.param({"ReturnConsumedCapacity": "TOTAL"}, {}, id="total-then-absent"),
+        pytest.param({}, {"ReturnConsumedCapacity": "TOTAL"}, id="absent-then-total"),
+        pytest.param(
+            {"ReturnConsumedCapacity": "TOTAL"},
+            {"ReturnConsumedCapacity": "INDEXES"},
+            id="total-then-indexes",
+        ),
+    ],
+)
+def test_idempotent_replay_with_another_return_consumed_capacity_is_a_mismatch(
+    dynamodb_client, ttable, first, replay
+):
+    token = uuid.uuid4().hex
+    statements = _insert_one(ttable)
+    resp = _txn(dynamodb_client, statements, ClientRequestToken=token, **first)
+    assert resp["Responses"] == []
+    with pytest.raises(ClientError) as excinfo:
+        _txn(dynamodb_client, statements, ClientRequestToken=token, **replay)
+    assert _error(excinfo) == _IDEMPOTENT_MISMATCH
+
+
+def test_idempotent_replay_without_return_consumed_capacity(dynamodb_client, ttable):
+    token = uuid.uuid4().hex
+    statements = _insert_one(ttable)
+    for _ in range(2):
+        resp = _txn(dynamodb_client, statements, ClientRequestToken=token)
+        resp.pop("ResponseMetadata", None)
+        assert resp == {"Responses": []}
+
+
 # --- T6: conflicting keys (request-level) ---------------------------------
 
 
