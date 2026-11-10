@@ -16,6 +16,23 @@ with DynamoDB works with ExtendDB, unchanged.
 - **Multi-cloud** — use DynamoDB semantics on any cloud that runs an ExtendDB-supported database backend
 - **Air-gapped environments** — DynamoDB functionality with no internet connectivity
 
+## Scope
+
+ExtendDB is a server that implements the Amazon DynamoDB API on a database that you provide: PostgreSQL, SQLite, MongoDB or Cassandra. An application connects to it through the endpoint setting of an AWS SDK or the AWS CLI. The application signs each request with an access key stored in ExtendDB.
+
+ExtendDB 1.0 is for:
+
+- Local development and continuous integration (CI) test runs.
+- Self-hosted deployments: on premises, in a private or public cloud, at the edge, or on a network with no internet access.
+
+ExtendDB 1.0 is not:
+
+- Amazon DynamoDB: ExtendDB is a separate implementation of the API. [Differences from DynamoDB](docs/differences-from-dynamodb.md) lists the known differences and the operations that ExtendDB does not implement, for example global tables.
+- A managed service: you provide the database, and the database's own tools handle replication, failover and database backups.
+- A multi-server deployment: run one ExtendDB server for each catalog. In 1.0, more than one server on one catalog is not supported.
+
+[Storage backends](#storage-backends) says what 1.0 promises for each backend. The [versioning policy](docs/versioning.md) says what a release can change.
+
 ## Features
 
 - Full DynamoDB wire protocol: CRUD, Query, Scan, Batch, Transactions, Streams, TTL, Import/Export
@@ -26,6 +43,27 @@ with DynamoDB works with ExtendDB, unchanged.
 - CSRF protection, security headers, session management
 - JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions
 - Daemon mode with syslog logging, plus `--foreground` for container and supervisor environments
+
+## Storage backends
+
+An ExtendDB binary contains one storage backend, which the build selects. The tier of a backend says what the 1.x releases promise for it:
+
+- Stable: for production. The [versioning policy](docs/versioning.md) applies in full. The ExtendDB CI is reliably green for the backend.
+- Beta: for production within the known limits in the table. The ExtendDB CI is reliably green for the backend. The versioning policy applies with one exception. To remove a known limit, a minor release can change the behavior that the table lists, and its release notes name the change.
+- Experimental: for evaluation. The backend is not for production use. The versioning policy does not apply. A release can change the backend's behavior or configuration with no deprecation period.
+
+A backend moves up one tier in a minor release. Before that release, the maintainers agree in an issue that the ExtendDB CI has been reliably green for the backend. They also agree that its known limits fit the higher tier. The release notes name the move. A backend moves down a tier only through the [deprecation steps](docs/versioning.md#deprecation) of the versioning policy.
+
+| Backend | Tier | Topology | Data across upgrades | API coverage | CI | Known limits |
+|---|---|---|---|---|---|---|
+| PostgreSQL | Stable | PostgreSQL 14 or later, on the same host, on another host or as a managed service. | `extenddb migrate --yes` migrates the catalog in place. CI upgrades catalogs that 0.1.x releases created. | The operations in [Supported Operations](#supported-operations). Vector search needs the pgvector extension. | `integration`, required, on PostgreSQL 16 | Time to Live (TTL) removes about 100 expired items per table per minute. |
+| SQLite | Stable (single node) | SQLite runs in the server process. A lock file allows one server for each database file. There is no production image, so build from source. | As PostgreSQL. `migrate --yes` copies the database file before its first change. | The operations in Supported Operations. | `integration`, required | One write transaction at a time. TTL as PostgreSQL. |
+| MongoDB | Beta | MongoDB 7.0 or later, as a replica set, also for one node. | As PostgreSQL. | No vector search. On a global secondary index (GSI) with more than one RANGE attribute, `Query` takes a key condition on the first one only. | `mongodb-integration`, required, on MongoDB 7 | A number in a key attribute has at most 34 significant digits. The database names are fixed, so one replica set holds one catalog. TTL as PostgreSQL. |
+| Cassandra | Experimental | Cassandra 4.1 or later, with `PasswordAuthenticator`. Each table takes its writes in one datacenter. | `migrate --yes` migrates the catalog. No rollback procedure is tested. | No vector search. CreateBackup keeps each backup in the catalog, with or without a backup store. The `Query` limit of MongoDB on a GSI with more than one RANGE attribute. | `cassandra-integration`, required, on Cassandra 4.1 | Some management operations are not atomic. A few known race conditions are open. TTL removes about 1,000 expired items per table per minute. See [Known Limitations](docs/cassandra-setup.md#known-limitations). |
+
+On every backend, run one ExtendDB server for each catalog. Only SQLite enforces this. [Differences from DynamoDB](docs/differences-from-dynamodb.md) lists the differences of each backend from the service.
+
+The `@extenddb/dev` npm package and the `extenddb/extenddb-dev` image run a dev-mode SQLite build, for local development and CI. Dev mode uses plain HTTP and seeds an example key that can do everything, so keep a dev-mode server on loopback. At startup it migrates a catalog that is behind it, after it copies the database file.
 
 ## Quick Start
 
@@ -283,6 +321,7 @@ docs/
 | [Deployment Guide](docs/manuals/11-deployment-guide.md) | Self-hosted, multi-cloud, air-gapped deployments |
 | [Backup and Restore](docs/manuals/14-backup-and-restore.md) | Backup strategy, recovery figures, restore drill, catalog-loss recovery |
 | [Differences from DynamoDB](docs/differences-from-dynamodb.md) | Behavioral differences and unsupported operations |
+| [Versioning and Support Policy](docs/versioning.md) | What each release can change, and how long a release gets fixes |
 | [Troubleshooting](docs/troubleshooting.md) | Common errors and solutions |
 | [Verifying Container Images](docs/verifying-images.md) | Build provenance and SBOM attestations for the published images |
 
