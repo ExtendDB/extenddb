@@ -196,7 +196,7 @@ still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
 8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. On SIGTERM/SIGINT: drain connections (5s timeout), end the running backup jobs through their failure path (30s), stop the background tasks (5s, then abort) and give up the serving registration, exit
 
 ## Catalog Model
 
@@ -247,7 +247,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- Sessions expire after 8 hours of inactivity
+- Sessions end 8 hours after login, however active they are, when the session cookie also expires
 
 ### Input Validation
 
@@ -260,7 +260,7 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own account), version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
@@ -277,7 +277,7 @@ The console reads all data through four of the traits that `CatalogStore` combin
 
 ### Authentication Model
 
-- Session-based authentication; sessions expire after 8 hours of inactivity
+- Session-based authentication; sessions end 8 hours after login, however active they are, when the session cookie also expires
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
 - Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers

@@ -9,6 +9,15 @@ license.workspace = true
 
 [features]
 mongodb-test-hooks = []
+# The backup and restore jobs' kill-point pauses (`EXTENDDB_BACKUP_PAUSE`),
+# for the binary-level crash tests. The engine's points are its own feature;
+# the points inside the backends' writes (`restore_sqlite_mid_batch`,
+# `restore_postgres_before_progress_delete`,
+# `restore_mongodb_after_insert_many`, `restore_cassandra_before_progress`)
+# are calls of `extenddb_storage::backup_catalog::restore_pause_point`, so
+# `extenddb-storage/test-hooks` arms them in whichever backend the build
+# selects without naming a backend crate here (the server depends on none).
+backup-test-hooks = ["extenddb-engine/backup-test-hooks", "extenddb-storage/test-hooks"]
 
 [dependencies]
 extenddb-cache = { workspace = true }
@@ -16,6 +25,7 @@ extenddb-core = { workspace = true }
 extenddb-config = { workspace = true }
 extenddb-engine = { workspace = true }
 extenddb-storage = { workspace = true }
+extenddb-backup-store = { workspace = true }
 extenddb-auth = { workspace = true }
 futures = { workspace = true }
 axum = { workspace = true }
@@ -51,3 +61,10 @@ libc = { workspace = true }
 
 [dev-dependencies]
 extenddb-cache = { workspace = true, features = ["test-util"] }
+# The login tests count bcrypt checks with `count_verifications` against an
+# in-memory SQLite catalog.
+extenddb-storage = { workspace = true, features = ["test-util"] }
+extenddb-storage-sqlite = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }

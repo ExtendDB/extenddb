@@ -107,7 +107,7 @@ async fn two_migrators_started_together_apply_a_legacy_catalog_once() {
     )
     .await;
     // The second migrator waits for the first's whole run, every schema
-    // statement of migrations 1 to 6 with an agreement wait after each:
+    // statement of migrations 1 to 6 and 9 with an agreement wait after each:
     // about 16 s on an idle node, and past 60 s beside the rest of this
     // binary's tests on one node.
     let wait = 4 * TIMEOUT;

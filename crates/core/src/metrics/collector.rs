@@ -348,6 +348,81 @@ impl MetricsCollector {
         );
     }
 
+    /// Record the end of a store-backed backup job: one `BackupJobs` under
+    /// the outcome and its duration in microseconds under the same
+    /// dimension. The job measures the duration from the snapshot's open to
+    /// the end of its last catalog or store call: the AVAILABLE write for a
+    /// job that succeeded, the FAILED write and the prefix's deletion for
+    /// one that failed.
+    pub fn record_backup_job(&self, outcome: super::types::BackupJobOutcome, duration_us: f64) {
+        let outcome = outcome.to_string();
+        self.record(MetricName::BackupJobs, 1.0, None, None, Some(&outcome));
+        self.record(
+            MetricName::BackupJobDuration,
+            duration_us,
+            None,
+            None,
+            Some(&outcome),
+        );
+    }
+
+    /// Record bytes a backup job wrote to the store; the job records them
+    /// once it ended AVAILABLE, so a failed job's uploaded and then deleted
+    /// bytes are not counted.
+    #[allow(clippy::cast_precision_loss)] // byte counts of one backup
+    pub fn record_backup_bytes_uploaded(&self, bytes: u64) {
+        self.record(
+            MetricName::BackupBytesUploaded,
+            bytes as f64,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Record a running backup job's snapshot age in seconds (gauge).
+    pub fn record_backup_snapshot_age(&self, age_secs: f64) {
+        self.record(MetricName::BackupSnapshotAge, age_secs, None, None, None);
+    }
+
+    /// Record a failed store call of a backup job, a restore job or the
+    /// backup reconciler; `op` names the call (a backup job's `put` and
+    /// `delete_prefix`, a restore's `get`, the reconciler's `get`, `list`
+    /// and `delete_prefix`).
+    pub fn record_backup_store_error(&self, op: &str) {
+        self.record(MetricName::BackupStoreErrors, 1.0, None, None, Some(op));
+    }
+
+    /// Record the end of a store-backed restore job: one `RestoreJobs` under
+    /// the outcome and its duration in microseconds under the same
+    /// dimension, as [`Self::record_backup_job`] records a backup's. The job
+    /// measures the duration from its registration to the end of its last
+    /// catalog or store call.
+    pub fn record_restore_job(&self, outcome: super::types::BackupJobOutcome, duration_us: f64) {
+        let outcome = outcome.to_string();
+        self.record(MetricName::RestoreJobs, 1.0, None, None, Some(&outcome));
+        self.record(
+            MetricName::RestoreJobDuration,
+            duration_us,
+            None,
+            None,
+            Some(&outcome),
+        );
+    }
+
+    /// Record bytes a restore job read from the store, as each download
+    /// arrived.
+    #[allow(clippy::cast_precision_loss)] // byte counts of one backup
+    pub fn record_restore_bytes_downloaded(&self, bytes: u64) {
+        self.record(
+            MetricName::RestoreBytesDownloaded,
+            bytes as f64,
+            None,
+            None,
+            None,
+        );
+    }
+
     /// Record per-segment latency breakdown for a request.
     pub fn record_segments(
         &self,
