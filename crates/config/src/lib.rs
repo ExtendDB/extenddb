@@ -186,6 +186,16 @@ impl StorageConfig {
         self.config.database_file()
     }
 
+    /// [`Self::database_file`] with the reason a location names no usable
+    /// file ([`extenddb_storage::config::StorageConfig::database_location`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    pub fn database_location(&self) -> Result<Option<PathBuf>, String> {
+        self.config.database_location()
+    }
+
     /// Get a reference to the underlying trait object for factory calls.
     pub fn as_trait(&self) -> &(dyn extenddb_storage::config::StorageConfig + 'static) {
         &*self.config
