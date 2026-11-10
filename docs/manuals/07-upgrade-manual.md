@@ -20,16 +20,16 @@ An S3 store needs `spool_path` set on every backend except file-backed SQLite, w
 
 Migration 8 adds the `restore_progress` table to the PostgreSQL data database. Run `extenddb migrate --yes` before you start the new binary. If you restore the PostgreSQL data database from a dump taken before migration 8, run `extenddb migrate --yes` again.
 
-If a restore recorded no progress, the reconciler starts it again from its first data file. It marks the restore `FAILED` as `target_not_empty` only when the target holds more items than the backup. To restore that backup again, run `extenddb backup remove-target --account <account> <table>`, which removes the target and its record (see the admin guide's `backup` section). `backup remove-target` writes the catalog, so on SQLite stop the server for it, as for `purge`.
+If a store-backed restore whose server stopped has no recorded progress, the reconciler starts it again from its first data file. It marks the restore `FAILED` as `target_not_empty` only when the target holds more items than the backup. To restore that backup again, run `extenddb backup remove-target --account <account> <table>`. It removes the target and its record (see the admin guide's `backup` section). `backup remove-target` writes the catalog, so on SQLite stop the server for it, as for `purge`.
 
 A rollback restores the catalog from the pre-upgrade backup (see [Migration 6](#migration-6-the-backup-catalog-index)), so a store-backed restore in flight loses its job record. The previous binary resumes no restore. Quiesce restores before a downgrade.
 
-On file-backed SQLite, an absent `[backup.store]` section is a filesystem store at `backups/` beside the database file, created `0700` at startup. That root must be owned by the extenddb user, with mode `0700`. Each directory above it must be owned by root or by that user, with no write access for others.
+On file-backed SQLite, an absent `[backup.store]` section is a filesystem store at `backups/` beside the database file, created `0700` at startup. That root must be owned by the extenddb user, with mode `0700`. Each directory above it must be owned by root or by that user, with no write access for group or others.
 
 - A default root can break this rule, for example when the database file is in a group-writable directory. Its `extenddb-store.json` can also name another catalog, for example after `destroy` and `init` re-created the catalog under the old root. In both cases the server logs a warning at startup: `backup store: the default root ... failed its check`. It leaves the store unconfigured, not unhealthy. So the upgrade never stops a server that never configured backups, and CreateBackup keeps working on it. `kind = "disabled"` silences this warning. The same root configured explicitly is a startup error or an unhealthy store.
 - The warning applies only while the catalog has no backup rows for the default root. That is the case after an upgrade, on a new deployment, and on a catalog re-created by `destroy` and `init`. Once a server has written rows for it, the default root is handled as a configured one. Its backups then never vanish behind a warning. A failed identity check is then an unhealthy store, reported on `/health`. A root that can no longer be opened is a startup error.
 
-More than one server on one catalog is not supported in 1.0. A second server on the same catalog with a host-local store root starts with the store unhealthy, and `/health` reports `backup_store` unhealthy. The admin guide's `[backup.store]` section describes the checks.
+More than one server on one catalog is not supported in 1.0. The admin guide's `[backup.store]` section describes the store checks.
 
 `extenddb destroy` leaves the store, and `extenddb backup purge --confirm` deletes its backups. A catalog re-created with `init` needs the old root's `extenddb-store.json` removed, or a new root, because the file names the old catalog.
 
