@@ -1,0 +1,471 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+name: Cross-backend restore matrix (nightly)
+
+# The cross-backend restore matrix (design PR 9b): a backup taken on one
+# backend restores, through the store, into another. Each cell starts a source
+# and a target server from the per-backend binaries, copies the source's backup
+# prefix under a root the target owns, seeds the target's `backup_index` row as
+# `backup sync --adopt-store` will (PR 10), restores and compares. The cells are
+# heavy (two servers each, four backends, PostgreSQL + a MongoDB replica set +
+# Cassandra) so they run nightly rather than on every pull request.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time: the cells drop and re-create fixed MongoDB database and
+# Cassandra keyspace names, so two runs on one runner would destroy each
+# other's catalogs. A second run queues behind the first.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 127.0.0.1:9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only runs on main save, so other runs restore main's cache; a
+          # scheduled run's ref is the default branch, so the nightly saves.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        # requirements-matrix.txt adds the MongoDB and Cassandra drivers the
+        # script's seed and teardown use on those backends.
+        run: pip install -r requirements.txt -r requirements-matrix.txt
+
+      - name: Install the PostgreSQL client
+        # The matrix script seeds and tears down every PostgreSQL source and
+        # target through the host's psql; the runner image is not assumed to
+        # carry one.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Check the host tools the matrix script calls
+        run: |
+          psql --version
+          python3 -c "import pymongo, cassandra; print(pymongo.version, cassandra.__version__)"
+
+      - name: Configure Cassandra authentication
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2
+          exit 1
+
+      - name: Start a MongoDB replica set
+        # GitHub `services:` cannot express a replica set (--replSet + initiate
+        # + wait-for-PRIMARY), so start it directly, as devtools/run-mongodb-tests
+        # does. Published on loopback only; no authentication.
+        run: |
+          docker run -d --name matrix-mongo -p 127.0.0.1:27117:27017 mongo:7 \
+            mongod --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec matrix-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null \
+              | grep -qx 1 && break
+            sleep 1
+          done
+          docker exec matrix-mongo mongosh --quiet --eval \
+            'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})' >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do
+            state=$(docker exec matrix-mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' 2>/dev/null | tail -1)
+            [ "$state" = PRIMARY ] && { echo "replica set PRIMARY after ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "MongoDB replica set did not elect a PRIMARY" >&2
+          exit 1
+
+      - name: Build the four backend binaries
+        # One target directory, four sequential builds (cargo rebuilds only
+        # the feature-dependent crates between them), each binary copied to
+        # the path the script's --bin defaults use
+        # (target/rel-<backend>/release/extenddb). Every `init` the script
+        # runs writes the TLS material under ~/.extenddb/tls when absent, so
+        # nothing has to generate it here.
+        run: |
+          for b in postgres sqlite mongodb cassandra; do
+            cargo build --release -p extenddb --no-default-features --features "$b"
+            mkdir -p "target/rel-$b/release"
+            cp target/release/extenddb "target/rel-$b/release/extenddb"
+          done
+
+      - name: Run the matrix
+        run: |
+          set -o pipefail
+          mkdir -p matrix-logs
+          rc=0
+          plain="postgres sqlite mongodb"
+          targets="postgres sqlite mongodb cassandra"
+          for s in $plain; do
+            for t in $targets; do
+              echo "=== $s -> $t ==="
+              python3 devtools/backup-restore-matrix --source "$s" --target "$t" \
+                --work "matrix-logs/$s-$t" || rc=1
+            done
+          done
+          # The duplicate-key cell into every target, from a PostgreSQL source.
+          for t in $targets; do
+            echo "=== postgres -> $t --duplicate-key ==="
+            python3 devtools/backup-restore-matrix --source postgres --target "$t" --duplicate-key \
+              --work "matrix-logs/postgres-$t-dup" || rc=1
+          done
+          # The vector cells: into PostgreSQL and SQLite the vector index is
+          # restored and answers; into MongoDB and Cassandra the manifest is
+          # refused before any table.
+          for s in postgres sqlite; do
+            for t in postgres sqlite mongodb cassandra; do
+              echo "=== $s -> $t --vector ==="
+              python3 devtools/backup-restore-matrix --source "$s" --target "$t" --vector \
+                --work "matrix-logs/$s-$t-vector" || rc=1
+            done
+          done
+          exit $rc
+
+      - name: Upload the matrix logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: matrix-logs
+          path: matrix-logs
+          if-no-files-found: ignore
+
+      - name: Stop the MongoDB replica set
+        if: always()
+        run: docker rm -f matrix-mongo >/dev/null 2>&1 || true
+
+  # The restore pause points, driven through devtools/backup-kill-points.py
+  # (committed by the CreateBackup PR; the restore half of the harness):
+  # `restore <backend> <point> --bin <hooks binary> --work <dir>` pauses a
+  # restore at the point, kills the server, restarts it and asserts the
+  # outcome. No other job builds `backup-test-hooks`, so the restore kill
+  # points have no CI coverage without these jobs, one per backend, each
+  # starting its backend as the matrix job does. The points a backend has are
+  # the script's `RESTORE_POINTS`; the two second-reach runs put the kill
+  # after an earlier batch's progress is recorded. Every outcome is ACTIVE
+  # with the exact base and GSI counts, except the tampered-file point
+  # (`restore_between_failed_and_removal`), whose target is removed.
+  restore-kill-points-sqlite:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Build the SQLite binary with the backup test hooks
+        # The pause points inside the backends' restore writes compile only
+        # under `backup-test-hooks`; the harness drives this binary.
+        run: cargo build --release -p extenddb --no-default-features --features sqlite,extenddb-app/backup-test-hooks
+      - name: Run the SQLite restore kill points
+        run: |
+          set -o pipefail
+          rc=0
+          for point in restore_after_download restore_after_file_commit \
+              restore_sqlite_mid_batch restore_between_failed_and_removal sigterm; do
+            echo "=== sqlite restore kill point: $point ==="
+            python3 devtools/backup-kill-points.py restore sqlite "$point" \
+              --bin target/release/extenddb --work "kill-point-logs/sqlite-$point" || rc=1
+          done
+          exit $rc
+      - name: Upload the kill-point logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: kill-point-logs-sqlite
+          path: kill-point-logs
+          if-no-files-found: ignore
+
+  restore-kill-points-postgres:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: devpass
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Install the PostgreSQL client
+        # The script creates, probes (`pg_terminate_backend`, the vector
+        # relation check) and drops its PostgreSQL databases through the
+        # host's psql.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          psql --version
+      - name: Build the PostgreSQL binary with the backup test hooks
+        run: cargo build --release -p extenddb --no-default-features --features postgres,extenddb-app/backup-test-hooks
+      - name: Run the PostgreSQL restore kill points
+        # `pg_terminate_backend` is not a pause point of its own: the claim
+        # session is terminated while the job is paused after its first
+        # file's commit. `--vector` on the tampered-file point asserts the
+        # removed target's vector relation gone (the service image carries
+        # pgvector).
+        run: |
+          set -o pipefail
+          rc=0
+          for point in restore_after_download restore_after_file_commit \
+              restore_postgres_before_progress_delete restore_between_failed_and_removal \
+              restore_fenced_out pg_terminate_backend sigterm; do
+            echo "=== postgres restore kill point: $point ==="
+            python3 devtools/backup-kill-points.py restore postgres "$point" \
+              --bin target/release/extenddb --work "kill-point-logs/postgres-$point" || rc=1
+          done
+          echo "=== postgres restore kill point: restore_between_failed_and_removal --vector ==="
+          python3 devtools/backup-kill-points.py restore postgres restore_between_failed_and_removal \
+            --vector --bin target/release/extenddb \
+            --work kill-point-logs/postgres-restore_between_failed_and_removal-vector || rc=1
+          exit $rc
+      - name: Upload the kill-point logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: kill-point-logs-postgres
+          path: kill-point-logs
+          if-no-files-found: ignore
+
+  restore-kill-points-mongodb:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        # requirements-matrix.txt adds pymongo, which the script's setup and
+        # teardown use to drop the fixed databases.
+        run: |
+          pip install -r requirements.txt -r requirements-matrix.txt
+          python3 -c "import pymongo; print(pymongo.version)"
+      - name: Start a MongoDB replica set
+        # As the matrix job does: `services:` cannot express a replica set.
+        # Published on loopback only; no authentication.
+        run: |
+          docker run -d --name kill-point-mongo -p 127.0.0.1:27117:27017 mongo:7 \
+            mongod --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec kill-point-mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null \
+              | grep -qx 1 && break
+            sleep 1
+          done
+          docker exec kill-point-mongo mongosh --quiet --eval \
+            'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})' >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do
+            state=$(docker exec kill-point-mongo mongosh --quiet --eval 'rs.status().members[0].stateStr' 2>/dev/null | tail -1)
+            [ "$state" = PRIMARY ] && { echo "replica set PRIMARY after ${i}s"; exit 0; }
+            sleep 1
+          done
+          echo "MongoDB replica set did not elect a PRIMARY" >&2
+          exit 1
+      - name: Build the MongoDB binary with the backup test hooks
+        run: cargo build --release -p extenddb --no-default-features --features mongodb,extenddb-app/backup-test-hooks
+      - name: Run the MongoDB restore kill points
+        # The second reach of `restore_mongodb_after_insert_many` kills after
+        # an earlier batch's progress committed (24,000 items in three files).
+        run: |
+          set -o pipefail
+          rc=0
+          for point in restore_after_download restore_after_file_commit \
+              restore_mongodb_after_insert_many restore_mongodb_before_worker_flip \
+              restore_between_failed_and_removal sigterm; do
+            echo "=== mongodb restore kill point: $point ==="
+            python3 devtools/backup-kill-points.py restore mongodb "$point" \
+              --bin target/release/extenddb --work "kill-point-logs/mongodb-$point" || rc=1
+          done
+          echo "=== mongodb restore kill point: restore_mongodb_after_insert_many --second-reach ==="
+          python3 devtools/backup-kill-points.py restore mongodb restore_mongodb_after_insert_many \
+            --second-reach --items 24000 --bin target/release/extenddb \
+            --work kill-point-logs/mongodb-restore_mongodb_after_insert_many-second || rc=1
+          exit $rc
+      - name: Upload the kill-point logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: kill-point-logs-mongodb
+          path: kill-point-logs
+          if-no-files-found: ignore
+      - name: Stop the MongoDB replica set
+        if: always()
+        run: docker rm -f kill-point-mongo >/dev/null 2>&1 || true
+
+  restore-kill-points-cassandra:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 90
+    services:
+      cassandra:
+        image: cassandra:4.1
+        ports:
+          - 127.0.0.1:9042:9042
+        env:
+          CASSANDRA_CLUSTER_NAME: extenddb-ci
+          HEAP_NEWSIZE: 128M
+          MAX_HEAP_SIZE: 1024M
+        options: >-
+          --health-cmd "cqlsh -e 'SELECT release_version FROM system.local'"
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        # requirements-matrix.txt adds cassandra-driver, which the script's
+        # teardown uses to drop the keyspaces.
+        run: |
+          pip install -r requirements.txt -r requirements-matrix.txt
+          python3 -c "import cassandra; print(cassandra.__version__)"
+      - name: Configure Cassandra authentication
+        # The script's `init` and config use cassandra/cassandra, as the
+        # matrix job's do.
+        run: |
+          docker exec ${{ job.services.cassandra.id }} sed -i \
+            's/^authenticator: .*/authenticator: PasswordAuthenticator/' \
+            /etc/cassandra/cassandra.yaml
+          docker restart ${{ job.services.cassandra.id }}
+          for i in $(seq 1 90); do
+            if docker exec ${{ job.services.cassandra.id }} \
+                cqlsh -u cassandra -p cassandra \
+                -e 'SELECT release_version FROM system.local' >/dev/null 2>&1; then
+              echo "Cassandra ready with PasswordAuthenticator after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Cassandra did not become ready" >&2
+          exit 1
+      - name: Build the Cassandra hooks binary and the SQLite source binary
+        # Cassandra has no SnapshotEngine, so its CreateBackup is in-catalog
+        # and no backup taken on it restores through the store-backed job: the
+        # script takes each point's backup on a SQLite source server
+        # (`--source-bin`, a plain SQLite build) and adopts it into the
+        # Cassandra target's catalog, as the matrix does. One target
+        # directory, two sequential builds.
+        run: |
+          cargo build --release -p extenddb --no-default-features --features sqlite
+          mkdir -p target/rel-sqlite/release
+          cp target/release/extenddb target/rel-sqlite/release/extenddb
+          cargo build --release -p extenddb --no-default-features --features cassandra,extenddb-app/backup-test-hooks
+      - name: Run the Cassandra restore kill points
+        # The first reach of `restore_cassandra_before_progress` leaves the
+        # first batch's items with no progress recorded and resumes with
+        # upserts; the second reach kills after the first batch's progress.
+        run: |
+          set -o pipefail
+          rc=0
+          for point in restore_after_download restore_after_file_commit \
+              restore_cassandra_before_progress restore_between_failed_and_removal sigterm; do
+            echo "=== cassandra restore kill point: $point ==="
+            python3 devtools/backup-kill-points.py restore cassandra "$point" \
+              --bin target/release/extenddb --source-bin target/rel-sqlite/release/extenddb \
+              --work "kill-point-logs/cassandra-$point" || rc=1
+          done
+          echo "=== cassandra restore kill point: restore_cassandra_before_progress --second-reach ==="
+          python3 devtools/backup-kill-points.py restore cassandra restore_cassandra_before_progress \
+            --second-reach --bin target/release/extenddb --source-bin target/rel-sqlite/release/extenddb \
+            --work kill-point-logs/cassandra-restore_cassandra_before_progress-second || rc=1
+          exit $rc
+      - name: Upload the kill-point logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: kill-point-logs-cassandra
+          path: kill-point-logs
+          if-no-files-found: ignore

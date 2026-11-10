@@ -90,7 +90,7 @@ pub use layout::{
     format_backup_id, is_backup_id, is_region, parse_backup_arn, trim_backup_arn,
 };
 pub use manifest::{
-    CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest, ItemOrder, KeyRange,
-    KeyRangeCheck, KeyRangeTracker, SnapshotDescriptor, SourceTableSchema, check_format_version,
-    verify_manifest_checksum,
+    BackupGsi, BackupLsi, CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest,
+    ItemOrder, KeyRange, KeyRangeCheck, KeyRangeTracker, SnapshotDescriptor, SourceTableSchema,
+    check_format_version, verify_manifest_checksum,
 };

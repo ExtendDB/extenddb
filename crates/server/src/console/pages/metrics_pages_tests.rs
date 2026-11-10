@@ -219,12 +219,16 @@ fn nav_bar_links_the_admin_only_pages_for_admins_only() {
     let admin_row = format!("{accounts}\n{}\n{spacer}", admin_links.join("\n"));
     assert!(admin_nav.contains(&admin_row), "{admin_nav}");
 
+    // An IAM user's bar has no Accounts link either: Dashboard comes right
+    // before the spacer.
+    let dashboard = r#"<a href="/console">Dashboard</a>"#;
     let user_nav = html::nav_bar(&identity_label(&iam_user()));
     for link in admin_links {
         assert!(!user_nav.contains(link), "{user_nav}");
     }
+    assert!(!user_nav.contains(accounts), "{user_nav}");
     assert!(
-        user_nav.contains(&format!("{accounts}\n{spacer}")),
+        user_nav.contains(&format!("{dashboard}\n{spacer}")),
         "{user_nav}"
     );
     assert!(user_nav.contains("444455556666/bob"), "{user_nav}");

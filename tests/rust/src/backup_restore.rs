@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 /// Where the server under test writes its backups, from
 /// `EXTENDDB_TEST_BACKUP_STORE`: `filesystem` or `s3` (a configured
-/// `[backup.store]`, under which a backup is in the store and this release
-/// refuses to restore it, PR 9a adding the restore) or `none` (the
-/// in-catalog create, which restores). Against the service the variable is
+/// `[backup.store]`, under which a backup is in the store and the restore
+/// job restores it) or `none` (the in-catalog create, which the legacy
+/// reader restores). Against the service the variable is
 /// not read (the restore runs). Against ExtendDB a test whose outcome depends
 /// on it fails when it is unset, with the text the Python fixture prints,
 /// rather than accept either outcome.
@@ -306,49 +306,39 @@ async fn restore_table_from_backup() {
         .backup_arn(&arn)
         .send()
         .await;
-    match backup_store() {
-        // A backup in the configured store is listed, described and deleted
-        // but not restored this release (the restore job is PR 9a's).
-        BackupStore::Filesystem | BackupStore::S3 => {
-            let err = restore.expect_err("a store-backed backup restored");
-            assert_eq!(err_code(&err), Some("ValidationException"), "{err:?}");
-            let msg = err_msg(&err);
-            assert!(
-                msg.contains("is in a backup store"),
-                "the refusal does not name the store: {msg}"
-            );
-            println!("restore of a store-backed backup refused: {msg}");
-            assert!(
-                c.describe_table()
-                    .table_name(&restored)
-                    .send()
-                    .await
-                    .is_err(),
-                "the refused restore created {restored}"
-            );
-        }
-        BackupStore::None => {
-            let resp = restore.unwrap();
-            assert_eq!(
-                resp.table_description()
-                    .unwrap()
-                    .table_status()
-                    .unwrap()
-                    .as_str(),
-                "CREATING"
-            );
+    // The round trip on either path: a backup in the configured store is
+    // restored by the restore job, an in-catalog one by the legacy reader.
+    let resp = restore.unwrap();
+    let desc = resp.table_description().unwrap();
+    assert_eq!(desc.table_status().unwrap().as_str(), "CREATING");
+    let summary = desc
+        .restore_summary()
+        .expect("a CREATING restore target carries its RestoreSummary");
+    assert_eq!(summary.source_backup_arn(), Some(arn.as_str()));
+    assert!(summary.restore_in_progress());
 
-            wait_for_active(c, &restored).await;
-            let scan = c.scan().table_name(&restored).send().await.unwrap();
-            assert_eq!(scan.count(), 5);
-            println!(
-                "restore of an in-catalog backup completed with {} items",
-                scan.count()
-            );
-
-            c.delete_table().table_name(&restored).send().await.ok();
-        }
-    }
+    wait_for_active(c, &restored).await;
+    let scan = c.scan().table_name(&restored).send().await.unwrap();
+    assert_eq!(scan.count(), 5);
+    let after = c
+        .describe_table()
+        .table_name(&restored)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        after.table().unwrap().restore_summary().is_none(),
+        "RestoreSummary is reported only while CREATING"
+    );
+    println!(
+        "restore of a {} backup completed with {} items",
+        match backup_store() {
+            BackupStore::Filesystem | BackupStore::S3 => "store-backed",
+            BackupStore::None => "in-catalog",
+        },
+        scan.count()
+    );
+    c.delete_table().table_name(&restored).send().await.ok();
 
     delete_backup_quietly(c, &arn).await;
     c.delete_table().table_name(&table).send().await.ok();

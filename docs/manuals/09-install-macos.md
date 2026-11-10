@@ -96,7 +96,7 @@ Expected:
 ```
 === extenddb verify ===
 ...
-  OK: Current: the catalog is at migration 7
+  OK: Current: the catalog is at migration 9
 ...
 === HEALTHY: All checks passed ===
 ```

@@ -108,6 +108,14 @@ pub(crate) async fn authorize_request(
     source_ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<extenddb_engine::AuthorizedKeyInfo, DynamoDbError> {
+    // A table name, index name or ARN that the service refuses, in TableName
+    // or in any other field that carries one (RequestItems, TransactItems, the
+    // restore and import names, the stream, backup and tag ARNs), is refused
+    // here, before the key info and resource tag lookups below and before the
+    // developer-mode return, the cross-account refusal and the ARN shape
+    // checks (see `table_name_gate`).
+    crate::table_name_gate::check_table_name_chars(operation, input, account_id)?;
+
     let table_name = extract_table_name(input);
     let mut authorized_key_info = extenddb_engine::AuthorizedKeyInfo::new();
 
@@ -227,6 +235,20 @@ pub(crate) async fn authorize_request(
     // item operations passed. Any future operation-specific branch must be added
     // below this point, or it will reintroduce that defect.
     if state.dev_mode {
+        return Ok(authorized_key_info);
+    }
+
+    // A PartiQL request names its tables inside its statements. The service
+    // authorizes each statement with the action of its type
+    // (`dynamodb:PartiQLSelect` and the others) against the table or index it
+    // reads or writes, and needs no action for the operation itself (measured
+    // 2026-11-03). The engine authorizes each statement through the item
+    // authorizer the handler gives it, and refuses every statement without
+    // one (see `item_authz`).
+    if matches!(
+        operation,
+        "ExecuteStatement" | "BatchExecuteStatement" | "ExecuteTransaction"
+    ) {
         return Ok(authorized_key_info);
     }
 
@@ -417,7 +439,8 @@ pub(crate) async fn authorize_request(
     } else {
         // Multi-permission operations (restore). Each pair is authorized with
         // the request-level params; a Deny on any required resource fails the
-        // request.
+        // request. The pairs are checked in the order `authz_targets` returns
+        // them, and the first denied pair is the one the denial names.
         for target in &targets {
             authorization::check_authorization(
                 state.authz_cache.as_ref(),

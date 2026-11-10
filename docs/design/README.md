@@ -21,6 +21,7 @@ This directory contains the authoritative design documents for ExtendDB (extendd
 | 13 | [MongoDB Storage](13-storage-mongodb.md) | MongoDB storage backend: engine and catalog traits over the official driver, replica-set transactions |
 | 15 | [Backup and Restore](15-backup-restore.md) | Overview of the off-host backup series: the invariants, the per-operation contracts and a short section per later PR; the format, store and snapshot documentation lives with their crates (`crates/core/src/backup_format`, `crates/backup-store`, `crates/storage/src/snapshot.rs`) |
 | 15b | [Backup memory and duration record, PR 8](15-backup-restore-bench-pr8.md) | The measurements section 7 and revision item 31 of the design cite: peak RSS and duration of the 100k, 1M, worst-expansion and incompressible backups per backend, the allocator series, the PostgreSQL page's cost |
+| 15c | [Restore memory and duration record, PR 9](15-backup-restore-bench-pr9.md) | The measurements section 7 and revision item 33 of the design cite for the restore: peak RSS and duration of the 100k, 1M, worst-expansion and large-item restores on SQLite and PostgreSQL, with and without one allocator arena, the terms the code bounds and the sizing sentence |
 
 
 ## How to Use These Docs
