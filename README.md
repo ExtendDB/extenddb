@@ -49,10 +49,10 @@ ExtendDB 1.0 is not:
 An ExtendDB binary contains one storage backend, which the build selects. The tier of a backend says what the 1.x releases promise for it:
 
 - Stable: for production. The [versioning policy](docs/versioning.md) applies in full. The ExtendDB CI is reliably green for the backend.
-- Beta: for production within the known limits in the table. The versioning policy applies with one exception. To remove a known limit, a minor release can change the behavior that the table lists, and its release notes name the change.
+- Beta: for production within the known limits in the table. The ExtendDB CI is reliably green for the backend. The versioning policy applies with one exception. To remove a known limit, a minor release can change the behavior that the table lists, and its release notes name the change.
 - Experimental: for evaluation. The backend is not for production use. The versioning policy does not apply. A release can change the backend's behavior or configuration with no deprecation period.
 
-A backend moves up one tier in a minor release, once the ExtendDB CI has been reliably green for it. The maintainers first agree in an issue that its known limits fit the higher tier. The release notes name the move. A backend moves down a tier only through the deprecation steps of the versioning policy.
+A backend moves up one tier in a minor release. Before that release, the maintainers agree in an issue that the ExtendDB CI has been reliably green for the backend. They also agree that its known limits fit the higher tier. The release notes name the move. A backend moves down a tier only through the [deprecation steps](docs/versioning.md#deprecation) of the versioning policy.
 
 | Backend | Tier | Topology | Data across upgrades | API coverage | CI | Known limits |
 |---|---|---|---|---|---|---|
