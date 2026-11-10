@@ -766,36 +766,56 @@ async fn migration_10_refuses_copies_it_cannot_resolve_and_writes_nothing() {
             delete_sentence(catalog)
         )
     };
-    for item in [
-        owners(
-            &fixture_id,
-            &owner,
-            [
-                described(&owner, &account, "cu-tester", created),
-                described(&oid(1).into(), &account, "importer", created + 60_000),
-            ],
+    // A failure names the missing refusal and prints none of its text,
+    // which names the account.
+    for (refusal, item) in [
+        (
+            "the fixture's access key ID, which two users hold",
+            owners(
+                &fixture_id,
+                &owner,
+                [
+                    described(&owner, &account, "cu-tester", created),
+                    described(&oid(1).into(), &account, "importer", created + 60_000),
+                ],
+            ),
         ),
-        owners(
-            TWO_ACCOUNTS_KEY_ID,
-            &oid(2).into(),
-            [
-                described(&oid(2).into(), &account, "shared", created + 30_000),
-                described(&oid(3).into(), OTHER_ACCOUNT, "shared", created + 90_000),
-            ],
+        (
+            "the access key ID that users in two accounts hold",
+            owners(
+                TWO_ACCOUNTS_KEY_ID,
+                &oid(2).into(),
+                [
+                    described(&oid(2).into(), &account, "shared", created + 30_000),
+                    described(&oid(3).into(), OTHER_ACCOUNT, "shared", created + 90_000),
+                ],
+            ),
         ),
-        format!(
-            "{REFUSED}2 documents in {catalog}.access_keys have no access key ID. ExtendDB never \
-             reads these documents to authenticate a request. The unique index on access_key_id \
-             allows at most one document with no access key ID. Delete all of these documents \
-             except one. The documents are: {}, {}. {}",
-            described(&oid(21).into(), &account, "broken", created),
-            described(&oid(22).into(), &account, "broken", created),
-            delete_sentence(catalog)
+        (
+            "the two documents without an access key ID",
+            format!(
+                "{REFUSED}2 documents in {catalog}.access_keys have no access key ID. ExtendDB \
+                 never reads these documents to authenticate a request. The unique index on \
+                 access_key_id allows at most one document with no access key ID. Delete all of \
+                 these documents except one. The documents are: {}, {}. {}",
+                described(&oid(21).into(), &account, "broken", created),
+                described(&oid(22).into(), &account, "broken", created),
+                delete_sentence(catalog)
+            ),
         ),
-        array_refusal(catalog, &account, 31, created),
+        (
+            "the document whose access key ID is an array",
+            array_refusal(catalog, &account, 31, created),
+        ),
     ] {
-        assert!(items.contains(&item), "{item}\n{items:#?}");
-        assert!(message.contains(&item), "{item}\n{message}");
+        assert!(
+            items.contains(&item),
+            "the status items lack the refusal of {refusal}"
+        );
+        assert!(
+            message.contains(&item),
+            "the error of migrate --yes lacks the refusal of {refusal}"
+        );
     }
     assert!(!message.contains(EXAMPLE_KEY_ID), "{message}");
     assert_eq!(
