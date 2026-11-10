@@ -27,19 +27,41 @@ use extenddb_storage_mongodb::migrations::{
 };
 use futures::TryStreamExt;
 
-/// The catalog definitions migration 1 creates in an empty store.
-pub const CATALOG_EXPECTED: &str =
+/// The definitions migration 1 creates in the catalog database.
+pub const CATALOG_BASELINE: &str =
     include_str!("../../migrations/catalog/0001_baseline.expected.json");
 
-/// The name of the index migration 6 creates on `access_keys`.
+/// The collections and indexes migration 6 adds to the catalog database:
+/// whole collections, and the indexes it adds to a collection migration 1
+/// creates (`tables`).
+pub const CATALOG_MIGRATION_6: &str =
+    include_str!("../fixtures/0006_backup_catalog_index.expected.json");
+
+/// The name of the index migration 10 creates on `access_keys`.
 pub const ACCESS_KEY_ID_INDEX: &str = "access_key_id_1";
 
-/// The catalog definitions after every migration: migration 1's, without
-/// the collection migration 5 drops, with the index migration 6 creates.
-pub fn catalog_after_every_migration() -> Definitions {
-    let mut catalog: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("catalog");
-    catalog.remove("continuous_backups");
-    catalog
+/// The catalog database's definitions after every migration: migration 1's,
+/// without `continuous_backups`, which migration 5 drops, with what
+/// migration 6 adds, and with the index migration 10 creates on
+/// `access_keys`.
+///
+/// # Panics
+///
+/// A committed file is not a definitions file.
+#[must_use]
+pub fn expected_catalog() -> Definitions {
+    let mut expected: Definitions = serde_json::from_str(CATALOG_BASELINE).expect("migration 1");
+    expected.remove("continuous_backups");
+    let added: Definitions = serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
+    for (name, collection) in added {
+        match expected.get_mut(&name) {
+            Some(existing) => existing.indexes.extend(collection.indexes),
+            None => {
+                expected.insert(name, collection);
+            }
+        }
+    }
+    expected
         .get_mut("access_keys")
         .expect("access_keys")
         .indexes
@@ -50,7 +72,7 @@ pub fn catalog_after_every_migration() -> Definitions {
                 options: [("unique".to_owned(), serde_json::json!(true))].into(),
             },
         );
-    catalog
+    expected
 }
 
 /// The server the tests run against, or `None` to skip.

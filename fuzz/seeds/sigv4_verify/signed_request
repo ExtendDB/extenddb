@@ -1,0 +1,7 @@
+AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20150830/us-east-1/dynamodb/aws4_request, SignedHeaders=content-type;host;x-amz-date;x-amz-target, Signature=34f4239d34842310969b2eacd173c943cac9f842d5a661117fa63667b71870b7
+content-type:application/x-amz-json-1.0
+host:dynamodb.us-east-1.amazonaws.com
+x-amz-date:20150830T123600Z
+x-amz-target:DynamoDB_20120810.ListTables
+
+{}

@@ -18,6 +18,7 @@ REQ-AUTH-001, REQ-AUTH-002
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import boto3
@@ -1447,6 +1448,14 @@ class TestBackupAuthorization:
             backup_arn = admin_client.create_backup(
                 TableName=table, BackupName="authz",
             )["BackupDetails"]["BackupArn"]
+            # A store-backed backup is CREATING until its job ends; a restore
+            # of a CREATING backup is BackupInUse, so the cells wait here.
+            deadline = time.monotonic() + 120
+            while admin_client.describe_backup(
+                BackupArn=backup_arn
+            )["BackupDescription"]["BackupDetails"]["BackupStatus"] == "CREATING":
+                assert time.monotonic() < deadline, f"backup {backup_arn} still CREATING"
+                time.sleep(0.2)
             yield admin_client, table, backup_arn
         finally:
             for t in self.created:
@@ -1456,6 +1465,13 @@ class TestBackupAuthorization:
                     pass
             if backup_arn is not None:
                 try:
+                    # A store-backed backup is CREATING until its job ends
+                    # and refuses DeleteBackup until then.
+                    deadline = time.monotonic() + 120
+                    while time.monotonic() < deadline and admin_client.describe_backup(
+                        BackupArn=backup_arn
+                    )["BackupDescription"]["BackupDetails"]["BackupStatus"] == "CREATING":
+                        time.sleep(0.2)
                     admin_client.delete_backup(BackupArn=backup_arn)
                 except Exception:
                     pass

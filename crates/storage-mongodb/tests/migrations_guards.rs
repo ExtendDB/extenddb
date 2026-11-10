@@ -10,11 +10,11 @@ mod migrations_support;
 use std::time::Duration;
 
 use bson::{Document, doc};
-use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, Runner};
+use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, MigrationId, Runner};
 use extenddb_storage_mongodb::migrations::{
     Definitions, MigrationLock, MongoMigrations, Timing, describe_store, lock,
 };
-use migrations_support::{Deployment, catalog_after_every_migration, fixture, server};
+use migrations_support::{Deployment, fixture, server};
 
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
 
@@ -64,7 +64,7 @@ async fn assert_fresh_definitions(d: &Deployment) {
         .await
         .expect("data");
     migrations.close().await;
-    let expected_catalog = catalog_after_every_migration();
+    let expected_catalog = migrations_support::expected_catalog();
     assert!(!catalog.contains_key("continuous_backups"));
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).expect("json");
     for (name, want) in &expected_catalog {
@@ -204,7 +204,12 @@ async fn migrate_creates_the_indexes_a_deployment_lacks() {
             .await
             .contains(&"table_id_1".to_owned())
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert_fresh_definitions(&d).await;
     d.drop_databases().await;
 }
@@ -229,7 +234,9 @@ async fn stop_at_every_request(uri: &str, state: Option<&str>) -> usize {
         }
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 6 },
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            },
             "{requests}"
         );
         assert_fresh_definitions(&d).await;

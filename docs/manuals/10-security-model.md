@@ -139,7 +139,7 @@ Policy sources collected for evaluation:
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
 - **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
-- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
+- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
 
 ### Supported Condition Operators
@@ -173,7 +173,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
 
-Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values.
+Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values in a `2012-10-17` document; a `2008-10-17` document, or one with no `Version`, compares the value as written, so `${aws:username}` is the literal text, as IAM does. In a `2012-10-17` document `${*}`, `${?}` and `${$}` stand for the literal characters `*`, `?` and `$`; in `StringLike`, `ArnLike` and `ArnEquals` the escaped character is matched literally while a `*` or `?` written in the policy is a wildcard (`a${*}` matches `a*` and not `abc`), and the result of an escape is not expanded again (`a${$}{x}` is the text `a${x}`). The `${key, 'default'}` form expands to `default` when the request does not carry `key`, and code points up to U+0020 around the key name, around the comma of the default form and before the closing brace are ignored, as in IAM. A variable with no default whose key the request does not carry makes that value match nothing: a positive operator such as `StringEquals` does not match it and a negated operator such as `StringNotEquals` does, except that every `Arn*` operator is false against a request value that is not an ARN. A multivalued key such as `dynamodb:LeadingKeys` is not expanded; when the request carries it the value matches nothing, and a written default is used only when the request does not carry the key. Only the string and ARN operators (with or without `ForAnyValue:`, `ForAllValues:` or `IfExists`) expand variables. A numeric, date or address value written as a variable is compared as written. A `Bool` or `Null` value written as one is read as the boolean `false`, as IAM does, so `Null` then holds when the key is present and `Bool` holds when the request value is `false`. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`; the IAM policy simulator refuses a policy whose value has fewer, such as `${aws:ResourceTag/owner}`, and ExtendDB fails that condition closed in a document of any `Version`, so a `Deny` applies and an `Allow` does not grant. A role trust policy follows its own `Version`. Because a negated operator holds for an unresolved variable, an `Allow` written as `StringNotEquals` against `${aws:PrincipalTag/team}` grants to a caller without that tag; add a `Null` condition on the tag to require it.
 
 ### Access Control Patterns
 
@@ -197,7 +197,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 - `Effect`: Allow, Deny
 - `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
-- `Resource` / `NotResource`: ARN patterns with wildcards
+- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys` that the request carries, makes the pattern match nothing (a written default is used only when the key is absent); a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does. Code points up to U+0020 around the key name, around the comma of the default form and before the closing brace are ignored, as in IAM, and a space inside the quotes of a default is kept. A tag whose value is the empty string expands to no characters, as in IAM: `table/${aws:PrincipalTag/team}*` matches every table for a caller tagged `team=""`, while with no `team` tag it matches nothing. To refuse such a caller, add a condition such as `StringLike` on `aws:PrincipalTag/team` with the value `?*` to the `Allow` statement (measured with the IAM policy simulator). A `Deny NotResource` statement on such a pattern spares every table for that caller (also measured), and that condition on it does not change this.
 - `Condition`: Full condition block support (see operators and keys above)
 
 ## Transport Security
@@ -222,15 +222,17 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 
 ## Web Console Security
 
-An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list shows an IAM-user session its own account alone, and the console home page shows the deployment's account count and admin count to admin sessions only. In its own account an IAM-user session currently reads every user, group and role page, including other users' access key IDs, policy names and tags, which the management API refuses the same user. Issue #731 tracks this. An IAM-user session can create and delete access keys for its own user, and every other change in the console needs an admin session. Until pull request #727 merges, `/console/metrics-data` serves every console session the table names, index names and traffic metrics of every account, because the metrics table has no account column.
+An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list, and the deployment's account count and admin count on the console home page, are for admin sessions only. In its own account an IAM-user session opens its own user page, which lists its access keys, and creates and deletes its own access keys: the access key reads and writes the management API gives the same user. The console has no form to change the password or import a key. Its own user page leaves out the user's inline policies, groups and tags, which the management API does not give it either. Every other page and form under its account redirects it to `/console`: the account page, the pages of the other users, every group and role page, and every form that changes a user, group, role or policy, its own user and its own policies included. The handler compares the user name in the path with the session's own before it reads anything about that user, so another user's name and a name that no user has get the same answer. The only read before that comparison is the session check, which reads the password hash of the session's own principal.
 
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
+- **Session management**: Server-side sessions that end 8 hours after login however active they are (the cookie's `Max-Age` is the same 8 hours), HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
+- **Session revocation**: A session is bound to the password hash its admin or IAM user logged in with. Every console request reads that hash from the catalog again. When the principal has been deleted, or its password has been changed, the session is removed and the request is redirected to the login page. This happens at the session's next request on every server that shares the catalog, because no server keeps a copy of the hash between requests. On Cassandra the read and the writes that change the hash use `LOCAL_QUORUM`, so a server in another datacenter sees the change once it has replicated there. If the catalog cannot be read, the request gets HTTP 503 and the session is kept. A refused request does not count as activity, so the 8 hour idle timeout keeps running during a catalog outage.
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
 - **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).
+- **Admin-only metrics**: The metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) serve admin sessions only. The metrics table has no account column, so the feed carries the table names, index names and traffic of every account. An IAM-user session is redirected from the page and gets HTTP 403 with no metric data from the feed.
 
 ## Login Rate Limiting
 
@@ -242,6 +244,8 @@ The console login form, the management API (HTTP Basic auth) and the `/metrics` 
 - **Bounded verification.** At most 4 bcrypt operations (password checks and password hashes) run at once per process. A login that waits more than 10 seconds for a slot is answered `500` and is not counted as a failure, since no password was checked.
 
 A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
+
+Every login that the limits admit runs one bcrypt check, or is answered `500` after waiting 10 seconds for a slot, whatever the name. When no admin or IAM user has the name, or the IAM user has no console password, that check runs against a fixed hash, and the login is answered and counted as a wrong password.
 
 The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
 
@@ -309,13 +313,14 @@ Import/export file paths are validated:
 ### Credential Handling
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
-- The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
+- `extenddb manage` reads the password from the `EXTENDDB_PASSWORD` environment variable when `--password` is not given, so the password does not appear in process listings
 - Access key secrets are shown once on creation and cannot be retrieved afterward
 
 ### Logging
 
-- All logging goes to syslog (no log files with sensitive data on disk)
-- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted and denied), and settings changes. Other management changes, such as creating or deleting users, roles, access keys and policies, are not audit-logged
+- The server logs to syslog when it runs as a daemon and to stderr with `--foreground`, and writes no log files of its own
+- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted, and refused by the role's trust policy), and settings changes made through the management API. `extenddb settings set` changes the catalog without the server and prints its entry on its own standard output, so the server writes no audit entry for that change. Other management changes, such as creating or deleting IAM users, roles, access keys and policies, are not audit-logged
+- Audit entries are WARN events, so none are written while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off
 - Cache flushes (`cache invalidate`) are logged at INFO with the admin name, the scope and its selectors, so they are not recorded when the log level (`logging.level`, or the `log_level` setting, which overrides it) is `warn` or `error`
 - Log messages do not contain secret keys, passwords, or item data. Access key IDs can appear, for example in cache flush records
 

@@ -16,11 +16,9 @@ use std::collections::BTreeMap;
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
 use bson::{Binary, Bson, Document, doc};
-use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, exit};
+use extenddb_storage::migrations::{CatalogStatus, MigrationBackend, MigrationId, exit};
 use extenddb_storage_mongodb::migrations::{Definitions, MongoMigrations, describe_store};
-use migrations_support::{
-    ACCESS_KEY_ID_INDEX, Deployment, catalog_after_every_migration, fixture, server,
-};
+use migrations_support::{ACCESS_KEY_ID_INDEX, Deployment, fixture, server};
 use serde_json::Value;
 
 const DATA_EXPECTED: &str = include_str!("../migrations/data/0001_baseline.expected.json");
@@ -139,7 +137,7 @@ fn golden(name: &str, value: &Value) {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install() {
     let Some(uri) = server() else { return };
-    let expected_catalog = catalog_after_every_migration();
+    let expected_catalog = migrations_support::expected_catalog();
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).unwrap();
     let fresh = Deployment::new(&uri, "freshkeys").await;
     fresh.create().await;
@@ -165,12 +163,18 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 7, "{state}");
+        assert_eq!(pending.len(), 11, "{state}");
         let report = d.migrate().await.expect("migrate");
-        assert_eq!((report.from, report.to), (None, Some(6)), "{state}");
+        assert_eq!(
+            (report.from, report.to),
+            (None, Some(MigrationId::LATEST.number())),
+            "{state}"
+        );
         assert_eq!(
             d.status().await,
-            CatalogStatus::Current { version: 6 },
+            CatalogStatus::Current {
+                version: MigrationId::LATEST.number()
+            },
             "{state}"
         );
 
@@ -290,6 +294,101 @@ async fn migration_2_rewrites_the_released_policies_as_the_golden_file_records()
     d.drop_databases().await;
 }
 
+/// Migration 6's body on the oldest released catalog holding three restore
+/// registrations: a finished restore (ACTIVE), one handed to the index
+/// backfill worker at the stop (CREATING with `restore_backfill_pending`),
+/// and one the stop interrupted (CREATING). Each gets its job record, the
+/// first two DONE and completed at the table's creation, the third RUNNING
+/// with the epoch heartbeat and generation 0, which the committed golden
+/// file pins with the ledger row's notes. A reconverge runs the body again
+/// and changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_6_backfills_the_released_restore_registrations_as_the_golden_file_records() {
+    let Some(uri) = server() else { return };
+    let d = Deployment::new(&uri, "golden6").await;
+    fixture::load(&d, &fixture::read("0.1.12")).await;
+    let tables = d.catalog().collection::<Document>("tables");
+    let created = bson::DateTime::from_millis(1_700_000_000_000);
+    for (name, status, handed) in [
+        ("golden6_done", "ACTIVE", false),
+        ("golden6_handed", "CREATING", true),
+        ("golden6_interrupted", "CREATING", false),
+    ] {
+        let mut table = doc! {
+            "_id": { "account_id": "123456789012", "table_name": name },
+            "table_id": format!("golden6-{name}"),
+            "table_status": status,
+            "creation_date_time": created,
+            "restore_source_backup_arn":
+                "arn:aws:dynamodb:us-east-1:123456789012:table/src/backup/01700000000000-0000000a",
+            "restore_operation_id": "old-operation",
+            "restore_heartbeat_at": created,
+        };
+        if handed {
+            table.insert("restore_backfill_pending", true);
+        }
+        tables.insert_one(table).await.unwrap();
+    }
+    d.migrate().await.expect("migrate");
+    let registrations = || async {
+        let mut found: Vec<Value> = Vec::new();
+        for t in Deployment::documents(&d.catalog(), "tables").await {
+            if !t.contains_key("restore_source_backup_arn") {
+                continue;
+            }
+            let job = t.get_document("restore_job").expect("a job record");
+            let earlier: Vec<&str> = ["restore_operation_id", "restore_heartbeat_at"]
+                .into_iter()
+                .filter(|f| t.contains_key(*f))
+                .collect();
+            found.push(serde_json::json!({
+                "table": t.get_document("_id").unwrap().get_str("table_name").unwrap(),
+                "table_status": t.get_str("table_status").unwrap(),
+                "status": job.get_str("status").unwrap(),
+                "kind": job.get_str("kind").unwrap(),
+                "owner_generation": job.get_i64("owner_generation").unwrap(),
+                "heartbeat_at": job.get_datetime("heartbeat_at").unwrap().timestamp_millis(),
+                "completed_at_creation": job
+                    .get_datetime("completed_at")
+                    .ok()
+                    .map(|at| Some(at) == t.get_datetime("creation_date_time").ok()),
+                "earlier_fields": earlier,
+            }));
+        }
+        found.sort_by_key(|v| v["table"].as_str().unwrap().to_owned());
+        found
+    };
+    let found = registrations().await;
+    let catalog_id = d.setting("catalog_id").await.expect("a catalog id");
+    assert!(uuid::Uuid::parse_str(&catalog_id).is_ok(), "{catalog_id}");
+    let rows = d.catalog_ledger().await;
+    let row = rows
+        .iter()
+        .find(|r| r.id == MigrationId::BackupCatalogIndex.number())
+        .expect("migration 6's row");
+    let notes: Vec<&str> = row.notes.lines().collect();
+    golden(
+        "0006_backup_catalog_index",
+        &serde_json::json!({ "registrations": found, "notes": notes }),
+    );
+
+    let reconverged = d.reconverge().await.expect("reconverge");
+    assert!(
+        reconverged
+            .applied
+            .iter()
+            .any(|step| step.id == row.id && step.notes.is_empty()),
+        "{reconverged:?}"
+    );
+    assert_eq!(registrations().await, found);
+    assert_eq!(
+        d.setting("catalog_id").await,
+        Some(catalog_id),
+        "the catalog id is kept"
+    );
+    d.drop_databases().await;
+}
+
 /// Migration 1's bodies on the oldest released catalog: both databases'
 /// definitions, the settings keys and the legacy ledger, which the
 /// committed golden file pins.
@@ -402,7 +501,12 @@ async fn a_reconverge_leaves_policies_written_after_migration_2_as_they_are() {
             .any(|n| n.starts_with("Skipped 2 resource_tag_condition_keys:")),
         "{report:?}"
     );
-    assert_eq!(d.status().await, CatalogStatus::Current { version: 6 });
+    assert_eq!(
+        d.status().await,
+        CatalogStatus::Current {
+            version: MigrationId::LATEST.number()
+        }
+    );
     assert_eq!(
         documents(Deployment::documents(&d.catalog(), "iam_policies").await),
         before

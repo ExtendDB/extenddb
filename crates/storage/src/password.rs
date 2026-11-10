@@ -11,7 +11,10 @@
 //!
 //! Every backend's password verification goes through [`verify_password`],
 //! and the management API hashes through [`hash_password`], so the bound
-//! holds whatever store a login is checked against.
+//! holds whatever store a login is checked against. When a login names no
+//! principal with a password, [`verify_stored_password`] checks the password
+//! against a fixed hash, so the login waits for a slot and does the same
+//! bcrypt work as a wrong password.
 //!
 //! A slot is held by the blocking call itself, not by the async caller. A
 //! caller whose future is dropped while bcrypt runs (a client that closes
@@ -39,6 +42,15 @@ pub const VERIFY_WAIT: Duration = Duration::from_secs(10);
 /// overload apart from storage errors.
 pub const VERIFY_OVERLOADED: &str = "password verification is overloaded; try again later";
 
+/// A bcrypt hash, at the default cost, of a random value that was discarded
+/// once the hash was made. [`verify_stored_password`] checks a password
+/// against it when a principal has no stored hash, so that a login for a name
+/// that does not exist runs the same bcrypt work as a wrong password for a
+/// name that does. That check refuses the login whatever bcrypt returns: a
+/// password that matched this hash would still be refused, so knowing the
+/// hash does not help a caller log in.
+const NO_STORED_HASH: &str = "$2b$12$L4yNgP/xgOa4sckbcBNixutZwPfrRn3iJsfX1cMGumbupNRaepaEy";
+
 static BCRYPT_SEMAPHORE: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BCRYPT);
 
 /// bcrypt calls running right now (on the blocking pool).
@@ -46,6 +58,30 @@ static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
 /// The most bcrypt calls ever observed running at once in this process.
 static HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "test-util"))]
+tokio::task_local! {
+    /// The bcrypt cost of each verification run inside the current
+    /// [`count_verifications`] scope.
+    static VERIFICATIONS: std::cell::RefCell<Vec<u32>>;
+}
+
+/// Run `future` and return its output with the bcrypt cost of each
+/// verification it ran through [`verify_password`], in order. A verification
+/// is recorded when bcrypt has checked the password against the hash, with
+/// the cost read from the hash. A hash that bcrypt refuses with an error,
+/// such as one that does not parse, records nothing. Verifications in tasks
+/// that `future` spawns are not recorded, so tests that run bcrypt at the
+/// same time do not change each other's records.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn count_verifications<F: std::future::Future>(future: F) -> (F::Output, Vec<u32>) {
+    VERIFICATIONS
+        .scope(std::cell::RefCell::default(), async move {
+            let output = future.await;
+            (output, VERIFICATIONS.with(std::cell::RefCell::take))
+        })
+        .await
+}
 
 fn semaphore_closed() -> OpError {
     OpError::Internal("bcrypt semaphore closed".to_owned())
@@ -100,10 +136,44 @@ pub async fn verify_password(password: String, hash: String) -> OpResult<bool> {
         return Err(OpError::Internal(VERIFY_OVERLOADED.to_owned()));
     };
     let permit = acquired.map_err(|_| semaphore_closed())?;
-    run_bcrypt(permit, move || {
-        bcrypt::verify(&password, &hash).unwrap_or(false)
-    })
-    .await
+    #[cfg(any(test, feature = "test-util"))]
+    let cost = hash
+        .parse::<bcrypt::HashParts>()
+        .ok()
+        .map(|parts| parts.get_cost());
+    let checked = run_bcrypt(permit, move || bcrypt::verify(&password, &hash)).await?;
+    #[cfg(any(test, feature = "test-util"))]
+    if let (Some(cost), Ok(_)) = (cost, &checked) {
+        let _ = VERIFICATIONS.try_with(|costs| costs.borrow_mut().push(cost));
+    }
+    Ok(checked.unwrap_or(false))
+}
+
+/// Verify `password` against a principal's stored bcrypt hash. `stored_hash`
+/// is `None` when the principal does not exist or has no password.
+///
+/// Without a stored hash, the password is checked against a fixed hash at the
+/// default cost and refused whatever bcrypt returns. That check waits for a
+/// bcrypt slot and runs one bcrypt verification, as a check against a stored
+/// hash does. A lookup that finds no principal therefore does the same bcrypt
+/// work as a wrong password.
+///
+/// # Errors
+///
+/// As [`verify_password`], with or without a stored hash: a check for a
+/// principal that does not exist fails with the same errors, including
+/// [`VERIFY_OVERLOADED`], as a check for one that does.
+pub async fn verify_stored_password(
+    password: String,
+    stored_hash: Option<String>,
+) -> OpResult<bool> {
+    match stored_hash {
+        Some(hash) => verify_password(password, hash).await,
+        None => {
+            verify_password(password, NO_STORED_HASH.to_owned()).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// Run one bcrypt call on the blocking pool. The permit moves into the
@@ -226,6 +296,73 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn the_fixed_hash_is_a_bcrypt_hash_at_the_default_cost() {
+        let parts: bcrypt::HashParts = NO_STORED_HASH.parse().unwrap();
+        assert_eq!(parts.get_cost(), bcrypt::DEFAULT_COST);
+        // A hash bcrypt cannot decode fails before any work is done, which
+        // would make a check without a stored hash return at once.
+        assert!(bcrypt::verify("any password", NO_STORED_HASH).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_check_without_a_stored_hash_runs_one_verification_and_refuses() {
+        let _counters = COUNTERS.lock().await;
+        let hash = bcrypt::hash("correct horse", COST).unwrap();
+        let (wrong, wrong_costs) = count_verifications(verify_stored_password(
+            "battery staple".to_owned(),
+            Some(hash),
+        ))
+        .await;
+        assert!(!wrong.unwrap(), "a wrong password verified");
+        assert_eq!(wrong_costs, [COST]);
+        let (absent, absent_costs) =
+            count_verifications(verify_stored_password("battery staple".to_owned(), None)).await;
+        assert!(!absent.unwrap(), "a principal with no stored hash verified");
+        assert_eq!(
+            absent_costs,
+            [bcrypt::DEFAULT_COST],
+            "a check without a stored hash must run one verification at the default cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_without_a_stored_hash_waits_for_a_bcrypt_slot() {
+        let _counters = COUNTERS.lock().await;
+        let slots = u32::try_from(MAX_CONCURRENT_BCRYPT).unwrap();
+        let held = BCRYPT_SEMAPHORE.acquire_many(slots).await.unwrap();
+        let check = tokio::spawn(count_verifications(verify_stored_password(
+            "pw".to_owned(),
+            None,
+        )));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // Every slot is held here, so the check cannot have run.
+        assert!(!check.is_finished(), "the check finished without a slot");
+        assert_eq!(RUNNING.load(Ordering::SeqCst), 0);
+        drop(held);
+        let (result, costs) = check.await.unwrap();
+        assert!(!result.unwrap());
+        assert_eq!(costs, [bcrypt::DEFAULT_COST]);
+    }
+
+    #[tokio::test]
+    async fn a_hash_bcrypt_refuses_records_no_verification() {
+        let _counters = COUNTERS.lock().await;
+        // The second hash has bcrypt's three parts and cost 12, but its salt
+        // is not bcrypt's base64, so bcrypt refuses it before hashing.
+        let unreadable_salt = format!("$2b$12${}", "!".repeat(53));
+        assert!(unreadable_salt.parse::<bcrypt::HashParts>().is_ok());
+        for hash in ["not a bcrypt hash".to_owned(), unreadable_salt] {
+            assert!(bcrypt::verify("x", &hash).is_err(), "{hash}");
+            let (verified, costs) =
+                count_verifications(verify_password("x".to_owned(), hash)).await;
+            assert!(!verified.unwrap());
+            assert!(costs.is_empty(), "a refused hash was recorded: {costs:?}");
+        }
     }
 
     #[tokio::test]
