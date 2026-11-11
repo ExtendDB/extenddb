@@ -156,6 +156,7 @@ mod armed {
         pub(super) after_delete_claim: HashMap<String, Arc<Pause>>,
         pub(super) after_deleted_write: HashMap<String, Arc<Pause>>,
         pub(super) before_tombstone_removal: HashMap<String, Arc<Pause>>,
+        pub(super) gsi_worker_before_wait: HashMap<String, Arc<Pause>>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -592,6 +593,45 @@ pub(crate) fn index_entry_batch_error(backup_arn: &str) -> Option<StorageError> 
     }
     let _ = backup_arn;
     None
+}
+
+/// The key of a GSI worker's pause: the engine's keyspace prefix and the
+/// worker id, so a pause holds only the worker of the test that armed it.
+#[cfg(feature = "test-hooks")]
+fn gsi_worker_key(keyspace_prefix: &str, worker_id: u64) -> String {
+    format!("{keyspace_prefix}/{worker_id}")
+}
+
+/// Arm a pause in GSI worker `worker_id` of the engine on `keyspace_prefix`,
+/// after its next pass that applies nothing and before it waits for a wake.
+/// The pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_gsi_worker_before_wait(
+    keyspace_prefix: &str,
+    worker_id: u64,
+) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks.gsi_worker_before_wait.insert(
+            gsi_worker_key(keyspace_prefix, worker_id),
+            std::sync::Arc::clone(&pause),
+        );
+    });
+    pause
+}
+
+/// Hold here if a test armed a pause for GSI worker `worker_id` of the
+/// engine on `keyspace_prefix`.
+pub(crate) async fn gsi_worker_before_wait(keyspace_prefix: &str, worker_id: u64) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| {
+        hooks
+            .gsi_worker_before_wait
+            .remove(&gsi_worker_key(keyspace_prefix, worker_id))
+    }) {
+        pause.hold().await;
+    }
+    let _ = (keyspace_prefix, worker_id);
 }
 
 /// The period the jobs of `account_id` heartbeat at.

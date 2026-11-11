@@ -66,6 +66,7 @@ async fn assert_fresh_definitions(d: &Deployment) {
     migrations.close().await;
     let expected_catalog = migrations_support::expected_catalog();
     assert!(!catalog.contains_key("continuous_backups"));
+    assert!(!catalog.contains_key("metrics"));
     let expected_data: Definitions = serde_json::from_str(DATA_EXPECTED).expect("json");
     for (name, want) in &expected_catalog {
         assert_eq!(catalog.get(name), Some(want), "{name}");
