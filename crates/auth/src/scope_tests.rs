@@ -4,7 +4,9 @@
 //! Unit tests for the request timestamp and credential scope checks of
 //! `BuiltinAuthProvider::authenticate`, and for the order of its checks.
 
-use super::tests::{MockCredentialStore, SECRET, make_headers_with_auth, provider, signed_headers};
+use super::tests::{
+    MockCredentialStore, SECRET, credential, make_headers_with_auth, provider, signed_headers,
+};
 use super::*;
 use axum::http::{HeaderMap, HeaderValue};
 
@@ -144,12 +146,30 @@ fn signed_with_scope(
     service: &str,
     scope_date: Option<&str>,
 ) -> HeaderMap {
-    let mut headers = make_headers_with_auth(access_key, None);
+    signed_with_scope_and_token(access_key, region, service, scope_date, None)
+}
+
+/// `signed_with_scope` with a session token: `token`, when present, is sent
+/// and signed, as a client with temporary credentials sends it.
+fn signed_with_scope_and_token(
+    access_key: &str,
+    region: &str,
+    service: &str,
+    scope_date: Option<&str>,
+    token: Option<&str>,
+) -> HeaderMap {
+    let mut headers = make_headers_with_auth(access_key, token);
     headers.remove("authorization");
     let date_str = headers["x-amz-date"].to_str().unwrap().to_owned();
     let scope_date = scope_date.unwrap_or(&date_str[..8]).to_owned();
-    let signed = "content-type;host;x-amz-date;x-amz-target";
-    let creq = sigv4::canonical::canonical_request("POST", "/", "", &headers, signed, b"{}");
+    let mut names = vec!["content-type", "host", "x-amz-date", "x-amz-target"];
+    if token.is_some() {
+        names.push("x-amz-security-token");
+    }
+    // SigV4 lists the signed headers sorted by character code.
+    names.sort_unstable();
+    let signed = names.join(";");
+    let creq = sigv4::canonical::canonical_request("POST", "/", "", &headers, &signed, b"{}");
     let scope = format!("{scope_date}/{region}/{service}/aws4_request");
     let sts = sigv4::canonical::string_to_sign(&date_str, &scope, &creq);
     let key = sigv4::signing_key::derive_signing_key(SECRET, &scope_date, region, service);
@@ -328,4 +348,82 @@ async fn scope_wrong_in_more_than_one_part_reports_each_complaint() {
             other => panic!("scope {region}/{service}: expected the scope message, got {other:?}"),
         }
     }
+}
+
+/// A provider whose store holds a temporary key whose session ends at
+/// `expires_at`, read through the credential cache. The cache refuses an
+/// expired session with the error the storage layer returns.
+fn provider_with_a_session_expiring_at(
+    expires_at: time::OffsetDateTime,
+) -> BuiltinAuthProvider<CachedCredentialStore> {
+    let mut session = credential(true);
+    session.expires_at = Some(expires_at);
+    BuiltinAuthProvider::new(
+        CachedCredentialStore::new(
+            MockCredentialStore {
+                credential: Some(session),
+                error: None,
+            },
+            extenddb_cache::SwrCacheConfig::default(),
+        ),
+        "us-east-1",
+    )
+}
+
+/// Measured 2026-11-10 on signed ListTables requests with temporary
+/// credentials, after the session token expired. A credential scope dated
+/// the previous day answered the scope date refusal, and a scope dated the
+/// day of `X-Amz-Date` answered the expired token refusal. The scope date is
+/// compared before the token's expiry is checked. The measurement recorded
+/// the error type after the `#` only, so the prefix is not compared.
+#[tokio::test]
+async fn scope_date_is_compared_before_the_session_token_expiry() {
+    let now = time::OffsetDateTime::now_utc();
+    let expired = provider_with_a_session_expiring_at(now - time::Duration::minutes(1));
+    let stale = yesterday();
+    let cases = [
+        (
+            Some(stale.as_str()),
+            (400, "InvalidSignatureException", SCOPE_DATE_MESSAGE),
+        ),
+        (
+            None,
+            (
+                400,
+                "ExpiredTokenException",
+                "The security token included in the request is expired",
+            ),
+        ),
+    ];
+    for (scope_date, expected) in cases {
+        let headers = signed_with_scope_and_token(
+            "ASIAEXTENDDB00000000",
+            "us-east-1",
+            "dynamodb",
+            scope_date,
+            Some("stored-token"),
+        );
+        match expired.authenticate(&headers, b"{}").await {
+            Err(e) => assert_eq!(
+                (e.status_code(), e.error_type(), e.message()),
+                expected,
+                "scope date {scope_date:?}"
+            ),
+            Ok(_) => panic!("scope date {scope_date:?}: the expired session authenticated"),
+        }
+    }
+
+    // A provider built the same way, whose session ends an hour from now,
+    // accepts the same request with a matching scope date. This shows that
+    // the expiry is the only fault in the matching case.
+    let current = provider_with_a_session_expiring_at(now + time::Duration::hours(1));
+    let headers = signed_with_scope_and_token(
+        "ASIAEXTENDDB00000000",
+        "us-east-1",
+        "dynamodb",
+        None,
+        Some("stored-token"),
+    );
+    let id = current.authenticate(&headers, b"{}").await.unwrap();
+    assert!(matches!(id, AuthIdentity::RoleSession { .. }));
 }

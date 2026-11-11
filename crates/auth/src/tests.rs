@@ -113,7 +113,7 @@ async fn nonexistent_key_returns_unrecognized_client() {
 
 pub(super) const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
-fn credential(is_session: bool) -> StoredCredential {
+pub(super) fn credential(is_session: bool) -> StoredCredential {
     StoredCredential {
         secret_key: SECRET.to_owned(),
         account_id: "123456789012".to_owned(),
