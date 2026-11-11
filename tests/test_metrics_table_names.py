@@ -16,8 +16,8 @@ The test sends the rejected requests, a successful ListBackups filtered by a
 table that does not exist, a successful CreateBackup that names a table of its
 own by its ARN, a successful BatchWriteItem with an extra top-level
 ``TableName``, and last a successful PutItem on that table. It waits for the
-PutItem's and the CreateBackup's rows, then reads once more after the flush
-has had time to write the rest of its rows (see ``flushed``).
+PutItem's and the CreateBackup's rows, then reads until two reads in a row
+are the same, so the flush that wrote them has finished (see ``flushed``).
 
 Prerequisites:
   - extenddb running on EXTENDDB_TEST_ENDPOINT
@@ -26,6 +26,7 @@ Prerequisites:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import uuid
@@ -43,8 +44,11 @@ from raw_signed_request import signed_post
 # intervals to reach the metrics table.
 FLUSH_DEADLINE_SECONDS = 180
 POLL_SECONDS = 5
-# How long after the last awaited row the fixture reads again; see `flushed`.
+# After the awaited rows, the fixture reads the metrics every SETTLE_SECONDS
+# until two reads in a row are the same; see `flushed`.
 SETTLE_SECONDS = 5
+# How long the teardown waits for the test's backup to leave CREATING.
+BACKUP_DEADLINE_SECONDS = 60
 
 pytestmark = pytest.mark.slow
 
@@ -98,6 +102,48 @@ def _rows(data: dict[str, Any], metric: str, operation: str) -> list[dict[str, A
         for m in data["metrics"]
         if m["metric"] == metric and _dimension(m, "Operation") == operation
     ]
+
+
+def _table_dimensions(data: dict[str, Any], metric: str, operation: str) -> list[Any]:
+    """The TableName of each row of ``metric`` for ``operation``, None if absent."""
+    return sorted(
+        (_dimension(m, "TableName") for m in _rows(data, metric, operation)),
+        key=lambda n: (n is not None, n or ""),
+    )
+
+
+def _canonical(data: dict[str, Any]) -> list[str]:
+    return sorted(json.dumps(m, sort_keys=True) for m in data["metrics"])
+
+
+def _settled_metrics(
+    endpoint: str, data: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    """Read the metrics until two reads SETTLE_SECONDS apart are the same."""
+    while True:
+        time.sleep(SETTLE_SECONDS)
+        again = _admin_metrics(endpoint, window="LastHour")
+        # The server lists the rows in no fixed order, so compare them sorted.
+        if _canonical(again) == _canonical(data):
+            return again
+        assert time.monotonic() < deadline, (
+            f"the metrics were still changing {FLUSH_DEADLINE_SECONDS}s after "
+            f"the test's requests"
+        )
+        data = again
+
+
+def _delete_backup_when_created(client, backup_arn: str) -> None:
+    """Delete the backup once it has left CREATING, which DeleteBackup refuses."""
+    deadline = time.monotonic() + BACKUP_DEADLINE_SECONDS
+    while True:
+        status = client.describe_backup(BackupArn=backup_arn)[
+            "BackupDescription"
+        ]["BackupDetails"]["BackupStatus"]
+        if status != "CREATING" or time.monotonic() > deadline:
+            break
+        time.sleep(1)
+    client.delete_backup(BackupArn=backup_arn)
 
 
 def _raw_post(endpoint: str, operation: str, body: dict[str, Any]) -> requests.Response:
@@ -189,23 +235,33 @@ def flushed(endpoint_url: str, dynamodb_client, dynamodb_client_no_validation):
                 break
             time.sleep(POLL_SECONDS)
         assert sentinel_rows_flushed(data), (
-            f"the metrics flush did not persist the PutItem and CreateBackup rows "
-            f"for {sentinel} within {FLUSH_DEADLINE_SECONDS}s"
+            f"within {FLUSH_DEADLINE_SECONDS}s the metrics lacked the PutItem row "
+            f"under {sentinel} or the CreateBackup latency row under it or its "
+            f"ARN. Either the flush did not persist it, or it was recorded under "
+            f"another table name or none. PutItem ConsumedWriteCapacityUnits rows: "
+            f"{_table_dimensions(data, 'ConsumedWriteCapacityUnits', 'PutItem')}; "
+            f"CreateBackup SuccessfulRequestLatency rows: "
+            f"{_table_dimensions(data, 'SuccessfulRequestLatency', 'CreateBackup')}"
         )
-        # The flush writes one statement per row, in no fixed order, so a read
-        # can land partway through it. The rows with no table name (the
-        # BatchWriteItem's, the ListBackups', the rejected CreateTables') cannot
-        # be waited for by name on a shared server. Writing this test's rows
-        # takes milliseconds, so a read after SETTLE_SECONDS sees the whole
-        # flush.
-        time.sleep(SETTLE_SECONDS)
-        data = _admin_metrics(endpoint_url, window="LastHour")
+        # One flush tick writes every pending row of the minute, one statement
+        # per row, and on a shared server that includes the rows of every
+        # other test running against it, so a read can land partway through
+        # it. The rows with no table name (the BatchWriteItem's, the
+        # ListBackups', the rejected CreateTables') cannot be waited for by
+        # name. So read until two reads SETTLE_SECONDS apart are the same:
+        # nothing was written between them, so the flush that wrote the
+        # awaited rows has finished.
+        data = _settled_metrics(
+            endpoint_url, data, time.monotonic() + FLUSH_DEADLINE_SECONDS
+        )
         yield (*INVALID_NAMES, refused_valid, decoy, missing), sentinel, data
     finally:
-        if backup_arn is not None:
-            dynamodb_client.delete_backup(BackupArn=backup_arn)
-        dynamodb_client.delete_table(TableName=sentinel)
-        wait_for_deleted(dynamodb_client, sentinel)
+        try:
+            if backup_arn is not None:
+                _delete_backup_when_created(dynamodb_client, backup_arn)
+        finally:
+            dynamodb_client.delete_table(TableName=sentinel)
+            wait_for_deleted(dynamodb_client, sentinel)
 
 
 def test_rejected_requests_leave_no_table_name_in_the_metrics(flushed) -> None:
