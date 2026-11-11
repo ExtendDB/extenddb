@@ -36,6 +36,12 @@ a later syntax error and a duplicate on sk were each reported ahead of `<>`
 and contains; and a number in begins_with answered its operand type error
 without a duplicate too.
 
+The order of a Query's checks without a duplicate was measured
+2026-11-11T12:42Z to 12:44Z in us-east-1 on the table with the index, two
+sends each: the parameter mixing error first, then every FilterExpression
+fault, then every KeyConditionExpression fault, then Select, the table, the
+index and ConsistentRead.
+
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
@@ -614,3 +620,156 @@ class TestReferenceAndOperatorOrder:
         assert code == "ValidationException"
         assert msg.startswith("Invalid KeyConditionExpression: "), msg
         assert "operator" not in msg, msg
+
+
+FILTER_UNDEFINED_Q = (
+    "Invalid FilterExpression: An expression attribute name used in the "
+    "document path is not defined; attribute name: #q"
+)
+FILTER_UNDEFINED_ZZ = (
+    "Invalid FilterExpression: An expression attribute value used in "
+    "expression is not defined; attribute value: :zz"
+)
+EMPTY_PARTITION = {"S": "p484-empty"}
+
+
+def _mixing(*expression_parameters: str) -> str:
+    return (
+        "Can not use both expression and non-expression parameters in the same "
+        "request: Non-expression parameters: {ConditionalOperator} Expression "
+        f"parameters: {{{', '.join(expression_parameters)}}}"
+    )
+
+
+class TestQueryCheckOrder:
+    """The order of a Query's checks without a duplicate (2026-11-11T12:42Z to
+    12:44Z): parameters, then the FilterExpression, then the
+    KeyConditionExpression, then Select, the table, the index and
+    ConsistentRead."""
+
+    @pytest.mark.parametrize(
+        ("kce", "values", "filter_expr", "want"),
+        [
+            # F1: an undefined key condition value beside an undefined filter
+            # name.
+            ("pk = :a AND sk = :missing", {":a": A}, "#q = :a", FILTER_UNDEFINED_Q),
+            # F1c, F1d: an undefined key condition name beside an undefined
+            # filter name or value.
+            ("pk = :a AND #s = :b", {":a": A, ":b": B}, "#q = :a", FILTER_UNDEFINED_Q),
+            ("pk = :a AND #s = :b", {":a": A, ":b": B}, "foo = :zz", FILTER_UNDEFINED_ZZ),
+            # F1e: a valid filter, so the key condition value answers.
+            (
+                "pk = :a AND sk = :missing",
+                {":a": A},
+                "foo = :a",
+                "Invalid KeyConditionExpression: An expression attribute value used "
+                "in expression is not defined; attribute value: :missing",
+            ),
+            # F1f: a number in begins_with on the S sort key.
+            (
+                "pk = :a AND begins_with(sk, :n)",
+                {":a": A, ":n": N1},
+                "#q = :a",
+                FILTER_UNDEFINED_Q,
+            ),
+            # F1g: a key condition syntax error (a trailing AND).
+            ("pk = :a AND", {":a": A}, "#q = :a", FILTER_UNDEFINED_Q),
+        ],
+        ids=["F1", "F1c", "F1d", "F1e", "F1f", "F1g"],
+    )
+    def test_filter_fault_reported_ahead_of_key_condition_fault(
+        self, dynamodb_client, range_table, kce, values, filter_expr, want
+    ):
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression=kce,
+                ExpressionAttributeValues=values,
+                FilterExpression=filter_expr,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == want
+
+    def test_filter_syntax_error_reported_ahead_of_key_condition_value(
+        self, dynamodb_client, range_table
+    ):
+        """F1b. The service answers `Invalid FilterExpression: Syntax error;
+        token: "=", near: "= = :a"`; extenddb words its syntax errors
+        differently, so the prefix is compared."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND sk = :missing",
+                ExpressionAttributeValues={":a": A},
+                FilterExpression="zz = = :a",
+            )
+        )
+        assert code == "ValidationException"
+        assert msg.startswith("Invalid FilterExpression: "), msg
+
+    @pytest.mark.parametrize(
+        ("kwargs", "on_index", "want"),
+        [
+            # F2a to F2d: the mixing error ahead of each.
+            (
+                {"TableName": "extenddb-test-484-no-such-table", "ConditionalOperator": "AND"},
+                False,
+                _mixing("KeyConditionExpression"),
+            ),
+            ({"IndexName": "nope", "ConditionalOperator": "AND"}, False, _mixing("KeyConditionExpression")),
+            ({"Select": "BOGUS", "ConditionalOperator": "AND"}, False, _mixing("KeyConditionExpression")),
+            (
+                {"IndexName": KEYS_ONLY_INDEX, "ConsistentRead": True, "ConditionalOperator": "AND"},
+                True,
+                _mixing("KeyConditionExpression"),
+            ),
+            # H1 to H4: an undefined filter name ahead of each.
+            (
+                {"TableName": "extenddb-test-484-no-such-table", "FilterExpression": "#q = :a"},
+                False,
+                FILTER_UNDEFINED_Q,
+            ),
+            ({"IndexName": "nope", "FilterExpression": "#q = :a"}, False, FILTER_UNDEFINED_Q),
+            ({"Select": "BOGUS", "FilterExpression": "#q = :a"}, False, FILTER_UNDEFINED_Q),
+            (
+                {"IndexName": KEYS_ONLY_INDEX, "ConsistentRead": True, "FilterExpression": "#q = :a"},
+                True,
+                FILTER_UNDEFINED_Q,
+            ),
+            # H5: the mixing error ahead of an undefined filter name.
+            (
+                {"ConditionalOperator": "AND", "FilterExpression": "#q = :a"},
+                False,
+                _mixing("FilterExpression", "KeyConditionExpression"),
+            ),
+        ],
+        ids=["F2a", "F2b", "F2c", "F2d", "H1", "H2", "H3", "H4", "H5"],
+    )
+    def test_parameter_and_filter_checks_reported_ahead_of_request_checks(
+        self, dynamodb_client, range_table, kwargs, on_index, want
+    ):
+        request = {
+            "TableName": range_table,
+            "KeyConditionExpression": "g = :a" if on_index else "pk = :a",
+            "ExpressionAttributeValues": {":a": A},
+            **kwargs,
+        }
+        code, msg = _error(lambda: dynamodb_client.query(**request))
+        assert code == "ValidationException"
+        assert msg == want
+
+    def test_undefined_filter_value_refused_on_an_empty_partition(
+        self, dynamodb_client, range_table
+    ):
+        """F3: refused before any item is read."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a",
+                ExpressionAttributeValues={":a": EMPTY_PARTITION},
+                FilterExpression="foo = :zz",
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == FILTER_UNDEFINED_ZZ

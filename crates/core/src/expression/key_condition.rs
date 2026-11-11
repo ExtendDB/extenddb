@@ -465,7 +465,7 @@ impl KeyCondition {
 
 /// The service's message when a `KeyConditionExpression` carries more than one
 /// condition on the same key attribute. Measured 2026-10-24 (us-east-1).
-pub const ONE_CONDITION_PER_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key";
+const ONE_CONDITION_PER_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key";
 
 /// The service's message for a `#name` reference that
 /// `ExpressionAttributeNames` does not define.

@@ -25,8 +25,8 @@ mod update_parser;
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
 pub use evaluator::evaluate_condition;
 pub use key_condition::{
-    KeyClauseOperand, KeyCondition, ONE_CONDITION_PER_KEY_ERR, SortKeyCondition,
-    key_condition_clause_operands, parse_key_condition, parse_key_condition_with_maps,
+    KeyClauseOperand, KeyCondition, SortKeyCondition, key_condition_clause_operands,
+    parse_key_condition, parse_key_condition_with_maps,
 };
 pub use kind::ExpressionKind;
 pub use parser::{parse_condition, parse_condition_with_depth_limit};

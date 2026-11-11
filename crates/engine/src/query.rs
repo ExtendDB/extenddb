@@ -9,9 +9,7 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
-use extenddb_core::expression::{
-    ExpressionKind, ExpressionMaps, ONE_CONDITION_PER_KEY_ERR, Projection,
-};
+use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
 use extenddb_core::types::{
     IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
@@ -62,10 +60,12 @@ pub async fn handle_query(
             clause: crate::EnumClause::Named("returnConsumedCapacity"),
         }],
     )?;
-    // A second condition on one key attribute is reported ahead of an invalid
-    // Select (measured 2026-11-11: `pk = :a AND pk = :b` with Select `BOGUS`
-    // answers the duplicate), so an invalid Select is left out of the typed
-    // input and its error waits for that check below.
+    // The service checks Select after the request's parameters, its
+    // FilterExpression and its KeyConditionExpression (measured 2026-11-11:
+    // with Select `BOGUS`, a parameter mixing error, an undefined filter
+    // `#name` and a second condition on one key attribute each answer
+    // first), so an invalid Select is left out of the typed input and its
+    // error waits for those checks below.
     let select_check = crate::validate_enum_fields(
         &body,
         &[crate::EnumField {
@@ -100,32 +100,22 @@ pub async fn handle_query(
         input.expression_attribute_values.as_ref(),
     );
 
-    // The key condition is parsed here because the service reports a second
-    // condition on one key attribute ahead of the Select, table, index and
-    // ConsistentRead checks (measured 2026-11-11: with `pk = :a AND pk = :b`,
-    // Select `BOGUS`, a missing table, IndexName `nope`, ConsistentRead on a
-    // GSI and Select `ALL_ATTRIBUTES` on a KEYS_ONLY GSI each answer the
-    // duplicate). The checks of the request's parameters that come before the
-    // parse, and the FilterExpression's own faults, are reported first
-    // (measured 2026-11-11: ConditionalOperator, or KeyConditions, beside the
-    // expression answers the parameter mixing error). Any other fault of the
-    // parse is reported further down.
-    let key_condition_parse = input
+    // The service checks a Query in this order (measured 2026-11-11 in
+    // us-east-1): the request's parameters, then every FilterExpression
+    // fault, then every KeyConditionExpression fault, then Select, the table,
+    // the index and ConsistentRead. A parameter mixing error answers ahead of
+    // a filter fault, and ahead of a missing table, IndexName `nope`, Select
+    // `BOGUS` and ConsistentRead on a GSI. A filter fault answers ahead of an
+    // undefined key condition reference, a key condition syntax error, a
+    // number in `begins_with` and those four. A key condition fault answers
+    // ahead of those four. Limit stays below, where it was checked before.
+    check_request_parameters(&input)?;
+    let filter_expression = parse_filter_expression(&input, &maps, &ctx.limits)?;
+    let key_condition_expression = input
         .key_condition_expression
         .as_deref()
-        .map(|kce| crate::expression_helpers::parse_key_condition_expr(kce, &maps, &ctx.limits));
-    if let Some(Err(DynamoDbError::ValidationException(msg))) = &key_condition_parse
-        && msg == ONE_CONDITION_PER_KEY_ERR
-    {
-        check_request_parameters(&input)?;
-        refuse_filter_faults(
-            input.filter_expression.as_deref(),
-            input.expression_attribute_names.as_ref(),
-            &maps,
-            &ctx.limits,
-        )?;
-        return Err(DynamoDbError::ValidationException(msg.clone()));
-    }
+        .map(|kce| crate::expression_helpers::parse_key_condition_expr(kce, &maps, &ctx.limits))
+        .transpose()?;
     select_check?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -190,7 +180,14 @@ pub async fn handle_query(
         validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
-    check_request_parameters(&input)?;
+    // Validate Limit >= 1 (REQ-QUERY-001)
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
+                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
+            ));
+    }
 
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
@@ -213,13 +210,9 @@ pub async fn handle_query(
     };
 
     // Parse KeyConditionExpression or desugar legacy KeyConditions
-    let (mut key_condition, legacy_kc_maps) = if let Some(parsed) = key_condition_parse {
-        // Parsed above. The parse refuses, in this order, the first undefined
-        // `#name` or `:value` in the order the expression is written, a
-        // `begins_with` operand of the wrong type and a second condition on
-        // one key attribute, before the clauses are classified (measured
-        // 2026-10-31 and 2026-11-11).
-        (parsed?, None)
+    let (mut key_condition, legacy_kc_maps) = if let Some(parsed) = key_condition_expression {
+        // Parsed and checked above, after the FilterExpression.
+        (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info
             .key_schema
@@ -316,23 +309,15 @@ pub async fn handle_query(
         }
     }
 
-    // Parse FilterExpression or desugar legacy QueryFilter
-    let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
-        if qf.is_empty() {
-            (
-                parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-                None,
-            )
-        } else {
+    // Desugar a legacy QueryFilter. A FilterExpression was parsed and checked
+    // above; the parameter mixing check refuses a request with both.
+    let (filter, filter_maps) = match input.query_filter {
+        Some(ref qf) if !qf.is_empty() => {
             let cond_op = input.conditional_operator.unwrap_or_default();
             let (expr, fmaps) = desugar_filter(qf, cond_op)?;
             (Some(expr), Some(fmaps))
         }
-    } else {
-        (
-            parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-            None,
-        )
+        _ => (filter_expression, None),
     };
 
     // Validate #name references in filter are defined in ExpressionAttributeNames
@@ -678,27 +663,19 @@ fn refuse_begins_with_on_number(
     Ok(())
 }
 
-/// The checks of a request's parameters that run before the key condition
-/// parse, in this order: `Limit`, the mixing of expression and non-expression
-/// parameters, an empty `KeyConditionExpression`, `ExpressionAttributeNames`
-/// and `ExpressionAttributeValues` with no expression that uses them, and
+/// The checks of a request's parameters, in main's order: the mixing of
+/// expression and non-expression parameters, an empty
+/// `KeyConditionExpression`, `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues` with no expression that uses them, and
 /// `ConditionalOperator` without a `QueryFilter` of two or more conditions.
 ///
-/// `handle_query` runs these after the table, index, `ConsistentRead` and
-/// `Select` checks, and, for a key condition with a second condition on one
-/// key attribute, ahead of them and ahead of that refusal (measured
-/// 2026-11-11: `pk = :a AND pk = :b` with `ConditionalOperator` `AND` and no
-/// `QueryFilter`, or with `KeyConditions`, answers the mixing error).
+/// `handle_query` runs these first, ahead of the `FilterExpression`, the
+/// `KeyConditionExpression` and the `Select`, table, index and
+/// `ConsistentRead` checks (measured 2026-11-11: `ConditionalOperator` `AND`
+/// beside `pk = :a` answers the mixing error with a missing table, IndexName
+/// `nope`, Select `BOGUS`, ConsistentRead on a GSI or an undefined filter
+/// `#name`, and beside `pk = :a AND pk = :b`).
 fn check_request_parameters(input: &QueryInput) -> Result<(), DynamoDbError> {
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
-
     // --- Legacy vs expression mutual exclusivity checks ---
     let kce_present = input.key_condition_expression.is_some();
     let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
@@ -761,31 +738,36 @@ fn check_request_parameters(input: &QueryInput) -> Result<(), DynamoDbError> {
     )
 }
 
-/// Refuse a `FilterExpression` fault that the service reports ahead of a
-/// second condition on one key attribute.
+/// Parse the request's `FilterExpression` and refuse its faults, before the
+/// key condition is parsed and the table is read.
 ///
-/// Measured 2026-11-11 (us-east-1), with `pk = :a AND pk = :b`: a filter
-/// syntax error, a reserved word, an undefined `#name` or `:value`, and a
-/// number in `begins_with` each answer the filter's own message. This runs
-/// only for a key condition with that duplicate.
-fn refuse_filter_faults(
-    filter: Option<&str>,
-    names: Option<&HashMap<String, String>>,
+/// The checks run in main's order: grammar and reserved words, undefined
+/// `#name` references, `begins_with` and ordering operand types, then
+/// undefined `:value` references. Measured 2026-11-11 (us-east-1): an
+/// undefined filter `#name`, an undefined filter `:value` and a filter syntax
+/// error each answer ahead of a key condition fault, and an undefined filter
+/// `:value` is refused on a partition with no items.
+fn parse_filter_expression(
+    input: &QueryInput,
     maps: &ExpressionMaps,
     limits: &extenddb_core::limits::LimitsConfig,
-) -> Result<(), DynamoDbError> {
-    let Some(filter) = parse_optional_filter(filter, limits)? else {
-        return Ok(());
+) -> Result<Option<extenddb_core::expression::Expr>, DynamoDbError> {
+    let Some(filter) = parse_optional_filter(input.filter_expression.as_deref(), limits)? else {
+        return Ok(None);
     };
+    let names = input.expression_attribute_names.as_ref();
     validate_name_refs_in_expr(&filter, names, ExpressionKind::Filter)?;
+    extenddb_core::expression::validate_begins_with_operands(&filter, maps)
+        .and_then(|()| extenddb_core::expression::validate_ordering_operand_types(&filter, maps))
+        .map_err(|e| {
+            crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter)
+        })?;
     let mut placeholders = Vec::new();
     extenddb_core::expression::collect_value_placeholders(&filter, &mut placeholders);
     for placeholder in &placeholders {
         maps.resolve_value_for(placeholder, ExpressionKind::Filter.as_str())?;
     }
-    extenddb_core::expression::validate_begins_with_operands(&filter, maps)
-        .and_then(|()| extenddb_core::expression::validate_ordering_operand_types(&filter, maps))
-        .map_err(|e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter))
+    Ok(Some(filter))
 }
 
 /// Validate that all `#name` references in an expression AST are defined.
