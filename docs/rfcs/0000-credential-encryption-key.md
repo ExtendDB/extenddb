@@ -55,7 +55,7 @@ key_file = "/etc/extenddb/kek"
 
 The `catalog` source is the default, so an upgrade changes nothing until the operator moves the deployment.
 
-The KEK file holds 32 random bytes in standard base64. The server strips one trailing newline, so `head -c 32 /dev/urandom | base64 > kek`, run under `umask 077`, writes a file that the server accepts.
+The KEK file holds 32 random bytes in standard base64. The server strips one trailing newline, so `head -c 32 /dev/urandom | base64 > kek`, run under `umask 077`, writes a file that the server accepts. A leading `~` in `key_file` expands through `expand_tilde`, as in the TLS key path (`crates/app/src/serve_helpers.rs:164`).
 
 The server refuses to start when other users can read the KEK file. It accepts mode 0600 or 0400 when the server's user owns the file, and mode 0640 or 0440 when root owns it. PostgreSQL applies the same rule to its TLS private key. A Kubernetes secret volume uses mode 0644 unless `defaultMode` is set ([Kubernetes volume reference](https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/volume/)). The deployment docs therefore give a `defaultMode` that meets the rule.
 
@@ -87,6 +87,7 @@ Migration 11 adds a nullable integer column, `key_id`, to `access_keys` and `iam
 - A null `key_id` means the catalog key. Every row written before the upgrade has a null `key_id`, so no existing row changes.
 - Under the `catalog` source, writers keep `key_id` null. Under the `file` source, writers store the id of the active DEK.
 - A reader decrypts a row with the key that the row names. The AAD stays the access key ID, so no existing ciphertext changes.
+- Nine call sites encrypt a secret and eight decrypt one: create and import on each backend, AssumeRole, and two lookups in each credential store. Today each is handed a key string. They call two new functions beside `secret_cipher` in `crates/storage` instead. One encrypts with the active key and returns the key id with the ciphertext. The other takes the key id of the row. No call site picks a key itself.
 - A row can name a key that the server does not hold. Such a row fails as a decrypt failure fails today, with HTTP 500 `InternalServerError` (`crates/storage-sqlite/src/credential_store.rs:54-60` and the matching stores). The log line that names the access key ID also names the key id. Only a row that the rotation command could not decrypt names such a key (section 5).
 
 With the column, a reader finds the key of a row without trial decryption. A prefix in the stored bytes cannot do that. The current bytes start with a random nonce, so no prefix tells an old row from a new one.
@@ -101,7 +102,7 @@ Migration 11 is convergent. It is `Kind::Breaking`, because declaring a migratio
 
 ### 4. Startup
 
-Each backend factory reads the `encryption_key` row and the `encryption_key_ring` row. It passes both, with the configured source, to one function in `crates/storage`, beside the key check that #863 adds there. The function returns the one key that the server uses, or a reason to refuse:
+One function in `crates/storage` loads the key, beside the key check that #863 adds there. It reads the `encryption_key` row and the `encryption_key_ring` row through the existing `SettingsStore::get_setting` of the backend (`crates/storage/src/management_store/mod.rs:56`). Each backend factory calls it once, in place of its own key query (`crates/storage-sqlite/src/lib.rs:427-434` and the matching factories) and its call to the check of #863. The function returns the one key that the server uses, or a reason to refuse:
 
 | The catalog holds | Configured source | Result |
 |---|---|---|
@@ -114,6 +115,7 @@ Each backend factory reads the `encryption_key` row and the `encryption_key_ring
 | neither row | either | Refuse with `MissingEncryptionKey`, as today. |
 
 - A damaged catalog key, KEK file or key ring also stops the server. The refusals reuse `MissingEncryptionKey` and the `InvalidEncryptionKey` of #863 with the source in the text. One new error variant carries the reason for a mismatch. No message, log line or settings response contains key material.
+- At startup the server logs the key source. Under the `catalog` source the line says that a copy of the catalog decrypts every stored secret.
 - The server holds one key, in one zeroizing buffer. The catalog store, the credential store and AssumeRole share it by `Arc`. Today each of them holds its own copy (`crates/storage-sqlite/src/lib.rs:443-450`, `crates/server/src/management/assume_role.rs:292-308`).
 - Today some code reads the `encryption_key` row when its store holds no key. This change deletes that code: `crates/server/src/management/assume_role.rs:292-308`, `crates/storage-sqlite/src/management_store/access_keys.rs:20-33`, `crates/storage-postgres/src/management_store/access_keys.rs:21-34` and `:120-133`, `crates/storage-mongodb/src/management_store.rs:2484-2499`, and `crates/storage-cassandra/src/management_store/access_keys.rs:25-44` and `:173-192`. A store built without the key refuses to create, import or store a credential. The `settings` and `migrate` commands and the migration bodies use such stores, and none of them writes a credential.
 - The factory takes the key source as a new argument, not as a field of the `Copy` options struct (`crates/storage/src/server_components.rs:86-135`). `serve` passes it. The `extenddb backup` commands pass none (`crates/app/src/cmd_backup.rs:602-625`). They read no credential, so they read neither key row and do not need the KEK file.
@@ -146,6 +148,8 @@ In step 3:
 - On SQLite, PostgreSQL and MongoDB the writes go in batches, with one transaction per batch.
 
 A run that stops at any step can run again with the same arguments. Each row records its key id, so the rows that name an older key are the remaining work. Until a run finishes, the server refuses to start (section 4).
+
+The pass is one driver in `crates/storage`, as the pass of migration 2 is (`crates/storage/src/policy_migration.rs`, `crates/storage/src/migrations/m0002_resource_tag_condition_keys.rs:13-18`). Each backend adds two `ManagementStore` methods: a batched read of the rows that do not name the target key, and the conditional write of one row. The notes below describe those methods.
 
 Per backend:
 
@@ -213,7 +217,8 @@ Line numbers are on main at 870962647.
   - `docs/design/04-component-storage.md:195-198`, `docs/design/05-component-auth-v3.md:404-410`, `docs/design/06-component-server.md:474`, `docs/design/13-storage-mongodb.md:112-115` and `:145-147`
   - `docs/getting-started.md:90`, `docs/manuals/04-quickstart-setup-guide.md:141`, `docs/manuals/08-install-linux.md:86`, `docs/manuals/09-install-macos.md:70`
   - `docs/adr/0026-credential-crypto-on-aws-lc.md:85-86`
-- Statements already false on main, in paragraphs that this change rewrites: `docs/troubleshooting.md:149`, `:595-611`, `:655-657`, `:797-799` and `:897-901`, and `docs/design/05-component-auth.md:37` and `:1036-1039`.
+- Statements already false on main, in paragraphs that this change rewrites: `docs/troubleshooting.md` at `:595-611`, `:655-657`, `:797-799` and `:897-901`.
+- #972 covers the false statements that this change does not touch: `docs/troubleshooting.md:149` and the text that says the config file may contain the key, and `docs/design/05-component-auth.md:37` and `:1036-1039`.
 - Code comments: `crates/storage/src/secret_cipher.rs:7-9`, `crates/storage/src/lib.rs:781-783`, `crates/storage-postgres/src/catalog_store.rs:24-25`, `crates/storage-cassandra/src/catalog_store.rs:46-47` and `crates/storage-cassandra/src/bootstrapper.rs:552`.
 - New text:
   - migration 11 beside `docs/manuals/07-upgrade-manual.md:7-11`, and the rollback step beside `:79`
@@ -230,6 +235,10 @@ Three pull requests, each with its own docs, ship in one release:
 1. Migration 11, the shared startup function and the one shared key, for the `catalog` source only. The pull request also deletes the fallback reads and adds the new factory argument. The released-upgrade tests and `docs/schema/<backend>.txt` change with the migration (`CONTRIBUTING.md:329-341`). No request or response changes. Crates: `storage`, `storage-sqlite`, `storage-postgres`, `storage-mongodb`, `storage-cassandra`, `server` and `app`.
 2. The `file` source, its file rule and the KEK id. The bootstrap rule of section 4, the startup refusals, and `extenddb encryption-key rotate` on SQLite and PostgreSQL. Crates: `config`, `storage`, `storage-sqlite`, `storage-postgres` and `app`.
 3. `rotate` on MongoDB and Cassandra, and the consistency argument of the Cassandra helpers. Crates: `storage-mongodb` and `storage-cassandra`.
+
+Tests: one check in `crates/storage` holds the rotation and startup cases as one table, and each backend's tests run it with their own store. `metrics_conformance` is the precedent (`crates/storage/src/metrics_conformance.rs:44`). The tests of PostgreSQL, MongoDB and Cassandra call it, and so does a SQLite test file (`crates/storage-sqlite/src/migrations/released_tests.rs:411`). The cases include a row with a null `key_id`, a row under a DEK and a row that does not decrypt. They also cover a run resumed after a stop, each refusal of section 4, and a key id that the server does not hold.
+
+Size: each pull request reports its production and test line counts. For comparison, the files of migration 9 on main have 62 lines on SQLite, 12 on PostgreSQL and 13 on Cassandra, comments included. The shared metrics check has 306 lines. The TLS key mode check has 197 lines before its tests (`crates/app/src/serve_helpers.rs:126-322`).
 
 ## Answers to the questions on #707
 
@@ -248,7 +257,7 @@ Three pull requests, each with its own docs, ship in one release:
 - A rotation stops every server for the length of the pass. In the proxy measurement of section 5, 100,000 rows took 3.85 s on PostgreSQL and 1.44 s on SQLite. MongoDB and Cassandra were not measured.
 - On Cassandra a rotation needs every replica of the catalog keyspace up.
 - The operator keeps the KEK readable only by the server's user, and backs it up apart from the catalog. A lost KEK loses every stored secret.
-- SQLite, PostgreSQL and Cassandra never delete expired sessions. The pass therefore reads every session row to find the ones that have not expired.
+- SQLite, PostgreSQL and Cassandra never delete expired sessions (#971). The pass therefore reads every session row to find the ones that have not expired.
 - Migration 11 is breaking, so its rollback is a restore.
 - The move does not protect the secrets that older catalog copies hold (section 5).
 
