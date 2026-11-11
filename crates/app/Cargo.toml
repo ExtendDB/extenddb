@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Command-line interface of the ExtendDB server, shared by every backend build. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # Developer mode: plain HTTP on loopback, open authorization (SigV4

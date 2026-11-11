@@ -7,6 +7,8 @@
 //! time so `extenddb version` can report them without runtime git access.
 
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,12 +16,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=EXTENDDB_GIT_HASH");
     println!("cargo:rerun-if-env-changed=EXTENDDB_BUILD_TIME");
 
-    // Git commit hash (short). Container builds exclude .git from the context,
-    // so the release workflow injects EXTENDDB_GIT_HASH explicitly. Local builds
-    // retain the convenient git fallback.
+    // Git commit hash. Container builds exclude .git from the context, so the
+    // release workflow injects EXTENDDB_GIT_HASH (the full SHA) explicitly. A
+    // build of the published crate has no git repository either, so the
+    // commit `cargo package` recorded is read next. Local builds retain the
+    // convenient git fallback (short form).
     let git_hash = env::var("EXTENDDB_GIT_HASH")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(packaged_commit)
         .unwrap_or_else(|| {
             Command::new("git")
                 .args(["rev-parse", "--short", "HEAD"])
@@ -77,4 +82,32 @@ fn main() {
     // No file-specific rerun directives: Cargo still re-runs build.rs when any
     // file in the package changes, while the env directives above make metadata
     // overrides participate in Cargo's normal rebuild tracking.
+}
+
+/// The commit of a build from the published crate.
+///
+/// `cargo package` writes `.cargo_vcs_info.json` beside the manifest, with
+/// `"sha1": "<40 hex digits>"` for the packaged commit and `"dirty": true`
+/// when the tree had uncommitted changes. The file exists only in a packaged
+/// crate, so a build in the repository returns `None` here and falls back to
+/// git. A file without a well-formed SHA also returns `None`.
+fn packaged_commit() -> Option<String> {
+    let dir = env::var_os("CARGO_MANIFEST_DIR")?;
+    let text = fs::read_to_string(Path::new(&dir).join(".cargo_vcs_info.json")).ok()?;
+    let after_key = &text[text.find("\"sha1\"")? + "\"sha1\"".len()..];
+    let value = &after_key[after_key.find('"')? + 1..];
+    let sha = value.get(..40)?;
+    if !sha.bytes().all(|b| b.is_ascii_hexdigit()) || !value[40..].starts_with('"') {
+        return None;
+    }
+    let dirty = text.find("\"dirty\"").is_some_and(|at| {
+        let rest = text[at + "\"dirty\"".len()..].trim_start();
+        rest.strip_prefix(':')
+            .is_some_and(|value| value.trim_start().starts_with("true"))
+    });
+    Some(if dirty {
+        format!("{sha}-dirty")
+    } else {
+        sha.to_owned()
+    })
 }

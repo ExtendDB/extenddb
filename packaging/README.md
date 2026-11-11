@@ -105,9 +105,10 @@ cargo build --release --locked --no-default-features --features sqlite,dev-mode 
 Flow (mirrors the container release: candidate first, promotion is a
 deliberate second step):
 
-1. Land the release state on `main` with the workspace version bumped and
-   `npm/package.json` bumped to match, then tag that commit `vX.Y.Z` and push
-   the tag. The tagged commit itself must carry the matching
+1. Land the release state on `main`. Bump the workspace version and the 13
+   `=X.Y.Z` pins in the root `[workspace.dependencies]`, regenerate the four
+   license notices, and bump `npm/package.json` to match. Tag that commit
+   `vX.Y.Z` and push the tag. The tagged commit itself must carry the matching
    `npm/package.json`. The launcher runs only a binary of its own release.
    On a tag whose `package.json` lags the workspace version, the launcher
    tests would fail on every build leg. The publish gate refuses such a tag
