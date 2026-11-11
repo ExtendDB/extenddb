@@ -11,7 +11,9 @@ use extenddb_storage::error::StorageError;
 /// refused with its own sentence; alone it is not. Measured 2026-11-11:
 /// beside an index delete it answers the index sentence, beside an index
 /// Update carrying WarmThroughput the WarmThroughput sentence, and beside an
-/// index Update of ProvisionedThroughput it is not refused.
+/// index Update of ProvisionedThroughput it is not refused. A Create beside an
+/// Update (not measured) answers the index sentence: any Create or Delete
+/// decides it.
 #[test]
 fn a_stream_change_refuses_its_companions() {
     let with = |extra: &Value| -> UpdateTableInput {
@@ -29,6 +31,11 @@ fn a_stream_change_refuses_its_companions() {
     let warm = "One or more parameter values were invalid: WarmThroughput must be the only operation in the request";
     let protection = "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request";
     let units = serde_json::json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 5});
+    let create = serde_json::json!({"Create": {
+        "IndexName": "g",
+        "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+        "Projection": {"ProjectionType": "ALL"}
+    }});
     let gsi = |update: Value| serde_json::json!({"GlobalSecondaryIndexUpdates": [update]});
     for (extra, expected) in [
         (
@@ -43,12 +50,12 @@ fn a_stream_change_refuses_its_companions() {
             gsi(serde_json::json!({"Delete": {"IndexName": "g"}})),
             Some(index),
         ),
+        (gsi(create.clone()), Some(index)),
         (
-            gsi(serde_json::json!({"Create": {
-                "IndexName": "g",
-                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
-                "Projection": {"ProjectionType": "ALL"}
-            }})),
+            serde_json::json!({"GlobalSecondaryIndexUpdates": [
+                create,
+                {"Update": {"IndexName": "h", "ProvisionedThroughput": units}}
+            ]}),
             Some(index),
         ),
         (

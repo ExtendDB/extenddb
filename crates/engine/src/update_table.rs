@@ -161,50 +161,21 @@ pub async fn handle_update_table(
 
     crate::gsi_updates::validate_gsi_updates(&input)?;
 
-    // The service refuses a stream change sent with some other changes, and
-    // applies nothing. Measured 2026-10-24: beside BillingMode or
-    // ProvisionedThroughput it refuses with the IOPS sentence, beside an index
-    // Create with the index sentence. The per-index definition checks above
-    // come first, and the already-enabled refusal (`Table already has an
-    // enabled stream`) comes before the IOPS sentence, so the table's stored
-    // specification is read here when a companion change is present.
-    // DeletionProtectionEnabled beside a stream change is refused with the
-    // service's only-operation sentence (measured 2026-10-24); the general rule
-    // for DeletionProtection beside any other change is PR #474's and is not
-    // claimed here. Measured 2026-11-11 on a provisioned table: an index Delete
-    // answers the index sentence, an index Update carrying WarmThroughput the
-    // WarmThroughput sentence, and an index Update of ProvisionedThroughput is
-    // accepted and both changes apply. TableClass is refused with its own
-    // sentence, on a table whose stream is already disabled too, so it is
-    // checked before the table is read; its order against the other companions
-    // is not measured. OnDemandThroughput beside a stream change is not
-    // measured and stays accepted.
+    // A stream change is refused beside some other changes, and nothing
+    // applies (measured 2026-10-24 and 2026-11-11). TableClass gets its
+    // only-operation sentence before the table is read, as the service answers
+    // for a missing table. Billing or throughput (the IOPS sentence), an index
+    // Create or Delete (the index sentence), and an index WarmThroughput or
+    // DeletionProtection (their only-operation sentences) are refused by
+    // `stream_change_companion`, after the index checks above and the stream
+    // state check below. Not measured: the order of TableClass against those,
+    // and OnDemandThroughput beside a stream change, which stays accepted.
     if input.stream_specification.is_some() && input.table_class.is_some() {
         return Err(DynamoDbError::ValidationException(
             extenddb_core::validation::TABLE_CLASS_MUST_BE_ONLY_OPERATION.to_owned(),
         ));
     }
-    if let Some(companion) = stream_change_companion(&input) {
-        let existing = ctx
-            .storage
-            .describe_table(
-                &ctx.account_id,
-                extenddb_core::types::DescribeTableInput {
-                    table_name: input.table_name.clone(),
-                },
-            )
-            .await
-            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
-        if let Some(spec) = &input.stream_specification {
-            extenddb_storage::stream_lineage::stream_change(
-                &input.table_name,
-                existing.stream_specification.as_ref(),
-                spec,
-            )
-            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
-        }
-        return Err(DynamoDbError::ValidationException(companion.to_owned()));
-    }
+    let companion = stream_change_companion(&input);
 
     // A created GSI's projected attributes count toward the table's limit
     // together with the indexes it already has: the total CreateTable checks,
@@ -230,7 +201,12 @@ pub async fn handle_update_table(
     // A switch to PAY_PER_REQUEST stores the on-demand minimum as the warm
     // throughput of a provisioned table that is below it, so it needs the table.
     let switches_to_on_demand = matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
-    if projects_attributes || touches_warm || bare_update || switches_to_on_demand {
+    if companion.is_some()
+        || projects_attributes
+        || touches_warm
+        || bare_update
+        || switches_to_on_demand
+    {
         let existing = ctx
             .storage
             .describe_table(
@@ -241,6 +217,21 @@ pub async fn handle_update_table(
             )
             .await
             .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        // The stream state refusals (`Table already has an enabled stream`,
+        // `Table has no stream to disable`) come before the companion sentence
+        // (measured for the IOPS one, 2026-10-24) and before a bare index
+        // Update's (measured 2026-11-11).
+        if let Some(spec) = &input.stream_specification {
+            extenddb_storage::stream_lineage::stream_change(
+                &input.table_name,
+                existing.stream_specification.as_ref(),
+                spec,
+            )
+            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
+        }
+        if let Some(companion) = companion {
+            return Err(DynamoDbError::ValidationException(companion.to_owned()));
+        }
         if let Some(updates) = &input.global_secondary_index_updates
             && projects_attributes
         {

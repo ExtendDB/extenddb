@@ -22,12 +22,13 @@ import pytest
 from botocore.exceptions import ClientError
 
 from helpers import unique_name, wait_for_active, wait_for_deleted
-from warm_throughput_helpers import _wait_all_active
+from warm_throughput_helpers import ONLY_OPERATION, TABLE_CLASS_ONLY, _wait_all_active
 
 KEYS_ONLY = {"StreamEnabled": True, "StreamViewType": "KEYS_ONLY"}
 NEW_IMAGE = {"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"}
 DISABLED = {"StreamEnabled": False}
 INVALID = "One or more parameter values were invalid: "
+INDEX_CHANGE = INVALID + "You cannot create or delete index while changing stream status"
 
 ON_SERVICE = not os.environ.get("DYNAMODB_ENDPOINT", "").strip()
 
@@ -203,11 +204,7 @@ def test_a_stream_change_beside_a_billing_change_is_refused(run):
 
 
 def test_a_stream_change_beside_an_index_create_is_refused(run):
-    _refused(
-        run["disable_plus_gsi"],
-        "ValidationException",
-        INVALID + "You cannot create or delete index while changing stream status",
-    )
+    _refused(run["disable_plus_gsi"], "ValidationException", INDEX_CHANGE)
 
 
 def test_the_index_definition_check_precedes_the_companion_rule(run):
@@ -336,9 +333,6 @@ def test_enabling_it_creates_the_first_stream(run):
 # stream. Each row brings the stream to the state it was measured in, sends
 # the request, and checks the answer and the table once it is ACTIVE.
 
-TABLE_CLASS_ONLY = INVALID + "TableClass modification must be the only operation in the request"
-WARM_THROUGHPUT_ONLY = INVALID + "WarmThroughput must be the only operation in the request"
-INDEX_CHANGE = INVALID + "You cannot create or delete index while changing stream status"
 NO_INDEX_THROUGHPUT = pytest.mark.xfail(
     not ON_SERVICE,
     reason="ExtendDB does not change an index's ProvisionedThroughput "
@@ -346,20 +340,29 @@ NO_INDEX_THROUGHPUT = pytest.mark.xfail(
 )
 
 # (stream enabled before, StreamSpecification sent, change beside it, refusal
-# or None when the service accepts the request and applies both changes)
+# with {name} for the table, or None when the service accepts the request and
+# applies both changes)
 COMPANION_ROWS = [
     pytest.param(True, DISABLED, "index delete", INDEX_CHANGE, id="index-delete"),
     pytest.param(True, DISABLED, "table class", TABLE_CLASS_ONLY, id="table-class"),
     pytest.param(
         False, DISABLED, "table class", TABLE_CLASS_ONLY, id="table-class-already-disabled"
     ),
-    pytest.param(True, DISABLED, "index warm", WARM_THROUGHPUT_ONLY, id="index-warm-disable"),
-    pytest.param(False, NEW_IMAGE, "index warm", WARM_THROUGHPUT_ONLY, id="index-warm-enable"),
+    pytest.param(True, DISABLED, "index warm", ONLY_OPERATION, id="index-warm-disable"),
+    pytest.param(False, NEW_IMAGE, "index warm", ONLY_OPERATION, id="index-warm-enable"),
     pytest.param(
         True, DISABLED, "index units", None, id="index-units-disable", marks=NO_INDEX_THROUGHPUT
     ),
     pytest.param(
         False, NEW_IMAGE, "index units", None, id="index-units-enable", marks=NO_INDEX_THROUGHPUT
+    ),
+    pytest.param(
+        False, DISABLED, "index units", "Table has no stream to disable: TableName: {name}",
+        id="index-units-no-stream-to-disable",
+    ),
+    pytest.param(
+        True, NEW_IMAGE, "index units", "Table already has an enabled stream: TableName: {name}",
+        id="index-units-already-enabled",
     ),
 ]
 
@@ -434,7 +437,7 @@ def test_a_stream_change_beside_an_index_or_table_class_change(
     row = _call(ddb.update_table, TableName=provisioned, StreamSpecification=stream, **members)
     after = _wait_all_active(ddb, provisioned)
     if refusal is not None:
-        _refused(row, "ValidationException", refusal)
+        _refused(row, "ValidationException", refusal.format(name=provisioned))
         assert _stream_enabled(after) == before
         assert _index_units(after) == _index_units(table)
         assert after.get("TableClassSummary", {}).get("TableClass", "STANDARD") == "STANDARD"
