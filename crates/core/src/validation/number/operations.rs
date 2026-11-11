@@ -11,14 +11,15 @@
 //! and `DeleteItem` on 2026-10-27, and `PutItem`, `BatchWriteItem`,
 //! `TransactWriteItems` and `TransactGetItems` on 2026-11-11, where
 //! `10E2147483647` and `1E2147483648` are a `Number overflow` on all four
-//! paths. The operations differ in the text for an empty value: keys and
-//! items of `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and
-//! `DeleteItem` answer `The parameter cannot be converted to a numeric value: `
-//! with nothing after the colon, and keys and items of `BatchWriteItem`,
-//! `TransactGetItems` and `TransactWriteItems` answer the message without the
-//! colon (measured 2026-10-27). An empty value in `ExpressionAttributeValues`
-//! answers with the colon on `UpdateItem` and `TransactWriteItems` (measured
-//! 2026-11-11).
+//! paths. An empty value answers `The parameter cannot be converted to a
+//! numeric value: `, with nothing after the colon, on every path here except
+//! the keys and items of `BatchWriteItem`, which answer the message without
+//! the colon (measured 2026-11-11 on the keys of `GetItem`, `BatchGetItem`,
+//! `DeleteItem`, `UpdateItem`, `BatchWriteItem`, `TransactGetItems` and
+//! `TransactWriteItems`, the items of `BatchWriteItem` and
+//! `TransactWriteItems`, `Expected` values and `ExpressionAttributeValues`).
+//! On 2026-10-27 the keys and items of `TransactGetItems` and
+//! `TransactWriteItems` answered without the colon too.
 //!
 //! `ImportTable` reads the numbers of a row with a 32-bit exponent and scale
 //! (measured 2026-11-03 and 2026-11-11; see [`import_row`] and
@@ -56,13 +57,14 @@ const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
 /// The text an operation gives for an empty number.
 #[derive(Clone, Copy)]
 enum EmptyText {
-    /// The message and a colon with nothing after it: keys and items of
-    /// `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem`
-    /// (measured 2026-10-27), and `ExpressionAttributeValues` (measured on
-    /// `UpdateItem` and on a `TransactWriteItems` `Update` on 2026-11-11).
+    /// The message and a colon with nothing after it: keys of `GetItem`,
+    /// `BatchGetItem`, `DeleteItem` and `UpdateItem`, keys and items of
+    /// `TransactGetItems` and `TransactWriteItems`, `Expected` values and
+    /// `ExpressionAttributeValues` (measured 2026-11-11; `TransactGetItems`
+    /// and `TransactWriteItems` keys and items had no colon on 2026-10-27).
     WithColon,
-    /// The message without the colon: keys and items of `BatchWriteItem`,
-    /// `TransactGetItems` and `TransactWriteItems` (measured 2026-10-27).
+    /// The message without the colon: keys and items of `BatchWriteItem`, an
+    /// `NS` member included (measured 2026-10-27 and 2026-11-11).
     WithoutColon,
 }
 
@@ -187,13 +189,15 @@ pub fn put_item_item(input: &PutItemInput) -> Result<(), DynamoDbError> {
     crate::validation::validate_item_nesting_depth(&input.item)
 }
 
-/// Refuse a `TransactGetItems` key holding a number the service cannot read.
+/// Refuse a `TransactGetItems` key holding a number the service cannot read,
+/// with no prefix. An empty `N` answers with the colon (measured
+/// 2026-11-11).
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn transact_get_item(item: &TransactGetItem) -> Result<(), DynamoDbError> {
-    item_numbers(EmptyText::WithoutColon, &item.get.key).map_err(bare)
+    item_numbers(EmptyText::WithColon, &item.get.key).map_err(bare)
 }
 
 /// Refuse a `BatchWriteItem` request when a put item or a delete key holds a
@@ -230,9 +234,9 @@ pub fn batch_write_item(input: &BatchWriteItemInput) -> Result<(), DynamoDbError
 
 /// Refuse one `TransactWriteItems` action holding a number the service cannot
 /// read: its `ExpressionAttributeValues` first, then its key or item. Both
-/// answer the number message with no prefix and no wrapper (measured
-/// 2026-11-11 on `Update`, `Put`, `Delete` and `ConditionCheck` values and on
-/// a `Delete` key).
+/// answer the number message with no prefix and no wrapper, and an empty `N`
+/// with the colon (measured 2026-11-11 on `Update`, `Put`, `Delete` and
+/// `ConditionCheck` values, on a `Delete` key and on a `Put` item).
 ///
 /// # Errors
 ///
@@ -258,7 +262,7 @@ pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError
         return Ok(());
     };
     value_numbers(EmptyText::WithColon, values).map_err(bare)?;
-    item_numbers(EmptyText::WithoutColon, key_or_item).map_err(bare)
+    item_numbers(EmptyText::WithColon, key_or_item).map_err(bare)
 }
 
 /// Refuse `UpdateItem` `ExpressionAttributeValues` holding a number the

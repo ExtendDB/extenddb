@@ -666,6 +666,90 @@ async fn put_batch_and_transact_paths_read_a_64_bit_exponent() {
 }
 
 #[tokio::test]
+async fn an_empty_number_answers_with_the_colon_except_on_batch_write_item() {
+    // Measured 2026-11-11, each request twice. The message ends with a colon
+    // and a space on GetItem, BatchGetItem, DeleteItem, UpdateItem,
+    // TransactGetItems and TransactWriteItems keys and on a TransactWriteItems
+    // Put item value. BatchWriteItem keys, item values and NS members answer
+    // without the colon. TransactGetItems and TransactWriteItems keys and
+    // items had no colon on 2026-10-27.
+    let t = tables().await;
+    let table = &t.comp_key_number_string;
+    let with_colon = "The parameter cannot be converted to a numeric value: ";
+    let without_colon = "The parameter cannot be converted to a numeric value";
+
+    let get = client()
+        .get_item()
+        .table_name(table)
+        .set_key(Some(number_key("")))
+        .send()
+        .await;
+    assert_refused(&refused(get), with_colon);
+
+    let keys = KeysAndAttributes::builder()
+        .keys(number_key(""))
+        .build()
+        .expect("keys");
+    let batch_get = client()
+        .batch_get_item()
+        .request_items(table, keys)
+        .send()
+        .await;
+    assert_refused(&refused(batch_get), with_colon);
+
+    let delete = client()
+        .delete_item()
+        .table_name(table)
+        .set_key(Some(number_key("")))
+        .send()
+        .await;
+    assert_refused(&refused(delete), &format!("{PREFIX}{with_colon}"));
+
+    let update = client()
+        .update_item()
+        .table_name(table)
+        .set_key(Some(number_key("")))
+        .update_expression("SET a = :a")
+        .expression_attribute_values(":a", s("x"))
+        .send()
+        .await;
+    assert_refused(&refused(update), &format!("{PREFIX}{with_colon}"));
+
+    let get = Get::builder()
+        .table_name(table)
+        .set_key(Some(number_key("")))
+        .build()
+        .expect("get");
+    let transact_get = client()
+        .transact_get_items()
+        .transact_items(TransactGetItem::builder().get(get).build())
+        .send()
+        .await;
+    assert_refused(&refused(transact_get), with_colon);
+
+    let err = transact_write(vec![txn_delete(delete_of(table, number_key("")))]).await;
+    assert_refused(&err.unwrap_err(), with_colon);
+
+    let mut item = string_key("e618");
+    item.insert("amount".to_string(), n_raw(""));
+    let put = put_of(&t.simple_key_string, item.clone());
+    let err = transact_write(vec![txn_put(put)]).await;
+    assert_refused(&err.unwrap_err(), with_colon);
+
+    let err = batch_write(table, vec![delete_request(number_key(""))]).await;
+    assert_refused(&err.unwrap_err(), without_colon);
+
+    let err = batch_write(&t.simple_key_string, vec![put_request(item)]).await;
+    assert_refused(&err.unwrap_err(), without_colon);
+
+    let mut item = string_key("e618");
+    let members = vec!["1".to_string(), String::new()];
+    item.insert("amounts".to_string(), AttributeValue::Ns(members));
+    let err = batch_write(&t.simple_key_string, vec![put_request(item)]).await;
+    assert_refused(&err.unwrap_err(), without_colon);
+}
+
+#[tokio::test]
 async fn a_zero_inside_the_range_is_stored_as_zero_on_batch_and_transact_writes() {
     // Measured 2026-10-27: `0.0E126` and `-0E-130` are stored as 0.
     let t = tables().await;

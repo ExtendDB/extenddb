@@ -340,14 +340,17 @@ fn put_item_values_carry_the_prefix_and_follow_the_item() {
 #[test]
 fn transact_get_item_reads_a_64_bit_exponent() {
     // Measured 2026-11-11: `10E2147483647` and `1E2147483648` are a `Number
-    // overflow`. The empty value answers the message without the colon
-    // (2026-10-27).
+    // overflow`, and an empty `N` answers the message with the colon (it had
+    // no colon on 2026-10-27).
     let item = |n: &str| -> TransactGetItem {
         serde_json::from_value(json!({"Get": {"TableName": "t", "Key": {"pk": {"N": n}}}})).unwrap()
     };
     assert_eq!(refused(transact_get_item(&item("10E2147483647"))), OVERFLOW);
     assert_eq!(refused(transact_get_item(&item("1E2147483648"))), OVERFLOW);
-    assert_eq!(refused(transact_get_item(&item(""))), NUMERIC);
+    assert_eq!(
+        refused(transact_get_item(&item(""))),
+        format!("{NUMERIC}: ")
+    );
     transact_get_item(&item("5")).unwrap();
 }
 
@@ -378,8 +381,19 @@ fn batch_write_item_checks_put_items_and_delete_keys() {
             json!({"DeleteRequest": {"Key": {"pk": {"N": "1E126"}}}}),
             OVERFLOW.to_owned(),
         ),
+        // An empty `N` answers the message without the colon in a delete key,
+        // a put item value and an `NS` member (measured 2026-11-11; the
+        // delete key also on 2026-10-27).
         (
             json!({"DeleteRequest": {"Key": {"pk": {"N": ""}}}}),
+            NUMERIC.to_owned(),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": ""}}}}),
+            NUMERIC.to_owned(),
+        ),
+        (
+            json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"NS": ["1", ""]}}}}),
             NUMERIC.to_owned(),
         ),
     ] {
@@ -434,6 +448,22 @@ fn transact_write_item_checks_values_then_key_or_item() {
         "Key": {"pk": {"N": "1E2147483647"}},
     }}));
     assert_eq!(refused(transact_write_item(&delete)), OVERFLOW);
+}
+
+#[test]
+fn transact_write_item_keys_and_items_answer_an_empty_number_with_the_colon() {
+    // Measured 2026-11-11 on a Delete key and a Put item value, each twice;
+    // both had no colon on 2026-10-27.
+    let delete = transact(json!({"Delete": {"TableName": "t", "Key": {"pk": {"N": ""}}}}));
+    assert_eq!(
+        refused(transact_write_item(&delete)),
+        format!("{NUMERIC}: ")
+    );
+    let put = transact(json!({"Put": {
+        "TableName": "t",
+        "Item": {"pk": {"S": "a"}, "n": {"N": ""}},
+    }}));
+    assert_eq!(refused(transact_write_item(&put)), format!("{NUMERIC}: "));
 }
 
 #[test]
