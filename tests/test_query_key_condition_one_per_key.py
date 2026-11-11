@@ -42,7 +42,10 @@ sends each: the parameter mixing error first, then every FilterExpression
 fault, then every KeyConditionExpression fault, then Select, the table, the
 index and ConsistentRead. At 13:26Z, with the SDK's own checks off, Limit 0
 answered its own message ahead of every other fault sent beside it, and the
-other parameter checks answered ahead of a missing table.
+other parameter checks answered ahead of a missing table. At 14:39Z, two
+conditions on a non-key attribute, and two conditions on the partition key of
+a table keyed on pk (S) alone, each answered the one-condition-per-key
+message.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -114,6 +117,13 @@ def range_table(dynamodb_client):
             dynamodb_client.put_item(
                 TableName=name, Item={"pk": {"S": "alice"}, "sk": {"S": sk}}
             )
+        yield name
+
+
+@pytest.fixture(scope="class")
+def hash_table(dynamodb_client):
+    """pk (S) HASH and no sort key."""
+    with scoped_table(dynamodb_client) as name:
         yield name
 
 
@@ -214,6 +224,35 @@ class TestOneConditionPerKey:
                 KeyConditionExpression=expr,
                 ExpressionAttributeValues=values,
                 ExpressionAttributeNames=names,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == ONE_PER_KEY
+
+    def test_duplicate_condition_on_a_non_key_attribute(
+        self, dynamodb_client, range_table
+    ):
+        """Measured 2026-11-11T14:39Z: two conditions on zz, which is not a key
+        attribute, answer the duplicate too."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND zz = :b AND zz = :c",
+                ExpressionAttributeValues={":a": A, ":b": B, ":c": C},
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == ONE_PER_KEY
+
+    def test_duplicate_partition_key_condition_on_a_hash_only_table(
+        self, dynamodb_client, hash_table
+    ):
+        """Measured 2026-11-11T14:39Z on a table keyed on pk (S) alone."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=hash_table,
+                KeyConditionExpression="pk = :a AND pk = :b",
+                ExpressionAttributeValues={":a": A, ":b": B},
             )
         )
         assert code == "ValidationException"
