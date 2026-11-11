@@ -5647,11 +5647,15 @@ mod catalog_index {
         put_indexed_items(&s, "gq_src", &desc, 1).await;
         assert_eq!(pending().await, 1, "the write queued its index update");
 
-        // The factory reads the encryption key `init` writes.
+        // The factory reads the encryption key `init` writes, and refuses
+        // one that is not 32 bytes in base64.
+        let key = extenddb_storage::bootstrapper::helpers::generate_encryption_key()
+            .expect("generate key");
         sqlx::query(
-            "INSERT INTO settings (key, value) VALUES ('encryption_key', 'test-key') \
+            "INSERT INTO settings (key, value) VALUES ('encryption_key', $1) \
              ON CONFLICT (key) DO NOTHING",
         )
+        .bind(&key)
         .execute(&s.catalog)
         .await
         .expect("encryption key");
