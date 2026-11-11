@@ -121,6 +121,9 @@ cargo build
 
 # Release build (slower compilation, optimized runtime)
 cargo build --release
+
+# Release build with mimalloc in place of the system allocator (ADR-0030)
+cargo build --release --features mimalloc
 ```
 
 The binary is at `target/release/extenddb` (or `target/debug/extenddb`).

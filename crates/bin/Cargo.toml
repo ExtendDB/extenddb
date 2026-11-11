@@ -38,6 +38,9 @@ mongodb-test-hooks = [
 # fails (`main.rs` checks this at compile time). A production `sqlite` build
 # leaves it off.
 dev-mode = ["extenddb-app/dev-mode"]
+# Use mimalloc as the global allocator in place of the system allocator. Off by
+# default. See ADR-0030 for the measurements.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 extenddb-app = { workspace = true }
@@ -48,6 +51,7 @@ extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
 extenddb-config = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 sqlx = { workspace = true }
