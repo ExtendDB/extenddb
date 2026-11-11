@@ -2175,59 +2175,55 @@ mod tests {
         }
     }
 
+    /// A second condition on one key attribute, on the partition key or the
+    /// sort key, written with plain names or through `#name` references and
+    /// whatever the operators, answers the one-condition-per-key message; a
+    /// nested path and redundant parentheses keep their own (measured
+    /// 2026-10-24, us-east-1).
     #[test]
     fn duplicate_condition_on_one_key_attribute_rejected() {
-        // Measured 2026-10-24 (us-east-1): every one of these shapes answers
-        // the one-condition-per-key message, whatever the operators are and
-        // whichever key attribute is named twice.
-        for expr in [
-            "pk = :a AND pk = :b",
-            "pk = :a AND pk = :a",
-            "pk = :a AND pk = :b AND sk = :c",
-            "pk = :a AND pk > :b",
-            "pk > :b AND pk = :a",
-            ":a = pk AND pk = :b",
-            "(pk = :a) AND (pk = :b)",
-            "pk = :a AND sk = :b AND sk = :c",
-            "pk = :a AND sk = :b AND sk = :b",
-            "pk = :a AND sk BETWEEN :b AND :c AND sk = :b",
-            "pk = :a AND sk BETWEEN :b AND :c AND begins_with(sk, :b)",
-            "pk = :a AND begins_with(sk, :b) AND sk = :c",
-            "pk = :a AND sk > :b AND sk < :c",
-            "pk = :a AND begins_with(sk, :b) AND begins_with(sk, :c)",
-            "pk = :a AND pk = :b AND sk = :b AND sk = :c",
-            "sk = :b AND sk = :c",
-        ] {
-            assert_refused(
-                parse_request(expr, &HashMap::new()),
-                ONE_CONDITION_PER_KEY_ERR,
-                expr,
-            );
+        const REDUNDANT_PARENS: &str =
+            "Invalid KeyConditionExpression: The expression has redundant parentheses;";
+        let dup = ONE_CONDITION_PER_KEY_ERR;
+        // The expression, its `#name` definitions and the answer.
+        type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+        let cases: &[Case<'_>] = &[
+            ("pk = :a AND pk = :b", &[], dup),
+            ("pk = :a AND pk = :a", &[], dup),
+            ("pk = :a AND pk = :b AND sk = :c", &[], dup),
+            ("pk = :a AND pk > :b", &[], dup),
+            ("pk > :b AND pk = :a", &[], dup),
+            (":a = pk AND pk = :b", &[], dup),
+            ("(pk = :a) AND (pk = :b)", &[], dup),
+            ("pk = :a AND sk = :b AND sk = :c", &[], dup),
+            ("pk = :a AND sk = :b AND sk = :b", &[], dup),
+            ("pk = :a AND sk BETWEEN :b AND :c AND sk = :b", &[], dup),
+            (
+                "pk = :a AND sk BETWEEN :b AND :c AND begins_with(sk, :b)",
+                &[],
+                dup,
+            ),
+            ("pk = :a AND begins_with(sk, :b) AND sk = :c", &[], dup),
+            ("pk = :a AND sk > :b AND sk < :c", &[], dup),
+            (
+                "pk = :a AND begins_with(sk, :b) AND begins_with(sk, :c)",
+                &[],
+                dup,
+            ),
+            ("pk = :a AND pk = :b AND sk = :b AND sk = :c", &[], dup),
+            ("sk = :b AND sk = :c", &[], dup),
+            // `#p` and `pk` name one attribute once `#p` is resolved, on a
+            // single-attribute key schema and a multi-attribute one alike.
+            ("#p = :a AND pk = :b", &[("p", "pk")], dup),
+            ("#hh = :x AND h = :y AND a = :z", &[("hh", "h")], dup),
+            ("#p = :a AND #q = :b", &[("p", "pk"), ("q", "pk")], dup),
+            ("pk = :a AND #s = :b AND sk = :c", &[("s", "sk")], dup),
+            ("pk = :a AND pk.foo = :b", &[], NESTED_KEY_ERR),
+            ("((pk = :a)) AND (pk = :b)", &[], REDUNDANT_PARENS),
+        ];
+        for (expr, names, want) in cases {
+            assert_refused(parse_request(expr, &names_of(names)), want, expr);
         }
-    }
-
-    #[test]
-    fn duplicate_condition_through_name_reference_rejected() {
-        // `#p` and `pk` name the same attribute once `#p` is resolved, on a
-        // single-attribute key schema and a multi-attribute one alike.
-        let names = names_of(&[("p", "pk"), ("hh", "h")]);
-        for expr in ["#p = :a AND pk = :b", "#hh = :x AND h = :y AND a = :z"] {
-            assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
-        }
-    }
-
-    #[test]
-    fn duplicate_condition_through_two_name_references_rejected() {
-        let names = names_of(&[("p", "pk"), ("q", "pk")]);
-        let expr = "#p = :a AND #q = :b";
-        assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
-    }
-
-    #[test]
-    fn duplicate_condition_on_sort_key_through_name_reference_rejected() {
-        let names = names_of(&[("s", "sk")]);
-        let expr = "pk = :a AND #s = :b AND sk = :c";
-        assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
     }
 
     /// The first undefined reference in the order the expression is written is
@@ -2400,22 +2396,6 @@ mod tests {
             parse_key_condition_with_maps(&tokens, &ExpressionMaps::new(none, values)),
             NE_UNSUPPORTED,
             "pk = :a AND pk <>",
-        );
-    }
-
-    #[test]
-    fn nested_path_reported_ahead_of_duplicate() {
-        // Measured 2026-10-24: both of these answer their own message, not the
-        // one-condition-per-key message.
-        assert_refused(
-            parse_request("pk = :a AND pk.foo = :b", &HashMap::new()),
-            NESTED_KEY_ERR,
-            "pk = :a AND pk.foo = :b",
-        );
-        assert_refused(
-            parse_request("((pk = :a)) AND (pk = :b)", &HashMap::new()),
-            "Invalid KeyConditionExpression: The expression has redundant parentheses;",
-            "((pk = :a)) AND (pk = :b)",
         );
     }
 
