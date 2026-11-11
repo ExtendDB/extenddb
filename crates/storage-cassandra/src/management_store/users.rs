@@ -66,6 +66,10 @@ impl CassandraCatalogStore {
         if !applied {
             return Err(OpError::AlreadyExists("IAM user already exists".to_owned()));
         }
+        // A user deleted before deletes removed them could have left rows
+        // under this name.
+        self.clear_new_principal(&account_id, "user", &user_name)
+            .await?;
 
         // User was created; now insert the self-service policy.
         let policy_query = format!(
@@ -96,121 +100,13 @@ impl CassandraCatalogStore {
         if !self.user_exists(account_id, user_name).await? {
             return Err(OpError::NotFound("IAM user not found".to_owned()));
         }
-
-        let ks = self.catalog_keyspace();
-        let session = self.session();
-
-        // Gather all keys needed for cascade deletes before building the batch.
-        let key_ids: Vec<String> = crate::cassandra_util::query_rows(
-            session,
-            &format!(
-                "SELECT access_key_id FROM {ks}.access_keys \
-                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
-            ),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user access_keys",
-        )
-        .await?
-        .into_iter()
-        .map(|row| crate::cassandra_util::get_column(&row, "access_key_id", "delete_user"))
-        .collect::<Result<_, _>>()?;
-
-        let policy_names: Vec<String> = crate::cassandra_util::query_rows(
-            session,
-            &format!(
-                "SELECT policy_name FROM {ks}.iam_policies \
-                 WHERE account_id = ? AND principal_type = 'user' AND principal_name = ?"
-            ),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user policies",
-        )
-        .await?
-        .into_iter()
-        .map(|row| crate::cassandra_util::get_column(&row, "policy_name", "delete_user"))
-        .collect::<Result<_, _>>()?;
-
-        let group_names: Vec<String> = crate::cassandra_util::query_rows(
-            session,
-            &format!(
-                "SELECT group_name FROM {ks}.iam_group_members \
-                 WHERE account_id = ? AND user_name = ? ALLOW FILTERING"
-            ),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user groups",
-        )
-        .await?
-        .into_iter()
-        .map(|row| crate::cassandra_util::get_column(&row, "group_name", "delete_user"))
-        .collect::<Result<_, _>>()?;
-
-        // Sequential deletes ordered so that the most security-sensitive rows
-        // are removed first. access_keys is deleted before iam_users so that
-        // a partial failure leaves orphaned catalog entries (inert) rather than
-        // live credentials whose parent user is already gone. iam_users is
-        // deleted last so the user is only "officially" absent once all
-        // dependent rows have been cleaned up, and a retry can still find the
-        // user and re-attempt any failed steps.
-        //
-        // Only tables created with IF NOT EXISTS use IF EXISTS on delete
-        // (LWT/non-LWT mixing rule). Tables with plain INSERT use plain DELETE.
-        // See ADR-0021.
-        let session = std::sync::Arc::clone(session);
-        for key_id in &key_ids {
-            // access_keys has an IF NOT EXISTS insert path (import) — use IF EXISTS on delete
-            crate::cassandra_util::apply_lwt(
-                &session,
-                &format!("DELETE FROM {ks}.access_keys WHERE access_key_id = ? IF EXISTS"),
-                cdrs_tokio::query_values!(key_id.as_str()),
-                "delete_user access_keys",
-            )
+        // What the user owns goes first, and its row last: the user is only
+        // gone once all of it is, and a retry still finds the user and
+        // finishes (see `dependents`).
+        self.delete_principal_dependents(account_id, "user", user_name)
             .await?;
-        }
-        for group_name in &group_names {
-            // iam_group_members uses IF NOT EXISTS — must use IF EXISTS
-            crate::cassandra_util::apply_lwt(
-                &session,
-                &format!(
-                    "DELETE FROM {ks}.iam_group_members \
-                     WHERE account_id = ? AND group_name = ? AND user_name = ? IF EXISTS"
-                ),
-                cdrs_tokio::query_values!(account_id, group_name.as_str(), user_name),
-                "delete_user iam_group_members",
-            )
-            .await?;
-        }
-        for policy_name in &policy_names {
-            // iam_policies uses plain INSERT — plain DELETE is safe
-            crate::cassandra_util::execute(
-                &session,
-                &format!(
-                    "DELETE FROM {ks}.iam_policies \
-                     WHERE account_id = ? AND principal_type = 'user' \
-                     AND principal_name = ? AND policy_name = ?"
-                ),
-                cdrs_tokio::query_values!(account_id, user_name, policy_name.as_str()),
-                "delete_user iam_policies",
-            )
-            .await?;
-        }
-        // iam_user_tags uses plain INSERT — plain DELETE is safe
-        crate::cassandra_util::execute(
-            &session,
-            &format!("DELETE FROM {ks}.iam_user_tags WHERE account_id = ? AND user_name = ?"),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user iam_user_tags",
-        )
-        .await?;
-        // iam_users last: user is only gone once all dependent rows are cleaned up.
-        // Quorum commit, so the console's quorum session check sees the deletion.
-        crate::cassandra_util::apply_lwt(
-            &session,
-            &format!("DELETE FROM {ks}.iam_users WHERE account_id = ? AND user_name = ? IF EXISTS"),
-            cdrs_tokio::query_values!(account_id, user_name),
-            "delete_user iam_users",
-        )
-        .await?;
-
-        Ok(())
+        self.delete_principal_row(account_id, "user", user_name)
+            .await
     }
 
     pub(crate) async fn list_users_impl(
@@ -397,9 +293,14 @@ impl CassandraCatalogStore {
 
         // `None` when the user is absent or has no console password, which
         // still runs one bcrypt check (see `verify_stored_password`), as a
-        // wrong password does.
+        // wrong password does. A user of a deleted account counts as absent.
         let hash: Option<String> =
             row.and_then(|row| row.get_by_name("password_hash").ok().flatten());
+        let hash = if hash.is_some() && !self.account_exists_quorum(account_id).await? {
+            None
+        } else {
+            hash
+        };
         extenddb_storage::password::verify_stored_password(password.to_owned(), hash).await
     }
 

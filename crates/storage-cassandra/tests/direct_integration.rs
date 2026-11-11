@@ -36,6 +36,8 @@ mod delete_item;
 mod groups;
 #[path = "direct/gsi_worker_pass.rs"]
 mod gsi_worker_pass;
+#[path = "direct/iam_leftovers.rs"]
+mod iam_leftovers;
 #[path = "direct/index.rs"]
 mod index;
 #[path = "direct/index_delay_reads.rs"]

@@ -65,7 +65,23 @@ impl CassandraCatalogStore {
             return Err(OpError::AlreadyExists("Account already exists".to_owned()));
         }
 
-        Ok(())
+        // An account deleted before deletes removed them could have left its
+        // IAM rows under this id. If they cannot be removed, remove the new
+        // `accounts` row again, so that a retry is not refused while they
+        // stay; the retry finds the keyspace complete.
+        let cleared = self.delete_account_iam(account_id).await;
+        if cleared.is_err()
+            && let Err(e) = crate::cassandra_util::apply_lwt::<OpError>(
+                self.session(),
+                &format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ? IF EXISTS"),
+                cdrs_tokio::query_values!(account_id),
+                "create_account undo",
+            )
+            .await
+        {
+            tracing::error!("create_account: remove the new account after a failed clear: {e:?}");
+        }
+        cleared
     }
 
     pub(crate) async fn delete_account_impl(&self, account_id: &str) -> OpResult<()> {
@@ -94,6 +110,12 @@ impl CassandraCatalogStore {
                 "Cannot delete account with existing tables. Delete all tables first.".to_owned(),
             ));
         }
+
+        // The account's users, groups, roles and everything they own go
+        // first, as the foreign keys to `accounts` remove them on SQLite and
+        // PostgreSQL. Left behind, a user could still sign in, and an account
+        // created later with the same id would get them all.
+        self.delete_account_iam(account_id).await?;
 
         // Backups outlive their source table, but cannot outlive the account
         // keyspace that stores their payload. Remove every denormalized and
@@ -148,6 +170,7 @@ impl CassandraCatalogStore {
         )
         .await?;
 
+        // Quorum commit, so the console's quorum reads see the account gone.
         crate::cassandra_util::apply_lwt(
             self.session(),
             &format!("DELETE FROM {catalog_keyspace}.accounts WHERE account_id = ? IF EXISTS"),
