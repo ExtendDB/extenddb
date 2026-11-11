@@ -14,14 +14,16 @@ The test creates two accounts, each with a user that may call every
 DynamoDB action, and a table of the same name with TTL in each. Each
 account sends one PutItem (one write capacity unit for the first account,
 three for the second, so a sum of the two is visible), a GetItem, a Query,
-a DeleteItem whose condition fails, and a GetItem on a table that does not
-exist; the second account also sends a Scan. Each table holds one expired
+a DeleteItem whose condition fails, a GetItem on a table that does not
+exist, and PutItems to a table provisioned with one write capacity unit
+until one is throttled; the second account also sends a Scan. Each table holds one expired
 item for the TTL sweep. The fixture waits until the flush has persisted
 every row the tests read, with the PutItem sums at their final values,
 then reads until two reads in a row are the same (see ``flushed``).
 
 Prerequisites:
-  - extenddb running on EXTENDDB_TEST_ENDPOINT
+  - extenddb running on EXTENDDB_TEST_ENDPOINT, with the throttling_enabled
+    setting on, as devtools/run-tests sets it
   - Admin credentials in EXTENDDB_ADMIN_USER / EXTENDDB_ADMIN_PASSWORD
 """
 
@@ -65,6 +67,16 @@ KEY = {
     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
     "BillingMode": "PAY_PER_REQUEST",
 }
+
+# A table that throttles writes: one write capacity unit.
+SLOW_KEY = {
+    "AttributeDefinitions": KEY["AttributeDefinitions"],
+    "KeySchema": KEY["KeySchema"],
+    "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+}
+# How long PutItems go to that table before one must be throttled: the
+# server reads the throttling_enabled setting every 30 seconds.
+THROTTLE_DEADLINE_SECONDS = 60
 
 
 def _require_env() -> tuple[str, str, str]:
@@ -165,6 +177,25 @@ def _account(mgmt: ManagementClient, endpoint: str, label: str):
     return account_id, boto3.client(**kwargs), user
 
 
+def _throttle(client, table: str) -> None:
+    """PutItems to ``table`` until one is throttled."""
+    deadline = time.monotonic() + THROTTLE_DEADLINE_SECONDS
+    i = 0
+    while time.monotonic() < deadline:
+        try:
+            client.put_item(TableName=table, Item={"pk": {"S": f"w{i}"}})
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            assert code == "ProvisionedThroughputExceededException", code
+            return
+        i += 1
+        time.sleep(0.02)
+    pytest.fail(
+        f"PutItems to a table of one write capacity unit were not throttled "
+        f"within {THROTTLE_DEADLINE_SECONDS}s; is the throttling_enabled setting on?"
+    )
+
+
 def _send_requests(client, table: str, padding: int, scan: bool) -> None:
     """The requests whose metrics the tests read, as one account."""
     # The expired item goes in by BatchWriteItem, whose metrics carry no
@@ -204,6 +235,7 @@ def _send_requests(client, table: str, padding: int, scan: bool) -> None:
     with pytest.raises(ClientError) as missing:
         client.get_item(TableName=f"{table}-missing", Key={"pk": {"S": "1"}})
     assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    _throttle(client, f"{table}-slow")
 
 
 @pytest.fixture(scope="module")
@@ -223,8 +255,10 @@ def flushed():
             accounts.append(_account(mgmt, env[0], label))
         for _, client, _ in accounts:
             client.create_table(TableName=table, **KEY)
+            client.create_table(TableName=f"{table}-slow", **SLOW_KEY)
         for _, client, _ in accounts:
             wait_for_active(client, table)
+            wait_for_active(client, f"{table}-slow")
             client.update_time_to_live(
                 TableName=table,
                 TimeToLiveSpecification={"Enabled": True, "AttributeName": "expires"},
@@ -245,6 +279,8 @@ def flushed():
                 _per_account(data, "ConditionalCheckFailedRequests", "DeleteItem", table),
                 _per_account(data, "UserErrors", "GetItem", None),
                 _per_account(data, "TimeToLiveDeletedItemCount", None, table),
+                _per_account(data, "WriteThrottleEvents", "PutItem", f"{table}-slow"),
+                _per_account(data, "ThrottledRequests", "PutItem", f"{table}-slow"),
             ]
             return writes == dict(zip(ids, WRITE_UNITS)) and all(
                 every <= set(p) for p in present
@@ -278,10 +314,12 @@ def flushed():
     finally:
         for account_id, client, user in accounts:
             try:
-                client.delete_table(TableName=table)
-                wait_for_deleted(client, table)
-            except client.exceptions.ResourceNotFoundException:
-                pass
+                for name in (table, f"{table}-slow"):
+                    try:
+                        client.delete_table(TableName=name)
+                        wait_for_deleted(client, name)
+                    except client.exceptions.ResourceNotFoundException:
+                        pass
             finally:
                 resp = mgmt.delete_user(account_id, user)
                 assert resp.status_code in (200, 204), resp.text
@@ -310,6 +348,13 @@ def test_each_request_metric_names_its_account(flushed, metric, operation, on_ta
     _, table, ids, data = flushed
     rows = _per_account(data, metric, operation, table if on_table else None, "count")
     assert set(ids) <= set(rows), f"{metric} {operation}: {rows}"
+
+
+@pytest.mark.parametrize("metric", ["WriteThrottleEvents", "ThrottledRequests"])
+def test_each_throttle_metric_names_its_account(flushed, metric):
+    _, table, ids, data = flushed
+    rows = _per_account(data, metric, "PutItem", f"{table}-slow", "count")
+    assert set(ids) <= set(rows), f"{metric}: {rows}"
 
 
 def test_latency_counts_each_accounts_requests_apart(flushed):
