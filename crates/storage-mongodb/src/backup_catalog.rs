@@ -673,9 +673,9 @@ impl MongoEngine {
             match body {
                 Ok(outcome) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
@@ -768,7 +768,7 @@ impl MongoEngine {
                     .await
                 {
                     Ok(desc) => Ok(Ok(desc)),
-                    Err(StorageError::Transient(_)) => Err(TxErr::Transient),
+                    Err(StorageError::Transient(cause)) => Err(TxErr::Transient(cause)),
                     Err(e) => {
                         // A creation that failed after its insert committed
                         // (a collection or index could not be created) left a
@@ -817,7 +817,7 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     return Err(refusal);
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }

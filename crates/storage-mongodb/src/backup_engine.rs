@@ -651,7 +651,7 @@ impl MongoEngine {
                     Ok(desc) => Ok(Ok((desc, backup_id))),
                     // The insert's transaction lost a write conflict and was
                     // aborted before anything outside it was created.
-                    Err(StorageError::Transient(_)) => Err(TxErr::Transient),
+                    Err(StorageError::Transient(cause)) => Err(TxErr::Transient(cause)),
                     Err(e) => {
                         // A creation that failed after its insert committed
                         // (a collection or index could not be created) left a
@@ -693,7 +693,7 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     return Err(refusal);
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
@@ -1150,13 +1150,13 @@ impl MongoEngine {
             match body {
                 Ok(Ok(outcome)) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
                 Ok(Err(refusal)) => {
                     let _ = session.abort_transaction().await;
                     return Err(refusal);
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
