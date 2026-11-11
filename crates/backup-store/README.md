@@ -349,7 +349,7 @@ AWS_REGION=us-east-1 \
 cargo test -p extenddb-backup-store
 ```
 
-Another S3-compatible server (MinIO built from source, Garage, LocalStack)
+Another S3-compatible server (MinIO built from source, or Garage)
 should work the same way through the endpoint and credential variables,
 but none has been run; see the checksum note in "Behavior". What moto
 cannot produce is synthesised in the suite (a 301, a 403 with its error

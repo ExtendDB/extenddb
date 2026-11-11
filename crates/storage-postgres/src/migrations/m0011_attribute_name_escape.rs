@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 10, `attribute_name_escape`, PostgreSQL: rewrite the stored
+//! Migration 11, `attribute_name_escape`, PostgreSQL: rewrite the stored
 //! documents that carry attribute names through the escape that lets them
 //! hold U+0000.
 //!
@@ -33,7 +33,7 @@
 //! would change its names. Each body runs in the runner's transaction and
 //! commits with its ledger row, so a store records the migration exactly
 //! when its documents were rewritten, and the migration is not convergent:
-//! `--reconverge` skips it. `extenddb migrate --forget 10` on a database this
+//! `--reconverge` skips it. `extenddb migrate --forget 11` on a database this
 //! migration ran on, followed by a run, rewrites its documents a second time.
 //!
 //! This file's checksum is pinned once the migration is released. It is
@@ -49,10 +49,10 @@ use super::PostgresStores;
 use super::connect::sql_error;
 
 /// This file, whose SHA-256 the checksum test pins.
-pub(crate) const SOURCE: &str = include_str!("m0010_attribute_name_escape.rs");
+pub(crate) const SOURCE: &str = include_str!("m0011_attribute_name_escape.rs");
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
-const FINGERPRINT: &str = "0010_attribute_name_escape/postgres/1";
+const FINGERPRINT: &str = "0011_attribute_name_escape/postgres/1";
 
 /// The catalog database's documents that carry attribute names, by table.
 pub(crate) const CATALOG_DOCUMENTS: &[(&str, &[&str])] = &[

@@ -161,7 +161,7 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 11, "{state}");
+        assert_eq!(pending.len(), 12, "{state}");
         let report = d.migrate().await.expect("migrate");
         assert_eq!(
             (report.from, report.to),
@@ -180,10 +180,9 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
         for (name, want) in &expected_catalog {
             assert_eq!(catalog.get(name), Some(want), "{state}: {name}");
         }
-        assert!(
-            !catalog.contains_key("continuous_backups"),
-            "{state}: continuous_backups"
-        );
+        for dropped in ["continuous_backups", "metrics"] {
+            assert!(!catalog.contains_key(dropped), "{state}: {dropped}");
+        }
         for (name, want) in &expected_data {
             assert_eq!(data.get(name), Some(want), "{state}: {name}");
         }

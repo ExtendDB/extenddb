@@ -1,10 +1,10 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
-//! Golden tests of migration 10, `attribute_name_escape`, on PostgreSQL: the
+//! Golden tests of migration 11, `attribute_name_escape`, on PostgreSQL: the
 //! migration rewrites the raw names a release before it stored, and a
 //! reconverge leaves the names written after it as they are. The rewritten
 //! rows and the ledger notes are compared with
-//! `tests/fixtures/golden/0010_attribute_name_escape.txt`;
+//! `tests/fixtures/golden/0011_attribute_name_escape.txt`;
 //! `EXTENDDB_BLESS_EXPECTED=1` writes the file instead. See
 //! `migrations_support` for the database these tests need.
 
@@ -22,7 +22,7 @@ use migrations_support::{ACCOUNT, LATEST, Scratch, base_conn, golden, notes, ski
 use serde_json::json;
 use sqlx::PgPool;
 
-/// Names a release before migration 10 stored raw: a U+0001 pair, which the
+/// Names a release before migration 11 stored raw: a U+0001 pair, which the
 /// escape's decoder reads as U+0000, and U+0001 U+0002, which it reads as
 /// U+0001.
 const RAW_KEY: &str = "a\u{1}\u{1}z";
@@ -49,7 +49,7 @@ async fn engine(s: &Scratch) -> PostgresEngine {
 }
 
 /// The raw documents of a table, its GSI, a backup, a vector index and a
-/// queued index update, written by SQL as a release before migration 10
+/// queued index update, written by SQL as a release before migration 11
 /// wrote them. A second GSI's name holds the six characters `\u0001`: the
 /// rewrite finds its documents and leaves them as they are.
 async fn seed_raw_names(catalog: &PgPool, data: &PgPool) {
@@ -160,7 +160,7 @@ fn raw_store_backup_arn() -> (String, String) {
 }
 
 /// Two `backup_index` rows (migration 6's table), written by SQL as a
-/// release before migration 10 wrote them: the source table of a backup of
+/// release before migration 11 wrote them: the source table of a backup of
 /// `raw_tbl`, with the raw names, and one of a table whose names hold
 /// neither character, which the rewrite leaves as it is.
 async fn seed_raw_backup_index(catalog: &PgPool, backup_id: &str, arn: &str) {
@@ -222,11 +222,11 @@ async fn dump_documents(pool: &PgPool, sql: &str, out: &mut String) {
 }
 
 #[tokio::test]
-async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them() {
+async fn migration_11_rewrites_the_raw_names_of_every_document_that_carries_them() {
     let Some(base) = base_conn() else {
-        return skip("golden 10");
+        return skip("golden 11");
     };
-    let s = Scratch::new(&base, "pgm_g10").await;
+    let s = Scratch::new(&base, "pgm_g11").await;
     s.load("0.1.14").await;
     s.migrate_through(MigrationId::DropContinuousBackups).await;
     let (catalog, data) = (s.catalog().await, s.data().await);
@@ -268,9 +268,9 @@ async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them
         &mut out,
     )
     .await;
-    writeln!(out, "catalog notes:\n{}", notes(&catalog, 10).await).unwrap();
-    writeln!(out, "data notes:\n{}", notes(&data, 10).await).unwrap();
-    golden("0010_attribute_name_escape.txt", &out);
+    writeln!(out, "catalog notes:\n{}", notes(&catalog, 11).await).unwrap();
+    writeln!(out, "data notes:\n{}", notes(&data, 11).await).unwrap();
+    golden("0011_attribute_name_escape.txt", &out);
 
     // This binary reads the rewritten names as the release wrote them.
     let engine = engine(&s).await;
@@ -336,15 +336,15 @@ async fn migration_10_rewrites_the_raw_names_of_every_document_that_carries_them
     data.close().await;
 }
 
-/// Migration 10 is not convergent: a reconverge leaves the documents this
+/// Migration 11 is not convergent: a reconverge leaves the documents this
 /// release wrote after it, through the escape, as they are, and the names
 /// still read back as written.
 #[tokio::test]
-async fn a_reconverge_leaves_the_names_written_after_migration_10_as_they_are() {
+async fn a_reconverge_leaves_the_names_written_after_migration_11_as_they_are() {
     let Some(base) = base_conn() else {
-        return skip("reconverge after migration 10");
+        return skip("reconverge after migration 11");
     };
-    let s = Scratch::new(&base, "pgm_g10rc").await;
+    let s = Scratch::new(&base, "pgm_g11rc").await;
     s.load("0.1.14").await;
     s.migrate_through(MigrationId::LATEST).await;
     let catalog = s.catalog().await;
@@ -386,14 +386,14 @@ async fn a_reconverge_leaves_the_names_written_after_migration_10_as_they_are() 
     m.close().await;
     let report = report.expect("reconverge");
     assert!(
-        report.applied.iter().all(|step| step.id != 10),
+        report.applied.iter().all(|step| step.id != 11),
         "{report:?}"
     );
     assert!(
         report
             .notes
             .iter()
-            .any(|n| n.starts_with("Skipped 10 attribute_name_escape:")),
+            .any(|n| n.starts_with("Skipped 11 attribute_name_escape:")),
         "{report:?}"
     );
     assert_eq!(s.status().await, CatalogStatus::Current { version: LATEST });

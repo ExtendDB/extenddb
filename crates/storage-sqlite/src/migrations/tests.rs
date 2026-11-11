@@ -5,9 +5,9 @@
 //! protocol, the copy, the entry points and the in-memory case. The lock
 //! is in `serve_tests`, beside the server's refusal while a migration
 //! holds it.
-//! Released catalogs are in `released_tests`, migrations 2 to 4, 6 and 9 in
-//! `golden_tests`, refusals and rollbacks in `refusal_tests`, and the killed
-//! migrator in `crash_tests`.
+//! Released catalogs and migration 10 are in `released_tests`, migrations 2
+//! to 4, 6 and 9 in `golden_tests`, refusals and rollbacks in
+//! `refusal_tests`, and the killed migrator in `crash_tests`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

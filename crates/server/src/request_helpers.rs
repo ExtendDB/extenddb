@@ -50,6 +50,71 @@ pub(crate) fn extract_table_name(input: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Operations whose top-level `TableName` names the table the request acts
+/// on. These are the operations the engine dispatches whose input shape has a
+/// top-level `TableName` in botocore 1.43.125's `dynamodb` and
+/// `dynamodbstreams` models, less `ListBackups` and `ListStreams`.
+///
+/// Each of these succeeds only when the table exists (`CreateTable` once it
+/// does), so a successful request records metrics under a real table. In
+/// `ListBackups` and `ListStreams`, `TableName` is a filter over the account's
+/// backups or streams, and either answers 200 with an empty list for a table
+/// that does not exist. Under it, any valid name a caller makes up would become
+/// a dimension value, so they record no table.
+///
+/// Any other operation ignores or refuses a `TableName` it is sent, so its
+/// metrics must not take one from the request either: a `BatchWriteItem` with
+/// an extra `TableName` would otherwise record its metrics under a table it
+/// never touched.
+const TABLE_NAME_OPERATIONS: &[&str] = &[
+    "CreateBackup",
+    "CreateTable",
+    "DeleteItem",
+    "DeleteTable",
+    "DescribeContinuousBackups",
+    "DescribeTable",
+    "DescribeTimeToLive",
+    "GetItem",
+    "PutItem",
+    "Query",
+    "Scan",
+    "SearchVectors",
+    "UpdateContinuousBackups",
+    "UpdateItem",
+    "UpdateTable",
+    "UpdateTimeToLive",
+];
+
+/// The table name a request's metrics are recorded under, or `None` when the
+/// request names no valid table.
+///
+/// The name comes from the request's top-level `TableName`, and only for an
+/// operation that acts on the table it names ([`TABLE_NAME_OPERATIONS`]). A
+/// table ARN is reduced to its table name, so a table has one dimension value
+/// however the request named it. The result must pass the table name rules
+/// (`validate_table_name`); a request that fails validation can carry any
+/// string, control characters included, and every reader of the metrics would
+/// get it as a dimension value (issue #728). Otherwise the result is `None`,
+/// and the request's metrics carry no table.
+pub(crate) fn metric_table_name(
+    operation: &str,
+    input: &Value,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Option<String> {
+    if !TABLE_NAME_OPERATIONS.contains(&operation) {
+        return None;
+    }
+    let sent = input.get("TableName")?.as_str()?;
+    let name = if sent.starts_with("arn:") {
+        extenddb_core::arn::parse(sent)?.table
+    } else {
+        sent.to_owned()
+    };
+    extenddb_core::validation::validate_table_name(&name, limits)
+        .is_ok()
+        .then_some(name)
+}
+
 /// Decide how a `TableKeyInfo` lookup result feeds request authorization.
 ///
 /// A present table yields its key info. A missing table yields `None`: the
@@ -618,5 +683,124 @@ mod tests {
             matches!(err, DynamoDbError::UnknownOperationException(_)),
             "Expected UnknownOperationException, got: {err:?}"
         );
+    }
+
+    fn metric_name_of(table_name: Value) -> Option<String> {
+        metric_table_name(
+            "PutItem",
+            &json!({ "TableName": table_name }),
+            &extenddb_core::limits::LimitsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn metric_table_name_keeps_a_valid_name() {
+        assert_eq!(
+            metric_name_of(json!("Orders_v2.prod-1")).as_deref(),
+            Some("Orders_v2.prod-1")
+        );
+    }
+
+    #[test]
+    fn metric_table_name_reduces_a_table_arn_to_its_name() {
+        for arn in [
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders",
+            "arn:aws:dynamodb:us-east-1:123456789012:table/Orders/index/ByDate",
+        ] {
+            assert_eq!(
+                metric_name_of(json!(arn)).as_deref(),
+                Some("Orders"),
+                "{arn}"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_table_name_drops_a_name_that_breaks_the_rules() {
+        // The values issue #728 found in the metrics table after rejected
+        // CreateTable calls, a name too short, and ARNs that name no table.
+        for sent in [
+            "x\";DROP TABLE tables;--".to_owned(),
+            "a\u{0}b".to_owned(),
+            "ééé".to_owned(),
+            "a".repeat(256),
+            "ab".to_owned(),
+            String::new(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/".to_owned(),
+            "arn:aws:s3:::bucket".to_owned(),
+            "arn:aws:dynamodb:us-east-1:123456789012:table/a;b".to_owned(),
+        ] {
+            assert_eq!(metric_name_of(json!(sent)), None, "{sent:?}");
+        }
+    }
+
+    #[test]
+    fn metric_table_name_is_none_without_a_string_table_name() {
+        assert_eq!(metric_name_of(json!(42)), None);
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        assert_eq!(metric_table_name("PutItem", &json!({}), &limits), None);
+    }
+
+    /// An operation that does not act on the table its `TableName` names
+    /// records no table, whatever valid name the request carries: those whose
+    /// input has no top-level `TableName` member, and `ListBackups` and
+    /// `ListStreams`, where it is a filter. One that acts on it keeps it.
+    #[test]
+    fn metric_table_name_reads_table_name_only_for_operations_on_that_table() {
+        let limits = extenddb_core::limits::LimitsConfig::default();
+        let input = json!({ "TableName": "Orders" });
+        for operation in [
+            "BatchWriteItem",
+            "BatchGetItem",
+            "TransactWriteItems",
+            "TransactGetItems",
+            "ExecuteStatement",
+            "BatchExecuteStatement",
+            "ExecuteTransaction",
+            "ListTables",
+            "ListBackups",
+            "ListStreams",
+            "TagResource",
+            "DescribeBackup",
+            "RestoreTableFromBackup",
+            "ImportTable",
+            "NotAnOperation",
+        ] {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits),
+                None,
+                "{operation}"
+            );
+        }
+        let mut listed = super::TABLE_NAME_OPERATIONS.to_vec();
+        listed.sort_unstable();
+        // Spelled out, not read from the constant, so a dropped, misspelt or
+        // added entry fails here.
+        let expected = [
+            "CreateBackup",
+            "CreateTable",
+            "DeleteItem",
+            "DeleteTable",
+            "DescribeContinuousBackups",
+            "DescribeTable",
+            "DescribeTimeToLive",
+            "GetItem",
+            "PutItem",
+            "Query",
+            "Scan",
+            "SearchVectors",
+            "UpdateContinuousBackups",
+            "UpdateItem",
+            "UpdateTable",
+            "UpdateTimeToLive",
+        ];
+        assert_eq!(listed, expected);
+        for operation in expected {
+            assert_eq!(
+                metric_table_name(operation, &input, &limits).as_deref(),
+                Some("Orders"),
+                "{operation}"
+            );
+        }
     }
 }

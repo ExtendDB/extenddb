@@ -37,7 +37,7 @@ mod m0003_sort_key_definitions;
 mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0010_attribute_name_escape;
+mod m0011_attribute_name_escape;
 mod postcheck;
 mod registrar;
 mod rows;
@@ -170,6 +170,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0009_warm_throughput.sql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
         MigrationId::AttributeNameEscape => Migration::Applies {
             // A binary without the decoder reads an escaped name as another
             // name, and one without the encoder writes a U+0001 raw, which
@@ -182,13 +191,13 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
             bodies: vec![
                 StoreBody::code(
                     StoreKind::Catalog,
-                    &m0010_attribute_name_escape::CatalogDocuments,
-                    m0010_attribute_name_escape::SOURCE,
+                    &m0011_attribute_name_escape::CatalogDocuments,
+                    m0011_attribute_name_escape::SOURCE,
                 ),
                 StoreBody::code(
                     StoreKind::Data,
-                    &m0010_attribute_name_escape::QueuedContexts,
-                    m0010_attribute_name_escape::SOURCE,
+                    &m0011_attribute_name_escape::QueuedContexts,
+                    m0011_attribute_name_escape::SOURCE,
                 ),
             ],
         },
@@ -218,6 +227,7 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::StreamPending
         | MigrationId::RestoreProgress
         | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics
         | MigrationId::AttributeNameEscape => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }

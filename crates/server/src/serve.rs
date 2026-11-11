@@ -47,7 +47,9 @@ pub struct BuildInfo {
     /// Package version of the deployed binary (e.g. `env!("CARGO_PKG_VERSION")`
     /// from the bin crate — not from a library crate, whose version may drift).
     pub version: &'static str,
-    /// Short git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`).
+    /// Git commit hash of the build (e.g. `env!("EXTENDDB_GIT_HASH")`): the
+    /// full SHA in release images and in builds from crates.io, the short form
+    /// in local builds.
     pub git_hash: &'static str,
     /// Build timestamp (e.g. `env!("EXTENDDB_BUILD_TIME")`).
     pub build_time: &'static str,

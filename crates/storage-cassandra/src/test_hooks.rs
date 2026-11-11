@@ -51,7 +51,18 @@
 //! * a fault on the lightweight transaction of `forget_available_backup_row`,
 //!   and an error on the logged batch that removes a row's index entries, so
 //!   a test can see the serial re-read settle a lost removal and a removal
-//!   whose entries stay answer that the row is removed.
+//!   whose entries stay answer that the row is removed;
+//! * a fault on the lightweight transaction of `rewrite_store`, and a stop
+//!   of one row's rewrite after its first write or after its transaction, so
+//!   a test can see the serial re-read settle a lost rewrite and see where a
+//!   stopped rewrite leaves the row listed;
+//! * a pause in one row's `rewrite_store` between the new root's status
+//!   entry and the lightweight transaction, so a test can delete or move
+//!   the row in that gap and see the transaction's conditions and the
+//!   serial re-read after it;
+//! * a pause in `set_backup_deleted` between its read of the row and its
+//!   lightweight transaction, so a test can move the row in that gap and see
+//!   the transaction's store condition send it under the root it names.
 
 use std::time::Duration;
 
@@ -69,6 +80,16 @@ pub enum ProgressWriteFault {
     Lost,
 }
 
+/// Where a test stops one row's `rewrite_store`, with an error, as a process
+/// that dies there would: after the write that precedes the lightweight
+/// transaction (the new root's status entry), or after the transaction,
+/// before the old root's entry is deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewriteStop {
+    AfterNewEntry,
+    AfterRow,
+}
+
 #[cfg(feature = "test-hooks")]
 mod armed {
     use std::collections::{HashMap, VecDeque};
@@ -77,7 +98,7 @@ mod armed {
 
     use tokio::sync::Notify;
 
-    use super::ProgressWriteFault;
+    use super::{ProgressWriteFault, RewriteStop};
 
     /// A pause a test arms at one point of one operation: the operation
     /// signals `reached` when it gets there and waits for `released`.
@@ -128,6 +149,14 @@ mod armed {
         pub(super) index_entry_batch_errors: HashMap<String, usize>,
         pub(super) forget_write_faults: HashMap<String, VecDeque<ProgressWriteFault>>,
         pub(super) index_entry_removal_errors: HashMap<String, usize>,
+        pub(super) rewrite_write_faults: HashMap<String, VecDeque<ProgressWriteFault>>,
+        pub(super) rewrite_stops: HashMap<String, RewriteStop>,
+        pub(super) before_rewrite_write: HashMap<String, Arc<Pause>>,
+        pub(super) before_deleted_write: HashMap<String, Arc<Pause>>,
+        pub(super) after_delete_claim: HashMap<String, Arc<Pause>>,
+        pub(super) after_deleted_write: HashMap<String, Arc<Pause>>,
+        pub(super) before_tombstone_removal: HashMap<String, Arc<Pause>>,
+        pub(super) gsi_worker_before_wait: HashMap<String, Arc<Pause>>,
     }
 
     pub(super) static HOOKS: LazyLock<Mutex<Hooks>> = LazyLock::new(Mutex::default);
@@ -179,6 +208,76 @@ pub fn pause_before_delete_claim(backup_arn: &str) -> std::sync::Arc<Pause> {
     armed::with_hooks(|hooks| {
         hooks
             .before_delete_claim
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Arm a pause in the next `rewrite_store` of the row of `backup_arn`,
+/// between the new root's status entry and the lightweight transaction on
+/// the row. The pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_rewrite_write(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_rewrite_write
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Arm a pause in the next `set_backup_deleted` of `backup_arn`, between
+/// its read of the row and its lightweight transaction. The pause is taken
+/// once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_deleted_write(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_deleted_write
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Arm a pause in the next delete of `backup_arn`, after its applied
+/// DELETING claim and before the batch that moves its status entry. The
+/// pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_after_delete_claim(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .after_delete_claim
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Arm a pause in the next `set_backup_deleted` of `backup_arn`, after its
+/// applied lightweight transaction and before the batch that moves its
+/// status entry. The pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_after_deleted_write(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .after_deleted_write
+            .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
+    });
+    pause
+}
+
+/// Arm a pause in the next `remove_backup_row` of `backup_arn`, between its
+/// read of the row and its lightweight transaction. The pause is taken once
+/// and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_before_tombstone_removal(backup_arn: &str) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks
+            .before_tombstone_removal
             .insert(backup_arn.to_owned(), std::sync::Arc::clone(&pause));
     });
     pause
@@ -345,6 +444,69 @@ pub fn fail_index_entry_removals(backup_arn: &str, count: usize) {
     });
 }
 
+/// Make the next lightweight transactions of `rewrite_store` on the row of
+/// `backup_arn` answer `WriteOutcome::Unknown`, one fault per write in the
+/// order given, as [`fail_insert_writes`] does for the insert.
+#[cfg(feature = "test-hooks")]
+pub fn fail_rewrite_writes(backup_arn: &str, faults: &[ProgressWriteFault]) {
+    armed::with_hooks(|hooks| {
+        hooks
+            .rewrite_write_faults
+            .insert(backup_arn.to_owned(), faults.iter().copied().collect());
+    });
+}
+
+/// Stop the next `rewrite_store` of the row of `backup_arn` at `at` with an
+/// error, which ends the whole call. Taken once, then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn stop_rewrite(backup_arn: &str, at: RewriteStop) {
+    armed::with_hooks(|hooks| {
+        hooks.rewrite_stops.insert(backup_arn.to_owned(), at);
+    });
+}
+
+/// The fault the next rewrite lightweight transaction of `backup_arn` takes,
+/// if a test armed one.
+pub(crate) fn rewrite_write_fault(backup_arn: &str) -> Option<ProgressWriteFault> {
+    #[cfg(feature = "test-hooks")]
+    {
+        armed::with_hooks(|hooks| {
+            hooks
+                .rewrite_write_faults
+                .get_mut(backup_arn)
+                .and_then(std::collections::VecDeque::pop_front)
+        })
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        let _ = backup_arn;
+        None
+    }
+}
+
+/// The error a rewrite of `backup_arn` that reached `at` stops with, if a
+/// test armed [`stop_rewrite`] there.
+pub(crate) fn rewrite_stop(backup_arn: &str, at: RewriteStop) -> Result<(), StorageError> {
+    #[cfg(feature = "test-hooks")]
+    {
+        let armed_here = armed::with_hooks(|hooks| {
+            if hooks.rewrite_stops.get(backup_arn) == Some(&at) {
+                hooks.rewrite_stops.remove(backup_arn);
+                true
+            } else {
+                false
+            }
+        });
+        if armed_here {
+            return Err(StorageError::Internal(format!(
+                "test hook: the rewrite of {backup_arn} stopped at {at:?}"
+            )));
+        }
+    }
+    let _ = (backup_arn, at);
+    Ok(())
+}
+
 /// The fault the next removal lightweight transaction of `backup_arn` takes,
 /// if a test armed one.
 pub(crate) fn forget_write_fault(backup_arn: &str) -> Option<ProgressWriteFault> {
@@ -433,6 +595,45 @@ pub(crate) fn index_entry_batch_error(backup_arn: &str) -> Option<StorageError> 
     None
 }
 
+/// The key of a GSI worker's pause: the engine's keyspace prefix and the
+/// worker id, so a pause holds only the worker of the test that armed it.
+#[cfg(feature = "test-hooks")]
+fn gsi_worker_key(keyspace_prefix: &str, worker_id: u64) -> String {
+    format!("{keyspace_prefix}/{worker_id}")
+}
+
+/// Arm a pause in GSI worker `worker_id` of the engine on `keyspace_prefix`,
+/// after its next pass that applies nothing and before it waits for a wake.
+/// The pause is taken once and then disarmed.
+#[cfg(feature = "test-hooks")]
+pub fn pause_gsi_worker_before_wait(
+    keyspace_prefix: &str,
+    worker_id: u64,
+) -> std::sync::Arc<Pause> {
+    let pause = std::sync::Arc::new(Pause::new());
+    armed::with_hooks(|hooks| {
+        hooks.gsi_worker_before_wait.insert(
+            gsi_worker_key(keyspace_prefix, worker_id),
+            std::sync::Arc::clone(&pause),
+        );
+    });
+    pause
+}
+
+/// Hold here if a test armed a pause for GSI worker `worker_id` of the
+/// engine on `keyspace_prefix`.
+pub(crate) async fn gsi_worker_before_wait(keyspace_prefix: &str, worker_id: u64) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| {
+        hooks
+            .gsi_worker_before_wait
+            .remove(&gsi_worker_key(keyspace_prefix, worker_id))
+    }) {
+        pause.hold().await;
+    }
+    let _ = (keyspace_prefix, worker_id);
+}
+
 /// The period the jobs of `account_id` heartbeat at.
 pub(crate) fn heartbeat_interval(account_id: &str) -> Duration {
     #[cfg(feature = "test-hooks")]
@@ -472,6 +673,56 @@ pub(crate) fn heartbeat_error(account_id: &str) -> Option<StorageError> {
 pub(crate) async fn before_delete_claim(backup_arn: &str) {
     #[cfg(feature = "test-hooks")]
     if let Some(pause) = armed::with_hooks(|hooks| hooks.before_delete_claim.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause for the rewrite of `backup_arn`.
+pub(crate) async fn before_rewrite_write(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_rewrite_write.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause for the DELETED write of `backup_arn`.
+pub(crate) async fn before_deleted_write(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.before_deleted_write.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause after the DELETING claim of
+/// `backup_arn`.
+pub(crate) async fn after_delete_claim(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.after_delete_claim.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause after the DELETED write of
+/// `backup_arn`.
+pub(crate) async fn after_deleted_write(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) = armed::with_hooks(|hooks| hooks.after_deleted_write.remove(backup_arn)) {
+        pause.hold().await;
+    }
+    let _ = backup_arn;
+}
+
+/// Hold here if a test armed a pause for the tombstone removal of
+/// `backup_arn`.
+pub(crate) async fn before_tombstone_removal(backup_arn: &str) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pause) =
+        armed::with_hooks(|hooks| hooks.before_tombstone_removal.remove(backup_arn))
+    {
         pause.hold().await;
     }
     let _ = backup_arn;

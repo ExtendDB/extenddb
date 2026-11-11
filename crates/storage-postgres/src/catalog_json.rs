@@ -30,11 +30,11 @@
 //! `vector_indexes.vector_attribute`, `vector_indexes.search_schema`,
 //! `vector_indexes.projection` and `backup_index.source_table_details_json`;
 //! in the data database
-//! `gsi_pending.index_context`. Releases before catalog migration 10
+//! `gsi_pending.index_context`. Releases before catalog migration 11
 //! (`attribute_name_escape`) stored these documents raw, and a raw name that
 //! holds U+0001 followed by U+0001 or U+0002 would read back as a different
-//! name, so migration 10 rewrites every stored document through the escape
-//! once (`migrations/m0010_attribute_name_escape.rs`).
+//! name, so migration 11 rewrites every stored document through the escape
+//! once (`migrations/m0011_attribute_name_escape.rs`).
 //!
 //! The item documents (`item_data`, the stream record images, the images in
 //! `gsi_pending`) are not written through this module.

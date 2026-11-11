@@ -32,12 +32,20 @@ mod concurrent_account_creation;
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
+#[path = "direct/gsi_worker_pass.rs"]
+mod gsi_worker_pass;
 #[path = "direct/index.rs"]
 mod index;
+#[path = "direct/index_delay_reads.rs"]
+mod index_delay_reads;
+#[path = "direct/index_propagation_setting.rs"]
+mod index_propagation_setting;
 #[path = "direct/keyspace_migrations.rs"]
 mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
+#[path = "direct/metrics_store.rs"]
+mod metrics_store;
 #[path = "direct/policies.rs"]
 mod policies;
 #[path = "direct/pool_size.rs"]
