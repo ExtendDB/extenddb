@@ -54,7 +54,9 @@
 //! blocking pool, where dropping the future does not stop it; a guard in
 //! the future sets a flag when it is dropped, and the walk checks the flag
 //! before each removal, so a dropped `delete_prefix` stops at its next
-//! entry.
+//! entry. `delete_prefix_before` checks its deadline at the same point, so a
+//! walk that reaches the deadline stops before its next removal, whatever
+//! the caller's timer has done by then.
 //!
 //! Writes go to a temporary sibling file and rename into place, so a crash
 //! never leaves a truncated file under its final name. The temporary is
@@ -126,7 +128,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use crate::key::{normalize_prefix, validate_key, validate_prefix};
-use crate::{BackupStore, ByteStream, ObjectMeta, StoreError};
+use crate::{BackupStore, ByteStream, ObjectMeta, PrefixDeletion, StoreError};
 
 /// Prefix and suffix marking in-flight temporary files, hidden from listings.
 const TEMP_PREFIX: &str = ".put-";
@@ -600,6 +602,19 @@ impl FilesystemStore {
     }
 
     async fn delete_prefix_impl(&self, prefix: &str) -> Result<u64, StoreError> {
+        self.delete_walk(prefix, None)
+            .await
+            .map(|done| done.deleted)
+    }
+
+    /// The walk of `delete_prefix` and `delete_prefix_before`: with a
+    /// `deadline`, the walk starts no removal at or after it and returns
+    /// what it removed with `finished` false.
+    async fn delete_walk(
+        &self,
+        prefix: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PrefixDeletion, StoreError> {
         validate_prefix(prefix)?;
         let normalized = normalize_prefix(prefix).to_owned();
         let root = self.root.clone();
@@ -614,10 +629,25 @@ impl FilesystemStore {
             cancel: cancel.0.clone(),
             removal_hook: self.removal_hook.clone(),
             removals: std::sync::atomic::AtomicU64::new(0),
+            deadline,
+            out_of_time: std::sync::atomic::AtomicBool::new(false),
+            removed: std::sync::atomic::AtomicU64::new(0),
         };
-        tokio::task::spawn_blocking(move || delete_objects(&root, &normalized, &walk))
-            .await
-            .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let outcome = delete_objects(&root, &normalized, &walk);
+            if walk.out_of_time.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(PrefixDeletion {
+                    deleted: walk.removed.load(std::sync::atomic::Ordering::Acquire),
+                    finished: false,
+                });
+            }
+            outcome.map(|deleted| PrefixDeletion {
+                deleted,
+                finished: true,
+            })
+        })
+        .await
+        .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
     }
 
     async fn validate_impl(&self) -> Result<(), StoreError> {
@@ -740,6 +770,14 @@ impl BackupStore for FilesystemStore {
 
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>> {
         self.delete_prefix_impl(prefix).boxed()
+    }
+
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        self.delete_walk(prefix, Some(deadline)).boxed()
     }
 
     fn validate(&self) -> BoxFuture<'_, Result<(), StoreError>> {
@@ -1254,21 +1292,38 @@ impl Drop for CancelOnDrop {
 }
 
 /// What one `delete_prefix` walk carries down the tree: the flag its
-/// `CancelOnDrop` sets, and the store's removal hook (set only in the
-/// crate's own tests) with the count it is called with.
+/// `CancelOnDrop` sets, the store's removal hook (set only in the crate's
+/// own tests) with the count it is called with, and for
+/// `delete_prefix_before` the deadline, whether the walk reached it, and
+/// the files it removed.
 struct DeleteWalk {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     removal_hook: Option<RemovalHook>,
     removals: std::sync::atomic::AtomicU64,
+    deadline: Option<tokio::time::Instant>,
+    out_of_time: std::sync::atomic::AtomicBool,
+    removed: std::sync::atomic::AtomicU64,
 }
 
 impl DeleteWalk {
-    /// The error a cancelled walk ends with; nobody receives it, since the
-    /// caller's future is gone.
+    /// The error a cancelled walk, or one past its deadline, ends with;
+    /// nobody receives the first, since the caller's future is gone, and
+    /// `delete_walk` turns the second into an unfinished deletion. Called
+    /// before each removal.
     fn check_cancel(&self) -> Result<(), StoreError> {
         if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StoreError::Other(
                 "delete_prefix was dropped before it finished".to_owned(),
+            ));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.out_of_time
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(StoreError::Other(
+                "delete_prefix_before reached its deadline".to_owned(),
             ));
         }
         Ok(())
@@ -1368,7 +1423,11 @@ fn check_tree(dir: &Path, dir_meta: &std::fs::Metadata) -> Result<(), StoreError
 fn remove_file_counted(path: &Path, walk: &DeleteWalk) -> Result<u64, StoreError> {
     walk.before_removal();
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(1),
+        Ok(()) => {
+            walk.removed
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(1)
+        }
         Err(e) if vanished(&e) => Ok(0),
         Err(e) => Err(StoreError::io(format!("remove {}", path.display()), e)),
     }

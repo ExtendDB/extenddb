@@ -209,8 +209,11 @@ Defined in `crates/storage/src/management_store/mod.rs`. Historical metrics pers
 
 | Method | Purpose |
 |--------|---------|
-| `record_metrics` | Insert a metrics snapshot |
-| `query_metrics` | Query metrics by time range, operation, and table filters |
+| `insert_metrics` | Insert a batch of one-minute rows, each with the account it was recorded for (none for a metric of the whole deployment) |
+| `query_metrics` | Query rows by time range, filtered by `MetricsFilter`: account, table name and metric |
+| `prune_metrics` | Delete rows older than the retention period |
+
+Two accounts' rows for a table of the same name must never be read back as one: a store that adds rows of one key together keeps the account in the key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
 
 ### RateLimitStore
 

@@ -3,10 +3,9 @@
 
 """The console metrics dashboard and its data feed serve admins only.
 
-The metrics table behind the dashboard has no account column, so its feed
-carries the table names and traffic of every account. An IAM user who logs in
-to the console gets neither the page nor the feed. An admin gets both, with
-every account's tables.
+The feed behind the dashboard carries the table names and traffic of every
+account. An IAM user who logs in to the console gets neither the page nor the
+feed. An admin gets both, with every account's tables.
 
 The Settings and Cache pages are admin only too. Each of the three pages
 redirects an IAM-user session to the console dashboard, and the navigation bar

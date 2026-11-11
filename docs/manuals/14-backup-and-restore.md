@@ -243,30 +243,32 @@ host-local directory configured at one path on each host is not one root: once t
 a second instance pointed at its own directory under that path starts with the store unhealthy. Before the
 first backup nothing tells the directories apart: each instance creates its own identity file and store id,
 the first backups split the rows between the two ids, and the next check reports an identity mismatch
-(`/health` gives `"reason":"identity mismatch"`), which no command in this release clears: `backup purge
---confirm` refuses an unhealthy store ("fix that before purging its backups"), plain `backup sync` and
-`--prune-missing` refuse it too ("sync changes no row while the store is unhealthy"), and `--adopt-store`
-takes only a root another catalog owns. Two remedies exist. Restore the catalog from a copy taken before the
-split ([The catalog is restored from a database backup](#the-catalog-is-restored-from-a-database-backup)),
-keeping the directory whose store id the copy's rows for the root carry, if it has any: rows that carry the
-other directory's id make the next check report the mismatch again. The backups that the other directory's
-instance took after the copy are in neither the restored catalog nor the kept directory, so before
-`backup sync` copy the other directory's account directories, not its `extenddb-store.json`, into the kept
-directory under the [Restore drill](#restore-drill)'s copy rules (directories `0700`, files `0600`;
-`backup sync` exits 1 on a `0755`
-directory), point every instance at the kept directory over a shared mount, and run `backup sync` before the
-next backup; a backup left in the other directory stays unknown to the catalog. Or keep one directory as the
-root by hand: delete from the catalog database the backup rows that carry the other directory's store id
-(`backup list` runs on an unhealthy store and prints every row of the root with its `store_id`; the rows are
-in the `backup_index` table on SQLite and PostgreSQL, the `backup_index` collection on MongoDB, and on
-Cassandra in `backups_by_arn`, where a row with `store_kind` set is an index row, and
-`backup_index_by_status`, each with a `store_id` column; on Cassandra also delete each such row's entries in
-`backups_by_account` and `backups_by_table`, which have no `store_id` column, with the keys from its
-`backups_by_arn` row: `account_id`, `table_name`, `created_at` and `backup_arn`), copy that directory's
-account directories, not its `extenddb-store.json`, into the kept directory under the same copy rules, point
-every instance at the kept directory over a shared mount, and run `backup sync`, which adopts the copied
-backups (the deployment guide's
-[Multi-Instance Considerations](11-deployment-guide.md#multi-instance-considerations)). With an
+(`/health` gives `"reason":"identity mismatch"`). `backup purge --confirm` refuses an unhealthy store ("fix
+that before purging its backups"), plain `backup sync` and `--prune-missing` refuse it too ("sync changes no
+row while the store is unhealthy"), `--adopt-store` takes only a root another catalog owns, and
+`--forget-store` does not apply: both directories have the one root label, the configured root, which it
+refuses. Two remedies exist. Keep one directory as the root: on a host whose instance uses the kept directory,
+remove each row that carries the other directory's store id with `extenddb backup sync --forget-backup <arn>`
+(`backup list` runs on an unhealthy store and prints every row of the root with its `store_id`; the option
+runs on the unhealthy store, can be given once per ARN, deletes no object, and after the removals runs the
+store's check once, printing "The configured store's check passes (store id <id>)" when no row of the other
+id is left). A `DELETING` row among them is refused, naming its store id as one the identity check refuses;
+remove it with the same command run with `[backup.store] kind = "disabled"`, as step 2 of [Moving a store to
+a new root](#moving-a-store-to-a-new-root) does, and `DeleteBackup` it again once its backup is adopted. Then
+copy the other directory's account directories, not its `extenddb-store.json`, into the kept directory, under
+the [Restore drill](#restore-drill)'s copy rules: as the server's user, keeping directories `0700` and files
+`0600` (`cp -rp` or `rsync -a`; a copy left `0755` by `tar`, by `rsync` without permissions or by `aws s3 cp
+--recursive` under a `022` umask makes `backup sync` exit 1 naming the directory). Point every instance at
+the kept directory over a shared mount, and run plain `backup sync`, which adopts the copied backups (the
+deployment guide's [Multi-Instance
+Considerations](11-deployment-guide.md#multi-instance-considerations)). Or restore the catalog from a copy
+taken before the split ([The catalog is restored from a database
+backup](#the-catalog-is-restored-from-a-database-backup)): keep the directory whose store id the restored
+rows carry (rows of the root under the other directory's id make the next check report the mismatch again;
+with no rows for the root, either directory), copy the other directory's account directories into it under
+the same copy rules before `backup sync` (the backups that the other directory's instance took after the
+catalog's copy are in neither the restored catalog nor the kept directory, and the sync adopts only what the
+kept directory holds), and point every instance at the kept directory before the next backup. With an
 `extenddb-store.json` copied from one directory to the other nothing detects the split, and a restart can
 delete the only copy of a backup (the admin guide's [`[backup.store]`](05-admin-guide.md#backupstore)
 section). Point every instance at the shared root before the first backup, and never copy
@@ -280,7 +282,10 @@ unconfigured, with `CreateBackup` writing in-catalog backups ([The catalog is lo
 re-created](#the-catalog-is-lost-and-re-created)). Or configure a new root. `destroy` leaves the config file
 too, and `init` refuses a config file that exists; `init --overwrite` regenerates the whole file from defaults,
 keeping only the storage connection settings (values edited in the default sections revert too), so copy the
-file aside first and put the copy back whole, apart from the storage settings, before the server starts.
+file aside first and put the copy back whole, apart from the storage settings, before the server starts. A
+root that has to change while the catalog stays (a new volume, a new bucket) keeps its backups when its tree is
+copied under the new root and `extenddb backup sync --move-store <old root>` re-points the rows ([Moving a
+store to a new root](#moving-a-store-to-a-new-root)).
 
 `/health` reports the store as the `backup_store` component, for example
 `{"components":{"backup_store":{"kind":"filesystem","status":"healthy"}},"status":"healthy"}` (on MongoDB
@@ -510,9 +515,26 @@ store. When the newest of those rows is the catalog's newest `AVAILABLE` backup,
 check looks for that backup's manifest, and `/health` reports `"reason":"manifest probe failed"`): both
 commands refuse ("sync changes no row while the store is unhealthy"), as do `CreateBackup` and the restore and
 delete of every backup in that store, and the state survives a restart. Putting that backup's prefix back from
-a copy clears it. This release has no command that clears it without such a copy: `--prune-missing` refuses
-while the store is unhealthy. To stay out of this state, take each catalog backup right after the deletions
-your scheduler makes, so that the newest backup a catalog backup names is not one deleted later.
+a copy clears it. When the backup is gone for good, remove its row:
+
+```bash
+extenddb backup sync --forget-backup <arn> --config extenddb.toml
+```
+
+with the ARN the refusal and the server's log line name (`extenddb backup list` lists it too). First check that
+the root is the one that holds the backups: a root that is not shared by every server (another host's directory
+at the same path) shows the same refusal. An unmounted volume shows another one, "the root has no
+extenddb-store.json but the catalog has rows for it", and `--forget-backup` leaves the rows of such a root ("the
+configured root has no extenddb-store.json while the catalog holds rows for it (a volume that is not
+mounted?)"), so its rows are not removed one by one from under an empty mount point. The command runs on the
+unhealthy store, removes that row outright and deletes no
+object, then runs the store's check once, writing nothing to the root, and prints it: "The configured store's
+check passes", or the next `AVAILABLE` row whose manifest is gone, with the same command for it; repeat for that one (the option can be given more than
+once, and an ARN whose row is already gone counts as done, so the same command line can be run again). Once the check
+passes, `extenddb backup sync --prune-missing` removes the older rows whose manifest is gone, and each running
+server finds the store healthy at its next reconciler cycle. To stay out of this state, take each catalog
+backup right after the deletions your scheduler makes, so that the newest backup a catalog backup names is not
+one deleted later.
 
 Tables backed up after the copy can be restored, under their own names or others, once `backup sync` lists
 their backups; their writes after their last backup are lost.
@@ -615,7 +637,8 @@ In both shapes plain `backup sync` refuses (exit 1, "owned by another catalog").
 On SQLite every `backup sync` needs the server stopped, since it opens the database as the server does. On
 PostgreSQL, MongoDB and Cassandra it runs beside servers and holds the catalog's maintenance claim while it
 runs, during which `CreateBackup` and `RestoreTableFromBackup` on every instance answer
-`LimitExceededException`; `--adopt-store` and `--prune-missing` first wait, as `purge` does, until no backup
+`LimitExceededException`; `--adopt-store`, `--prune-missing`, `--move-store`, `--forget-store` and
+`--forget-backup` first wait, as `purge` does, until no backup
 or restore job is running and no backup failed within `stale_job_after_secs` (a job that failed may still be
 writing to its prefix), at most `2 * stale_job_after_secs`, and then refuse. Sync exits 0 when it completed
 and 1 when it refused or skipped a prefix for a store or catalog error (run it again). It exits 6 when it
@@ -661,6 +684,138 @@ The answer is `{"key":"allow_credential_import","value":"true"}`. Start a new in
 only after the old one has exited. A root that a durable catalog owns is never adopted by an in-memory server.
 Every `extenddb backup` command refuses an in-memory database (exit 1), since it would open a new, empty
 catalog that ends with the command.
+
+## Moving a store to a new root
+
+Each backup's row names its store's root as the catalog stores it (the canonical directory of a filesystem
+store; `s3://<bucket>/<prefix>` for S3, with `?endpoint=<url>` when an endpoint is set), so a tree copied to
+a new root comes with no rows: configured with the new root, `extenddb backup sync` skips every copied prefix,
+naming the row of the old store that holds it, and lists the old root's rows under "Rows of other stores".
+`--move-store` re-points those rows at the configured store, and the backups keep their ARNs:
+
+1. Reconfigure every server of the catalog to the new root, on every host, and restart it (on SQLite stop it:
+   the move needs the serve lock). A server left on the old root keeps writing its backups there after the
+   move, and nothing detects it beyond the next sync's report of other stores.
+2. Copy the old root's tree under the new root, whole and with the same relative paths, as the server's user,
+   keeping directories `0700` and files `0600`, and leave the old root's `extenddb-store.json` out of the
+   copy: the servers restarted in step 1 gave the new root its own (`rsync -a --exclude=/extenddb-store.json
+   /srv/backups/old/ /srv/backups/new/`; for S3, `aws s3 sync --exclude extenddb-store.json` between the two
+   prefixes). Finish the copy before the move: the move checks the copy once, and the reconciler later deletes
+   what the copy brought of the moved `FAILED` and `DELETED` backups. If the old root's `extenddb-store.json`
+   was copied over the new root's, every running server's store turns unhealthy (an identity mismatch). With
+   no backup taken under the new root since the restart, the move still runs; restart every server after it.
+   With one taken (a server kept serving between the steps), the move refuses with the same mismatch:
+   `extenddb backup list` names those backups under the new root's first store id; remove each row with
+   `extenddb backup sync --forget-backup <arn>` (its bytes stay), run the move, whose sync adopts them again,
+   and restart every server. A `DELETING` row among them (a `DeleteBackup` that had not finished) is refused,
+   naming its store id as one the identity check refuses: its deletion waits on a check that cannot pass while
+   the copied file and that row's id disagree. Remove it with the same command run with `[backup.store] kind =
+   "disabled"` (its bytes stay), configure the new root again, run the move, whose sync adopts that backup
+   too, restart every server, and `DeleteBackup` it again.
+3. With the configuration naming the new root, run:
+
+   ```bash
+   extenddb backup sync --move-store /srv/backups/old --config extenddb.toml
+   ```
+
+   Give the old root byte for byte, as `extenddb backup list` printed it before the change or as plain sync's
+   report of other stores prints it. A root that differs by a trailing `/`, or by an S3 root's `?endpoint=`
+   suffix, has no rows; the command says so and lists the roots the catalog holds rows for.
+
+The move needs the configured store healthy. It takes the maintenance claim, waits for the running jobs of the
+configured store and of the old root, and checks every row of the old root against the copy:
+
+- an `AVAILABLE` row needs its prefix complete under the new root: the manifest and its sidecar, the row's ARN,
+  every data file at its recorded size, and the row's size and item count;
+- a `CREATING` row whose job is dead is resolved `AVAILABLE` when the copy holds its complete backup. A copy
+  without the complete backup stops the move and the row is left `CREATING`: a copy that lacks the manifest
+  or a data file says nothing about the old root's prefix, and a `FAILED` row would have the reconciler delete
+  the copy. Run a server configured with the old root (on SQLite, plain `extenddb backup sync` there), whose
+  reconciler resolves the row against the old root, then copy that prefix again; or remove the row with
+  `--forget-backup`. A `CREATING` row whose job still runs stops the move;
+- a `DELETING` row has its deletion finished under the new root, which deletes what the copy brought of it;
+- a `DELETING`, `DELETED` or `FAILED` row whose copied prefix holds a complete backup stops the move: moving
+  that row would have the reconciler delete the backup. For a `DELETING` or `DELETED` row the backup was
+  deleted: remove that prefix from the new root and run the move again. Removing the row with
+  `--forget-backup` instead would have the next sync adopt the prefix, so the backup a client deleted would be
+  `AVAILABLE` again and would have to be deleted again. For a `FAILED` row, remove the prefix, or remove the
+  row with `--forget-backup` and let the next sync adopt the prefix.
+
+Every row that stops the move is named with its reason in one run, and no row moves while any does (exit 1):
+
+```
+--- Stopping the move (no row is moved while any is listed here):
+  arn:aws:dynamodb:us-east-1:<account>:table/orders/backup/<backup id> (AVAILABLE, account <account>): not a complete copy under the configured root: data file data/000001.json.gz is not in the store; copy the prefix again (or remove the row with --forget-backup)
+```
+
+Copy what is missing and run the command again, or remove the row with `extenddb backup sync --forget-backup
+<arn>` and run the move again; the prefix is then reported as an incomplete backup by every sync until the
+missing file is copied, and the next sync adopts it. With no row stopping it, the move rewrites the rows,
+logs each under `extenddb::audit`, and syncs the new root:
+
+```
+=== extenddb backup sync --move-store complete: 3 row(s) moved, 0 resolved, 0 deletion(s) finished, 0 row(s) stopping the move, 0 gone during the move, 0 left under the old root ===
+```
+
+`DescribeBackup`, `ListBackups` and restores of the moved backups then work against the new root. A row still
+under the old root after the rewrite (a `CreateBackup` of a server left on the old root) is listed and the
+command exits 1: its prefix was written after the copy, so reconfigure that server, copy its prefix under the
+new root (or `--forget-backup` it), and run the move again. The move rewrites the rows 500 at a time (on
+Cassandra, which rewrites key by key, one row at a time), confirms its maintenance claim before each 500 rows and
+reads the claim's state, with no write, before every call: a move whose claim another command took over (on
+MongoDB and Cassandra, a move stopped for longer than `stale_job_after_secs`) writes nothing after the one call
+it had sent or was about to send when it stopped (one row on Cassandra, up to 500 on MongoDB), and exits 1 with
+the earlier rows moved and the rest listed under the old root; a second run moves them. A first Ctrl-C or
+`SIGTERM` during the rewrite stops it the same way before its next call. On PostgreSQL
+each slice is one statement in a transaction of its own, under a 30 s statement timeout (the admin guide's
+`backup sync` paragraph has the figures). A move interrupted after its rewrite (a signal, a lost connection)
+has moved its rows: run plain `extenddb backup sync`, since a second `--move-store` then finds no row under
+the old root and says so. A row of the old root in the report of other stores the move's own sync prints (a
+`CreateBackup` whose insert landed during that sync) is named and the command exits 1 ("a row landed under the
+old root during the move"). Nothing under the old root is read or changed, and no object is copied. Before you
+delete the old root, run plain `extenddb backup sync` and check that its report of other stores lists no row
+of the old root: a server still configured with it, or a `CreateBackup` that read the maintenance claim before
+the move took it and inserted its row after the move's report, can leave a row there whose bytes exist only
+under the old root. On Cassandra that report reads each root's rows whatever status their status entry is
+under, so a row of the old root is listed as a row; a line that counts only "status entries with no row of
+that status behind them" names no row, and `extenddb backup sync --forget-store <old root>` removes those
+entries. A restore that failed because it read a store other than the configured one is run again once its
+backup's rows are moved. The move's memory grows with the rows of both roots: every backend reads a listing's
+rows whole, and the move reads the old root's rows and the configured root's (for the check of one backup id
+per account; the sync after the move reads them again), each about 23 KiB per row on PostgreSQL and 27 on
+SQLite, above about 50 MiB, for a table with five GSIs, measured at 1,452 bytes of table description per row
+(the figure grows with the description; the admin guide's `backup sync` paragraph has the figures).
+
+To drop the rows of a root without moving them (a root that is gone, or one retired with its backups),
+`extenddb backup sync --forget-store <root>` removes every row of that root outright, leaving no tombstone,
+and deletes no object; it refuses the configured root. It runs on a store in any state and with no store
+configured; a configured root that cannot be opened (a directory that does not exist: "[backup.store] ...
+cannot be opened") stops it before anything is read, as it stops plain sync, and the same command with
+`[backup.store] kind = "disabled"` runs it. Beside servers it waits a minute after taking the maintenance claim before its first removal of a
+`FAILED` or `DELETED` row, and prints the wait: a reconciler cycle that began before the claim may be deleting
+such a row's prefix, and its deletion stops within that time, checking its deadline before each removal, so
+what it can still do once the command removes the row is the one removal (or one S3 request) in flight at that
+deadline. That holds while the servers' processes keep running: a server paused for longer than the wait (a
+stopped process, a frozen container or VM) in the middle of a deletion takes up that step when it resumes. A
+`DELETING` row of another store keeps its bytes unless a server configured with that store finishes the
+deletion (its reconciler does, the deletion the `DeleteBackup` asked for): if that root comes back with the
+bytes, `backup sync` adopts the backup again. It waits for running jobs as `purge` does, and any running job
+holds it, not only the jobs of the rows it removes: a backup job of the configured store (a `CREATING` or
+`FAILED` row whose heartbeat is live), or a running restore from any backup. The wait lasts up to twice
+`stale_job_after_secs` (600 s at the default), and the command refuses, exit 1, if a job is still running when
+it ends; a `CREATING` or `FAILED` row whose job writes a heartbeat after the wait, and a row a restore is
+reading, are left and named (exit 1): run it again once the job ends, and for the restore once it ends or, if
+it failed, once its target is removed with `extenddb backup remove-target --account <id> <table>`. On
+Cassandra it also sweeps the root's status entries: it deletes those that no row of the root stands behind,
+writes again under its row's status one left under an earlier status (a status change whose entry batch
+failed), and says how many of each. If the root comes back and is configured again, `backup sync` adopts its
+backups again. `--forget-backup <arn>` does the same for one backup; for a `DELETING` row of the configured
+store it first waits as for a `DELETED` row, then finishes the deletion its `DeleteBackup` asked for (the
+per-row line says the command deleted its objects), which needs the store's check to pass, and refuses the row
+otherwise. While the configured root has no `extenddb-store.json` and the catalog holds rows for it (an
+unmounted volume), or on SQLite the default root is missing while the catalog holds rows for it (moved away,
+or a link to a volume that is gone), `--forget-backup` refuses that root's rows and writes nothing to it:
+mount the volume, or point `[backup.store]` at the root that holds the backups, then run it again.
 
 ## Legacy backups
 

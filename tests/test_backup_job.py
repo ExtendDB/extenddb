@@ -81,7 +81,8 @@ MongoDB, whose commands take the maintenance claim):
 - an identity file rewritten to name another catalog while a plain sync is
   in its prefix loop ends the command with exit 1, naming that catalog;
 - (beside a server) while `--prune-missing` holds the maintenance claim, `backup
-  purge` and `--adopt-store` fail at once, and `--adopt-store` on a root
+  purge`, `--adopt-store`, `--move-store`, `--forget-store` and
+  `--forget-backup` fail at once, and `--adopt-store` on a root
   the catalog owns waits for a running job as `--prune-missing` does;
 - (beside a server) on host-local roots, `--prune-missing` on the host that
   lacks a backup's bytes removes its row only, the other host keeps the
@@ -97,6 +98,46 @@ MongoDB, whose commands take the maintenance claim):
   with its last check healthy after the adoption, is refused by its
   deletion fence and leaves the bytes, and the adopting catalog's store
   stays healthy.
+
+`backup sync --move-store`, `--forget-store` and `--forget-backup`, on the
+three deployments (the steps that edit a row at the catalog on SQLite and
+PostgreSQL):
+
+- a tree copied to a new root: sync there names the old store's rows,
+  `--move-store` refuses the configured root and a root that differs by a
+  trailing `/`, and stops on a FAILED row whose copy is a complete backup
+  and on a copy missing a data file, naming each and moving none;
+  `--forget-backup` of the incomplete one lets the move finish, the sync
+  after it skips that prefix until the file is copied, and a server on the
+  new root restores a moved backup;
+- the rows of another root are left alone by a server's reconciler (a copy
+  of that root's tree under the configured root included) and reported by
+  sync; `--forget-store` removes them outright and deletes
+  nothing, after which the root's return has its prefixes adopted;
+- a store left unhealthy by its newest backups' missing manifests is cleared
+  by `--forget-backup`, which prints the store's check, after which
+  `--prune-missing` runs;
+- `--forget-backup` leaves a live CREATING row (PostgreSQL), an ARN spelt
+  with another region and an in-catalog backup, and runs with no store
+  configured;
+- (PostgreSQL, MongoDB) a CreateBackup during `--move-store`'s wait for a
+  running job is refused by the maintenance claim, and the move finishes
+  once the job ends;
+- (PostgreSQL) a CreateBackup of a server left on the old root whose row
+  lands during the move's sync is named under "Rows that landed under the
+  old root during the move" and the move exits 1;
+- (PostgreSQL, MongoDB) the backup manual's move procedure in its order
+  beside a running server, the tree copied without its identity file and a
+  CreateBackup between the restart and the copy: the server stays healthy,
+  restores a moved backup and backs up again; with the identity file
+  copied, the manual's remedy (`--forget-backup` of the backup taken
+  meanwhile, the move, a restart) ends in the same state;
+- `--forget-backup` refuses a string that is no ARN before the claim, goes
+  past an ARN whose row is gone, and on an empty root under the rows runs no
+  store check and writes nothing there;
+- (PostgreSQL) a forget option started while a DELETING row and a dead
+  RUNNING restore exist proceeds once a server's held-claim cycle has
+  finished the one and failed the other.
 
 The binary at `EXTENDDB_BINARY` decides which deployment runs: a SQLite build,
 a PostgreSQL build (with `EXTENDDB_TEST_PG_CONNECTION_STRING`) or a MongoDB
@@ -1816,8 +1857,15 @@ def test_sync_rebuilds_dropped_rows_and_adopts_only_verified_prefixes(deployment
             others[label] = arn
         if d.backend == "sqlite":
             # The serve lock held is the catalog refusal `serve` gives for
-            # it: exit 6, before any store or row is read.
-            for args in (("sync",), ("sync", "--prune-missing")):
+            # it: exit 6, before any store or row is read. The options that
+            # move or remove rows of other stores take it too.
+            for args in (
+                ("sync",),
+                ("sync", "--prune-missing"),
+                ("sync", "--move-store", os.path.join(d.cwd, "elsewhere")),
+                ("sync", "--forget-store", os.path.join(d.cwd, "elsewhere")),
+                ("sync", "--forget-backup", kept),
+            ):
                 beside = d.run("backup", *args)
                 assert beside.returncode == 6, beside.stdout + beside.stderr
                 assert "another extenddb process" in beside.stdout + beside.stderr, beside.stdout + beside.stderr
@@ -1941,8 +1989,8 @@ def test_prune_missing_and_the_unhealthy_store_refusals(deployment, tmp_path):
     sync reports it with the `--prune-missing` hint and leaves it AVAILABLE;
     `--prune-missing` takes the maintenance claim and removes the row
     outright (no tombstone, BackupNotFound), deleting no object: the rest of
-    its prefix stays. An unhealthy store refuses plain sync and
-    `--prune-missing`, exit 1, with no row changed and nothing written to the
+    its prefix stays. An unhealthy store refuses plain sync, `--prune-missing`
+    and `--move-store`, exit 1, with no row changed and nothing written to the
     root, for each shape an unmounted volume gives: an empty root under the
     rows, a root holding only the identity file (the newest AVAILABLE row's
     manifest absent), and a root whose identity file carries another store
@@ -2009,7 +2057,11 @@ def test_prune_missing_and_the_unhealthy_store_refusals(deployment, tmp_path):
                 if content is not None:
                     _private_file(os.path.join(d.root, "extenddb-store.json"), content)
                 tree = _tree(d.root)
-                for args in (("sync",), ("sync", "--prune-missing")):
+                for args in (
+                    ("sync",),
+                    ("sync", "--prune-missing"),
+                    ("sync", "--move-store", os.path.join(d.cwd, "elsewhere")),
+                ):
                     res = d.run("backup", *args)
                     out = res.stdout + res.stderr
                     assert res.returncode == 1, (shape, args, out)
@@ -2043,8 +2095,10 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
     """`backup sync --prune-missing` takes the maintenance claim and waits
     for a CREATING row whose owner beat just now (the row edited at the
     catalog, its heartbeat the database's now); while it waits, `backup
-    purge --confirm` and `backup sync --adopt-store` each fail within
-    seconds, exit 1, naming the one-at-a-time rule, and change nothing. The
+    purge --confirm`, `backup sync --adopt-store`, and `--move-store`,
+    `--forget-store` (of a root a second backup's row was edited to name)
+    and `--forget-backup` each fail within seconds, exit 1, naming the
+    one-at-a-time rule, and change nothing. The
     first command, signalled, stops before any change and releases the
     claim. `--adopt-store` on the root this catalog owns then takes the
     claim and waits for the same live job ("Waiting for running jobs to
@@ -2061,8 +2115,23 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
     server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
     try:
         name, busy = _small_backed_up_table(ddb, "claim")
+        moved = ddb.create_backup(TableName=name, BackupName="elsewhere")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, moved, timeout=60)
     finally:
         server.stop()
+    elsewhere = os.path.join(d.cwd, "elsewhere")
+    if d.backend == "mongodb":
+        n = _mongosh(
+            f"print(db.backup_index.updateOne({_mongodb_row_filter(moved)}, "
+            f"{{$set: {{store_root: {json.dumps(elsewhere)}}}}}).matchedCount)"
+        )
+    else:
+        n = _catalog(
+            d,
+            "UPDATE backup_index SET store_root = ? WHERE account_id = ? AND backup_id = ?",
+            (elsewhere, ACCOUNT, _backup_id(moved)),
+        )
+    assert n == 1, f"{n} backup_index rows match {moved}"
     _set_status(d, busy, "CREATING")
     out_path = str(tmp_path / "first.out")
     with open(out_path, "wb") as out:
@@ -2077,7 +2146,13 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
             assert time.monotonic() < deadline, open(out_path).read()
             time.sleep(0.2)
         assert busy in open(out_path).read() or name in open(out_path).read(), open(out_path).read()
-        for args in (("purge", "--confirm"), ("sync", "--adopt-store")):
+        for args in (
+            ("purge", "--confirm"),
+            ("sync", "--adopt-store"),
+            ("sync", "--move-store", elsewhere),
+            ("sync", "--forget-store", elsewhere),
+            ("sync", "--forget-backup", moved),
+        ):
             started = time.monotonic()
             res = d.run("backup", *args)
             took = time.monotonic() - started
@@ -2087,6 +2162,7 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
             assert took < 15, f"{args} took {took:.1f} s to refuse"
             print(f"{' '.join(args)}: refused in {took:.1f} s")
         assert first.poll() is None, "the first command stopped while the others ran"
+        assert _rows_present(d, [moved]) == 1, "a refused command removed the other root's row"
         first.send_signal(15)
         assert first.wait(timeout=30) == 1
         text = open(out_path).read()
@@ -2832,3 +2908,1112 @@ def test_an_adopter_whose_put_lands_during_the_sync_ends_it_with_exit_1(deployme
     ) in text, text[-4000:]
     assert f"  {arn}" in _adopted_section(text), text[-4000:]
     assert "=== extenddb backup sync complete" not in text, text[-4000:]
+
+
+# --- `backup sync --move-store`, `--forget-store`, `--forget-backup` ---------------
+#
+# These cells change rows only through the binary, so they run on the MongoDB
+# deployment too; the steps that edit a row at the catalog (`_catalog`) run on
+# SQLite and PostgreSQL only and say so.
+
+_STORE_SECTION = re.compile(
+    r"^\[backup\.store\]\n(?:kind = .*\n)(?:\[backup\.store\.filesystem\]\npath = .*\n)?", re.M
+)
+
+
+def _set_root(d: _Deployment, path: str) -> None:
+    """Configure the deployment's filesystem store at `path`, replacing the
+    `[backup.store]` section the fixture or an earlier call wrote (SQLite's
+    fixture writes none: its root is the defaulted one)."""
+    with open(d.config) as f:
+        text = f.read()
+    section = f'[backup.store]\nkind = "filesystem"\n[backup.store.filesystem]\npath = "{path}"\n'
+    found = list(_STORE_SECTION.finditer(text))
+    assert len(found) <= 1, text
+    if found:
+        text = text[: found[0].start()] + section + text[found[0].end() :]
+    else:
+        text += section
+    with open(d.config, "w") as f:
+        f.write(text)
+
+
+def _set_store_disabled(d: _Deployment) -> None:
+    """Configure `[backup.store] kind = "disabled"`: CreateBackup writes an
+    in-catalog backup, and no store is configured."""
+    with open(d.config) as f:
+        text = f.read()
+    found = list(_STORE_SECTION.finditer(text))
+    section = '[backup.store]\nkind = "disabled"\n'
+    if found:
+        text = text[: found[0].start()] + section + text[found[0].end() :]
+    else:
+        text += section
+    with open(d.config, "w") as f:
+        f.write(text)
+
+
+def _copy_root(src: str, dst: str) -> None:
+    """Copy a store tree as `cp -rp` does (contents, modes and times; the
+    identity file included)."""
+    shutil.copytree(src, dst, copy_function=shutil.copy2)
+    os.chmod(dst, 0o700)
+
+
+def _copy_tree_into(src: str, dst: str, identity: bool = False) -> None:
+    """Copy a store tree into an existing root as the backup manual's move
+    procedure says, `rsync -a --exclude=/extenddb-store.json src/ dst/`:
+    contents, modes and times, the identity file at the top left out unless
+    `identity`."""
+
+    def top_identity(directory: str, names: list[str]) -> list[str]:
+        if not identity and os.path.samefile(directory, src):
+            return [n for n in names if n == "extenddb-store.json"]
+        return []
+
+    shutil.copytree(src, dst, copy_function=shutil.copy2, ignore=top_identity, dirs_exist_ok=True)
+
+
+def _tree_without_identity(root: str) -> list[str]:
+    """`_tree` without the identity file at the top."""
+    return [entry for entry in _tree(root) if not entry.startswith("extenddb-store.json")]
+
+
+def _section(stdout: str, header: str) -> str:
+    """One `--- header` section of a command's report: the header's line
+    and the lines under it, up to a blank line or the next `---` or `===`
+    line."""
+    assert header in stdout, f"{header!r} not in\n{stdout}"
+    lines = stdout.split(header, 1)[1].split("\n")
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if not line or line.startswith(("---", "===")):
+            break
+        kept.append(line)
+    return "\n".join(kept)
+
+
+OTHER_STORES = "--- Rows of other stores (left as they are; sync reads and changes none of them):"
+
+
+def test_move_store_moves_a_copied_tree_and_stops_on_an_incomplete_copy(deployment, tmp_path):
+    """Three backups under the root; the tree copied to a new root and the
+    configuration pointed at it. Plain sync there skips each prefix, naming
+    the row of the old store that holds it, and its report of other stores
+    counts the old root's three AVAILABLE rows and names `--move-store` and
+    `--forget-store`. `--move-store` refuses the configured root and a root
+    that differs from the old one by a trailing `/` (printing the stores the
+    catalog knows). (SQLite and PostgreSQL) A FAILED row whose copied prefix
+    holds a complete backup stops the move, naming `--forget-backup` and the
+    adopting sync; a DELETED one stops it saying the backup was deleted and
+    to remove the prefix. With
+    one data file of the second backup left out of the copy, the move names
+    that row and that file, exits 1 and moves none; `--forget-backup` of it
+    removes the row and prints the store's check; the move then moves the
+    other two (audit lines), syncs the configured root, which skips the
+    incomplete prefix naming the missing file, and its report of other
+    stores is empty. Once the file is copied, sync adopts that backup. A
+    server on the new root describes and restores a moved backup. Nothing
+    under the old root changes."""
+    d = deployment
+    old = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, b1 = _small_backed_up_table(ddb, "move")
+        b2 = ddb.create_backup(TableName=name, BackupName="two")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b2, timeout=60)
+        b3 = ddb.create_backup(TableName=name, BackupName="three")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b3, timeout=60)
+    finally:
+        server.stop()
+    store_id = _store_id(old)
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _section(res.stdout, OTHER_STORES).splitlines()[1:] == ["  (none)"], res.stdout
+    old_tree = _tree(old)
+
+    new = os.path.join(d.cwd, "backups-new")
+    _copy_root(old, new)
+    new = os.path.realpath(new)
+    _set_root(d, new)
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    print(f"branch: {d.backend}\n{res.stdout}")
+    for arn in (b1, b2, b3):
+        line = (
+            f"  {_key_prefix(name, arn)}: a row of another store holds it (AVAILABLE; filesystem {old}, "
+            f"store id {store_id}); it is left as it is"
+        )
+        assert line in res.stdout, f"{line!r} not in\n{res.stdout}"
+    others = _section(res.stdout, OTHER_STORES).splitlines()[1:]
+    assert others[0] == f"  filesystem {old} (store id {store_id}): 3 AVAILABLE", others
+    assert "--move-store <root>" in others[1] and "--forget-store <root>" in others[1], others
+    assert len(others) == 2, others
+    assert _rows(d) == {}, "the configured store has no row before the move"
+
+    res = d.run("backup", "sync", "--move-store", new)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "that is the configured store's root, so nothing would move" in out, out
+    res = d.run("backup", "sync", "--move-store", old + "/")
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "the catalog has no backup row under that root" in out, out
+    known = _section(res.stdout, "--- The stores the catalog holds backup rows for:").splitlines()[1:]
+    assert known == [f"  filesystem {old} (store id {store_id}): 3 AVAILABLE"], res.stdout
+    assert "Took the maintenance claim" not in res.stdout, res.stdout
+
+    if d.catalog:
+        # A tombstone whose copied prefix holds a complete backup (its owner
+        # long dead: the move's wait passes over it). A FAILED row's text
+        # offers adopting the prefix; a DELETED row's says the backup was
+        # deleted and to remove the prefix.
+        for status, remedy in (
+            ("FAILED", "let backup sync adopt the prefix"),
+            ("DELETED", "The backup was deleted: remove that prefix from the configured root"),
+        ):
+            _age_row(d, b3, status)
+            tree = _tree(new)
+            res = d.run("backup", "sync", "--move-store", old)
+            out = res.stdout + res.stderr
+            assert res.returncode == 1, out
+            stopping = _section(res.stdout, "--- Stopping the move (no row is moved while any is listed here):")
+            assert (
+                f"  {b3} ({status}, account {ACCOUNT}): {status} whose prefix under the configured root holds a "
+                "verified manifest"
+            ) in stopping and "--forget-backup" in stopping and remedy in stopping, stopping
+            assert len(stopping.splitlines()) == 2, stopping
+            assert "--move-store moved no row: 1 row(s) stop the move" in out, out
+            assert _tree(new) == tree, "the refused move changed the copy"
+        _set_status(d, b3, "AVAILABLE")
+
+    # One data file of b2 left out of the copy.
+    data = os.path.join(_prefix(d, name, b2).replace(old, new, 1), "data")
+    dropped = sorted(os.listdir(data))[0]
+    aside = os.path.join(d.cwd, dropped)
+    os.rename(os.path.join(data, dropped), aside)
+    res = d.run("backup", "sync", "--move-store", old)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1, out
+    stopping = _section(res.stdout, "--- Stopping the move (no row is moved while any is listed here):")
+    assert stopping.splitlines()[1:] == [
+        f"  {b2} (AVAILABLE, account {ACCOUNT}): not a complete copy under the configured root: data file "
+        f"data/{dropped} is not in the store; copy the prefix again (or remove the row with --forget-backup)"
+    ], stopping
+    assert "--move-store moved no row: 1 row(s) stop the move" in out, out
+    assert "=== extenddb backup sync complete" not in res.stdout, "a stopped move ran the sync"
+    assert _rows(d) == {}
+
+    res = d.run("backup", "sync", "--forget-backup", b2)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert f"  {b2}: removed: the row (AVAILABLE) is gone, and no object was deleted" in res.stdout, out
+    assert f"The configured store's check passes (store id {store_id})" in res.stdout, out
+    assert "removed a backup row outright; no object was deleted" in out, "no audit line"
+
+    res = d.run("backup", "sync", "--move-store", old)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert (
+        "=== extenddb backup sync --move-store complete: 2 row(s) moved, 0 resolved, 0 deletion(s) finished, "
+        "0 row(s) stopping the move, 0 gone during the move, 0 left under the old root ==="
+    ) in res.stdout, out
+    moved = _section(res.stdout, "--- Moved (each row now names the configured store):").splitlines()[1:]
+    assert sorted(moved) == sorted([f"  {b1}", f"  {b3}"]), moved
+    assert out.count("moved a backup row to the configured store; no object was copied or deleted") == 2, out
+    skipped = _section(res.stdout, "--- Skipped (not adopted):")
+    assert f"  {_key_prefix(name, b2)}: " in skipped and f"data file data/{dropped} is not in the store" in skipped, skipped
+    assert _section(res.stdout, OTHER_STORES).splitlines()[1:] == ["  (none)"], res.stdout
+    assert _rows(d) == {b1: "AVAILABLE", b3: "AVAILABLE"}
+
+    os.rename(aside, os.path.join(data, dropped))
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _adopted_section(res.stdout).splitlines()[1:-1] == [f"  {b2}"], res.stdout
+
+    server, ddb, creds = _started(d, str(tmp_path / "serve-new.log"))
+    try:
+        details = ddb.describe_backup(BackupArn=b1)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "nightly", details
+        target = f"{name}-r"
+        ddb.restore_table_from_backup(TargetTableName=target, BackupArn=b1)
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+    finally:
+        server.stop()
+    assert _tree(old) == old_tree, "a command changed the old root"
+
+
+def _age_row(d: _Deployment, arn: str, status: str) -> None:
+    """Set the backup's row to `status` with its heartbeat and completion in
+    2000: a FAILED row whose owner is long dead and past every staleness
+    window, a DELETED tombstone past its retention."""
+    n = _catalog(
+        d,
+        "UPDATE backup_index SET status = ?, heartbeat_at = ?, completed_at = ? "
+        "WHERE account_id = ? AND backup_id = ?",
+        (status, "2000-01-01T00:00:00.000Z", "2000-01-01T00:00:00.000Z", ACCOUNT, _backup_id(arn)),
+    )
+    assert n == 1, f"{n} backup_index rows match {arn}"
+
+
+def test_another_roots_rows_are_left_alone_until_forget_store_drops_them(deployment, tmp_path):
+    """Four backups under root B; the configuration then names a new, empty
+    root A. (SQLite and PostgreSQL: the rows of B are edited at the catalog
+    to a FAILED row and a DELETED tombstone dated 2000, past every window,
+    and a DELETING row.) A server on A runs three reconciler cycles: B's
+    tree is byte-identical after them and B's rows keep their statuses.
+    Plain sync on A reports B's rows per status and names the DELETING row.
+    `--forget-store` refuses the configured root A; `--forget-store B`
+    removes every row of B outright (no tombstone: `backup list` on B is
+    empty), deletes nothing under B and logs each removal; a second run
+    finds no row there. Configured with B again, sync adopts the four
+    prefixes as AVAILABLE backups."""
+    d = deployment
+    b_root = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, a1 = _small_backed_up_table(ddb, "forget")
+        arns = [a1]
+        for label in ("two", "three", "four"):
+            arn = ddb.create_backup(TableName=name, BackupName=label)["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn, timeout=60)
+            arns.append(arn)
+    finally:
+        server.stop()
+    store_id = _store_id(b_root)
+    _, a2, a3, a4 = arns
+    if d.catalog:
+        _age_row(d, a2, "FAILED")
+        _set_status(d, a3, "DELETING")
+        _age_row(d, a4, "DELETED")
+        expected = {a1: "AVAILABLE", a2: "FAILED", a3: "DELETING", a4: "DELETED"}
+        counts = "1 AVAILABLE, 1 DELETING, 1 DELETED, 1 FAILED"
+    else:
+        expected = {arn: "AVAILABLE" for arn in arns}
+        counts = "4 AVAILABLE"
+    print(f"branch: {d.backend}, the rows of B: {counts}")
+    assert _rows(d) == expected
+    b_tree = _tree(b_root)
+
+    # A holds a copy of B's tree (without B's identity file), as before a
+    # move: a duty of A's server acting on B's rows would find the bytes.
+    a_root = os.path.join(d.cwd, "backups-a")
+    os.mkdir(a_root, 0o700)
+    a_root = os.path.realpath(a_root)
+    _copy_tree_into(b_root, a_root)
+    a_tree = _tree_without_identity(a_root)
+    _set_root(d, a_root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve-a.log"))
+    try:
+        time.sleep(3.5)  # three cycles at reconcile_interval_secs = 1
+        assert server.proc.poll() is None
+    finally:
+        server.stop()
+    assert _tree(b_root) == b_tree, "a reconciler on another root changed B"
+    assert _tree_without_identity(a_root) == a_tree, "a reconciler deleted the copy of another root's backups"
+    _set_root(d, b_root)
+    assert _rows(d) == expected, "a reconciler on another root changed B's rows"
+    _set_root(d, a_root)
+
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    others = _section(res.stdout, OTHER_STORES).splitlines()[1:]
+    assert others[0] == f"  filesystem {b_root} (store id {store_id}): {counts}", others
+    named = [line for line in others[1:] if line.startswith("    ")]
+    assert named == ([f"    DELETING {a3} (account {ACCOUNT})"] if d.catalog else []), others
+
+    res = d.run("backup", "sync", "--forget-store", a_root)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "that is the configured store's root, which --forget-store refuses" in out, out
+    res = d.run("backup", "sync", "--forget-store", b_root)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "=== extenddb backup sync --forget-store complete: 4 row(s) removed, 0 left ===" in res.stdout, out
+    # Beside servers the FAILED and DELETED removals wait out a deletion a
+    # server's reconciler may have started before the claim; on SQLite the
+    # serve lock excludes every server.
+    waited = "before the first removal of a FAILED or DELETED row" in res.stdout
+    assert waited == (d.catalog != "" and d.backend != "sqlite"), res.stdout
+    listed = _section(res.stdout, f"--- --forget-store {b_root} (filesystem): rows removed outright; no object is deleted:")
+    for arn in arns:
+        assert f"  {arn} (" in listed, listed
+    assert listed.count(": removed: the row (") == 4, listed
+    assert out.count("removed a backup row outright; no object was deleted") == 4, out
+    assert _tree(b_root) == b_tree, "--forget-store changed B"
+    res = d.run("backup", "sync", "--forget-store", b_root)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "the catalog has no backup row under that root" in out, out
+
+    _set_root(d, b_root)
+    assert _rows(d) == {}, "a tombstone was left"
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert sorted(_adopted_section(res.stdout).splitlines()[1:-1]) == sorted(f"  {arn}" for arn in arns), res.stdout
+    assert _rows(d) == {arn: "AVAILABLE" for arn in arns}
+
+
+def test_forget_backup_clears_a_store_whose_newest_manifests_are_gone(deployment, tmp_path):
+    """The state a catalog restored from a dump can be in: of its four
+    backups, the manifests of the two newest and of the oldest are gone from
+    the store. The store is unhealthy (the manifest probe of the newest
+    AVAILABLE row), so plain sync refuses, naming `--forget-backup`, and
+    `--prune-missing` refuses, with no row changed. `--forget-backup
+    <newest>` runs on the unhealthy store: it removes that row and prints
+    the store's check, which now names the next one and the command for it;
+    `--forget-backup <next>` removes that one and the check passes (beside
+    servers, the running server's `/health` turns healthy at its next
+    cycle). `--prune-missing` then removes the oldest row, and the second
+    one, whose manifest is there, stays. No object is deleted."""
+    d = deployment
+    root = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, c1 = _small_backed_up_table(ddb, "heal")
+        arns = [c1]
+        for label in ("second", "third", "fourth"):
+            arn = ddb.create_backup(TableName=name, BackupName=label)["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn, timeout=60)
+            arns.append(arn)
+        _, c2, c3, c4 = arns
+        if d.backend == "sqlite":
+            server.stop()
+        print(f"branch: {d.backend}, the server {'stopped' if d.backend == 'sqlite' else 'running'}")
+        store_id = _store_id(root)
+        for arn in (c1, c3, c4):
+            os.remove(os.path.join(_prefix(d, name, arn), "extenddb-manifest.json"))
+        tree = _tree(root)
+        before = _rows(d)
+        for args in (("sync",), ("sync", "--prune-missing")):
+            res = d.run("backup", *args)
+            out = res.stdout + res.stderr
+            assert res.returncode == 1 and "is unhealthy" in out and c4 in out, (args, out)
+            assert f"remove its row with extenddb backup sync --forget-backup {c4}," in out, (args, out)
+        assert _rows(d) == before
+
+        res = d.run("backup", "sync", "--forget-backup", c4)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"Store:  filesystem {root} (unhealthy: " in res.stdout, out
+        assert f"  {c4}: removed: the row (AVAILABLE) is gone, and no object was deleted" in res.stdout, out
+        assert "The configured store's check fails: " in res.stdout, out
+        assert f"run extenddb backup sync --forget-backup {c3}" in res.stdout, out
+
+        res = d.run("backup", "sync", "--forget-backup", c3)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"The configured store's check passes (store id {store_id})" in res.stdout, out
+        if d.backend != "sqlite":
+            health = _wait_health(
+                d.port,
+                lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy",
+                server=server,
+            )
+            print(f"the running server's store after the removals: {health['components']['backup_store']}")
+
+        res = d.run("backup", "sync", "--prune-missing")
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"  {c1}: removed: the row is gone, and no object was deleted" in res.stdout, out
+        assert _rows(d) == {c2: "AVAILABLE"}
+        assert _tree(root) == tree, "an object was deleted"
+    finally:
+        server.stop()
+
+
+def test_forget_backup_leaves_a_live_creating_row_and_an_in_catalog_backup(deployment, tmp_path):
+    """`--forget-backup` changes nothing for an ARN it cannot act on: (on
+    PostgreSQL, beside servers) a CREATING row of another root whose owner
+    beat just now is left with exit 1, and removed once its heartbeat is an
+    hour old; an ARN spelt with another region than the row's is refused,
+    naming the row's ARN; with `[backup.store] kind = "disabled"` (no store
+    configured, which both forget options accept) an earlier release's
+    in-catalog backup is reported as one with exit 1, the ARN after it in
+    the same command is not reached and keeps its row, and a second command
+    removes that row. The in-catalog backup is still AVAILABLE afterwards."""
+    d = deployment
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, e1 = _small_backed_up_table(ddb, "refuse")
+        e2 = ddb.create_backup(TableName=name, BackupName="two")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, e2, timeout=60)
+    finally:
+        server.stop()
+    print(f"branch: {d.backend}")
+    if d.backend == "postgres":
+        elsewhere = os.path.join(d.cwd, "elsewhere")
+        n = _catalog(
+            d,
+            "UPDATE backup_index SET store_root = ?, status = 'CREATING', completed_at = NULL, "
+            "heartbeat_at = {now} WHERE account_id = ? AND backup_id = ?",
+            (elsewhere, ACCOUNT, _backup_id(e2)),
+        )
+        assert n == 1
+        res = d.run("backup", "sync", "--forget-backup", e2)
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert f"  {e2}: left: the CREATING row has a live owner" in res.stdout, out
+        assert f"--forget-backup did not remove the row of {e2}" in out, out
+        assert _rows_present(d, [e2]) == 1
+        n = _catalog(
+            d,
+            "UPDATE backup_index SET heartbeat_at = {now} - interval '1 hour' WHERE account_id = ? AND backup_id = ?",
+            (ACCOUNT, _backup_id(e2)),
+        )
+        assert n == 1
+        res = d.run("backup", "sync", "--forget-backup", e2)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"  {e2}: removed: the row (CREATING) is gone, and no object was deleted" in res.stdout, out
+        assert _rows_present(d, [e2]) == 0
+
+    region = e1.split(":")[3]
+    respelt = e1.replace(f":{region}:", ":eu-west-3:", 1)
+    assert respelt != e1
+    res = d.run("backup", "sync", "--forget-backup", respelt)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1, out
+    assert f"  {respelt}: left: no row carries this ARN as written; the row of this backup is {e1}" in res.stdout, out
+    assert e1 in _rows(d)
+
+    _set_store_disabled(d)
+    server = _Server(d.config, str(tmp_path / "serve-disabled.log"))
+    try:
+        _wait_health(d.port, lambda h: True, server=server)
+        ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+        legacy = ddb.create_backup(TableName=name, BackupName="in-catalog")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, legacy, timeout=60)
+    finally:
+        server.stop()
+    res = d.run("backup", "sync", "--forget-backup", legacy, "--forget-backup", e1)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1, out
+    assert "Store:  none (" in res.stdout, out
+    assert f"  {legacy}: an in-catalog backup; --forget-backup changes nothing; DeleteBackup removes it" in res.stdout, out
+    assert f"  {e1}: not reached" in res.stdout, out
+    assert "=== extenddb backup sync --forget-backup stopped: 0 row(s) removed, 2 not ===" in res.stdout, out
+    if d.catalog:
+        assert _rows_present(d, [e1]) == 1
+    res = d.run("backup", "sync", "--forget-backup", e1)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert f"  {e1}: removed: the row (AVAILABLE) is gone, and no object was deleted" in res.stdout, out
+    if d.catalog:
+        assert _rows_present(d, [e1]) == 0
+
+    server = _Server(d.config, str(tmp_path / "serve-disabled2.log"))
+    try:
+        _wait_health(d.port, lambda h: True, server=server)
+        ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+        details = ddb.describe_backup(BackupArn=legacy)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE", details
+    finally:
+        server.stop()
+
+
+def test_a_create_backup_during_the_moves_wait_is_refused(deployment, tmp_path):
+    """Beside servers (PostgreSQL and MongoDB): a CREATING row of the old
+    root whose owner beat just now; the tree copied to a new root, a server
+    running on it. `--move-store <old root>` takes the claim and waits for
+    that job; while it waits, a CreateBackup on the server is refused with
+    LimitExceededException (the maintenance claim) and writes no row. Once
+    the job's row is AVAILABLE the move goes on and moves both rows, and the
+    server's next CreateBackup and a DescribeBackup of a moved backup
+    work."""
+    _sync_cell(deployment)
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
+    old = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, m1 = _small_backed_up_table(ddb, "race")
+        m2 = ddb.create_backup(TableName=name, BackupName="two")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, m2, timeout=60)
+    finally:
+        server.stop()
+    _set_status(d, m2, "CREATING")
+    new = os.path.join(d.cwd, "backups-new")
+    _copy_root(old, new)
+    new = os.path.realpath(new)
+    _set_root(d, new)
+    server, ddb, creds = _started(d, str(tmp_path / "serve-new.log"))
+    out_path = str(tmp_path / "move.out")
+    def every_row() -> int:
+        if d.backend == "mongodb":
+            return _mongosh(f"print(db.backup_index.countDocuments({{account_id: {json.dumps(ACCOUNT)}}}))")
+        return _catalog(d, "SELECT backup_id FROM backup_index WHERE account_id = ?", (ACCOUNT,))
+
+    try:
+        before = every_row()
+        assert before == 2, before
+        with open(out_path, "wb") as out:
+            moving = subprocess.Popen(
+                [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--move-store", old],
+                cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            )
+        try:
+            deadline = time.monotonic() + 60
+            while "Waiting for running jobs to finish" not in open(out_path).read():
+                assert moving.poll() is None, open(out_path).read()
+                assert time.monotonic() < deadline, open(out_path).read()
+                time.sleep(0.2)
+            assert _backup_id(m2) in open(out_path).read(), open(out_path).read()
+            with pytest.raises(ClientError) as refused:
+                ddb.create_backup(TableName=name, BackupName="during")
+            error = refused.value.response["Error"]
+            print(f"CreateBackup during the wait: {error}")
+            assert error["Code"] == "LimitExceededException", error
+            assert "maintenance claim" in error["Message"], error
+            assert every_row() == before, "the refused CreateBackup wrote a row"
+            _set_status(d, m2, "AVAILABLE")
+            assert moving.wait(timeout=60) == 0, open(out_path).read()
+        finally:
+            if moving.poll() is None:
+                moving.kill()
+                moving.wait(timeout=10)
+        text = open(out_path).read()
+        assert "=== extenddb backup sync --move-store complete: 2 row(s) moved" in text, text
+        assert _rows(d) == {m1: "AVAILABLE", m2: "AVAILABLE"}
+        after = ddb.create_backup(TableName=name, BackupName="after")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, after, timeout=60)
+        details = ddb.describe_backup(BackupArn=m1)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE", details
+    finally:
+        server.stop()
+
+
+def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
+    """Beside servers (PostgreSQL): server A stays on the old root, server B
+    runs on a new root holding a copy of the old tree and 2,000 junk
+    prefixes (so the move's sync lists for a while). A CreateBackup on A
+    passes its claim reads and is held in its CREATING insert by a trigger;
+    `--move-store <old root>` then moves the old row, and the trigger lets
+    the insert go once the move prints that it syncs the configured store.
+    The job's row lands under the old root during that sync: the closing
+    report names it under "Rows that landed under the old root during the
+    move" and the command exits 1, naming the remedy."""
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
+    if d.backend == "mongodb":
+        pytest.skip(
+            "on MongoDB this cell's catalog trigger is SQL, and the deployment's catalog is not "
+            "an SQL database"
+        )
+    old = os.path.realpath(d.root)
+    config_a = os.path.join(d.cwd, "extenddb-a.toml")
+    shutil.copy(d.config, config_a)
+    a = _Server(config_a, str(tmp_path / "serve-a.log"))
+    b = None
+    held = False
+    try:
+        _wait_health(
+            d.port,
+            lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy",
+            server=a,
+        )
+        creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
+        ddb_a = _client(d.port, creds)
+        name, moved = _small_backed_up_table(ddb_a, "landed")
+        new = os.path.join(d.cwd, "backups-new")
+        os.mkdir(new, 0o700)
+        new = os.path.realpath(new)
+        _set_root(d, new)
+        port_b = lh._find_free_port()
+        lh._patch_config_port(d.config, port_b)
+        b = _Server(d.config, str(tmp_path / "serve-b.log"))
+        _wait_health(
+            port_b,
+            lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy",
+            server=b,
+        )
+        _copy_tree_into(old, new)
+        for i in range(2000):
+            _private_file(
+                os.path.join(new, ACCOUNT, "junk", f"0179{i:010d}-0000abcd", "data", "000001.json.gz"),
+                b"x",
+            )
+        _catalog(d, "CREATE TABLE landed_release (x int)", ())
+        _catalog(
+            d,
+            "CREATE OR REPLACE FUNCTION landed_hold() RETURNS trigger AS $$ BEGIN "
+            "WHILE NOT EXISTS (SELECT 1 FROM landed_release) LOOP PERFORM pg_sleep(0.05); END LOOP; "
+            "RETURN NEW; END $$ LANGUAGE plpgsql",
+            (),
+        )
+        _catalog(
+            d,
+            "CREATE TRIGGER landed_hold BEFORE INSERT ON backup_index FOR EACH ROW "
+            "WHEN (NEW.status = 'CREATING') EXECUTE FUNCTION landed_hold()",
+            (),
+        )
+        held = True
+        result: dict = {}
+
+        def create() -> None:
+            try:
+                result["arn"] = _client(d.port, creds).create_backup(
+                    TableName=name, BackupName="late"
+                )["BackupDetails"]["BackupArn"]
+            except Exception as e:  # noqa: BLE001 - reported by the assertion below
+                result["error"] = repr(e)
+
+        creating = threading.Thread(target=create)
+        creating.start()
+        deadline = time.monotonic() + 30
+        while _catalog(
+            d,
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
+            "AND wait_event = 'PgSleep' AND query LIKE ?",
+            ("%backup_index%",),
+        ) == 0:
+            assert time.monotonic() < deadline, "the CreateBackup's insert is not held"
+            time.sleep(0.1)
+        out_path = str(tmp_path / "move.out")
+        with open(out_path, "wb") as out:
+            moving = subprocess.Popen(
+                [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--move-store", old],
+                cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            )
+        released = False
+        try:
+            deadline = time.monotonic() + 120
+            while moving.poll() is None:
+                assert time.monotonic() < deadline, open(out_path).read()[-4000:]
+                if not released and "syncing it." in open(out_path).read():
+                    _catalog(d, "INSERT INTO landed_release VALUES (1)", ())
+                    released = True
+                time.sleep(0.02)
+            rc = moving.wait(timeout=60)
+        finally:
+            if moving.poll() is None:
+                moving.kill()
+                moving.wait(timeout=10)
+            if not released:
+                _catalog(d, "INSERT INTO landed_release VALUES (1)", ())
+        creating.join(timeout=60)
+        text = open(out_path).read()
+        late = result.get("arn")
+        assert late is not None, result
+        assert released, "the move's sync line was printed before it ended"
+        assert f"Moved (each row now names the configured store):\n  {moved}" in text, text[-4000:]
+        assert "--- Rows that landed under the old root during the move:\n  " + late in text, text[-4000:]
+        assert rc == 1, text[-4000:]
+        assert "a row landed under the old root during the move (1 listed above)" in text, text[-4000:]
+    finally:
+        if held:
+            _catalog(d, "DROP TRIGGER IF EXISTS landed_hold ON backup_index", ())
+            _catalog(d, "DROP FUNCTION IF EXISTS landed_hold()", ())
+            _catalog(d, "DROP TABLE IF EXISTS landed_release", ())
+        a.stop()
+        if b is not None:
+            b.stop()
+
+
+def test_the_manuals_move_procedure_beside_a_running_server(deployment, tmp_path):
+    """The backup manual's "Moving a store to a new root" in its order,
+    beside a running server (PostgreSQL, MongoDB): one backup under the old
+    root; the configuration pointed at a new, empty root and the server
+    restarted (step 1), which gives the new root its own identity file; a
+    CreateBackup there before the copy (the server keeps serving); the old
+    tree copied in without its `extenddb-store.json` (step 2); then
+    `--move-store` (step 3), which moves the old row and keeps the new one.
+    The running server's store stays healthy throughout, it restores the
+    moved backup, and its next CreateBackup is AVAILABLE."""
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
+    old = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, b1 = _small_backed_up_table(ddb, "proc")
+    finally:
+        server.stop()
+    old_tree = _tree(old)
+    new = os.path.join(d.cwd, "backups-new")
+    os.mkdir(new, 0o700)
+    new = os.path.realpath(new)
+    _set_root(d, new)
+    healthy = lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy"  # noqa: E731
+    server, ddb, creds = _started(d, str(tmp_path / "serve-new.log"))
+    try:
+        _wait_health(d.port, healthy, server=server)
+        new_id = _store_id(new)
+        assert new_id != _store_id(old)
+        b2 = ddb.create_backup(TableName=name, BackupName="between")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b2, timeout=60)
+        _copy_tree_into(old, new)
+        assert _store_id(new) == new_id, "the copy brought the old identity file"
+        res = d.run("backup", "sync", "--move-store", old)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert (
+            "=== extenddb backup sync --move-store complete: 1 row(s) moved, 0 resolved, 0 deletion(s) "
+            "finished, 0 row(s) stopping the move, 0 gone during the move, 0 left under the old root ==="
+        ) in res.stdout, out
+        time.sleep(2)  # two cycles' checks of the running server
+        _wait_health(d.port, healthy, server=server)
+        target = f"{name}-r"
+        ddb.restore_table_from_backup(TargetTableName=target, BackupArn=b1)
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+        b3 = ddb.create_backup(TableName=name, BackupName="after")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b3, timeout=60)
+    finally:
+        server.stop()
+    assert _rows(d) == {b1: "AVAILABLE", b2: "AVAILABLE", b3: "AVAILABLE"}
+    res = d.run("backup", "list")
+    assert res.stdout.count(f"store_id={new_id}") == 3, res.stdout
+    assert _tree(old) == old_tree, "the move changed the old root"
+
+
+def test_a_copied_identity_file_is_undone_by_the_manuals_remedy(deployment, tmp_path):
+    """The manual's way out when `extenddb-store.json` was copied with the
+    tree over the new root's own (PostgreSQL, MongoDB): one backup under the
+    old root, the server restarted on the new root and a CreateBackup there,
+    then the whole tree copied, identity file included. The running server's
+    store turns unhealthy (an identity mismatch) and `--move-store` refuses
+    (the copied file's id against the row the new root's backup carries).
+    `extenddb backup list` names that backup under the new root's first id;
+    `--forget-backup` of it removes the row and deletes nothing; the move
+    then moves the old row and its sync adopts the forgotten backup again
+    under the copied file's id. After a restart every server's store is
+    healthy, both backups restore or describe, and a new CreateBackup is
+    AVAILABLE."""
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
+    old = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, b1 = _small_backed_up_table(ddb, "copied")
+    finally:
+        server.stop()
+    old_id = _store_id(old)
+    new = os.path.join(d.cwd, "backups-new")
+    os.mkdir(new, 0o700)
+    new = os.path.realpath(new)
+    _set_root(d, new)
+    status = lambda h: h.get("components", {}).get("backup_store", {}).get("status")  # noqa: E731
+    server, ddb, creds = _started(d, str(tmp_path / "serve-new.log"))
+    try:
+        _wait_health(d.port, lambda h: status(h) == "healthy", server=server)
+        first_id = _store_id(new)
+        b2 = ddb.create_backup(TableName=name, BackupName="between")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b2, timeout=60)
+        _copy_tree_into(old, new, identity=True)
+        assert _store_id(new) == old_id
+        health = _wait_health(d.port, lambda h: status(h) == "unhealthy", server=server)
+        print(f"the running server's store after the copy: {health['components']['backup_store']}")
+        res = d.run("backup", "sync", "--move-store", old)
+        out = res.stdout + res.stderr
+        assert res.returncode == 1 and "is unhealthy" in out and first_id in out, out
+        res = d.run("backup", "list")
+        assert f"{b2}  store_root={new} store_id={first_id}" in res.stdout, res.stdout
+        tree = _tree(new)
+        res = d.run("backup", "sync", "--forget-backup", b2)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert f"  {b2}: removed: the row (AVAILABLE) is gone, and no object was deleted" in res.stdout, out
+        assert f"The configured store's check passes (store id {old_id})" in res.stdout, out
+        assert _tree(new) == tree, "--forget-backup changed the root"
+        res = d.run("backup", "sync", "--move-store", old)
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert "=== extenddb backup sync --move-store complete: 1 row(s) moved" in res.stdout, out
+        assert _adopted_section(res.stdout).splitlines()[1:-1] == [f"  {b2}"], res.stdout
+    finally:
+        server.stop()
+    server, ddb, creds = _started(d, str(tmp_path / "serve-restarted.log"))
+    try:
+        _wait_health(d.port, lambda h: status(h) == "healthy", server=server)
+        target = f"{name}-r"
+        ddb.restore_table_from_backup(TargetTableName=target, BackupArn=b1)
+        _wait_active(ddb, target)
+        assert _count(ddb, target) == HAND_BUILT_ITEMS
+        details = ddb.describe_backup(BackupArn=b2)["BackupDescription"]["BackupDetails"]
+        assert details["BackupStatus"] == "AVAILABLE", details
+        b3 = ddb.create_backup(TableName=name, BackupName="after")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b3, timeout=60)
+    finally:
+        server.stop()
+    res = d.run("backup", "list")
+    assert res.stdout.count(f"store_id={old_id}") == 3, res.stdout
+
+
+def test_forget_backup_checks_its_arns_first_goes_past_removed_ones_and_writes_no_store(deployment, tmp_path):
+    """`--forget-backup` refuses a string that is no ARN before it takes the
+    claim, with nothing changed; given again after a run that removed its
+    first ARN, it says that ARN carries no row and removes the next, exit 0.
+    With the root replaced by an empty directory (a volume not mounted under
+    the rows), it refuses the root's last row, exit 1, naming the unmounted
+    volume, and writes nothing to the root; run again, the same, where a
+    removal would have left a root with no rows that a server's check gives
+    a new identity file."""
+    d = deployment
+    root = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, a = _small_backed_up_table(ddb, "again")
+        arns = [a]
+        for label in ("bbb", "ccc"):
+            arn = ddb.create_backup(TableName=name, BackupName=label)["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn, timeout=60)
+            arns.append(arn)
+    finally:
+        server.stop()
+    _, b, c = arns
+
+    for given in ("", "not-an-arn"):
+        res = d.run("backup", "sync", "--forget-backup", given, "--forget-backup", a)
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert f"  {given!r}: not a backup ARN" in res.stdout.replace('"', "'"), out
+        assert "nothing was changed" in out, out
+        assert "Took the maintenance claim" not in res.stdout, out
+    assert set(_rows(d)) == set(arns)
+
+    res = d.run("backup", "sync", "--forget-backup", a)
+    assert res.returncode == 0, res.stdout + res.stderr
+    res = d.run("backup", "sync", "--forget-backup", a, "--forget-backup", b)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert f"  {a}: no row carries this ARN; nothing to remove" in res.stdout, out
+    assert f"  {b}: removed: the row (AVAILABLE) is gone, and no object was deleted" in res.stdout, out
+    assert "=== extenddb backup sync --forget-backup complete: 1 row(s) removed, 0 not ===" in res.stdout, out
+    assert set(_rows(d)) == {c}
+
+    aside = os.path.join(d.cwd, "aside")
+    os.rename(root, aside)
+    os.mkdir(root, 0o700)
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "has no extenddb-store.json but the catalog has rows for it" in out, out
+    for run in ("first", "again"):
+        res = d.run("backup", "sync", "--forget-backup", c)
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, f"{run}: {out}"
+        assert (
+            f"  {c}: left: the configured root has no extenddb-store.json while the catalog holds rows for "
+            "it (a volume that is not mounted?); mount it, or point [backup.store] at the root that holds "
+            "these backups, then run again"
+        ) in res.stdout, f"{run}: {out}"
+        assert (
+            f"The configured store's check was not run: the root {root} had no extenddb-store.json when the "
+            "command opened it"
+        ) in res.stdout, f"{run}: {out}"
+        assert os.listdir(root) == [], f"{run}: the forget wrote to the empty root"
+        assert set(_rows(d)) == {c}, run
+
+
+@pytest.mark.parametrize("shape", ["renamed away", "dangling link"])
+def test_forget_refuses_the_rows_of_a_missing_default_root(deployment, tmp_path, shape):
+    """SQLite's defaulted root missing while the catalog holds rows for it:
+    renamed away, or a symbolic link to a volume directory that is gone
+    (the rows carry the link's target). `--forget-backup` refuses the root's
+    row as an unmounted root's, exit 1, and says the root is missing with
+    rows rather than that no server has run with the database file;
+    `--forget-store` of the root refuses it as the configured root. Nothing
+    is created at the root's path, and the row is kept."""
+    d = deployment
+    if d.backend != "sqlite":
+        pytest.skip("the defaulted root is SQLite's")
+    root = d.root
+    if shape == "dangling link":
+        volume = os.path.join(d.cwd, "volume")
+        os.mkdir(volume, 0o700)
+        label = os.path.join(volume, "backups")
+        os.mkdir(label, 0o700)
+        os.symlink(label, root)
+    else:
+        label = root
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        _, arn = _small_backed_up_table(ddb, "gone")
+    finally:
+        server.stop()
+    if shape == "dangling link":
+        os.rename(volume, os.path.join(d.cwd, "volume-gone"))
+        assert os.path.islink(root) and not os.path.exists(root)
+    else:
+        os.rename(root, os.path.join(d.cwd, "aside"))
+    res = d.run("backup", "sync", "--forget-backup", arn)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1, out
+    assert f"the default root {label} is missing while the catalog holds rows for it" in res.stdout, out
+    assert "no server has run with this database file" not in out, out
+    assert (
+        f"  {arn}: left: the configured root has no extenddb-store.json while the catalog holds rows for it"
+    ) in res.stdout, out
+    res = d.run("backup", "sync", "--forget-store", label)
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "that is the configured store's root" in out, out
+    assert not os.path.exists(root), "the forget created the default root"
+    assert _rows_present(d, [arn]) == 1, "the row is kept"
+
+
+def test_the_forget_options_write_nothing_to_a_fresh_root(deployment, tmp_path):
+    """A configured root with no identity file and no rows (a fresh root):
+    `--forget-backup` of an ARN no row carries, and `--forget-store` of a
+    root with no rows, open the store without writing to it; the root is
+    still empty afterwards, where the writing check of plain sync would
+    have created its identity file."""
+    d = deployment
+    fresh = os.path.join(d.cwd, "fresh-root")
+    os.mkdir(fresh, 0o700)
+    fresh = os.path.realpath(fresh)
+    _set_root(d, fresh)
+    absent = f"arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/x/backup/01700000000000-deadbeef"
+    res = d.run("backup", "sync", "--forget-backup", absent)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert f"  {absent}: no row carries this ARN; nothing to remove" in res.stdout, out
+    assert (
+        f"The configured store's check was not run: the root {fresh} had no extenddb-store.json when the "
+        "command opened it"
+    ) in res.stdout, out
+    assert os.listdir(fresh) == [], "the forget wrote to the fresh root"
+    res = d.run("backup", "sync", "--forget-store", os.path.join(d.cwd, "nowhere"))
+    out = res.stdout + res.stderr
+    assert res.returncode == 1 and "the catalog has no backup row under that root" in out, out
+    assert os.listdir(fresh) == [], "the forget wrote to the fresh root"
+
+
+def _store_status(health: dict) -> "str | None":
+    """The backup store component's status in a /health answer."""
+    return health.get("components", {}).get("backup_store", {}).get("status")
+
+
+def test_forget_backup_beside_a_server_keeps_the_rows_of_an_unmounted_root(deployment, tmp_path):
+    """Beside a running server: the root replaced by an empty directory (a
+    volume not mounted under the rows), the server reports the identity file
+    missing. `--forget-backup` of the root's last row refuses it, exit 1,
+    and writes nothing; the server's checks then find the rows still there,
+    give the root no identity file and keep the store unhealthy, so no
+    CreateBackup lands on the empty mount point."""
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("beside a server")
+    root = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, a = _small_backed_up_table(ddb, "unm")
+        os.rename(root, os.path.join(d.cwd, "aside"))
+        os.mkdir(root, 0o700)
+        _wait_health(d.port, lambda h: _store_status(h) == "unhealthy", server=server)
+        res = d.run("backup", "sync", "--forget-backup", a)
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert f"  {a}: left: the configured root has no extenddb-store.json" in res.stdout, out
+        assert os.listdir(root) == [], out
+        time.sleep(4)
+        assert os.listdir(root) == [], "a server's check wrote to the empty mount point"
+        assert _store_status(_health(d.port)) == "unhealthy"
+        assert set(_rows(d)) == {a}
+    finally:
+        server.stop()
+
+
+def test_forget_backup_finishes_a_deleting_row_of_the_configured_store(deployment, tmp_path):
+    """A DELETING row of the configured store (its DeleteBackup's state
+    before the prefix is gone), no server running: `--forget-backup` deletes
+    the prefix first, says so, and removes the row; the next plain sync
+    adopts nothing. On SQLite the command's own pass over what the stopped
+    server left may finish the deletion first, and the line says so too."""
+    d = deployment
+    if not d.catalog:
+        pytest.skip("edits the catalog")
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, a = _small_backed_up_table(ddb, "deling")
+    finally:
+        server.stop()
+    _set_status(d, a, "DELETING")
+    prefix = _prefix(d, name, a)
+    assert os.listdir(prefix)
+    res = d.run("backup", "sync", "--forget-backup", a)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert (
+        f"  {a}: removed: the row is gone, and this command deleted its objects first (the row was "
+        "DELETING in the configured store: the deletion its DeleteBackup asked for)"
+    ) in res.stdout, out
+    assert "no object was deleted" not in res.stdout, out
+    assert not os.path.isdir(prefix) or os.listdir(prefix) == [], os.listdir(prefix)
+    assert a not in _rows(d)
+    res = d.run("backup", "sync")
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "=== extenddb backup sync complete: 0 backup(s) adopted" in res.stdout, out
+    assert a not in _rows(d)
+
+
+def test_a_maintenance_command_waits_out_a_deleting_row_and_a_dead_restore(deployment, tmp_path):
+    """Beside a server (PostgreSQL): a DELETING row and a RUNNING restore
+    record whose owner is long dead (its target CREATING, both edited at the
+    catalog with the server stopped). `--forget-backup` of the restored
+    backup takes the claim and waits for the restore; a server started
+    while it waits runs its held-claim cycle, which finishes the DELETING
+    row's deletion and fails the dead restore and removes its target, and
+    the command then removes the backup's row (no longer in use), exit 0."""
+    d = deployment
+    if d.backend != "postgres":
+        pytest.skip("beside servers, the restore record edited at the PostgreSQL catalog")
+    root = os.path.realpath(d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name, b1 = _small_backed_up_table(ddb, "dead")
+        b2 = ddb.create_backup(TableName=name, BackupName="two")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, b2, timeout=60)
+        target = f"{name}-r"
+        ddb.restore_table_from_backup(TargetTableName=target, BackupArn=b1)
+        _wait_active(ddb, target)
+    finally:
+        server.stop()
+    n = _catalog(
+        d,
+        "UPDATE tables SET table_status = 'CREATING' WHERE account_id = ? AND table_name = ?",
+        (ACCOUNT, target),
+    )
+    assert n == 1
+    n = _catalog(
+        d,
+        "UPDATE table_restores SET status = 'RUNNING', file_index = NULL, items_applied = NULL, "
+        "failure_reason = NULL, completed_at = NULL, heartbeat_at = '1970-01-01T00:00:00Z' "
+        "WHERE table_id = (SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?)",
+        (ACCOUNT, target),
+    )
+    assert n == 1
+    _set_status(d, b2, "DELETING")
+    out_path = str(tmp_path / "forget.out")
+    with open(out_path, "wb") as out:
+        forgetting = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--forget-backup", b1],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    server = None
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(out_path).read():
+            assert forgetting.poll() is None, open(out_path).read()
+            assert time.monotonic() < deadline, open(out_path).read()
+            time.sleep(0.2)
+        assert target in open(out_path).read(), open(out_path).read()
+        server, ddb, creds = _started(d, str(tmp_path / "serve-held.log"))
+        assert forgetting.wait(timeout=120) == 0, open(out_path).read()
+        text = open(out_path).read()
+        assert f"  {b1}: removed: the row (AVAILABLE) is gone, and no object was deleted" in text, text
+        with pytest.raises(ClientError) as gone:
+            ddb.describe_table(TableName=target)
+        assert gone.value.response["Error"]["Code"] == "ResourceNotFoundException", gone.value.response
+        log = server.log_text()
+        assert "a maintenance claim is held" in log, log[-4000:]
+    finally:
+        if forgetting.poll() is None:
+            forgetting.kill()
+            forgetting.wait(timeout=10)
+        if server:
+            server.stop()
+    assert _rows(d) == {b2: "DELETED"}
+    assert not os.path.exists(_prefix(d, name, b2)), "the DELETING row's deletion was not finished"
+    assert os.path.isdir(root)

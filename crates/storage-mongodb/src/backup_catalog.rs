@@ -45,7 +45,7 @@ use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
     JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
+    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -69,6 +69,10 @@ pub(crate) const BACKUP_MAINTENANCE: &str = "backup_maintenance";
 pub(crate) const CATALOG_ID: &str = "catalog_id";
 /// The counter a row-locking transaction `$inc`s so two of them conflict.
 pub(crate) const LOCK_SEQ: &str = "lock_seq";
+/// Keys per `update_many` of `rewrite_store`: one statement's `$or` stays
+/// far below the 16 MiB command bound, and a root of any size is a few
+/// statements.
+pub(crate) const REWRITE_CHUNK_KEYS: usize = 1_000;
 
 /// The restore job record, a subdocument of a restore target's `tables`
 /// document, with the field names the job record has on every backend.
@@ -946,6 +950,30 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        // The `{store_kind, store_root}` prefix of the store index; the
+        // status is a residual filter.
+        rows_stream(async move {
+            let mut filter = doc! { "store_kind": store_kind.as_str(), "store_root": store_root };
+            if let Some(status) = status {
+                filter.insert("status", status.as_str());
+            }
+            self.backup_index()
+                .find(filter)
+                .sort(listing_sort())
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)
+        })
+    }
+
     fn newest_available_backup_row<'a>(
         &'a self,
         store: &'a StoreIdentity,
@@ -1035,6 +1063,57 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            // One `update_many` per chunk, no transaction: one over every key
+            // of a large root would meet the transaction size and lifetime
+            // limits. Each document's update is atomic. This update and a
+            // transaction that writes the document (a DeleteBackup's
+            // `start_backup_delete_tx`, a restore's `claim_restore_tx`) are
+            // serialized: when the update commits after the transaction's
+            // snapshot and before its write, the transaction conflicts and
+            // re-runs, reading the row as the update left it; when the
+            // transaction wrote the document first, the update waits for it
+            // to end and then applies its filter to the committed document.
+            // A registration keeps the store its server is configured with.
+            // The `$inc` of `lock_seq` is a convention, not what serializes
+            // them: a write that moves the row also advances its lock
+            // counter.
+            let mut rewritten = 0;
+            for chunk in keys.chunks(REWRITE_CHUNK_KEYS) {
+                let any_key: Vec<Document> = chunk.iter().map(key_filter).collect();
+                let result = self
+                    .backup_index()
+                    .update_many(
+                        doc! {
+                            "$or": any_key,
+                            "store_kind": from_kind.as_str(),
+                            "store_root": from_root,
+                            "status": { "$ne": BackupStatus::Creating.as_str() },
+                        },
+                        doc! {
+                            "$set": {
+                                "store_kind": to.store_kind.as_str(),
+                                "store_root": &to.store_root,
+                                "store_id": &to.store_id,
+                            },
+                            "$inc": { LOCK_SEQ: 1_i64 },
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                rewritten += result.modified_count;
+            }
+            Ok(rewritten)
+        })
+    }
+
     fn set_backup_deleted<'a>(
         &'a self,
         key: &'a BackupKey,
@@ -1060,6 +1139,8 @@ impl BackupCatalog for MongoEngine {
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let mut filter = key_filter(key);
@@ -1067,6 +1148,8 @@ impl BackupCatalog for MongoEngine {
                 "status",
                 doc! { "$in": [BackupStatus::Deleted.as_str(), BackupStatus::Failed.as_str()] },
             );
+            filter.insert("store_kind", store_kind.as_str());
+            filter.insert("store_root", store_root);
             let result = self
                 .backup_index()
                 .delete_one(filter)
@@ -1416,6 +1499,49 @@ impl BackupCatalog for MongoEngine {
                 .collect();
             ids.sort();
             Ok(ids)
+        })
+    }
+
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        Box::pin(async move {
+            let groups: Vec<Document> = self
+                .backup_index()
+                .aggregate([doc! { "$group": {
+                    "_id": {
+                        "store_kind": "$store_kind",
+                        "store_root": "$store_root",
+                        "store_id": "$store_id",
+                        "status": "$status",
+                    },
+                    "rows": { "$sum": 1_i64 },
+                } }])
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)?;
+            let mut counts = Vec::with_capacity(groups.len());
+            for group in groups {
+                let id = group.get_document("_id").map_err(internal)?;
+                let rows = match group.get("rows") {
+                    Some(Bson::Int64(n)) => *n,
+                    Some(Bson::Int32(n)) => i64::from(*n),
+                    other => {
+                        return Err(StorageError::Internal(format!(
+                            "a root summary count is not an integer: {other:?}"
+                        )));
+                    }
+                };
+                counts.push(StoreRootCount::from_columns(
+                    &required_str(id, "store_kind")?,
+                    required_str(id, "store_root")?,
+                    required_str(id, "store_id")?,
+                    &required_str(id, "status")?,
+                    rows,
+                )?);
+            }
+            StoreRootCount::sort(&mut counts);
+            Ok(counts)
         })
     }
 

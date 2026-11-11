@@ -93,6 +93,16 @@
 //! them. A later sync where the bytes are adopts them again. Without
 //! `--prune-missing` such rows stay AVAILABLE.
 //!
+//! [`sync`] neither lists nor changes the rows of the other stores (another
+//! kind or root, or the configured root under another store id): a prefix
+//! whose backup id such a row holds meets it at the read under the ARN's
+//! spellings or at the insert, and is skipped naming that row's status,
+//! kind, root and store id. The command reports
+//! those rows as a whole once a listing has reached its end
+//! ([`super::store_maintenance::other_stores`]: the rows per status of
+//! each other store, and each CREATING and DELETING row by ARN), with the
+//! two options that act on them, `--move-store` and `--forget-store`.
+//!
 //! The command takes the maintenance claim for every sync on PostgreSQL,
 //! MongoDB and Cassandra, where it runs beside servers (design 4(f)), and
 //! runs under the serve lock on SQLite; so no purge runs between its row
@@ -151,7 +161,7 @@ use extenddb_core::backup_format::{
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_storage::BackupCatalog;
 use extenddb_storage::backup_catalog::{
-    BackupKey, BackupRow, BackupStatus, ForgetRow, StoreIdentity, StoreKind, UNOWNED_GENERATION,
+    BackupKey, BackupRow, BackupStatus, ForgetRow, StoreIdentity, UNOWNED_GENERATION,
     is_backup_not_found,
 };
 use extenddb_storage::error::StorageError;
@@ -1032,22 +1042,33 @@ pub async fn startup_sync<S: BackupCatalog + ?Sized>(
             claim: None,
         },
     );
+    // A store call abandoned at its bound or dropped with the run (a
+    // filesystem call, whose thread still runs) is marked in flight under
+    // its caller's name: the run's own call, or another caller's (a
+    // deletion's, whose call held the slot the run waited for). Until it
+    // returns, each cycle's check is refused and the store is unreachable,
+    // so the sync runs again on the first cycle after it; the clause names
+    // the caller as the refusal does. A run cut in a catalog call, or after
+    // its last store call returned, marks nothing, and with no other
+    // caller's call in flight the next cycle's check runs as usual.
+    let in_flight = || {
+        store
+            .call_in_flight_caller()
+            .map_or_else(String::new, |caller| {
+                format!(
+                    " (once the abandoned {caller} has returned; until then the store is \
+                     unreachable)"
+                )
+            })
+    };
     let Ok(outcome) = tokio::time::timeout(STARTUP_SYNC_TIMEOUT, run).await else {
-        // On a filesystem store the abandoned listing's walk still runs:
-        // until it returns, each cycle's check is refused and the store is
-        // unreachable, so the sync runs again on the first cycle after it.
         tracing::warn!(
             "backup store ({}) startup sync of the in-memory catalog did not finish within {} \
              s; the backups it adopted keep their rows, and a later reconciler cycle runs it \
              again from the first key of the root{}",
             store.kind,
             STARTUP_SYNC_TIMEOUT.as_secs(),
-            if store.kind == StoreKind::Filesystem {
-                " (once the abandoned listing of the root has returned; until then the store is \
-                 unreachable)"
-            } else {
-                ""
-            }
+            in_flight()
         );
         return None;
     };
@@ -1102,8 +1123,9 @@ pub async fn startup_sync<S: BackupCatalog + ?Sized>(
         }
         Err(e) => tracing::warn!(
             "backup store ({}) startup sync of the in-memory catalog stopped: {e}; a later \
-             reconciler cycle runs it again",
-            store.kind
+             reconciler cycle runs it again{}",
+            store.kind,
+            in_flight()
         ),
     }
     Some(outcome)

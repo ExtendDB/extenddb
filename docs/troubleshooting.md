@@ -124,6 +124,26 @@ The error intentionally does not name the specific file to avoid leaking filesys
    ```
 4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
 
+### TLS private key readable by other users
+
+`WARNING: TLS private key (server.tls.key_path) had permissions <mode>, which let other users read it. …`
+
+**Cause:** `extenddb serve`, or `extenddb init` when it keeps an existing certificate, found the TLS private key readable by group or other users. An older `init` that stopped before it set the key's mode left it that way, as does a key copied in with the default umask. The warning names the setting rather than the file, as the TLS load error above does, and goes to stderr: the terminal that ran the command, or the log stream under `--foreground`.
+
+What the server did depends on the rest of the message:
+
+- **`It is now 0600: group and other access were removed`**: the server could change the key's mode, because it owns the key or runs as root, and narrowed it. If another service read the key through its group, it can no longer read it. If `server.tls.key_path` is a symlink, the file it points to was changed.
+- **`Another user (uid <n>) owns it`**: the key is readable by every user, and the server cannot change it. What its owner should run depends on the key's group, which the message names:
+  - **`this server reads it through its group`**: remove other access with `chmod o-rwx <file>`. The group's access stays, and the server reads the key through it.
+  - **`this server is not in its group`**: the server reads the key through the access every user has, so `chmod o-rwx` alone would leave it unable to load the key. Give the key to the server's group first, then remove other access: `chgrp <server gid> <file>`, then `chmod 640 <file>`.
+
+  A key another user owns that only its owner and group can read is a supported layout and gets no warning.
+- **`it is on a read-only filesystem`**: set the mode where the file is provided. For a Kubernetes Secret volume, use `defaultMode: 0440` with the pod's `fsGroup` set to the server's group (gid 10001 in the official image). Secret volume files are owned by root, so `defaultMode: 0400` without a matching group would leave the key unreadable to a server that does not run as root.
+- **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
+- **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
+
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
+
 ### `Config file <path> has permissions <mode>, which is too open.`
 
 **Cause:** The config file has group or world-readable permissions. Since the config file may contain the encryption key for credential storage, it must be restricted to owner-only access.
