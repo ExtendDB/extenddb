@@ -7,7 +7,8 @@ A stream change beside a billing, throughput or index change; ListStreams
 paging over a table with two streams; GetShardIterator on an unknown shard or
 stream; a table created with StreamSpecification {StreamEnabled: false}.
 Companion to test_stream_disable.py. One module fixture runs the measured
-sequence once; each test asserts one row.
+sequence once; each test asserts one row. F5, measured on 2026-11-11, is one
+data table run against a provisioned table of its own.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from helpers import unique_name, wait_for_active, wait_for_deleted
+from warm_throughput_helpers import _wait_all_active
 
 KEYS_ONLY = {"StreamEnabled": True, "StreamViewType": "KEYS_ONLY"}
 NEW_IMAGE = {"StreamEnabled": True, "StreamViewType": "NEW_IMAGE"}
@@ -327,3 +329,117 @@ def test_enabling_it_creates_the_first_stream(run):
     after = run["off_after_enable"]
     assert after["StreamSpecification"] == KEYS_ONLY
     assert after["LatestStreamArn"] == desc["LatestStreamArn"]
+
+
+# F5: a stream change beside an index or table class change, measured on
+# 2026-11-11 on a PROVISIONED 1/1 table with one GSI (1/1) and a KEYS_ONLY
+# stream. Each row brings the stream to the state it was measured in, sends
+# the request, and checks the answer and the table once it is ACTIVE.
+
+TABLE_CLASS_ONLY = INVALID + "TableClass modification must be the only operation in the request"
+WARM_THROUGHPUT_ONLY = INVALID + "WarmThroughput must be the only operation in the request"
+INDEX_CHANGE = INVALID + "You cannot create or delete index while changing stream status"
+NO_INDEX_THROUGHPUT = pytest.mark.xfail(
+    not ON_SERVICE,
+    reason="ExtendDB does not change an index's ProvisionedThroughput "
+    "(UpdateGlobalSecondaryIndex is not yet supported)",
+)
+
+# (stream enabled before, StreamSpecification sent, change beside it, refusal
+# or None when the service accepts the request and applies both changes)
+COMPANION_ROWS = [
+    pytest.param(True, DISABLED, "index delete", INDEX_CHANGE, id="index-delete"),
+    pytest.param(True, DISABLED, "table class", TABLE_CLASS_ONLY, id="table-class"),
+    pytest.param(
+        False, DISABLED, "table class", TABLE_CLASS_ONLY, id="table-class-already-disabled"
+    ),
+    pytest.param(True, DISABLED, "index warm", WARM_THROUGHPUT_ONLY, id="index-warm-disable"),
+    pytest.param(False, NEW_IMAGE, "index warm", WARM_THROUGHPUT_ONLY, id="index-warm-enable"),
+    pytest.param(
+        True, DISABLED, "index units", None, id="index-units-disable", marks=NO_INDEX_THROUGHPUT
+    ),
+    pytest.param(
+        False, NEW_IMAGE, "index units", None, id="index-units-enable", marks=NO_INDEX_THROUGHPUT
+    ),
+]
+
+
+@pytest.fixture(scope="module")
+def provisioned(dynamodb_client):
+    ddb = dynamodb_client
+    name = unique_name("f515")
+    units = {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+    ddb.create_table(
+        TableName=name,
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
+        ],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        BillingMode="PROVISIONED",
+        ProvisionedThroughput=units,
+        GlobalSecondaryIndexes=[{
+            "IndexName": "gsi",
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "KEYS_ONLY"},
+            "ProvisionedThroughput": units,
+        }],
+        StreamSpecification=KEYS_ONLY,
+    )
+    _wait_all_active(ddb, name)
+    try:
+        yield name
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+            wait_for_deleted(ddb, name)
+        except ClientError:
+            pass
+
+
+def _stream_enabled(table: dict) -> bool:
+    return table.get("StreamSpecification", {}).get("StreamEnabled", False)
+
+
+def _index_units(table: dict) -> list:
+    return [(g["IndexName"], g["ProvisionedThroughput"]) for g in table["GlobalSecondaryIndexes"]]
+
+
+def _change(change: str, gsi: dict) -> dict:
+    """The request members of `change`, from the index as it is now: the
+    current WarmThroughput, or one more read and write unit."""
+    if change == "table class":
+        return {"TableClass": "STANDARD_INFREQUENT_ACCESS"}
+    if change == "index delete":
+        return {"GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "gsi"}}]}
+    if change == "index warm":
+        warm = gsi["WarmThroughput"]
+        update = {"WarmThroughput": {k: warm[k] for k in ("ReadUnitsPerSecond", "WriteUnitsPerSecond")}}
+    else:
+        n = gsi["ProvisionedThroughput"]["ReadCapacityUnits"] + 1
+        update = {"ProvisionedThroughput": {"ReadCapacityUnits": n, "WriteCapacityUnits": n}}
+    return {"GlobalSecondaryIndexUpdates": [{"Update": {"IndexName": "gsi", **update}}]}
+
+
+@pytest.mark.parametrize("before, stream, change, refusal", COMPANION_ROWS)
+def test_a_stream_change_beside_an_index_or_table_class_change(
+    dynamodb_client, provisioned, before, stream, change, refusal
+):
+    ddb = dynamodb_client
+    table = _wait_all_active(ddb, provisioned)
+    if _stream_enabled(table) != before:
+        _set_stream(ddb, provisioned, KEYS_ONLY if before else DISABLED)
+        table = _wait_all_active(ddb, provisioned)
+    members = _change(change, table["GlobalSecondaryIndexes"][0])
+    row = _call(ddb.update_table, TableName=provisioned, StreamSpecification=stream, **members)
+    after = _wait_all_active(ddb, provisioned)
+    if refusal is not None:
+        _refused(row, "ValidationException", refusal)
+        assert _stream_enabled(after) == before
+        assert _index_units(after) == _index_units(table)
+        assert after.get("TableClassSummary", {}).get("TableClass", "STANDARD") == "STANDARD"
+        return
+    assert row["status"] == 200, row
+    assert _stream_enabled(after) == stream["StreamEnabled"]
+    sent = members["GlobalSecondaryIndexUpdates"][0]["Update"]["ProvisionedThroughput"]
+    assert {k: after["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"][k] for k in sent} == sent

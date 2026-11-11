@@ -161,18 +161,29 @@ pub async fn handle_update_table(
 
     crate::gsi_updates::validate_gsi_updates(&input)?;
 
-    // A stream change travels alone. Measured 2026-10-24: beside BillingMode or
-    // ProvisionedThroughput the service refuses with the IOPS sentence, beside
-    // any GlobalSecondaryIndexUpdates entry with the index sentence, and
-    // applies nothing. The per-index definition checks above come first, and
-    // the already-enabled refusal (`Table already has an enabled stream`) comes
-    // before the IOPS sentence, so the table's stored specification is read
-    // here when a companion change is present. DeletionProtectionEnabled beside
-    // a stream change is refused with the service's only-operation sentence
-    // (measured 2026-10-24); the general rule for DeletionProtection beside any
-    // other change is PR #474's and is not claimed here. TableClass and
-    // OnDemandThroughput beside a stream change are not measured and stay
-    // accepted.
+    // The service refuses a stream change sent with some other changes, and
+    // applies nothing. Measured 2026-10-24: beside BillingMode or
+    // ProvisionedThroughput it refuses with the IOPS sentence, beside an index
+    // Create with the index sentence. The per-index definition checks above
+    // come first, and the already-enabled refusal (`Table already has an
+    // enabled stream`) comes before the IOPS sentence, so the table's stored
+    // specification is read here when a companion change is present.
+    // DeletionProtectionEnabled beside a stream change is refused with the
+    // service's only-operation sentence (measured 2026-10-24); the general rule
+    // for DeletionProtection beside any other change is PR #474's and is not
+    // claimed here. Measured 2026-11-11 on a provisioned table: an index Delete
+    // answers the index sentence, an index Update carrying WarmThroughput the
+    // WarmThroughput sentence, and an index Update of ProvisionedThroughput is
+    // accepted and both changes apply. TableClass is refused with its own
+    // sentence, on a table whose stream is already disabled too, so it is
+    // checked before the table is read; its order against the other companions
+    // is not measured. OnDemandThroughput beside a stream change is not
+    // measured and stays accepted.
+    if input.stream_specification.is_some() && input.table_class.is_some() {
+        return Err(DynamoDbError::ValidationException(
+            extenddb_core::validation::TABLE_CLASS_MUST_BE_ONLY_OPERATION.to_owned(),
+        ));
+    }
     if let Some(companion) = stream_change_companion(&input) {
         let existing = ctx
             .storage
@@ -290,12 +301,17 @@ pub async fn handle_update_table(
 
 /// The sentence the service refuses a stream change with when the same
 /// `UpdateTable` also changes the table's billing or throughput, creates or
-/// deletes an index, or changes deletion protection. `None` when the request
-/// carries no stream change or no such companion. With both the billing and
-/// the index companion present the IOPS sentence is answered (measured); the
-/// deletion-protection sentence's order against the other two is not measured
-/// and comes last.
+/// deletes an index, sets an index's `WarmThroughput`, or changes deletion
+/// protection. `None` when the request carries no stream change or no such
+/// companion; an index `Update` without `WarmThroughput` is not one (measured
+/// 2026-11-11). With both the billing and the index companion present the
+/// IOPS sentence is answered (measured); the order of the WarmThroughput and
+/// deletion-protection sentences against the others is not measured.
 fn stream_change_companion(input: &UpdateTableInput) -> Option<&'static str> {
+    use extenddb_core::validation::{
+        DELETION_PROTECTION_MUST_BE_ONLY_OPERATION, INDEX_CHANGE_WITH_STREAM_CHANGE,
+        WARM_THROUGHPUT_MUST_BE_ONLY_OPERATION,
+    };
     input.stream_specification.as_ref()?;
     if input.billing_mode.is_some() || input.provisioned_throughput.is_some() {
         return Some(
@@ -304,17 +320,20 @@ fn stream_change_companion(input: &UpdateTableInput) -> Option<&'static str> {
     }
     if input
         .global_secondary_index_updates
-        .as_ref()
-        .is_some_and(|u| !u.is_empty())
+        .iter()
+        .flatten()
+        .any(|u| u.create.is_some() || u.delete.is_some())
     {
-        return Some(
-            "One or more parameter values were invalid: You cannot create or delete index while changing stream status",
-        );
+        return Some(INDEX_CHANGE_WITH_STREAM_CHANGE);
+    }
+    // An index Update's, since a Create answered above; a table-level
+    // WarmThroughput beside a stream change is refused earlier, by
+    // `validate_warm_throughput_is_only_operation`.
+    if crate::warm_throughput::touches_warm_throughput(input) {
+        return Some(WARM_THROUGHPUT_MUST_BE_ONLY_OPERATION);
     }
     if input.deletion_protection_enabled.is_some() {
-        return Some(
-            "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request",
-        );
+        return Some(DELETION_PROTECTION_MUST_BE_ONLY_OPERATION);
     }
     None
 }

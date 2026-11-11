@@ -7,11 +7,14 @@ use super::*;
 use extenddb_storage::error::StorageError;
 
 /// Measured 2026-10-24: a stream change beside a billing or throughput
-/// change, beside an index create or delete, or beside a deletion protection
-/// change is refused with its own sentence; alone it is not.
+/// change, beside an index create, or beside a deletion protection change is
+/// refused with its own sentence; alone it is not. Measured 2026-11-11:
+/// beside an index delete it answers the index sentence, beside an index
+/// Update carrying WarmThroughput the WarmThroughput sentence, and beside an
+/// index Update of ProvisionedThroughput it is not refused.
 #[test]
-fn a_stream_change_travels_alone() {
-    let with = |extra: Value| -> UpdateTableInput {
+fn a_stream_change_refuses_its_companions() {
+    let with = |extra: &Value| -> UpdateTableInput {
         let mut body = serde_json::json!({
             "TableName": "t",
             "StreamSpecification": {"StreamEnabled": false},
@@ -23,41 +26,50 @@ fn a_stream_change_travels_alone() {
     };
     let iops = "One or more parameter values were invalid: You cannot modify stream status while updating table IOPS";
     let index = "One or more parameter values were invalid: You cannot create or delete index while changing stream status";
-    assert_eq!(
-        stream_change_companion(&with(serde_json::json!({"BillingMode": "PROVISIONED"}))),
-        Some(iops)
-    );
-    assert_eq!(
-        stream_change_companion(&with(serde_json::json!({
-            "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
-        }))),
-        Some(iops)
-    );
-    assert_eq!(
-        stream_change_companion(&with(serde_json::json!({
-            "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "g"}}]
-        }))),
-        Some(index)
-    );
-    assert_eq!(
-        stream_change_companion(&with(serde_json::json!({
-            "GlobalSecondaryIndexUpdates": [{"Create": {
+    let warm = "One or more parameter values were invalid: WarmThroughput must be the only operation in the request";
+    let protection = "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request";
+    let units = serde_json::json!({"ReadCapacityUnits": 5, "WriteCapacityUnits": 5});
+    let gsi = |update: Value| serde_json::json!({"GlobalSecondaryIndexUpdates": [update]});
+    for (extra, expected) in [
+        (
+            serde_json::json!({"BillingMode": "PROVISIONED"}),
+            Some(iops),
+        ),
+        (
+            serde_json::json!({"ProvisionedThroughput": units}),
+            Some(iops),
+        ),
+        (
+            gsi(serde_json::json!({"Delete": {"IndexName": "g"}})),
+            Some(index),
+        ),
+        (
+            gsi(serde_json::json!({"Create": {
                 "IndexName": "g",
                 "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
                 "Projection": {"ProjectionType": "ALL"}
-            }}]
-        }))),
-        Some(index)
-    );
-    assert_eq!(stream_change_companion(&with(serde_json::json!({}))), None);
-    assert_eq!(
-        stream_change_companion(&with(
-            serde_json::json!({"DeletionProtectionEnabled": true})
-        )),
-        Some(
-            "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request"
-        )
-    );
+            }})),
+            Some(index),
+        ),
+        (
+            gsi(serde_json::json!({"Update": {"IndexName": "g", "ProvisionedThroughput": units}})),
+            None,
+        ),
+        (
+            gsi(serde_json::json!({"Update": {
+                "IndexName": "g",
+                "WarmThroughput": {"ReadUnitsPerSecond": 5, "WriteUnitsPerSecond": 5}
+            }})),
+            Some(warm),
+        ),
+        (
+            serde_json::json!({"DeletionProtectionEnabled": true}),
+            Some(protection),
+        ),
+        (serde_json::json!({}), None),
+    ] {
+        assert_eq!(stream_change_companion(&with(&extra)), expected, "{extra}");
+    }
     let no_stream: UpdateTableInput =
         serde_json::from_value(serde_json::json!({"TableName": "t", "BillingMode": "PROVISIONED"}))
             .unwrap();
