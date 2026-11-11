@@ -172,6 +172,9 @@ impl std::fmt::Display for MetricName {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Dimension {
+    /// The account the metric belongs to. Absent on a metric of the whole
+    /// deployment.
+    AccountId(String),
     TableName(String),
     GlobalSecondaryIndexName(String),
     Operation(String),
@@ -320,6 +323,10 @@ pub struct Percentiles {
 /// Auto-granularity when not specified: ≤10m→1m, ≤2h→5m, ≤8h→15m, >8h→1h.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MetricsQuery {
+    /// Only the metrics of this account. Absent: every account's metrics and
+    /// the deployment's own.
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(default)]
     pub table_name: Option<String>,
     #[serde(default)]
@@ -346,6 +353,8 @@ pub struct FlushBucket {
     pub bucket: std::time::SystemTime,
     /// Which metric this bucket aggregates.
     pub metric: MetricName,
+    /// Account dimension (empty string for a metric of the whole deployment).
+    pub account_id: String,
     /// Table name dimension (empty string if not table-scoped).
     pub table_name: String,
     /// Index name dimension (empty string if not index-scoped).

@@ -133,8 +133,9 @@ async fn settings(db: &Path) -> BTreeMap<String, String> {
 }
 
 /// Tables that a released catalog has and a migration drops: migration 5
-/// drops `continuous_backups`.
-const DROPPED_TABLES: &[&str] = &["continuous_backups"];
+/// drops `continuous_backups`, and migration 10 `metrics`, which
+/// `account_metrics` replaces.
+const DROPPED_TABLES: &[&str] = &["continuous_backups", "metrics"];
 
 /// Row counts of every table but the ones a migration writes.
 async fn row_counts(db: &Path) -> BTreeMap<String, i64> {
@@ -359,6 +360,63 @@ async fn every_released_catalog_upgrades_to_the_fresh_schema() {
             "{name}: objects after a reconverge differ from a fresh install"
         );
     }
+}
+
+/// Migration 10 replaces `metrics`, whose rows carry no account, with an
+/// empty `account_metrics` keyed by account: the released rows are dropped,
+/// not copied. Two accounts' rows for a table of the same name are then two
+/// rows, and a second run of the body changes nothing.
+#[tokio::test]
+async fn migration_10_replaces_metrics_with_an_empty_account_metrics() {
+    let db = temp_db("m10");
+    load_dump(&db, DEV_0_1_14).await;
+    assert!(count(&db, "SELECT COUNT(*) FROM metrics").await > 0);
+    run(&db).await.expect("migrate");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'metrics'"
+        )
+        .await,
+        0,
+        "metrics is dropped"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 0);
+
+    // Two rows that differ only in their account.
+    exec(
+        &db,
+        "INSERT INTO account_metrics (bucket, account_id, metric, table_name, operation, \
+         sum, count, min, max) VALUES \
+         ('2026-11-11T00:00:00Z', '111111111111', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1), \
+         ('2026-11-11T00:00:00Z', '222222222222', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1)",
+    )
+    .await;
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 2);
+
+    // The body again, as --reconverge runs it: the rows stay.
+    let body = include_str!("../../migrations/0010_account_metrics.sql");
+    exec(&db, body).await;
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 2);
+}
+
+/// The metrics store on a migrated catalog keeps two accounts' tables of
+/// the same name apart, and filters on the account.
+#[tokio::test]
+async fn the_metrics_store_keeps_two_accounts_apart() {
+    let db = temp_db("metrics-store");
+    run(&db).await.expect("migrate");
+    let pool = plain_pool(&db).await;
+    let store = crate::SqliteCatalogStore::new(pool.clone());
+    extenddb_storage::metrics_conformance::run(
+        &store,
+        extenddb_storage::metrics_conformance::Expectations {
+            accumulates: true,
+            prunes: true,
+        },
+    )
+    .await;
+    pool.close().await;
 }
 
 /// A release before 1.0 that starts on a v1.0 catalog rewrites

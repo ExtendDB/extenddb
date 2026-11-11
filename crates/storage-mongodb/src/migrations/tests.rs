@@ -59,6 +59,13 @@ fn every_body_is_code_and_three_four_seven_eight_and_nine_do_not_apply() {
     }
     assert!(migration(MigrationId::Baseline).convergent());
     assert!(!migration(MigrationId::ResourceTagConditionKeys).convergent());
+    // Migration 10 replaces the metrics collection, and runs again under
+    // --reconverge after migration 1 creates `metrics` again.
+    assert_eq!(
+        migration(MigrationId::AccountMetrics).store_kinds(),
+        [StoreKind::Catalog]
+    );
+    assert!(migration(MigrationId::AccountMetrics).convergent());
 }
 
 /// The lock, the registrations and the ledgers are read and written through

@@ -168,6 +168,15 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0009_warm_throughput.cql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0010_account_metrics.cql"
+            )],
+        },
     }
 }
 
