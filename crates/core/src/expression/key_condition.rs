@@ -241,9 +241,11 @@ impl KeyCondition {
             .as_deref()
             .and_then(|a| hash_attrs.iter().position(|h| *h == a));
 
-        // One condition per key attribute. A second condition on one HASH or
-        // RANGE attribute, equality or not, is refused before any coverage
-        // check (measured on the service, 2026-10-21).
+        // One condition per key attribute. The engine parses a request's key
+        // condition with `parse_key_condition_with_maps`, which refuses a
+        // second condition on one key attribute before this runs. This guards
+        // the map-less `parse_key_condition`, which authorization reads for
+        // `dynamodb:LeadingKeys`.
         hash_eqs.sort_by_key(|(pos, _, _)| *pos);
         range_eqs.sort_by_key(|(pos, _, _)| *pos);
         let duplicated = hash_eqs.windows(2).any(|w| w[0].0 == w[1].0)
@@ -251,11 +253,7 @@ impl KeyCondition {
             || non_eq_pos.is_some_and(|p| range_eqs.iter().any(|(q, _, _)| *q == p))
             || non_eq_hash_pos.is_some_and(|p| hash_eqs.iter().any(|(q, _, _)| *q == p));
         if duplicated {
-            return Err(DynamoDbError::ValidationException(
-                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain \
-                 one condition per key"
-                    .to_string(),
-            ));
+            return Err(validation_err(ONE_CONDITION_PER_KEY_ERR));
         }
 
         // More conditions than key attributes (measured 2026-10-21: the count
