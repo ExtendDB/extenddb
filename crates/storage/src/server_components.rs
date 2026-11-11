@@ -82,9 +82,10 @@ impl std::fmt::Display for BackendError {
             ),
             Self::InvalidEncryptionKey(reason) => write!(
                 f,
-                "Encryption key in settings table is not valid: {reason}. Restore the \
+                "Encryption key in settings table is not valid: {}. Restore the \
                  original key: every stored access key and session secret is encrypted \
-                 under it"
+                 under it",
+                reason.trim_end_matches('.')
             ),
             Self::InitializationFailed(msg) => write!(f, "Backend initialization failed: {msg}"),
             Self::Catalog(e) => write!(f, "{e}"),
@@ -105,7 +106,9 @@ impl std::error::Error for BackendError {}
 /// Returns [`BackendError::InvalidEncryptionKey`] when `key_b64` is not
 /// base64 or does not decode to 32 bytes.
 pub fn check_encryption_key(key_b64: &str) -> Result<(), BackendError> {
-    crate::secret_cipher::check_key(key_b64).map_err(BackendError::InvalidEncryptionKey)
+    crate::secret_cipher::cipher_key(key_b64)
+        .map(|_| ())
+        .map_err(BackendError::InvalidEncryptionKey)
 }
 
 /// Options for server-component creation, beyond the storage config itself.
@@ -297,19 +300,17 @@ mod tests {
 
     #[test]
     fn a_key_the_cipher_refuses_is_an_invalid_encryption_key() {
-        // 32 zero bytes, and 16 zero bytes.
-        assert!(check_encryption_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_ok());
-        let err = check_encryption_key("AAAAAAAAAAAAAAAAAAAAAA==").unwrap_err();
-        assert!(
-            matches!(&err, BackendError::InvalidEncryptionKey(reason)
-                if reason == "encryption key must be 32 bytes"),
-            "{err:?}"
-        );
+        // 16 zero bytes.
         assert_eq!(
-            err.to_string(),
+            check_encryption_key("AAAAAAAAAAAAAAAAAAAAAA==")
+                .unwrap_err()
+                .to_string(),
             "Encryption key in settings table is not valid: encryption key must be 32 \
              bytes. Restore the original key: every stored access key and session \
              secret is encrypted under it"
         );
+        // The base64 decoder's reason ends with a period of its own.
+        let err = check_encryption_key("AAAA-AAA").unwrap_err().to_string();
+        assert!(err.contains("offset 4. Restore"), "{err}");
     }
 }

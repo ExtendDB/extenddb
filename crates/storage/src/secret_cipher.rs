@@ -86,20 +86,6 @@ pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<Stri
         .map_err(|e| format!("decrypted secret is not valid UTF-8: {e}"))
 }
 
-/// Check that `key_b64` is a key that [`encrypt_secret`] and
-/// [`decrypt_secret`] accept: standard base64 that decodes to 32 bytes.
-///
-/// A backend calls this on the key it loads from the catalog at startup, so a
-/// damaged key stops the server instead of failing every credential lookup.
-///
-/// # Errors
-///
-/// Returns the error that `encrypt_secret` and `decrypt_secret` return for
-/// the same key: `key_b64` is not base64, or does not decode to 32 bytes.
-pub fn check_key(key_b64: &str) -> Result<(), String> {
-    cipher_key(key_b64).map(|_| ())
-}
-
 /// Refuse an empty AAD. A ciphertext sealed with an empty AAD is the same as
 /// one sealed with none, so accepting it would reopen the path without the
 /// access key id binding.
@@ -111,7 +97,7 @@ fn require_aad(aad: &str) -> Result<(), String> {
 }
 
 /// Decode the base64 encryption key and load it into an AES-256-GCM key.
-fn cipher_key(key_b64: &str) -> Result<RandomizedNonceKey, String> {
+pub(crate) fn cipher_key(key_b64: &str) -> Result<RandomizedNonceKey, String> {
     // The capacity is the decoder's own size estimate, so `decode_vec` never
     // reallocates, and the decoded bytes, partial ones included, are wiped on
     // every return path.
@@ -263,44 +249,16 @@ mod tests {
                 "decrypt, {len}-byte key"
             );
         }
-        let err = encrypt_secret(PLAINTEXT, "not base64!", AAD).unwrap_err();
-        assert!(err.starts_with("decode encryption key: "), "{err}");
-        let err = decrypt_secret(&sealed, "not base64!", AAD).unwrap_err();
-        assert!(err.starts_with("decode encryption key: "), "{err}");
-    }
-
-    /// `check_key` refuses a key exactly when `encrypt_secret` does, with the
-    /// same error. A trailing newline, from a key edited by hand, and a key
-    /// without its padding are not base64.
-    #[test]
-    fn check_key_agrees_with_the_cipher() {
-        let keys = [
-            KEY_B64.to_owned(),
-            BASE64.encode([0x11; 16]),
-            BASE64.encode([0x11; 31]),
-            BASE64.encode([0x11; 33]),
-            String::new(),
-            format!("{KEY_B64}\n"),
-            KEY_B64.trim_end_matches('=').to_owned(),
-            "not base64!".to_owned(),
-        ];
-        for key in &keys {
-            assert_eq!(
-                check_key(key),
-                encrypt_secret(PLAINTEXT, key, AAD).map(|_| ()),
-                "key {key:?}"
-            );
-        }
-        assert_eq!(check_key(KEY_B64), Ok(()));
-        assert_eq!(
-            check_key(&BASE64.encode([0x11; 16])).unwrap_err(),
-            "encryption key must be 32 bytes"
-        );
+        // A trailing newline, from a key edited by hand, and a key without its
+        // padding are not base64.
         for key in [
+            "not base64!".to_owned(),
             format!("{KEY_B64}\n"),
             KEY_B64.trim_end_matches('=').to_owned(),
         ] {
-            let err = check_key(&key).unwrap_err();
+            let err = encrypt_secret(PLAINTEXT, &key, AAD).unwrap_err();
+            assert!(err.starts_with("decode encryption key: "), "{key:?}: {err}");
+            let err = decrypt_secret(&sealed, &key, AAD).unwrap_err();
             assert!(err.starts_with("decode encryption key: "), "{key:?}: {err}");
         }
     }

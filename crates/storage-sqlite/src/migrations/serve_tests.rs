@@ -227,26 +227,18 @@ async fn a_server_refuses_an_encryption_key_the_cipher_refuses() {
     let location = current_catalog(&db).await;
     let set_key =
         |key: &str| format!("UPDATE settings SET value = '{key}' WHERE key = 'encryption_key'");
-    for (key, reason) in [
-        // 16 bytes.
-        (
-            "AAAAAAAAAAAAAAAAAAAAAA==",
-            "encryption key must be 32 bytes",
-        ),
-        // 32 bytes and a trailing newline.
-        (
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
-            "decode encryption key: ",
-        ),
-    ] {
-        exec(&db, &set_key(key)).await;
-        match start(&location, false).await {
-            Err(BackendError::InvalidEncryptionKey(r)) => {
-                assert!(r.starts_with(reason), "{key:?}: {r}");
-            }
-            Err(other) => panic!("{key:?}: refused for another reason: {other}"),
-            Ok(_) => panic!("{key:?}: the server started"),
+    // 32 bytes and a trailing newline.
+    exec(
+        &db,
+        &set_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"),
+    )
+    .await;
+    match start(&location, false).await {
+        Err(BackendError::InvalidEncryptionKey(r)) => {
+            assert!(r.starts_with("decode encryption key: "), "{r}");
         }
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("the server started"),
     }
     exec(
         &db,
