@@ -209,8 +209,11 @@ Defined in `crates/storage/src/management_store/mod.rs`. Historical metrics pers
 
 | Method | Purpose |
 |--------|---------|
-| `record_metrics` | Insert a metrics snapshot |
-| `query_metrics` | Query metrics by time range, operation, and table filters |
+| `insert_metrics` | Insert a batch of one-minute rows, each with the account it was recorded for (none for a metric of the whole deployment) |
+| `query_metrics` | Query rows by time range, filtered by `MetricsFilter`: account, table name and metric |
+| `prune_metrics` | Delete rows older than the retention period |
+
+Two accounts' rows for a table of the same name must never be read back as one: a store that adds rows of one key together keeps the account in the key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
 
 ### RateLimitStore
 
@@ -223,7 +226,7 @@ Defined in `crates/storage/src/management_store/mod.rs`. Login rate limiting:
 | `record_failed_login` | Record a failed login attempt with its source address |
 | `cleanup_old_attempts` | Garbage-collect old login attempt records |
 
-Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password::verify_password`, which bounds concurrent bcrypt work per process.
+Password verification in a backend's `AdminStore` and `ManagementStore` must go through `extenddb_storage::password`, which bounds concurrent bcrypt work per process. `verify_admin_password` checks an existing admin's hash with `verify_password` and returns `None` without a bcrypt check when no admin has the name. `verify_iam_user_password` passes the user's hash to `verify_stored_password`, or `None` when the account or the user does not exist or the user has no console password; with `None`, the helper checks the password against a fixed hash and refuses it. A login checks the admin first and the IAM user only when no admin has the name, so every login runs one bcrypt check whether or not the name exists. The management API checks through these two methods and runs the fixed-hash check itself for a name without `/`. The console reads the stored hashes through `PasswordHashStore` and passes them to `verify_stored_password` itself, with `None` for a name without `/` and when `get_user_password_hash` returns `None`.
 
 ### AuthorizationStore
 
@@ -288,8 +291,8 @@ The `storage-postgres` crate provides the default implementation:
 ### Database Architecture
 
 extenddb uses a dual-database architecture:
-- **Catalog database** (`extenddb`) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
-- **Data database** (`extenddb_data`) — DynamoDB items and index rows
+- **Catalog database** (`extenddb_catalog` by default) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
+- **Data database** (`extenddb` by default, the catalog's name without `_catalog`) — DynamoDB items and index rows
 
 ### Migrations
 
@@ -402,7 +405,7 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 
 2. **Transaction isolation**: the PostgreSQL backend runs `transact_write_items` at `READ COMMITTED` and makes it serializable with locks held until commit: `SELECT ... FOR UPDATE` on every item that exists, and a reserved unique key on every item that a ConditionCheck or Delete finds missing. Your backend needs equivalent isolation guarantees.
 
-3. **Sequence generation** — stream sequence numbers use PostgreSQL sequences (`nextval`). Your backend needs a monotonic counter mechanism.
+3. **Sequence generation**: stream sequence numbers come from a PostgreSQL sequence (`nextval`), drawn after the write commits. A write stores its record in `stream_pending`, and a numbering step moves a shard's committed records to `stream_records` in the order they were stored, one numbering of a shard at a time; GetRecords and a `LATEST` iterator run one batch of it on their shard before they read. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past. Your backend needs numbers that become visible on each shard in increasing order: once a consumer has read a number, no record with a lower number may appear on that shard later ([RFC-0003](../rfcs/0003-backend-acceptance-criteria.md), criterion 5.2).
 
 4. **CASCADE deletes** — account deletion cascades through foreign keys. Your backend needs equivalent cascade logic (can be application-level).
 

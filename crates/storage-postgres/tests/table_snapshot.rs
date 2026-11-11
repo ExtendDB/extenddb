@@ -555,9 +555,18 @@ async fn half_the_pool_holds_snapshots(shared: bool) {
     .await
     .expect("an open over the bound is refused at once, not queued")
     .expect_err("the sixth open is over the bound");
-    assert!(
-        matches!(err, extenddb_storage::error::StorageError::LimitExceeded(_)),
-        "{err}"
+    // The one refusal text every job bound answers, naming this one.
+    assert_eq!(
+        err.to_string(),
+        extenddb_storage::error::StorageError::LimitExceeded(
+            extenddb_storage::backup_catalog::limit_exceeded_message(
+                extenddb_storage::backup_catalog::JobBound::Counted {
+                    name: extenddb_storage_postgres::SNAPSHOT_SLOT_BOUND,
+                    limit: 5,
+                }
+            )
+        )
+        .to_string()
     );
     let key: Item = [
         ("pk".to_owned(), AttributeValue::S("p000".to_owned())),
@@ -1077,6 +1086,662 @@ async fn snapshot_marker_and_key_order(shared: bool) {
 }
 on_both_layouts!(snapshot_marker_and_key_order);
 
+/// The keyset pages respect the byte budget on both layouts
+/// (`snapshot_conformance::run_page_bounds`), and the rows the server reads
+/// past each page's cut are those the row bound lets it: with a budget of
+/// eight rows the first page asks for `MIN_PAGE_ROWS` (16) and keeps eight,
+/// so it reads eight it drops; every later page is sized from the largest
+/// row of the page before (the budget divided by it, eight here), so it
+/// reads exactly the rows it keeps and drops none. The figure is asserted
+/// exactly: a counter that never moves would pass a bound (lesson 25), and a
+/// row bound sized from the average again reads the same eight, so the
+/// mixed-page case is pinned by `next_page_rows`'s unit test and by
+/// `the_row_bound_remembers_large_rows_among_small_ones`.
+async fn pages_are_cut_at_the_byte_budget(shared: bool) {
+    let s = scratch_with(shared).await;
+    let bounds = snapshot_conformance::run_page_bounds(
+        &s.hooks,
+        &s.engine,
+        ACCOUNT,
+        "page_bounds",
+        || async {
+            s.engine
+                .process_control_plane_transitions()
+                .await
+                .expect("pump");
+        },
+    )
+    .await;
+    let past_cut = bounds.rows_past_cut;
+    let first_page = u64::try_from(
+        extenddb_storage_postgres::MIN_PAGE_ROWS - snapshot_conformance::PAGE_BOUNDS_ROWS,
+    )
+    .unwrap();
+    // The figure the memory record cites beside the RSS numbers.
+    eprintln!(
+        "rows read past the cut: {past_cut} over {} pages of {} rows ({first_page} expected, all \
+         on the first page)",
+        bounds.pages,
+        bounds.budget / bounds.row_bytes
+    );
+    assert_eq!(
+        past_cut, first_page,
+        "{past_cut} rows read past the cut over {} pages: the first page reads MIN_PAGE_ROWS and \
+         drops {first_page}, and every later page is sized to the rows it keeps",
+        bounds.pages
+    );
+}
+on_both_layouts!(pages_are_cut_at_the_byte_budget);
+
+/// Every plan node type under `node`, in depth-first order.
+fn plan_node_types(node: &serde_json::Value, into: &mut Vec<String>) {
+    if let Some(t) = node.get("Node Type").and_then(serde_json::Value::as_str) {
+        into.push(t.to_owned());
+    }
+    for child in node
+        .get("Plans")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        plan_node_types(child, into);
+    }
+}
+
+/// The index names every scan node under `node` uses.
+fn plan_index_names(node: &serde_json::Value, into: &mut Vec<String>) {
+    if let Some(name) = node.get("Index Name").and_then(serde_json::Value::as_str) {
+        into.push(name.to_owned());
+    }
+    for child in node
+        .get("Plans")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        plan_index_names(child, into);
+    }
+}
+
+/// A 100k-row composite-key table (`pk` = `p00000`..`p02000`, 50 rows each,
+/// `sk_n` = 1..100000) filled straight into the data table and analyzed,
+/// with its description and a data pool; the engine's `put_item` would take
+/// minutes for 100k rows.
+async fn hundred_k_table(s: &Scratch) -> (extenddb_core::types::TableDescription, PgPool) {
+    filled_table(
+        s,
+        "hundred_k",
+        "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                   'sk', jsonb_build_object('N', i::text), \
+                                   'v', jsonb_build_object('S', repeat('x', 100))) \
+         FROM generate_series(1, 100000) AS i",
+    )
+    .await
+}
+
+/// One key value bound to a page query's seek: text (numeric keys travel
+/// as text) or bytes.
+enum Bind {
+    Text(&'static str),
+    Bytes(Vec<u8>),
+}
+
+/// `EXPLAIN (FORMAT JSON)` of the page query (with `COLLATE "C"` on its text
+/// key columns when `collate_c`, as the engine writes it for a table whose
+/// columns have that collation) after `after` (`None` for the first page) at
+/// row bound `n`: the plan's node types in depth-first order and the index
+/// names its scans use, with the plan for the message.
+async fn explain_page(
+    data: &PgPool,
+    desc: &extenddb_core::types::TableDescription,
+    collate_c: bool,
+    after: Option<Vec<Bind>>,
+    n: i64,
+) -> (Vec<String>, Vec<String>, serde_json::Value) {
+    let budget = i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap();
+    let sql =
+        extenddb_storage_postgres::page_sql_for(desc, &desc.table_id, collate_c, after.is_some());
+    let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
+    let mut explain = sqlx::query_scalar::<_, serde_json::Value>(&explain_sql);
+    let seek = after.is_some();
+    for value in after.into_iter().flatten() {
+        explain = match value {
+            Bind::Text(t) => explain.bind(t),
+            Bind::Bytes(b) => explain.bind(b),
+        };
+    }
+    let plan = explain
+        .bind(n)
+        .bind(budget)
+        .fetch_one(data)
+        .await
+        .unwrap_or_else(|e| panic!("explain (after a key: {seek}) at n = {n}: {e}"));
+    let root = &plan[0]["Plan"];
+    let mut types = Vec::new();
+    plan_node_types(root, &mut types);
+    let mut indexes = Vec::new();
+    plan_index_names(root, &mut indexes);
+    (types, indexes, plan)
+}
+
+/// Assert that a page query's plan is `Limit` over one `Index Scan` on the
+/// primary key index with no sort: the seek and the order both follow the
+/// index, so the page costs the server the rows it reads, up to `n`, each
+/// serialized once, and not the rows before them.
+fn assert_index_scan(
+    label: &str,
+    types: &[String],
+    indexes: &[String],
+    plan: &serde_json::Value,
+    pkey: &str,
+) {
+    assert!(
+        !types.iter().any(|t| t == "Sort"),
+        "{label}: the plan sorts: {types:?}\n{plan}"
+    );
+    let scans: Vec<&str> = types
+        .iter()
+        .map(String::as_str)
+        .filter(|t| t.ends_with("Scan") && *t != "Subquery Scan")
+        .collect();
+    assert_eq!(
+        scans,
+        vec!["Index Scan"],
+        "{label}: the relation is not read by one index scan: {types:?}\n{plan}"
+    );
+    assert_eq!(
+        indexes,
+        vec![pkey.to_owned()],
+        "{label}: the scan does not use the primary key index\n{plan}"
+    );
+}
+
+/// A key shape the page query is run on: the `CreateTable` input, the data
+/// table's key columns, the `SELECT` filling 20,000 rows of it, and a key in
+/// its middle to seek past.
+struct KeyShape {
+    label: &'static str,
+    input: extenddb_core::types::CreateTableInput,
+    columns: &'static str,
+    rows: &'static str,
+    middle: Vec<Bind>,
+    /// Whether the text key columns have collation "C", so the engine writes
+    /// `COLLATE "C"` into the query (every table but the legacy one).
+    collate_c: bool,
+    /// Whether the stream reports the table ordered (a multi-part range key
+    /// has no format order; a legacy table's key column has the database
+    /// collation).
+    ordered: bool,
+}
+
+fn key_shape_input(name: &str, range: &[(&str, &str)]) -> extenddb_core::types::CreateTableInput {
+    let mut key_schema = vec![serde_json::json!({"AttributeName": "pk", "KeyType": "HASH"})];
+    let mut defs = vec![serde_json::json!({"AttributeName": "pk", "AttributeType": "S"})];
+    for (attr, ty) in range {
+        key_schema.push(serde_json::json!({"AttributeName": attr, "KeyType": "RANGE"}));
+        defs.push(serde_json::json!({"AttributeName": attr, "AttributeType": ty}));
+    }
+    serde_json::from_value(serde_json::json!({
+        "TableName": name,
+        "KeySchema": key_schema,
+        "AttributeDefinitions": defs,
+        "BillingMode": "PAY_PER_REQUEST"
+    }))
+    .expect("create input")
+}
+
+/// The six key shapes a data table's primary key can have: hash only; an
+/// `S`, `N` or `B` range key; a multi-part range key; and a legacy table
+/// whose text key column carries the database collation (recollated after
+/// the fill, as `legacy_collation_table_streams_unordered_and_complete`
+/// does).
+fn key_shapes() -> Vec<KeyShape> {
+    vec![
+        KeyShape {
+            label: "hash only",
+            input: key_shape_input("hash_only", &[]),
+            columns: "pk, item_data",
+            rows: "SELECT 'p' || lpad(i::text, 5, '0'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad(i::text, 5, '0')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "S range key",
+            input: key_shape_input("range_s", &[("sk", "S")]),
+            columns: "pk, sk_s, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), 'k' || lpad(i::text, 5, '0'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('S', 'k' || lpad(i::text, 5, '0')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("k10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "N range key",
+            input: key_shape_input("range_n", &[("sk", "N")]),
+            columns: "pk, sk_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("10000")],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "B range key",
+            input: key_shape_input("range_b", &[("sk", "B")]),
+            columns: "pk, sk_b, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), decode(lpad(to_hex(i), 8, '0'), 'hex'), \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('B', encode(decode(lpad(to_hex(i), 8, '0'), 'hex'), 'base64')), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![
+                Bind::Text("p00200"),
+                Bind::Bytes(10000_u32.to_be_bytes().to_vec()),
+            ],
+            collate_c: true,
+            ordered: true,
+        },
+        KeyShape {
+            label: "multi-part range key (S, N)",
+            input: key_shape_input("multi_part", &[("sk", "S"), ("sk2", "N")]),
+            columns: "pk, sk_s, sk2_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), 'k' || lpad((i / 10)::text, 4, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('S', 'k' || lpad((i / 10)::text, 4, '0')), \
+                                      'sk2', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![
+                Bind::Text("p00200"),
+                Bind::Text("k1000"),
+                Bind::Text("10000"),
+            ],
+            collate_c: true,
+            ordered: false,
+        },
+        KeyShape {
+            label: "legacy collation (pk on the database collation)",
+            input: key_shape_input("legacy", &[("sk", "N")]),
+            columns: "pk, sk_n, item_data",
+            rows: "SELECT 'p' || lpad((i / 50)::text, 5, '0'), i, \
+                   jsonb_build_object('pk', jsonb_build_object('S', 'p' || lpad((i / 50)::text, 5, '0')), \
+                                      'sk', jsonb_build_object('N', i::text), \
+                                      'v', jsonb_build_object('S', repeat('x', 100))) \
+                   FROM generate_series(1, 20000) AS i",
+            middle: vec![Bind::Text("p00200"), Bind::Text("10000")],
+            collate_c: false,
+            ordered: false,
+        },
+    ]
+}
+
+/// On every key shape a table can have, the page query (first page and a
+/// page after a key in the table's middle, at the first page's row bound of
+/// 16 and at 1000) is `Limit` over one `Index Scan` on the primary key index
+/// with no sort, on a 20,000-row table; and the stream over the rows is
+/// complete, ordered where the shape has a format order, in 21 round trips
+/// (16 rows, then nineteen pages of 1000 and a last of 984). The legacy
+/// table carries no `COLLATE "C"` in its query and pages in its index's
+/// order. Near the end of a small table the plan differs:
+/// `the_last_page_sorts_the_rows_after_the_seek`.
+async fn the_page_query_is_an_index_scan_on_every_key_shape(shared: bool) {
+    let s = scratch_with(shared).await;
+    for shape in key_shapes() {
+        let name = shape.input.table_name.clone();
+        create_active(&s, shape.input).await;
+        let desc = s
+            .engine
+            .describe_table(
+                ACCOUNT,
+                extenddb_core::types::DescribeTableInput {
+                    table_name: name.clone(),
+                },
+            )
+            .await
+            .expect("describe");
+        let ddb_table = data_table_name(&desc.table_id);
+        let data = s.data_pool().await;
+        sqlx::query(&format!(
+            "INSERT INTO {ddb_table} ({}) {}",
+            shape.columns, shape.rows
+        ))
+        .execute(&data)
+        .await
+        .unwrap_or_else(|e| panic!("{}: fill the table: {e}", shape.label));
+        if shape.label.starts_with("legacy") {
+            sqlx::query(&format!(
+                "ALTER TABLE {ddb_table} ALTER COLUMN pk TYPE TEXT COLLATE \"default\""
+            ))
+            .execute(&data)
+            .await
+            .expect("recollate");
+        }
+        sqlx::query(&format!("ANALYZE {ddb_table}"))
+            .execute(&data)
+            .await
+            .expect("analyze");
+        let pkey = format!("{}_pkey", ddb_table.trim_matches('"'));
+        for n in [
+            i64::try_from(extenddb_storage_postgres::MIN_PAGE_ROWS).unwrap(),
+            1000,
+        ] {
+            let (types, indexes, plan) = explain_page(&data, &desc, shape.collate_c, None, n).await;
+            assert_index_scan(
+                &format!("{}, first page at n = {n}", shape.label),
+                &types,
+                &indexes,
+                &plan,
+                &pkey,
+            );
+            let middle: Vec<Bind> = shape
+                .middle
+                .iter()
+                .map(|b| match b {
+                    Bind::Text(t) => Bind::Text(t),
+                    Bind::Bytes(v) => Bind::Bytes(v.clone()),
+                })
+                .collect();
+            let (types, indexes, plan) =
+                explain_page(&data, &desc, shape.collate_c, Some(middle), n).await;
+            assert_index_scan(
+                &format!("{}, page after a key at n = {n}", shape.label),
+                &types,
+                &indexes,
+                &plan,
+                &pkey,
+            );
+        }
+        let sql =
+            extenddb_storage_postgres::page_sql_for(&desc, &desc.table_id, shape.collate_c, true);
+        assert_eq!(
+            sql.contains("COLLATE \"C\""),
+            shape.collate_c,
+            "{}: {sql}",
+            shape.label
+        );
+        data.close().await;
+
+        let fetches_before = extenddb_storage::snapshot::paging::fetches();
+        let snapshot = s
+            .engine
+            .open_table_snapshot(ACCOUNT, &name)
+            .await
+            .expect("open");
+        assert_eq!(snapshot.key_ordered, shape.ordered, "{}", shape.label);
+        let order = extenddb_core::backup_format::KeyOrder::resolve(
+            &snapshot.description.key_schema,
+            &snapshot.description.attribute_definitions,
+        )
+        .ok();
+        let items: Vec<extenddb_core::types::Item> = {
+            use futures::StreamExt as _;
+            snapshot
+                .items
+                .map(|item| item.expect("item"))
+                .collect()
+                .await
+        };
+        assert_eq!(items.len(), 20_000, "{}: every row streams", shape.label);
+        if shape.ordered {
+            let order = order.expect("an ordered shape has a format order");
+            for pair in items.windows(2) {
+                assert_eq!(
+                    order.compare(&pair[0], &pair[1]).expect("comparable keys"),
+                    std::cmp::Ordering::Less,
+                    "{}: {:?} is not before {:?}",
+                    shape.label,
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+        let fetches = extenddb_storage::snapshot::paging::fetches() - fetches_before;
+        assert_eq!(
+            fetches, 21,
+            "{}: a first page of 16, nineteen of 1000 and a last of 984",
+            shape.label
+        );
+    }
+}
+on_both_layouts!(the_page_query_is_an_index_scan_on_every_key_shape);
+
+/// Bytes of item text in a 27 MB row of `scattered_table`: the size of
+/// #394's worst-expansion line, so three such rows fill the 64 MiB budget
+/// (0, 27, 54 MB before each) and the fourth is the next page's.
+const LARGE_ROW_PAD: usize = 27_000_000;
+
+/// A table of `small` rows of 50-byte text under keys `a0000`.., with a
+/// 27 MB row at every `every`th key (`i % every == every - 1`), filled
+/// straight into the data table. Key order does not sort items by size, so
+/// a table whose large items are a minority is this shape rather than the
+/// grouped one (`put-worst`'s `zz` keys after the `a` keys).
+async fn scattered_table(
+    s: &Scratch,
+    name: &str,
+    small: usize,
+    every: usize,
+) -> (extenddb_core::types::TableDescription, PgPool) {
+    filled_table(
+        s,
+        name,
+        &format!(
+            "SELECT 'a' || lpad(i::text, 4, '0'), i, \
+                    jsonb_build_object('pk', jsonb_build_object('S', 'a' || lpad(i::text, 4, '0')), \
+                                       'sk', jsonb_build_object('N', i::text), \
+                                       'v', jsonb_build_object('S', CASE WHEN i % {every} = {} \
+                                           THEN repeat('x', {LARGE_ROW_PAD}) ELSE repeat('x', 50) END)) \
+             FROM generate_series(0, {}) AS i",
+            every - 1,
+            small - 1
+        ),
+    )
+    .await
+}
+
+/// On a table whose 27 MB rows are scattered among small ones (every 33rd
+/// key of 300, nine large rows) the row bound's memory holds: the first
+/// page reads 16 small rows, the second asks for the row bound (1000), meets
+/// the large rows and reads every row left (284) for the 83 it keeps (up to
+/// and including the third large one, whose predecessors hold 54 MB), and
+/// every page after it asks for the floor (4) until the table ends, since
+/// the memory covers a row bound's worth of rows and the table has fewer:
+/// 201 rows read past the cut, all on the second page, over 53 round trips,
+/// every row once in key order. With one page of memory the bound returns to
+/// 1000 after four small rows and the over-read recurs (306 rows past the
+/// cut over 7 pages on this table), which is what the rule corrects; the
+/// bound that remains is the second page, and then the page that follows a
+/// row bound's worth of small rows, each reading up to `n` rows of up to the
+/// line cap: the 201 rows here are that second page's.
+async fn the_row_bound_remembers_large_rows_among_small_ones(shared: bool) {
+    let s = scratch_with(shared).await;
+    let (_desc, data) = scattered_table(&s, "scattered", 300, 33).await;
+    data.close().await;
+    let budget = extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES;
+    extenddb_storage::snapshot::paging::reset_page_counters();
+    let fetches_before = extenddb_storage::snapshot::paging::fetches();
+    let snapshot = s
+        .engine
+        .open_table_snapshot(ACCOUNT, "scattered")
+        .await
+        .expect("open");
+    assert!(snapshot.key_ordered);
+    let keys: Vec<String> = {
+        use futures::StreamExt as _;
+        snapshot
+            .items
+            .map(|item| match item.expect("item").get("pk") {
+                Some(extenddb_core::types::AttributeValue::S(v)) => v.clone(),
+                other => panic!("pk is {other:?}"),
+            })
+            .collect()
+            .await
+    };
+    let expected: Vec<String> = (0..300).map(|i| format!("a{i:04}")).collect();
+    assert_eq!(keys, expected, "every row once, in key order");
+    let fetches = extenddb_storage::snapshot::paging::fetches() - fetches_before;
+    let past_cut = extenddb_storage::snapshot::paging::rows_past_cut();
+    let first = extenddb_storage_postgres::MIN_PAGE_ROWS;
+    let second_read = 300 - first;
+    let second_kept = 99 - first;
+    let rest: usize = 300 - 99;
+    eprintln!(
+        "scattered rows: {past_cut} rows read past the cut over {fetches} pages ({} expected, all on \
+         the second page)",
+        second_read - second_kept
+    );
+    assert_eq!(
+        past_cut,
+        u64::try_from(second_read - second_kept).unwrap(),
+        "rows read past the cut: the second page reads the {second_read} rows left for the \
+         {second_kept} it keeps, and no later page asks for more than the floor"
+    );
+    // The floor is written as its value: a floor of 2 (the budget divided by
+    // a 27 MB row) would page a table of such rows two to a page with no page
+    // reaching its cut, and show here as 103 round trips.
+    assert_eq!(
+        fetches,
+        u64::try_from(2 + rest.div_ceil(4)).unwrap(),
+        "round trips: two pages, then {rest} rows at the floor of four"
+    );
+    let largest = extenddb_storage::snapshot::paging::max_page_bytes();
+    assert!(
+        largest >= budget && largest < budget + LARGE_ROW_PAD,
+        "the largest page holds {largest} bytes"
+    );
+}
+on_both_layouts!(the_row_bound_remembers_large_rows_among_small_ones);
+
+/// A table filled with `rows` straight into its data table and analyzed, as
+/// `hundred_k_table` does, with its description and a data pool; `rows` is
+/// the `SELECT` producing `(pk, sk_n, item_data)`.
+async fn filled_table(
+    s: &Scratch,
+    name: &str,
+    rows: &str,
+) -> (extenddb_core::types::TableDescription, PgPool) {
+    create_active(s, snapshot_conformance::table_input(name)).await;
+    let desc = s
+        .engine
+        .describe_table(
+            ACCOUNT,
+            extenddb_core::types::DescribeTableInput {
+                table_name: name.to_owned(),
+            },
+        )
+        .await
+        .expect("describe");
+    let ddb_table = data_table_name(&desc.table_id);
+    let data = s.data_pool().await;
+    sqlx::query(&format!(
+        "INSERT INTO {ddb_table} (pk, sk_n, item_data) {rows}"
+    ))
+    .execute(&data)
+    .await
+    .expect("fill the table");
+    sqlx::query(&format!("ANALYZE {ddb_table}"))
+        .execute(&data)
+        .await
+        .expect("analyze");
+    (desc, data)
+}
+
+/// The plan near the end of a table, where the planner's estimate of the
+/// rows after the seek is under the row bound, is the planner's choice and
+/// not always the index scan: on the 100k-row table a page after the
+/// 99,990th row at `n` = 1000 (ten rows left) is still `Limit` over the
+/// `Index Scan`, while on a table of 1,060 rows (1,000 under one key prefix,
+/// 60 under another) a page after the third
+/// of the last 60 at `n` = 810 is a `Bitmap Heap Scan` driven by a `Bitmap
+/// Index Scan` on the primary key index and a `Sort` of the 57 rows after
+/// the seek under the `Limit`, so that page sorts the rows it reads, with
+/// their text (PostgreSQL 16). The cell pins both so the module doc's
+/// statement of them stays measured; the seek uses the primary key index in
+/// both, and the sorted page returns the rows after the seek in key order.
+async fn the_last_page_sorts_the_rows_after_the_seek(shared: bool) {
+    let s = scratch_with(shared).await;
+    let (desc, data) = hundred_k_table(&s).await;
+    let ddb_table = data_table_name(&desc.table_id);
+    let pkey = vec![format!("{}_pkey", ddb_table.trim_matches('"'))];
+    let (types, indexes, plan) = explain_page(
+        &data,
+        &desc,
+        true,
+        Some(vec![Bind::Text("p01999"), Bind::Text("99990")]),
+        1000,
+    )
+    .await;
+    eprintln!("100k rows, a page after ('p01999', 99990) at n = 1000: {types:?}");
+    assert_eq!(
+        indexes, pkey,
+        "100k: the seek does not use the primary key index\n{plan}"
+    );
+    assert!(
+        types.iter().any(|t| t == "Index Scan") && !types.iter().any(|t| t == "Sort"),
+        "100k rows: the page near the end is not the index scan the module doc says it is \
+         (correct the doc if the planner changed): {types:?}\n{plan}"
+    );
+    data.close().await;
+
+    let (desc, data) = filled_table(
+        &s,
+        "small",
+        "SELECT pk, i, jsonb_build_object('pk', jsonb_build_object('S', pk), \
+                'sk', jsonb_build_object('N', i::text), \
+                'v', jsonb_build_object('S', repeat('x', 50))) \
+         FROM (SELECT 'a' || lpad(i::text, 4, '0') AS pk, i FROM generate_series(0, 999) AS i \
+               UNION ALL \
+               SELECT 'zz' || lpad(i::text, 3, '0'), i FROM generate_series(0, 59) AS i) rows",
+    )
+    .await;
+    let ddb_table = data_table_name(&desc.table_id);
+    let pkey = vec![format!("{}_pkey", ddb_table.trim_matches('"'))];
+    let (types, indexes, plan) = explain_page(
+        &data,
+        &desc,
+        true,
+        Some(vec![Bind::Text("zz002"), Bind::Text("2")]),
+        810,
+    )
+    .await;
+    eprintln!("1,060 rows, a page after ('zz002', 2) at n = 810: {types:?}");
+    assert_eq!(
+        indexes, pkey,
+        "1,060: the seek does not use the primary key index\n{plan}"
+    );
+    assert!(
+        types.iter().any(|t| t == "Sort") && types.iter().any(|t| t == "Bitmap Heap Scan"),
+        "1,060 rows: the page near the end is not the bitmap scan and Sort the module doc says \
+         PostgreSQL 16 chooses there (correct the doc if the planner changed): {types:?}\n{plan}"
+    );
+    // The sorted page's rows: the 57 after the seek, in key order.
+    let sql = extenddb_storage_postgres::page_sql_for(&desc, &desc.table_id, true, true);
+    let rows: Vec<(String, String)> = sqlx::query_as(&format!("SELECT c0, c1 FROM ({sql}) q"))
+        .bind("zz002")
+        .bind("2")
+        .bind(810_i64)
+        .bind(i64::try_from(extenddb_storage::snapshot::paging::SNAPSHOT_FETCH_BYTES).unwrap())
+        .fetch_all(&data)
+        .await
+        .expect("the last page");
+    let expected: Vec<(String, String)> = (3..60)
+        .map(|i| (format!("zz{i:03}"), i.to_string()))
+        .collect();
+    assert_eq!(rows, expected);
+    data.close().await;
+}
+on_both_layouts!(the_last_page_sorts_the_rows_after_the_seek);
+
 /// A hash-only table with no index, for tests that need many of them.
 fn plain_input(name: &str) -> extenddb_core::types::CreateTableInput {
     serde_json::from_value(serde_json::json!({
@@ -1253,16 +1918,17 @@ async fn a_restored_table_describes_its_restore(shared: bool) {
 }
 on_both_layouts!(a_restored_table_describes_its_restore);
 
-/// The pid of the one backend whose last statement was the stream's `FETCH`.
+/// The pid of the one backend whose last statement was the stream's page
+/// query (its projection starts with the first key column's alias).
 async fn stream_backend(s: &Scratch, data: &PgPool) -> i32 {
     sqlx::query_scalar(
         "SELECT pid FROM pg_stat_activity WHERE datname = $1 \
-         AND state = 'idle in transaction' AND query LIKE 'FETCH%'",
+         AND state = 'idle in transaction' AND query LIKE 'SELECT page.k0 AS c0%'",
     )
     .bind(s.data_name())
     .fetch_one(data)
     .await
-    .expect("the stream's backend is idle in its transaction after a FETCH")
+    .expect("the stream's backend is idle in its transaction after a page query")
 }
 
 /// End the stream's backend from another session, as a server restart or
@@ -1436,7 +2102,7 @@ async fn release_wakes_the_active_poller(shared: bool, how: Release) {
                 match snapshot.items.next().await {
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break,
-                    None => panic!("the stream ended without the FETCH error"),
+                    None => panic!("the stream ended without the page query error"),
                 }
             }
             kept = Some(snapshot);
@@ -1649,7 +2315,7 @@ async fn the_in_catalog_backup_wakes_the_active_poller(shared: bool) {
 }
 on_both_layouts!(the_in_catalog_backup_wakes_the_active_poller);
 
-/// A `FETCH` that fails (the backend ended under the stream) ends the stream
+/// A page query that fails (the backend ended under the stream) ends the stream
 /// at the error and frees its permit and connection at once: with the
 /// errored stream still held a full bound of five opens succeeds. The
 /// `SnapshotExpired` codes take this branch.
@@ -1671,10 +2337,10 @@ async fn a_fetch_error_ends_the_stream_and_frees_its_permit(shared: bool) {
         match snapshot.items.next().await {
             Some(Ok(_)) => items += 1,
             Some(Err(e)) => {
-                eprintln!("FETCH error after {items} items: {e}");
+                eprintln!("page query error after {items} items: {e}");
                 break;
             }
-            None => panic!("the stream ended without reporting the FETCH error"),
+            None => panic!("the stream ended without reporting the page query error"),
         }
     }
     assert_eq!(items, 5, "the first page, then the error");
@@ -2580,12 +3246,10 @@ async fn make_data_unreachable(s: &Scratch) {
 }
 
 /// Separate data database: when the data commit fails after the catalog
-/// commit, the spawned task retries the drop on a fresh connection, so the
-/// delete still succeeds and no data table is left without its row. This is
-/// the window the PR used to describe as "a process that dies between the
-/// two commits"; any failure of the data commit reaches it, with the process
-/// up, and the retry closes it. Mutant: return the commit error instead of
-/// retrying, and the relations stay.
+/// commit, the row is DELETING from the catalog commit on, and the spawned
+/// task redoes the drop on a fresh connection, so `DeleteTable` still
+/// returns `Ok` and no data table is left without its row. Mutant: return
+/// the commit error instead of redoing the drop, and the relations stay.
 #[tokio::test]
 async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
     if base_conn().is_none() {
@@ -2611,8 +3275,8 @@ async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
     }
     assert_eq!(
         catalog_status(&s, "recommit").await.as_deref(),
-        None,
-        "the catalog commit is in by the pause"
+        Some("DELETING"),
+        "the row is DELETING by the pause, not removed"
     );
     terminate_held_data_backend(&s).await;
     pause.resume();
@@ -2639,15 +3303,18 @@ async fn a_failed_data_commit_after_the_catalog_commit_is_retried() {
 }
 
 /// Separate data database: when the data database stays unreachable past the
-/// retry bound, the delete gives up, names the leaked relations in its error
-/// (and logs them with the `DROP TABLE` to run), and the catalog row is gone
-/// regardless. A test-shortened bound keeps it quick.
+/// retry bound, the delete gives up and names the relations it could not drop
+/// in its error (and logs them with the `DROP TABLE` to run), but the catalog
+/// row stays DELETING, not removed. Once the data database is reachable again
+/// the control-plane poller finishes the drop and removes the row, so the
+/// relations are never left without one. A test-shortened bound keeps it
+/// quick.
 #[tokio::test]
-async fn an_unreachable_data_database_past_the_bound_reports_the_leaked_relations() {
+async fn an_unreachable_data_database_past_the_bound_leaves_the_row_deleting_for_the_poller() {
     if base_conn().is_none() {
         eprintln!(
-            "SKIP an_unreachable_data_database_past_the_bound_reports_the_leaked_relations: no \
-             PostgreSQL"
+            "SKIP an_unreachable_data_database_past_the_bound_leaves_the_row_deleting_for_the_poller: \
+             no PostgreSQL"
         );
         return;
     }
@@ -2685,12 +3352,15 @@ async fn an_unreachable_data_database_past_the_bound_reports_the_leaked_relation
     }
     assert_eq!(
         catalog_status(&s, "stranded").await.as_deref(),
-        None,
-        "the catalog row is removed even though the data drop could not be redone"
+        Some("DELETING"),
+        "the row stays DELETING when the data drop could not be redone, not removed"
     );
-    // Let the engine reach the data database again so the Drop cleanup can
-    // force-drop it.
+
+    // The data database is reachable again; the control-plane poller finishes
+    // the drop and removes the row, leaving nothing without a catalog row.
     set_data_allow_connections(&s, true).await;
+    assert_no_orphan(&s, "stranded", &relations, "after the bound was exhausted").await;
+    pump_until_removed(&s, "stranded", &relations).await;
 }
 
 /// Separate data database: a caller that gives up after the catalog commit
@@ -2736,6 +3406,410 @@ async fn a_caller_cancelled_between_the_commits_does_not_strand_the_data() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     panic!("the detached task did not finish the drop after the caller was cancelled");
+}
+
+/// Run a `DeleteTable` of `table` the way another server process would, on
+/// its own runtime with its own engine, until it signals `reached` (a pause
+/// the caller armed), then drop that runtime, the way a kill does: the task
+/// running the request is dropped where it waits, with whatever transactions
+/// it holds. Returns once no session holds a lock on `relations`, so the
+/// server has rolled back what the dead process left open.
+async fn kill_delete_table_at_the_pause(
+    s: &Scratch,
+    table: &str,
+    relations: &[String],
+    reached: tokio::sync::oneshot::Receiver<()>,
+) {
+    let catalog_url = format!("{}/{}", s.base, s.names[0]);
+    let table_name = table.to_owned();
+    let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+    let dying = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build the dying process's runtime");
+        let engine = rt.block_on(async {
+            PostgresEngine::new(
+                &PostgresConfig {
+                    connection_string: catalog_url,
+                    pool_size: 8,
+                    max_item_size_bytes: 400_000,
+                },
+                REGION,
+            )
+            .await
+            .expect("open the dying process's engine")
+        });
+        rt.spawn(async move {
+            let _ = engine
+                .delete_table(ACCOUNT, delete_input(&table_name))
+                .await;
+        });
+        // Block the thread until the test has seen the pause reached, then
+        // "die": dropping the runtime drops the task mid-request.
+        let _ = kill_rx.recv();
+        drop(rt);
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+        .await
+        .expect("the dying DeleteTable reached the pause in time")
+        .expect("the pause was reached");
+    kill_tx
+        .send(())
+        .expect("signal the dying process to drop its runtime");
+    dying.join().expect("the dying process's thread ends");
+
+    // Wait for the server to notice the dropped connections and roll back
+    // what they held, releasing the locks.
+    let data = s.data_pool().await;
+    for _ in 0..200 {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'relation' AND granted \
+             AND pid <> pg_backend_pid() \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             AND relation = ANY (SELECT to_regclass(n)::oid FROM unnest($1::text[]) AS n))",
+        )
+        .bind(relations)
+        .fetch_one(&data)
+        .await
+        .expect("probe the data relations' locks");
+        if !held {
+            data.close().await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("a session still holds the data relations 5 s after the kill");
+}
+
+/// Separate data database: a process that dies between the catalog commit and
+/// the data commit leaves the row DELETING, so the next process's startup
+/// pass finishes the drop. The request runs on its own runtime with its own
+/// engine; dropping that runtime drops the task holding the uncommitted data
+/// drops, the way a kill does, so the data drops roll back and both data
+/// tables remain. The DELETING row still names them, and the startup pass
+/// drops the tables and removes the row.
+#[tokio::test]
+async fn process_death_between_the_commits_is_finished_by_the_startup_pass() {
+    if base_conn().is_none() {
+        eprintln!(
+            "SKIP process_death_between_the_commits_is_finished_by_the_startup_pass: no PostgreSQL"
+        );
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("killed")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "killed", 5).await;
+    let relations = base_and_gsi_relations(&s, "killed").await;
+
+    // The dying process reaches the between-commits pause after the catalog
+    // commit, with the data drops held uncommitted, and is killed there.
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::BetweenCommits,
+    );
+    let reached = pause.take_reached();
+    kill_delete_table_at_the_pause(&s, "killed", &relations, reached).await;
+
+    // The row is DELETING and names the data tables the rolled-back drops
+    // left behind.
+    assert_eq!(
+        catalog_status(&s, "killed").await.as_deref(),
+        Some("DELETING"),
+        "the row is left DELETING, not removed, after the process died between the commits"
+    );
+    assert_eq!(
+        present_relations(&s, &relations).await,
+        relations,
+        "the interrupted data drop rolled back, so both data tables remain"
+    );
+    assert_no_orphan(&s, "killed", &relations, "after the process died").await;
+
+    // The next process's startup pass finishes the delete: drops the data
+    // tables, then removes the row.
+    s.engine.recover_control_plane_at_startup_for_tests().await;
+    assert_eq!(
+        catalog_status(&s, "killed").await,
+        None,
+        "the startup pass removed the row"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the startup pass dropped every data relation"
+    );
+    drop(pause);
+}
+
+/// Separate data database: a process that dies after the data commit and
+/// before the row removal leaves the row DELETING with no data relations,
+/// and the next process's startup pass removes the row.
+#[tokio::test]
+async fn process_death_after_the_data_commit_is_finished_by_the_startup_pass() {
+    if base_conn().is_none() {
+        eprintln!(
+            "SKIP process_death_after_the_data_commit_is_finished_by_the_startup_pass: \
+             no PostgreSQL"
+        );
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("dropped")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "dropped", 5).await;
+    let relations = base_and_gsi_relations(&s, "dropped").await;
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::AfterDataCommit,
+    );
+    let reached = pause.take_reached();
+    kill_delete_table_at_the_pause(&s, "dropped", &relations, reached).await;
+
+    assert_eq!(
+        catalog_status(&s, "dropped").await.as_deref(),
+        Some("DELETING"),
+        "the row is DELETING after the process died past the data commit"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the data commit dropped every data relation before the process died"
+    );
+
+    s.engine.recover_control_plane_at_startup_for_tests().await;
+    assert_eq!(
+        catalog_status(&s, "dropped").await,
+        None,
+        "the startup pass removed the row"
+    );
+    drop(pause);
+}
+
+/// Separate data database: past the data commit the request removes the row
+/// itself; no control-plane pass runs here. Mutant: skip the call to
+/// `remove_deleting_row`, and the row is still DELETING after `DeleteTable`
+/// returns.
+#[tokio::test]
+async fn delete_table_removes_the_row_after_the_data_commit() {
+    if base_conn().is_none() {
+        eprintln!("SKIP delete_table_removes_the_row_after_the_data_commit: no PostgreSQL");
+        return;
+    }
+    let s = scratch_with(false).await;
+    create_active(&s, snapshot_conformance::table_input("removed")).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, "removed", 5).await;
+    let relations = base_and_gsi_relations(&s, "removed").await;
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::AfterDataCommit,
+    );
+    let reached = pause.take_reached();
+    let mut delete = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        s.engine.delete_table(ACCOUNT, delete_input("removed")),
+    ));
+    tokio::select! {
+        r = &mut delete => panic!("DeleteTable finished before the after-data-commit pause: {r:?}"),
+        r = reached => r.expect("DeleteTable reached the after-data-commit pause"),
+    }
+    assert_eq!(
+        catalog_status(&s, "removed").await.as_deref(),
+        Some("DELETING"),
+        "the row is DELETING at the pause"
+    );
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the data commit dropped every data relation by the pause"
+    );
+
+    pause.resume();
+    let deleted = delete
+        .await
+        .expect("DeleteTable returns within 30 s")
+        .expect("DeleteTable returns Ok");
+    assert_eq!(
+        deleted.table_status,
+        extenddb_core::types::TableStatus::Deleting
+    );
+    assert_eq!(
+        catalog_status(&s, "removed").await,
+        None,
+        "the request removed the row"
+    );
+}
+
+/// Whether a session on the catalog database waits for a lock it has not
+/// been granted.
+async fn catalog_lock_waiter(s: &Scratch) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+         WHERE NOT l.granted AND a.datname = $1)",
+    )
+    .bind(&s.names[0])
+    .fetch_one(&s.catalog)
+    .await
+    .expect("catalog lock waiters")
+}
+
+/// Separate data database: a control-plane pass holds the DELETING row when
+/// the request comes to remove it. A pass locks the row (`FOR UPDATE SKIP
+/// LOCKED`), then deletes the table's tags, then the row, and commits at the
+/// end of the pass. An outside catalog transaction runs those statements in
+/// that order here, since no hook holds a pass between its select and its
+/// tag delete. The request takes the row first too, without waiting for it,
+/// so it leaves the tags and the row to the pass and returns `Ok`. Mutant:
+/// delete the tags, then the row, with no lock taken on the row first, and
+/// on a tagged table the request waits for the row while the pass waits for
+/// the tags, until the server's deadlock check fails one of them. Mutant:
+/// take the row with a `FOR UPDATE` that waits, and the request waits for
+/// the pass.
+async fn a_pass_holding_the_deleting_row_does_not_fail_delete_table(tagged: bool) {
+    let s = scratch_with(false).await;
+    let table = if tagged { "tagged" } else { "untagged" };
+    create_active(&s, snapshot_conformance::table_input(table)).await;
+    snapshot_conformance::populate(&s.engine, ACCOUNT, table, 5).await;
+    let relations = base_and_gsi_relations(&s, table).await;
+    let (arn, table_id): (String, String) =
+        sqlx::query_as("SELECT table_arn, table_id FROM tables WHERE table_name = $1")
+            .bind(table)
+            .fetch_one(&s.catalog)
+            .await
+            .expect("the table's arn and id");
+    if tagged {
+        sqlx::query("INSERT INTO tags (resource_arn, tag_key, tag_value) VALUES ($1, 'k', 'v')")
+            .bind(&arn)
+            .execute(&s.catalog)
+            .await
+            .expect("tag the table");
+    }
+
+    let mut pause = extenddb_storage_postgres::arm_delete_table_pause_at(
+        extenddb_storage_postgres::DeleteTablePoint::BetweenCommits,
+    );
+    let reached = pause.take_reached();
+    let mut delete = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        s.engine.delete_table(ACCOUNT, delete_input(table)),
+    ));
+    tokio::select! {
+        r = &mut delete => panic!("DeleteTable finished before the between-commits pause: {r:?}"),
+        r = reached => r.expect("DeleteTable reached the between-commits pause"),
+    }
+
+    // The pass takes the DELETING row, which is due at once.
+    let mut pass_conn = PgConnection::connect(&format!("{}/{}", s.base, s.names[0]))
+        .await
+        .expect("the pass's connection");
+    let mut pass = pass_conn.begin().await.expect("begin the pass");
+    let candidates: Vec<String> = sqlx::query_scalar(
+        "SELECT table_id FROM tables \
+         WHERE table_status = 'DELETING' AND status_transition_at <= NOW() \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *pass)
+    .await
+    .expect("the pass's select");
+    assert_eq!(candidates, vec![table_id.clone()], "the pass holds the row");
+
+    // The request commits its data drop and comes to remove the row. Wait
+    // until it has returned or waits on a lock.
+    pause.resume();
+    let mut returned = None;
+    let mut waiting = false;
+    for _ in 0..200 {
+        tokio::select! {
+            r = &mut delete => {
+                returned = Some(r);
+                break;
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+        }
+        if catalog_lock_waiter(&s).await {
+            waiting = true;
+            break;
+        }
+    }
+    assert!(
+        returned.is_some() || waiting,
+        "DeleteTable neither returned nor waited on a lock within 5 s"
+    );
+
+    // The pass's next statements for this row: its tags, then the row.
+    let tags_deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sqlx::query("DELETE FROM tags WHERE resource_arn = $1")
+            .bind(&arn)
+            .execute(&mut *pass),
+    )
+    .await
+    .expect("the pass's tag delete returns within 10 s");
+    let pass_committed = match tags_deleted {
+        Ok(_) => {
+            sqlx::query("DELETE FROM tables WHERE table_id = $1")
+                .bind(&table_id)
+                .execute(&mut *pass)
+                .await
+                .expect("the pass deletes the row");
+            pass.commit().await.map_err(|e| e.to_string())
+        }
+        Err(e) => {
+            drop(pass);
+            Err(e.to_string())
+        }
+    };
+    let deleted = match returned {
+        Some(r) => r,
+        None => delete.await,
+    }
+    .expect("DeleteTable returns within 30 s")
+    .unwrap_or_else(|e| panic!("DeleteTable failed while a pass held the row: {e}"));
+    assert!(
+        pass_committed.is_ok(),
+        "the pass committed: {pass_committed:?}"
+    );
+    assert!(!waiting, "DeleteTable waited for the row the pass holds");
+    assert_eq!(
+        deleted.table_status,
+        extenddb_core::types::TableStatus::Deleting
+    );
+    assert_eq!(
+        catalog_status(&s, table).await,
+        None,
+        "the pass removed the row"
+    );
+    let tags: i64 = sqlx::query_scalar("SELECT count(*) FROM tags WHERE resource_arn = $1")
+        .bind(&arn)
+        .fetch_one(&s.catalog)
+        .await
+        .expect("count the tags");
+    assert_eq!(tags, 0, "the pass removed the tags");
+    assert!(
+        present_relations(&s, &relations).await.is_empty(),
+        "the request dropped every data relation"
+    );
+    pass_conn
+        .close()
+        .await
+        .expect("close the pass's connection");
+    drop(pause);
+}
+
+mod a_pass_holding_the_deleting_row_does_not_fail_delete_table {
+    #[tokio::test]
+    async fn tagged() {
+        if super::base_conn().is_none() {
+            eprintln!("SKIP {}: no PostgreSQL", module_path!());
+            return;
+        }
+        super::a_pass_holding_the_deleting_row_does_not_fail_delete_table(true).await;
+    }
+
+    #[tokio::test]
+    async fn untagged() {
+        if super::base_conn().is_none() {
+            eprintln!("SKIP {}: no PostgreSQL", module_path!());
+            return;
+        }
+        super::a_pass_holding_the_deleting_row_does_not_fail_delete_table(false).await;
+    }
 }
 
 /// A hash-only table with three GSIs, for the drop-deadline test.

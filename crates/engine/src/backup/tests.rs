@@ -5,7 +5,7 @@
 //! reader that records what the engine asked of it.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extenddb_core::backup_format::BackupArn;
@@ -14,23 +14,27 @@ use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, BillingMode,
     BillingModeSummary, CreateTableInput, DeleteTableInput, DescribeTableInput, GsiDescription,
-    GsiInput, IndexInfo, KeySchemaElement, KeyType, ListTablesInput, ListTablesOutput, LsiInput,
-    OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
+    GsiInput, IndexInfo, Item, KeySchemaElement, KeyType, ListTablesInput, ListTablesOutput,
+    LsiInput, OnDemandThroughput, Projection, ProjectionType, ProvisionedThroughput,
     ProvisionedThroughputDescription, RestoreSummary, ScalarAttributeType, SourceTableDetails,
     StreamSpecification, StreamViewType, TableDescription, TableKeyInfo, TableStatus,
     TimeToLiveDescription, TimeToLiveStatus, UpdateTableInput,
 };
 use extenddb_storage::backup_catalog::{
-    AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim,
-    RestoreJobRow, RestoreTargetKey, StoreIdentity, StoreKind, TimeBounds,
+    AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat,
+    JobClaim, JobRow, JobStatus, RestoreJobRow, RestoreKind, RestoreRegistrationRow,
+    RestoreTargetKey, StaleClock, StatusEntrySweep, StatusFields, StoreIdentity, StoreKind,
+    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTableDefinition};
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupCatalog, BackupRestoreSource, BoxedFuture, JobPermit, LegacyBackupReader, RestoreRequest,
-    TableEngine,
+    BackupCatalog, BackupRestoreSource, BoxedFuture, BulkLoadFile, DataEngine, Finished, JobPermit,
+    LegacyBackupReader, MetadataEngine, RestoreEngine, RestoreRequest, SnapshotEngine, TableEngine,
+    TableSnapshot,
 };
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use super::*;
@@ -51,6 +55,9 @@ fn source_arn() -> String {
 
 #[derive(Default)]
 struct Fake {
+    /// Cancelled by `list_dead_restore_jobs`: a token that fires in the
+    /// middle of a cycle, after its store check.
+    cancel_on_list_dead: Mutex<Option<extenddb_storage::CancellationToken>>,
     sources: Mutex<HashMap<String, BackupRestoreSource>>,
     descriptions: Mutex<HashMap<String, BackupDescription>>,
     summaries: Mutex<Vec<BackupSummary>>,
@@ -66,8 +73,8 @@ struct Fake {
     listed_for: Mutex<Vec<Option<String>>>,
     /// When set, `restore_source` waits for a permit before answering.
     source_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-    /// The catalog index: rows by ARN.
-    rows: Mutex<HashMap<String, BackupRow>>,
+    /// The catalog index: rows by ARN, shared with the claims handed out.
+    rows: Arc<Mutex<HashMap<String, BackupRow>>>,
     /// `backup_in_use` answers: the CREATING target's name, by backup ARN.
     in_use: Mutex<HashMap<String, String>>,
     /// What `start_backup_delete` answers after the row check, by ARN.
@@ -91,11 +98,23 @@ struct Fake {
     abandoned_backups: Mutex<Vec<AbandonedLegacyBackup>>,
     deleted: Mutex<Vec<String>>,
     maintenance_held: Mutex<bool>,
-    /// How many times `check_maintenance_claim` ran: one per reconciler
-    /// cycle, so a test can see that a cycle ran.
-    maintenance_checks: Mutex<usize>,
+    /// The windows `check_maintenance_claim` was called with: one entry per
+    /// reconciler cycle, so a test can see that a cycle ran.
+    maintenance_checks: Mutex<Vec<Duration>>,
     /// When set, `check_maintenance_claim` fails with it (every call).
     maintenance_error: Mutex<Option<String>>,
+    /// When set, the age of a live maintenance claim's last heartbeat, and
+    /// `check_maintenance_claim(stale_after)` answers held while the age is
+    /// under `stale_after`, the rule the backends apply; `maintenance_held`
+    /// answers otherwise.
+    maintenance_beat_age: Mutex<Option<Duration>>,
+    /// How far the catalog's clock runs ahead of this process's (negative:
+    /// behind), in seconds; `list_backup_rows_older_than` measures ages on
+    /// the catalog's clock.
+    catalog_clock_offset_secs: Mutex<f64>,
+    /// When set, `check_maintenance_claim` takes this long to answer (a
+    /// catalog query held behind the pool).
+    maintenance_delay: Mutex<Option<Duration>>,
     /// The `TimeBounds` `list_account_backup_rows` received.
     bounds_seen: Mutex<Vec<TimeBounds>>,
     /// The account's tables, by name, as `describe_table` reports them; a
@@ -103,16 +122,796 @@ struct Fake {
     tables: Mutex<HashMap<String, TableDescription>>,
     /// The names `describe_table` was asked for.
     table_reads: Mutex<Vec<String>>,
+    /// What `catalog_id` answers; `catalog-1` unless a test changes it.
+    catalog_id: Mutex<Option<String>>,
+    /// When set, `catalog_id` fails as a catalog that cannot be read.
+    catalog_id_error: Mutex<bool>,
+    /// Rows `set_backup_deleted` moved to DELETED, by ARN.
+    set_deleted: Mutex<Vec<String>>,
+    /// Rows `remove_backup_row` removed, by ARN.
+    removed_rows: Mutex<Vec<String>>,
+    /// Every `remove_backup_row` call, by ARN, refused ones included.
+    remove_attempts: Mutex<Vec<String>>,
+    /// When set, `list_backup_rows` fails with it.
+    list_error: Mutex<Option<String>>,
+    /// The stores `newest_available_backup_row` was asked for.
+    newest_reads: Mutex<Vec<StoreIdentity>>,
+    /// RUNNING restore records with a live heartbeat (a fresh one, say),
+    /// which `list_running_restore_jobs` lists and `list_dead_restore_jobs`
+    /// does not.
+    running_jobs: Mutex<Vec<RestoreJobRow>>,
+    /// The table snapshots `open_table_snapshot` serves, by table name; a
+    /// name absent is `TableNotFound`.
+    snapshots: Mutex<HashMap<String, SnapshotFixture>>,
+    /// When set, `open_table_snapshot` fails with it (once).
+    snapshot_error: Mutex<Option<StorageError>>,
+    /// Snapshots opened, by table name.
+    snapshots_opened: Mutex<Vec<String>>,
+    /// What `describe_ttl` answers; disabled when unset.
+    ttl: Mutex<Option<TimeToLiveDescription>>,
+    /// The rows `claim_backup` received, as given.
+    claims: Mutex<Vec<BackupRow>>,
+    /// The ARNs `claim_dead_backup` hands over (the backend's liveness test
+    /// modelled as a set): a CREATING row named here has a dead owner.
+    dead: Mutex<std::collections::HashSet<String>>,
+    /// The ARNs `claim_dead_backup` took over.
+    takeovers: Mutex<Vec<String>>,
+    /// Every `set_status` a claim received, in order.
+    status_writes: Arc<Mutex<Vec<StatusWrite>>>,
+    /// What a claim's `heartbeat` does.
+    heartbeat_answer: Arc<Mutex<HeartbeatAnswer>>,
+    /// Releases a beat parked under `HeartbeatAnswer::Park`.
+    park_release: Arc<tokio::sync::Notify>,
+    /// What the fake's claims declare about their beat
+    /// (`JobClaim::heartbeat_parks_before_its_bound`): `true` models SQLite,
+    /// `false` (the default) the other backends.
+    parks_before_bound: Arc<std::sync::atomic::AtomicBool>,
+    /// Heartbeats the claims received.
+    heartbeats: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, the next `set_status` reports `Unknown` (applied or not as
+    /// the flag says) instead of its outcome; taken by that write unless
+    /// `unknown_write_sticky` is set (a connection that fails on every
+    /// write).
+    unknown_write: Arc<Mutex<Option<UnknownWrite>>>,
+    unknown_write_sticky: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, moved into `unknown_write` once a (non-sticky) unknown
+    /// write has been taken: the write sent after an unknown outcome is
+    /// itself unknown, in this way.
+    unknown_write_then: Arc<Mutex<Option<UnknownWrite>>>,
+    /// When set, every `set_status` fails as a claim connection that was
+    /// reset.
+    status_write_error: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `claim_dead_backup` hands the claim over and then gives
+    /// the row a newer generation: another reconciler took the row over in
+    /// the gap before this one's write (item 31's two-reconciler race).
+    takeover_lost_to_another: std::sync::atomic::AtomicBool,
+    /// What `sweep_restore_registrations` answers.
+    swept_registrations: Mutex<Vec<String>>,
+    /// The store-backed restore records, by target table id: what
+    /// `claim_restore` writes and the restore's claims, `read_restore_job`,
+    /// `list_restore_jobs` and the reconciler read.
+    restore_jobs: Arc<Mutex<HashMap<String, RestoreJobRow>>>,
+    /// The restore targets' data, by table id: the key schema the duplicate
+    /// rule reads keys with, the items `bulk_load` applied, and the
+    /// statuses `finish_restore` flips.
+    restore_tables: Mutex<HashMap<String, RestoreTable>>,
+    /// Every `claim_restore` call: the account and the input.
+    restore_claims: Mutex<Vec<(String, CreateTableInput)>>,
+    /// When set, the next `claim_restore` fails with it instead of
+    /// registering (a name race the backend lost, a backup deleted under
+    /// the lock).
+    claim_restore_error: Mutex<Option<StorageError>>,
+    /// Every `set_status` a restore claim received, in order.
+    restore_writes: Arc<Mutex<Vec<StatusWrite>>>,
+    /// The table ids `claim_restore_dead` hands over (the backend's liveness
+    /// test modelled as a set).
+    restore_dead: Mutex<std::collections::HashSet<String>>,
+    /// Every `claim_restore_dead` that handed a claim over: the table id and
+    /// the `spool_host` it was given.
+    restore_takeovers: Mutex<Vec<(String, Option<String>)>>,
+    /// Every `bulk_load`: the file, and the items the stream yielded before
+    /// it ended or failed.
+    bulk_loads: Mutex<Vec<BulkLoadCall>>,
+    /// When set, every `bulk_load` waits for one permit before it reads its
+    /// stream, so a test can hold the job between files.
+    bulk_load_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// When set, `bulk_load` takes one permit before each item it pulls
+    /// from its stream, so a test can hold the job at a known item of a
+    /// file; `bulk_load_items_seen` counts the items pulled so far.
+    bulk_load_item_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    bulk_load_items_seen: std::sync::atomic::AtomicUsize,
+    /// When set, `count_restore_target` answers this instead of the table's
+    /// item count (a backend that kept one of two rows with one key).
+    count_override: Mutex<Option<u64>>,
+    /// When set, `count_restore_target` waits for one permit before it
+    /// counts, so a test can hold the job after its last `bulk_load`.
+    count_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// `count_restore_target` calls, counted before the gate.
+    count_calls: std::sync::atomic::AtomicUsize,
+    /// When set, `claim_restore` takes this long before it registers (a
+    /// registration held behind the catalog's lock or pool).
+    claim_restore_delay: Mutex<Option<Duration>>,
+    /// What `finish_restore` answers when its conditions hold: ACTIVE, or
+    /// DONE with the backfill pending (MongoDB).
+    finish_pending: std::sync::atomic::AtomicBool,
+    /// The progress rows a backend keeps apart from the record
+    /// (PostgreSQL's `restore_progress`), by table id.
+    progress_rows: Mutex<HashMap<String, Vec<(u32, u64)>>>,
+    /// The `running` lists `sweep_restore_progress` received.
+    progress_sweeps: Mutex<Vec<Vec<String>>>,
+    /// Whether `as_vector_search` answers an engine: a target with vector
+    /// support.
+    vector_search: std::sync::atomic::AtomicBool,
+    /// Every `list_restore_jobs` call's filter.
+    restore_lists: Mutex<Vec<Option<JobStatus>>>,
+    /// When set, `list_restore_jobs` fails as a backend that has no restore
+    /// records yet (its `Unsupported` stub).
+    restore_list_error: std::sync::atomic::AtomicBool,
+    /// `bulk_load` calls begun, counted before the gate, so a test can tell
+    /// a job waiting at the gate.
+    bulk_loads_started: std::sync::atomic::AtomicUsize,
+    /// When set, run inside `list_restore_jobs` after it builds its answer,
+    /// that is, after the reconciler read the RUNNING records and before its
+    /// spool listing uses them: the moment a registration can land between
+    /// the sweep's two reads.
+    sweep_hook: Mutex<Option<SweepHook>>,
+    /// What the next `finish_restore` calls do instead of answering, in
+    /// order: fail after the flip landed, or fail without flipping.
+    finish_errors: Mutex<std::collections::VecDeque<FinishError>>,
+    /// Every `finish_restore` call's `size_bytes`.
+    finish_sizes: Mutex<Vec<u64>>,
+    /// When set, `read_restore_job` takes this long to answer (a catalog
+    /// read held behind the pool).
+    read_restore_job_delay: Mutex<Option<Duration>>,
+    /// When set, `claim_restore_dead` hands the claim over and then removes
+    /// the record (gone between the takeover and the reads that follow).
+    takeover_removes_record: std::sync::atomic::AtomicBool,
+    /// The maintenance claims `maintenance_claim` handed out, as the test's
+    /// handles on them; `None` in the error slot makes the next call fail
+    /// as a claim a live holder has.
+    maintenance_holders: Mutex<Vec<Arc<FakeHolder>>>,
+    maintenance_claim_held_by: Arc<Mutex<Option<String>>>,
+    /// When set, `claim_restore` stamps the record's `heartbeat_at` this
+    /// many seconds in the past: a registration that stalled on a lock, as
+    /// PostgreSQL's transaction-start `now()` stamps it.
+    registration_heartbeat_age: Mutex<Option<f64>>,
+    /// Table ids whose data tables never came up: `restore_target_ready`
+    /// answers `false` for them, the state a crash between the
+    /// registration's commit and the data DDL leaves.
+    targets_without_tables: Mutex<std::collections::HashSet<String>>,
+    /// When set, the next `maintenance_claim` hands out a holder whose
+    /// heartbeats report the claim lost at once: the HeldClaim's timer sees
+    /// it and `lost()` reports it before the removal.
+    next_claim_lost: Mutex<bool>,
+    /// When set, `list_restore_jobs` sleeps this long before it answers, so a
+    /// test can let the maintenance claim's heartbeat timer observe a lost
+    /// claim during the read that precedes the removal.
+    list_jobs_delay: Mutex<Option<Duration>>,
+    /// How many `count_restore_target` calls still fail with an error (a
+    /// `COUNT(*)` that times out), taken one per call.
+    count_errors: std::sync::atomic::AtomicU32,
+    /// When set, run inside `claim_restore_dead` once it has handed a claim
+    /// over, before the reconciler's second read of the maintenance claim:
+    /// the moment a command can take that claim during the cycle.
+    takeover_hook: Mutex<Option<SweepHook>>,
+    /// When set, `remove_restore_target_exclusive` answers `false` without
+    /// removing anything: the owner's lock (PostgreSQL's per-session
+    /// advisory lock) is still held by a frozen owner's session.
+    owner_lock_held: Mutex<bool>,
+    /// Rows `insert_backup_row` lands just before it decides, by ARN: a
+    /// CreateBackup on another instance whose row lands between sync's read
+    /// of the rows and its insert.
+    lands_before_insert: Mutex<Vec<BackupRow>>,
+    /// ARNs `list_backup_rows` does not return though the row exists: a
+    /// Cassandra row whose list and status entries were never written.
+    unlisted: Mutex<std::collections::HashSet<String>>,
+    /// When set, `insert_backup_row` that meets an unowned row under the
+    /// same ARN equal to the given one in every column the insert takes
+    /// answers `true` and lists it again (`unlisted` loses it): Cassandra's
+    /// completion of an insert that stopped before its entries.
+    completes_own_insert: std::sync::atomic::AtomicBool,
+    /// Every row `insert_backup_row` received, inserted or not.
+    insert_attempts: Mutex<Vec<BackupRow>>,
+    /// The status filter of every `list_backup_rows` call, in order.
+    row_listings: Mutex<Vec<Option<BackupStatus>>>,
+    /// When set, `insert_backup_row` fails with this error and writes
+    /// nothing.
+    insert_error: Mutex<Option<String>>,
+    /// When set, `insert_backup_row` never answers (a catalog write that
+    /// hangs) and writes nothing.
+    stall_inserts: std::sync::atomic::AtomicBool,
+    /// Every key `forget_available_backup_row` received.
+    forgets_seen: Mutex<Vec<BackupKey>>,
+    /// Preset answers of `forget_available_backup_row`, by ARN; the row is
+    /// left as the test set it.
+    forget_answers: Mutex<HashMap<String, ForgetRow>>,
+    /// When set, `read_backup_row` fails with this error (every call).
+    read_row_error: Mutex<Option<String>>,
+    /// When set, rows are unique by ARN alone, as on Cassandra:
+    /// `insert_backup_row` answers `false` only for a row under the same
+    /// ARN, and `read_backup_row` finds a row by its ARN; otherwise by
+    /// backup id, as on PostgreSQL, SQLite and MongoDB.
+    unique_by_arn: std::sync::atomic::AtomicBool,
+    /// Rows `rewrite_store` lands just before it decides, by ARN: a
+    /// CreateBackup of a server still on the old root whose row lands after
+    /// the move's checks, or another writer's change to a row the move
+    /// checked.
+    lands_before_rewrite: Mutex<Vec<BackupRow>>,
+    /// When set, `rewrite_store` rewrites at most this many rows and then
+    /// fails, leaving the rest of the keys as they were: a move that stops
+    /// part way (MongoDB between chunks, Cassandra between keys).
+    fail_rewrite_after: Mutex<Option<usize>>,
+    /// Every `rewrite_store` call: the old kind and root, the keys and the
+    /// new store.
+    rewrites_seen: Mutex<Vec<RewriteCall>>,
+    /// When set, `rewrite_store_runs_key_by_key` answers `true`, as
+    /// Cassandra's does.
+    rewrites_key_by_key: std::sync::atomic::AtomicBool,
+    /// When set, the `rewrite_store` call of this number (1 for the first)
+    /// sleeps for the duration after its rows are rewritten and before it
+    /// answers: a command stopped inside the rewrite.
+    rewrite_sleep: Mutex<Option<(usize, Duration)>>,
+    /// When set, run (once) inside `list_backup_rows_older_than` of this
+    /// status and clock after it builds its answer: a maintenance command's
+    /// removal or move of a row landing between a duty's listing and its
+    /// deletion.
+    after_older_than: Mutex<Option<(BackupStatus, StaleClock, SweepHook)>>,
+    /// When set, run (once) right after `read_backup_row` of this ARN
+    /// builds its answer: a maintenance command acting between a duty's
+    /// re-read of the row and what follows it.
+    after_row_read: Mutex<Option<(String, SweepHook)>>,
+    /// When set, run (once) right after the `n`th `check_maintenance_claim`
+    /// (counted over `maintenance_checks`) builds its answer: a command
+    /// taking the claim just after a reader found it free.
+    after_maintenance_check: Mutex<Option<(usize, SweepHook)>>,
+    /// When set, `claim_dead_backup` hands over a CREATING row whose
+    /// `heartbeat_at` is older than its `stale_after` on the catalog's
+    /// clock, as the backends judge it, instead of the rows in `dead`.
+    dead_by_heartbeat: std::sync::atomic::AtomicBool,
+    /// When set, `list_backup_rows_by_root` fails once `rewrite_store` has
+    /// been called: the move's re-list of the old root failing.
+    by_root_error_after_rewrite: std::sync::atomic::AtomicBool,
+    /// When set, `read_backup_row` fails once `rewrite_store` has been
+    /// called: the move's read of a row the old root no longer lists
+    /// failing.
+    read_row_error_after_rewrite: std::sync::atomic::AtomicBool,
+    /// Rows `rewrite_store` removes just before it decides, by ARN: a
+    /// tombstone duty of a server on the old root removing a row the move
+    /// checked.
+    removed_before_rewrite: Mutex<Vec<String>>,
+    /// When set, `remove_backup_row` waits this long before it removes
+    /// anything (a catalog write held on a lock); a call dropped during the
+    /// wait removes nothing.
+    remove_delay: Mutex<Option<Duration>>,
+    /// Status entries with no row behind them, as Cassandra can hold
+    /// (store and status): `read_store_ids` and `summarize_store_roots`
+    /// count them, and `remove_orphan_status_entries` deletes a root's.
+    orphan_entries: Mutex<Vec<(StoreIdentity, BackupStatus)>>,
+    /// What `summary_counts_status_entries` answers (Cassandra's `true`).
+    counts_entries: std::sync::atomic::AtomicBool,
+    /// Status entries a writer still configured with a root writes after
+    /// `remove_orphan_status_entries` read that root: counted by
+    /// `read_store_ids`, not seen by the sweep.
+    late_entries: Mutex<Vec<StoreIdentity>>,
+    /// Rows whose one status entry is under an earlier status, by ARN, as
+    /// Cassandra holds after a status change whose entry batch failed (or
+    /// whose writer died before it): the entry's status, and the row's
+    /// status and store when the knob was set. While the row keeps that
+    /// status and store, `list_backup_rows` does not list it (its readers
+    /// read one status partition and skip the entry) and
+    /// `summarize_store_roots` counts it under the entry's status;
+    /// `list_backup_rows_by_root` lists it under its own, and
+    /// `remove_orphan_status_entries` of its root repairs the entry (or
+    /// removes it, once the row is gone or names another store).
+    stale_entries: Mutex<HashMap<String, (BackupStatus, BackupStatus, StoreIdentity)>>,
+    /// When set, `list_backup_rows_by_root` of this root fails.
+    by_root_error_for: Mutex<Option<String>>,
+    /// When set, `list_backup_rows_older_than` fails with it (every call).
+    older_than_error: Mutex<Option<String>>,
+}
+
+/// One `rewrite_store` call the `Fake` received: the old kind and root, the
+/// keys and the new store.
+type RewriteCall = (StoreKind, String, Vec<BackupKey>, StoreIdentity);
+
+/// A closure the `Fake` runs inside `sweep_restore_progress`.
+type SweepHook = Box<dyn Fn(&Fake) + Send>;
+
+/// What a `finish_restore` of the `Fake` does instead of answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinishError {
+    /// The flip landed (the record DONE, the table ACTIVE) and the call
+    /// then failed: PostgreSQL's progress delete after the commit.
+    AfterFlip,
+    /// The call failed before anything was written.
+    BeforeFlip,
+    /// The call failed before anything was written, and another claim took
+    /// the record over and wrote DONE under its own generation before the
+    /// re-read.
+    TakenAndDone,
+}
+
+/// A restore target's data in the `Fake`.
+#[derive(Debug, Clone)]
+struct RestoreTable {
+    name: String,
+    key_attributes: Vec<String>,
+    items: Vec<Item>,
+    active: bool,
+}
+
+/// One `bulk_load` the `Fake` received.
+#[derive(Debug, Clone, PartialEq)]
+struct BulkLoadCall {
+    table_id: String,
+    file: BulkLoadFile,
+    /// The items the stream yielded.
+    items: Vec<Item>,
+    /// The text of the `Err` item that ended the stream, if one did.
+    stream_error: Option<String>,
+}
+
+/// A `Fake` claim on one restore record, by table id: the backends'
+/// `heartbeat` (`status = RUNNING AND owner_generation = ?`), `set_status`
+/// conditioned on the generation and `from`, and `read`.
+struct FakeRestoreClaim {
+    records: Arc<Mutex<HashMap<String, RestoreJobRow>>>,
+    table_id: String,
+    generation: u64,
+    writes: Arc<Mutex<Vec<StatusWrite>>>,
+    heartbeat_answer: Arc<Mutex<HeartbeatAnswer>>,
+    heartbeats: Arc<std::sync::atomic::AtomicUsize>,
+    unknown_write: Arc<Mutex<Option<UnknownWrite>>>,
+    status_write_error: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JobClaim for FakeRestoreClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxedFuture<'_, Result<Heartbeat, StorageError>> {
+        self.heartbeats
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let answer = *self.heartbeat_answer.lock().unwrap();
+        let confirmed = match self.records.lock().unwrap().get_mut(&self.table_id) {
+            Some(record)
+                if answer == HeartbeatAnswer::Confirm
+                    && record.owner_generation == self.generation
+                    && record.status == JobStatus::Running =>
+            {
+                record.heartbeat_at = seconds_since_epoch();
+                true
+            }
+            _ => false,
+        };
+        Box::pin(async move {
+            match answer {
+                HeartbeatAnswer::Confirm if confirmed => Ok(Heartbeat::Confirmed),
+                HeartbeatAnswer::AlwaysConfirm => Ok(Heartbeat::Confirmed),
+                HeartbeatAnswer::Confirm | HeartbeatAnswer::Lost => Ok(Heartbeat::Lost),
+                HeartbeatAnswer::Stall | HeartbeatAnswer::Park => futures::future::pending().await,
+                HeartbeatAnswer::Error => Err(StorageError::Internal(
+                    "the claim connection failed".to_owned(),
+                )),
+            }
+        })
+    }
+
+    fn set_status<'a>(
+        &'a self,
+        from: JobStatus,
+        to: JobStatus,
+        fields: &'a StatusFields,
+    ) -> BoxedFuture<'a, Result<WriteOutcome, StorageError>> {
+        self.writes.lock().unwrap().push(StatusWrite {
+            arn: self.table_id.clone(),
+            generation: self.generation,
+            from,
+            to,
+            fields: fields.clone(),
+        });
+        if self
+            .status_write_error
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(async move {
+                Err(StorageError::Internal(
+                    "claim session: connection reset".to_owned(),
+                ))
+            });
+        }
+        let unknown = self.unknown_write.lock().unwrap().take();
+        let apply = unknown != Some(UnknownWrite::Lost);
+        let mut outcome = WriteOutcome::NotMatched;
+        if let Some(record) = self.records.lock().unwrap().get_mut(&self.table_id)
+            && record.owner_generation == self.generation
+            && record.status == from
+        {
+            if unknown == Some(UnknownWrite::TakenAndWritten) {
+                record.owner_generation = new_generation();
+                record.status = to;
+            } else if apply {
+                record.status = to;
+                if let Some(reason) = &fields.failure_reason {
+                    record.failure_reason = Some(reason.clone());
+                }
+                if fields.completed {
+                    record.completed_at = Some(seconds_since_epoch());
+                }
+                outcome = WriteOutcome::Matched;
+            }
+        }
+        if unknown.is_some() {
+            outcome = WriteOutcome::Unknown;
+        }
+        Box::pin(async move { Ok(outcome) })
+    }
+
+    fn read(&self) -> BoxedFuture<'_, Result<JobRow, StorageError>> {
+        let found = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&self.table_id)
+            .map(|record| JobRow {
+                status: record.status,
+                owner_generation: record.owner_generation,
+                heartbeat_at: record.heartbeat_at,
+                failure_reason: record.failure_reason.clone(),
+            });
+        Box::pin(async move {
+            found.ok_or_else(|| StorageError::Internal("the record is gone".to_owned()))
+        })
+    }
 }
 
 impl Fake {
-    fn with_source(source: BackupRestoreSource) -> Self {
+    /// The status of `row`'s stale status entry (`stale_entries`), while
+    /// the row keeps the status and store it had when the entry was set.
+    fn stale_entry(&self, row: &BackupRow) -> Option<BackupStatus> {
+        self.stale_entries
+            .lock()
+            .unwrap()
+            .get(&row.backup_arn)
+            .filter(|(_, status, store)| *status == row.status && *store == row.store)
+            .map(|(entry, _, _)| *entry)
+    }
+
+    /// Leave the seeded row of `arn` with its one status entry under
+    /// `entry` (`stale_entries`).
+    fn set_stale_entry(&self, arn: &str, entry: BackupStatus) {
+        let row = self.rows.lock().unwrap()[arn].clone();
+        self.stale_entries
+            .lock()
+            .unwrap()
+            .insert(arn.to_owned(), (entry, row.status, row.store));
+    }
+
+    fn restore_claim_on(&self, table_id: &str, generation: u64) -> Box<dyn JobClaim> {
+        Box::new(FakeRestoreClaim {
+            records: Arc::clone(&self.restore_jobs),
+            table_id: table_id.to_owned(),
+            generation,
+            writes: Arc::clone(&self.restore_writes),
+            heartbeat_answer: Arc::clone(&self.heartbeat_answer),
+            heartbeats: Arc::clone(&self.heartbeats),
+            unknown_write: Arc::clone(&self.unknown_write),
+            status_write_error: Arc::clone(&self.status_write_error),
+        })
+    }
+
+    /// The key of `item` under `attributes`, for the duplicate rule.
+    fn item_key(attributes: &[String], item: &Item) -> String {
+        attributes
+            .iter()
+            .map(|a| serde_json::to_string(&item.get(a)).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// The restore record of the target named `table`, if any.
+    fn restore_job(&self, table: &str) -> Option<RestoreJobRow> {
+        self.restore_jobs
+            .lock()
+            .unwrap()
+            .values()
+            .find(|r| r.target.table_name == table)
+            .cloned()
+    }
+
+    /// The items a restore target holds, by table name.
+    fn restored_items(&self, table: &str) -> Vec<Item> {
+        self.restore_tables
+            .lock()
+            .unwrap()
+            .values()
+            .find(|t| t.name == table)
+            .map(|t| t.items.clone())
+            .unwrap_or_default()
+    }
+
+    /// The `bulk_load` calls received, as `(file_index, start_at, reapplying,
+    /// item count)`.
+    fn bulk_load_files(&self) -> Vec<(u32, u64, bool, usize)> {
+        self.bulk_loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c.file.file_index,
+                    c.file.start_at,
+                    c.file.reapplying,
+                    c.items.len(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// A table snapshot the `Fake` serves.
+struct SnapshotFixture {
+    description: TableDescription,
+    key_ordered: bool,
+    items: Vec<Result<Item, StorageError>>,
+    /// When set, the stream takes one permit per item before yielding it,
+    /// so a test can hold the job inside the stream.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// One `set_status` a claim received.
+#[derive(Debug, Clone)]
+struct StatusWrite {
+    arn: String,
+    generation: u64,
+    from: JobStatus,
+    to: JobStatus,
+    fields: StatusFields,
+}
+
+/// What a `Fake` claim's heartbeat does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HeartbeatAnswer {
+    /// Confirm while the row carries the claim's generation, whatever its
+    /// status (the backends' `UPDATE ... WHERE owner_generation = ?` has no
+    /// status clause, so a job's beats during its own `delete_prefix`
+    /// refresh the FAILED row), refreshing `heartbeat_at`; `Lost` otherwise.
+    #[default]
+    Confirm,
+    /// Confirm whatever the row carries (a connection whose session still
+    /// holds its lock while the row was rewritten).
+    AlwaysConfirm,
+    /// `Lost`, whatever the row.
+    Lost,
+    /// Never return.
+    Stall,
+    /// An error.
+    Error,
+    /// Park outside the bound, as SQLite's beat does behind the engine
+    /// write lock, until `Fake::park_release` is notified; then answer as
+    /// `heartbeat_answer` reads at that moment.
+    Park,
+}
+
+/// How the next `set_status` reports `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownWrite {
+    /// The write landed and the connection failed after it.
+    Applied,
+    /// The write was lost with the connection.
+    Lost,
+    /// The write was lost with the connection, and another claim took the
+    /// record over and wrote the same status under its own generation
+    /// before the re-read.
+    TakenAndWritten,
+}
+
+/// A `Fake` claim on one row.
+struct FakeClaim {
+    rows: Arc<Mutex<HashMap<String, BackupRow>>>,
+    arn: String,
+    generation: u64,
+    status_writes: Arc<Mutex<Vec<StatusWrite>>>,
+    heartbeat_answer: Arc<Mutex<HeartbeatAnswer>>,
+    park_release: Arc<tokio::sync::Notify>,
+    parks_before_bound: Arc<std::sync::atomic::AtomicBool>,
+    heartbeats: Arc<std::sync::atomic::AtomicUsize>,
+    unknown_write: Arc<Mutex<Option<UnknownWrite>>>,
+    unknown_write_sticky: Arc<std::sync::atomic::AtomicBool>,
+    unknown_write_then: Arc<Mutex<Option<UnknownWrite>>>,
+    status_write_error: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Fake {
+    fn claim_on(&self, arn: &str, generation: u64) -> Box<dyn JobClaim> {
+        Box::new(FakeClaim {
+            rows: Arc::clone(&self.rows),
+            arn: arn.to_owned(),
+            generation,
+            status_writes: Arc::clone(&self.status_writes),
+            heartbeat_answer: Arc::clone(&self.heartbeat_answer),
+            park_release: Arc::clone(&self.park_release),
+            parks_before_bound: Arc::clone(&self.parks_before_bound),
+            heartbeats: Arc::clone(&self.heartbeats),
+            unknown_write: Arc::clone(&self.unknown_write),
+            unknown_write_sticky: Arc::clone(&self.unknown_write_sticky),
+            unknown_write_then: Arc::clone(&self.unknown_write_then),
+            status_write_error: Arc::clone(&self.status_write_error),
+        })
+    }
+}
+
+/// `JobStatus` as a backup row carries it.
+fn row_status(status: JobStatus) -> Option<BackupStatus> {
+    match status {
+        JobStatus::Creating => Some(BackupStatus::Creating),
+        JobStatus::Available => Some(BackupStatus::Available),
+        JobStatus::Failed => Some(BackupStatus::Failed),
+        JobStatus::Running | JobStatus::Done => None,
+    }
+}
+
+/// `BackupStatus` as a job record reports it.
+fn job_status(status: BackupStatus) -> JobStatus {
+    match status {
+        BackupStatus::Creating => JobStatus::Creating,
+        BackupStatus::Available => JobStatus::Available,
+        BackupStatus::Failed => JobStatus::Failed,
+        BackupStatus::Deleting | BackupStatus::Deleted => JobStatus::Done,
+    }
+}
+
+impl JobClaim for FakeClaim {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn heartbeat(&self) -> BoxedFuture<'_, Result<Heartbeat, StorageError>> {
+        self.heartbeats
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let answer = *self.heartbeat_answer.lock().unwrap();
+        let confirmed = match self.rows.lock().unwrap().get_mut(&self.arn) {
+            Some(row)
+                if answer == HeartbeatAnswer::Confirm
+                    && row.owner_generation == self.generation =>
+            {
+                row.heartbeat_at = seconds_since_epoch();
+                true
+            }
+            _ => false,
+        };
+        Box::pin(async move {
+            match answer {
+                HeartbeatAnswer::Confirm if confirmed => Ok(Heartbeat::Confirmed),
+                HeartbeatAnswer::AlwaysConfirm => Ok(Heartbeat::Confirmed),
+                HeartbeatAnswer::Confirm | HeartbeatAnswer::Lost => Ok(Heartbeat::Lost),
+                HeartbeatAnswer::Stall => futures::future::pending().await,
+                HeartbeatAnswer::Error => Err(StorageError::Internal(
+                    "the claim connection failed".to_owned(),
+                )),
+                HeartbeatAnswer::Park => futures::future::pending().await,
+            }
+        })
+    }
+
+    /// SQLite's shape: under `Park` the beat waits outside the bound (the
+    /// engine write lock's queue) and the bound covers the answer alone.
+    fn heartbeat_within(
+        &self,
+        bound: Duration,
+    ) -> BoxedFuture<'_, Option<Result<Heartbeat, StorageError>>> {
+        Box::pin(async move {
+            if *self.heartbeat_answer.lock().unwrap() == HeartbeatAnswer::Park {
+                self.park_release.notified().await;
+            }
+            tokio::time::timeout(bound, self.heartbeat()).await.ok()
+        })
+    }
+
+    /// What the fake declares about its beat: `true` models SQLite (the
+    /// park is the write lock's queue), `false` the other backends, where a
+    /// beat still in flight past its bound is one the process was stopped
+    /// in (`Park` then stands for the stop).
+    fn heartbeat_parks_before_its_bound(&self) -> bool {
+        self.parks_before_bound
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The backends' write: conditioned on the claim's generation and on
+    /// the row being in `from`; `completed` stamps `completed_at`.
+    fn set_status<'a>(
+        &'a self,
+        from: JobStatus,
+        to: JobStatus,
+        fields: &'a StatusFields,
+    ) -> BoxedFuture<'a, Result<WriteOutcome, StorageError>> {
+        self.status_writes.lock().unwrap().push(StatusWrite {
+            arn: self.arn.clone(),
+            generation: self.generation,
+            from,
+            to,
+            fields: fields.clone(),
+        });
+        if self
+            .status_write_error
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(async move {
+                Err(StorageError::Internal(
+                    "claim session: connection reset".to_owned(),
+                ))
+            });
+        }
+        let unknown = if self
+            .unknown_write_sticky
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            *self.unknown_write.lock().unwrap()
+        } else {
+            let taken = self.unknown_write.lock().unwrap().take();
+            if taken.is_some() {
+                *self.unknown_write.lock().unwrap() =
+                    self.unknown_write_then.lock().unwrap().take();
+            }
+            taken
+        };
+        let apply = unknown != Some(UnknownWrite::Lost);
+        let mut outcome = WriteOutcome::NotMatched;
+        if apply
+            && let Some(row) = self.rows.lock().unwrap().get_mut(&self.arn)
+            && row.owner_generation == self.generation
+            && Some(row.status) == row_status(from)
+            && let Some(to_status) = row_status(to)
+        {
+            row.status = to_status;
+            if let Some(size) = fields.size_bytes {
+                row.size_bytes = size;
+            }
+            if let Some(count) = fields.item_count {
+                row.item_count = count;
+            }
+            if let Some(reason) = &fields.failure_reason {
+                row.failure_reason = Some(reason.clone());
+            }
+            if let Some(details) = &fields.source_table_details_json {
+                row.source_table_details_json = details.clone();
+            }
+            if fields.completed {
+                row.completed_at = Some(seconds_since_epoch());
+            }
+            outcome = WriteOutcome::Matched;
+        }
+        if unknown.is_some() {
+            outcome = WriteOutcome::Unknown;
+        }
+        Box::pin(async move { Ok(outcome) })
+    }
+
+    fn read(&self) -> BoxedFuture<'_, Result<JobRow, StorageError>> {
+        let found = self.rows.lock().unwrap().get(&self.arn).map(|row| JobRow {
+            status: job_status(row.status),
+            owner_generation: row.owner_generation,
+            heartbeat_at: row.heartbeat_at,
+            failure_reason: row.failure_reason.clone(),
+        });
+        Box::pin(async move {
+            found.ok_or_else(|| StorageError::Internal("the row is gone".to_owned()))
+        })
+    }
+}
+
+impl Fake {
+    /// A `Fake` serving `source` through the legacy reader, in the `Arc` the
+    /// restore request takes (its manifest branch spawns a task that owns a
+    /// clone).
+    fn with_source(source: BackupRestoreSource) -> Arc<Self> {
         let fake = Self::default();
         fake.sources
             .lock()
             .unwrap()
             .insert(source.backup_arn.clone(), source);
-        fake
+        Arc::new(fake)
     }
     fn restores(&self) -> Vec<RestoreRequest> {
         self.restores.lock().unwrap().clone()
@@ -137,6 +936,746 @@ fn store() -> StoreIdentity {
         store_root: "/var/lib/extenddb/backups".to_owned(),
         store_id: "store-1".to_owned(),
     }
+}
+
+/// An in-memory `BackupStore` for the engine's tests: objects by key, a
+/// switch that makes every call fail as a transport error, a switch that
+/// makes every call wait forever (a store that has stopped answering), and
+/// the keys each operation was called with.
+#[derive(Default)]
+struct MemStore {
+    objects: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    /// When set, every operation fails with this text as the cause under a
+    /// "dispatch failure" link, the shape the SDK's transport errors have.
+    down: Mutex<Option<String>>,
+    /// When set, every operation's future never completes; `stalls` counts
+    /// the calls that entered the stall. A stalled call returns once the
+    /// store is un-stalled, as a parked filesystem call returns when its
+    /// mount answers.
+    stalled: std::sync::atomic::AtomicBool,
+    stalls: std::sync::atomic::AtomicUsize,
+    /// When set, every operation takes this long before it answers: a
+    /// healthy root whose calls are slow.
+    delay: Mutex<Option<Duration>>,
+    deletes: Mutex<Vec<String>>,
+    puts: Mutex<Vec<String>>,
+    /// When set, `put` fails as a transport error after reading its body;
+    /// every other call answers.
+    fail_puts: std::sync::atomic::AtomicBool,
+    /// When set, `put` fails as a transport error 200 ms after reading its
+    /// body's first chunk, while the encoder waits for the file's next item
+    /// (a connection reset mid-upload).
+    fail_puts_after_first_chunk: std::sync::atomic::AtomicBool,
+    /// When set, `put` reports one byte more than it stored (a store whose
+    /// size accounting differs from the bytes written).
+    misreport_put_size: std::sync::atomic::AtomicBool,
+    /// When set, `get` of a key under this prefix fails as a transport
+    /// error; every other call answers (the identity file's read among
+    /// them, so the store stays healthy).
+    fail_gets_under: Mutex<Option<String>>,
+    /// When set, the next `n` `get`s of a data file (a key under a `data/`
+    /// component) fail at the call with the error kind given; every other
+    /// call answers.
+    fail_gets: Mutex<Option<(GetFailure, usize)>>,
+    /// When set, the next `get` of a data file yields this many bytes and
+    /// then fails as a transport error mid-body (a `GetObject` body that
+    /// stopped arriving).
+    fail_get_after_bytes: Mutex<Option<usize>>,
+    /// When set, every `get` of a data file fails at the call as a transport
+    /// error while the clock reads before this instant (an outage of a
+    /// known length under a paused clock).
+    fail_data_gets_until: Mutex<Option<tokio::time::Instant>>,
+    /// When set, every `get` of a key ending in this text fails at the call
+    /// as a transport error (one object the store never serves).
+    fail_gets_of: Mutex<Option<String>>,
+    /// When set, `get` of this key never answers; every other call answers.
+    stall_gets_of: Mutex<Option<String>>,
+    /// When set, the body of the `get` with this ordinal (1-based, over
+    /// every `get` the store saw) panics after its first chunk: a reader on
+    /// the blocking pool that dies mid-file.
+    panic_body_of_get: std::sync::atomic::AtomicUsize,
+    /// Every `get`'s key, in order, failed ones included.
+    gets: Mutex<Vec<String>>,
+    /// When set, `delete_prefix_before` deletes nothing and answers that it
+    /// reached its deadline (a walk stopped at its next entry).
+    deadline_reached: std::sync::atomic::AtomicBool,
+    /// Every `delete_prefix_before`'s prefix and deadline, in order.
+    deadlines_seen: Mutex<Vec<(String, tokio::time::Instant)>>,
+    /// Called with the key of every `put` that stored its object, so a test
+    /// can act at a point of the job (after the sidecar's put, before the
+    /// claim re-check).
+    on_put: Mutex<Option<OnPut>>,
+    /// Bytes `put` stored, by key, in the order the puts ended.
+    put_sizes: Mutex<Vec<(String, u64)>>,
+    /// When set, the bytes `put_if_absent` leaves under the key right after
+    /// it stored its own: a server that ignores `If-None-Match` and a second
+    /// writer that won the plain-put race.
+    overwrite_after_conditional_put: Mutex<Option<Vec<u8>>>,
+    /// When set, `put_if_absent` finds the key taken (`None`) while `get`
+    /// and `head` find no object: something that is not an object (a FIFO,
+    /// a socket) sits at the path.
+    key_taken_by_a_non_object: std::sync::atomic::AtomicBool,
+    /// When set, `validate` fails with this text as a store condition (the
+    /// probe write failing with an I/O error) while every other call
+    /// answers.
+    validate_error: Mutex<Option<String>>,
+    /// When set, a `delete_prefix` of a prefix (not of a manifest key) is
+    /// followed by a put of this key under the prefix: a writer whose put
+    /// overlapped the deletion.
+    late_put_after_delete: Mutex<Option<String>>,
+    /// When set, `delete_prefix` takes this long before it answers (a slow
+    /// store's deletion).
+    delete_delay: Mutex<Option<Duration>>,
+    /// When set, every `delete_prefix` waits until it is cleared, counted
+    /// in `stalls`, while every other call answers: a deletion parked in a
+    /// mount that stopped answering beside reads of the identity file that
+    /// do not.
+    stall_deletes: std::sync::atomic::AtomicBool,
+    /// When set, `list` of this prefix fails as a transport error.
+    fail_lists_of: Mutex<Option<String>>,
+    /// When set, a `list` of the whole root fails as a transport error
+    /// once it has yielded the keys that sort before this one: a listing
+    /// that stops part-way through.
+    fail_root_list_at: Mutex<Option<String>>,
+    /// When set, `delete_prefix` of this prefix fails as a transport error.
+    fail_deletes_of: Mutex<Option<String>>,
+    /// When set, the identity file becomes these bytes right after the next
+    /// `get` of it has read the current ones: a root another catalog adopts
+    /// between a store's check and what follows it.
+    identity_after_read: Mutex<Option<Vec<u8>>>,
+    /// When set, a `list` of the whole root never yields (a listing that
+    /// stalls); a `list` of any prefix answers.
+    stall_root_list: std::sync::atomic::AtomicBool,
+    /// While set, a `list` of the whole root waits, and answers once it is
+    /// cleared (a walk of a slow mount that returns).
+    hold_root_list: std::sync::atomic::AtomicBool,
+    /// When set, the `get`s of the identity file after the first `n` (the
+    /// count) fail as a transport error, or never answer (`stall`); every
+    /// other call answers. The deletion fence's read failing alone.
+    identity_get_failure: Mutex<Option<(usize, IdentityFailure)>>,
+    /// When set, `head` of this key fails as a transport error; every other
+    /// call answers.
+    fail_heads_of: Mutex<Option<String>>,
+    /// When set, `head` of this key never answers; every other call answers.
+    stall_heads_of: Mutex<Option<String>>,
+    /// Every `list`'s prefix, in order.
+    lists: Mutex<Vec<String>>,
+}
+
+/// How `MemStore::identity_get_failure` fails a read of the identity file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityFailure {
+    Transport,
+    Stall,
+    /// The store refuses the read (an `AccessDenied` on S3).
+    Denied,
+    /// The read fails with the filesystem store's shape for a file it may
+    /// not open (a file at mode 000): an I/O error, not a denial.
+    Unreadable,
+}
+
+/// What `MemStore::on_put` runs after a stored `put`, with the object's key.
+type OnPut = Box<dyn Fn(&str) + Send + Sync>;
+
+/// How `MemStore::fail_gets_with` fails a data file's `get`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetFailure {
+    /// The SDK's transport shape, which the restore retries.
+    Transport,
+    /// A denial, which it does not.
+    PermissionDenied,
+}
+
+/// A transport error with the SDK's shape: a top link naming only the class
+/// and the cause one link below it.
+#[derive(Debug)]
+struct DispatchFailure(ConnectError);
+
+#[derive(Debug)]
+struct ConnectError(String);
+
+impl std::fmt::Display for DispatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("dispatch failure")
+    }
+}
+
+impl std::error::Error for DispatchFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+impl MemStore {
+    /// A store that is down fails every call as the S3 store fails one it
+    /// cannot send: a transport error whose cause is a link below the top.
+    fn check(&self) -> Result<(), extenddb_backup_store::StoreError> {
+        match self.down.lock().unwrap().as_ref() {
+            Some(text) => Err(extenddb_backup_store::StoreError::Transport {
+                source: Box::new(DispatchFailure(ConnectError(text.clone()))),
+            }),
+            None => Ok(()),
+        }
+    }
+    /// Wait while the store is stalled, and the delay if one is set;
+    /// otherwise return at once.
+    async fn stall(&self) {
+        let delay = *self.delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.stalled.load(std::sync::atomic::Ordering::Acquire) {
+            self.stalls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            while self.stalled.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    fn set_down(&self, down: bool) {
+        *self.down.lock().unwrap() = down.then(|| "connection refused".to_owned());
+    }
+    fn set_stalled(&self, stalled: bool) {
+        self.stalled
+            .store(stalled, std::sync::atomic::Ordering::Release);
+    }
+    fn set_delay(&self, delay: Option<Duration>) {
+        *self.delay.lock().unwrap() = delay;
+    }
+    fn insert(&self, key: &str, body: &[u8]) {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), body.to_vec());
+    }
+    /// The next `times` `get`s of a data file fail with `failure`.
+    fn fail_gets_with(&self, failure: GetFailure, times: usize) {
+        *self.fail_gets.lock().unwrap() = Some((failure, times));
+    }
+    /// The next `get` of a data file stops after `n` bytes with a transport
+    /// error.
+    fn fail_get_after_bytes(&self, n: usize) {
+        *self.fail_get_after_bytes.lock().unwrap() = Some(n);
+    }
+    fn gets(&self) -> Vec<String> {
+        self.gets.lock().unwrap().clone()
+    }
+    fn is_data_file(key: &str) -> bool {
+        key.contains("/data/")
+    }
+    fn keys(&self) -> Vec<String> {
+        self.objects.lock().unwrap().keys().cloned().collect()
+    }
+    fn matches(key: &str, prefix: &str) -> bool {
+        let prefix = prefix.trim_end_matches('/');
+        prefix.is_empty() || key == prefix || key.starts_with(&format!("{prefix}/"))
+    }
+}
+
+async fn collect_body(
+    body: extenddb_backup_store::ByteStream,
+) -> Result<Vec<u8>, extenddb_backup_store::StoreError> {
+    body.try_fold(Vec::new(), |mut acc, chunk| async move {
+        acc.extend_from_slice(&chunk);
+        Ok(acc)
+    })
+    .await
+}
+
+impl extenddb_backup_store::BackupStore for MemStore {
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        body: extenddb_backup_store::ByteStream,
+    ) -> BoxedFuture<'a, Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>>
+    {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            let mut body = body;
+            if self
+                .fail_puts_after_first_chunk
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let _first = body.try_next().await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError(
+                        "connection reset mid-body".to_owned(),
+                    ))),
+                });
+            }
+            let bytes = collect_body(body).await?;
+            if self.fail_puts.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("put refused".to_owned()))),
+                });
+            }
+            self.puts.lock().unwrap().push(key.to_owned());
+            let size = bytes.len() as u64;
+            self.put_sizes.lock().unwrap().push((key.to_owned(), size));
+            self.insert(key, &bytes);
+            if let Some(on_put) = self.on_put.lock().unwrap().as_ref() {
+                on_put(key);
+            }
+            let reported = if self
+                .misreport_put_size
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                size + 1
+            } else {
+                size
+            };
+            Ok(extenddb_backup_store::ObjectMeta {
+                key: key.to_owned(),
+                size: reported,
+                last_modified: None,
+                etag: None,
+            })
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: extenddb_backup_store::ByteStream,
+    ) -> BoxedFuture<
+        'a,
+        Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+    > {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            let bytes = collect_body(body).await?;
+            if self
+                .key_taken_by_a_non_object
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(None);
+            }
+            let mut objects = self.objects.lock().unwrap();
+            if objects.contains_key(key) {
+                return Ok(None);
+            }
+            self.puts.lock().unwrap().push(key.to_owned());
+            let size = bytes.len() as u64;
+            objects.insert(key.to_owned(), bytes);
+            if let Some(other) = self.overwrite_after_conditional_put.lock().unwrap().clone() {
+                objects.insert(key.to_owned(), other);
+            }
+            Ok(Some(extenddb_backup_store::ObjectMeta {
+                key: key.to_owned(),
+                size,
+                last_modified: None,
+                etag: None,
+            }))
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxedFuture<'a, Result<extenddb_backup_store::ByteStream, extenddb_backup_store::StoreError>>
+    {
+        Box::pin(async move {
+            self.gets.lock().unwrap().push(key.to_owned());
+            self.stall().await;
+            self.check()?;
+            if self.stall_gets_of.lock().unwrap().as_deref() == Some(key) {
+                self.stalls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                std::future::pending::<()>().await;
+            }
+            if key == STORE_IDENTITY_KEY {
+                let failure = {
+                    let mut slot = self.identity_get_failure.lock().unwrap();
+                    match slot.as_mut() {
+                        Some((0, failure)) => Some(*failure),
+                        Some((pass, _)) => {
+                            *pass -= 1;
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                match failure {
+                    Some(IdentityFailure::Transport) => {
+                        return Err(extenddb_backup_store::StoreError::Transport {
+                            source: Box::new(DispatchFailure(ConnectError(
+                                "identity get refused".to_owned(),
+                            ))),
+                        });
+                    }
+                    Some(IdentityFailure::Stall) => futures::future::pending::<()>().await,
+                    Some(IdentityFailure::Denied) => {
+                        return Err(extenddb_backup_store::StoreError::PermissionDenied(
+                            format!("GetObject {key}: permission denied"),
+                        ));
+                    }
+                    Some(IdentityFailure::Unreadable) => {
+                        return Err(extenddb_backup_store::StoreError::Io {
+                            context: format!("open {key}"),
+                            source: std::io::Error::from_raw_os_error(13),
+                        });
+                    }
+                    None => {}
+                }
+            }
+            if self
+                .fail_gets_under
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("get refused".to_owned()))),
+                });
+            }
+            let ordinal = self.gets.lock().unwrap().len();
+            if Self::is_data_file(key)
+                && (self
+                    .fail_data_gets_until
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|until| tokio::time::Instant::now() < until)
+                    || self
+                        .fail_gets_of
+                        .lock()
+                        .unwrap()
+                        .as_deref()
+                        .is_some_and(|suffix| key.ends_with(suffix)))
+            {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError(
+                        "connection reset by peer".to_owned(),
+                    ))),
+                });
+            }
+            if Self::is_data_file(key) {
+                let mut fail = self.fail_gets.lock().unwrap();
+                if let Some((failure, times)) = *fail {
+                    *fail = (times > 1).then_some((failure, times - 1));
+                    return Err(match failure {
+                        GetFailure::Transport => extenddb_backup_store::StoreError::Transport {
+                            source: Box::new(DispatchFailure(ConnectError(
+                                "connection reset by peer".to_owned(),
+                            ))),
+                        },
+                        GetFailure::PermissionDenied => {
+                            extenddb_backup_store::StoreError::PermissionDenied(format!(
+                                "GetObject {key}"
+                            ))
+                        }
+                    });
+                }
+            }
+            let bytes = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(extenddb_backup_store::StoreError::NotFound)?;
+            if key == STORE_IDENTITY_KEY
+                && let Some(next) = self.identity_after_read.lock().unwrap().take()
+            {
+                self.insert(key, &next);
+            }
+            if Self::is_data_file(key)
+                && let Some(n) = self.fail_get_after_bytes.lock().unwrap().take()
+            {
+                let head = bytes[..n.min(bytes.len())].to_vec();
+                let stream = futures::stream::iter(vec![
+                    Ok(bytes::Bytes::from(head)),
+                    Err(extenddb_backup_store::StoreError::Transport {
+                        source: Box::new(DispatchFailure(ConnectError(
+                            "the body stopped arriving".to_owned(),
+                        ))),
+                    }),
+                ]);
+                return Ok(Box::pin(stream) as extenddb_backup_store::ByteStream);
+            }
+            if ordinal
+                == self
+                    .panic_body_of_get
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let head = bytes[..bytes.len().min(16)].to_vec();
+                let stream = futures::stream::iter(vec![Ok(bytes::Bytes::from(head))]).chain(
+                    futures::stream::once(async {
+                        panic!("the body's reader died (a test fixture)")
+                    }),
+                );
+                return Ok(Box::pin(stream) as extenddb_backup_store::ByteStream);
+            }
+            Ok(extenddb_backup_store::byte_stream_from(bytes))
+        })
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxedFuture<
+        'a,
+        Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+    > {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            if self.fail_heads_of.lock().unwrap().as_deref() == Some(key) {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("head refused".to_owned()))),
+                });
+            }
+            if self.stall_heads_of.lock().unwrap().as_deref() == Some(key) {
+                self.stalls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                std::future::pending::<()>().await;
+            }
+            Ok(self.objects.lock().unwrap().get(key).map(|bytes| {
+                extenddb_backup_store::ObjectMeta {
+                    key: key.to_owned(),
+                    size: bytes.len() as u64,
+                    last_modified: None,
+                    etag: None,
+                }
+            }))
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxStream<'a, Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>>
+    {
+        self.lists.lock().unwrap().push(prefix.to_owned());
+        if let Err(e) = self.check() {
+            return Box::pin(futures::stream::once(async move { Err(e) }));
+        }
+        if prefix.is_empty()
+            && self
+                .stall_root_list
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(futures::stream::pending());
+        }
+        if prefix.is_empty()
+            && self
+                .hold_root_list
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(
+                futures::stream::once(async move {
+                    while self
+                        .hold_root_list
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    self.list(prefix)
+                })
+                .flatten(),
+            );
+        }
+        if self.fail_lists_of.lock().unwrap().as_deref() == Some(prefix) {
+            return Box::pin(futures::stream::once(async move {
+                Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("list refused".to_owned()))),
+                })
+            }));
+        }
+        let fail_at = self
+            .fail_root_list_at
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|_| prefix.is_empty());
+        let mut metas: Vec<_> = self
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| Self::matches(k, prefix))
+            .take_while(|(k, _)| fail_at.as_ref().is_none_or(|at| *k < at))
+            .map(|(k, v)| {
+                Ok(extenddb_backup_store::ObjectMeta {
+                    key: k.clone(),
+                    size: v.len() as u64,
+                    last_modified: None,
+                    etag: None,
+                })
+            })
+            .collect();
+        if fail_at.is_some() {
+            metas.push(Err(extenddb_backup_store::StoreError::Transport {
+                source: Box::new(DispatchFailure(ConnectError("list stopped".to_owned()))),
+            }));
+        }
+        Box::pin(futures::stream::iter(metas))
+    }
+
+    fn delete_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxedFuture<'a, Result<u64, extenddb_backup_store::StoreError>> {
+        Box::pin(async move {
+            self.stall().await;
+            if self
+                .stall_deletes
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.stalls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                while self
+                    .stall_deletes
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            self.check()?;
+            let delay = *self.delete_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            if self.fail_deletes_of.lock().unwrap().as_deref() == Some(prefix) {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("delete refused".to_owned()))),
+                });
+            }
+            self.deletes.lock().unwrap().push(prefix.to_owned());
+            let mut objects = self.objects.lock().unwrap();
+            let before = objects.len();
+            objects.retain(|k, _| !Self::matches(k, prefix));
+            let deleted = (before - objects.len()) as u64;
+            if let Some(late) = self.late_put_after_delete.lock().unwrap().as_deref()
+                && !prefix.ends_with(".json")
+            {
+                objects.insert(format!("{prefix}{late}"), b"late".to_vec());
+            }
+            Ok(deleted)
+        })
+    }
+
+    /// The trait's rule (the deadline checked once, then the whole
+    /// deletion); `deadline_reached` answers unfinished with nothing
+    /// deleted.
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxedFuture<
+        'a,
+        Result<extenddb_backup_store::PrefixDeletion, extenddb_backup_store::StoreError>,
+    > {
+        self.deadlines_seen
+            .lock()
+            .unwrap()
+            .push((prefix.to_owned(), deadline));
+        Box::pin(async move {
+            if self
+                .deadline_reached
+                .load(std::sync::atomic::Ordering::Acquire)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return Ok(extenddb_backup_store::PrefixDeletion {
+                    deleted: 0,
+                    finished: false,
+                });
+            }
+            self.delete_prefix(prefix)
+                .await
+                .map(|deleted| extenddb_backup_store::PrefixDeletion {
+                    deleted,
+                    finished: true,
+                })
+        })
+    }
+
+    fn validate(&self) -> BoxedFuture<'_, Result<(), extenddb_backup_store::StoreError>> {
+        Box::pin(async move {
+            self.stall().await;
+            self.check()?;
+            match self.validate_error.lock().unwrap().clone() {
+                Some(text) => Err(extenddb_backup_store::StoreError::Other(text)),
+                None => Ok(()),
+            }
+        })
+    }
+}
+
+/// A runtime with `store` configured as `identity`, healthy. A root with no
+/// identity file gets one naming the `Fake`'s catalog, as the check that
+/// made it healthy leaves it, so the deletion fence passes.
+fn runtime_on(mem: &Arc<MemStore>, identity: StoreIdentity) -> BackupRuntime {
+    if !mem.objects.lock().unwrap().contains_key(STORE_IDENTITY_KEY) {
+        mem.insert(
+            STORE_IDENTITY_KEY,
+            &identity_file(&identity.store_id, "catalog-1"),
+        );
+    }
+    runtime().with_store(ConfiguredStore::new(
+        identity.store_kind,
+        identity.store_root.clone(),
+        Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(identity),
+    ))
+}
+
+/// A runtime whose configured store (`store()`'s kind and root) failed its
+/// startup check with `problem`: the id is unknown.
+fn runtime_unhealthy(mem: &Arc<MemStore>, problem: StoreProblem) -> BackupRuntime {
+    runtime().with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Err(problem),
+    ))
+}
+
+/// A deletion fence over a healthy store whose root's identity file names
+/// the `Fake`'s catalog: it passes. For the tests that call a deleting step
+/// with a store of their own.
+fn passing_fence() -> super::StoreFence {
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::new(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(store()),
+    )
+    .fence()
+}
+
+/// The identity file of `store()` for catalog `catalog_id`, as bytes.
+fn identity_file(store_id: &str, catalog_id: &str) -> Vec<u8> {
+    identity_file_of(store_id, catalog_id, false)
+}
+
+/// [`identity_file`] with the in-memory catalog marker as given.
+fn identity_file_of(store_id: &str, catalog_id: &str, ephemeral_catalog: bool) -> Vec<u8> {
+    StoreIdentityFile {
+        format_version: 1,
+        store_id: store_id.to_owned(),
+        catalog_id: catalog_id.to_owned(),
+        backend: "test".to_owned(),
+        created_at_ms: 0,
+        ephemeral_catalog,
+    }
+    .to_bytes()
 }
 
 /// A catalog row for `arn`, with the manifest fixture's source table (the
@@ -166,24 +1705,612 @@ fn row(arn: &str, status: BackupStatus) -> BackupRow {
     }
 }
 
+impl Fake {
+    /// `claim_restore`'s registration once any delay has passed.
+    fn register_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &RestoreRegistrationRow,
+    ) -> Result<(TableDescription, Box<dyn JobClaim>), StorageError> {
+        let arn = &registration.backup.backup_arn;
+        let available = self
+            .rows
+            .lock()
+            .unwrap()
+            .get(arn)
+            .is_some_and(|r| r.status == BackupStatus::Available);
+        if !available {
+            return Err(extenddb_storage::backup_catalog::backup_not_found(arn));
+        }
+        let in_use = self.in_use.lock().unwrap().get(arn).cloned().or_else(|| {
+            let jobs = self.restore_jobs.lock().unwrap();
+            self.restore_tables
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, t)| !t.active)
+                .find(|(id, _)| jobs.get(*id).is_some_and(|j| j.source_backup_arn == *arn))
+                .map(|(_, t)| t.name.clone())
+        });
+        if let Some(table) = in_use {
+            return Err(extenddb_storage::backup_catalog::backup_in_use(&table, arn));
+        }
+        let mut tables = self.tables.lock().unwrap();
+        if let Some(taken) = tables.get(&input.table_name) {
+            let err = match taken
+                .restore_summary
+                .as_ref()
+                .filter(|_| taken.table_status == TableStatus::Creating)
+                .and_then(|s| s.source_backup_arn.clone())
+            {
+                Some(backup_arn) => StorageError::TableBeingRestored {
+                    table_name: input.table_name.clone(),
+                    backup_arn,
+                },
+                None => StorageError::TableAlreadyExists(input.table_name.clone()),
+            };
+            return Err(err);
+        }
+        let table_id = format!("tid-{}", input.table_name);
+        let generation = new_generation();
+        let mut desc = described(&RestoreRequest {
+            backup_arn: arn.clone(),
+            source_table_arn: registration.source_table_arn.clone(),
+            restore_date_time: registration.restore_date_time,
+            input: input.clone(),
+        });
+        desc.table_id = table_id.clone();
+        desc.restore_summary = Some(RestoreSummary {
+            source_backup_arn: Some(arn.clone()),
+            source_table_arn: Some(registration.source_table_arn.clone()),
+            restore_date_time: registration.restore_date_time,
+            restore_in_progress: true,
+        });
+        tables.insert(input.table_name.clone(), desc.clone());
+        drop(tables);
+        let target = RestoreTargetKey {
+            account_id: account_id.to_owned(),
+            table_name: input.table_name.clone(),
+            table_id: table_id.clone(),
+        };
+        self.restore_jobs.lock().unwrap().insert(
+            table_id.clone(),
+            RestoreJobRow {
+                target,
+                source_backup_arn: arn.clone(),
+                kind: RestoreKind::Manifest,
+                status: JobStatus::Running,
+                owner_generation: generation,
+                heartbeat_at: seconds_since_epoch()
+                    - self
+                        .registration_heartbeat_age
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(0.0),
+                store: Some(registration.store.clone()),
+                spool_host: registration.spool_host.clone(),
+                file_index: None,
+                items_applied: None,
+                failure_reason: None,
+                completed_at: None,
+            },
+        );
+        self.restore_tables.lock().unwrap().insert(
+            table_id.clone(),
+            RestoreTable {
+                name: input.table_name.clone(),
+                key_attributes: input
+                    .key_schema
+                    .iter()
+                    .map(|k| k.attribute_name.clone())
+                    .collect(),
+                items: Vec::new(),
+                active: false,
+            },
+        );
+        let claim = self.restore_claim_on(&table_id, generation);
+        Ok((desc, claim))
+    }
+}
+
 impl BackupCatalog for Fake {
     fn catalog_id(&self) -> BoxedFuture<'_, Result<String, StorageError>> {
-        Box::pin(async { Ok("catalog-1".to_owned()) })
+        if *self.catalog_id_error.lock().unwrap() {
+            return Box::pin(async { Err(StorageError::Internal("pool exhausted".to_owned())) });
+        }
+        let id = self
+            .catalog_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "catalog-1".to_owned());
+        Box::pin(async move { Ok(id) })
     }
 
+    /// The backends' insert: the row as given, CREATING under a fresh
+    /// generation with `heartbeat_at` now; `AlreadyExists` when the ARN has a
+    /// row.
     fn claim_backup<'a>(
         &'a self,
-        _row: &'a BackupRow,
+        row: &'a BackupRow,
     ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
-        unused()
+        self.claims.lock().unwrap().push(row.clone());
+        let mut rows = self.rows.lock().unwrap();
+        if rows.contains_key(&row.backup_arn) {
+            let arn = row.backup_arn.clone();
+            return Box::pin(async move { Err(StorageError::AlreadyExists(arn)) });
+        }
+        let generation = new_generation();
+        let mut inserted = row.clone();
+        inserted.status = BackupStatus::Creating;
+        inserted.owner_generation = generation;
+        inserted.heartbeat_at = seconds_since_epoch();
+        rows.insert(row.backup_arn.clone(), inserted);
+        drop(rows);
+        let claim = self.claim_on(&row.backup_arn, generation);
+        Box::pin(async move { Ok(claim) })
     }
 
+    /// The backends' unowned insert: the row as given, owner
+    /// `UNOWNED_GENERATION`, `completed_at` and `heartbeat_at` now; `false`
+    /// when a row with the backup id exists (PostgreSQL's, SQLite's and
+    /// MongoDB's unique `backup_id`, which also covers the key), or with
+    /// `unique_by_arn` a row under the ARN (Cassandra's), unless
+    /// `completes_own_insert` is set and the row is this insert's own.
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        self.insert_attempts.lock().unwrap().push(row.clone());
+        if self
+            .stall_inserts
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(std::future::pending());
+        }
+        if let Some(e) = self.insert_error.lock().unwrap().clone() {
+            return Box::pin(async move { Err(StorageError::Internal(e)) });
+        }
+        let mut rows = self.rows.lock().unwrap();
+        for landed in self.lands_before_insert.lock().unwrap().drain(..) {
+            rows.insert(landed.backup_arn.clone(), landed);
+        }
+        if self
+            .completes_own_insert
+            .load(std::sync::atomic::Ordering::Acquire)
+            && rows.get(&row.backup_arn).is_some_and(|stored| {
+                stored.owner_generation == UNOWNED_GENERATION
+                    && BackupRow {
+                        owner_generation: row.owner_generation,
+                        completed_at: row.completed_at,
+                        heartbeat_at: row.heartbeat_at,
+                        ..stored.clone()
+                    } == *row
+            })
+        {
+            self.unlisted.lock().unwrap().remove(&row.backup_arn);
+            return Box::pin(async move { Ok(true) });
+        }
+        let exists = if self
+            .unique_by_arn
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            rows.contains_key(&row.backup_arn)
+        } else {
+            rows.values().any(|r| r.backup_id == row.backup_id)
+        };
+        if !exists {
+            let now = seconds_since_epoch();
+            let mut inserted = row.clone();
+            inserted.owner_generation = UNOWNED_GENERATION;
+            inserted.completed_at = Some(now);
+            inserted.heartbeat_at = now;
+            rows.insert(row.backup_arn.clone(), inserted);
+        }
+        Box::pin(async move { Ok(!exists) })
+    }
+
+    /// The backends' registration: under the backup row's lock the row must
+    /// be AVAILABLE (else `Backup not found`) and not in use (else
+    /// `BackupInUse`), the name free (else `TableAlreadyExists`, or
+    /// `TableBeingRestored` for a CREATING restore target); then the target
+    /// CREATING with its `RestoreSummary` and the record RUNNING under a
+    /// fresh generation, `heartbeat_at` now, in one step.
+    fn claim_restore<'a>(
+        &'a self,
+        account_id: &'a str,
+        input: CreateTableInput,
+        registration: &'a RestoreRegistrationRow,
+    ) -> BoxedFuture<'a, Result<(TableDescription, Box<dyn JobClaim>), StorageError>> {
+        self.restore_claims
+            .lock()
+            .unwrap()
+            .push((account_id.to_owned(), input.clone()));
+        if let Some(e) = self.claim_restore_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(e) });
+        }
+        let delay = *self.claim_restore_delay.lock().unwrap();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.register_restore(account_id, input, registration)
+        })
+    }
+
+    /// The takeover: a RUNNING manifest record whose table id is in the
+    /// `restore_dead` set gets a fresh generation, the claimant's
+    /// `spool_host` and a fresh `heartbeat_at` (so a second taker finds it
+    /// live at once); anything else is `None`.
+    fn claim_restore_dead<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+        _stale_after: Duration,
+        spool_host: Option<&'a str>,
+    ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        let dead = self.restore_dead.lock().unwrap().contains(&key.table_id);
+        let mut records = self.restore_jobs.lock().unwrap();
+        let claim = match records.get_mut(&key.table_id) {
+            Some(record)
+                if dead
+                    && record.status == JobStatus::Running
+                    && record.kind == RestoreKind::Manifest =>
+            {
+                record.owner_generation = new_generation();
+                record.spool_host = spool_host.map(str::to_owned);
+                record.heartbeat_at = seconds_since_epoch();
+                let generation = record.owner_generation;
+                if self
+                    .takeover_removes_record
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    records.remove(&key.table_id);
+                }
+                drop(records);
+                self.restore_takeovers
+                    .lock()
+                    .unwrap()
+                    .push((key.table_id.clone(), spool_host.map(str::to_owned)));
+                if let Some(hook) = self.takeover_hook.lock().unwrap().take() {
+                    hook(self);
+                }
+                Some(self.restore_claim_on(&key.table_id, generation))
+            }
+            _ => None,
+        };
+        Box::pin(async move { Ok(claim) })
+    }
+
+    fn read_restore_job<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+        let delay = *self.read_restore_job_delay.lock().unwrap();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(self
+                .restore_jobs
+                .lock()
+                .unwrap()
+                .get(&key.table_id)
+                .cloned())
+        })
+    }
+
+    fn list_restore_jobs<'a>(
+        &'a self,
+        status: Option<JobStatus>,
+    ) -> BoxedFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
+        self.restore_lists.lock().unwrap().push(status);
+        if self
+            .restore_list_error
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(async {
+                Err(StorageError::Unsupported("not implemented".to_owned()))
+            });
+        }
+        let mut rows: Vec<RestoreJobRow> = self
+            .restore_jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| status.is_none_or(|s| r.status == s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.target.table_id.cmp(&b.target.table_id));
+        // The moment a registration can land between the sweep's two reads:
+        // after the reconciler read the RUNNING records and before its spool
+        // listing uses them. The reconciler lists the spool first, so the
+        // entry a registration opens after this read is not in that listing
+        // and is never a sweep candidate; the hook plants such a
+        // registration so the test fails if the two reads are swapped.
+        if let Some(hook) = self.sweep_hook.lock().unwrap().take() {
+            hook(self);
+        }
+        let delay = *self.list_jobs_delay.lock().unwrap();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(rows)
+        })
+    }
+
+    /// The takeover: a CREATING row whose ARN is in the `dead` set gets a
+    /// fresh generation, `heartbeat_at` untouched; anything else is `None`.
+    fn claim_dead_backup<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+        let mut rows = self.rows.lock().unwrap();
+        let dead = if self
+            .dead_by_heartbeat
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let cutoff = seconds_since_epoch() + *self.catalog_clock_offset_secs.lock().unwrap()
+                - stale_after.as_secs_f64();
+            rows.get(&key.backup_arn)
+                .is_some_and(|row| row.heartbeat_at < cutoff)
+        } else {
+            self.dead.lock().unwrap().contains(&key.backup_arn)
+        };
+        let claim = match rows.get_mut(&key.backup_arn) {
+            Some(row) if dead && row.status == BackupStatus::Creating => {
+                row.owner_generation = new_generation();
+                let generation = row.owner_generation;
+                if self
+                    .takeover_lost_to_another
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    row.owner_generation = new_generation();
+                }
+                drop(rows);
+                self.takeovers.lock().unwrap().push(key.backup_arn.clone());
+                Some(self.claim_on(&key.backup_arn, generation))
+            }
+            _ => None,
+        };
+        Box::pin(async move { Ok(claim) })
+    }
+
+    fn sweep_restore_registrations(&self) -> BoxedFuture<'_, Result<Vec<String>, StorageError>> {
+        let swept = self.swept_registrations.lock().unwrap().clone();
+        Box::pin(async move { Ok(swept) })
+    }
+
+    /// The backend's listing: rows of the store (kind, root and id), of the
+    /// status when given, in (`created_at`, `backup_arn`) order.
     fn list_backup_rows<'a>(
         &'a self,
-        _status: Option<BackupStatus>,
-        _store: &'a StoreIdentity,
+        status: Option<BackupStatus>,
+        store: &'a StoreIdentity,
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
-        Box::pin(futures::stream::empty())
+        self.row_listings.lock().unwrap().push(status);
+        if let Some(e) = self.list_error.lock().unwrap().clone() {
+            return Box::pin(futures::stream::once(async move {
+                Err(StorageError::Internal(e))
+            }));
+        }
+        let mut rows: Vec<BackupRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.store == *store)
+            .filter(|r| status.is_none_or(|s| r.status == s))
+            .filter(|r| !self.unlisted.lock().unwrap().contains(&r.backup_arn))
+            .filter(|r| self.stale_entry(r).is_none())
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .total_cmp(&b.created_at)
+                .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+        });
+        Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
+    }
+
+    /// The backend's listing of a root: rows of the kind and root, whatever
+    /// their id, of the status when given, in the order `list_backup_rows`
+    /// uses; `unlisted` rows and `list_error` as there.
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        if self
+            .by_root_error_after_rewrite
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self.rewrites_seen.lock().unwrap().is_empty()
+        {
+            return Box::pin(futures::stream::once(async {
+                Err(StorageError::Internal(
+                    "the root's listing failed".to_owned(),
+                ))
+            }));
+        }
+        if let Some(e) = self.list_error.lock().unwrap().clone() {
+            return Box::pin(futures::stream::once(async move {
+                Err(StorageError::Internal(e))
+            }));
+        }
+        if self.by_root_error_for.lock().unwrap().as_deref() == Some(store_root) {
+            return Box::pin(futures::stream::once(async {
+                Err(StorageError::Internal(
+                    "the root's listing failed".to_owned(),
+                ))
+            }));
+        }
+        let mut rows: Vec<BackupRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.store.store_kind == store_kind && r.store.store_root == store_root)
+            .filter(|r| status.is_none_or(|s| r.status == s))
+            .filter(|r| !self.unlisted.lock().unwrap().contains(&r.backup_arn))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .total_cmp(&b.created_at)
+                .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+        });
+        Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
+    }
+
+    /// The backends' rewrite: `lands_before_rewrite` lands first; then each
+    /// key's row that is still of the old kind and root and not CREATING
+    /// gets the new store, counted, until `fail_rewrite_after` rows are
+    /// rewritten, when the call fails with the rest left.
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        let call = {
+            let mut seen = self.rewrites_seen.lock().unwrap();
+            seen.push((from_kind, from_root.to_owned(), keys.to_vec(), to.clone()));
+            seen.len()
+        };
+        let sleep = self
+            .rewrite_sleep
+            .lock()
+            .unwrap()
+            .filter(|(n, _)| *n == call)
+            .map(|(_, d)| d);
+        let mut rows = self.rows.lock().unwrap();
+        for landed in self.lands_before_rewrite.lock().unwrap().drain(..) {
+            rows.insert(landed.backup_arn.clone(), landed);
+        }
+        for removed in self.removed_before_rewrite.lock().unwrap().drain(..) {
+            rows.remove(&removed);
+        }
+        let limit = *self.fail_rewrite_after.lock().unwrap();
+        let mut rewritten = 0_usize;
+        for key in keys {
+            let Some(row) = rows.get_mut(&key.backup_arn) else {
+                continue;
+            };
+            if row.account_id != key.account_id
+                || row.store.store_kind != from_kind
+                || row.store.store_root != from_root
+                || row.status == BackupStatus::Creating
+            {
+                continue;
+            }
+            if limit.is_some_and(|limit| rewritten >= limit) {
+                return Box::pin(async move {
+                    Err(StorageError::Internal(format!(
+                        "the rewrite stopped after {rewritten} rows"
+                    )))
+                });
+            }
+            row.store = to.clone();
+            rewritten += 1;
+        }
+        Box::pin(async move {
+            if let Some(d) = sleep {
+                tokio::time::sleep(d).await;
+            }
+            Ok(rewritten as u64)
+        })
+    }
+
+    fn rewrite_store_runs_key_by_key(&self) -> bool {
+        self.rewrites_key_by_key
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// One count per store and status of the rows, sorted as the backends
+    /// sort them.
+    fn summarize_store_roots(&self) -> BoxedFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        let mut seen: Vec<(StoreIdentity, BackupStatus)> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| (r.store.clone(), self.stale_entry(r).unwrap_or(r.status)))
+            .collect();
+        seen.extend(self.orphan_entries.lock().unwrap().iter().cloned());
+        let counts = StoreRootCount::tally(seen);
+        Box::pin(async move { Ok(counts) })
+    }
+
+    fn summary_counts_status_entries(&self) -> bool {
+        self.counts_entries
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Delete the root's entries of `orphan_entries`, and settle its
+    /// `stale_entries`: repaired while the row is of the root under
+    /// another status, removed once it is gone or names another store.
+    fn remove_orphan_status_entries<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxedFuture<'a, Result<StatusEntrySweep, StorageError>> {
+        let at_root = |store: &StoreIdentity| {
+            store.store_kind == store_kind && store.store_root == store_root
+        };
+        let mut sweep = StatusEntrySweep::default();
+        let mut entries = self.orphan_entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|(store, _)| !at_root(store));
+        sweep.removed = (before - entries.len()) as u64;
+        drop(entries);
+        let rows = self.rows.lock().unwrap();
+        self.stale_entries
+            .lock()
+            .unwrap()
+            .retain(|arn, (entry, _, store)| {
+                if !at_root(store) {
+                    return true;
+                }
+                match rows.get(arn) {
+                    Some(row) if at_root(&row.store) => {
+                        if row.status != *entry {
+                            sweep.repaired += 1;
+                        }
+                    }
+                    _ => sweep.removed += 1,
+                }
+                false
+            });
+        Box::pin(async move { Ok(sweep) })
+    }
+
+    /// The last AVAILABLE row of the store in the listing's order, read as
+    /// one row; `list_error` fails it as it fails the listing.
+    fn newest_available_backup_row<'a>(
+        &'a self,
+        store: &'a StoreIdentity,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        self.newest_reads.lock().unwrap().push(store.clone());
+        if let Some(e) = self.list_error.lock().unwrap().clone() {
+            return Box::pin(async move { Err(StorageError::Internal(e)) });
+        }
+        let newest = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.store == *store && r.status == BackupStatus::Available)
+            .max_by(|a, b| {
+                a.created_at
+                    .total_cmp(&b.created_at)
+                    .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+            })
+            .cloned();
+        Box::pin(async move { Ok(newest) })
     }
 
     fn list_account_backup_rows<'a>(
@@ -207,20 +2334,50 @@ impl BackupCatalog for Fake {
     }
 
     /// The backend's rule: the row of (account, id), and only when its
-    /// account, table and ARN equal the request's.
+    /// account, table and ARN equal the request's; with `unique_by_arn`,
+    /// the row of (account, ARN), as Cassandra keys it.
     fn read_backup_row<'a>(
         &'a self,
         arn: &'a BackupArn,
     ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
         self.row_reads.lock().unwrap().push(arn.to_arn_string());
+        if let Some(e) = self.read_row_error.lock().unwrap().clone() {
+            return Box::pin(async move { Err(StorageError::Internal(e)) });
+        }
+        if self
+            .read_row_error_after_rewrite
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self.rewrites_seen.lock().unwrap().is_empty()
+        {
+            return Box::pin(async { Err(StorageError::Internal("read timed out".to_owned())) });
+        }
+        let by_arn = self
+            .unique_by_arn
+            .load(std::sync::atomic::Ordering::Acquire);
         let found = self
             .rows
             .lock()
             .unwrap()
             .values()
-            .find(|r| r.account_id == arn.account_id() && r.backup_id == arn.backup_id())
+            .find(|r| {
+                r.account_id == arn.account_id()
+                    && if by_arn {
+                        r.backup_arn == arn.to_arn_string()
+                    } else {
+                        r.backup_id == arn.backup_id()
+                    }
+            })
             .filter(|r| r.table_name == arn.table_name() && r.backup_arn == arn.to_arn_string())
             .cloned();
+        let mut hook = self.after_row_read.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(a, _)| *a == arn.to_arn_string())
+        {
+            let (_, run) = hook.take().expect("checked");
+            drop(hook);
+            run(self);
+        }
         Box::pin(async move { Ok(found) })
     }
 
@@ -235,12 +2392,17 @@ impl BackupCatalog for Fake {
             .unwrap()
             .get(&key.backup_arn)
             .cloned();
-        let status = self
-            .rows
-            .lock()
-            .unwrap()
-            .get(&key.backup_arn)
-            .map(|r| r.status);
+        let mut rows = self.rows.lock().unwrap();
+        let status = rows.get(&key.backup_arn).map(|r| r.status);
+        // The natural answer moves an AVAILABLE row to DELETING, as the
+        // backends do; a preset answer leaves the row as the test set it.
+        if answer.is_none()
+            && status == Some(BackupStatus::Available)
+            && let Some(row) = rows.get_mut(&key.backup_arn)
+        {
+            row.status = BackupStatus::Deleting;
+        }
+        drop(rows);
         Box::pin(async move {
             match (answer, status) {
                 (Some(answer), _) => Ok(answer),
@@ -251,42 +2413,288 @@ impl BackupCatalog for Fake {
         })
     }
 
+    /// DELETING to DELETED, conditional, as the backends do.
     fn set_backup_deleted<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
-        unused()
+        let moved = match self.rows.lock().unwrap().get_mut(&key.backup_arn) {
+            Some(row) if row.status == BackupStatus::Deleting => {
+                row.status = BackupStatus::Deleted;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.set_deleted
+                .lock()
+                .unwrap()
+                .push(key.backup_arn.clone());
+        }
+        Box::pin(async move { Ok(moved) })
     }
 
+    /// Remove a DELETED or FAILED tombstone still of the store given, as
+    /// the backends do.
     fn remove_backup_row<'a>(
         &'a self,
-        _key: &'a BackupKey,
+        key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
-        unused()
+        self.remove_attempts
+            .lock()
+            .unwrap()
+            .push(key.backup_arn.clone());
+        if let Some(delay) = *self.remove_delay.lock().unwrap() {
+            return Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                *self.remove_delay.lock().unwrap() = None;
+                self.remove_backup_row(key, store_kind, store_root).await
+            });
+        }
+        let mut rows = self.rows.lock().unwrap();
+        let removed = match rows.get(&key.backup_arn) {
+            Some(row)
+                if matches!(row.status, BackupStatus::Deleted | BackupStatus::Failed)
+                    && row.store.store_kind == store_kind
+                    && row.store.store_root == store_root =>
+            {
+                rows.remove(&key.backup_arn);
+                true
+            }
+            _ => false,
+        };
+        if removed {
+            self.removed_rows
+                .lock()
+                .unwrap()
+                .push(key.backup_arn.clone());
+        }
+        Box::pin(async move { Ok(removed) })
     }
 
+    /// The backends' outright removal, without the in-use rule; preset
+    /// `InUse` answers stand for it. A preset answer in `forget_answers`
+    /// leaves the row as the test set it; otherwise an AVAILABLE row goes,
+    /// another status is answered, and a missing row is `Backup not found`.
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxedFuture<'a, Result<ForgetRow, StorageError>> {
+        self.forgets_seen.lock().unwrap().push(key.clone());
+        let answer = self
+            .forget_answers
+            .lock()
+            .unwrap()
+            .get(&key.backup_arn)
+            .cloned();
+        let mut rows = self.rows.lock().unwrap();
+        let status = rows.get(&key.backup_arn).map(|r| r.status);
+        if answer.is_none() && status == Some(BackupStatus::Available) {
+            rows.remove(&key.backup_arn);
+        }
+        drop(rows);
+        Box::pin(async move {
+            match (answer, status) {
+                (Some(answer), _) => Ok(answer),
+                (None, Some(BackupStatus::Available)) => Ok(ForgetRow::Removed),
+                (None, Some(status)) => Ok(ForgetRow::Status(status)),
+                (None, None) => Err(StorageError::Validation("Backup not found: x".to_owned())),
+            }
+        })
+    }
+
+    /// Remove a CREATING row whose heartbeat is older than `stale_after`
+    /// (on this process's clock, which stands for the catalog's here).
+    fn remove_dead_creating_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+        stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let mut rows = self.rows.lock().unwrap();
+        let removed = match rows.get(&key.backup_arn) {
+            Some(row)
+                if row.status == BackupStatus::Creating
+                    && row.heartbeat_at < now - stale_after.as_secs_f64() =>
+            {
+                rows.remove(&key.backup_arn);
+                true
+            }
+            _ => false,
+        };
+        Box::pin(async move { Ok(removed) })
+    }
+
+    /// The backends' listing on the named clock, the catalog's being this
+    /// process's moved by `catalog_clock_offset_secs`: rows of the store
+    /// with `status` whose `heartbeat_at`, or `completed_at` when set, is
+    /// older than `age`.
+    fn list_backup_rows_older_than<'a>(
+        &'a self,
+        status: BackupStatus,
+        store: &'a StoreIdentity,
+        clock: StaleClock,
+        age: Duration,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        if let Some(e) = self.older_than_error.lock().unwrap().clone() {
+            return Box::pin(futures::stream::once(async move {
+                Err(StorageError::Internal(e))
+            }));
+        }
+        let cutoff = seconds_since_epoch() + *self.catalog_clock_offset_secs.lock().unwrap()
+            - age.as_secs_f64();
+        let mut rows: Vec<BackupRow> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.store == *store && r.status == status)
+            .filter(|r| match clock {
+                StaleClock::Heartbeat => r.heartbeat_at < cutoff,
+                StaleClock::Completed => r.completed_at.is_some_and(|c| c < cutoff),
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .total_cmp(&b.created_at)
+                .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+        });
+        let mut hook = self.after_older_than.lock().unwrap();
+        if hook
+            .as_ref()
+            .is_some_and(|(s, c, _)| *s == status && *c == clock)
+        {
+            let (_, _, run) = hook.take().expect("checked");
+            drop(hook);
+            run(self);
+        }
+        Box::pin(futures::stream::iter(rows.into_iter().map(Ok)))
+    }
+
+    /// The preset answer, or the name of a CREATING restore target the
+    /// `Fake` registered from the backup.
     fn backup_in_use<'a>(
         &'a self,
         key: &'a BackupKey,
     ) -> BoxedFuture<'a, Result<Option<String>, StorageError>> {
-        let found = self.in_use.lock().unwrap().get(&key.backup_arn).cloned();
+        let found = self
+            .in_use
+            .lock()
+            .unwrap()
+            .get(&key.backup_arn)
+            .cloned()
+            .or_else(|| {
+                let jobs = self.restore_jobs.lock().unwrap();
+                self.restore_tables
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, t)| !t.active)
+                    .find(|(id, _)| {
+                        jobs.get(*id)
+                            .is_some_and(|j| j.source_backup_arn == key.backup_arn)
+                    })
+                    .map(|(_, t)| t.name.clone())
+            });
         Box::pin(async move { Ok(found) })
     }
 
+    /// A target the `Fake` registered is removed with its record and its
+    /// progress rows when it is still CREATING; any other key answers the
+    /// preset `target_still_creating`.
     fn remove_restore_target<'a>(
         &'a self,
         key: &'a RestoreTargetKey,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
         self.removed_targets.lock().unwrap().push(key.clone());
-        let answer = *self.target_still_creating.lock().unwrap();
+        let mut targets = self.restore_tables.lock().unwrap();
+        let answer = match targets.get(&key.table_id) {
+            Some(target) if !target.active && target.name == key.table_name => {
+                let target = targets.remove(&key.table_id).expect("present");
+                self.tables.lock().unwrap().remove(&target.name);
+                self.restore_jobs.lock().unwrap().remove(&key.table_id);
+                self.progress_rows.lock().unwrap().remove(&key.table_id);
+                true
+            }
+            Some(_) => false,
+            // The table is no longer a CREATING restore target with this id:
+            // its record went with it (the flip wrote DONE, the removal took
+            // both), so a re-read finds it changed or gone.
+            None => {
+                let still = *self.target_still_creating.lock().unwrap();
+                if !still {
+                    self.restore_jobs.lock().unwrap().remove(&key.table_id);
+                }
+                still
+            }
+        };
         Box::pin(async move { Ok(answer) })
     }
 
+    /// The command's removal: refused, nothing removed, while a test holds
+    /// the owner's lock (`owner_lock_held`); otherwise `remove_restore_target`.
+    fn remove_restore_target_exclusive<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        if *self.owner_lock_held.lock().unwrap() {
+            return Box::pin(async { Ok(false) });
+        }
+        self.remove_restore_target(key)
+    }
+
+    /// The preset `dead_jobs`, plus the `Fake`'s own records that the
+    /// backends' rule would list: RUNNING ones in the `restore_dead` set, and
+    /// FAILED ones whose target is still CREATING.
     fn list_dead_restore_jobs(
         &self,
         _stale_after: Duration,
     ) -> BoxedFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
-        let jobs = self.dead_jobs.lock().unwrap().clone();
+        if let Some(token) = self.cancel_on_list_dead.lock().unwrap().take() {
+            token.cancel();
+        }
+        let mut jobs = self.dead_jobs.lock().unwrap().clone();
+        let dead = self.restore_dead.lock().unwrap();
+        let targets = self.restore_tables.lock().unwrap();
+        let mut own: Vec<RestoreJobRow> = self
+            .restore_jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| match r.status {
+                JobStatus::Running => dead.contains(&r.target.table_id),
+                JobStatus::Failed => targets.get(&r.target.table_id).is_some_and(|t| !t.active),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        own.sort_by(|a, b| a.target.table_id.cmp(&b.target.table_id));
+        jobs.extend(own);
+        Box::pin(async move { Ok(jobs) })
+    }
+
+    /// A RUNNING record of the `Fake`'s own is FAILED with the reason; any
+    /// other key answers the preset `record_still_running`.
+    /// The RUNNING records of `dead_jobs` and every record of
+    /// `running_jobs`, by status, whatever their heartbeat.
+    fn list_running_restore_jobs(
+        &self,
+    ) -> BoxedFuture<'_, Result<Vec<RestoreJobRow>, StorageError>> {
+        let mut jobs: Vec<RestoreJobRow> = self
+            .dead_jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| j.status == extenddb_storage::backup_catalog::JobStatus::Running)
+            .cloned()
+            .collect();
+        jobs.extend(self.running_jobs.lock().unwrap().iter().cloned());
         Box::pin(async move { Ok(jobs) })
     }
 
@@ -305,7 +2713,10 @@ impl BackupCatalog for Fake {
             .lock()
             .unwrap()
             .push((key.clone(), reason.to_owned()));
-        let current = self
+        // The fence: the write matches only the claim the listing read
+        // (`owner_generation`, `heartbeat_at`), a beat that landed since
+        // (`heartbeat_after_listing`) making it miss.
+        let listed = self
             .dead_jobs
             .lock()
             .unwrap()
@@ -313,23 +2724,715 @@ impl BackupCatalog for Fake {
             .find(|j| j.target == *key)
             .map(|j| (j.owner_generation, j.heartbeat_at));
         let beat = self.heartbeat_after_listing.lock().unwrap().remove(key);
-        let answer = *self.record_still_running.lock().unwrap()
-            && current.is_some_and(|(generation, heartbeat)| {
-                generation == owner_generation && beat.unwrap_or(heartbeat) == heartbeat_at
-            });
+        let fence_holds = |generation: u64, heartbeat: f64| {
+            generation == owner_generation && beat.unwrap_or(heartbeat) == heartbeat_at
+        };
+        let answer = match self.restore_jobs.lock().unwrap().get_mut(&key.table_id) {
+            Some(record) if record.status == JobStatus::Running => {
+                if fence_holds(record.owner_generation, record.heartbeat_at) {
+                    record.status = JobStatus::Failed;
+                    record.failure_reason = Some(reason.to_owned());
+                    record.completed_at = Some(seconds_since_epoch());
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(_) => false,
+            None => {
+                *self.record_still_running.lock().unwrap()
+                    && listed
+                        .is_some_and(|(generation, heartbeat)| fence_holds(generation, heartbeat))
+            }
+        };
         Box::pin(async move { Ok(answer) })
     }
 
-    fn check_maintenance_claim(&self) -> BoxedFuture<'_, Result<bool, StorageError>> {
-        *self.maintenance_checks.lock().unwrap() += 1;
-        let held = *self.maintenance_held.lock().unwrap();
+    fn read_store_ids<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxedFuture<'a, Result<Vec<String>, StorageError>> {
+        let mut ids: Vec<String> = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| row.store.store_kind == store_kind && row.store.store_root == store_root)
+            .map(|row| row.store.store_id.clone())
+            .collect();
+        ids.extend(
+            self.orphan_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(store, _)| {
+                    store.store_kind == store_kind && store.store_root == store_root
+                })
+                .map(|(store, _)| store.store_id.clone()),
+        );
+        ids.extend(
+            self.late_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .chain(
+                    self.stale_entries
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .map(|(_, _, s)| s),
+                )
+                .filter(|store| store.store_kind == store_kind && store.store_root == store_root)
+                .map(|store| store.store_id.clone()),
+        );
+        ids.sort();
+        ids.dedup();
+        Box::pin(async move { Ok(ids) })
+    }
+
+    /// A claim on the `Fake`'s maintenance record: refused naming the holder
+    /// while `maintenance_claim_held_by` names one, else a `FakeHolder` the
+    /// test keeps a handle on.
+    fn maintenance_claim<'a>(
+        &'a self,
+        holder: &'a str,
+        _stale_after: Duration,
+    ) -> BoxedFuture<'a, Result<Box<dyn extenddb_storage::MaintenanceClaim>, StorageError>> {
+        if let Some(live) = self.maintenance_claim_held_by.lock().unwrap().clone() {
+            return Box::pin(async move {
+                Err(StorageError::AlreadyExists(format!(
+                    "the maintenance claim is held by {live:?}"
+                )))
+            });
+        }
+        let fake = Arc::new(FakeHolder::default());
+        *fake.lost.lock().unwrap() = *self.next_claim_lost.lock().unwrap();
+        self.maintenance_holders
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&fake));
+        *self.maintenance_claim_held_by.lock().unwrap() = Some(holder.to_owned());
+        let claim: Box<dyn extenddb_storage::MaintenanceClaim> = Box::new(ReleasingForward(
+            Arc::clone(&self.maintenance_claim_held_by),
+            fake,
+        ));
+        Box::pin(async move { Ok(claim) })
+    }
+
+    fn check_maintenance_claim(
+        &self,
+        stale_after: Duration,
+    ) -> BoxedFuture<'_, Result<bool, StorageError>> {
+        let checks = {
+            let mut checks = self.maintenance_checks.lock().unwrap();
+            checks.push(stale_after);
+            checks.len()
+        };
+        let held = match *self.maintenance_beat_age.lock().unwrap() {
+            Some(age) => age < stale_after,
+            None => *self.maintenance_held.lock().unwrap(),
+        };
         let error = self.maintenance_error.lock().unwrap().clone();
+        let mut hook = self.after_maintenance_check.lock().unwrap();
+        if hook.as_ref().is_some_and(|(n, _)| *n == checks) {
+            let (_, run) = hook.take().expect("checked");
+            drop(hook);
+            run(self);
+        }
+        let delay = *self.maintenance_delay.lock().unwrap();
         Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             match error {
                 Some(e) => Err(StorageError::Internal(e)),
                 None => Ok(held),
             }
         })
+    }
+}
+
+impl RestoreEngine for Fake {
+    /// The backends' load: under the claim's generation and RUNNING, the
+    /// stream read whole; an `Err` item fails the file with nothing applied;
+    /// a key the target holds fails the file unless the file is
+    /// `reapplying`, where the duplicate is skipped; the progress recorded
+    /// on the record as SQLite records it (`file_index`, the running total).
+    fn bulk_load<'a>(
+        &'a self,
+        target: &'a RestoreTargetKey,
+        claim: &'a dyn JobClaim,
+        file: BulkLoadFile,
+        items: BoxStream<'a, Result<Item, StorageError>>,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            self.bulk_loads_started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let gate = self.bulk_load_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire()
+                    .await
+                    .expect("the gate is never closed")
+                    .forget();
+            }
+            let mut call = BulkLoadCall {
+                table_id: target.table_id.clone(),
+                file,
+                items: Vec::new(),
+                stream_error: None,
+            };
+            let mut items = items;
+            let mut failed = None;
+            let item_gate = self.bulk_load_item_gate.lock().unwrap().clone();
+            loop {
+                if let Some(gate) = &item_gate {
+                    gate.acquire()
+                        .await
+                        .expect("the gate is never closed")
+                        .forget();
+                }
+                let Some(next) = items.next().await else {
+                    break;
+                };
+                match next {
+                    Ok(item) => {
+                        self.bulk_load_items_seen
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        call.items.push(item);
+                    }
+                    Err(e) => {
+                        call.stream_error = Some(e.to_string());
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            let streamed = std::mem::take(&mut call.items);
+            call.items.clone_from(&streamed);
+            self.bulk_loads.lock().unwrap().push(call);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            let owned = self
+                .restore_jobs
+                .lock()
+                .unwrap()
+                .get(&target.table_id)
+                .is_some_and(|r| {
+                    r.owner_generation == claim.generation() && r.status == JobStatus::Running
+                });
+            if !owned {
+                return Err(StorageError::Internal(
+                    "the restore record is not RUNNING under this claim".to_owned(),
+                ));
+            }
+            let mut targets = self.restore_tables.lock().unwrap();
+            let Some(table) = targets.get_mut(&target.table_id) else {
+                return Err(StorageError::TableNotFound(target.table_name.clone()));
+            };
+            let mut keys: std::collections::HashSet<String> = table
+                .items
+                .iter()
+                .map(|i| Fake::item_key(&table.key_attributes, i))
+                .collect();
+            let mut applied = 0;
+            for item in streamed {
+                let key = Fake::item_key(&table.key_attributes, &item);
+                if !keys.insert(key.clone()) {
+                    if file.reapplying {
+                        continue;
+                    }
+                    return Err(StorageError::Validation(format!(
+                        "holds a primary key the target already has (the backup holds a key \
+                         twice): {key}"
+                    )));
+                }
+                table.items.push(item);
+                applied += 1;
+            }
+            drop(targets);
+            if let Some(record) = self.restore_jobs.lock().unwrap().get_mut(&target.table_id) {
+                record.file_index = Some(file.file_index);
+                record.items_applied = Some(file.start_at + applied);
+            }
+            Ok(applied)
+        })
+    }
+
+    /// DONE and ACTIVE in one step under the claim's generation, RUNNING and
+    /// a CREATING target; `Pending` when the test says the backend's worker
+    /// flips the table. A queued `FinishError` makes the call fail, after
+    /// the flip landed or before anything was written.
+    fn finish_restore<'a>(
+        &'a self,
+        target: &'a RestoreTargetKey,
+        claim: &'a dyn JobClaim,
+        item_count: u64,
+        size_bytes: u64,
+    ) -> BoxedFuture<'a, Result<Finished, StorageError>> {
+        self.finish_sizes.lock().unwrap().push(size_bytes);
+        let error = self.finish_errors.lock().unwrap().pop_front();
+        if error == Some(FinishError::TakenAndDone)
+            && let Some(record) = self.restore_jobs.lock().unwrap().get_mut(&target.table_id)
+            && record.owner_generation == claim.generation()
+        {
+            record.owner_generation = new_generation();
+            record.status = JobStatus::Done;
+        }
+        if matches!(
+            error,
+            Some(FinishError::BeforeFlip | FinishError::TakenAndDone)
+        ) {
+            return Box::pin(async {
+                Err(StorageError::Internal(
+                    "the claim connection failed before the DONE write".to_owned(),
+                ))
+            });
+        }
+        let mut records = self.restore_jobs.lock().unwrap();
+        let mut targets = self.restore_tables.lock().unwrap();
+        let finished = match (
+            records.get_mut(&target.table_id),
+            targets.get_mut(&target.table_id),
+        ) {
+            (Some(record), Some(table))
+                if record.owner_generation == claim.generation()
+                    && record.status == JobStatus::Running
+                    && !table.active =>
+            {
+                record.status = JobStatus::Done;
+                record.completed_at = Some(seconds_since_epoch());
+                let pending = self
+                    .finish_pending
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if !pending {
+                    table.active = true;
+                    if let Some(desc) = self.tables.lock().unwrap().get_mut(&table.name) {
+                        desc.table_status = TableStatus::Active;
+                        desc.item_count = i64::try_from(item_count).unwrap_or(i64::MAX);
+                        for gsi in desc.global_secondary_indexes.iter_mut().flatten() {
+                            gsi.index_status = "ACTIVE".to_owned();
+                        }
+                    }
+                }
+                self.progress_rows.lock().unwrap().remove(&target.table_id);
+                if pending {
+                    Finished::Pending
+                } else {
+                    Finished::Active
+                }
+            }
+            (Some(record), _) => Finished::NotMatched(format!(
+                "the record is {} under generation {} (the claim's is {})",
+                record.status,
+                record.owner_generation,
+                claim.generation()
+            )),
+            (None, _) => Finished::NotMatched("the record is gone".to_owned()),
+        };
+        Box::pin(async move {
+            if error == Some(FinishError::AfterFlip) {
+                return Err(StorageError::Internal(
+                    "the data pool failed after the flip's commit".to_owned(),
+                ));
+            }
+            Ok(finished)
+        })
+    }
+
+    fn count_restore_target<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        self.count_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let gate = self.count_gate.lock().unwrap().clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.acquire()
+                    .await
+                    .expect("the gate is never closed")
+                    .forget();
+            }
+            // Take one error from the budget, if any is left: a
+            // compare-exchange loop, since `fetch_update` is deprecated on
+            // current stable and its replacement is not on 1.88.
+            let mut left = self.count_errors.load(std::sync::atomic::Ordering::Acquire);
+            while let Some(next) = left.checked_sub(1) {
+                match self.count_errors.compare_exchange(
+                    left,
+                    next,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return Err(StorageError::Internal(
+                            "count restore target: the read timed out".to_owned(),
+                        ));
+                    }
+                    Err(now) => left = now,
+                }
+            }
+            match *self.count_override.lock().unwrap() {
+                Some(count) => Ok(count),
+                None => self
+                    .restore_tables
+                    .lock()
+                    .unwrap()
+                    .get(&key.table_id)
+                    .map(|t| t.items.len() as u64)
+                    .ok_or_else(|| StorageError::TableNotFound(key.table_name.clone())),
+            }
+        })
+    }
+
+    fn read_restore_progress<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<Vec<(u32, u64)>, StorageError>> {
+        let rows = self
+            .progress_rows
+            .lock()
+            .unwrap()
+            .get(&key.table_id)
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { Ok(rows) })
+    }
+
+    fn restore_target_ready<'a>(
+        &'a self,
+        key: &'a RestoreTargetKey,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        // The record must name a restore target with this id, as the
+        // backends' catalog read requires; a target the test put in
+        // `targets_without_tables` is one whose data DDL never ran (the
+        // owner died between the registration's commit and the DDL).
+        let known = self
+            .restore_jobs
+            .lock()
+            .unwrap()
+            .contains_key(&key.table_id);
+        let ready = !self
+            .targets_without_tables
+            .lock()
+            .unwrap()
+            .contains(&key.table_id);
+        let table_name = key.table_name.clone();
+        let table_id = key.table_id.clone();
+        Box::pin(async move {
+            if known {
+                Ok(ready)
+            } else {
+                Err(StorageError::TableNotFound(format!(
+                    "{table_name} is not a CREATING restore target with table id {table_id}"
+                )))
+            }
+        })
+    }
+
+    fn sweep_restore_progress<'a>(
+        &'a self,
+        running: &'a [String],
+    ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+        self.progress_sweeps.lock().unwrap().push(running.to_vec());
+        let mut rows = self.progress_rows.lock().unwrap();
+        let before = rows.len();
+        rows.retain(|id, _| running.contains(id));
+        let removed = (before - rows.len()) as u64;
+        Box::pin(async move { Ok(removed) })
+    }
+}
+
+/// A vector-search engine the `Fake` hands out when it stands for a target
+/// with vector support; never searched.
+struct CapableVectorSearch;
+
+impl extenddb_storage::VectorSearchEngine for CapableVectorSearch {
+    fn search_vectors(
+        &self,
+        _req: extenddb_storage::VectorSearch<'_>,
+    ) -> BoxedFuture<'_, extenddb_storage::VectorSearchResult> {
+        unused()
+    }
+}
+
+static CAPABLE_VECTOR_SEARCH: CapableVectorSearch = CapableVectorSearch;
+
+/// The restore's vector gate reads `as_vector_search`; nothing else of the
+/// data plane is used by these tests.
+impl DataEngine for Fake {
+    fn put_item(
+        &self,
+        _: &TableKeyInfo,
+        _: Item,
+        _: bool,
+        _: Option<&extenddb_core::expression::Expr>,
+        _: &extenddb_core::expression::ExpressionMaps,
+        _: Option<&extenddb_storage::StreamCapture>,
+    ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
+        unused()
+    }
+
+    fn get_item(
+        &self,
+        _: &TableKeyInfo,
+        _: &Item,
+    ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
+        unused()
+    }
+
+    fn delete_item(
+        &self,
+        _: &TableKeyInfo,
+        _: &Item,
+        _: bool,
+        _: Option<&extenddb_core::expression::Expr>,
+        _: &extenddb_core::expression::ExpressionMaps,
+        _: Option<&extenddb_storage::StreamCapture>,
+    ) -> BoxedFuture<'_, Result<Option<Item>, StorageError>> {
+        unused()
+    }
+
+    fn update_item(
+        &self,
+        _: &TableKeyInfo,
+        _: &Item,
+        _: &[extenddb_core::expression::UpdateAction],
+        _: bool,
+        _: bool,
+        _: Option<&extenddb_core::expression::Expr>,
+        _: &extenddb_core::expression::ExpressionMaps,
+        _: Option<&extenddb_storage::StreamCapture>,
+    ) -> BoxedFuture<'_, extenddb_storage::ItemPairResult> {
+        unused()
+    }
+
+    fn query(
+        &self,
+        _: &TableKeyInfo,
+        _: &extenddb_core::expression::KeyCondition,
+        _: &extenddb_core::expression::ExpressionMaps,
+        _: bool,
+        _: Option<i64>,
+        _: Option<&Item>,
+        _: Option<&str>,
+    ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
+        unused()
+    }
+
+    fn scan(
+        &self,
+        _: &TableKeyInfo,
+        _: Option<i64>,
+        _: Option<&Item>,
+        _: Option<i64>,
+        _: Option<i64>,
+        _: Option<&str>,
+    ) -> BoxedFuture<'_, extenddb_storage::QueryResult> {
+        unused()
+    }
+
+    fn scan_key_in_segment(
+        &self,
+        _: &TableKeyInfo,
+        _: &Item,
+        _: i64,
+        _: i64,
+        _: Option<&str>,
+    ) -> BoxedFuture<'_, Result<bool, StorageError>> {
+        unused()
+    }
+
+    fn as_vector_search(&self) -> Option<&dyn extenddb_storage::VectorSearchEngine> {
+        self.vector_search
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(&CAPABLE_VECTOR_SEARCH)
+    }
+
+    fn transact_get_items(
+        &self,
+        _: &[extenddb_storage::TransactGetOp<'_>],
+    ) -> BoxedFuture<'_, Result<Vec<Option<Item>>, StorageError>> {
+        unused()
+    }
+
+    fn transact_write_items(
+        &self,
+        _: &[extenddb_storage::TransactWriteOp<'_>],
+        _: Option<extenddb_storage::IdempotencyKey<'_>>,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn cleanup_expired_idempotency_tokens(
+        &self,
+        _: i64,
+    ) -> BoxedFuture<'_, Result<u64, StorageError>> {
+        unused()
+    }
+}
+
+impl SnapshotEngine for Fake {
+    /// The fixture for the table, or `TableNotFound`; the description and
+    /// the items are the fixture's, in its order, through the gate when it
+    /// has one.
+    fn open_table_snapshot(
+        &self,
+        _account_id: &str,
+        table_name: &str,
+    ) -> BoxedFuture<'_, Result<TableSnapshot, StorageError>> {
+        self.snapshots_opened
+            .lock()
+            .unwrap()
+            .push(table_name.to_owned());
+        if let Some(e) = self.snapshot_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(e) });
+        }
+        let mut snapshots = self.snapshots.lock().unwrap();
+        let Some(fixture) = snapshots.get_mut(table_name) else {
+            let name = table_name.to_owned();
+            return Box::pin(async move {
+                Err(StorageError::TableNotFound(format!(
+                    "Table not found: {name}"
+                )))
+            });
+        };
+        let items = std::mem::take(&mut fixture.items);
+        let gate = fixture.gate.clone();
+        let snapshot = TableSnapshot {
+            description: fixture.description.clone(),
+            info: extenddb_core::backup_format::SnapshotDescriptor {
+                kind: "test".to_owned(),
+                marker: String::new(),
+            },
+            key_ordered: fixture.key_ordered,
+            items: Box::pin(futures::stream::unfold(
+                (items.into_iter(), gate),
+                |(mut items, gate)| async move {
+                    let next = items.next()?;
+                    if let Some(gate) = &gate {
+                        gate.acquire()
+                            .await
+                            .expect("the gate is never closed")
+                            .forget();
+                    }
+                    Some((next, (items, gate)))
+                },
+            )),
+        };
+        Box::pin(async move { Ok(snapshot) })
+    }
+}
+
+impl MetadataEngine for Fake {
+    fn describe_ttl(
+        &self,
+        _account_id: &str,
+        _table_name: &str,
+    ) -> BoxedFuture<'_, Result<TimeToLiveDescription, StorageError>> {
+        let ttl = self
+            .ttl
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(TimeToLiveDescription {
+                time_to_live_status: TimeToLiveStatus::Disabled,
+                attribute_name: None,
+            });
+        Box::pin(async move { Ok(ttl) })
+    }
+
+    fn update_ttl(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: bool,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn tag_resource(
+        &self,
+        _: &str,
+        _: &[extenddb_core::types::Tag],
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn untag_resource(&self, _: &str, _: &[String]) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn list_tags(
+        &self,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<Vec<extenddb_core::types::Tag>, StorageError>> {
+        unused()
+    }
+
+    fn tables_with_ttl(
+        &self,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<Vec<(String, String)>, StorageError>> {
+        unused()
+    }
+
+    fn all_tables_with_ttl(
+        &self,
+    ) -> BoxedFuture<'_, Result<Vec<extenddb_storage::TtlTableInfo>, StorageError>> {
+        unused()
+    }
+
+    fn all_tables_with_ttl_index_ready(
+        &self,
+    ) -> BoxedFuture<'_, Result<Vec<extenddb_storage::TtlTableInfo>, StorageError>> {
+        unused()
+    }
+
+    fn create_ttl_index(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn drop_ttl_index(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn find_expired_items_indexed(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: usize,
+    ) -> BoxedFuture<'_, Result<Vec<Item>, StorageError>> {
+        unused()
+    }
+
+    fn refresh_table_size(&self, _: &str, _: &str) -> BoxedFuture<'_, Result<(), StorageError>> {
+        unused()
+    }
+
+    fn list_active_table_names(
+        &self,
+        _: &str,
+    ) -> BoxedFuture<'_, Result<Vec<String>, StorageError>> {
+        unused()
+    }
+
+    fn all_active_tables(&self) -> BoxedFuture<'_, Result<Vec<(String, String)>, StorageError>> {
+        unused()
     }
 }
 
@@ -561,6 +3664,8 @@ fn described(request: &RestoreRequest) -> TableDescription {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: String::new(),
+                    warm_throughput: None,
+                    warm_throughput_record: None,
                 })
                 .collect()
         }),
@@ -606,6 +3711,7 @@ fn gsi(name: &str, pk: &str, pt: Option<ProvisionedThroughput>) -> GsiInput {
             non_key_attributes: None,
         },
         provisioned_throughput: pt,
+        warm_throughput: None,
     }
 }
 
@@ -669,14 +3775,23 @@ fn restore_body(extra: Value) -> Value {
     body
 }
 
-async fn restore(fake: &Fake, body: Value) -> Result<Value, DynamoDbError> {
+async fn restore(fake: &Arc<Fake>, body: Value) -> Result<Value, DynamoDbError> {
+    restore_on(fake, &runtime(), &body).await
+}
+
+/// `restore` on `runtime` rather than the tests' default one.
+async fn restore_on(
+    fake: &Arc<Fake>,
+    runtime: &BackupRuntime,
+    body: &Value,
+) -> Result<Value, DynamoDbError> {
     restore_table_from_backup(
         fake,
-        &runtime(),
+        runtime,
         ACCOUNT,
         REGION,
         &LimitsConfig::default(),
-        &body,
+        body,
     )
     .await
     .map(|(_, v)| v)
@@ -944,7 +4059,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 
     // DescribeBackup: canonical not found, as written found.
     let fake = with_stored();
-    let desc = describe_backup(&fake, ACCOUNT, REGION, &spellings)
+    let desc = describe_backup(&*fake, ACCOUNT, REGION, &spellings)
         .await
         .unwrap();
     assert_eq!(desc.backup_details.backup_status, "AVAILABLE");
@@ -968,7 +4083,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 
     // DeleteBackup: the full description, and the stored row is gone.
     let fake = with_stored();
-    let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
+    let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &spellings)
         .await
         .unwrap();
     assert_eq!(deleted.backup_details.backup_status, "DELETED");
@@ -992,7 +4107,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
         .unwrap();
     assert_eq!(fake.restores()[0].backup_arn, ours);
     assert_eq!(fake.source_reads(), 1);
-    let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
+    let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &spellings)
         .await
         .unwrap();
     assert_eq!(deleted.backup_details.backup_status, "DELETED");
@@ -1001,7 +4116,7 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
 
     // Neither spelling: BackupNotFoundException from the backend, after both
     // were tried; the server's own spelling is tried once.
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     for (body, reads) in [(stored.clone(), 2), (ours.clone(), 1)] {
         let before = fake.source_reads();
         let err = restore(&fake, restore_body(json!({ "BackupArn": body })))
@@ -1013,13 +4128,13 @@ async fn a_backup_stored_under_another_region_resolves_as_written() {
         );
         assert_eq!(fake.source_reads() - before, reads);
         assert!(matches!(
-            describe_backup(&fake, ACCOUNT, REGION, &own(&body))
+            describe_backup(&*fake, ACCOUNT, REGION, &own(&body))
                 .await
                 .unwrap_err(),
             DynamoDbError::BackupNotFoundException(_)
         ));
         assert!(matches!(
-            delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&body))
+            delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&body))
                 .await
                 .unwrap_err(),
             DynamoDbError::BackupNotFoundException(_)
@@ -1107,7 +4222,11 @@ async fn a_restore_request_dropped_while_the_backup_is_read_still_restores() {
     use std::task::{Context, Waker};
 
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let mut fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    let mut fake = Fake::default();
+    fake.sources
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), source(Some(definition("PROVISIONED"))));
     fake.source_gate = Some(Arc::clone(&gate));
     let fake = Arc::new(fake);
 
@@ -1361,14 +4480,148 @@ fn lsi_entry() -> Value {
 }
 
 /// The target input of a restore of `src` with `body`'s overrides, or the
-/// engine's refusal.
+/// engine's refusal, through both paths: the legacy reader's, and the
+/// manifest path over a store-backed backup whose `source_table` is `src`'s
+/// definition (`manifest_from_source`). The two must agree (the same input,
+/// or the same refusal), so one list of override cases binds both; the
+/// manifest records the SSE *description*, not the specification a legacy
+/// definition keeps, so that member is compared only when an override set
+/// it. A source without a definition (pre-0.0.4) has no manifest form and
+/// runs the legacy path alone.
 async fn restored_input(
     src: BackupRestoreSource,
     body: Value,
 ) -> Result<CreateTableInput, DynamoDbError> {
-    let fake = Fake::with_source(src);
-    restore(&fake, restore_body(body)).await?;
-    Ok(fake.restores()[0].input.clone())
+    let fake = Fake::with_source(src.clone());
+    let legacy = restore(&fake, restore_body(body.clone()))
+        .await
+        .map(|_| fake.restores()[0].input.clone());
+    if legacy.is_err() {
+        assert!(
+            fake.restores().is_empty(),
+            "the legacy path reached storage for a refused {body}"
+        );
+    }
+    if src.definition.is_none() {
+        return legacy;
+    }
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let item: Item = src
+        .key_schema
+        .iter()
+        .map(|k| {
+            (
+                k.attribute_name.clone(),
+                extenddb_core::types::AttributeValue::S("a".to_owned()),
+            )
+        })
+        .collect();
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        manifest_from_source(&src),
+        &[vec![item]],
+        false,
+    );
+    let runtime = job_runtime(&mem);
+    let manifest = restore_on(&fake, &runtime, &restore_body(body.clone()))
+        .await
+        .map(|_| fake.restore_claims.lock().unwrap()[0].1.clone());
+    wait_for_jobs(&runtime).await;
+    // The manifest records the SSE description, from which the restore
+    // derives the enabled KMS specification, so the member is compared when
+    // the source had SSE enabled or an override set it; a legacy
+    // definition's disabled specification has no manifest form.
+    let source_sse_enabled = src
+        .definition
+        .as_ref()
+        .and_then(|d| d.sse_specification.as_ref())
+        .and_then(|sse| sse.get("Enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    match (&legacy, &manifest) {
+        (Ok(a), Ok(b)) => {
+            let mut a = a.clone();
+            let mut b = b.clone();
+            if body.get("SSESpecificationOverride").is_none() && !source_sse_enabled {
+                a.sse_specification = None;
+                b.sse_specification = None;
+            }
+            assert_eq!(a, b, "the two paths built different inputs for {body}");
+        }
+        (Err(a), Err(b)) => {
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "the two paths refused differently for {body}"
+            );
+            assert!(
+                fake.restore_claims.lock().unwrap().is_empty(),
+                "the manifest path registered a target it then refused for {body}"
+            );
+        }
+        (a, b) => panic!("the two paths disagree for {body}: legacy {a:?}, manifest {b:?}"),
+    }
+    legacy
+}
+
+/// A manifest's `source_table` for a legacy source with a definition: the
+/// same keys, indexes, billing and throughput, so the manifest path builds
+/// the input the legacy path builds.
+fn manifest_from_source(src: &BackupRestoreSource) -> SourceTableSchema {
+    let def = src.definition.as_ref().expect("a definition");
+    let sse_description = def
+        .sse_specification
+        .as_ref()
+        .filter(|s| s.get("Enabled").and_then(Value::as_bool) == Some(true))
+        .map(|_| extenddb_core::types::SseDescription {
+            status: "ENABLED".to_owned(),
+            sse_type: Some(extenddb_core::types::SseType::KMS),
+            kms_master_key_arn: None,
+        });
+    SourceTableSchema {
+        table_name: src.source_table_name.clone(),
+        table_id: src.source_table_id.clone(),
+        table_arn: src.source_table_arn.clone(),
+        table_creation_date_time: src.table_creation_date_time,
+        key_schema: src.key_schema.clone(),
+        attribute_definitions: src.attribute_definitions.clone(),
+        billing_mode: if def.billing_mode == "PAY_PER_REQUEST" {
+            BillingMode::PayPerRequest
+        } else {
+            BillingMode::Provisioned
+        },
+        provisioned_throughput: def.provisioned_throughput.clone(),
+        on_demand_throughput: def.on_demand_throughput.clone(),
+        table_class: def.table_class.clone(),
+        sse_description,
+        global_secondary_indexes: def
+            .global_secondary_indexes
+            .iter()
+            .map(|g| extenddb_core::backup_format::BackupGsi {
+                index_name: g.index_name.clone(),
+                key_schema: g.key_schema.clone(),
+                projection: g.projection.clone(),
+                provisioned_throughput: g.provisioned_throughput.clone(),
+            })
+            .collect(),
+        local_secondary_indexes: def
+            .local_secondary_indexes
+            .iter()
+            .map(|l| extenddb_core::backup_format::BackupLsi {
+                index_name: l.index_name.clone(),
+                key_schema: l.key_schema.clone(),
+                projection: l.projection.clone(),
+            })
+            .collect(),
+        vector_indexes: None,
+        stream_specification: None,
+        time_to_live: None,
+        item_count: src.item_count,
+        table_size_bytes: src.table_size_bytes,
+    }
 }
 
 /// The attribute names `input` defines.
@@ -1706,11 +4959,13 @@ async fn index_overrides_the_service_refuses_are_refused() {
              BillingMode is PAY_PER_REQUEST",
         ),
         (
-            "a member ExtendDB cannot apply",
+            "a warm throughput on a GSI entry",
             json!({ "GlobalSecondaryIndexOverride": [entry_with(
                 "WarmThroughput", json!({ "ReadUnitsPerSecond": 12000 }),
             )] }),
-            "index gsi1: member WarmThroughput is not supported",
+            // Row S6d, whole: the service's own sentence.
+            "One or more parameter values were invalid: WarmThroughput is not supported on \
+             Global Secondary Indexes via RestoreTableFromBackup",
         ),
         (
             "an LSI member ExtendDB cannot apply",
@@ -1744,10 +4999,12 @@ async fn index_overrides_the_service_refuses_are_refused() {
         ),
     ];
     for (what, body, expect) in cases {
-        let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
-        let msg = validation_message(restore(&fake, restore_body(body)).await.unwrap_err());
+        let msg = validation_message(
+            restored_input(source(Some(definition("PROVISIONED"))), body)
+                .await
+                .unwrap_err(),
+        );
         assert!(msg.contains(expect), "{what}: {msg}");
-        assert!(fake.restores().is_empty(), "{what}: reached storage");
     }
 
     // A legacy backup restores no index, so any listed one is not in it; an
@@ -1836,17 +5093,17 @@ async fn a_provisioned_restore_needs_each_gsis_throughput_overridden() {
         ),
     ];
     for (what, def, body) in refused {
-        let fake = Fake::with_source(source(Some(def)));
-        let msg = validation_message(restore(&fake, restore_body(body)).await.unwrap_err());
+        let msg = validation_message(restored_input(source(Some(def)), body).await.unwrap_err());
         assert_eq!(msg, expected, "{what}");
-        assert!(fake.restores().is_empty(), "{what}: reached storage");
     }
     // The first GSI of two is the one named.
-    let fake = Fake::with_source(source(Some(two_gsis("PAY_PER_REQUEST"))));
     let msg = validation_message(
-        restore(&fake, restore_body(provisioned.clone()))
-            .await
-            .unwrap_err(),
+        restored_input(
+            source(Some(two_gsis("PAY_PER_REQUEST"))),
+            provisioned.clone(),
+        )
+        .await
+        .unwrap_err(),
     );
     assert_eq!(msg, expected);
 
@@ -2046,19 +5303,32 @@ async fn table_class_is_not_restored() {
     assert_eq!(input.table_class, None);
 }
 
+/// A source with SSE enabled restores with an enabled KMS specification on
+/// both paths: the legacy definition carries the specification, the
+/// manifest the description it was derived from.
+#[tokio::test]
+async fn an_enabled_sse_source_restores_sse_on_both_paths() {
+    let mut def = definition("PROVISIONED");
+    def.sse_specification = Some(json!({ "Enabled": true, "SSEType": "KMS" }));
+    let input = restored_input(source(Some(def)), json!({})).await.unwrap();
+    assert_eq!(
+        input.sse_specification,
+        Some(json!({ "Enabled": true, "SSEType": "KMS" }))
+    );
+}
+
 #[tokio::test]
 async fn sse_override_replaces_the_recorded_specification() {
     let mut def = definition("PROVISIONED");
     def.sse_specification = Some(json!({ "Enabled": false }));
-    let fake = Fake::with_source(source(Some(def)));
     let sse = json!({ "Enabled": true, "SSEType": "KMS", "KMSMasterKeyId": "alias/k" });
-    restore(
-        &fake,
-        restore_body(json!({ "SSESpecificationOverride": sse })),
+    let input = restored_input(
+        source(Some(def)),
+        json!({ "SSESpecificationOverride": sse }),
     )
     .await
     .unwrap();
-    assert_eq!(fake.restores()[0].input.sse_specification, Some(sse));
+    assert_eq!(input.sse_specification, Some(sse));
 
     // A legacy backup takes the override too.
     let fake = Fake::with_source(source(None));
@@ -2083,14 +5353,10 @@ async fn sse_override_replaces_the_recorded_specification() {
 #[tokio::test]
 async fn billing_overrides_shape_the_restore_input() {
     // PROVISIONED -> PAY_PER_REQUEST drops table and GSI throughput.
-    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
-    let out = restore(
-        &fake,
-        restore_body(json!({ "BillingModeOverride": "PAY_PER_REQUEST" })),
-    )
-    .await
-    .unwrap();
-    let input = &fake.restores()[0].input;
+    let body = json!({ "BillingModeOverride": "PAY_PER_REQUEST" });
+    let input = restored_input(source(Some(definition("PROVISIONED"))), body.clone())
+        .await
+        .unwrap();
     assert_eq!(input.billing_mode, Some(BillingMode::PayPerRequest));
     assert!(input.provisioned_throughput.is_none());
     assert!(
@@ -2098,6 +5364,9 @@ async fn billing_overrides_shape_the_restore_input() {
             .provisioned_throughput
             .is_none()
     );
+    // The response zeros the throughput of an on-demand table and index.
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    let out = restore(&fake, restore_body(body)).await.unwrap();
     let td = &out["TableDescription"];
     assert_eq!(td["ProvisionedThroughput"]["ReadCapacityUnits"], 0);
     assert_eq!(
@@ -2106,16 +5375,14 @@ async fn billing_overrides_shape_the_restore_input() {
     );
 
     // A throughput override on a PROVISIONED backup replaces the table's.
-    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
-    restore(
-        &fake,
-        restore_body(json!({
+    let input = restored_input(
+        source(Some(definition("PROVISIONED"))),
+        json!({
             "ProvisionedThroughputOverride": { "ReadCapacityUnits": 11, "WriteCapacityUnits": 12 },
-        })),
+        }),
     )
     .await
     .unwrap();
-    let input = &fake.restores()[0].input;
     assert_eq!(input.provisioned_throughput, Some(throughput(11, 12)));
     assert_eq!(
         input.global_secondary_indexes.as_ref().unwrap()[0].provisioned_throughput,
@@ -2123,28 +5390,25 @@ async fn billing_overrides_shape_the_restore_input() {
     );
 
     // A throughput override on an on-demand backup without a billing override.
-    let fake = Fake::with_source(source(Some(definition("PAY_PER_REQUEST"))));
-    let err = restore(
-        &fake,
-        restore_body(json!({
+    let err = restored_input(
+        source(Some(definition("PAY_PER_REQUEST"))),
+        json!({
             "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 },
-        })),
+        }),
     )
     .await
     .unwrap_err();
     assert!(validation_message(err).contains("can only be specified"));
-    assert!(fake.restores().is_empty());
 }
 
 #[tokio::test]
 async fn provisioned_override_on_an_on_demand_gsi_has_the_services_text() {
-    let fake = Fake::with_source(source(Some(definition("PAY_PER_REQUEST"))));
-    let err = restore(
-        &fake,
-        restore_body(json!({
+    let err = restored_input(
+        source(Some(definition("PAY_PER_REQUEST"))),
+        json!({
             "BillingModeOverride": "PROVISIONED",
             "ProvisionedThroughputOverride": { "ReadCapacityUnits": 5, "WriteCapacityUnits": 5 },
-        })),
+        }),
     )
     .await
     .unwrap_err();
@@ -2153,12 +5417,11 @@ async fn provisioned_override_on_an_on_demand_gsi_has_the_services_text() {
         "Invalid Request: Must override ProvisionedThroughput if BillingMode is overridden to \
          PROVISIONED for index gsi1"
     );
-    assert!(fake.restores().is_empty());
 }
 
 #[tokio::test]
 async fn override_shape_is_refused_before_any_storage_read() {
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     let err = restore(
         &fake,
         restore_body(json!({ "BillingModeOverride": "PROVISIONED" })),
@@ -2167,6 +5430,15 @@ async fn override_shape_is_refused_before_any_storage_read() {
     .unwrap_err();
     assert!(validation_message(err).contains("ProvisionedThroughputOverride must"));
     assert_eq!(fake.source_reads(), 0);
+    // The manifest path refuses the shape the same way, before any store or
+    // row read.
+    let err = restored_input(
+        source(Some(definition("PROVISIONED"))),
+        json!({ "BillingModeOverride": "PROVISIONED" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(validation_message(err).contains("ProvisionedThroughputOverride must"));
 }
 
 // --- refusals and validation --------------------------------------------------
@@ -2178,23 +5450,6 @@ async fn multi_part_key_backups_are_refused_in_the_engine() {
     let fake = Fake::with_source(src);
     let msg = validation_message(restore(&fake, restore_body(json!({}))).await.unwrap_err());
     assert!(msg.contains("multi-part key"), "{msg}");
-    assert!(fake.restores().is_empty());
-}
-
-#[tokio::test]
-async fn vector_index_backups_are_refused_in_the_engine() {
-    let mut def = definition("PAY_PER_REQUEST");
-    def.vector_index_names.push("v".to_owned());
-    let fake = Fake::with_source(source(Some(def)));
-    let msg = validation_message(restore(&fake, restore_body(json!({}))).await.unwrap_err());
-    assert!(msg.contains("vector index"), "{msg}");
-    assert!(fake.restores().is_empty());
-
-    let mut legacy = source(None);
-    legacy.legacy_vector_index_count = 1;
-    let fake = Fake::with_source(legacy);
-    let msg = validation_message(restore(&fake, restore_body(json!({}))).await.unwrap_err());
-    assert!(msg.contains("vector index"), "{msg}");
     assert!(fake.restores().is_empty());
 }
 
@@ -2338,7 +5593,7 @@ async fn a_table_create_table_accepted_restores() {
 
 #[tokio::test]
 async fn a_missing_backup_is_backup_not_found() {
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     assert!(matches!(
         restore(&fake, restore_body(json!({}))).await.unwrap_err(),
         DynamoDbError::BackupNotFoundException(_)
@@ -2707,7 +5962,7 @@ async fn name_lengths_are_counted_in_characters_and_table_names_take_the_limits(
     );
     let fake = fake_with_summaries(vec![]);
     list_backups(
-        &fake,
+        &*fake,
         ACCOUNT,
         REGION,
         &raised,
@@ -2727,7 +5982,7 @@ async fn name_lengths_are_counted_in_characters_and_table_names_take_the_limits(
     assert!(msg.contains("length less than or equal to 255"), "{msg}");
     let msg = validation_message(
         list_backups(
-            &fake,
+            &*fake,
             ACCOUNT,
             REGION,
             &limits(),
@@ -2880,7 +6135,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         let on_demand = def.billing_mode == "PAY_PER_REQUEST";
         let fake = fake_with_backup("AVAILABLE", source(Some(def)));
         let described = describe(&fake).await;
-        let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap();
         let deleted = serde_json::to_value(deleted).unwrap();
@@ -2907,7 +6162,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         assert_eq!(deleted, expected);
         // The backup is gone.
         assert!(matches!(
-            delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+            delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
                 .await
                 .unwrap_err(),
             DynamoDbError::BackupNotFoundException(_)
@@ -2928,7 +6183,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
         let what = format!("{err:?}");
         let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
         *fake.source_error.lock().unwrap() = Some(err);
-        let deleted = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        let deleted = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(deleted.backup_details.backup_status, "DELETED", "{what}");
@@ -2949,7 +6204,7 @@ async fn delete_backup_answers_the_full_description_as_deleted() {
     let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
     *fake.source_error.lock().unwrap() = Some(StorageError::Connection("refused".to_owned()));
     assert!(matches!(
-        delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_err(),
         DynamoDbError::InternalServerError(_)
@@ -3028,7 +6283,7 @@ fn backup_description(status: &str, billing: &str) -> BackupDescription {
     }
 }
 
-fn fake_with_backup(status: &str, src: BackupRestoreSource) -> Fake {
+fn fake_with_backup(status: &str, src: BackupRestoreSource) -> Arc<Fake> {
     let billing = src.billing_mode.clone();
     let fake = Fake::with_source(src);
     fake.descriptions
@@ -3172,7 +6427,7 @@ async fn describe_backup_survives_a_definition_that_does_not_read() {
         let what = format!("{err:?}");
         let fake = fake_with_backup("AVAILABLE", source(Some(definition("PROVISIONED"))));
         *fake.source_error.lock().unwrap() = Some(err);
-        let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn_text))
+        let desc = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn_text))
             .await
             .unwrap_or_else(|e| panic!("{what}: {e:?}"));
         assert_eq!(fake.source_reads(), 1, "{what}");
@@ -3198,7 +6453,7 @@ async fn describe_backup_survives_a_definition_that_does_not_read() {
         *fake.source_error.lock().unwrap() = Some(err);
         // The backup operations' mapping reports both as a 500
         // (`storage_err_to_dynamo` in backup.rs), which SDKs retry.
-        match describe_backup(&fake, ACCOUNT, REGION, &own(&arn_text)).await {
+        match describe_backup(&*fake, ACCOUNT, REGION, &own(&arn_text)).await {
             Err(DynamoDbError::InternalServerError(_)) => {}
             other => panic!("{what} must reach the client as an error: {other:?}"),
         }
@@ -3246,8 +6501,8 @@ fn summary(n: u64, millis: u64) -> BackupSummary {
     }
 }
 
-fn fake_with_summaries(summaries: Vec<BackupSummary>) -> Fake {
-    let fake = Fake::default();
+fn fake_with_summaries(summaries: Vec<BackupSummary>) -> Arc<Fake> {
+    let fake = Arc::new(Fake::default());
     *fake.summaries.lock().unwrap() = summaries;
     fake
 }
@@ -3691,8 +6946,8 @@ fn music_arn(account: &str, id: &str) -> String {
     format!("arn:aws:dynamodb:{REGION}:{account}:table/Music/backup/{id}")
 }
 
-fn fake_with_row(status: BackupStatus) -> Fake {
-    let fake = Fake::default();
+fn fake_with_row(status: BackupStatus) -> Arc<Fake> {
+    let fake = Arc::new(Fake::default());
     fake.rows
         .lock()
         .unwrap()
@@ -3701,7 +6956,7 @@ fn fake_with_row(status: BackupStatus) -> Fake {
 }
 
 fn runtime_with_store() -> BackupRuntime {
-    runtime().with_store(store())
+    runtime_on(&Arc::new(MemStore::default()), store())
 }
 
 /// DescribeBackup answers from the catalog row when one exists, derived from
@@ -3714,7 +6969,7 @@ async fn describe_backup_reads_the_catalog_row_first() {
         arn(ACCOUNT),
         backup_description("AVAILABLE", "PAY_PER_REQUEST"),
     );
-    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+    let desc = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
         .await
         .unwrap();
     assert_eq!(desc.backup_details.backup_name, "music-nightly");
@@ -3746,13 +7001,13 @@ async fn describe_backup_reads_the_catalog_row_first() {
 #[tokio::test]
 async fn describe_backup_maps_the_row_status() {
     let fake = fake_with_row(BackupStatus::Creating);
-    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+    let desc = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
         .await
         .unwrap();
     assert_eq!(desc.backup_details.backup_status, "CREATING");
 
     let fake = fake_with_row(BackupStatus::Deleting);
-    let desc = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+    let desc = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
         .await
         .unwrap();
     assert_eq!(desc.backup_details.backup_status, "DELETED");
@@ -3763,7 +7018,7 @@ async fn describe_backup_maps_the_row_status() {
             .lock()
             .unwrap()
             .insert(arn(ACCOUNT), backup_description("AVAILABLE", "PROVISIONED"));
-        let err = describe_backup(&fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        let err = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_err();
         assert!(
@@ -3782,7 +7037,7 @@ async fn describe_backup_of_another_accounts_id_is_not_found() {
     const OTHER: &str = "999999999999";
     let fake = fake_with_row(BackupStatus::Available);
     let other = own_for(&music_arn(OTHER, "01791976431438-73d8d5bc"), OTHER);
-    let err = describe_backup(&fake, OTHER, REGION, &other)
+    let err = describe_backup(&*fake, OTHER, REGION, &other)
         .await
         .unwrap_err();
     assert!(
@@ -3969,7 +7224,7 @@ async fn delete_backup_over_a_row_refuses_before_the_lock() {
     for status in [BackupStatus::Deleted, BackupStatus::Failed] {
         let fake = fake_with_row(status);
         let err = delete_backup(
-            &fake,
+            &*fake,
             &runtime_with_store(),
             ACCOUNT,
             REGION,
@@ -3985,7 +7240,7 @@ async fn delete_backup_over_a_row_refuses_before_the_lock() {
     }
     let fake = fake_with_row(BackupStatus::Creating);
     let err = delete_backup(
-        &fake,
+        &*fake,
         &runtime_with_store(),
         ACCOUNT,
         REGION,
@@ -4002,7 +7257,7 @@ async fn delete_backup_over_a_row_refuses_before_the_lock() {
     // No store configured: every row is a row of another store.
     let fake = fake_with_row(BackupStatus::Available);
     let msg = validation_message(
-        delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
             .await
             .unwrap_err(),
     );
@@ -4025,7 +7280,7 @@ async fn delete_backup_over_a_row_refuses_before_the_lock() {
         .lock()
         .unwrap()
         .insert(arn(ACCOUNT), "Earlier".to_owned());
-    let err = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+    let err = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
         .await
         .unwrap_err();
     assert!(
@@ -4046,7 +7301,7 @@ async fn delete_backup_over_a_row_refuses_before_the_lock() {
 async fn delete_backup_over_a_row_runs_the_in_use_check_under_the_lock() {
     let fake = fake_with_row(BackupStatus::Available);
     let desc = delete_backup(
-        &fake,
+        &*fake,
         &runtime_with_store(),
         ACCOUNT,
         REGION,
@@ -4067,7 +7322,7 @@ async fn delete_backup_over_a_row_runs_the_in_use_check_under_the_lock() {
 
     let fake = fake_with_row(BackupStatus::Deleting);
     let desc = delete_backup(
-        &fake,
+        &*fake,
         &runtime_with_store(),
         ACCOUNT,
         REGION,
@@ -4104,7 +7359,7 @@ async fn delete_backup_over_a_row_runs_the_in_use_check_under_the_lock() {
             .unwrap()
             .insert(arn(ACCOUNT), answer.clone());
         let err = delete_backup(
-            &fake,
+            &*fake,
             &runtime_with_store(),
             ACCOUNT,
             REGION,
@@ -4138,7 +7393,7 @@ async fn delete_backup_over_a_row_runs_the_in_use_check_under_the_lock() {
         .unwrap()
         .insert(arn(ACCOUNT), DeleteStart::Status(BackupStatus::Available));
     let err = delete_backup(
-        &fake,
+        &*fake,
         &runtime_with_store(),
         ACCOUNT,
         REGION,
@@ -4246,7 +7501,7 @@ async fn a_backup_of_a_name_the_store_prefix_refuses_resolves_through_the_legacy
             .unwrap()
             .insert(legacy_arn.clone(), description);
 
-        let desc = describe_backup(&fake, ACCOUNT, REGION, &spellings)
+        let desc = describe_backup(&*fake, ACCOUNT, REGION, &spellings)
             .await
             .unwrap();
         assert_eq!(desc.backup_details.backup_arn, legacy_arn);
@@ -4271,7 +7526,7 @@ async fn a_backup_of_a_name_the_store_prefix_refuses_resolves_through_the_legacy
         assert_eq!(fake.restores().len(), 1);
         assert_eq!(fake.restores()[0].backup_arn, legacy_arn);
 
-        let desc = delete_backup(&fake, &runtime(), ACCOUNT, REGION, &spellings)
+        let desc = delete_backup(&*fake, &runtime(), ACCOUNT, REGION, &spellings)
             .await
             .unwrap();
         assert_eq!(desc.backup_details.backup_status, "DELETED");
@@ -4292,14 +7547,14 @@ async fn a_backup_of_a_name_the_store_prefix_refuses_resolves_through_the_legacy
 /// or not the row is of the configured store (the in-use check runs before
 /// the other-store check, as the delete's does); a row
 /// of another store is a ValidationException, with no store configured and
-/// with a different one configured; and an AVAILABLE row of the
-/// configured store is refused by this release. The runtime has no free
-/// slot, so a permit taken anywhere before the row's refusal, even one
-/// dropped again, would turn the refusal into LimitExceeded; the legacy
-/// reader is never reached.
+/// with a different one configured; and an AVAILABLE row of the healthy
+/// configured store passes to the permit, the next check, with no store
+/// read. The runtime has no free slot, so a permit taken anywhere before a
+/// row's refusal, even one dropped again, would turn the refusal into
+/// LimitExceeded; the legacy reader is never reached.
 #[tokio::test]
 async fn restore_over_a_row_refuses_before_the_permit() {
-    async fn check(fake: Fake, runtime: &BackupRuntime) -> DynamoDbError {
+    async fn check(fake: Arc<Fake>, runtime: &BackupRuntime) -> DynamoDbError {
         assert_eq!(runtime.free_slots(), 0, "every slot is held");
         let err = restore_table_from_backup(
             &fake,
@@ -4319,8 +7574,15 @@ async fn restore_over_a_row_refuses_before_the_permit() {
         assert!(fake.restores().is_empty());
         err
     }
+    let configured_mem = Arc::new(MemStore::default());
     let configured = BackupRuntime::new(1)
-        .with_store(store())
+        .with_store(ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&configured_mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        ))
         .with_permit_wait(Duration::ZERO);
     let _held_configured = JobPermit::try_acquire(configured.slots()).unwrap();
     let none = BackupRuntime::new(1).with_permit_wait(Duration::ZERO);
@@ -4365,17 +7627,44 @@ async fn restore_over_a_row_refuses_before_the_permit() {
         matches!(err, DynamoDbError::BackupInUseException(ref m) if m.contains("another table")),
         "the in-use check runs before the other-store check: {err:?}"
     );
-    let msg = validation_message(check(fake_with_row(BackupStatus::Available), &configured).await);
-    assert!(msg.contains("in-catalog backups only"), "{msg}");
+    // An AVAILABLE row of the healthy configured store passes the row checks:
+    // the permit is the next check, before any store read, so with every
+    // slot held the request is LimitExceeded and the store saw no get.
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = restore_table_from_backup(
+        &fake,
+        &configured,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        &restore_body(json!({})),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(_)),
+        "the permit is the check after the row's: {err:?}"
+    );
+    assert!(
+        configured_mem.gets().is_empty(),
+        "no store read before the permit"
+    );
+    assert!(fake.restore_claims.lock().unwrap().is_empty());
     let msg = validation_message(check(fake_with_row(BackupStatus::Available), &none).await);
     assert!(msg.contains("store other than"), "{msg}");
     // A configured store that is not the row's: the row is of another store,
     // not of "the" store because one is configured.
     let other = BackupRuntime::new(1)
-        .with_store(StoreIdentity {
-            store_id: "store-2".to_owned(),
-            ..store()
-        })
+        .with_store(ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::new(MemStore::default()) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(StoreIdentity {
+                store_id: "store-2".to_owned(),
+                ..store()
+            }),
+        ))
         .with_permit_wait(Duration::ZERO);
     let _held_other = JobPermit::try_acquire(other.slots()).unwrap();
     let msg = validation_message(check(fake_with_row(BackupStatus::Available), &other).await);
@@ -4392,7 +7681,7 @@ async fn restore_over_a_row_refuses_before_the_permit() {
 #[tokio::test]
 async fn restore_takes_the_permit_last() {
     async fn restore_with(
-        fake: &Fake,
+        fake: &Arc<Fake>,
         runtime: &BackupRuntime,
     ) -> Result<(String, Value), DynamoDbError> {
         let body = restore_body(json!({}));
@@ -4430,7 +7719,7 @@ async fn restore_takes_the_permit_last() {
 
     // A refusal earlier in the order takes no slot: a missing backup.
     let runtime = BackupRuntime::new(1);
-    let empty = Fake::default();
+    let empty = Arc::new(Fake::default());
     let err = restore_with(&empty, &runtime).await.unwrap_err();
     assert!(
         matches!(err, DynamoDbError::BackupNotFoundException(_)),
@@ -4479,7 +7768,7 @@ async fn restore_checks_the_target_name_after_the_backup_and_before_the_permit()
             ..Default::default()
         }
     }
-    async fn check(fake: Fake, target: TableDescription) -> (Fake, DynamoDbError) {
+    async fn check(fake: Arc<Fake>, target: TableDescription) -> (Arc<Fake>, DynamoDbError) {
         let full = BackupRuntime::new(1).with_permit_wait(Duration::ZERO);
         let _held = full.take_permit().await.unwrap();
         fake.tables
@@ -4540,7 +7829,7 @@ async fn restore_checks_the_target_name_after_the_backup_and_before_the_permit()
     // The backup missing: BackupNotFound whatever the target's state, and
     // the name is never read.
     for (i, target) in targets.iter().enumerate() {
-        let (fake, err) = check(Fake::default(), target.clone()).await;
+        let (fake, err) = check(Arc::new(Fake::default()), target.clone()).await;
         assert!(
             matches!(err, DynamoDbError::BackupNotFoundException(ref m)
                 if *m == format!("Backup not found: {}", arn(ACCOUNT))),
@@ -4650,13 +7939,14 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
     };
     let full = BackupRuntime::new(1).with_permit_wait(Duration::ZERO);
     let _held = full.take_permit().await.unwrap();
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
 
     let err = create_backup(
         &fake,
         &full,
         ACCOUNT,
         REGION,
+        &LimitsConfig::default(),
         "Music",
         "nightly",
         Err(StorageError::TableNotFound("Music".to_owned())),
@@ -4676,6 +7966,7 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
         &full,
         ACCOUNT,
         REGION,
+        &LimitsConfig::default(),
         "Music",
         "nightly",
         Ok(creating),
@@ -4718,6 +8009,7 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
             &full,
             ACCOUNT,
             REGION,
+            &LimitsConfig::default(),
             "Music",
             "nightly",
             Ok(with_vectors),
@@ -4732,6 +8024,7 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
         &full,
         ACCOUNT,
         REGION,
+        &LimitsConfig::default(),
         "Music",
         "nightly",
         Ok(active.clone()),
@@ -4753,6 +8046,7 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
         &free,
         ACCOUNT,
         REGION,
+        &LimitsConfig::default(),
         "Music",
         "nightly",
         Ok(active),
@@ -4776,7 +8070,7 @@ async fn create_backup_checks_the_table_then_takes_the_permit_last() {
 /// no store prefix. The store-prefix rules belong to the store-backed writer.
 #[tokio::test]
 async fn create_backup_accepts_a_name_the_store_prefix_refuses() {
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     for name in ["x".repeat(256), "x".repeat(1024), "...".to_owned()] {
         let runtime = BackupRuntime::new(1);
         let desc = TableDescription {
@@ -4784,9 +8078,18 @@ async fn create_backup_accepts_a_name_the_store_prefix_refuses() {
             table_status: TableStatus::Active,
             ..Default::default()
         };
-        create_backup(&fake, &runtime, ACCOUNT, REGION, &name, "nightly", Ok(desc))
-            .await
-            .unwrap_or_else(|e| panic!("{name:?}: {e:?}"));
+        create_backup(
+            &fake,
+            &runtime,
+            ACCOUNT,
+            REGION,
+            &LimitsConfig::default(),
+            &name,
+            "nightly",
+            Ok(desc),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name:?}: {e:?}"));
         assert_eq!(runtime.free_slots(), 0, "the backend holds the slot");
     }
     let created: Vec<String> = fake
@@ -4802,6 +8105,55 @@ async fn create_backup_accepts_a_name_the_store_prefix_refuses() {
     );
 }
 
+/// The store-backed create applies the store-prefix rules the in-catalog one
+/// does not (`check_store_prefix_fits`): a name over 255 bytes or made only
+/// of dots fits no prefix, so it is refused before a snapshot is opened or a
+/// row is written, naming the rule (the length before the ARN is formed, so
+/// the limit is named whatever the length).
+#[tokio::test]
+async fn a_store_backed_create_refuses_a_name_no_store_prefix_can_carry() {
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    let runtime = job_runtime(&mem);
+    for (name, needle) in [
+        ("x".repeat(256), "256 bytes"),
+        ("x".repeat(1024), "1024 bytes"),
+        ("...".to_owned(), "only dots"),
+    ] {
+        let desc = TableDescription {
+            table_name: name.clone(),
+            table_status: TableStatus::Active,
+            ..Default::default()
+        };
+        let msg = validation_message(
+            create_backup(
+                &fake,
+                &runtime,
+                ACCOUNT,
+                REGION,
+                &LimitsConfig::default(),
+                &name,
+                "nightly",
+                Ok(desc),
+            )
+            .await
+            .unwrap_err(),
+        );
+        assert!(
+            msg.contains("cannot be backed up") && msg.contains(needle),
+            "{name:?}: {msg}"
+        );
+        assert!(!msg.contains("not a backup ARN"), "{msg}");
+    }
+    assert!(fake.rows.lock().unwrap().is_empty(), "no row was claimed");
+    assert_eq!(
+        mem.keys(),
+        [STORE_IDENTITY_KEY],
+        "nothing was written to the store but the identity file"
+    );
+    assert_eq!(runtime.free_slots(), 4, "no slot was taken");
+}
+
 /// Under a `server.region` outside `[a-z0-9-]` no backup ARN can be formed
 /// for any table, so CreateBackup is refused naming `server.region`, not the
 /// table name, before the permit (the runtime's one permit is held). The
@@ -4814,7 +8166,7 @@ async fn create_backup_accepts_a_name_the_store_prefix_refuses() {
 async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting() {
     let runtime = BackupRuntime::new(1).with_permit_wait(Duration::ZERO);
     let _held = runtime.take_permit().await.unwrap();
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     let desc = TableDescription {
         table_name: "Music".to_owned(),
         table_status: TableStatus::Active,
@@ -4826,6 +8178,7 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
             &runtime,
             ACCOUNT,
             "LOCAL",
+            &LimitsConfig::default(),
             "Music",
             "nightly",
             Ok(desc),
@@ -4852,7 +8205,7 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
         .unwrap()
         .insert(stored.clone(), row(&stored, BackupStatus::Available));
     let spellings = backup_arn_field(&json!({ "BackupArn": stored }), ACCOUNT, "LOCAL").unwrap();
-    let desc = describe_backup(&fake, ACCOUNT, "LOCAL", &spellings)
+    let desc = describe_backup(&*fake, ACCOUNT, "LOCAL", &spellings)
         .await
         .unwrap();
     assert_eq!(desc.backup_details.backup_arn, stored);
@@ -4873,30 +8226,561 @@ async fn create_backup_under_a_region_outside_the_arn_alphabet_names_the_setting
     assert_eq!(fake.row_reads.lock().unwrap().len(), 1, "no further read");
 }
 
+/// While a maintenance command holds the catalog's claim, CreateBackup and
+/// RestoreTableFromBackup are refused with LimitExceeded naming a maintenance command
+/// (generically: every maintenance command holds the same claim),
+/// after every other check (a missing table is still TableNotFound) and
+/// before the permit (no slot is taken, and the backend is not asked); once
+/// the claim is gone both run.
+#[tokio::test]
+async fn jobs_are_refused_while_a_maintenance_claim_is_held() {
+    let fake = Fake::with_source(source(Some(definition("PROVISIONED"))));
+    *fake.maintenance_held.lock().unwrap() = true;
+    let runtime = BackupRuntime::new(1).with_stale_job_after(Duration::from_secs(7));
+    let err = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds") && !m.contains("purge")),
+        "{err:?}"
+    );
+    assert!(fake.creates.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 1, "no slot was taken");
+    let err = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Err(StorageError::TableNotFound("Music".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableNotFoundException(_)),
+        "the table check comes first: {err:?}"
+    );
+
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds") && !m.contains("purge")),
+        "{err:?}"
+    );
+    assert!(fake.restores().is_empty(), "the backend was not asked");
+    assert_eq!(runtime.free_slots(), 1);
+    assert_eq!(
+        *fake.maintenance_checks.lock().unwrap(),
+        vec![Duration::from_secs(7); 2],
+        "the claim is read with stale_job_after_secs"
+    );
+
+    *fake.maintenance_held.lock().unwrap() = false;
+    create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap();
+    fake.permits.lock().unwrap().clear();
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(fake.creates.lock().unwrap().len(), 1);
+    assert_eq!(fake.restores().len(), 1);
+
+    // Before the permit: with every slot held and the claim held, the
+    // refusal names the maintenance claim, not the slot limit, so the check cannot
+    // have run after `take_permit`.
+    *fake.maintenance_held.lock().unwrap() = true;
+    let full = BackupRuntime::new(1).with_stale_job_after(Duration::from_secs(7));
+    let held_slot = full.take_permit().await.unwrap();
+    assert_eq!(full.free_slots(), 0, "every slot is held");
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds") && !m.contains("purge")),
+        "the claim is checked before the permit: {err:?}"
+    );
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds") && !m.contains("purge")),
+        "the claim is checked before the permit: {err:?}"
+    );
+    drop(held_slot);
+}
+
+// --- purge: the wait and the row deletion (`maintenance`) ----------------------
+
+/// A maintenance claim handle for `HeldClaim`: heartbeats confirm until
+/// `lost` is set.
+#[derive(Default)]
+struct FakeHolder {
+    lost: Mutex<bool>,
+    released: Mutex<bool>,
+}
+
+impl extenddb_storage::MaintenanceClaim for FakeHolder {
+    fn generation(&self) -> u64 {
+        11
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        let lost = *self.lost.lock().unwrap();
+        Box::pin(async move {
+            Ok(if lost {
+                extenddb_storage::backup_catalog::Heartbeat::Lost
+            } else {
+                extenddb_storage::backup_catalog::Heartbeat::Confirmed
+            })
+        })
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        *self.released.lock().unwrap() = true;
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A forwarding handle, so the test keeps its own reference to the holder.
+struct Forward(Arc<FakeHolder>);
+
+impl extenddb_storage::MaintenanceClaim for Forward {
+    fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        self.0.heartbeat()
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        self.0.release()
+    }
+}
+
+fn held(holder: &Arc<FakeHolder>) -> maintenance::HeldClaim {
+    maintenance::HeldClaim::start(
+        Box::new(Forward(Arc::clone(holder))),
+        Duration::from_secs(1),
+    )
+}
+
+/// A held claim whose heartbeats confirm, for the steps that re-check it.
+fn confirmed_claim() -> maintenance::HeldClaim {
+    held(&Arc::new(FakeHolder::default()))
+}
+
+/// The claim object the `Fake`'s `maintenance_claim` hands out: `Forward`
+/// whose release also frees the `Fake`'s record, so a second command may
+/// take the claim once the first released it.
+struct ReleasingForward(Arc<Mutex<Option<String>>>, Arc<FakeHolder>);
+
+impl extenddb_storage::MaintenanceClaim for ReleasingForward {
+    fn generation(&self) -> u64 {
+        self.1.generation()
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        self.1.heartbeat()
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        *self.0.lock().unwrap() = None;
+        self.1.release()
+    }
+}
+
+fn seconds_since_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// A row of `store()` under ARN `arn` in `status`, with a manifest and a
+/// data file under its prefix in `mem`.
+fn seed(fake: &Fake, mem: &MemStore, arn: &str, status: BackupStatus) {
+    let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+    mem.insert(&format!("{prefix}extenddb-manifest.json"), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"x");
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn.to_owned(), row(arn, status));
+}
+
+fn arn_n(n: u32) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/0179197643143{n}-0000000{n}")
+}
+
+/// The states a row can be in when purge reaches it after reading it
+/// AVAILABLE, a DeleteBackup having run meanwhile: still AVAILABLE; moved to
+/// DELETING (the other deleter mid-way); moved to DELETED (the other
+/// finished); gone (finished and its tombstone removed). Each ends with no
+/// row and no object, counted as deleted; a status that cannot follow
+/// AVAILABLE (FAILED) is the one case left for a look. A tombstone read
+/// and removed meanwhile (a second purge) counts as deleted too.
+#[tokio::test]
+async fn purge_finishes_a_row_another_deleter_moved_or_removed_meanwhile() {
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    let arns: Vec<String> = (1..=6).map(arn_n).collect();
+    for arn in &arns[..5] {
+        seed(&fake, &mem, arn, BackupStatus::Available);
+    }
+    // A DELETED tombstone the command read, whose prefix is already empty.
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arns[5].clone(), row(&arns[5], BackupStatus::Deleted));
+    // The command's read under the claim.
+    let read: Vec<BackupRow> = fake
+        .list_backup_rows(None, &store())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(read.len(), 6);
+    // Between the read and the rows' turns, DeleteBackup moves rows 2 and 3
+    // and finishes 4 (its tombstone removed too); a writer moves 5 to
+    // FAILED, which no DeleteBackup does; the tombstone 6 is removed by a
+    // second purge.
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        rows.get_mut(&arns[1]).unwrap().status = BackupStatus::Deleting;
+        rows.get_mut(&arns[2]).unwrap().status = BackupStatus::Deleted;
+        rows.remove(&arns[3]);
+        rows.get_mut(&arns[4]).unwrap().status = BackupStatus::Failed;
+        rows.remove(&arns[5]);
+    }
+    // The deleter that finished rows 3 and 4 deleted their objects.
+    for arn in [&arns[2], &arns[3]] {
+        let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+        extenddb_backup_store::BackupStore::delete_prefix(&mem, &prefix)
+            .await
+            .unwrap();
+    }
+
+    let mut outcomes = Vec::new();
+    for row in &read {
+        outcomes.push(
+            maintenance::purge_row(
+                &fake,
+                &mem,
+                &passing_fence(),
+                row,
+                Duration::from_secs(300),
+                &confirmed_claim(),
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        outcomes[0],
+        Ok(()),
+        "still AVAILABLE: moved and deleted here"
+    );
+    assert_eq!(
+        outcomes[1],
+        Ok(()),
+        "moved to DELETING by another deleter: finished here"
+    );
+    assert_eq!(
+        outcomes[2],
+        Ok(()),
+        "moved to DELETED by another deleter: the tombstone removed here, counted as deleted"
+    );
+    assert_eq!(outcomes[3], Ok(()), "gone: counted as deleted");
+    assert_eq!(
+        outcomes[4],
+        Err("its status changed to FAILED".to_owned()),
+        "a status that cannot follow AVAILABLE is left"
+    );
+    assert_eq!(
+        outcomes[5],
+        Ok(()),
+        "a tombstone removed meanwhile: counted as deleted"
+    );
+    let left: Vec<String> = fake.rows.lock().unwrap().keys().cloned().collect();
+    assert_eq!(left, vec![arns[4].clone()], "no row of the five remains");
+    let failed_prefix = BackupArn::parse(&arns[4]).unwrap().store_prefix();
+    assert_eq!(
+        mem.keys(),
+        vec![
+            format!("{failed_prefix}data/00001.json.gz"),
+            format!("{failed_prefix}extenddb-manifest.json"),
+        ],
+        "only the left row's objects remain"
+    );
+    // The row moved to DELETED was never moved by purge (DELETING to
+    // DELETED is the other deleter's write); the one left DELETING and the
+    // one still AVAILABLE were finished by purge; the three tombstones were
+    // removed here.
+    assert_eq!(
+        *fake.set_deleted.lock().unwrap(),
+        vec![arns[0].clone(), arns[1].clone()]
+    );
+    assert_eq!(
+        *fake.removed_rows.lock().unwrap(),
+        vec![arns[0].clone(), arns[1].clone(), arns[2].clone()]
+    );
+}
+
+/// A CREATING row with a dead owner goes through the dead-owner removal and
+/// then its prefix; one whose heartbeat is young is left with its objects
+/// under the live window, and removed under the zero window SQLite uses.
+#[tokio::test]
+async fn purge_removes_a_dead_creating_row_and_leaves_a_live_one() {
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    let dead = arn_n(1);
+    let live = arn_n(2);
+    seed(&fake, &mem, &dead, BackupStatus::Creating);
+    seed(&fake, &mem, &live, BackupStatus::Creating);
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&live)
+        .unwrap()
+        .heartbeat_at = seconds_since_epoch();
+    let window = Duration::from_secs(300);
+    let dead_row = fake.rows.lock().unwrap()[&dead].clone();
+    let live_row = fake.rows.lock().unwrap()[&live].clone();
+    assert_eq!(
+        maintenance::purge_row(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &dead_row,
+            window,
+            &confirmed_claim()
+        )
+        .await,
+        Ok(())
+    );
+    let err = maintenance::purge_row(
+        &fake,
+        &mem,
+        &passing_fence(),
+        &live_row,
+        window,
+        &confirmed_claim(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("the CREATING row could not be removed"),
+        "{err}"
+    );
+    let left: Vec<String> = fake.rows.lock().unwrap().keys().cloned().collect();
+    assert_eq!(left, vec![live.clone()]);
+    assert_eq!(mem.keys().len(), 2, "the live row's objects stay");
+    // A heartbeat written a moment ago is older than a zero window once a
+    // moment has passed.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        maintenance::purge_row(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &live_row,
+            Duration::ZERO,
+            &confirmed_claim()
+        )
+        .await,
+        Ok(())
+    );
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(mem.keys().is_empty());
+}
+
+/// The wait's five outcomes are told apart: quiet, also with a FAILED
+/// restore record whose target is still CREATING (the reconciler's duty,
+/// not a running job) and a FAILED backup row whose owner is dead; busy at
+/// the limit, with the jobs named (a CREATING row and a FAILED row with a
+/// live heartbeat, a RUNNING restore) and announced once; the ages read on
+/// the catalog's clock, not this host's (a skewed catalog clock decides
+/// busy and quiet against what this host's clock would say); a signal,
+/// during a sleep and before the first read; the catalog unreadable; the
+/// claim lost.
+#[tokio::test(start_paused = true)]
+async fn the_wait_reports_each_outcome_as_itself() {
+    use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
+    use maintenance::{Interrupt, Wait, WaitOutcome, wait_for_quiet};
+    let fake = Fake::default();
+    let holder = Arc::new(FakeHolder::default());
+    let claim = held(&holder);
+    let limit = Duration::from_secs(20);
+    let wait = Wait {
+        owner_window: Duration::from_secs(10),
+        limit,
+        poll: Duration::from_secs(2),
+    };
+    let announced: Mutex<Vec<Vec<String>>> = Mutex::new(Vec::new());
+    let announce = |jobs: &[String]| announced.lock().unwrap().push(jobs.to_vec());
+
+    let (_tx, mut quiet) = Interrupt::new();
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Quiet
+    );
+    // A FAILED record whose target is still CREATING is listed by the
+    // zero-window dead-job listing with the RUNNING ones; it is the
+    // reconciler's to finish and no job runs under it. A FAILED backup row
+    // whose heartbeat is older than the window has a dead owner.
+    let mut failed_record = dead_job(RestoreKind::Legacy, "FailedTarget");
+    failed_record.status = JobStatus::Failed;
+    fake.dead_jobs.lock().unwrap().push(failed_record);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn_n(3), row(&arn_n(3), BackupStatus::Failed));
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Quiet,
+        "a FAILED restore record and a FAILED row with a dead owner are not waited on"
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO, "quiet at the first read");
+    assert!(announced.lock().unwrap().is_empty());
+
+    // Busy: a CREATING row and a FAILED row whose heartbeats are young, and
+    // a RUNNING restore.
+    for (n, status) in [(1, BackupStatus::Creating), (2, BackupStatus::Failed)] {
+        fake.rows.lock().unwrap().insert(arn_n(n), {
+            let mut r = row(&arn_n(n), status);
+            r.heartbeat_at = seconds_since_epoch();
+            r
+        });
+    }
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "Target"));
+    let started = tokio::time::Instant::now();
+    let busy = wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, announce).await;
+    let expected = vec![
+        format!(
+            "CreateBackup {} has a live owner (heartbeat within stale_job_after_secs)",
+            arn_n(1)
+        ),
+        format!(
+            "the FAILED backup {} has a live owner (heartbeat within stale_job_after_secs)",
+            arn_n(2)
+        ),
+        format!("a restore into Target (account {ACCOUNT}) is RUNNING"),
+    ];
+    assert_eq!(busy, WaitOutcome::Busy(expected.clone()));
+    assert!(started.elapsed() >= limit, "{:?}", started.elapsed());
+    assert_eq!(*announced.lock().unwrap(), vec![expected]);
+
+    // A signal during a sleep ends the wait before the limit.
+    let (tx, mut interrupted) = Interrupt::new();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = tx.send(Some("SIGTERM"));
+    });
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut interrupted, announce).await,
+        WaitOutcome::Interrupted("SIGTERM")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(3_500),
+        "the signal ends the sleep, not the next poll: {:?}",
+        started.elapsed()
+    );
+    // One already received ends it before the first read.
+    assert_eq!(interrupted.signalled(), Some("SIGTERM"));
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut interrupted, announce).await,
+        WaitOutcome::Interrupted("SIGTERM")
+    );
+
+    // The catalog unreadable.
+    *fake.list_error.lock().unwrap() = Some("pool exhausted".to_owned());
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::CatalogError(
+            "cannot list the catalog's backup rows: Internal error: pool exhausted".to_owned()
+        )
+    );
+    *fake.list_error.lock().unwrap() = None;
+
+    // The claim lost: the next heartbeat records it, and the wait stops.
+    *holder.lost.lock().unwrap() = true;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, announce).await,
+        WaitOutcome::Lost(
+            "the maintenance claim was lost (another holder took it over)".to_owned()
+        )
+    );
+    claim.release().await.unwrap();
+    assert!(*holder.released.lock().unwrap());
+}
+
 // --- the reconciler -------------------------------------------------------------
 
 fn dead_job(kind: extenddb_storage::backup_catalog::RestoreKind, name: &str) -> RestoreJobRow {
-    RestoreJobRow {
-        target: RestoreTargetKey {
+    RestoreJobRow::reconciler_row(
+        RestoreTargetKey {
             account_id: ACCOUNT.to_owned(),
             table_name: name.to_owned(),
             table_id: format!("tid-{name}"),
         },
-        source_backup_arn: arn(ACCOUNT),
+        arn(ACCOUNT),
         kind,
-        status: extenddb_storage::backup_catalog::JobStatus::Running,
-        owner_generation: 0,
-        heartbeat_at: 0.0,
-    }
+        extenddb_storage::backup_catalog::JobStatus::Running,
+        0,
+        0.0,
+    )
 }
 
 /// A legacy restore whose owner is dead is marked FAILED and its target
-/// removed; a manifest restore is left for its resumer; an abandoned
-/// in-catalog CREATING backup is removed through the reader's delete.
+/// removed; a manifest restore whose store is not the configured one is
+/// left alone when this instance has no store configured (it is the job of
+/// the instance that holds the record's store, not this one's to fail);
+/// an abandoned in-catalog CREATING backup is removed through the reader's
+/// delete.
 #[tokio::test]
 async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups() {
     use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     *fake.target_still_creating.lock().unwrap() = true;
     *fake.record_still_running.lock().unwrap() = true;
     fake.dead_jobs.lock().unwrap().extend([
@@ -4918,7 +8802,9 @@ async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups
 
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -4926,12 +8812,31 @@ async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups
     assert!(!report.maintenance_held);
     assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
     assert!(report.failed_targets_removed.is_empty());
-    assert_eq!(report.manifest_restores_seen, ["ManifestTarget"]);
-    assert_eq!(report.manifest_restores_logged, ["ManifestTarget"]);
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(
+        report.manifest_restores_failed.is_empty(),
+        "an instance with no configured store leaves a store-backed record alone: {:?}",
+        report.manifest_restores_failed
+    );
+    assert!(
+        fake.failed_jobs.lock().unwrap().is_empty()
+            || fake
+                .failed_jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, reason)| reason != OTHER_STORE),
+        "no OTHER_STORE write when this instance has no store: {:?}",
+        fake.failed_jobs.lock().unwrap()
+    );
     assert_eq!(report.legacy_backups_removed, [arn(ACCOUNT)]);
 
     let failed = fake.failed_jobs.lock().unwrap().clone();
-    assert_eq!(failed.len(), 1);
+    assert_eq!(
+        failed.len(),
+        1,
+        "only the legacy restore is failed: {failed:?}"
+    );
     assert_eq!(failed[0].0.table_name, "LegacyTarget");
     assert_eq!(failed[0].1, reconciler::OWNER_DEAD);
     assert_eq!(
@@ -4946,7 +8851,7 @@ async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups
 #[tokio::test]
 async fn the_reconciler_leaves_a_target_whose_record_moved() {
     use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     *fake.record_still_running.lock().unwrap() = false;
     *fake.target_still_creating.lock().unwrap() = true;
     fake.dead_jobs
@@ -4955,7 +8860,9 @@ async fn the_reconciler_leaves_a_target_whose_record_moved() {
         .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -4975,7 +8882,7 @@ async fn the_reconciler_leaves_a_target_whose_record_moved() {
 #[tokio::test]
 async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_failed_write() {
     use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     *fake.record_still_running.lock().unwrap() = true;
     *fake.target_still_creating.lock().unwrap() = false;
     let dead = dead_job(RestoreKind::Legacy, "LegacyTarget");
@@ -4987,7 +8894,9 @@ async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_fai
         .extend([dead.clone(), failed.clone()]);
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -5012,11 +8921,16 @@ async fn the_reconciler_leaves_a_target_that_is_no_longer_creating_after_the_fai
 }
 
 /// The maintenance claim is checked first and reported; the duties that
-/// resolve dead owners still run while it is held.
+/// resolve dead owners and the DELETING rows of the configured store still
+/// run while it is held (the command waits on the first and finishes the
+/// second itself, so neither races it).
 #[tokio::test]
 async fn the_reconciler_reports_a_held_maintenance_claim_and_still_resolves_dead_owners() {
     use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
     *fake.maintenance_held.lock().unwrap() = true;
     *fake.target_still_creating.lock().unwrap() = true;
     *fake.record_still_running.lock().unwrap() = true;
@@ -5026,13 +8940,242 @@ async fn the_reconciler_reports_a_held_maintenance_claim_and_still_resolves_dead
         .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
     let report = reconciler::cycle(
         &fake,
+        &runtime_on(&mem, store()),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
     .unwrap();
     assert!(report.maintenance_held);
     assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
+    assert_eq!(
+        report.deletions_finished,
+        [arn(ACCOUNT)],
+        "a DELETING row is finished while the claim is held"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+}
+
+/// The wait tells a live owner from a dead one on the catalog's clock, the
+/// clock the owner's heartbeat was written on, and never on this host's:
+/// with the catalog's clock 400 s behind this host's, a CREATING row whose
+/// heartbeat is the catalog's now has a live owner although this host's
+/// clock reads it 400 s old, past the 300 s window; with the catalog's clock
+/// 400 s ahead, a row stamped with this host's now is 400 s old to the
+/// catalog and its owner dead.
+#[tokio::test(start_paused = true)]
+async fn the_wait_reads_a_live_owner_on_the_catalogs_clock() {
+    use maintenance::{Interrupt, Wait, WaitOutcome, wait_for_quiet};
+    let fake = Fake::default();
+    let holder = Arc::new(FakeHolder::default());
+    let claim = held(&holder);
+    let wait = Wait {
+        owner_window: Duration::from_secs(300),
+        limit: Duration::from_secs(4),
+        poll: Duration::from_secs(2),
+    };
+    let (_tx, mut quiet) = Interrupt::new();
+
+    *fake.catalog_clock_offset_secs.lock().unwrap() = -400.0;
+    fake.rows.lock().unwrap().insert(arn_n(1), {
+        let mut r = row(&arn_n(1), BackupStatus::Creating);
+        r.heartbeat_at = seconds_since_epoch() - 400.0;
+        r
+    });
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, |_| {}).await,
+        WaitOutcome::Busy(vec![format!(
+            "CreateBackup {} has a live owner (heartbeat within stale_job_after_secs)",
+            arn_n(1)
+        )]),
+        "an owner whose heartbeat is young on the catalog's clock is live"
+    );
+
+    *fake.catalog_clock_offset_secs.lock().unwrap() = 400.0;
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn_n(1))
+        .unwrap()
+        .heartbeat_at = seconds_since_epoch();
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, |_| {}).await,
+        WaitOutcome::Quiet,
+        "an owner whose heartbeat is old on the catalog's clock is dead"
+    );
+}
+
+/// A cycle run by the holder of the maintenance claim with a zero dead-owner
+/// window (`backup purge` on SQLite) takes the held branch without reading
+/// the claim: the command's claim was heartbeated a millisecond ago, which
+/// a zero window reads as stale, so a cycle that read it would take the
+/// branch for a free claim. The held branch skips the deleting duties the
+/// command must not race: a stale FAILED row keeps its prefix and the
+/// registrations sweep does not run. The same cycle without the holder's
+/// state reads the claim through the window, finds it free and runs them;
+/// that is the read the holder's state replaces.
+#[tokio::test]
+async fn a_cycle_run_by_the_claim_holder_takes_the_held_branch_whatever_its_window() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let stale_failed = arn_n(1);
+    let mut r = row(&stale_failed, BackupStatus::Failed);
+    r.heartbeat_at = seconds_since_epoch() - 1000.0;
+    r.completed_at = Some(seconds_since_epoch());
+    fake.rows.lock().unwrap().insert(stale_failed.clone(), r);
+    let prefix = BackupArn::parse(&stale_failed).unwrap().store_prefix();
+    mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+    fake.swept_registrations.lock().unwrap().push(arn_n(9));
+    *fake.maintenance_beat_age.lock().unwrap() = Some(Duration::from_millis(1));
+    *fake.target_still_creating.lock().unwrap() = true;
+    *fake.record_still_running.lock().unwrap() = true;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
+    let report = reconciler::cycle(
+        &fake,
+        &runtime_on(&mem, store()),
+        Duration::ZERO,
+        "test",
+        &mut reconciler::ReconcilerState::for_maintenance_holder(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.failed_prefixes_deleted.is_empty() && objects_under(&mem, &stale_failed).len() == 1,
+        "the holder's cycle deleted a FAILED row's prefix: {:?}",
+        report.failed_prefixes_deleted
+    );
+    assert!(
+        report.registrations_swept.is_empty(),
+        "the holder's cycle swept the registrations"
+    );
+    assert!(
+        report.maintenance_held,
+        "the holder's cycle took the branch for a free claim"
+    );
+    assert!(
+        fake.maintenance_checks.lock().unwrap().is_empty(),
+        "the holder's cycle read the claim: {:?}",
+        fake.maintenance_checks.lock().unwrap()
+    );
+    // The duties the command waits on still ran under the zero window.
+    assert_eq!(report.legacy_restores_removed, ["LegacyTarget"]);
+    assert_eq!(report.deletions_finished, [arn(ACCOUNT)]);
+
+    // Without the holder's state the zero window reads the same claim as
+    // free.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime_on(&mem, store()),
+        Duration::ZERO,
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!report.maintenance_held);
+    assert_eq!(
+        *fake.maintenance_checks.lock().unwrap(),
+        [Duration::ZERO, Duration::ZERO],
+        "a default state reads the claim through the window it is given, at the cycle's start \
+         and again before the FAILED row's deletion"
+    );
+    assert_eq!(
+        report.failed_prefixes_deleted,
+        std::slice::from_ref(&stale_failed)
+    );
+    assert!(objects_under(&mem, &stale_failed).is_empty());
+    assert_eq!(report.registrations_swept, [arn_n(9)]);
+}
+
+/// The restore arm of a cycle run by the holder of the maintenance claim with
+/// a zero dead-owner window (`backup purge` on SQLite): a RUNNING `manifest`
+/// record whose owner is dead is FAILED `OWNER_DEAD` and its target removed,
+/// as 4(f) asks of a held claim, and not taken over and resumed inside the
+/// command. The command's claim was heartbeated a millisecond ago, which a
+/// zero window read through the clock finds stale; a cycle that read it
+/// would take the arm for a free claim and spawn a resume.
+#[tokio::test]
+async fn a_cycle_run_by_the_claim_holder_fails_a_dead_manifest_restore_rather_than_resuming_it() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 1).await;
+    runtime.drain_jobs(Duration::from_millis(50)).await;
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    *fake.bulk_load_gate.lock().unwrap() = None;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Running,
+        "precondition: the stopped restore left its record RUNNING"
+    );
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+    *fake.maintenance_beat_age.lock().unwrap() = Some(Duration::from_millis(1));
+    // The restore's own request read the claim; the cycle must not.
+    fake.maintenance_checks.lock().unwrap().clear();
+
+    let command = job_runtime(&mem);
+    let report = reconciler::cycle(
+        &fake,
+        &command,
+        Duration::ZERO,
+        "test",
+        &mut reconciler::ReconcilerState::for_maintenance_holder(),
+    )
+    .await
+    .unwrap();
+    wait_for_jobs(&command).await;
+    assert!(
+        report.manifest_restores_resumed.is_empty(),
+        "the holder's cycle resumed a restore: {:?}",
+        report.manifest_restores_resumed
+    );
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    assert_eq!(
+        report.manifest_restores_failed_and_removed,
+        ["MusicRestored"]
+    );
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    assert!(
+        fake.failed_jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(key, reason)| key.table_name == "MusicRestored"
+                && reason == reconciler::OWNER_DEAD),
+        "{:?}",
+        fake.failed_jobs.lock().unwrap()
+    );
+    assert!(fake.maintenance_checks.lock().unwrap().is_empty());
 }
 
 /// The worker runs a cycle at once (observed through the maintenance check,
@@ -5047,10 +9190,12 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
     let shutdown = extenddb_storage::CancellationToken::new();
     let worker = tokio::spawn(reconciler::run(
         Arc::clone(&fake),
+        Arc::new(runtime()),
         reconciler::ReconcilerSettings {
             interval: Duration::from_secs(3600),
             stale_job_after: Duration::from_secs(300),
         },
+        "test".to_owned(),
         Arc::clone(&metrics),
         Arc::new(tokio::sync::Mutex::new(
             reconciler::ReconcilerState::default(),
@@ -5058,7 +9203,7 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
         shutdown.clone(),
     ));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while *fake.maintenance_checks.lock().unwrap() == 0 {
+    while fake.maintenance_checks.lock().unwrap().is_empty() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the first cycle did not run"
@@ -5066,7 +9211,7 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
-        *fake.maintenance_checks.lock().unwrap(),
+        fake.maintenance_checks.lock().unwrap().len(),
         1,
         "one cycle before the first interval"
     );
@@ -5075,7 +9220,7 @@ async fn the_reconciler_worker_runs_at_startup_and_stops_on_shutdown() {
         .await
         .expect("the worker stops at shutdown")
         .unwrap();
-    assert_eq!(*fake.maintenance_checks.lock().unwrap(), 1);
+    assert_eq!(fake.maintenance_checks.lock().unwrap().len(), 1);
     let recorded: Vec<MetricName> = metrics
         .drain(Duration::ZERO)
         .into_iter()
@@ -5101,10 +9246,12 @@ async fn a_failed_reconciler_cycle_records_a_worker_error() {
     let shutdown = extenddb_storage::CancellationToken::new();
     let worker = tokio::spawn(reconciler::run(
         Arc::clone(&fake),
+        Arc::new(runtime()),
         reconciler::ReconcilerSettings {
             interval: Duration::from_millis(5),
             stale_job_after: Duration::from_secs(300),
         },
+        "test".to_owned(),
         Arc::clone(&metrics),
         Arc::new(tokio::sync::Mutex::new(
             reconciler::ReconcilerState::default(),
@@ -5112,7 +9259,7 @@ async fn a_failed_reconciler_cycle_records_a_worker_error() {
         shutdown.clone(),
     ));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while *fake.maintenance_checks.lock().unwrap() < 2 {
+    while fake.maintenance_checks.lock().unwrap().len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the worker did not go on after a failed cycle"
@@ -5141,7 +9288,7 @@ async fn a_failed_reconciler_cycle_records_a_worker_error() {
 #[tokio::test]
 async fn the_reconciler_removes_the_target_of_a_failed_record_without_writing_failed_again() {
     use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     *fake.target_still_creating.lock().unwrap() = true;
     let mut failed = dead_job(RestoreKind::Legacy, "FailedTarget");
     failed.status = JobStatus::Failed;
@@ -5153,7 +9300,9 @@ async fn the_reconciler_removes_the_target_of_a_failed_record_without_writing_fa
         .extend([failed.clone(), failed_manifest.clone()]);
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -5167,49 +9316,11 @@ async fn the_reconciler_removes_the_target_of_a_failed_record_without_writing_fa
         ["FailedTarget", "FailedManifestTarget"]
     );
     assert!(report.legacy_restores_removed.is_empty());
-    assert!(report.manifest_restores_seen.is_empty());
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(report.manifest_restores_failed.is_empty());
     assert_eq!(
         fake.removed_targets.lock().unwrap().as_slice(),
         [failed.target, failed_manifest.target]
-    );
-}
-
-/// A dead manifest record, which this release cannot act on, is reported
-/// once per record for as long as the process runs, not every cycle.
-#[tokio::test]
-async fn a_dead_manifest_record_is_logged_once_per_record() {
-    use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
-    fake.dead_jobs
-        .lock()
-        .unwrap()
-        .push(dead_job(RestoreKind::Manifest, "ManifestTarget"));
-    let mut state = reconciler::ReconcilerState::default();
-    let first = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
-    assert_eq!(first.manifest_restores_seen, ["ManifestTarget"]);
-    assert_eq!(first.manifest_restores_logged, ["ManifestTarget"]);
-    let second = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
-    assert_eq!(second.manifest_restores_seen, ["ManifestTarget"]);
-    assert!(
-        second.manifest_restores_logged.is_empty(),
-        "the same record is not reported twice"
-    );
-    fake.dead_jobs
-        .lock()
-        .unwrap()
-        .push(dead_job(RestoreKind::Manifest, "Another"));
-    let third = reconciler::cycle(&fake, Duration::from_secs(300), &mut state)
-        .await
-        .unwrap();
-    assert_eq!(third.manifest_restores_logged, ["Another"]);
-    assert!(
-        fake.failed_jobs.lock().unwrap().is_empty()
-            && fake.removed_targets.lock().unwrap().is_empty(),
-        "a manifest record is never acted on by this release"
     );
 }
 
@@ -5221,7 +9332,7 @@ async fn a_dead_manifest_record_is_logged_once_per_record() {
 #[tokio::test]
 async fn the_reconciler_leaves_a_record_whose_owner_heartbeated_after_the_listing() {
     use extenddb_storage::backup_catalog::RestoreKind;
-    let fake = Fake::default();
+    let fake = Arc::new(Fake::default());
     *fake.target_still_creating.lock().unwrap() = true;
     *fake.record_still_running.lock().unwrap() = true;
     let mut listed = dead_job(RestoreKind::Legacy, "LateBeat");
@@ -5235,7 +9346,9 @@ async fn the_reconciler_leaves_a_record_whose_owner_heartbeated_after_the_listin
 
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -5258,7 +9371,9 @@ async fn the_reconciler_leaves_a_record_whose_owner_heartbeated_after_the_listin
     // removed.
     let report = reconciler::cycle(
         &fake,
+        &runtime(),
         Duration::from_secs(300),
+        "test",
         &mut reconciler::ReconcilerState::default(),
     )
     .await
@@ -5270,6 +9385,10971 @@ async fn the_reconciler_leaves_a_record_whose_owner_heartbeated_after_the_listin
     );
 }
 
+// --- the store identity file and the store's health ---------------------------
+
+const MANIFEST_KEY_SUFFIX: &str = "extenddb-manifest.json";
+
+/// The manifest key of `arn`'s prefix.
+fn manifest_key(arn: &str) -> String {
+    format!(
+        "{}{MANIFEST_KEY_SUFFIX}",
+        BackupArn::parse(arn).unwrap().store_prefix()
+    )
+}
+
+/// An ACTIVE table description, the probe CreateBackup's handler ran.
+fn active_table(name: &str) -> TableDescription {
+    TableDescription {
+        table_name: name.to_owned(),
+        table_status: TableStatus::Active,
+        ..Default::default()
+    }
+}
+
+/// A second, newer backup of the `Music` table.
+fn newer_arn(account: &str) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{account}:table/Music/backup/01791976999999-0badf00d")
+}
+
+fn fake_with_rows(rows: &[(String, BackupStatus)]) -> Arc<Fake> {
+    let fake = Arc::new(Fake::default());
+    for (arn, status) in rows {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn.clone(), row(arn, *status));
+    }
+    fake
+}
+
+/// A restore of a store-backed row checks the target name once the row is
+/// known to exist and AVAILABLE, before the backup's in-use rule and before
+/// the store is read (the service's order: a restore of a backup into its
+/// own CREATING target is `TableInUseException`, measured): an existing
+/// table of the name is `TableAlreadyExistsException`, a CREATING restore
+/// target `TableInUseException` naming its source backup, and a free name
+/// goes on to the manifest read (here `BackupNotFoundException`: the row is
+/// AVAILABLE and the store holds nothing under its prefix). A row that is
+/// not AVAILABLE answers for itself before the name is read.
+#[tokio::test]
+async fn a_store_backed_restore_checks_the_target_name_after_the_row_and_before_the_store() {
+    let mem = Arc::new(MemStore::default());
+    let runtime = runtime_on(&mem, store());
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Available)]);
+
+    fake.tables.lock().unwrap().insert(
+        "MusicRestored".to_owned(),
+        TableDescription {
+            table_name: "MusicRestored".to_owned(),
+            table_status: TableStatus::Active,
+            ..Default::default()
+        },
+    );
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(_)),
+        "{err:?}"
+    );
+
+    fake.tables.lock().unwrap().insert(
+        "MusicRestored".to_owned(),
+        TableDescription {
+            table_name: "MusicRestored".to_owned(),
+            table_status: TableStatus::Creating,
+            restore_summary: Some(RestoreSummary {
+                source_backup_arn: Some(arn(ACCOUNT)),
+                source_table_arn: None,
+                restore_date_time: 0.0,
+                restore_in_progress: true,
+            }),
+            ..Default::default()
+        },
+    );
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableInUseException(ref m) if m.contains(&arn(ACCOUNT))),
+        "{err:?}"
+    );
+
+    fake.tables.lock().unwrap().remove("MusicRestored");
+    assert!(mem.gets().is_empty(), "no store read before the name");
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
+        "{err:?}"
+    );
+    assert!(!mem.gets().is_empty(), "the free name reached the store");
+
+    // A row that is not AVAILABLE: its own answer, the name unread.
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleted)]);
+    fake.tables.lock().unwrap().insert(
+        "MusicRestored".to_owned(),
+        TableDescription {
+            table_name: "MusicRestored".to_owned(),
+            table_status: TableStatus::Active,
+            ..Default::default()
+        },
+    );
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
+        "{err:?}"
+    );
+    assert!(fake.table_reads.lock().unwrap().is_empty());
+}
+
+/// An empty root and a catalog with no rows for it: startup creates the file
+/// with this catalog's id and a fresh store id, re-reads it and uses that id.
+#[tokio::test]
+async fn establish_creates_the_identity_file_on_an_empty_root() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    let identity =
+        store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test", false)
+            .await
+            .unwrap();
+    assert_eq!(identity.store_kind, StoreKind::Filesystem);
+    assert_eq!(identity.store_root, "/r");
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.store_id, identity.store_id);
+    assert_eq!(file.catalog_id, "catalog-1");
+    assert_eq!(file.backend, "test");
+    assert_eq!(mem.puts.lock().unwrap().as_slice(), [STORE_IDENTITY_KEY]);
+    // A second startup against the same root reads the file and uses its id.
+    let again = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test", false)
+        .await
+        .unwrap();
+    assert_eq!(again, identity);
+    assert_eq!(
+        mem.puts.lock().unwrap().len(),
+        1,
+        "the file is not rewritten"
+    );
+}
+
+/// Two instances of one catalog starting against one empty root: one creates
+/// the file, the other finds it present, and both use the winner's id.
+#[tokio::test]
+async fn two_instances_on_one_empty_root_end_with_one_id() {
+    let mem = Arc::new(MemStore::default());
+    let fakes = [Fake::default(), Fake::default()];
+    let (a, b) = tokio::join!(
+        store_identity::establish(&*mem, StoreKind::S3, "s3://b/", &fakes[0], "test", false),
+        store_identity::establish(&*mem, StoreKind::S3, "s3://b/", &fakes[1], "test", false),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a, b);
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    assert_eq!(
+        mem.puts.lock().unwrap().len(),
+        1,
+        "one create stored its file"
+    );
+}
+
+/// A root whose file names another catalog is unhealthy, and stays so until
+/// the file is restored; the problem names both catalogs and no root.
+#[tokio::test]
+async fn a_file_naming_another_catalog_is_unhealthy_until_restored() {
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file("store-1", "another-catalog"),
+    );
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &*fake, "test", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "another-catalog".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    assert_eq!(err.category(), "owned by another catalog");
+    assert!(!err.public_reason().contains("/r"));
+    // Restored: the check passes.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let identity = store_identity::recheck(&mem, &store(), &*fake, "test", false).await;
+    assert_eq!(identity, Ok(()));
+}
+
+/// Something that is not an object at the identity file's key (a FIFO, a
+/// socket): the create finds the key taken and the read finds no object, so
+/// nothing was created and nothing can be read, and the problem says so
+/// rather than claiming a file was created.
+#[tokio::test]
+async fn a_non_object_at_the_identity_key_is_neither_readable_nor_creatable() {
+    let mem = MemStore::default();
+    mem.key_taken_by_a_non_object
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Fake::default();
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::Transport("extenddb-store.json is neither readable nor creatable".to_owned())
+    );
+    assert!(mem.keys().is_empty(), "nothing was created");
+}
+
+/// The rows for the root carry an id the file does not, or more than one id,
+/// or the root has no file while rows exist: each is unhealthy.
+#[tokio::test]
+async fn ids_that_disagree_or_a_missing_file_with_rows_are_unhealthy() {
+    // The file holds another id than the rows.
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::IdMismatch {
+            file_id: "store-2".to_owned(),
+            row_ids: vec!["store-1".to_owned()],
+        }
+    );
+    assert_eq!(err.category(), "identity mismatch");
+
+    // No file, rows exist.
+    let mem = MemStore::default();
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()])
+    );
+    assert!(mem.keys().is_empty(), "nothing is created over rows");
+    // The file put back: healthy.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Rows carrying two ids.
+    let fake = fake_with_row(BackupStatus::Available);
+    let mut other = row(&newer_arn(ACCOUNT), BackupStatus::Available);
+    other.store.store_id = "store-9".to_owned();
+    fake.rows.lock().unwrap().insert(newer_arn(ACCOUNT), other);
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        store().store_root.as_str(),
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::MultipleRowIds(vec!["store-1".to_owned(), "store-9".to_owned()])
+    );
+}
+
+/// The manifest probe: the newest AVAILABLE row's manifest must be under the
+/// root. A second instance with a host-local root at the same path and the
+/// first's file copied to it has the file and none of the objects, which is
+/// what the probe catches; a root with no AVAILABLE row is not probed.
+#[tokio::test]
+async fn the_manifest_probe_reads_the_newest_available_rows_manifest() {
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = fake_with_rows(&[
+        (arn(ACCOUNT), BackupStatus::Available),
+        (newer_arn(ACCOUNT), BackupStatus::Available),
+        (
+            music_arn(ACCOUNT, "01791976999999-0bad0bad"),
+            BackupStatus::Creating,
+        ),
+    ]);
+    // Only the older manifest is there: the newest is probed and missing.
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ManifestMissing {
+            backup_arn: newer_arn(ACCOUNT),
+        }
+    );
+    assert_eq!(err.category(), "manifest probe failed");
+    mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+    store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap();
+    // The CREATING row's manifest is not probed: it has none yet.
+    // A root with rows but none AVAILABLE is not probed either.
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Creating)]);
+    let empty = MemStore::default();
+    empty.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    store_identity::establish(
+        &empty,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+/// A store that ignores the conditional put makes the create a plain put: a
+/// race lost before the re-read leaves another id in the file, which the
+/// re-read catches, naming both ids.
+#[tokio::test]
+async fn a_create_race_lost_on_a_store_ignoring_the_condition_is_caught_by_the_re_read() {
+    let mem = MemStore::default();
+    *mem.overwrite_after_conditional_put.lock().unwrap() =
+        Some(identity_file("the-other-instance", "catalog-1"));
+    let fake = Fake::default();
+    let err = store_identity::establish(&mem, StoreKind::S3, "s3://b/", &fake, "test", false)
+        .await
+        .unwrap_err();
+    match err {
+        StoreProblem::CreateRaceLost { ours, file } => {
+            assert_eq!(file, "the-other-instance");
+            assert_ne!(ours, file);
+            let reason = StoreProblem::CreateRaceLost {
+                ours: ours.clone(),
+                file: file.clone(),
+            }
+            .public_reason();
+            assert!(reason.contains(&ours) && reason.contains(&file), "{reason}");
+        }
+        other => panic!("expected CreateRaceLost, got {other:?}"),
+    }
+}
+
+/// An unreachable store is unhealthy with the store's error in the log line
+/// and not in the `/health` text; the check that runs again (the
+/// reconciler's) recovers it once the store answers.
+#[tokio::test]
+async fn an_unreachable_store_is_unhealthy_and_recovers_on_recheck() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_down(true);
+    let fake = Arc::new(Fake::default());
+    let err = store_identity::establish(
+        &*mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "test",
+        false,
+    )
+    .await
+    .unwrap_err();
+    // The operator's line carries the whole cause chain: the top link names
+    // the class ("dispatch failure"), the cause is the link below it.
+    assert!(
+        matches!(&err, StoreProblem::Transport(m)
+            if m.contains("dispatch failure") && m.contains("connection refused")),
+        "{err:?}"
+    );
+    assert_eq!(err.public_reason(), "the store could not be reached");
+    assert!(err.to_string().contains("connection refused"));
+
+    let runtime = runtime_unhealthy(&mem, err);
+    assert_eq!(
+        runtime.configured_store().unwrap().identity(),
+        None,
+        "the id is unknown until a check passes"
+    );
+    let report = runtime.store_health().unwrap();
+    assert_eq!(report.kind, "filesystem");
+    assert_eq!(report.status, "unhealthy");
+    assert_eq!(report.reason, Some("unreachable"));
+
+    // Still down: the cycle leaves it unhealthy.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    // Up again: the cycle's recheck passes and the component recovers.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert_eq!(runtime.store_health().unwrap().status, "healthy");
+    assert_eq!(runtime.store_health().unwrap().reason, None);
+    assert_eq!(
+        runtime.configured_store().unwrap().identity(),
+        Some(store()),
+        "the check that passed settled the id from the file"
+    );
+    // And back to unhealthy when it goes away again.
+    mem.set_down(true);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+}
+
+/// A store that has stopped answering costs a cycle its check bound and
+/// nothing more: the dead-owner duties ran before the check, the check is
+/// abandoned at `check_timeout` (5 s for a filesystem root) and recorded as
+/// a transport failure naming the bound, the cycle returns, and the next
+/// cycle on a store that answers again recovers it.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_store_check_is_abandoned_at_its_bound() {
+    use extenddb_storage::backup_catalog::RestoreKind;
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_stalled(true);
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    assert_eq!(configured.check_timeout(), LOCAL_CHECK_TIMEOUT);
+    let fake = Arc::new(Fake::default());
+    *fake.record_still_running.lock().unwrap() = true;
+    *fake.target_still_creating.lock().unwrap() = true;
+    fake.dead_jobs
+        .lock()
+        .unwrap()
+        .push(dead_job(RestoreKind::Legacy, "LegacyTarget"));
+
+    let started = tokio::time::Instant::now();
+    // The test's own bound, far past the check's: a cycle that waits on the
+    // store for longer than it fails here instead of hanging.
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        reconciler::cycle(
+            &fake,
+            &runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::default(),
+        ),
+    )
+    .await
+    .expect("the cycle returns within the check's bound")
+    .unwrap();
+    assert_eq!(
+        started.elapsed(),
+        LOCAL_CHECK_TIMEOUT,
+        "the check's bound is the whole cost"
+    );
+    assert_eq!(
+        report.legacy_restores_removed,
+        ["LegacyTarget"],
+        "the duties ran"
+    );
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport(
+            "the check did not finish within 5 s".to_owned()
+        ))
+    );
+    assert_eq!(runtime.store_health().unwrap().reason, Some("unreachable"));
+    assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+    // The abandoned check's call is still in the store (on a filesystem
+    // root, a thread parked on the mount). A cycle during the stall starts
+    // no second check: it returns at once, the store stays `unreachable`
+    // with the reason, and the store sees no second call.
+    assert!(configured.check_call_in_flight());
+    let started = tokio::time::Instant::now();
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "a cycle that starts no check waits no bound"
+    );
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport(
+            "an abandoned check has not returned".to_owned()
+        ))
+    );
+    assert_eq!(
+        mem.stalls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "no second call reached the store while the first was in flight"
+    );
+    // Checking stores wait the same bound: an S3 store's is 30 s, under the
+    // SDK's attempt timeout so no retry outlives the check.
+    let s3 = ConfiguredStore::checking(
+        StoreKind::S3,
+        "s3://b/".to_owned(),
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    );
+    assert_eq!(s3.check_timeout(), S3_CHECK_TIMEOUT);
+    assert_eq!(S3_CHECK_TIMEOUT, Duration::from_secs(30));
+    assert!(S3_CHECK_TIMEOUT < extenddb_backup_store::S3_ATTEMPT_TIMEOUT);
+    // An S3 store's abandoned request is dropped with the check (the SDK
+    // would otherwise retry it past the bound), so nothing is in flight
+    // afterwards and the next cycle sends a fresh request.
+    let s3_runtime = BackupRuntime::new(4).with_store(s3);
+    let s3 = s3_runtime.configured_store().unwrap();
+    let calls_before = mem.stalls.load(std::sync::atomic::Ordering::Acquire);
+    for _ in 0..2 {
+        let started = tokio::time::Instant::now();
+        reconciler::cycle(
+            &fake,
+            &s3_runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), S3_CHECK_TIMEOUT);
+        assert!(
+            !s3.check_call_in_flight(),
+            "an S3 request ends with the check"
+        );
+    }
+    assert_eq!(
+        mem.stalls.load(std::sync::atomic::Ordering::Acquire),
+        calls_before + 2,
+        "each cycle's check reached the endpoint"
+    );
+
+    // The store answers again: the parked call returns (its task clears the
+    // in-flight mark), and the next cycle's check passes.
+    mem.set_stalled(false);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !configured.check_call_in_flight(),
+        "the parked call returned once the store answered"
+    );
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(configured.is_healthy());
+}
+
+/// A shutdown that fires while a cycle waits on the store's check ends the
+/// cycle at once (the health is left as it was), so the worker drains
+/// without waiting the check's bound.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_during_the_store_check_ends_the_cycle() {
+    use extenddb_core::metrics::MetricsCollector;
+    let mem = Arc::new(MemStore::default());
+    mem.set_stalled(true);
+    // An S3 store, whose bound (30 s) is the longer one.
+    let runtime = Arc::new(runtime().with_store(ConfiguredStore::checking(
+        StoreKind::S3,
+        "s3://b/".to_owned(),
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    )));
+    let fake = Arc::new(Fake::default());
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let worker = tokio::spawn(reconciler::run(
+        Arc::clone(&fake),
+        Arc::clone(&runtime),
+        reconciler::ReconcilerSettings {
+            interval: Duration::from_secs(3600),
+            stale_job_after: Duration::from_secs(300),
+        },
+        "test".to_owned(),
+        Arc::new(MetricsCollector::new()),
+        Arc::new(tokio::sync::Mutex::new(
+            reconciler::ReconcilerState::default(),
+        )),
+        shutdown.clone(),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while mem.stalls.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first cycle's check reached the store"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let cancelled = tokio::time::Instant::now();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker stops at shutdown without waiting the check's bound")
+        .unwrap();
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(1),
+        "the drain took {:?}",
+        cancelled.elapsed()
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Checking,
+        "a check shutdown ended records nothing"
+    );
+}
+
+/// A command's identity read (`backup list`, the purge's dry run) runs under
+/// the store's check bound as the server's check does: a store that does not
+/// answer costs the command the bound (5 s for a filesystem root) and
+/// reports it, where the unbounded read would wait out the store's retries
+/// or, on a stalled mount, never return; a store that answers is read.
+#[tokio::test(start_paused = true)]
+async fn a_commands_identity_read_is_bounded_as_the_check_is() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Fake::default();
+    let configured = ConfiguredStore::checking(
+        StoreKind::Filesystem,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    );
+    let read = runtime::read_identity_bounded(&configured, &fake)
+        .await
+        .unwrap();
+    assert_eq!(read.map(|i| i.store_id), Some("store-1".to_owned()));
+
+    mem.set_stalled(true);
+    let started = tokio::time::Instant::now();
+    // The test's own bound, far past the read's: an unbounded read fails
+    // here instead of hanging.
+    let problem = tokio::time::timeout(
+        Duration::from_secs(120),
+        runtime::read_identity_bounded(&configured, &fake),
+    )
+    .await
+    .expect("the read returns at its bound")
+    .unwrap_err();
+    assert_eq!(started.elapsed(), LOCAL_CHECK_TIMEOUT);
+    assert_eq!(
+        problem,
+        StoreProblem::Transport("the identity read did not finish within 5 s".to_owned())
+    );
+    assert_eq!(problem.category(), "unreachable");
+    assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+    mem.set_stalled(false);
+}
+
+/// `record_check` logs a transition once per category: it reports a change
+/// of category, and not a new text within the same one, so a store that
+/// stays down with a varying error costs one line.
+#[test]
+fn record_check_reports_a_transition_only_across_categories() {
+    let mem = Arc::new(MemStore::default());
+    let runtime = runtime_on(&mem, store());
+    let store = runtime.configured_store().unwrap();
+    assert!(store.record_check(Err(StoreProblem::Transport("refused".to_owned()))));
+    assert!(
+        !store.record_check(Err(StoreProblem::Transport("timed out".to_owned()))),
+        "a new text in the same category is not a transition"
+    );
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("timed out".to_owned())),
+        "the latest text is kept"
+    );
+    assert!(store.record_check(Err(StoreProblem::Validate("no bucket".to_owned()))));
+    assert!(store.record_check(Ok(self::store())));
+    assert!(!store.record_check(Ok(self::store())));
+    assert!(
+        !store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned()))),
+        "a catalog read failure changes nothing"
+    );
+}
+
+/// A recheck of a root that lost its file while the catalog has no rows for
+/// it writes the file back with the same id.
+#[tokio::test]
+async fn a_recheck_rewrites_a_lost_file_when_no_rows_exist() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    store_identity::recheck(&mem, &store(), &fake, "test", false)
+        .await
+        .unwrap();
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.store_id, "store-1");
+    assert_eq!(file.catalog_id, "catalog-1");
+    // A file that changed under the running server (the root replaced) is
+    // an id mismatch.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let err = store_identity::recheck(&mem, &store(), &fake, "test", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::IdMismatch {
+            file_id: "store-2".to_owned(),
+            row_ids: vec!["store-1".to_owned()],
+        }
+    );
+}
+
+/// No store configured: `/health` has no component and no operation is
+/// refused for the store.
+#[test]
+fn no_configured_store_reports_no_component() {
+    assert_eq!(runtime().store_health(), None);
+    assert_eq!(
+        runtime_with_store().store_health().unwrap().status,
+        "healthy"
+    );
+}
+
+/// The `/health` reason is the problem's category and nothing else: the
+/// endpoint is unauthenticated, and the ARN (account, table and backup id)
+/// a manifest probe names, and the catalog and store ids the identity
+/// problems name, go to the operator's log line only.
+#[test]
+fn the_health_reason_is_the_category_only() {
+    let mem = Arc::new(MemStore::default());
+    for (problem, category) in [
+        (
+            StoreProblem::ManifestMissing {
+                backup_arn: arn("999988887777"),
+            },
+            "manifest probe failed",
+        ),
+        (
+            StoreProblem::ForeignCatalog {
+                file_catalog_id: "cat-other".to_owned(),
+                catalog_id: "cat-mine".to_owned(),
+            },
+            "owned by another catalog",
+        ),
+        (
+            StoreProblem::IdMismatch {
+                file_id: "store-9".to_owned(),
+                row_ids: vec!["store-1".to_owned()],
+            },
+            "identity mismatch",
+        ),
+        (
+            StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()]),
+            "identity file missing",
+        ),
+        (
+            StoreProblem::Transport("connect /var/lib/extenddb: refused".to_owned()),
+            "unreachable",
+        ),
+    ] {
+        let report = runtime_unhealthy(&mem, problem.clone())
+            .store_health()
+            .unwrap();
+        assert_eq!(report.status, "unhealthy");
+        assert_eq!(report.reason, Some(category), "{problem:?}");
+        for secret in ["999988887777", "cat-", "store-", "/var/lib", "arn:"] {
+            assert!(
+                !report.reason.unwrap().contains(secret),
+                "{problem:?}: the reason carries {secret:?}"
+            );
+        }
+    }
+}
+
+/// An identity file over the read bound is reported unreadable without
+/// being read in full; one under it parses.
+#[tokio::test]
+async fn an_oversized_identity_file_is_unreadable() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    let mut big = identity_file("store-1", "catalog-1");
+    big.resize(store_identity::STORE_IDENTITY_MAX_BYTES + 1, b' ');
+    mem.insert(STORE_IDENTITY_KEY, &big);
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreProblem::FileUnreadable(m) if m.contains("larger than 65536 bytes")),
+        "{err:?}"
+    );
+    assert_eq!(err.category(), "identity file unreadable");
+    // Trailing blanks up to the bound are JSON whitespace: the file parses.
+    let mut padded = identity_file("store-1", "catalog-1");
+    padded.resize(store_identity::STORE_IDENTITY_MAX_BYTES, b' ');
+    mem.insert(STORE_IDENTITY_KEY, &padded);
+    let identity =
+        store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "test", false)
+            .await
+            .unwrap();
+    assert_eq!(identity.store_id, "store-1");
+}
+
+/// A check that could not read the catalog leaves the store's health as the
+/// last check left it, healthy or unhealthy, and keeps its id.
+#[tokio::test]
+async fn a_catalog_read_failure_leaves_the_health_unchanged() {
+    let mem = Arc::new(MemStore::default());
+    let healthy = runtime_on(&mem, store());
+    let store = healthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned())));
+    assert_eq!(store.health(), StoreHealth::Healthy);
+    assert_eq!(store.identity(), Some(self::store()));
+    let unhealthy = runtime_unhealthy(&mem, StoreProblem::Transport("refused".to_owned()));
+    let store = unhealthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Catalog("pool exhausted".to_owned())));
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("refused".to_owned()))
+    );
+    // And through a cycle: a catalog that fails `catalog_id` leaves a
+    // healthy store healthy.
+    let fake = Arc::new(Fake::default());
+    *fake.catalog_id_error.lock().unwrap() = true;
+    let report = reconciler::cycle(
+        &fake,
+        &healthy,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    // A problem of another category replaces the last one; one of the same
+    // category is kept as the latest text.
+    let store = healthy.configured_store().unwrap();
+    store.record_check(Err(StoreProblem::Transport("refused".to_owned())));
+    store.record_check(Err(StoreProblem::Transport("timed out".to_owned())));
+    assert_eq!(
+        store.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport("timed out".to_owned()))
+    );
+}
+
+/// A store whose checks run after the listener is up is `checking` until
+/// the first check records: `/health` says so with no reason, the
+/// operations that touch the store refuse naming the pending check, and
+/// the check runs `validate` first (a store that cannot be reached fails
+/// there, with its id still unknown), then the identity check, which
+/// settles the id.
+#[tokio::test]
+async fn a_store_checked_after_startup_is_checking_until_the_first_check() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.set_down(true);
+    let runtime = runtime().with_store(ConfiguredStore::checking(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    ));
+    let configured = runtime.configured_store().unwrap();
+    assert_eq!(configured.health(), StoreHealth::Checking);
+    assert!(!configured.is_validated());
+    let report = runtime.store_health().unwrap();
+    assert_eq!((report.status, report.reason), ("checking", None));
+    let err = runtime.require_healthy_store().err().unwrap();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("first check is pending")),
+        "{err:?}"
+    );
+    // The restore check of a row of the store refuses the same way, before
+    // the permit: with no slot free, the refusal is still the store's.
+    let fake = fake_with_row(BackupStatus::Available);
+    let full = BackupRuntime::new(0).with_store(ConfiguredStore::checking(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+    ));
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("first check is pending")),
+        "{err:?}"
+    );
+
+    // The first check: `validate` fails on the unreachable store.
+    let fake = Arc::new(Fake::default());
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(!configured.is_validated());
+    assert_eq!(runtime.store_health().unwrap().reason, Some("unreachable"));
+    assert_eq!(configured.identity(), None);
+    // Reachable: `validate` passes once and is not run again, the identity
+    // check settles the id, and the store is healthy.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(configured.is_validated());
+    assert_eq!(configured.identity(), Some(store()));
+    assert_eq!(runtime.store_health().unwrap().status, "healthy");
+}
+
+/// An unhealthy store refuses the operations that touch it, before a slot is
+/// taken and naming the store's kind and the problem's category and never
+/// its root or the cause: CreateBackup (store-backed on this runtime),
+/// DeleteBackup of a row of the store, and the restore of one (with no slot
+/// free it is still the store's refusal, not LimitExceeded). A backend
+/// bound to the in-catalog create is not refused: its create touches no
+/// store. A row of another store is refused as another store's, whatever
+/// the configured one's health.
+#[tokio::test]
+async fn an_unhealthy_store_refuses_create_delete_and_restore_unless_bound_to_the_in_catalog_create()
+ {
+    let mem = Arc::new(MemStore::default());
+    let unhealthy = || {
+        runtime_unhealthy(
+            &mem,
+            StoreProblem::Transport("connect /var/lib/extenddb/backups: refused".to_owned()),
+        )
+    };
+    let check = |e: DynamoDbError| {
+        let DynamoDbError::ValidationException(m) = e else {
+            panic!("expected ValidationException, got {e:?}");
+        };
+        assert!(m.contains("filesystem backup store"), "{m}");
+        assert!(m.contains("unreachable"), "{m}");
+        assert!(!m.contains("/var/lib"), "{m}");
+        assert!(!m.contains("connect"), "{m}");
+    };
+
+    // The store-backed create is refused before the permit and the open.
+    let fake = Arc::new(Fake::default());
+    let runtime = unhealthy();
+    let err = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap_err();
+    check(err);
+    assert_eq!(runtime.free_slots(), 4, "no slot was taken");
+    assert!(fake.snapshots_opened.lock().unwrap().is_empty());
+    assert!(fake.creates.lock().unwrap().is_empty());
+
+    // A backend bound to the in-catalog create runs it, taking its slot.
+    let runtime = unhealthy().with_legacy_create_only(true);
+    create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(active_table("Music")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fake.creates.lock().unwrap().len(), 1);
+    assert_eq!(runtime.free_slots(), 3, "the create holds its slot");
+    fake.permits.lock().unwrap().clear();
+
+    // DeleteBackup of a row of the store.
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = delete_backup(&*fake, &unhealthy(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    check(err);
+    assert!(
+        fake.delete_starts_seen.lock().unwrap().is_empty(),
+        "no DELETING write"
+    );
+
+    // The restore of a row of the store, with no slot free: the refusal is
+    // the store's, so it came before the permit.
+    let full = BackupRuntime::new(0).with_store(ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Err(StoreProblem::Transport(
+            "connect /var/lib/extenddb/backups: refused".to_owned(),
+        )),
+    ));
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    check(err);
+    assert!(fake.restores().is_empty(), "the backend was not asked");
+
+    // A row of another store is the other-store refusal, whatever the health
+    // of the configured one.
+    let mut other = row(&arn(ACCOUNT), BackupStatus::Available);
+    other.store.store_root = "/elsewhere".to_owned();
+    let fake = Arc::new(Fake::default());
+    fake.rows.lock().unwrap().insert(arn(ACCOUNT), other);
+    let err = delete_backup(&*fake, &unhealthy(), ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("other than")),
+        "{err:?}"
+    );
+}
+
+/// With a healthy store configured, CreateBackup is store-backed: the
+/// legacy reader is not asked, the table's snapshot is opened and the answer
+/// is CREATING; a table with vector indexes is backed up on this path (the
+/// refusal belongs to the in-catalog create alone).
+#[tokio::test]
+async fn a_healthy_store_makes_create_backup_store_backed() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let mut table = music_table();
+    table.vector_indexes = Some(vec![vector_index()]);
+    snapshot_fixture(&fake, &table, Vec::new(), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(table),
+    )
+    .await
+    .unwrap();
+    assert_eq!(details.backup_status, "CREATING");
+    assert!(
+        fake.creates.lock().unwrap().is_empty(),
+        "the legacy reader was not asked"
+    );
+    assert_eq!(fake.snapshots_opened.lock().unwrap().as_slice(), ["Music"]);
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Available);
+    assert_eq!(
+        row.source_table_details_json["vector_indexes"][0]["IndexName"],
+        "v"
+    );
+}
+
+/// DeleteBackup of a row of the configured store deletes the manifest first
+/// (a `delete_prefix` on its exact key), then the prefix, and moves the row
+/// to DELETED once the prefix lists nothing; a retry on a DELETING row runs
+/// the same deletion. The identity file and other backups' prefixes stay.
+#[tokio::test]
+async fn delete_backup_of_a_configured_store_row_deletes_manifest_prefix_then_marks_deleted() {
+    let mem = Arc::new(MemStore::default());
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"gz");
+    mem.insert(&format!("{prefix}manifest-files.json"), b"{}");
+    mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+    let fake = fake_with_rows(&[
+        (arn(ACCOUNT), BackupStatus::Deleting),
+        (newer_arn(ACCOUNT), BackupStatus::Available),
+    ]);
+    let runtime = runtime_on(&mem, store());
+    let desc = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert_eq!(
+        mem.deletes.lock().unwrap().as_slice(),
+        [manifest_key(&arn(ACCOUNT)), prefix.clone()],
+        "the manifest first, then the prefix"
+    );
+    assert_eq!(
+        mem.keys(),
+        [
+            manifest_key(&newer_arn(ACCOUNT)),
+            STORE_IDENTITY_KEY.to_owned()
+        ],
+        "the other backup and the identity file stay"
+    );
+    assert_eq!(fake.set_deleted.lock().unwrap().as_slice(), [arn(ACCOUNT)]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+}
+
+/// A store failure during the deletion leaves the row DELETING and still
+/// answers the description with `BackupStatus` DELETED (the service has no
+/// counterpart for a failed object deletion, and every reader reports the
+/// backup deleted from the DELETING write on); the reconciler's next cycle
+/// finishes it once the store answers, and leaves it alone while the store
+/// is unhealthy.
+#[tokio::test]
+async fn a_failed_deletion_stays_deleting_and_the_reconciler_finishes_it() {
+    let mem = Arc::new(MemStore::default());
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+    mem.insert(&format!("{prefix}data/00001.json.gz"), b"gz");
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let runtime = runtime_on(&mem, store());
+
+    mem.set_down(true);
+    let out = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.backup_details.backup_status, "DELETED",
+        "the description answers DELETED once DELETING committed"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+    assert_eq!(mem.keys().len(), 3, "nothing was deleted");
+
+    // The reconciler finds the store down: unhealthy, and no row touched.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(report.deletions_finished.is_empty());
+    assert!(runtime.require_healthy_store().is_err());
+
+    // The store answers again: the cycle recovers the health and finishes
+    // the deletion.
+    mem.set_down(false);
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.store_healthy, Some(true));
+    assert_eq!(report.deletions_finished, [arn(ACCOUNT)]);
+    assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+    // Nothing left to finish.
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.deletions_finished.is_empty());
+}
+
+/// The reconciler finishes DELETING rows of the configured store only: a
+/// DELETING row of another store is left alone, and so is one whose prefix
+/// still lists an object after the deletion (a put that overlapped it).
+#[tokio::test]
+async fn the_reconciler_finishes_only_the_configured_stores_deleting_rows() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let mut other = row(&newer_arn(ACCOUNT), BackupStatus::Deleting);
+    other.store.store_id = "store-9".to_owned();
+    other.store.store_root = "/elsewhere".to_owned();
+    fake.rows.lock().unwrap().insert(newer_arn(ACCOUNT), other);
+    let runtime = runtime_on(&mem, store());
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.deletions_finished, [arn(ACCOUNT)]);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&newer_arn(ACCOUNT)].status,
+        BackupStatus::Deleting,
+        "another store's row is not touched"
+    );
+    assert!(
+        mem.deletes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| !p.contains("0badf00d")),
+        "nothing of the other store's prefix was deleted"
+    );
+}
+
+/// `finish_backup_delete` reports a prefix that still lists an object after
+/// the deletion and leaves the row DELETING for the next run.
+#[tokio::test]
+async fn a_prefix_that_still_lists_an_object_is_left_deleting() {
+    struct Refilling(MemStore);
+    impl extenddb_backup_store::BackupStore for Refilling {
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            body: extenddb_backup_store::ByteStream,
+        ) -> BoxedFuture<
+            'a,
+            Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>,
+        > {
+            self.0.put(key, body)
+        }
+        fn put_if_absent<'a>(
+            &'a self,
+            key: &'a str,
+            body: extenddb_backup_store::ByteStream,
+        ) -> BoxedFuture<
+            'a,
+            Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+        > {
+            self.0.put_if_absent(key, body)
+        }
+        fn get<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> BoxedFuture<
+            'a,
+            Result<extenddb_backup_store::ByteStream, extenddb_backup_store::StoreError>,
+        > {
+            self.0.get(key)
+        }
+        fn head<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> BoxedFuture<
+            'a,
+            Result<Option<extenddb_backup_store::ObjectMeta>, extenddb_backup_store::StoreError>,
+        > {
+            self.0.head(key)
+        }
+        fn list<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxStream<
+            'a,
+            Result<extenddb_backup_store::ObjectMeta, extenddb_backup_store::StoreError>,
+        > {
+            self.0.list(prefix)
+        }
+        /// The deletion runs, and a late put lands under the prefix after
+        /// it.
+        fn delete_prefix<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxedFuture<'a, Result<u64, extenddb_backup_store::StoreError>> {
+            Box::pin(async move {
+                let n = self.0.delete_prefix(prefix).await?;
+                if !prefix.ends_with(MANIFEST_KEY_SUFFIX) {
+                    self.0
+                        .insert(&format!("{prefix}data/late.json.gz"), b"late");
+                }
+                Ok(n)
+            })
+        }
+        fn validate(&self) -> BoxedFuture<'_, Result<(), extenddb_backup_store::StoreError>> {
+            self.0.validate()
+        }
+    }
+    let store_handle = Refilling(MemStore::default());
+    let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+    let parsed = BackupArn::parse(&arn(ACCOUNT)).unwrap();
+    let err = finish_backup_delete(&*fake, &store_handle, &passing_fence(), &parsed)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("still lists"), "{err}");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+}
+
+// --- the second review round: the store's health, the purge's steps, the orders --
+
+mod review_round_2 {
+    use super::*;
+    use extenddb_storage::backup_catalog::{JobStatus, RestoreKind};
+    use maintenance::{
+        Interrupt, PurgeOutcome, Stop, Wait, WaitOutcome, purge_rows, wait_for_quiet,
+    };
+
+    async fn cycle_on(fake: &Arc<Fake>, runtime: &BackupRuntime) -> reconciler::CycleReport {
+        reconciler::cycle(
+            fake,
+            runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A store whose startup `validate` failed (an I/O error on the probe
+    /// write) is built unvalidated, so the next check runs `validate` again
+    /// and the store stays unhealthy while the probe fails, where a store
+    /// built validated would re-read the identity file alone and report
+    /// itself healthy after one cycle. Once the probe passes the store is
+    /// healthy.
+    #[tokio::test]
+    async fn a_store_whose_startup_validate_failed_is_rechecked_by_validate() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        *mem.validate_error.lock().unwrap() =
+            Some("write probe: Input/output error (os error 5)".to_owned());
+        let fake = Arc::new(Fake::default());
+        let runtime = runtime_unhealthy(
+            &mem,
+            StoreProblem::Validate("write probe: Input/output error (os error 5)".to_owned()),
+        );
+        let configured = runtime.configured_store().unwrap();
+        assert!(
+            !configured.is_validated(),
+            "a failed validate leaves the store unvalidated"
+        );
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(false));
+        assert_eq!(
+            configured.health(),
+            StoreHealth::Unhealthy(StoreProblem::Validate(
+                "write probe: Input/output error (os error 5)".to_owned()
+            )),
+            "validate ran again and failed again"
+        );
+        assert!(!configured.is_validated());
+        assert_eq!(runtime.store_health().unwrap().status, "unhealthy");
+
+        *mem.validate_error.lock().unwrap() = None;
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(true));
+        assert!(configured.is_validated());
+        assert_eq!(
+            configured.identity().map(|i| i.store_id),
+            Some("store-1".to_owned())
+        );
+
+        // A startup check that failed after `validate` passed (an identity
+        // problem) is built validated: the probe is not repeated.
+        let identity_problem = runtime_unhealthy(
+            &mem,
+            StoreProblem::ForeignCatalog {
+                file_catalog_id: "other".to_owned(),
+                catalog_id: "catalog-1".to_owned(),
+            },
+        );
+        assert!(identity_problem.configured_store().unwrap().is_validated());
+        for problem in [
+            StoreProblem::Transport("refused".to_owned()),
+            StoreProblem::Denied("mode 0755".to_owned()),
+        ] {
+            assert!(
+                !runtime_unhealthy(&mem, problem)
+                    .configured_store()
+                    .unwrap()
+                    .is_validated(),
+                "the problems validate can end in leave the store unvalidated"
+            );
+        }
+    }
+
+    /// `purge_row` deletes the manifest before the rest of the prefix (so
+    /// the prefix is no longer a complete backup to any reader while the
+    /// rest goes), lists the prefix after the deletion and leaves a row whose
+    /// prefix still holds an object (a put that overlapped the deletion),
+    /// and does not continue past `DeleteStart::InUse`: a restore reading
+    /// the backup keeps its source and the row stays AVAILABLE.
+    #[tokio::test]
+    async fn purge_row_deletes_manifest_first_lists_after_and_stops_at_in_use() {
+        // The order: the manifest key, then the prefix.
+        let fake = Fake::default();
+        let mem = MemStore::default();
+        let arn = arn_n(1);
+        seed(&fake, &mem, &arn, BackupStatus::Available);
+        let prefix = BackupArn::parse(&arn).unwrap().store_prefix();
+        let row = fake.rows.lock().unwrap()[&arn].clone();
+        maintenance::purge_row(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &row,
+            Duration::from_secs(300),
+            &confirmed_claim(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *mem.deletes.lock().unwrap(),
+            vec![format!("{prefix}{MANIFEST_KEY_SUFFIX}"), prefix.clone()],
+            "the manifest first, then the prefix"
+        );
+        assert!(mem.keys().is_empty());
+        assert!(fake.rows.lock().unwrap().is_empty());
+
+        // An object left under the prefix: the row is left, after the
+        // DELETING write, for the operator and the reconciler.
+        let fake = Fake::default();
+        let mem = MemStore::default();
+        *mem.late_put_after_delete.lock().unwrap() = Some("data/late.json.gz".to_owned());
+        seed(&fake, &mem, &arn, BackupStatus::Available);
+        let row = fake.rows.lock().unwrap()[&arn].clone();
+        let err = maintenance::purge_row(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &row,
+            Duration::from_secs(300),
+            &confirmed_claim(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("the prefix still lists {prefix}data/late.json.gz after the deletion")
+        );
+        assert_eq!(
+            fake.rows.lock().unwrap()[&arn].status,
+            BackupStatus::Deleting,
+            "the row is left DELETING, not removed, over objects"
+        );
+        assert!(fake.set_deleted.lock().unwrap().is_empty());
+        assert!(fake.removed_rows.lock().unwrap().is_empty());
+
+        // In use: a restore reads the backup, so nothing is deleted.
+        let fake = Fake::default();
+        let mem = MemStore::default();
+        seed(&fake, &mem, &arn, BackupStatus::Available);
+        fake.delete_starts
+            .lock()
+            .unwrap()
+            .insert(arn.clone(), DeleteStart::InUse("Restored".to_owned()));
+        let row = fake.rows.lock().unwrap()[&arn].clone();
+        let err = maintenance::purge_row(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &row,
+            Duration::from_secs(300),
+            &confirmed_claim(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "a restore into Restored is reading it");
+        assert!(mem.deletes.lock().unwrap().is_empty(), "no delete ran");
+        assert_eq!(mem.keys().len(), 2, "the objects stay");
+        assert_eq!(
+            fake.rows.lock().unwrap()[&arn].status,
+            BackupStatus::Available
+        );
+    }
+
+    /// The reconciler's DELETING duty runs only while the store is healthy:
+    /// with a foreign `extenddb-store.json` under the root (another
+    /// catalog's), and a store that answers deletes, no delete runs and the
+    /// row stays DELETING, so the reconciler never deletes under a root
+    /// another catalog owns.
+    #[tokio::test]
+    async fn an_unhealthy_store_whose_deletes_would_answer_has_no_row_touched() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(
+            STORE_IDENTITY_KEY,
+            &identity_file("store-1", "other-catalog"),
+        );
+        mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+        let fake = fake_with_rows(&[(arn(ACCOUNT), BackupStatus::Deleting)]);
+        let runtime = runtime_on(&mem, store());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(false));
+        assert_eq!(
+            runtime.configured_store().unwrap().health(),
+            StoreHealth::Unhealthy(StoreProblem::ForeignCatalog {
+                file_catalog_id: "other-catalog".to_owned(),
+                catalog_id: "catalog-1".to_owned(),
+            })
+        );
+        assert!(
+            report.deletions_finished.is_empty() && mem.deletes.lock().unwrap().is_empty(),
+            "no delete ran under a root another catalog owns"
+        );
+        assert_eq!(
+            fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+            BackupStatus::Deleting
+        );
+        assert_eq!(mem.keys().len(), 2, "the manifest and the file stay");
+    }
+
+    /// The maintenance refusal comes after every other check: with the claim
+    /// held, a create under a `server.region` `check_backup_arn_fits`
+    /// refuses and a restore whose throughput override does not fit the
+    /// backup's billing mode (`validate_override_for_source`) each answer
+    /// their own ValidationException, not LimitExceededException.
+    #[tokio::test]
+    async fn the_maintenance_refusal_comes_after_the_requests_own_checks() {
+        let fake = Fake::with_source(source(Some(definition("PAY_PER_REQUEST"))));
+        *fake.maintenance_held.lock().unwrap() = true;
+        let runtime = BackupRuntime::new(1).with_stale_job_after(Duration::from_secs(7));
+
+        let err = create_backup(
+            &fake,
+            &runtime,
+            ACCOUNT,
+            "US_EAST_1",
+            &LimitsConfig::default(),
+            "Music",
+            "nightly",
+            Ok(active_table("Music")),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m) if m.contains("server.region")),
+            "the region rule answers before the claim: {err:?}"
+        );
+
+        let body = restore_body(json!({
+            "BillingModeOverride": "PAY_PER_REQUEST",
+            "ProvisionedThroughputOverride": {
+                "ReadCapacityUnits": 5, "WriteCapacityUnits": 5
+            },
+        }));
+        let err = restore_on(&fake, &runtime, &body).await.unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(m)
+                if m.contains("ProvisionedThroughputOverride can only be specified")),
+            "the override rule answers before the claim: {err:?}"
+        );
+        assert!(
+            fake.maintenance_checks.lock().unwrap().is_empty(),
+            "the claim was not read for a request refused on its own terms"
+        );
+
+        // The same requests with their own faults removed are refused on the
+        // claim, so the claim is the next check.
+        let err = create_backup(
+            &fake,
+            &runtime,
+            ACCOUNT,
+            REGION,
+            &LimitsConfig::default(),
+            "Music",
+            "nightly",
+            Ok(active_table("Music")),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DynamoDbError::LimitExceededException(_)));
+        let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DynamoDbError::LimitExceededException(_)));
+        assert_eq!(fake.maintenance_checks.lock().unwrap().len(), 2);
+    }
+
+    /// `recheck` on a store startup settled: rows that arrive carrying
+    /// another id are an identity mismatch; a file deleted while rows exist
+    /// is `identity file missing` and is not rewritten; a file replaced with
+    /// another catalog's is `owned by another catalog`. Each runs through
+    /// the reconciler, as a running server runs it.
+    #[tokio::test]
+    async fn a_recheck_catches_rows_with_another_id_a_lost_file_and_a_foreign_file() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let runtime = runtime_on(&mem, store());
+        let configured = runtime.configured_store().unwrap();
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(true));
+
+        // Rows of the root with another id arrive after startup.
+        let mut foreign_row = row(&arn(ACCOUNT), BackupStatus::Available);
+        foreign_row.store.store_id = "store-2".to_owned();
+        mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+        fake.rows.lock().unwrap().insert(arn(ACCOUNT), foreign_row);
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(false));
+        assert_eq!(
+            configured.health(),
+            StoreHealth::Unhealthy(StoreProblem::IdMismatch {
+                file_id: "store-1".to_owned(),
+                row_ids: vec!["store-2".to_owned()],
+            })
+        );
+        fake.rows.lock().unwrap().clear();
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(true));
+
+        // The file is deleted while rows exist: not rewritten.
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Available));
+        let puts_before = mem.puts.lock().unwrap().len();
+        mem.objects.lock().unwrap().remove(STORE_IDENTITY_KEY);
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(false));
+        assert_eq!(
+            configured.health(),
+            StoreHealth::Unhealthy(StoreProblem::FileMissingWithRows(vec![
+                "store-1".to_owned()
+            ]))
+        );
+        assert_eq!(
+            mem.puts.lock().unwrap().len(),
+            puts_before,
+            "a root that lost its file while rows exist gets no new one"
+        );
+        assert!(!mem.keys().contains(&STORE_IDENTITY_KEY.to_owned()));
+        assert_eq!(
+            runtime.store_health().unwrap().reason,
+            Some("identity file missing")
+        );
+
+        // The file is replaced with another catalog's.
+        mem.insert(
+            STORE_IDENTITY_KEY,
+            &identity_file("store-1", "other-catalog"),
+        );
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(false));
+        assert_eq!(
+            configured.health(),
+            StoreHealth::Unhealthy(StoreProblem::ForeignCatalog {
+                file_catalog_id: "other-catalog".to_owned(),
+                catalog_id: "catalog-1".to_owned(),
+            })
+        );
+        // Restored, the store is healthy again.
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(true));
+    }
+
+    /// The wait reads RUNNING restores by status, with no age: a record
+    /// stamped this instant (one the dead-job listing never returns, its
+    /// heartbeat being within any window) holds the wait, and the wait
+    /// reports it.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_sees_a_running_restore_with_a_fresh_heartbeat() {
+        let fake = Fake::default();
+        let holder = Arc::new(FakeHolder::default());
+        let claim = held(&holder);
+        let mut fresh = dead_job(RestoreKind::Legacy, "Fresh");
+        fresh.heartbeat_at = seconds_since_epoch();
+        fresh.status = JobStatus::Running;
+        fake.running_jobs.lock().unwrap().push(fresh);
+        let wait = Wait {
+            owner_window: Duration::from_secs(10),
+            limit: Duration::from_secs(4),
+            poll: Duration::from_secs(2),
+        };
+        let (_tx, mut quiet) = Interrupt::new();
+        let outcome = wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, |_| {}).await;
+        assert_eq!(
+            outcome,
+            WaitOutcome::Busy(vec![format!(
+                "a restore into Fresh (account {ACCOUNT}) is RUNNING"
+            )])
+        );
+        fake.running_jobs.lock().unwrap().clear();
+        assert_eq!(
+            wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, |_| {}).await,
+            WaitOutcome::Quiet
+        );
+        claim.release().await.unwrap();
+    }
+
+    /// The deletion loop stops before its next row, never inside one: once a
+    /// heartbeat has found the claim lost, and once a signal has been
+    /// received (here sent as the first row's deletion is reported, so the
+    /// loop stops before the second). A row left for a reason is skipped
+    /// and the loop goes on.
+    #[tokio::test(start_paused = true)]
+    async fn the_deletion_loop_stops_at_a_lost_claim_and_at_a_signal() {
+        let fake = Fake::default();
+        let mem = MemStore::default();
+        let arns: Vec<String> = (1..=3).map(arn_n).collect();
+        for arn in &arns {
+            seed(&fake, &mem, arn, BackupStatus::Available);
+        }
+        let rows: Vec<BackupRow> = fake
+            .list_backup_rows(None, &store())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // The claim lost before the loop: no row is deleted.
+        let holder = Arc::new(FakeHolder::default());
+        let claim = held(&holder);
+        *holder.lost.lock().unwrap() = true;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(claim.lost().is_some());
+        let (_tx, interrupt) = Interrupt::new();
+        let mut reported = Vec::new();
+        let outcome = purge_rows(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &rows,
+            Duration::from_secs(300),
+            &claim,
+            &interrupt,
+            |row| reported.push(row.backup_arn.clone()),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PurgeOutcome {
+                deleted: vec![],
+                skipped: vec![],
+                stopped: Some(Stop::Lost(
+                    "the maintenance claim was lost (another holder took it over)".to_owned()
+                )),
+            }
+        );
+        assert!(reported.is_empty());
+        assert_eq!(fake.rows.lock().unwrap().len(), 3, "no row was touched");
+        assert_eq!(mem.keys().len(), 6, "no object was deleted");
+        claim.release().await.unwrap();
+
+        // A signal received as the first row is reported stops the loop
+        // before the second; the third is untouched.
+        let holder = Arc::new(FakeHolder::default());
+        let claim = held(&holder);
+        let (tx, interrupt) = Interrupt::new();
+        let mut reported = Vec::new();
+        let outcome = purge_rows(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &rows,
+            Duration::from_secs(300),
+            &claim,
+            &interrupt,
+            |row| {
+                reported.push(row.backup_arn.clone());
+                let _ = tx.send(Some("SIGTERM"));
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PurgeOutcome {
+                deleted: vec![arns[0].clone()],
+                skipped: vec![],
+                stopped: Some(Stop::Interrupted("SIGTERM")),
+            }
+        );
+        assert_eq!(reported, vec![arns[0].clone()]);
+        let mut left: Vec<String> = fake.rows.lock().unwrap().keys().cloned().collect();
+        left.sort();
+        assert_eq!(left, vec![arns[1].clone(), arns[2].clone()]);
+        assert_eq!(mem.keys().len(), 4);
+
+        // Nothing stops it: the rest goes, a row left for a reason skipped.
+        fake.delete_starts
+            .lock()
+            .unwrap()
+            .insert(arns[1].clone(), DeleteStart::InUse("Restored".to_owned()));
+        let (_tx, interrupt) = Interrupt::new();
+        let rest: Vec<BackupRow> = rows[1..].to_vec();
+        let outcome = purge_rows(
+            &fake,
+            &mem,
+            &passing_fence(),
+            &rest,
+            Duration::from_secs(300),
+            &claim,
+            &interrupt,
+            |_| {},
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PurgeOutcome {
+                deleted: vec![arns[2].clone()],
+                skipped: vec![format!(
+                    "{}: a restore into Restored is reading it",
+                    arns[1]
+                )],
+                stopped: None,
+            }
+        );
+        claim.release().await.unwrap();
+    }
+
+    /// A defaulted root whose startup checks did not finish starts checking
+    /// with the rule kept: a first check that fails while the catalog has no
+    /// rows for the root sets the store aside (no component, no store), as
+    /// the startup failure would have; with rows for it the same failure is
+    /// an unhealthy configured store.
+    #[tokio::test]
+    async fn a_defaulted_root_set_aside_after_its_first_failed_check() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(
+            STORE_IDENTITY_KEY,
+            &identity_file("store-1", "other-catalog"),
+        );
+        let fake = Arc::new(Fake::default());
+        let checking = || {
+            ConfiguredStore::checking(
+                store().store_kind,
+                store().store_root,
+                Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+                None,
+            )
+            .defaulted(true)
+        };
+        let runtime = BackupRuntime::new(4).with_store(checking());
+        assert!(runtime.configured_store().is_some());
+        assert_eq!(runtime.store_health().unwrap().status, "checking");
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(
+            report.store_healthy, None,
+            "the store is set aside, as none configured"
+        );
+        assert!(runtime.configured_store().is_none());
+        assert!(runtime.store_health().is_none());
+        assert!(!runtime.is_configured_store(&store()));
+        // The next cycle runs no check: the store is unconfigured for good.
+        let puts = mem.puts.lock().unwrap().len();
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, None);
+        assert_eq!(mem.puts.lock().unwrap().len(), puts);
+
+        // With rows for the root, the same failure is an unhealthy store.
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Available));
+        let runtime = BackupRuntime::new(4).with_store(checking());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(false));
+        assert_eq!(
+            runtime.store_health().unwrap().reason,
+            Some("owned by another catalog")
+        );
+        // A root that is not the defaulted one is never set aside.
+        let explicit = BackupRuntime::new(4).with_store(checking().defaulted(false));
+        fake.rows.lock().unwrap().clear();
+        assert_eq!(cycle_on(&fake, &explicit).await.store_healthy, Some(false));
+        assert!(explicit.configured_store().is_some());
+    }
+
+    /// The deletions run under the store's bound and the in-flight rule:
+    /// DeleteBackup on a store whose deletions stall (its fence reads, in
+    /// their own slot, answer) answers DELETED at the bound with the row
+    /// left DELETING, two DeleteBackups together park one thread between
+    /// them (the second waits for the first's slot and answers at its bound
+    /// with nothing parked), and the reconciler's deletion of those rows
+    /// returns at the bound too, with no second call parked beside the first.
+    #[tokio::test(start_paused = true)]
+    async fn the_deletions_run_under_the_stores_bound() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+        mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+        let fake = fake_with_rows(&[
+            (arn(ACCOUNT), BackupStatus::Available),
+            (newer_arn(ACCOUNT), BackupStatus::Available),
+        ]);
+        let runtime = runtime_on(&mem, store());
+        let configured = runtime.configured_store().unwrap();
+        mem.stall_deletes
+            .store(true, std::sync::atomic::Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let (first, second) = tokio::time::timeout(
+            Duration::from_secs(120),
+            futures::future::join(
+                delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT))),
+                delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&newer_arn(ACCOUNT))),
+            ),
+        )
+        .await
+        .expect("both deletes return at the store's bound");
+        assert_eq!(started.elapsed(), LOCAL_CHECK_TIMEOUT);
+        assert_eq!(first.unwrap().backup_details.backup_status, "DELETED");
+        assert_eq!(second.unwrap().backup_details.backup_status, "DELETED");
+        for row in [arn(ACCOUNT), newer_arn(ACCOUNT)] {
+            assert_eq!(
+                fake.rows.lock().unwrap()[&row].status,
+                BackupStatus::Deleting,
+                "the row is left for the reconciler"
+            );
+        }
+        assert!(
+            configured.check_call_in_flight(),
+            "the abandoned call is parked"
+        );
+        assert_eq!(
+            mem.stalls.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the second delete's call waited for the first's slot and parked nothing"
+        );
+
+        // The reconciler's cycle: the check is refused at once (a call is
+        // parked), so no deletion runs and nothing new is parked.
+        let started = tokio::time::Instant::now();
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(report.store_healthy, Some(false));
+        assert!(report.deletions_finished.is_empty());
+        assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        // The mount answers: the parked call returns, the next cycle checks
+        // and finishes the deletions.
+        mem.stall_deletes
+            .store(false, std::sync::atomic::Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!configured.check_call_in_flight());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(true));
+        let mut finished = report.deletions_finished.clone();
+        finished.sort();
+        let mut expected = [arn(ACCOUNT), newer_arn(ACCOUNT)];
+        expected.sort();
+        assert_eq!(finished, expected);
+        assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    }
+
+    /// A call's bound starts once it holds the root's slot: on a healthy
+    /// root whose calls take 3 s under a 5 s bound, two DeleteBackups
+    /// together both finish (the second waits 3 s for the slot and then has
+    /// the bound for its own 3 s call), both rows reach DELETED, nothing is
+    /// marked in flight and the next check finds the store healthy. With one
+    /// bound over the wait and the call the second was abandoned at 5 s, its
+    /// row left DELETING, and the next check marked the store unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn a_calls_bound_starts_when_it_holds_the_slot() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+        mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+        let fake = fake_with_rows(&[
+            (arn(ACCOUNT), BackupStatus::Available),
+            (newer_arn(ACCOUNT), BackupStatus::Available),
+        ]);
+        let runtime = runtime_on(&mem, store());
+        let configured = runtime.configured_store().unwrap();
+        mem.set_delay(Some(Duration::from_secs(3)));
+        let started = tokio::time::Instant::now();
+        let (first, second) = futures::future::join(
+            delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT))),
+            delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&newer_arn(ACCOUNT))),
+        )
+        .await;
+        assert_eq!(first.unwrap().backup_details.backup_status, "DELETED");
+        assert_eq!(second.unwrap().backup_details.backup_status, "DELETED");
+        assert!(
+            started.elapsed() > LOCAL_CHECK_TIMEOUT,
+            "the second call ran after the first's 3 s: {:?}",
+            started.elapsed()
+        );
+        for row in [arn(ACCOUNT), newer_arn(ACCOUNT)] {
+            assert_eq!(
+                fake.rows.lock().unwrap()[&row].status,
+                BackupStatus::Deleted,
+                "both deletions finished"
+            );
+        }
+        assert!(!configured.check_call_in_flight(), "nothing abandoned");
+        mem.set_delay(None);
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(true));
+    }
+
+    /// The manifest probe reads one row (`newest_available_backup_row`) and
+    /// not the listing: the catalog double records the read, and the probe
+    /// heads the newest AVAILABLE row's manifest.
+    #[tokio::test]
+    async fn the_manifest_probe_reads_one_row() {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        mem.insert(&manifest_key(&arn(ACCOUNT)), b"{}");
+        let fake = fake_with_rows(&[
+            (arn(ACCOUNT), BackupStatus::Available),
+            (newer_arn(ACCOUNT), BackupStatus::Available),
+        ]);
+        let runtime = runtime_on(&mem, store());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(false));
+        assert_eq!(
+            runtime.configured_store().unwrap().health(),
+            StoreHealth::Unhealthy(StoreProblem::ManifestMissing {
+                backup_arn: newer_arn(ACCOUNT),
+            }),
+            "the newest row's manifest is the one probed"
+        );
+        assert_eq!(fake.newest_reads.lock().unwrap().as_slice(), [store()]);
+        mem.insert(&manifest_key(&newer_arn(ACCOUNT)), b"{}");
+        assert_eq!(cycle_on(&fake, &runtime).await.store_healthy, Some(true));
+    }
+}
+
+// --- the store-backed create and its job ------------------------------------
+
+/// The `Music` table as a snapshot describes it: composite key, one GSI,
+/// provisioned.
+fn music_table() -> TableDescription {
+    TableDescription {
+        table_name: "Music".to_owned(),
+        key_schema: vec![
+            key("Artist", KeyType::Hash),
+            key("SongTitle", KeyType::Range),
+        ],
+        attribute_definitions: vec![attr("Artist"), attr("SongTitle"), attr("Genre")],
+        table_status: TableStatus::Active,
+        creation_date_time: 1_757_400_000.0,
+        table_size_bytes: 123_456,
+        item_count: 100_000,
+        table_arn: source_arn(),
+        table_id: "12345a12-abcd-123a-ab12-1234abc12345".to_owned(),
+        provisioned_throughput: ProvisionedThroughputDescription {
+            read_capacity_units: 5,
+            write_capacity_units: 5,
+            ..Default::default()
+        },
+        billing_mode_summary: Some(BillingModeSummary {
+            billing_mode: BillingMode::Provisioned,
+            last_update_to_pay_per_request_date_time: None,
+        }),
+        global_secondary_indexes: Some(vec![GsiDescription {
+            index_name: "GenreIndex".to_owned(),
+            key_schema: vec![key("Genre", KeyType::Hash)],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            index_status: "ACTIVE".to_owned(),
+            provisioned_throughput: Some(ProvisionedThroughputDescription {
+                read_capacity_units: 1,
+                write_capacity_units: 1,
+                ..Default::default()
+            }),
+            index_size_bytes: 0,
+            item_count: 0,
+            index_arn: String::new(),
+            warm_throughput: None,
+            warm_throughput_record: None,
+        }]),
+        ..Default::default()
+    }
+}
+
+/// A vector index description for a table with vector support.
+fn vector_index() -> extenddb_core::types::VectorIndexDescription {
+    serde_json::from_value(json!({
+        "IndexName": "v",
+        "VectorAttribute": { "AttributeName": "emb" },
+        "Dimensions": 3,
+        "DistanceFunction": "COSINE",
+        "IndexStatus": "ACTIVE",
+        "IndexSizeBytes": 0,
+        "ItemCount": 0,
+        "IndexArn": ""
+    }))
+    .unwrap()
+}
+
+/// An item of the `Music` table with a `Year` number.
+fn song(artist: &str, title: &str) -> Item {
+    use extenddb_core::types::AttributeValue;
+    Item::from([
+        ("Artist".to_owned(), AttributeValue::S(artist.to_owned())),
+        ("SongTitle".to_owned(), AttributeValue::S(title.to_owned())),
+        ("Year".to_owned(), AttributeValue::N("1999".to_owned())),
+    ])
+}
+
+/// `song` with a `Year` the wire refuses (#618's shape).
+fn song_with_bad_number(artist: &str, title: &str, year: &str) -> Item {
+    use extenddb_core::types::AttributeValue;
+    let mut item = song(artist, title);
+    item.insert("Year".to_owned(), AttributeValue::N(year.to_owned()));
+    item
+}
+
+/// `n` songs in key order.
+fn songs(n: usize) -> Vec<Item> {
+    (0..n)
+        .map(|i| song(&format!("artist-{i:05}"), &format!("title-{i:05}")))
+        .collect()
+}
+
+/// Make `fake` serve a snapshot of `table` yielding `items` (through `gate`
+/// when given).
+fn snapshot_fixture(
+    fake: &Fake,
+    table: &TableDescription,
+    items: Vec<Item>,
+    key_ordered: bool,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+) {
+    fake.snapshots.lock().unwrap().insert(
+        table.table_name.clone(),
+        SnapshotFixture {
+            description: table.clone(),
+            key_ordered,
+            items: items.into_iter().map(Ok).collect(),
+            gate,
+        },
+    );
+}
+
+/// A gate with no permit: the stream yields nothing until the test adds
+/// some.
+fn closed_gate() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(0))
+}
+
+/// The settings the job tests run with: small files, a short heartbeat.
+fn job_settings() -> JobSettings {
+    JobSettings {
+        data_file_target_bytes: 64 * 1024 * 1024,
+        heartbeat_interval: Duration::from_millis(50),
+        stale_job_after: Duration::from_secs(300),
+        failed_row_retention: Duration::from_secs(7 * 24 * 3600),
+    }
+}
+
+/// A healthy runtime on `mem` with the job settings above and a collector.
+fn job_runtime(mem: &Arc<MemStore>) -> BackupRuntime {
+    runtime_on(mem, store())
+        .with_job_settings(job_settings())
+        .with_metrics(Arc::new(extenddb_core::metrics::MetricsCollector::new()))
+}
+
+/// CreateBackup of `Music` through `runtime`.
+async fn create_music_backup(
+    fake: &Arc<Fake>,
+    runtime: &BackupRuntime,
+) -> Result<BackupDetails, DynamoDbError> {
+    create_backup(
+        fake,
+        runtime,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Ok(music_table()),
+    )
+    .await
+}
+
+/// Wait until no job task of `runtime` runs, failing after 30 s: a hang
+/// guard for jobs that take well under a second alone. A test whose job
+/// takes seconds calls [`wait_for_jobs_within`] with a bound at least ten
+/// times its time alone on an idle core, so a loaded host cannot reach it.
+async fn wait_for_jobs(runtime: &BackupRuntime) {
+    wait_for_jobs_within(runtime, Duration::from_secs(30)).await;
+}
+
+/// Wait until no job task of `runtime` runs, failing after `bound`.
+async fn wait_for_jobs_within(runtime: &BackupRuntime, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while runtime.running_jobs() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a job did not end within {bound:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The objects under the backup's prefix, by key.
+fn objects_under(mem: &MemStore, arn: &str) -> Vec<String> {
+    let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+    mem.keys()
+        .into_iter()
+        .filter(|k| k.starts_with(&prefix))
+        .collect()
+}
+
+/// The stored manifest of `arn`, parsed.
+fn stored_manifest(mem: &MemStore, arn: &str) -> extenddb_core::backup_format::ExtenddbManifest {
+    let bytes = mem.objects.lock().unwrap()[&manifest_key(arn)].clone();
+    extenddb_core::backup_format::ExtenddbManifest::from_json_bytes(&bytes).unwrap()
+}
+
+/// The status writes the fake's claims received, as `(to, failure_reason)`.
+fn writes(fake: &Fake) -> Vec<(JobStatus, Option<String>)> {
+    fake.status_writes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|w| (w.to, w.fields.failure_reason.clone()))
+        .collect()
+}
+
+/// The `BackupJobs` outcomes the collector drained, with their count.
+fn job_outcomes(runtime: &BackupRuntime) -> Vec<(String, f64)> {
+    use extenddb_core::metrics::MetricName;
+    let mut outcomes: Vec<(String, f64)> = runtime
+        .metrics()
+        .unwrap()
+        .drain(Duration::ZERO)
+        .into_iter()
+        .filter(|b| b.metric == MetricName::BackupJobs)
+        .map(|b| (b.operation, b.sum))
+        .collect();
+    outcomes.sort_by(|a, b| a.0.cmp(&b.0));
+    outcomes
+}
+
+/// The request's order and the job's happy path. The checks before the
+/// permit: a missing table is TableNotFound with every slot held and the
+/// store untouched. Then the detached task: the snapshot is opened, the row
+/// is inserted CREATING under the claim with the manifest's `source_table`
+/// (the TTL read beside the open), the maintenance claim is read, and the
+/// request is answered CREATING with the id's instant. The job then writes
+/// the data file, `manifest-files.json`, `manifest-summary.json`, the
+/// sidecar and the manifest, in that order and nothing else, and moves the
+/// row to AVAILABLE with the manifest's size, the stream's count and the
+/// manifest's `source_table`; the ARN's id, the row's `created_at`, the
+/// response's time and the manifest's `backup_creation_date_time` are one
+/// instant; the data file decodes back to the items; the slot is freed; the
+/// metrics name the outcome, and `BackupSnapshotAge` was recorded by the
+/// beats the job's three periods inside the stream gave it.
+#[tokio::test]
+async fn a_store_backed_create_answers_creating_and_its_job_writes_the_backup() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let items = songs(5);
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        items.clone(),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    *fake.ttl.lock().unwrap() = Some(TimeToLiveDescription {
+        time_to_live_status: TimeToLiveStatus::Enabled,
+        attribute_name: Some("expires_at".to_owned()),
+    });
+    let full = job_runtime(&mem);
+    let mut _held = Vec::new();
+    for _ in 0..4 {
+        _held.push(full.take_permit().await.unwrap());
+    }
+    let err = create_backup(
+        &fake,
+        &full,
+        ACCOUNT,
+        REGION,
+        &LimitsConfig::default(),
+        "Music",
+        "nightly",
+        Err(StorageError::TableNotFound("Music".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableNotFoundException(_)),
+        "{err:?}"
+    );
+    let err = create_music_backup(&fake, &full).await.unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(_)),
+        "{err:?}"
+    );
+    assert!(
+        fake.snapshots_opened.lock().unwrap().is_empty(),
+        "nothing was opened"
+    );
+    drop(_held);
+
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    assert_eq!(details.backup_status, "CREATING");
+    assert_eq!(details.backup_type, "USER");
+    assert_eq!(details.backup_name, "nightly");
+    assert_eq!(details.backup_size_bytes, 0);
+    let arn = BackupArn::parse(&details.backup_arn).unwrap();
+    assert_eq!(
+        extenddb_storage::util::backup_creation_date_time(&details.backup_arn),
+        Some(details.backup_creation_date_time),
+        "the response's time is the id's instant"
+    );
+    let claimed = fake.claims.lock().unwrap().clone();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].status, BackupStatus::Creating);
+    assert_eq!(claimed[0].store, store());
+    assert_eq!(claimed[0].created_at, details.backup_creation_date_time);
+    assert_eq!(claimed[0].item_count, 0);
+    assert_eq!(claimed[0].source_table_details_json["item_count"], 100_000);
+    assert_eq!(
+        claimed[0].source_table_details_json["time_to_live"]["AttributeName"],
+        "expires_at"
+    );
+    assert_eq!(
+        fake.maintenance_checks.lock().unwrap().as_slice(),
+        [Duration::from_secs(300); 3],
+        "the maintenance claim is read before the permit, by the refused request too, and by \
+         the job again before its insert"
+    );
+
+    // Three heartbeat periods inside the stream, so the timer beats before
+    // the job ends.
+    tokio::time::sleep(3 * job_settings().heartbeat_interval).await;
+    gate.add_permits(items.len());
+    wait_for_jobs(&runtime).await;
+    assert_eq!(runtime.free_slots(), 4, "the job freed its slot");
+    let prefix = arn.store_prefix();
+    assert_eq!(
+        mem.puts.lock().unwrap().as_slice(),
+        [
+            format!("{prefix}data/000001.json.gz"),
+            format!("{prefix}manifest-files.json"),
+            format!("{prefix}manifest-summary.json"),
+            format!("{prefix}extenddb-manifest.sha256"),
+            format!("{prefix}extenddb-manifest.json"),
+        ],
+        "the write order"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    let manifest = stored_manifest(&mem, &details.backup_arn);
+    assert_eq!(manifest.backup_arn, details.backup_arn);
+    assert_eq!(
+        manifest.backup_creation_date_time,
+        details.backup_creation_date_time
+    );
+    assert_eq!(manifest.source_table.item_count, 5, "the stream's count");
+    assert_eq!(
+        manifest.source_table.table_size_bytes,
+        items
+            .iter()
+            .map(|item| extenddb_core::types::item_size_bytes(item) as i64)
+            .sum::<i64>(),
+        "the stream's size, not the stats pass's 123,456"
+    );
+    assert_eq!(manifest.source_backend, "test");
+    assert_eq!(
+        manifest.item_order,
+        extenddb_core::backup_format::ItemOrder::KeyOrdered
+    );
+    assert_eq!(manifest.data_files.len(), 1);
+    assert!(manifest.data_files[0].key_range.is_some());
+    let file = mem.objects.lock().unwrap()[&format!("{prefix}data/000001.json.gz")].clone();
+    assert_eq!(manifest.data_files[0].bytes, file.len() as u64);
+    let mut reader = manifest.reader(&manifest.data_files[0], &file[..]).unwrap();
+    let mut decoded = Vec::new();
+    while let Some(item) = reader.next_item().unwrap() {
+        decoded.push(item);
+    }
+    assert_eq!(decoded, items);
+    let manifest_bytes =
+        mem.objects.lock().unwrap()[&format!("{prefix}extenddb-manifest.json")].clone();
+    let sidecar = mem.objects.lock().unwrap()[&format!("{prefix}extenddb-manifest.sha256")].clone();
+    extenddb_core::backup_format::verify_manifest_checksum(&manifest_bytes, &sidecar).unwrap();
+
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Available);
+    assert_eq!(row.size_bytes, manifest.backup_size_bytes);
+    assert_eq!(row.item_count, 5);
+    assert_eq!(
+        row.source_table_details_json,
+        serde_json::to_value(&manifest.source_table).unwrap()
+    );
+    assert!(row.completed_at.is_some());
+    assert_eq!(writes(&fake), [(JobStatus::Available, None)]);
+    let write = fake.status_writes.lock().unwrap()[0].clone();
+    assert_eq!(
+        (write.arn.as_str(), write.from, write.generation),
+        (
+            details.backup_arn.as_str(),
+            JobStatus::Creating,
+            row.owner_generation
+        ),
+        "every status write is conditioned on CREATING under the claim's generation"
+    );
+    assert!(fake.heartbeats.load(std::sync::atomic::Ordering::Acquire) >= 1);
+
+    use extenddb_core::metrics::MetricName;
+    let drained = runtime.metrics().unwrap().drain(Duration::ZERO);
+    let find = |metric: MetricName| {
+        drained
+            .iter()
+            .filter(|b| b.metric == metric)
+            .map(|b| (b.operation.clone(), b.sum))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        find(MetricName::BackupJobs),
+        [("succeeded".to_owned(), 1.0)]
+    );
+    assert_eq!(find(MetricName::BackupJobDuration).len(), 1);
+    let total: u64 = mem.put_sizes.lock().unwrap().iter().map(|(_, n)| n).sum();
+    assert_eq!(
+        find(MetricName::BackupBytesUploaded),
+        [(String::new(), total as f64)]
+    );
+    assert_eq!(
+        find(MetricName::WorkerLastSuccess)
+            .iter()
+            .map(|(op, _)| op.as_str())
+            .collect::<Vec<_>>(),
+        ["BackupJob"]
+    );
+    assert!(find(MetricName::WorkerErrorCount).is_empty());
+    let beats = fake.heartbeats.load(std::sync::atomic::Ordering::Acquire);
+    let ages: usize = drained
+        .iter()
+        .filter(|b| b.metric == MetricName::BackupSnapshotAge)
+        .map(|b| b.count as usize)
+        .sum();
+    assert!(
+        ages >= 1 && ages < beats,
+        "the snapshot's age is recorded at each confirmed timer beat and not at the re-check \
+         before the manifest: {ages} recorded, {beats} beats"
+    );
+}
+
+/// The maintenance claim is checked before the permit, as on the
+/// in-catalog path: held, the request is LimitExceeded naming a backup
+/// maintenance command and the claim, no snapshot is opened, no row is
+/// inserted (a FAILED `maintenance` row carried the insert's heartbeat and
+/// `backup purge`'s wait counted it as a live job), nothing reaches the
+/// store and every slot is free. A claim that cannot be read answers the
+/// read's error, with no row either.
+#[tokio::test]
+async fn a_store_backed_create_under_a_maintenance_claim_is_refused_before_its_row() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    *fake.maintenance_held.lock().unwrap() = true;
+    let runtime = job_runtime(&mem);
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds") && !m.contains("purge")),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(fake.snapshots_opened.lock().unwrap().is_empty());
+    assert!(fake.rows.lock().unwrap().is_empty(), "no row is inserted");
+    assert!(fake.claims.lock().unwrap().is_empty());
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 4);
+    assert_eq!(job_outcomes(&runtime), []);
+
+    *fake.maintenance_held.lock().unwrap() = false;
+    *fake.maintenance_error.lock().unwrap() = Some("the claim table is locked".to_owned());
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    assert!(fake.rows.lock().unwrap().is_empty(), "no row is inserted");
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// A snapshot the backend refuses to open answers the request with the
+/// open's error (here the backend's bound, LimitExceeded) and leaves no row
+/// and no object; the slot is freed.
+#[tokio::test]
+async fn an_open_that_fails_answers_the_request_and_leaves_nothing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    *fake.snapshot_error.lock().unwrap() =
+        Some(StorageError::LimitExceeded("too many snapshots".to_owned()));
+    let runtime = job_runtime(&mem);
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m == "too many snapshots"),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(fake.claims.lock().unwrap().is_empty());
+    assert_eq!(
+        mem.keys(),
+        [STORE_IDENTITY_KEY],
+        "no object but the identity file"
+    );
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The file close rule: a file closes at the first item that takes its
+/// uncompressed bytes to or past `data_file_target_bytes` (a knob of exactly
+/// three lines closes at the third), so every file but the last is at least
+/// the knob and under the knob plus one line, and the items are split across
+/// files in order. At the knob's minimum (32 MiB) with 5 MiB items, each
+/// file takes the items until the sum passes 32 MiB.
+#[tokio::test]
+async fn a_data_file_closes_at_the_first_item_that_reaches_the_knob() {
+    use extenddb_core::types::AttributeValue;
+    let line_bytes = |item: &Item| {
+        extenddb_core::backup_format::encode_item_line(item)
+            .unwrap()
+            .len() as u64
+    };
+
+    // A low knob and small items: the exact rule.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let items = songs(10);
+    let line = line_bytes(&items[0]);
+    let target = 3 * line;
+    snapshot_fixture(&fake, &music_table(), items.clone(), true, None);
+    let runtime = job_runtime(&mem).with_job_settings(JobSettings {
+        data_file_target_bytes: target,
+        ..job_settings()
+    });
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    {
+        let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+        assert_eq!(
+            (row.status, row.failure_reason.clone()),
+            (BackupStatus::Available, None),
+            "{:?}",
+            mem.puts.lock().unwrap()
+        );
+    }
+    let manifest = stored_manifest(&mem, &details.backup_arn);
+    let counts: Vec<u64> = manifest.data_files.iter().map(|f| f.item_count).collect();
+    assert_eq!(
+        counts,
+        [3, 3, 3, 1],
+        "the third line takes the file to the knob, so it closes there"
+    );
+    for file in &manifest.data_files[..3] {
+        assert!(file.uncompressed_bytes >= target);
+        assert!(file.uncompressed_bytes - line < target);
+    }
+    assert_eq!(
+        manifest
+            .data_files
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+            "data/000003.json.gz",
+            "data/000004.json.gz"
+        ]
+    );
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    let mut decoded = Vec::new();
+    for file in &manifest.data_files {
+        let bytes = mem.objects.lock().unwrap()[&format!("{prefix}{}", file.key)].clone();
+        let mut reader = manifest.reader(file, &bytes[..]).unwrap();
+        while let Some(item) = reader.next_item().unwrap() {
+            decoded.push(item);
+        }
+    }
+    assert_eq!(decoded, items);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&details.backup_arn].item_count,
+        10
+    );
+
+    // The knob's minimum, 32 MiB, with 5 MiB binary items (a 6.7 MiB
+    // line each): five lines pass 32 MiB, then three.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let items: Vec<Item> = (0..8)
+        .map(|i| {
+            let mut item = song("a", &format!("t{i}"));
+            item.insert(
+                "blob".to_owned(),
+                AttributeValue::B(vec![0u8; 5 * 1024 * 1024]),
+            );
+            item
+        })
+        .collect();
+    let line = line_bytes(&items[0]);
+    snapshot_fixture(&fake, &music_table(), items, true, None);
+    let runtime = job_runtime(&mem).with_job_settings(JobSettings {
+        data_file_target_bytes: 32 * 1024 * 1024,
+        ..job_settings()
+    });
+    let limits = LimitsConfig {
+        max_item_size_bytes: 8 * 1024 * 1024,
+        ..LimitsConfig::default()
+    };
+    let details = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &limits,
+        "Music",
+        "nightly",
+        Ok(music_table()),
+    )
+    .await
+    .unwrap();
+    // The whole test takes about 5 s alone on an idle core (eight 6.7 MiB
+    // lines encoded and compressed into two files), so the guard is 120 s.
+    wait_for_jobs_within(&runtime, Duration::from_secs(120)).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&details.backup_arn].failure_reason,
+        None
+    );
+    let manifest = stored_manifest(&mem, &details.backup_arn);
+    let counts: Vec<u64> = manifest.data_files.iter().map(|f| f.item_count).collect();
+    assert_eq!(counts, [5, 3]);
+    assert!(manifest.data_files[0].uncompressed_bytes >= 32 * 1024 * 1024);
+    assert!(manifest.data_files[0].uncompressed_bytes - line < 32 * 1024 * 1024);
+}
+
+/// An unordered snapshot writes `unordered` with no key ranges; an ordered
+/// one `key_ordered` with a range per file.
+#[tokio::test]
+async fn the_manifest_records_the_snapshots_order() {
+    for key_ordered in [false, true] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        snapshot_fixture(&fake, &music_table(), songs(3), key_ordered, None);
+        let runtime = job_runtime(&mem);
+        let details = create_music_backup(&fake, &runtime).await.unwrap();
+        wait_for_jobs(&runtime).await;
+        let manifest = stored_manifest(&mem, &details.backup_arn);
+        let expected = if key_ordered {
+            extenddb_core::backup_format::ItemOrder::KeyOrdered
+        } else {
+            extenddb_core::backup_format::ItemOrder::Unordered
+        };
+        assert_eq!(manifest.item_order, expected);
+        assert_eq!(manifest.data_files[0].key_range.is_some(), key_ordered);
+    }
+}
+
+/// A snapshot stream that fails after a refused item: the FAILED reason
+/// carries both, the refusals' count and first item and then the stream's
+/// error, so the item the operator is told to find is not lost behind the
+/// read failure. Nothing is uploaded and the prefix is deleted.
+#[tokio::test]
+async fn a_stream_error_after_a_refusal_keeps_the_refusal_in_the_reason() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let items = vec![
+        song("a", "1"),
+        song_with_bad_number("a", "2", "1E126"),
+        song_with_bad_number("a", "3", "abc"),
+    ];
+    snapshot_fixture(&fake, &music_table(), items, true, None);
+    fake.snapshots
+        .lock()
+        .unwrap()
+        .get_mut("Music")
+        .unwrap()
+        .items
+        .push(Err(StorageError::Internal(
+            "the page read failed".to_owned(),
+        )));
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap();
+    assert!(
+        reason.starts_with(
+            "2 item(s) cannot be restored; first: key {\"Artist\":{\"S\":\"a\"},\"SongTitle\":{\"S\":\"2\"}}, \
+             attribute Year: "
+        ),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with(" (#618); the snapshot then failed: Internal error: the page read failed"),
+        "{reason}"
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert!(objects_under(&mem, &details.backup_arn).is_empty());
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+
+    // The stream's error alone keeps its own reason.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(1), true, None);
+    fake.snapshots
+        .lock()
+        .unwrap()
+        .get_mut("Music")
+        .unwrap()
+        .items
+        .push(Err(StorageError::Internal(
+            "the page read failed".to_owned(),
+        )));
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&details.backup_arn]
+            .failure_reason
+            .as_deref(),
+        Some("reading the snapshot: Internal error: the page read failed")
+    );
+}
+
+/// The validator's rule: with three items the wire let in, the job reads
+/// and checks the whole stream past the first refusal (every gate permit is
+/// taken), encodes nothing more, and fails the row with the count and the
+/// first item, naming #618 for an invalid number; the FAILED write comes
+/// first and the prefix is deleted after it. The stream is fed one item
+/// every 20 ms, slower than the pipeline, so the encoder's stop lands
+/// before the stream's end and an uploader that read that stop as its own
+/// failure would end the feeder with the rest unchecked. An item refused
+/// for its size gives a reason that does not name #618.
+#[tokio::test]
+async fn the_validator_fails_the_backup_after_the_rest_is_validated() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let items = vec![
+        song("a", "1"),
+        song_with_bad_number("a", "2", "1E126"),
+        song("a", "3"),
+        song_with_bad_number("a", "4", "abc"),
+        song_with_bad_number("a", "5", "1E126"),
+        song("a", "6"),
+    ];
+    let count = items.len();
+    let gate = closed_gate();
+    snapshot_fixture(&fake, &music_table(), items, true, Some(Arc::clone(&gate)));
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    let feed = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        async move {
+            for _ in 0..count {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                gate.add_permits(1);
+            }
+        }
+    });
+    wait_for_jobs(&runtime).await;
+    feed.await.unwrap();
+    assert_eq!(gate.available_permits(), 0, "every item was read");
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap();
+    assert!(
+        reason.starts_with(
+            "3 item(s) cannot be restored; first: key {\"Artist\":{\"S\":\"a\"},\"SongTitle\":{\"S\":\"2\"}}, \
+             attribute Year: "
+        ),
+        "{reason}"
+    );
+    assert!(reason.ends_with(" (#618)"), "{reason}");
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(writes(&fake).len(), 1);
+    assert_eq!(writes(&fake)[0].0, JobStatus::Failed);
+    assert_eq!(
+        mem.deletes.lock().unwrap().as_slice(),
+        std::slice::from_ref(&prefix)
+    );
+    assert!(objects_under(&mem, &details.backup_arn).is_empty());
+    assert!(
+        mem.puts.lock().unwrap().is_empty(),
+        "after the first refused item nothing is uploaded, the first file with its one valid \
+         item included: {:?}",
+        mem.puts.lock().unwrap()
+    );
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+
+    // Over `max_item_size_bytes`: the reason names the size rule, not #618.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    let runtime = job_runtime(&mem);
+    let limits = LimitsConfig {
+        max_item_size_bytes: 20,
+        ..LimitsConfig::default()
+    };
+    let details = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &limits,
+        "Music",
+        "nightly",
+        Ok(music_table()),
+    )
+    .await
+    .unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap();
+    assert!(
+        reason.starts_with("2 item(s) cannot be restored; first: key "),
+        "{reason}"
+    );
+    assert!(reason.contains("20 bytes"), "{reason}");
+    assert!(!reason.contains("#618"), "{reason}");
+}
+
+/// A put that fails fails the row with the file named, and only then
+/// deletes the prefix; the store error is counted.
+#[tokio::test]
+async fn a_put_failure_fails_the_row_then_deletes_the_prefix() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("writing data/000001.json.gz: "),
+        "{:?}",
+        row.failure_reason
+    );
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(
+        writes(&fake),
+        [(JobStatus::Failed, row.failure_reason.clone())]
+    );
+    assert_eq!(mem.deletes.lock().unwrap().as_slice(), [prefix]);
+    use extenddb_core::metrics::MetricName;
+    let drained = runtime.metrics().unwrap().drain(Duration::ZERO);
+    assert!(drained.iter().any(|b| {
+        b.metric == MetricName::BackupStoreErrors && b.operation == "put" && b.sum == 1.0
+    }));
+    assert!(
+        drained
+            .iter()
+            .any(|b| { b.metric == MetricName::BackupJobs && b.operation == "failed" })
+    );
+    assert!(
+        drained
+            .iter()
+            .any(|b| { b.metric == MetricName::WorkerErrorCount && b.operation == "BackupJob" })
+    );
+}
+
+/// A FAILED write that matches no row (the row's generation changed under
+/// a heartbeat that kept confirming) ends the job with no store access: no
+/// `delete_prefix`, the row untouched.
+#[tokio::test]
+async fn a_failed_write_that_does_not_match_makes_no_store_call() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::AlwaysConfirm;
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    // Another generation takes the row while the job waits on its stream;
+    // the put then fails.
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&details.backup_arn)
+        .unwrap()
+        .owner_generation = 999;
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    gate.add_permits(3);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(writes(&fake).len(), 1);
+    assert_eq!(writes(&fake)[0].0, JobStatus::Failed);
+    assert!(
+        mem.deletes.lock().unwrap().is_empty(),
+        "no store access after NotMatched"
+    );
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert_eq!(row.owner_generation, 999);
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A status write whose outcome is unknown is re-read, not treated as a
+/// failure: an AVAILABLE write that landed is AVAILABLE with no store
+/// access after it; one that was lost is written once more. The same for
+/// the FAILED write: landed, the deletion follows; lost, it is written again
+/// and the deletion follows.
+#[tokio::test]
+async fn an_unknown_write_is_re_read() {
+    for (unknown, writes_expected) in [(UnknownWrite::Applied, 1), (UnknownWrite::Lost, 2)] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+        *fake.unknown_write.lock().unwrap() = Some(unknown);
+        let runtime = job_runtime(&mem);
+        let details = create_music_backup(&fake, &runtime).await.unwrap();
+        wait_for_jobs(&runtime).await;
+        let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+        assert_eq!(row.status, BackupStatus::Available, "{unknown:?}");
+        assert_eq!(writes(&fake).len(), writes_expected, "{unknown:?}");
+        assert!(mem.deletes.lock().unwrap().is_empty());
+        assert_eq!(objects_under(&mem, &details.backup_arn).len(), 5);
+        assert_eq!(job_outcomes(&runtime), [("succeeded".to_owned(), 1.0)]);
+    }
+    for (unknown, writes_expected) in [(UnknownWrite::Applied, 1), (UnknownWrite::Lost, 2)] {
+        let mem = Arc::new(MemStore::default());
+        mem.fail_puts
+            .store(true, std::sync::atomic::Ordering::Release);
+        let fake = Arc::new(Fake::default());
+        snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+        *fake.unknown_write.lock().unwrap() = Some(unknown);
+        let runtime = job_runtime(&mem);
+        let details = create_music_backup(&fake, &runtime).await.unwrap();
+        wait_for_jobs(&runtime).await;
+        let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+        assert_eq!(row.status, BackupStatus::Failed, "{unknown:?}");
+        assert_eq!(writes(&fake).len(), writes_expected, "{unknown:?}");
+        let prefix = BackupArn::parse(&details.backup_arn)
+            .unwrap()
+            .store_prefix();
+        assert_eq!(mem.deletes.lock().unwrap().as_slice(), [prefix]);
+    }
+}
+
+/// A heartbeat that reports the claim lost, or that does not return within
+/// a period, ends the job with no put and no catalog write: the row is left
+/// as it is for its owner or the reconciler.
+#[tokio::test]
+async fn a_lost_or_stalled_heartbeat_stops_the_job_with_no_put() {
+    for answer in [
+        HeartbeatAnswer::Lost,
+        HeartbeatAnswer::Stall,
+        HeartbeatAnswer::Error,
+    ] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        let gate = closed_gate();
+        snapshot_fixture(&fake, &music_table(), songs(3), true, Some(gate));
+        let runtime = job_runtime(&mem);
+        let details = create_music_backup(&fake, &runtime).await.unwrap();
+        // The job waits on its stream (the encoder is a blocking task, so
+        // the clock runs: a paused clock would not advance behind it); the
+        // first beat, a period later, finds the claim lost (or never
+        // returns: a period more).
+        *fake.heartbeat_answer.lock().unwrap() = answer;
+        wait_for_jobs(&runtime).await;
+        assert!(mem.puts.lock().unwrap().is_empty(), "{answer:?}: no put");
+        assert!(
+            mem.deletes.lock().unwrap().is_empty(),
+            "{answer:?}: no delete"
+        );
+        assert!(writes(&fake).is_empty(), "{answer:?}: no catalog write");
+        let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+        assert_eq!(row.status, BackupStatus::Creating, "{answer:?}");
+        assert_eq!(runtime.free_slots(), 4);
+        assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+    }
+}
+
+/// The pre-put check's numbers: with the claim confirming, the last
+/// confirmed beat stays recent however long the job runs; a timer that
+/// stopped running leaves the check true for two periods after the last
+/// confirmed beat and false after; with a beat that never returns, the
+/// check still passes until the timer has waited one period for the beat
+/// (two periods from the last confirmation), and the claim is lost from
+/// then on.
+#[tokio::test(start_paused = true)]
+async fn the_heartbeat_handle_confirms_the_claim_within_two_periods() {
+    let fake = Arc::new(Fake::default());
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Creating));
+    let claim: Arc<dyn JobClaim> = Arc::from(fake.claim_on(&arn(ACCOUNT), 7));
+    let period = Duration::from_secs(10);
+    let handle = job::heartbeat::HeartbeatHandle::start(
+        Arc::clone(&claim),
+        period,
+        job::heartbeat::HeartbeatMetric::None,
+        tokio::time::Instant::now(),
+    );
+    // Half a period past the tenth tick, so that tick's beat has confirmed.
+    tokio::time::sleep(10 * period + period / 2).await;
+    assert!(handle.confirms_the_claim());
+    assert!(fake.heartbeats.load(std::sync::atomic::Ordering::Acquire) >= 10);
+    // A timer that stopped running (no loss raised): the check holds for two
+    // periods after the last confirmed beat, the second period's end
+    // included, and then refuses.
+    handle.stop_timer();
+    tokio::time::sleep(period).await;
+    assert!(handle.confirms_the_claim(), "a period and a half");
+    tokio::time::sleep(period / 2).await;
+    assert!(
+        handle.confirms_the_claim(),
+        "exactly two periods: the bound is inclusive"
+    );
+    tokio::time::sleep(period / 2).await;
+    assert!(!handle.lost().is_cancelled());
+    assert!(
+        !handle.confirms_the_claim(),
+        "two and a half periods without a confirmed beat"
+    );
+    drop(handle);
+
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Stall;
+    let handle = job::heartbeat::HeartbeatHandle::start(
+        claim,
+        period,
+        job::heartbeat::HeartbeatMetric::None,
+        tokio::time::Instant::now(),
+    );
+    tokio::time::sleep(period + period / 2).await;
+    assert!(handle.confirms_the_claim(), "the beat may still return");
+    assert!(!handle.lost().is_cancelled());
+    tokio::time::sleep(period).await;
+    assert!(!handle.confirms_the_claim());
+    assert!(handle.lost().is_cancelled());
+    assert!(handle.reason().contains("did not return"));
+}
+
+/// The shutdown token runs the failure path: FAILED with reason `shutdown`,
+/// then the prefix deleted; the outcome is `cancelled`. `drain_jobs` is what
+/// the server calls: it cancels and waits for the job.
+#[tokio::test]
+async fn cancellation_runs_the_failure_path() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    // The job holds its first item and waits for the second.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while gate.available_permits() > 0 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(runtime.running_jobs(), 1);
+    let left = runtime.drain_jobs(Duration::from_secs(10)).await;
+    assert_eq!(left, 0);
+    assert_eq!(runtime.running_jobs(), 0);
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert_eq!(row.failure_reason.as_deref(), Some("shutdown"));
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(
+        writes(&fake),
+        [(JobStatus::Failed, Some("shutdown".to_owned()))]
+    );
+    assert_eq!(mem.deletes.lock().unwrap().as_slice(), [prefix]);
+    assert!(objects_under(&mem, &details.backup_arn).is_empty());
+    use extenddb_core::metrics::MetricName;
+    let drained = runtime.metrics().unwrap().drain(Duration::ZERO);
+    assert_eq!(
+        drained
+            .iter()
+            .filter(|b| b.metric == MetricName::BackupJobs)
+            .map(|b| (b.operation.clone(), b.sum))
+            .collect::<Vec<_>>(),
+        [("cancelled".to_owned(), 1.0)]
+    );
+    assert!(
+        !drained
+            .iter()
+            .any(|b| b.metric == MetricName::WorkerErrorCount),
+        "a clean shutdown is not a worker error"
+    );
+    assert!(
+        !drained
+            .iter()
+            .any(|b| b.metric == MetricName::WorkerLastSuccess),
+        "nor a success"
+    );
+}
+
+/// With `max_concurrent_jobs = 1`, a second CreateBackup while a job runs
+/// is LimitExceeded naming the bound; once the job ends the slot is free.
+#[tokio::test]
+async fn a_second_create_over_the_job_bound_is_limit_exceeded() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(2),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let runtime = BackupRuntime::new(1)
+        .with_store(ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        ))
+        .with_job_settings(job_settings());
+    create_music_backup(&fake, &runtime).await.unwrap();
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m) if m.contains("max_concurrent_jobs")),
+        "{err:?}"
+    );
+    assert_eq!(
+        fake.snapshots_opened.lock().unwrap().len(),
+        1,
+        "the second opened nothing"
+    );
+    gate.add_permits(2);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(runtime.free_slots(), 1);
+    snapshot_fixture(&fake, &music_table(), songs(1), true, None);
+    create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.rows.lock().unwrap().len(), 2);
+}
+
+/// A `tracing` subscriber that keeps every event's level and message, for
+/// the tests of the job's log lines. Set as the thread's default for the
+/// test's life through [`LogLines::capture`]; a `#[tokio::test]` runtime
+/// runs the job's tasks on the test's thread, so their events reach it (the
+/// encoders, on the blocking pool, log nothing).
+#[derive(Clone, Default)]
+struct LogLines(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+/// The process's global `tracing` subscriber while these tests run:
+/// interested in every callsite and enabled for none. `tracing` caches each
+/// callsite's interest the first time any thread reaches it; while exactly
+/// one scoped subscriber is registered in the process, that cache is
+/// computed from the default of the thread that got there first. A test
+/// without a subscriber running beside a `LogLines` test on another thread
+/// would so cache the job's log callsites as "never", and the `LogLines`
+/// test would then see no line from them (tokio-rs/tracing#2743). With this
+/// global default the cache reads "sometimes" instead, and each event asks
+/// the thread's own default, the `LogLines` where one is set.
+struct InterestedInEveryCallsite;
+
+impl tracing::Subscriber for InterestedInEveryCallsite {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+impl LogLines {
+    /// A fresh `LogLines` set as this thread's `tracing` default until the
+    /// guard drops, with the process's global default installed once.
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            // Another global may already be set by a test outside this
+            // module; then its interest rule applies and this one is moot.
+            let _ = tracing::subscriber::set_global_default(InterestedInEveryCallsite);
+        });
+        let lines = Self::default();
+        let guard = tracing::subscriber::set_default(lines.clone());
+        (lines, guard)
+    }
+
+    /// The messages containing `needle`, in order.
+    fn containing(&self, needle: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, m)| m.contains(needle))
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    /// The messages logged at `level`, in order.
+    fn at_level(&self, level: tracing::Level) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+}
+
+struct MessageVisitor<'a>(&'a mut String);
+
+/// A callsite met first by a thread without a scoped subscriber is still
+/// seen by a `LogLines` on another thread (the global default's interest
+/// rule; the doc of `InterestedInEveryCallsite`). Without that default the
+/// callsite's interest is cached as "never" whenever this is the only
+/// `LogLines` alive in the process, and nothing is captured.
+#[test]
+fn a_callsite_first_met_on_another_thread_still_reaches_the_lines() {
+    fn shared_callsite(n: u32) {
+        tracing::error!("probe {n}: a callsite shared by two threads");
+    }
+    let (lines, _guard) = LogLines::capture();
+    std::thread::spawn(|| shared_callsite(1)).join().unwrap();
+    shared_callsite(2);
+    assert_eq!(
+        lines.containing("probe "),
+        ["probe 2: a callsite shared by two threads"]
+    );
+}
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{value:?}");
+        }
+    }
+}
+
+impl tracing::Subscriber for LogLines {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = String::new();
+        event.record(&mut MessageVisitor(&mut message));
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), message));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The bytes of one item's data file line.
+fn line_bytes(item: &Item) -> u64 {
+    extenddb_core::backup_format::encode_item_line(item)
+        .unwrap()
+        .len() as u64
+}
+
+/// A put that fails while the snapshot stream is between pages ends the job
+/// at once: the stream holds one permit, so it yields the first item and
+/// then waits; the first file closes at that item (a one-line knob), its put
+/// fails, and the FAILED write lands with the stream still held, no permit
+/// released. Without the uploader's stop reaching the feeder, the feeder
+/// would wait for the stream's next item and the row would stay CREATING
+/// with a live heartbeat for as long as the stream did.
+#[tokio::test]
+async fn a_put_failure_ends_the_job_without_waiting_for_the_streams_next_item() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    let items = songs(3);
+    let target = line_bytes(&items[0]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    snapshot_fixture(&fake, &music_table(), items, true, Some(Arc::clone(&gate)));
+    let runtime = job_runtime(&mem).with_job_settings(JobSettings {
+        data_file_target_bytes: target,
+        ..job_settings()
+    });
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(gate.available_permits(), 0, "the stream was never released");
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("writing data/000001.json.gz: "),
+        "{:?}",
+        row.failure_reason
+    );
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(mem.deletes.lock().unwrap().as_slice(), [prefix]);
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// `BackupJobDuration` of a FAILED job covers its failure path: with the
+/// store's deletion taking 300 ms, the duration recorded under `failed` is
+/// at least that, so the metric measures the job to the end of its last
+/// store call for either outcome.
+#[tokio::test]
+async fn a_failed_jobs_duration_covers_its_failed_write_and_deletion() {
+    use extenddb_core::metrics::MetricName;
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    *mem.delete_delay.lock().unwrap() = Some(Duration::from_millis(300));
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert_eq!(mem.deletes.lock().unwrap().len(), 1);
+    let drained = runtime.metrics().unwrap().drain(Duration::ZERO);
+    let durations: Vec<(String, f64)> = drained
+        .iter()
+        .filter(|b| b.metric == MetricName::BackupJobDuration)
+        .map(|b| (b.operation.clone(), b.sum))
+        .collect();
+    assert_eq!(durations.len(), 1, "{durations:?}");
+    assert_eq!(durations[0].0, "failed");
+    assert!(
+        durations[0].1 >= 300_000.0,
+        "{} µs: the duration stops before the deletion",
+        durations[0].1
+    );
+}
+
+/// The two info lines: the start line gives the table's count as the stats
+/// pass last counted it (the description's figure, here 100,000), the
+/// completion line the stream's count (the items written) and the bytes.
+#[tokio::test]
+async fn the_start_and_completion_lines_name_the_two_item_counts() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(5), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let arn = &details.backup_arn;
+    let started = lines.containing(": started, ");
+    assert_eq!(
+        started,
+        [format!(
+            "backup {arn}: started, 100000 items in the table as last counted by the stats pass, \
+             key-ordered"
+        )]
+    );
+    let total: u64 = mem.put_sizes.lock().unwrap().iter().map(|(_, n)| n).sum();
+    let available = lines.containing(": AVAILABLE, ");
+    assert_eq!(available.len(), 1, "{available:?}");
+    assert!(
+        available[0].starts_with(&format!(
+            "backup {arn}: AVAILABLE, 5 items, {total} bytes written in "
+        )),
+        "{}",
+        available[0]
+    );
+}
+
+/// The refusal log cap: with 1,001 refused items the first 1,000 are
+/// logged one by one, one line counts the remainder, the reason carries the
+/// full count and the first item, the stream is read to its end and nothing
+/// is uploaded.
+#[tokio::test]
+async fn refusals_past_the_log_cap_are_counted_in_one_line() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let mut items = vec![song("a", "0")];
+    items.extend((1..=1001).map(|i| song_with_bad_number("a", &format!("{i:05}"), "1E126")));
+    items.push(song("a", "zzz"));
+    let gate = Arc::new(tokio::sync::Semaphore::new(items.len()));
+    snapshot_fixture(&fake, &music_table(), items, true, Some(Arc::clone(&gate)));
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(gate.available_permits(), 0, "every item was read");
+    let logged = lines.containing(": item cannot be restored: key ");
+    assert_eq!(logged.len(), 1000);
+    assert!(
+        logged[0].contains(r#""SongTitle":{"S":"00001"}"#)
+            && logged[0].contains(", attribute Year: "),
+        "{}",
+        logged[0]
+    );
+    assert!(
+        logged[999].contains(r#""SongTitle":{"S":"01000"}"#),
+        "{}",
+        logged[999]
+    );
+    assert_eq!(
+        lines.containing(" more item(s) cannot be restored (not listed)"),
+        [format!(
+            "backup {}: 1 more item(s) cannot be restored (not listed)",
+            details.backup_arn
+        )]
+    );
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap();
+    assert!(
+        reason.starts_with("1001 item(s) cannot be restored; first: key "),
+        "{reason}"
+    );
+    assert!(reason.contains(r#""SongTitle":{"S":"00001"}"#), "{reason}");
+    assert!(mem.puts.lock().unwrap().is_empty());
+}
+
+/// An item whose data file line would exceed the format's cap is refused
+/// through the validator's path, not the encoder's: under a raised item
+/// limit, a 600 KB item of the worst-expansion shape (a list of number
+/// sets, a 40 MB line) is counted, logged with its key and the cap, the
+/// rest of the stream is checked, nothing is uploaded and the FAILED
+/// reason names the item without #618. The item passes the validator
+/// itself (its numbers are valid, its size within the limit). The line is
+/// measured through a counting writer that stops at the cap (the format's
+/// own test pins that it holds no line), so the reason carries the cap and
+/// not the line's length.
+#[tokio::test]
+async fn an_item_whose_line_exceeds_the_cap_is_refused_and_named() {
+    use extenddb_core::backup_format::MAX_LINE_BYTES;
+    use extenddb_core::types::AttributeValue;
+    use std::collections::BTreeSet;
+    let (lines, _guard) = LogLines::capture();
+    // 81 two-digit values at `E-130`, 133 characters each in normalized
+    // form, 2 bytes of item size each (the `MAX_LINE_BYTES` doc's shape).
+    let set: BTreeSet<String> = (11..100)
+        .filter(|m| m % 10 != 0)
+        .map(|m| format!("0.{}{m}", "0".repeat(129)))
+        .collect();
+    assert_eq!(set.len(), 81);
+    let mut worst = song("a", "2");
+    worst.insert(
+        "l".to_owned(),
+        AttributeValue::L(vec![AttributeValue::NS(set); 3_700]),
+    );
+    let size = extenddb_core::types::item_size_bytes(&worst);
+    assert!(size > 409_600 && size < 2 * 1024 * 1024, "{size}");
+    let line = line_bytes(&worst);
+    assert!(line > MAX_LINE_BYTES as u64, "{line}");
+    let items = vec![song("a", "1"), worst, song("a", "3")];
+    let gate = Arc::new(tokio::sync::Semaphore::new(items.len()));
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), items, true, Some(Arc::clone(&gate)));
+    let runtime = job_runtime(&mem);
+    let limits = LimitsConfig {
+        max_item_size_bytes: 2 * 1024 * 1024,
+        ..LimitsConfig::default()
+    };
+    let details = create_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &limits,
+        "Music",
+        "nightly",
+        Ok(music_table()),
+    )
+    .await
+    .unwrap();
+    // The test takes about 20 s alone on an idle core, so the guard is
+    // 300 s.
+    wait_for_jobs_within(&runtime, Duration::from_secs(300)).await;
+    assert_eq!(
+        gate.available_permits(),
+        0,
+        "the rest of the stream was checked"
+    );
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap();
+    assert_eq!(
+        reason,
+        format!(
+            "1 item(s) cannot be restored; first: key {{\"Artist\":{{\"S\":\"a\"}},\"SongTitle\":\
+             {{\"S\":\"2\"}}}}: data file line exceeds the line cap of {MAX_LINE_BYTES} bytes"
+        )
+    );
+    assert_eq!(lines.containing(": item cannot be restored: key ").len(), 1);
+    assert!(
+        mem.puts.lock().unwrap().is_empty(),
+        "{:?}",
+        mem.puts.lock().unwrap()
+    );
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A status write that errors on the claim connection makes no store call,
+/// whichever write it is. The FAILED write: no `delete_prefix`, the row
+/// CREATING for the reconciler. The AVAILABLE write: the manifest was
+/// already put, so the five objects stay for the reconciler's probe, which
+/// is the order the design rests on (the manifest is the commit record, the
+/// AVAILABLE write follows it).
+#[tokio::test]
+async fn a_status_write_error_makes_no_store_call_and_leaves_the_manifest() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    fake.status_write_error
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert_eq!(writes(&fake).len(), 1);
+    assert!(
+        mem.deletes.lock().unwrap().is_empty(),
+        "no delete after a claim error on the FAILED write"
+    );
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    fake.status_write_error
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert_eq!(writes(&fake), [(JobStatus::Available, None)]);
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(
+        mem.puts.lock().unwrap().as_slice(),
+        [
+            format!("{prefix}data/000001.json.gz"),
+            format!("{prefix}manifest-files.json"),
+            format!("{prefix}manifest-summary.json"),
+            format!("{prefix}extenddb-manifest.sha256"),
+            format!("{prefix}extenddb-manifest.json"),
+        ],
+        "the manifest was put before the AVAILABLE write"
+    );
+    assert_eq!(objects_under(&mem, &details.backup_arn).len(), 5);
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A second unknown outcome, on the write sent once more, counts as
+/// matching no row: two writes and no third, the row left as it is, no
+/// delete, the outcome `failed` (the job ended by its own path, not a
+/// panic).
+#[tokio::test]
+async fn a_second_unknown_outcome_ends_the_job_without_a_third_write() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    *fake.unknown_write.lock().unwrap() = Some(UnknownWrite::Lost);
+    fake.unknown_write_sticky
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(writes(&fake).len(), 2);
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A second unknown outcome whose write landed counts as matched: the first
+/// FAILED write is lost with its connection (the re-read shows CREATING, so
+/// the write is sent once more), the second lands and its outcome is
+/// unknown too, and the second re-read shows the row FAILED under this
+/// claim, so the failure path goes on to the one `delete_prefix`. The row
+/// is FAILED under this generation and the prefix is the job's, so the
+/// deletion is right; a job that treated the second unknown outcome as
+/// matching no row would leave the prefix to the reconciler for nothing.
+#[tokio::test]
+async fn a_second_unknown_outcome_whose_write_landed_is_matched() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    *fake.unknown_write.lock().unwrap() = Some(UnknownWrite::Lost);
+    *fake.unknown_write_then.lock().unwrap() = Some(UnknownWrite::Applied);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        writes(&fake).iter().map(|w| w.0).collect::<Vec<_>>(),
+        [JobStatus::Failed, JobStatus::Failed]
+    );
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(
+        mem.deletes.lock().unwrap().as_slice(),
+        [prefix],
+        "the second re-read shows FAILED under this claim: the deletion follows"
+    );
+    assert!(objects_under(&mem, &details.backup_arn).is_empty());
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// The pre-put check in its two places: with the heartbeat timer stopped
+/// without raising the loss (a timer task that died) and two periods gone,
+/// neither a data file's put nor a document's put starts, each stopping the
+/// job as a lost claim naming the object.
+#[tokio::test]
+async fn a_stopped_heartbeat_timer_starts_no_put() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Fake::default();
+    let arn = arn(ACCOUNT);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(arn.clone(), row(&arn, BackupStatus::Creating));
+    let claim: Arc<dyn JobClaim> = Arc::from(fake.claim_on(&arn, 7));
+    let period = Duration::from_millis(50);
+    let heartbeat = job::heartbeat::HeartbeatHandle::start(
+        claim,
+        period,
+        job::heartbeat::HeartbeatMetric::None,
+        tokio::time::Instant::now(),
+    );
+    heartbeat.stop_timer();
+    tokio::time::sleep(3 * period).await;
+    assert!(!heartbeat.lost().is_cancelled());
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let parsed = BackupArn::parse(&arn).unwrap();
+    let prefix = parsed.store_prefix();
+    let runtime = runtime_on(&mem, store());
+    let identity = store();
+    let pipeline = job::writer::Pipeline {
+        store: &*mem,
+        configured: runtime.configured_store().unwrap(),
+        identity: &identity,
+        prefix: &prefix,
+        arn: &arn,
+        heartbeat: &heartbeat,
+        shutdown: &shutdown,
+        metrics: None,
+        target_bytes: 64 * 1024 * 1024,
+        key_prefix: "",
+        bucket: &store().store_root,
+    };
+    let table = music_table();
+    let key = extenddb_core::validation::RestorableKeySchema::resolve(
+        &table.key_schema,
+        &table.attribute_definitions,
+    )
+    .unwrap();
+    let stream: BoxStream<'static, Result<Item, StorageError>> =
+        Box::pin(futures::stream::iter(songs(1).into_iter().map(Ok)));
+    let limits = extenddb_core::validation::RestorableLimits::from(&LimitsConfig::default());
+    let stop = job::writer::write_data_files(&pipeline, stream, key, limits, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stop,
+        job::writer::Stop::ClaimLost(
+            "no heartbeat confirmed the claim recently enough for data file 1".to_owned()
+        )
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+    let stop = job::put_document(&pipeline, "manifest-files.json", b"{}")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        stop,
+        job::writer::Stop::ClaimLost(
+            "no heartbeat confirmed the claim recently enough for manifest-files.json".to_owned()
+        )
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(
+        mem.keys(),
+        [STORE_IDENTITY_KEY],
+        "no object but the identity file"
+    );
+}
+
+/// The maintenance checks (the request's before the permit, the job's right
+/// before its insert) run before the row, so a slow check delays the
+/// request and not the job's first put: with a period of
+/// 100 ms, `stale_job_after` of 300 ms (the floor's ratio) and a check of
+/// 400 ms, the request takes at least the check, the row is inserted after
+/// it (its heartbeat the insert's, within two periods of the first put), and
+/// the backup completes AVAILABLE.
+#[tokio::test]
+async fn a_slow_maintenance_check_delays_the_request_and_not_the_first_put() {
+    let period = Duration::from_millis(100);
+    let settings = JobSettings {
+        heartbeat_interval: period,
+        stale_job_after: 3 * period,
+        ..job_settings()
+    };
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    *fake.maintenance_delay.lock().unwrap() = Some(4 * period);
+    let runtime = job_runtime(&mem).with_job_settings(settings);
+    let asked = tokio::time::Instant::now();
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    assert!(
+        asked.elapsed() >= 4 * period,
+        "the request waited for the check"
+    );
+    assert_eq!(
+        fake.maintenance_checks.lock().unwrap().len(),
+        2,
+        "the request's check and the job's before its insert"
+    );
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(
+        (row.status, row.failure_reason),
+        (BackupStatus::Available, None)
+    );
+    assert_eq!(objects_under(&mem, &details.backup_arn).len(), 5);
+    assert_eq!(job_outcomes(&runtime), [("succeeded".to_owned(), 1.0)]);
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The claim re-check before the manifest: the heartbeat answers `Lost`
+/// from the sidecar's put on, with a period long enough that no timer beat
+/// runs during the job, so the re-check is the one beat the job sends; it
+/// finds the claim lost, the manifest is not written, the row is left
+/// CREATING with its four objects and no catalog write.
+#[tokio::test]
+async fn the_claim_re_check_before_the_manifest_stops_a_lost_claim() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    let answer = Arc::clone(&fake.heartbeat_answer);
+    *mem.on_put.lock().unwrap() = Some(Box::new(move |key: &str| {
+        if key.ends_with("extenddb-manifest.sha256") {
+            *answer.lock().unwrap() = HeartbeatAnswer::Lost;
+        }
+    }));
+    let runtime = job_runtime(&mem).with_job_settings(JobSettings {
+        heartbeat_interval: Duration::from_secs(10),
+        ..job_settings()
+    });
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.heartbeats.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the re-check is the one beat"
+    );
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert!(
+        writes(&fake).is_empty(),
+        "no catalog write after a lost claim"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    let objects = objects_under(&mem, &details.backup_arn);
+    assert_eq!(objects.len(), 4, "{objects:?}");
+    assert!(
+        !objects
+            .iter()
+            .any(|k| k.ends_with("extenddb-manifest.json")),
+        "the manifest was not written"
+    );
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+// --- the reconciler's duties over the store's rows ----------------------------
+
+/// A CREATING row whose owner is dead, with a complete, verified backup
+/// under its prefix (the golden manifest's documents and data files of the
+/// recorded sizes), in `mem` and `fake`; returns its ARN.
+fn seed_dead_creating_with_manifest(fake: &Fake, mem: &MemStore, complete: bool) -> String {
+    use extenddb_core::backup_format::{BackupDocuments, ExtenddbManifest, ManifestHeader};
+    let golden = ExtenddbManifest::from_json_bytes(include_bytes!(
+        "../../../core/testdata/extenddb-manifest/v1.json"
+    ))
+    .unwrap();
+    let docs = BackupDocuments::build(
+        ManifestHeader {
+            backup_arn: golden.backup_arn().unwrap(),
+            backup_name: golden.backup_name.clone(),
+            source_backend: golden.source_backend.clone(),
+            source_extenddb_version: golden.source_extenddb_version.clone(),
+            snapshot: golden.snapshot.clone(),
+            item_order: golden.item_order,
+            source_table: golden.source_table.clone(),
+        },
+        golden
+            .data_files
+            .iter()
+            .cloned()
+            .map(|entry| (entry, None))
+            .collect(),
+        "",
+        &store().store_root,
+    )
+    .unwrap();
+    let arn = golden.backup_arn.clone();
+    let prefix = golden.backup_arn().unwrap().store_prefix();
+    for (i, file) in golden.data_files.iter().enumerate() {
+        let size = if complete || i == 0 {
+            file.bytes
+        } else {
+            file.bytes - 1
+        };
+        mem.insert(
+            &format!("{prefix}{}", file.key),
+            &vec![0u8; usize::try_from(size).unwrap()],
+        );
+    }
+    for (name, bytes) in docs.documents() {
+        mem.insert(&format!("{prefix}{name}"), bytes);
+    }
+    let mut dead = row(&arn, BackupStatus::Creating);
+    dead.heartbeat_at = 1234.5;
+    dead.size_bytes = 0;
+    dead.item_count = 0;
+    fake.rows.lock().unwrap().insert(arn.clone(), dead);
+    fake.dead.lock().unwrap().insert(arn.clone());
+    arn
+}
+
+/// One cycle on `fake` and `mem`, the store healthy.
+async fn cycle_on(fake: &Arc<Fake>, runtime: &BackupRuntime) -> reconciler::CycleReport {
+    reconciler::cycle(
+        fake,
+        runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::default(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The reconciler's store calls that fail (not an absent object) record
+/// `BackupStoreErrors` under the call's name, as the job's do: a `get` of a
+/// dead owner's manifest, a `list` of a DELETED row's prefix, a
+/// `delete_prefix` of a stale FAILED row's prefix. Each row is left for the
+/// next cycle and the cycle itself completes, so `WorkerErrorCount` would
+/// not move; the store's health is untouched. The next cycle, with the
+/// store answering, finishes each duty and records nothing more.
+#[tokio::test]
+async fn the_reconcilers_failed_store_calls_are_counted_by_call() {
+    use extenddb_core::metrics::{MetricName, MetricsCollector};
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let now = seconds_since_epoch();
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    let dead_prefix = BackupArn::parse(&dead).unwrap().store_prefix();
+    let stale_failed = arn_n(1);
+    let deleted = arn_n(2);
+    for (a, status) in [
+        (&stale_failed, BackupStatus::Failed),
+        (&deleted, BackupStatus::Deleted),
+    ] {
+        let mut r = row(a, status);
+        r.heartbeat_at = now - 1000.0;
+        r.completed_at = Some(now);
+        fake.rows.lock().unwrap().insert(a.clone(), r);
+        let prefix = BackupArn::parse(a).unwrap().store_prefix();
+        mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+    }
+    let failed_prefix = BackupArn::parse(&stale_failed).unwrap().store_prefix();
+    let deleted_prefix = BackupArn::parse(&deleted).unwrap().store_prefix();
+    *mem.fail_gets_under.lock().unwrap() = Some(dead_prefix.clone());
+    *mem.fail_deletes_of.lock().unwrap() = Some(failed_prefix.clone());
+    *mem.fail_lists_of.lock().unwrap() = Some(deleted_prefix.clone());
+    let metrics = Arc::new(MetricsCollector::new());
+    let runtime = runtime_on(&mem, store()).with_metrics(Arc::clone(&metrics));
+
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(report.creating_resolved.is_empty());
+    assert!(report.failed_prefixes_deleted.is_empty());
+    assert!(report.deleted_prefixes_swept.is_empty());
+    let errors = |drained: &[extenddb_core::metrics::FlushBucket]| {
+        let mut ops: Vec<(String, f64)> = drained
+            .iter()
+            .filter(|b| b.metric == MetricName::BackupStoreErrors)
+            .map(|b| (b.operation.clone(), b.sum))
+            .collect();
+        ops.sort_by(|a, b| a.0.cmp(&b.0));
+        ops
+    };
+    assert_eq!(
+        errors(&metrics.drain(Duration::ZERO)),
+        [
+            ("delete_prefix".to_owned(), 1.0),
+            ("get".to_owned(), 1.0),
+            ("list".to_owned(), 1.0),
+        ]
+    );
+
+    *mem.fail_gets_under.lock().unwrap() = None;
+    *mem.fail_deletes_of.lock().unwrap() = None;
+    *mem.fail_lists_of.lock().unwrap() = None;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.creating_resolved, [(dead, BackupStatus::Available)]);
+    assert_eq!(report.failed_prefixes_deleted, [stale_failed]);
+    assert_eq!(report.deleted_prefixes_swept, [deleted]);
+    assert!(errors(&metrics.drain(Duration::ZERO)).is_empty());
+}
+
+/// A dead CREATING row whose prefix holds a complete, verified manifest is
+/// AVAILABLE with the manifest's size, count and `source_table` (the row's
+/// own `source_table_details_json`, the stats pass's, is replaced: it is
+/// seeded here with another object so the write is seen to carry the
+/// manifest's); the takeover leaves `heartbeat_at` as the dead owner wrote
+/// it and heartbeats nothing; the objects stay. A row whose owner is alive
+/// is left alone.
+#[tokio::test]
+async fn the_reconciler_resolves_a_dead_creating_row_with_a_manifest_to_available() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    let stats_pass = serde_json::json!({"TableName": "Music", "ItemCount": 0});
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&dead)
+        .unwrap()
+        .source_table_details_json = stats_pass.clone();
+    let live = arn(ACCOUNT);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(live.clone(), row(&live, BackupStatus::Creating));
+    let objects_before = mem.keys().len();
+    let runtime = runtime_on(&mem, store());
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.creating_resolved,
+        [(dead.clone(), BackupStatus::Available)]
+    );
+    assert_eq!(
+        fake.takeovers.lock().unwrap().as_slice(),
+        std::slice::from_ref(&dead)
+    );
+    let manifest = stored_manifest(&mem, &dead);
+    let row = fake.rows.lock().unwrap()[&dead].clone();
+    assert_eq!(row.status, BackupStatus::Available);
+    assert_eq!(row.size_bytes, manifest.backup_size_bytes);
+    assert_eq!(row.item_count, 100_000);
+    assert_ne!(
+        stats_pass,
+        serde_json::to_value(&manifest.source_table).unwrap()
+    );
+    assert_eq!(
+        row.source_table_details_json,
+        serde_json::to_value(&manifest.source_table).unwrap(),
+        "the AVAILABLE write carries the manifest's source_table"
+    );
+    assert_eq!(row.heartbeat_at, 1234.5, "the takeover left the heartbeat");
+    assert_ne!(row.owner_generation, 7, "a fresh generation");
+    assert!(row.completed_at.is_some());
+    assert_eq!(
+        fake.heartbeats.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the reconciler heartbeats no takeover claim"
+    );
+    assert_eq!(mem.keys().len(), objects_before, "nothing deleted");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&live].status,
+        BackupStatus::Creating
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+}
+
+/// A dead CREATING row without a complete manifest is FAILED with the
+/// owner-dead reason and `completed_at`, and the resolution itself deletes
+/// nothing; the FAILED-prefix duty deletes the prefix once it runs, the
+/// heartbeat the owner left being stale. Every guard of the probe has its
+/// shape: no manifest; a manifest without its sidecar; a sidecar that does
+/// not match; a manifest the reader refuses under a sidecar computed over
+/// its bytes (a sidecar matches what was stored, not what parses); a data
+/// file missing; a data file shorter than recorded; one larger than
+/// recorded; a manifest naming another backup under the row's prefix. A
+/// store error during the probe (not an absent object) is none of these:
+/// the row stays CREATING for the next cycle, nothing written.
+#[tokio::test]
+async fn the_reconciler_fails_a_dead_creating_row_without_a_complete_manifest() {
+    for shape in [
+        "none",
+        "no sidecar",
+        "sidecar mismatch",
+        "unparseable manifest",
+        "missing data file",
+        "short file",
+        "oversized file",
+        "foreign ARN",
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let mut dead = seed_dead_creating_with_manifest(&fake, &mem, shape != "short file");
+        let prefix = BackupArn::parse(&dead).unwrap().store_prefix();
+        let golden = stored_manifest(&mem, &dead);
+        match shape {
+            "none" => {
+                mem.objects
+                    .lock()
+                    .unwrap()
+                    .remove(&format!("{prefix}extenddb-manifest.json"));
+            }
+            "no sidecar" => {
+                mem.objects
+                    .lock()
+                    .unwrap()
+                    .remove(&format!("{prefix}extenddb-manifest.sha256"));
+            }
+            "sidecar mismatch" => {
+                mem.insert(&format!("{prefix}extenddb-manifest.sha256"), b"0000");
+            }
+            "unparseable manifest" => {
+                use sha2::Digest as _;
+                let garbage = b"{\"format_version\":1,\"backup_arn\":";
+                mem.insert(&format!("{prefix}extenddb-manifest.json"), garbage);
+                let sidecar = format!(
+                    "{}  extenddb-manifest.json\n",
+                    hex::encode(sha2::Sha256::digest(garbage))
+                );
+                mem.insert(
+                    &format!("{prefix}extenddb-manifest.sha256"),
+                    sidecar.as_bytes(),
+                );
+            }
+            "missing data file" => {
+                mem.objects
+                    .lock()
+                    .unwrap()
+                    .remove(&format!("{prefix}{}", golden.data_files[1].key));
+            }
+            "oversized file" => {
+                let key = format!("{prefix}{}", golden.data_files[1].key);
+                let bytes = usize::try_from(golden.data_files[1].bytes).unwrap() + 1;
+                mem.insert(&key, &vec![0u8; bytes]);
+            }
+            "foreign ARN" => {
+                // The golden backup's objects, whole, under another row's
+                // prefix: that row's manifest names the golden backup.
+                let other = arn_n(3);
+                let other_prefix = BackupArn::parse(&other).unwrap().store_prefix();
+                let objects: Vec<(String, Vec<u8>)> = mem
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, v) in objects {
+                    mem.objects.lock().unwrap().remove(&k);
+                    mem.insert(&format!("{other_prefix}{}", &k[prefix.len()..]), &v);
+                }
+                fake.rows.lock().unwrap().remove(&dead);
+                fake.dead.lock().unwrap().remove(&dead);
+                let mut r = row(&other, BackupStatus::Creating);
+                r.heartbeat_at = 1234.5;
+                fake.rows.lock().unwrap().insert(other.clone(), r);
+                fake.dead.lock().unwrap().insert(other.clone());
+                dead = other;
+            }
+            _ => {}
+        }
+        let objects_before = mem.keys().len();
+        // Under the maintenance claim, so the FAILED-prefix duty of the same
+        // cycle does not run and the resolution's own effect is visible.
+        *fake.maintenance_held.lock().unwrap() = true;
+        let runtime = runtime_on(&mem, store());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(
+            report.creating_resolved,
+            [(dead.clone(), BackupStatus::Failed)],
+            "{shape}"
+        );
+        assert!(report.failed_prefixes_deleted.is_empty());
+        let row = fake.rows.lock().unwrap()[&dead].clone();
+        assert_eq!(row.status, BackupStatus::Failed, "{shape}");
+        assert_eq!(
+            row.failure_reason.as_deref(),
+            Some(reconciler::OWNER_DEAD_NO_MANIFEST)
+        );
+        assert!(row.completed_at.is_some());
+        assert_eq!(row.heartbeat_at, 1234.5);
+        assert_eq!(mem.keys().len(), objects_before, "{shape}: nothing deleted");
+        assert!(mem.deletes.lock().unwrap().is_empty(), "{shape}");
+
+        // The next cycle without the claim: the FAILED row's heartbeat is
+        // stale (the dead owner's), the prefix lists objects, so it is
+        // deleted.
+        *fake.maintenance_held.lock().unwrap() = false;
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(
+            report.failed_prefixes_deleted,
+            std::slice::from_ref(&dead),
+            "{shape}"
+        );
+        assert!(objects_under(&mem, &dead).is_empty(), "{shape}");
+        assert_eq!(mem.keys(), [STORE_IDENTITY_KEY]);
+    }
+
+    // A store error during the probe: the row is taken over and left
+    // CREATING, no status write, nothing deleted; the next cycle, with the
+    // store answering, resolves it.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    *mem.fail_gets_under.lock().unwrap() = Some(BackupArn::parse(&dead).unwrap().store_prefix());
+    let runtime = runtime_on(&mem, store());
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.creating_resolved.is_empty());
+    assert!(
+        report.creating_left_to_owner.is_empty(),
+        "a probe that failed is neither resolved nor left to an owner"
+    );
+    assert_eq!(
+        fake.takeovers.lock().unwrap().as_slice(),
+        std::slice::from_ref(&dead)
+    );
+    let row = fake.rows.lock().unwrap()[&dead].clone();
+    assert_eq!(
+        row.status,
+        BackupStatus::Creating,
+        "left for the next cycle"
+    );
+    assert!(fake.status_writes.lock().unwrap().is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    *mem.fail_gets_under.lock().unwrap() = None;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.creating_resolved, [(dead, BackupStatus::Available)]);
+}
+
+/// A dead CREATING row whose status write fails on the claim connection is
+/// counted neither as resolved nor as left to its owner: the row stays
+/// CREATING for the next cycle (its takeover done, one write attempted),
+/// nothing deleted; with the connection back the next cycle resolves it.
+#[tokio::test]
+async fn a_dead_creating_row_whose_status_write_errors_is_left_for_the_next_cycle() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    fake.status_write_error
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.creating_resolved.is_empty(), "{report:?}");
+    assert!(report.creating_left_to_owner.is_empty(), "{report:?}");
+    assert!(!report.acted(), "nothing changed");
+    assert_eq!(
+        fake.takeovers.lock().unwrap().as_slice(),
+        std::slice::from_ref(&dead)
+    );
+    assert_eq!(writes(&fake), [(JobStatus::Available, None)]);
+    let row = fake.rows.lock().unwrap()[&dead].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    fake.status_write_error
+        .store(false, std::sync::atomic::Ordering::Release);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.creating_resolved, [(dead, BackupStatus::Available)]);
+}
+
+/// Within one cycle the dead-owner duty runs before the FAILED-prefix duty,
+/// so a row the cycle just failed, whose heartbeat the dead owner left
+/// stale, loses its prefix in that same cycle (the design states this as a
+/// property of the cycle, not a convenience).
+#[tokio::test]
+async fn a_row_failed_by_the_cycle_loses_its_prefix_in_that_cycle() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, false);
+    assert!(!objects_under(&mem, &dead).is_empty());
+    let runtime = runtime_on(&mem, store());
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.creating_resolved,
+        [(dead.clone(), BackupStatus::Failed)]
+    );
+    assert_eq!(
+        report.failed_prefixes_deleted,
+        std::slice::from_ref(&dead),
+        "the same cycle"
+    );
+    assert!(objects_under(&mem, &dead).is_empty());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&dead].status,
+        BackupStatus::Failed
+    );
+}
+
+/// A dead CREATING row whose status write matches no row (another
+/// reconciler took the row over in the gap before this one's write, item
+/// 29's race on MongoDB and Cassandra) is left to that owner: counted as
+/// such and not as resolved, the row still CREATING under the other
+/// generation, nothing deleted.
+#[tokio::test]
+async fn a_dead_creating_row_taken_over_by_another_is_left_to_that_owner() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    fake.takeover_lost_to_another
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.creating_resolved.is_empty());
+    assert_eq!(report.creating_left_to_owner, std::slice::from_ref(&dead));
+    assert!(!report.acted(), "nothing changed");
+    let writes = fake.status_writes.lock().unwrap().clone();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].to, JobStatus::Available);
+    let row = fake.rows.lock().unwrap()[&dead].clone();
+    assert_eq!(row.status, BackupStatus::Creating);
+    assert_ne!(row.owner_generation, writes[0].generation);
+    assert!(mem.deletes.lock().unwrap().is_empty());
+}
+
+/// The deleting duties and their gates. A FAILED row's prefix is deleted
+/// only once its heartbeat is older than `stale_job_after` and only while
+/// no maintenance claim is held; a DELETED row's objects are swept; a FAILED
+/// or DELETED row whose prefix is empty is removed once its `completed_at`
+/// is older than `failed_row_retention` (a prefix emptied earlier in the
+/// cycle counts), and kept while the retention has not passed or while its
+/// prefix still lists objects (a FAILED row past its retention whose
+/// heartbeat is fresh: no duty empties its prefix, so the tombstone duty
+/// keeps the row); an AVAILABLE row is no tombstone, whatever its clock and
+/// prefix. The dead-CREATING duty runs under the maintenance claim;
+/// the deleting duties and the registrations sweep do not. With the store
+/// unhealthy none of them runs.
+#[tokio::test]
+async fn the_reconciler_deletes_failed_and_deleted_prefixes_and_removes_tombstones_on_their_clocks()
+{
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let now = seconds_since_epoch();
+    let stale_failed = arn_n(1);
+    let fresh_failed = arn_n(2);
+    let deleted_with_objects = arn_n(3);
+    let old_failed_tombstone = arn_n(4);
+    let old_deleted_tombstone = arn_n(5);
+    let young_tombstone = arn_n(6);
+    let old_tombstone_with_objects = arn_n(7);
+    let old_failed_with_objects_and_a_live_heartbeat = arn_n(8);
+    for (a, status, heartbeat_at, completed_at, objects) in [
+        (
+            &stale_failed,
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now - 1000.0),
+            true,
+        ),
+        (&fresh_failed, BackupStatus::Failed, now, Some(now), true),
+        (
+            &deleted_with_objects,
+            BackupStatus::Deleted,
+            now - 1000.0,
+            Some(now - 1000.0),
+            true,
+        ),
+        (
+            &old_failed_tombstone,
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now - 1000.0),
+            false,
+        ),
+        (
+            &old_deleted_tombstone,
+            BackupStatus::Deleted,
+            now - 1000.0,
+            Some(now - 1000.0),
+            false,
+        ),
+        (
+            &young_tombstone,
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now - 10.0),
+            false,
+        ),
+        (
+            &old_tombstone_with_objects,
+            BackupStatus::Deleted,
+            now - 1000.0,
+            Some(now - 1000.0),
+            true,
+        ),
+        (
+            &old_failed_with_objects_and_a_live_heartbeat,
+            BackupStatus::Failed,
+            now,
+            Some(now - 1000.0),
+            true,
+        ),
+    ] {
+        let mut r = row(a, status);
+        r.heartbeat_at = heartbeat_at;
+        r.completed_at = completed_at;
+        fake.rows.lock().unwrap().insert(a.clone(), r);
+        if objects {
+            let prefix = BackupArn::parse(a).unwrap().store_prefix();
+            mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+        }
+    }
+    let retention = Duration::from_secs(600);
+    let settings = JobSettings {
+        failed_row_retention: retention,
+        ..job_settings()
+    };
+
+    // Unhealthy (the root's identity file names another store while the
+    // store answers): no duty over the store's rows runs, the dead-CREATING
+    // one included.
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file("another-store", "catalog-1"),
+    );
+    let runtime = runtime_on(&mem, store()).with_job_settings(settings);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(report.creating_resolved.is_empty());
+    assert!(report.failed_prefixes_deleted.is_empty());
+    assert!(report.deleted_prefixes_swept.is_empty());
+    assert!(report.tombstones_removed.is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap().len(), 9);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&dead].status,
+        BackupStatus::Creating
+    );
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+
+    // Under the maintenance claim, the store healthy again: the
+    // dead-CREATING duty runs, the deleting duties and the registrations
+    // sweep (which the backend has something for) do not.
+    fake.swept_registrations.lock().unwrap().push(arn_n(9));
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(report.maintenance_held);
+    assert_eq!(report.creating_resolved, [(dead, BackupStatus::Available)]);
+    assert!(report.failed_prefixes_deleted.is_empty());
+    assert!(report.deleted_prefixes_swept.is_empty());
+    assert!(report.tombstones_removed.is_empty());
+    assert!(
+        report.registrations_swept.is_empty(),
+        "the sweep does not run under the claim"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap().len(), 9);
+
+    // An AVAILABLE row past the retention with an empty prefix: a tombstone
+    // is a FAILED or DELETED row and nothing else. It enters the catalog
+    // here, older than the row the cycle above resolved, because the
+    // store's check heads the newest AVAILABLE row's manifest and this row
+    // has none.
+    let old_available_with_an_empty_prefix =
+        format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01700000000000-00000000");
+    let mut r = row(&old_available_with_an_empty_prefix, BackupStatus::Available);
+    r.heartbeat_at = now - 1000.0;
+    r.completed_at = Some(now - 1000.0);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(old_available_with_an_empty_prefix.clone(), r);
+
+    // The claim released: each duty on its clock.
+    *fake.maintenance_held.lock().unwrap() = false;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.failed_prefixes_deleted,
+        std::slice::from_ref(&stale_failed)
+    );
+    assert_eq!(
+        report.deleted_prefixes_swept,
+        [
+            deleted_with_objects.clone(),
+            old_tombstone_with_objects.clone()
+        ]
+    );
+    // The tombstone duty runs after the two deleting duties, so a prefix
+    // they emptied this cycle counts as empty here.
+    let mut removed = report.tombstones_removed.clone();
+    removed.sort();
+    assert_eq!(
+        removed,
+        [
+            stale_failed.clone(),
+            deleted_with_objects.clone(),
+            old_failed_tombstone.clone(),
+            old_deleted_tombstone.clone(),
+            old_tombstone_with_objects.clone(),
+        ]
+    );
+    assert_eq!(report.registrations_swept, [arn_n(9)]);
+    assert!(report.acted());
+    assert_eq!(
+        objects_under(&mem, &fresh_failed).len(),
+        1,
+        "a FAILED row with a live heartbeat keeps its prefix"
+    );
+    assert!(objects_under(&mem, &stale_failed).is_empty());
+    assert!(objects_under(&mem, &deleted_with_objects).is_empty());
+    assert_eq!(
+        objects_under(&mem, &old_failed_with_objects_and_a_live_heartbeat).len(),
+        1,
+        "no duty empties the prefix of a FAILED row with a live heartbeat"
+    );
+    {
+        let rows = fake.rows.lock().unwrap();
+        assert!(rows.contains_key(&fresh_failed), "its heartbeat is live");
+        assert!(
+            rows.contains_key(&young_tombstone),
+            "its retention has not passed"
+        );
+        assert!(
+            rows.contains_key(&old_failed_with_objects_and_a_live_heartbeat),
+            "its prefix still lists an object"
+        );
+        assert!(
+            rows.contains_key(&old_available_with_an_empty_prefix),
+            "AVAILABLE is not a tombstone status"
+        );
+        assert_eq!(
+            rows[&old_available_with_an_empty_prefix].status,
+            BackupStatus::Available
+        );
+        assert_eq!(rows.len(), 5, "the four kept and the resolved CREATING row");
+    }
+    assert!(
+        !fake
+            .remove_attempts
+            .lock()
+            .unwrap()
+            .contains(&old_available_with_an_empty_prefix),
+        "the duty asks the catalog to remove FAILED and DELETED rows only; the backends would \
+         refuse an AVAILABLE one, and the duty does not lean on that"
+    );
+
+    // The next cycle has nothing left to do.
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.tombstones_removed.is_empty());
+    assert!(report.deleted_prefixes_swept.is_empty());
+    assert!(report.failed_prefixes_deleted.is_empty());
+    assert!(report.creating_resolved.is_empty());
+}
+
+// --- the store-backed restore ---------------------------------------------------
+
+use extenddb_core::backup_format::{
+    BackupDocuments, DataFileEntry, EXTENDDB_MANIFEST_FILE, ExtenddbManifest, ItemOrder, KeyOrder,
+    KeyRangeTracker, MANIFEST_CHECKSUM_FILE, ManifestHeader, SnapshotDescriptor, SourceTableSchema,
+    data_file_key, encode_data_file,
+};
+use extenddb_core::metrics::MetricName;
+use extenddb_storage::snapshot::source_table_schema;
+
+/// The `Music` table's source schema as a manifest carries it.
+fn music_source_table() -> SourceTableSchema {
+    source_table_schema(&music_table(), None).unwrap()
+}
+
+/// `music_source_table` as an on-demand table (vector indexes need one).
+fn on_demand_source_table() -> SourceTableSchema {
+    let mut source_table = music_source_table();
+    source_table.billing_mode = BillingMode::PayPerRequest;
+    source_table.provisioned_throughput = None;
+    for gsi in &mut source_table.global_secondary_indexes {
+        gsi.provisioned_throughput = None;
+    }
+    source_table
+}
+
+/// A backup of `source_table` under `mem` for `arn`, as the writer leaves
+/// one: one data file per entry of `files`, encoded with the format's
+/// encoder; key-ordered with the tracker's ranges when `key_ordered`; the
+/// four documents built by `BackupDocuments::build`; and the row AVAILABLE
+/// in `fake` with the manifest's `source_table`. Returns the manifest.
+fn seed_manifest_backup(
+    fake: &Fake,
+    mem: &MemStore,
+    arn: &str,
+    mut source_table: SourceTableSchema,
+    files: &[Vec<Item>],
+    key_ordered: bool,
+) -> ExtenddbManifest {
+    let parsed = BackupArn::parse(arn).unwrap();
+    let prefix = parsed.store_prefix();
+    let mut tracker = key_ordered.then(|| {
+        KeyRangeTracker::new(
+            &KeyOrder::resolve(
+                &source_table.key_schema,
+                &source_table.attribute_definitions,
+            )
+            .unwrap(),
+        )
+    });
+    let mut entries = Vec::new();
+    let mut total = 0;
+    for (i, items) in files.iter().enumerate() {
+        let (bytes, checksums) = encode_data_file(items.iter().cloned()).unwrap();
+        let range = tracker.as_mut().map(|t| {
+            for item in items {
+                t.push(item).unwrap();
+            }
+            t.next_file().expect("a file with items has a range")
+        });
+        let key = data_file_key(u32::try_from(i + 1).unwrap());
+        mem.insert(&format!("{prefix}{key}"), &bytes);
+        total += items.len();
+        entries.push((DataFileEntry::from_checksums(key, &checksums, range), None));
+    }
+    source_table.item_count = i64::try_from(total).unwrap();
+    seed_manifest_documents(fake, mem, arn, source_table, entries, key_ordered)
+}
+
+/// The documents of a backup whose data files are already under the prefix,
+/// from `entries`, and the AVAILABLE row; the manifest as built.
+fn seed_manifest_documents(
+    fake: &Fake,
+    mem: &MemStore,
+    arn: &str,
+    source_table: SourceTableSchema,
+    entries: Vec<(DataFileEntry, Option<String>)>,
+    key_ordered: bool,
+) -> ExtenddbManifest {
+    let parsed = BackupArn::parse(arn).unwrap();
+    let prefix = parsed.store_prefix();
+    let total: u64 = entries.iter().map(|(e, _)| e.item_count).sum();
+    let docs = BackupDocuments::build(
+        ManifestHeader {
+            backup_arn: parsed,
+            backup_name: "nightly".to_owned(),
+            source_backend: "test".to_owned(),
+            source_extenddb_version: "0.0.0".to_owned(),
+            snapshot: SnapshotDescriptor {
+                kind: "test".to_owned(),
+                marker: String::new(),
+            },
+            item_order: if key_ordered {
+                ItemOrder::KeyOrdered
+            } else {
+                ItemOrder::Unordered
+            },
+            source_table,
+        },
+        entries,
+        "",
+        &store().store_root,
+    )
+    .unwrap();
+    for (name, bytes) in docs.documents() {
+        mem.insert(&format!("{prefix}{name}"), bytes);
+    }
+    let manifest = docs.manifest().clone();
+    let mut available = row(arn, BackupStatus::Available);
+    available.source_table_details_json = serde_json::to_value(&manifest.source_table).unwrap();
+    available.size_bytes = manifest.backup_size_bytes;
+    available.item_count = i64::try_from(total).unwrap();
+    fake.rows.lock().unwrap().insert(arn.to_owned(), available);
+    manifest
+}
+
+/// `n` songs from `from`, in key order.
+fn songs_from(from: usize, n: usize) -> Vec<Item> {
+    (from..from + n)
+        .map(|i| song(&format!("artist-{i:05}"), &format!("title-{i:05}")))
+        .collect()
+}
+
+/// A healthy runtime on `mem` with a spool at `spool` (an S3 store's shape),
+/// the job settings and a collector.
+fn spooled_runtime(mem: &Arc<MemStore>, spool: &std::path::Path) -> BackupRuntime {
+    runtime()
+        .with_store(
+            ConfiguredStore::new(
+                StoreKind::S3,
+                "bucket/prefix".to_owned(),
+                Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+                Some(Spool {
+                    path: spool.to_path_buf(),
+                    spool_host: "host-a:/var/spool".to_owned(),
+                }),
+                Ok(StoreIdentity {
+                    store_kind: StoreKind::S3,
+                    store_root: "bucket/prefix".to_owned(),
+                    store_id: "store-1".to_owned(),
+                }),
+            )
+            .with_manifest_names("bucket".to_owned(), "prefix/".to_owned()),
+        )
+        .with_job_settings(job_settings())
+        .with_metrics(Arc::new(extenddb_core::metrics::MetricsCollector::new()))
+}
+
+/// The `s3_row` of `arn`: the row with the spooled runtime's identity.
+fn s3_identity() -> StoreIdentity {
+    StoreIdentity {
+        store_kind: StoreKind::S3,
+        store_root: "bucket/prefix".to_owned(),
+        store_id: "store-1".to_owned(),
+    }
+}
+
+/// The `RestoreJobs` outcomes the collector drained, with their count.
+fn restore_outcomes(runtime: &BackupRuntime) -> Vec<(String, f64)> {
+    let mut outcomes: Vec<(String, f64)> = runtime
+        .metrics()
+        .unwrap()
+        .drain(Duration::ZERO)
+        .into_iter()
+        .filter(|b| b.metric == MetricName::RestoreJobs)
+        .map(|b| (b.operation, b.sum))
+        .collect();
+    outcomes.sort_by(|a, b| a.0.cmp(&b.0));
+    outcomes
+}
+
+/// Every metric bucket the collector drained, as `(name, operation, sum)`.
+fn drained(runtime: &BackupRuntime) -> Vec<(MetricName, String, f64)> {
+    runtime
+        .metrics()
+        .unwrap()
+        .drain(Duration::ZERO)
+        .into_iter()
+        .map(|b| (b.metric, b.operation, b.sum))
+        .collect()
+}
+
+/// Wait until `n` `bulk_load` calls have begun (a job waiting at the gate
+/// counts).
+async fn wait_for_bulk_loads_started(fake: &Fake, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fake
+        .bulk_loads_started
+        .load(std::sync::atomic::Ordering::Acquire)
+        < n
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no bulk_load began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The status writes the restore claims received, as `(from, to, reason)`.
+fn restore_writes(fake: &Fake) -> Vec<(JobStatus, JobStatus, Option<String>)> {
+    fake.restore_writes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|w| (w.from, w.to, w.fields.failure_reason.clone()))
+        .collect()
+}
+
+/// The store keys `mem` saw `get` for, without the prefix.
+fn gets_under(mem: &MemStore, arn: &str) -> Vec<String> {
+    let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+    mem.gets()
+        .into_iter()
+        .filter_map(|k| k.strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+/// The happy path. The request: the row passes, the permit is taken, the
+/// sidecar and manifest are read, the registration carries the manifest's
+/// table (key schema, GSI, billing) and the row's store, the maintenance
+/// claim is read once after it, and the response is CREATING with the
+/// manifest's provenance in its `RestoreSummary`. The job: every file is
+/// read once to hash it (in order), then once more to decode it, each file
+/// goes to one `bulk_load` from item 0 with `reapplying` false, the items
+/// come back whole and in order, the target is counted, the record is DONE
+/// and the table ACTIVE with its GSI, no status write was needed, the slot
+/// is free; `RestoreJobs{succeeded}`, `RestoreBytesDownloaded` of every
+/// file's bytes, `WorkerLastSuccess{RestoreJob}`.
+#[tokio::test]
+async fn a_store_backed_restore_answers_creating_and_its_job_loads_the_backup() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 3), songs_from(3, 2), songs_from(5, 4)];
+    let manifest = seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let runtime = job_runtime(&mem);
+
+    let response = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let table = &response["TableDescription"];
+    assert_eq!(table["TableStatus"], "CREATING");
+    assert_eq!(table["TableName"], "MusicRestored");
+    assert_eq!(table["RestoreSummary"]["SourceBackupArn"], arn(ACCOUNT));
+    assert_eq!(table["RestoreSummary"]["SourceTableArn"], source_arn());
+    assert_eq!(
+        table["RestoreSummary"]["RestoreDateTime"],
+        json!(manifest.backup_creation_date_time)
+    );
+    assert_eq!(table["RestoreSummary"]["RestoreInProgress"], true);
+    let claims = fake.restore_claims.lock().unwrap().clone();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].0, ACCOUNT);
+    let input = &claims[0].1;
+    assert_eq!(input.table_name, "MusicRestored");
+    assert_eq!(input.key_schema, music_table().key_schema);
+    assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+    assert_eq!(gsi_names(input), ["GenreIndex"]);
+    assert_eq!(input.vector_indexes, None);
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.kind, RestoreKind::Manifest);
+    assert_eq!(record.store, Some(store()));
+    assert_eq!(record.spool_host, None, "a filesystem store has no spool");
+    assert_eq!(
+        fake.maintenance_checks.lock().unwrap().as_slice(),
+        [job_settings().stale_job_after; 2],
+        "the maintenance claim was read before the registration and after it"
+    );
+
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.bulk_load_files(),
+        [(0, 0, false, 3), (1, 0, false, 2), (2, 0, false, 4)]
+    );
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done);
+    assert!(record.completed_at.is_some());
+    assert_eq!(record.file_index, Some(2));
+    assert_eq!(record.items_applied, Some(4));
+    let desc = fake.tables.lock().unwrap()["MusicRestored"].clone();
+    assert_eq!(desc.table_status, TableStatus::Active);
+    assert_eq!(
+        desc.item_count, 0,
+        "the restored table's ItemCount is 0 at ACTIVE, as the service reports it"
+    );
+    assert!(
+        restore_writes(&fake).is_empty(),
+        "the flip is the backend's one write"
+    );
+    assert_eq!(
+        fake.finish_sizes.lock().unwrap().as_slice(),
+        [0],
+        "the restored table's TableSizeBytes is 0 at ACTIVE, as the service reports it"
+    );
+    assert_eq!(runtime.free_slots(), 4);
+    let reads = gets_under(&mem, &arn(ACCOUNT));
+    assert_eq!(
+        reads,
+        [
+            MANIFEST_CHECKSUM_FILE,
+            EXTENDDB_MANIFEST_FILE,
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+            "data/000003.json.gz",
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+            "data/000003.json.gz",
+        ],
+        "every file hashed before any is decoded, each read twice in place"
+    );
+    let bytes: u64 = manifest.data_files.iter().map(|f| f.bytes).sum();
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("succeeded".to_owned(), 1.0)]
+    );
+    // Summed across the drain's buckets (one per wall-clock minute).
+    let downloaded: f64 = metrics
+        .iter()
+        .filter(|(m, _, _)| *m == MetricName::RestoreBytesDownloaded)
+        .map(|(_, _, sum)| *sum)
+        .sum();
+    assert!(
+        (downloaded - bytes as f64).abs() < f64::EPSILON,
+        "{metrics:?}"
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerLastSuccess && op == "RestoreJob"),
+        "{metrics:?}"
+    );
+    let started = lines.containing(": started, 3 data file(s), 9 items, key-ordered");
+    assert_eq!(started.len(), 1, "{started:?}");
+    let active = lines.containing(": ACTIVE, 9 items (9 applied by this run), ");
+    assert_eq!(active.len(), 1, "{active:?}");
+}
+
+/// The request's order on the manifest path, each refusal before the next
+/// step and the registration: a table of the target's name is
+/// `TableAlreadyExists` with no row read; a missing sidecar or manifest is
+/// `BackupNotFound` with the operator's line naming `--prune-missing`; a
+/// sidecar that does not match, a manifest naming another backup or another
+/// table are `ValidationException`s; none of them registers anything or
+/// takes a slot for longer than the request.
+#[tokio::test]
+async fn the_manifest_request_refuses_in_order_before_the_registration() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+
+    // A taken name: before the row.
+    fake.tables.lock().unwrap().insert(
+        "MusicRestored".to_owned(),
+        TableDescription {
+            table_name: "MusicRestored".to_owned(),
+            table_status: TableStatus::Active,
+            ..Default::default()
+        },
+    );
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableAlreadyExistsException(_)),
+        "{err:?}"
+    );
+    // The name is checked after the row is read (the service's order: a
+    // missing backup answers first) and before any store read.
+    assert_eq!(fake.row_reads.lock().unwrap().len(), 1);
+    assert!(mem.gets().is_empty());
+    fake.row_reads.lock().unwrap().clear();
+    fake.tables.lock().unwrap().remove("MusicRestored");
+
+    // A missing sidecar, then a missing manifest.
+    let sidecar_key = format!("{prefix}{MANIFEST_CHECKSUM_FILE}");
+    let manifest_key = format!("{prefix}{EXTENDDB_MANIFEST_FILE}");
+    let sidecar = mem.objects.lock().unwrap().remove(&sidecar_key).unwrap();
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(ref m) if m.contains(&arn(ACCOUNT))),
+        "{err:?}"
+    );
+    let prune = lines.containing("backup sync --prune-missing");
+    assert_eq!(prune.len(), 1, "{prune:?}");
+    assert!(prune[0].contains(MANIFEST_CHECKSUM_FILE), "{}", prune[0]);
+    mem.insert(&sidecar_key, &sidecar);
+    let manifest = mem.objects.lock().unwrap().remove(&manifest_key).unwrap();
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
+        "{err:?}"
+    );
+    assert_eq!(lines.containing("backup sync --prune-missing").len(), 2);
+
+    // A sidecar that does not match the manifest.
+    mem.insert(&manifest_key, &manifest);
+    mem.insert(
+        &sidecar_key,
+        b"0000000000000000000000000000000000000000000000000000000000000000\n",
+    );
+    let msg = validation_message(
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(msg.contains("checksum sidecar does not match"), "{msg}");
+    mem.insert(&sidecar_key, &sidecar);
+
+    // A manifest naming another backup (another account's, the same id),
+    // with a sidecar that matches it.
+    let other = arn("999999999999");
+    let mut parsed: Value = serde_json::from_slice(&manifest).unwrap();
+    parsed["backup_arn"] = json!(other);
+    parsed["source_table"]["table_arn"] = json!(format!(
+        "arn:aws:dynamodb:{REGION}:999999999999:table/Music"
+    ));
+    let other_bytes = serde_json::to_vec(&parsed).unwrap();
+    let other_sidecar = {
+        use sha2::Digest;
+        format!(
+            "{:x}  {EXTENDDB_MANIFEST_FILE}\n",
+            sha2::Sha256::digest(&other_bytes)
+        )
+    };
+    mem.insert(&manifest_key, &other_bytes);
+    mem.insert(&sidecar_key, other_sidecar.as_bytes());
+    let msg = validation_message(
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        msg.contains("names another backup") && msg.contains(&other),
+        "{msg}"
+    );
+
+    // A manifest whose source table is not the ARN's: the reader's own
+    // identity rule refuses it at the parse.
+    let mut parsed: Value = serde_json::from_slice(&manifest).unwrap();
+    parsed["source_table"]["table_name"] = json!("Other");
+    let renamed = serde_json::to_vec(&parsed).unwrap();
+    let renamed_sidecar = {
+        use sha2::Digest;
+        format!(
+            "{:x}  {EXTENDDB_MANIFEST_FILE}\n",
+            sha2::Sha256::digest(&renamed)
+        )
+    };
+    mem.insert(&manifest_key, &renamed);
+    mem.insert(&sidecar_key, renamed_sidecar.as_bytes());
+    let msg = validation_message(
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        msg.contains("cannot restore from")
+            && msg.contains("names table \"Music\" but source_table.table_name is \"Other\""),
+        "{msg}"
+    );
+
+    assert!(
+        fake.restore_claims.lock().unwrap().is_empty(),
+        "nothing was registered"
+    );
+    assert_eq!(runtime.free_slots(), 4, "every refusal returned its slot");
+    assert_eq!(runtime.running_jobs(), 0);
+}
+
+/// The maintenance claim is read immediately before the registration and
+/// again after it. Held before, the request is answered
+/// `LimitExceededException` and nothing is registered, so no record lands
+/// while a command holds the claim. Taken between the read before and the
+/// registration, the record is FAILED `maintenance` from RUNNING under the
+/// job's claim, its target removed, and the request answered
+/// `LimitExceededException` (the record is what the command's wait sees).
+/// A claim that cannot be read after the registration fails the record
+/// with the read's error and answers it.
+#[tokio::test]
+async fn a_manifest_restore_under_a_maintenance_claim_fails_its_record_after_registering() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    // Held before the registration.
+    let checks = |fake: &Fake| fake.maintenance_checks.lock().unwrap().len();
+    let take_claim_after = |fake: &Fake, n: usize| {
+        *fake.after_maintenance_check.lock().unwrap() = Some((
+            n,
+            Box::new(|fake: &Fake| *fake.maintenance_held.lock().unwrap() = true),
+        ));
+    };
+    *fake.maintenance_held.lock().unwrap() = true;
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(ref m) if m.contains("maintenance claim")),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(
+        fake.restore_claims.lock().unwrap().is_empty(),
+        "nothing is registered while the claim is held"
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert_eq!(runtime.free_slots(), 4);
+
+    // Taken after the read before the registration.
+    *fake.maintenance_held.lock().unwrap() = false;
+    take_claim_after(&fake, checks(&fake) + 1);
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(ref m) if m.contains("maintenance claim")),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_claims.lock().unwrap().len(),
+        1,
+        "the registration ran first"
+    );
+    assert_eq!(
+        restore_writes(&fake),
+        [(
+            JobStatus::Running,
+            JobStatus::Failed,
+            Some(job::MAINTENANCE.to_owned())
+        )]
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the target and its record are gone"
+    );
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 4);
+    // A FAILED record is a job end: the outcome beside the worker error.
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("failed".to_owned(), 1.0)],
+        "{metrics:?}"
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob"),
+        "{metrics:?}"
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::RestoreJobDuration && op == "failed"),
+        "{metrics:?}"
+    );
+
+    *fake.maintenance_held.lock().unwrap() = false;
+    let fail_after = checks(&fake) + 1;
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        fail_after,
+        Box::new(|fake: &Fake| {
+            *fake.maintenance_error.lock().unwrap() = Some("pool exhausted".to_owned());
+        }),
+    ));
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 2);
+    assert!(
+        writes[1].2.as_deref().unwrap().contains("pool exhausted"),
+        "{writes:?}"
+    );
+}
+
+/// The registration's own refusals reach the client as the legacy
+/// backend's do: a name taken under the registration is
+/// `TableAlreadyExistsException`, a CREATING restore target
+/// `TableInUseException`, a backup deleted under the lock
+/// `BackupNotFoundException`, a backup in use `BackupInUseException`; the
+/// slot is returned each time and no job runs. With no slot free the
+/// request is `LimitExceededException` before any store read.
+#[tokio::test]
+async fn the_registrations_refusals_keep_their_classes_and_return_the_slot() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    type Expected = fn(&DynamoDbError) -> bool;
+    let cases: [(StorageError, Expected); 4] = [
+        (
+            StorageError::TableAlreadyExists("MusicRestored".to_owned()),
+            |e| matches!(e, DynamoDbError::TableAlreadyExistsException(_)),
+        ),
+        (
+            StorageError::TableBeingRestored {
+                table_name: "MusicRestored".to_owned(),
+                backup_arn: arn(ACCOUNT),
+            },
+            |e| matches!(e, DynamoDbError::TableInUseException(_)),
+        ),
+        (
+            extenddb_storage::backup_catalog::backup_not_found(&arn(ACCOUNT)),
+            |e| matches!(e, DynamoDbError::BackupNotFoundException(_)),
+        ),
+        (
+            extenddb_storage::backup_catalog::backup_in_use("Earlier", &arn(ACCOUNT)),
+            |e| matches!(e, DynamoDbError::BackupInUseException(_)),
+        ),
+    ];
+    for (error, expected) in cases {
+        let shown = format!("{error:?}");
+        *fake.claim_restore_error.lock().unwrap() = Some(error);
+        let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap_err();
+        assert!(expected(&err), "{shown}: {err:?}");
+        wait_for_jobs(&runtime).await;
+        assert_eq!(runtime.free_slots(), 4, "{shown}");
+    }
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert!(restore_writes(&fake).is_empty());
+
+    // No wait for a slot: the refusal is what the cell reads.
+    let full = job_runtime(&mem).with_permit_wait(Duration::ZERO);
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(full.take_permit().await.unwrap());
+    }
+    let before = mem.gets().len();
+    let err = restore_on(&fake, &full, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::LimitExceededException(_)),
+        "{err:?}"
+    );
+    assert_eq!(mem.gets().len(), before, "no store read before the permit");
+}
+
+/// A second restore while the first's target is CREATING is
+/// `BackupInUseException` naming the backup, through the catalog's in-use
+/// rule the registration wrote; a second restore into the same name, of the
+/// same backup or of another, is `TableInUseException` (the target name is
+/// checked once the backup is known to exist and before its in-use rule, the
+/// service's measured order); once the first is ACTIVE the backup is free
+/// again.
+#[tokio::test]
+async fn a_backup_being_restored_is_in_use_until_its_target_is_active() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn_n(2),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 1).await;
+    assert_eq!(
+        runtime.free_slots(),
+        3,
+        "the job holds its slot past the reply, until it ends"
+    );
+    let err = restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "TargetTableName": "Second" })),
+    )
+    .await
+    .unwrap_err();
+    // The service's text names the backup, not the target (the log line
+    // names the target).
+    let in_use = extenddb_storage::backup_catalog::backup_in_use_message(&arn(ACCOUNT));
+    assert!(
+        matches!(err, DynamoDbError::BackupInUseException(ref m) if *m == in_use),
+        "{err:?}"
+    );
+    assert_eq!(runtime.free_slots(), 3, "a refusal returns its own slot");
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableInUseException(_)),
+        "the same backup into its own CREATING target (measured on DynamoDB): {err:?}"
+    );
+    let err = restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "BackupArn": arn_n(2) })),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::TableInUseException(_)),
+        "another backup into the name being restored into: {err:?}"
+    );
+    gate.add_permits(1);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        runtime.free_slots(),
+        4,
+        "the slot is free once the job ended"
+    );
+    *fake.bulk_load_gate.lock().unwrap() = None;
+    restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "TargetTableName": "Second" })),
+    )
+    .await
+    .unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.restored_items("Second").len(), 2);
+}
+
+/// The tamper cell: file 2 of 3 does not hash to the manifest's digest.
+/// Every file is verified before any is loaded, so no `bulk_load` is
+/// called at all, the record is FAILED naming the file, the target is
+/// removed (the FAILED write matched), and the failed outcome is recorded.
+#[tokio::test]
+async fn a_corrupt_second_file_fails_before_any_load() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 3), songs_from(3, 3), songs_from(6, 3)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let key = format!("{prefix}data/000002.json.gz");
+    let mut bytes = mem.objects.lock().unwrap()[&key].clone();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    mem.insert(&key, &bytes);
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    assert!(
+        fake.bulk_loads.lock().unwrap().is_empty(),
+        "no file was loaded"
+    );
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        (writes[0].0, writes[0].1),
+        (JobStatus::Running, JobStatus::Failed)
+    );
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("data file data/000002.json.gz does not match the manifest: "),
+        "{reason}"
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)).len(),
+        4,
+        "sidecar, manifest, files 1 and 2"
+    );
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("failed".to_owned(), 1.0)]
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, sum)| *m == MetricName::WorkerErrorCount
+                && op == "RestoreJob"
+                && (*sum - 1.0).abs() < f64::EPSILON),
+        "a FAILED job is a worker error: {metrics:?}"
+    );
+    let failed = lines.containing(": FAILED (data file data/000002.json.gz does not match");
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].ends_with("the target was removed"),
+        "{}",
+        failed[0]
+    );
+}
+
+/// A transport failure at the `get` and one mid-body are each retried
+/// after a backoff and the restore completes; the store's error is counted
+/// once per failed attempt; a denial is not retried and fails the restore
+/// naming the file; a file missing from the store fails it at once.
+#[tokio::test]
+async fn transport_failures_are_retried_and_other_failures_are_not() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    mem.fail_gets_with(GetFailure::Transport, 1);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    // The first data-file get failed; its retry, the next data-file get,
+    // stops mid-body.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while gets_under(&mem, &arn(ACCOUNT)).len() < 3 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    mem.fail_get_after_bytes(5);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(fake.restored_items("MusicRestored").len(), 4);
+    let reads = gets_under(&mem, &arn(ACCOUNT));
+    assert_eq!(
+        reads,
+        [
+            MANIFEST_CHECKSUM_FILE,
+            EXTENDDB_MANIFEST_FILE,
+            "data/000001.json.gz",
+            "data/000001.json.gz",
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+        ],
+        "file 1 took three attempts"
+    );
+    // Summed across the drain's buckets: the two errors are 1 to 2 s apart
+    // and a run that crosses a wall-clock minute puts them in two.
+    let errors: Vec<_> = drained(&runtime)
+        .into_iter()
+        .filter(|(m, _, _)| *m == MetricName::BackupStoreErrors)
+        .collect();
+    assert!(errors.iter().all(|(_, op, _)| op == "get"), "{errors:?}");
+    let total: f64 = errors.iter().map(|(_, _, sum)| *sum).sum();
+    assert!((total - 2.0).abs() < f64::EPSILON, "{errors:?}");
+
+    // A denial: no retry.
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    mem.fail_gets_with(GetFailure::PermissionDenied, 1);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason
+            .starts_with("reading data file data/000001.json.gz from the store: permission denied"),
+        "{reason}"
+    );
+    assert_eq!(gets_under(&mem, &arn(ACCOUNT)).len(), 3);
+    let errors: Vec<_> = drained(&runtime)
+        .into_iter()
+        .filter(|(m, _, _)| *m == MetricName::BackupStoreErrors)
+        .collect();
+    assert_eq!(
+        errors,
+        [(MetricName::BackupStoreErrors, "get".to_owned(), 1.0)],
+        "a denial is the store's error too"
+    );
+
+    // A file that is not there.
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.objects
+        .lock()
+        .unwrap()
+        .remove(&format!("{prefix}data/000002.json.gz"));
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(
+        writes[0].2.as_deref(),
+        Some("data file data/000002.json.gz is not in the store")
+    );
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    let errors: Vec<_> = drained(&runtime)
+        .into_iter()
+        .filter(|(m, _, _)| *m == MetricName::BackupStoreErrors)
+        .collect();
+    assert_eq!(
+        errors,
+        [(MetricName::BackupStoreErrors, "get".to_owned(), 1.0)],
+        "an absent file is the store's error too"
+    );
+}
+
+/// A store that keeps failing is retried for the bound and then fails the
+/// restore naming the file and the bound, with the record heartbeated
+/// meanwhile and no `bulk_load`; the backoff never exceeds a minute.
+#[tokio::test(start_paused = true)]
+async fn a_download_exhausting_the_retry_bound_fails_the_restore() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    mem.fail_gets_with(GetFailure::Transport, usize::MAX);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    // The paused clock runs ahead through the backoffs, so the job's end is
+    // waited for without `wait_for_jobs`'s wall-clock bound.
+    while runtime.running_jobs() > 0 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(15 * 60) && elapsed < Duration::from_secs(16 * 60 + 2),
+        "{elapsed:?}"
+    );
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("downloading data/000001.json.gz: transport error"),
+        "{reason}"
+    );
+    assert!(reason.contains("the bound is 900 s"), "{reason}");
+    let attempts = gets_under(&mem, &arn(ACCOUNT)).len() - 2;
+    // 1+2+4+8+16+32 s, then 60 s each: about 20 attempts in 15 minutes.
+    assert!((18..=24).contains(&attempts), "{attempts} attempts");
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert!(
+        fake.heartbeats.load(std::sync::atomic::Ordering::Acquire) > 100,
+        "the record was heartbeated through the wait"
+    );
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// The count after the last file: a backend that reports one item fewer
+/// than the manifest (one of two rows with one key kept) fails the restore
+/// with the count reason, after every file was loaded; and the duplicate
+/// rule of the backend itself (an unordered backup holding one key in two
+/// files) fails the second file's load with the backend's text.
+#[tokio::test]
+async fn a_duplicate_key_fails_the_restore_by_the_count_or_by_the_load() {
+    // The count runs on both orders.
+    for key_ordered in [false, true] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs_from(0, 2), songs_from(2, 2)],
+            key_ordered,
+        );
+        let runtime = job_runtime(&mem);
+        *fake.count_override.lock().unwrap() = Some(3);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        assert_eq!(
+            fake.bulk_loads.lock().unwrap().len(),
+            2,
+            "every file was loaded first ({key_ordered})"
+        );
+        let writes = restore_writes(&fake);
+        assert_eq!(
+            writes[0].2.as_deref(),
+            Some("restored 3 items, the manifest lists 4: the backup holds a key twice"),
+            "{key_ordered}"
+        );
+        assert!(fake.restore_job("MusicRestored").is_none());
+    }
+
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    let mut second = songs_from(5, 2);
+    second.push(song("artist-00001", "title-00001"));
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 3), second],
+        false,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.bulk_loads.lock().unwrap().len(), 2);
+    let writes = restore_writes(&fake);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("data file data/000002.json.gz: ")
+            && reason.contains("holds a primary key the target already has"),
+        "{reason}"
+    );
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert_eq!(fake.restored_items("MusicRestored").len(), 0);
+}
+
+/// A key-ordered file whose first item is below its recorded range fails
+/// the file through the reader's range check, naming the file; nothing of
+/// the file is applied and the target is removed.
+#[tokio::test]
+async fn a_file_leaving_its_key_range_fails_the_restore() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 3)];
+    let source_table = music_source_table();
+    let parsed = BackupArn::parse(&arn(ACCOUNT)).unwrap();
+    let prefix = parsed.store_prefix();
+    let order = KeyOrder::resolve(
+        &source_table.key_schema,
+        &source_table.attribute_definitions,
+    )
+    .unwrap();
+    let mut tracker = KeyRangeTracker::new(&order);
+    let mut entries = Vec::new();
+    for (i, items) in files.iter().enumerate() {
+        let (bytes, checksums) = encode_data_file(items.iter().cloned()).unwrap();
+        for item in items {
+            tracker.push(item).unwrap();
+        }
+        let mut range = tracker.next_file().unwrap();
+        if i == 1 {
+            // The recorded range starts at the file's second item.
+            range.first = order.endpoint_key(&items[1]).unwrap();
+        }
+        let key = data_file_key(u32::try_from(i + 1).unwrap());
+        mem.insert(&format!("{prefix}{key}"), &bytes);
+        entries.push((
+            DataFileEntry::from_checksums(key, &checksums, Some(range)),
+            None,
+        ));
+    }
+    seed_manifest_documents(&fake, &mem, &arn(ACCOUNT), source_table, entries, true);
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 2);
+    assert!(loads[1].stream_error.is_some(), "{loads:?}");
+    let writes = restore_writes(&fake);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("data file data/000002.json.gz: "),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("range") || reason.contains("key"),
+        "{reason}"
+    );
+    assert!(fake.restore_job("MusicRestored").is_none());
+}
+
+/// An item the validator refuses (a `Year` of `1E126`, #618's shape) fails
+/// the file before the backend sees it, naming the key and the attribute;
+/// the backend's stream ended with the error and nothing was applied.
+#[tokio::test]
+async fn a_validator_refusal_fails_the_restore_naming_the_item() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let mut second = songs_from(2, 1);
+    second.push(song_with_bad_number("artist-00003", "title-00003", "1E126"));
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 2), second],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 2);
+    assert_eq!(loads[1].items.len(), 0, "the chunk was never sent");
+    let writes = restore_writes(&fake);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with(
+            "data file data/000002.json.gz: item cannot be restored: key \
+             {\"Artist\":{\"S\":\"artist-00003\"},\"SongTitle\":{\"S\":\"title-00003\"}}, attribute Year: "
+        ),
+        "{reason}"
+    );
+    assert_eq!(
+        loads[0].items.len(),
+        2,
+        "file 1 was applied before file 2 failed"
+    );
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the target was removed"
+    );
+}
+
+/// The FAILED-write gate: a record another owner took (its generation
+/// changed) is not this job's to write, so a failing job makes no table
+/// access: no `remove_restore_target`, the record untouched. An unknown
+/// outcome is re-read: a write that landed is matched and the target is
+/// removed with one write; one that was lost is sent once more; one that
+/// was lost and whose record a successor then wrote FAILED under its own
+/// generation is not this job's, so no removal.
+#[tokio::test]
+async fn a_failed_write_that_does_not_match_removes_no_target_and_an_unknown_one_is_re_read() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::AlwaysConfirm;
+    // The job is held at its first `bulk_load`; the record changes hands
+    // meanwhile, so the load fails under the old generation and the FAILED
+    // write matches no record.
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 1).await;
+    let other = {
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        record.owner_generation = new_generation();
+        record.owner_generation
+    };
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].1, JobStatus::Failed);
+    assert!(
+        fake.removed_targets.lock().unwrap().is_empty(),
+        "no table access"
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert_eq!(record.owner_generation, other);
+    let line = lines.containing("no table access was made");
+    assert_eq!(line.len(), 1, "{line:?}");
+
+    // A corrupt file, so the failure path runs with the claim intact. A
+    // write lost with its connection and followed by a takeover whose
+    // successor wrote FAILED itself re-reads FAILED under another
+    // generation: the record is not this job's, so no removal.
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let key = format!("{prefix}data/000001.json.gz");
+    {
+        let (lines, _guard) = LogLines::capture();
+        let fake = Arc::new(Fake::default());
+        let mem = Arc::new(MemStore::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs(2)],
+            true,
+        );
+        let mut bytes = mem.objects.lock().unwrap()[&key].clone();
+        bytes[0] ^= 0xff;
+        mem.insert(&key, &bytes);
+        *fake.unknown_write.lock().unwrap() = Some(UnknownWrite::TakenAndWritten);
+        let runtime = job_runtime(&mem);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        assert_eq!(restore_writes(&fake).len(), 1, "no second write");
+        assert!(
+            fake.removed_targets.lock().unwrap().is_empty(),
+            "no table access: the FAILED record is the successor's"
+        );
+        assert!(fake.tables.lock().unwrap().contains_key("MusicRestored"));
+        let line =
+            lines.containing("the record is not this job's to write (the row carries generation");
+        assert_eq!(line.len(), 1, "{line:?}");
+    }
+    for (unknown, expected_writes) in [(UnknownWrite::Applied, 1), (UnknownWrite::Lost, 2)] {
+        let fake = Arc::new(Fake::default());
+        let mem = Arc::new(MemStore::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs(2)],
+            true,
+        );
+        let mut bytes = mem.objects.lock().unwrap()[&key].clone();
+        bytes[0] ^= 0xff;
+        mem.insert(&key, &bytes);
+        *fake.unknown_write.lock().unwrap() = Some(unknown);
+        let runtime = job_runtime(&mem);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        assert_eq!(restore_writes(&fake).len(), expected_writes, "{unknown:?}");
+        assert_eq!(fake.removed_targets.lock().unwrap().len(), 1, "{unknown:?}");
+        assert!(fake.restore_job("MusicRestored").is_none(), "{unknown:?}");
+    }
+}
+
+/// A lost heartbeat ends the job with no catalog write and no table access:
+/// the job is held inside the first `bulk_load`, the claim is reported lost
+/// at the next beat, and the job stops; the record stays RUNNING under its
+/// generation, nothing is removed, the outcome is `failed`.
+#[tokio::test]
+async fn a_lost_heartbeat_stops_the_restore_with_no_catalog_write_and_no_table_access() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    // The job reaches the gate; then the claim is lost at the next beat.
+    wait_for_bulk_loads_started(&fake, 1).await;
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+    wait_for_jobs(&runtime).await;
+    assert!(restore_writes(&fake).is_empty(), "no catalog write");
+    assert!(
+        fake.removed_targets.lock().unwrap().is_empty(),
+        "no table access"
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert!(fake.restored_items("MusicRestored").is_empty());
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+    // The stop line names the timer's reason, not the two-period clause.
+    let stopped = lines.containing(
+        "stopped with no further catalog or table access: the claim was lost: the row is gone \
+         or carries another generation; the record is left to its owner or to the reconciler",
+    );
+    assert_eq!(stopped.len(), 1, "{:?}", lines.containing("stopped with"));
+    let raised = lines.containing(
+        "the job's heartbeat raised the loss of its claim; the job stops at its next check: the \
+         claim was lost: the row is gone or carries another generation",
+    );
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert_eq!(lines.at_level(tracing::Level::WARN), raised);
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// A loss the timer raised while the job was inside a step (here the count)
+/// is named by the next check between steps: the pre-flip check's stop line
+/// carries the timer's reason, not the two-period clause.
+#[tokio::test]
+async fn a_loss_raised_inside_a_step_is_named_by_the_next_check() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let count_gate = closed_gate();
+    *fake.count_gate.lock().unwrap() = Some(Arc::clone(&count_gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fake.count_calls.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no count began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The claim is lost at the next beat, while the job waits in the count.
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+    while lines.containing("raised the loss of its claim").is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the loss was not raised"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    count_gate.add_permits(1);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.finish_sizes.lock().unwrap().len(), 0, "no DONE write");
+    assert!(restore_writes(&fake).is_empty(), "no catalog write");
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Running
+    );
+    let stopped = lines.containing(
+        "stopped with no further catalog or table access: the claim was lost: the row is gone \
+         or carries another generation; the record is left to its owner or to the reconciler",
+    );
+    assert_eq!(stopped.len(), 1, "{:?}", lines.containing("stopped with"));
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// Shutdown between files: the job stops at its next file with no status
+/// write, the record stays RUNNING with its progress, the spool entry stays
+/// with every file verified, the outcome is `cancelled` and no worker
+/// error is recorded; `drain_jobs` returns with every job ended.
+#[tokio::test]
+async fn a_shutdown_leaves_the_record_running_with_its_spool() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let s3_arn = arn(ACCOUNT);
+    let files = [songs_from(0, 2), songs_from(2, 2), songs_from(4, 2)];
+    seed_manifest_backup(&fake, &mem, &s3_arn, music_source_table(), &files, true);
+    fake.rows.lock().unwrap().get_mut(&s3_arn).unwrap().store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.restore_job("MusicRestored")
+            .unwrap()
+            .spool_host
+            .as_deref(),
+        Some("host-a:/var/spool")
+    );
+    // File 1 loads; file 2 waits at the gate.
+    wait_for_bulk_loads_started(&fake, 2).await;
+    let left = runtime.drain_jobs(Duration::from_millis(100)).await;
+    assert_eq!(left, 1, "the job waits at the gate past the bound");
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    assert!(
+        restore_writes(&fake).is_empty(),
+        "no status write at shutdown"
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert!(
+        record.file_index.is_some(),
+        "the progress of the loaded file(s) stays"
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    assert!(entry.is_dir(), "the spool entry stays");
+    for i in 0..3 {
+        assert!(entry.join(format!("{i:06}.json.gz")).is_file());
+        assert!(entry.join(format!("{i:06}.json.gz.verified")).is_file());
+    }
+    assert!(entry.join(EXTENDDB_MANIFEST_FILE).is_file());
+    assert!(entry.join(MANIFEST_CHECKSUM_FILE).is_file());
+    // One drain, both assertions read from it (a second drain reads an
+    // empty collector and asserts nothing).
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("cancelled".to_owned(), 1.0)]
+    );
+    assert!(
+        !metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob"),
+        "a clean shutdown is not a worker error: {metrics:?}"
+    );
+}
+
+/// On an S3 store the files are spooled: each is downloaded once into the
+/// entry, marked `.verified`, and the load reads the spool, not the store;
+/// the entry is removed when the job ends; and a completed job's second
+/// read of the store is never made.
+#[tokio::test]
+async fn an_s3_restore_spools_every_file_and_removes_its_entry_at_the_end() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !entry.join("000001.json.gz.verified").is_file() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&entry).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(entry.join("000000.json.gz"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(fake.restored_items("MusicRestored").len(), 4);
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        [
+            MANIFEST_CHECKSUM_FILE,
+            EXTENDDB_MANIFEST_FILE,
+            "data/000001.json.gz",
+            "data/000002.json.gz",
+        ],
+        "each file read from the store once"
+    );
+    assert!(!entry.exists(), "the entry is removed at the end");
+}
+
+/// A resumed job skips the files and items the record and the progress rows
+/// account for: the first open file is loaded from its `start_at` with
+/// `reapplying`, the rest from 0 without it, and the count covers the whole
+/// manifest.
+#[tokio::test]
+async fn a_resume_loads_from_the_recorded_progress() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 3), songs_from(3, 3), songs_from(6, 3)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    // A dead owner's record: file 0 complete, one item of file 1 applied,
+    // the target holding those four items.
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    {
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        record.status = JobStatus::Running;
+        record.completed_at = None;
+        record.file_index = Some(1);
+        record.items_applied = Some(1);
+        let mut targets = fake.restore_tables.lock().unwrap();
+        let target = targets.get_mut("tid-MusicRestored").unwrap();
+        target.items.truncate(4);
+        target.active = false;
+    }
+    fake.bulk_loads.lock().unwrap().clear();
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.bulk_load_files(), [(1, 1, true, 2), (2, 0, false, 3)]);
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+/// The vector refusal on the manifest path, narrowed to a target without
+/// vector support: a manifest with a non-empty `vector_indexes` into a
+/// target whose engine has no vector search is the legacy text's
+/// `ValidationException` with nothing registered; the same manifest into a
+/// target with vector support registers the table with its vector indexes;
+/// `null` and `[]` register on both.
+#[tokio::test]
+async fn vector_index_backups_are_refused_in_the_engine() {
+    let spec: extenddb_core::types::VectorIndexSpecification = serde_json::from_value(json!({
+        "IndexName": "vidx",
+        "VectorAttribute": { "AttributeName": "emb" },
+        "Dimensions": 3,
+        "DistanceFunction": "COSINE",
+        "Projection": { "ProjectionType": "ALL" }
+    }))
+    .unwrap();
+    let cases: [(
+        Option<Vec<extenddb_core::types::VectorIndexSpecification>>,
+        bool,
+        bool,
+    ); 6] = [
+        (Some(vec![spec.clone()]), false, false),
+        (Some(vec![spec.clone()]), true, true),
+        (None, false, true),
+        (None, true, true),
+        (Some(Vec::new()), false, true),
+        (Some(Vec::new()), true, true),
+    ];
+    for (vector_indexes, capable, registered) in cases {
+        let what = format!("{vector_indexes:?} into a target with vector support {capable}");
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        fake.vector_search
+            .store(capable, std::sync::atomic::Ordering::Release);
+        let mut source_table = on_demand_source_table();
+        source_table.vector_indexes = vector_indexes.clone();
+        seed_manifest_backup(&fake, &mem, &arn(ACCOUNT), source_table, &[songs(1)], true);
+        let runtime = job_runtime(&mem);
+        let result = restore_on(&fake, &runtime, &restore_body(json!({}))).await;
+        wait_for_jobs(&runtime).await;
+        if registered {
+            result.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let claims = fake.restore_claims.lock().unwrap();
+            assert_eq!(claims.len(), 1, "{what}");
+            let expected = vector_indexes.filter(|v| !v.is_empty());
+            assert_eq!(claims[0].1.vector_indexes, expected, "{what}");
+        } else {
+            let msg = validation_message(result.unwrap_err());
+            assert_eq!(
+                msg,
+                format!(
+                    "backup {} has 1 vector index(es); restoring a table with vector indexes is \
+                     not supported by this storage backend",
+                    arn(ACCOUNT)
+                ),
+                "{what}"
+            );
+            assert!(fake.restore_claims.lock().unwrap().is_empty(), "{what}");
+        }
+        assert_eq!(runtime.free_slots(), 4, "{what}");
+    }
+}
+
+/// The legacy reader's vector refusals stay as they were: a definition
+/// naming a vector index and a pre-0.0.4 source counting one.
+#[tokio::test]
+async fn legacy_vector_backups_keep_the_reader_refusal() {
+    let mut def = definition("PAY_PER_REQUEST");
+    def.vector_index_names.push("v".to_owned());
+    let fake = Fake::with_source(source(Some(def)));
+    let msg = validation_message(restore(&fake, restore_body(json!({}))).await.unwrap_err());
+    assert!(msg.contains("vector index"), "{msg}");
+    assert!(fake.restores().is_empty());
+
+    let mut legacy = source(None);
+    legacy.legacy_vector_index_count = 1;
+    let fake = Fake::with_source(legacy);
+    let msg = validation_message(restore(&fake, restore_body(json!({}))).await.unwrap_err());
+    assert!(msg.contains("vector index"), "{msg}");
+    assert!(fake.restores().is_empty());
+}
+
+/// A multi-part-key table (two HASH attributes, backed up unordered)
+/// registers on the manifest path when the target's limits allow the shape:
+/// `ensure_single_part_base_key` is the legacy reader's rule alone.
+#[tokio::test]
+async fn a_multi_part_key_manifest_is_registered() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let mut source_table = music_source_table();
+    source_table.key_schema = vec![
+        key("Artist", KeyType::Hash),
+        key("Label", KeyType::Hash),
+        key("SongTitle", KeyType::Range),
+    ];
+    source_table.attribute_definitions.push(attr("Label"));
+    source_table
+        .attribute_definitions
+        .retain(|a| a.attribute_name != "Genre");
+    source_table.global_secondary_indexes.clear();
+    let mut items = songs(2);
+    for item in &mut items {
+        item.insert(
+            "Label".to_owned(),
+            extenddb_core::types::AttributeValue::S("indie".to_owned()),
+        );
+    }
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        source_table,
+        &[items.clone()],
+        false,
+    );
+    let runtime = job_runtime(&mem);
+    let limits = LimitsConfig {
+        allow_multipart_table_keys: true,
+        ..LimitsConfig::default()
+    };
+    let (_, response) = restore_table_from_backup(
+        &fake,
+        &runtime,
+        ACCOUNT,
+        REGION,
+        &limits,
+        &restore_body(json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["TableDescription"]["TableStatus"], "CREATING");
+    wait_for_jobs(&runtime).await;
+    let claims = fake.restore_claims.lock().unwrap();
+    assert_eq!(claims[0].1.key_schema.len(), 3);
+    assert_eq!(fake.restored_items("MusicRestored"), items);
+}
+
+/// The override contract on the manifest path is the legacy path's:
+/// `restored_input` runs every case through both and asserts they agree,
+/// so one list of cases binds both (the override tests above). This cell
+/// pins the comparison itself with a case of each kind: an applied
+/// override and a refused one.
+#[tokio::test]
+async fn the_override_cases_run_through_both_paths() {
+    let input = restored_input(
+        source(Some(definition("PAY_PER_REQUEST"))),
+        json!({
+            "BillingModeOverride": "PROVISIONED",
+            "ProvisionedThroughputOverride": { "ReadCapacityUnits": 11, "WriteCapacityUnits": 12 },
+            "GlobalSecondaryIndexOverride": [gsi_entry(Some((3, 4)))],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input.billing_mode, Some(BillingMode::Provisioned));
+    assert_eq!(input.provisioned_throughput, Some(throughput(11, 12)));
+    let err = restored_input(
+        source(Some(definition("PAY_PER_REQUEST"))),
+        json!({ "ProvisionedThroughputOverride": { "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 } }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::ValidationException(_)),
+        "{err:?}"
+    );
+}
+
+// --- the reconciler's restore duties -------------------------------------------
+
+/// A dead RUNNING manifest record of the configured store whose owner was
+/// on another host: the reconciler takes it over (a fresh generation, this
+/// host's `spool_host`, `heartbeat_at` refreshed so a second taker finds the
+/// record live) and spawns the resume, which reads the manifest from the
+/// store, removes the entry this host's earlier run of the job left (its
+/// files were verified under a record that has since been another host's),
+/// downloads every file again and finishes the restore from the recorded
+/// progress; a live record is left alone.
+#[tokio::test]
+async fn the_reconciler_resumes_a_dead_manifest_restore_with_its_spool_host() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    // A record left by a dead owner on another host, file 0 applied.
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 2).await;
+    runtime.drain_jobs(Duration::from_millis(100)).await;
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    let before = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(before.status, JobStatus::Running);
+    assert_eq!(
+        before.file_index,
+        Some(1),
+        "file 1 was in its load when the shutdown fired"
+    );
+    *fake.bulk_load_gate.lock().unwrap() = None;
+    fake.bulk_loads.lock().unwrap().clear();
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+
+    // A live owner on this host: nothing happens, and the sweep keeps the
+    // entry of a RUNNING record that names this host.
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    assert!(report.spool_entries_swept.is_empty());
+    assert!(entry.join("000000.json.gz.verified").is_file());
+    assert!(entry.join("000001.json.gz.verified").is_file());
+
+    {
+        // As a backend whose file 1 write did not land would have left it:
+        // the record at file 0, the target holding file 0's items, the
+        // owner on another host (the record moved there and its job died),
+        // its heartbeat old. This host's entry from the stopped job still
+        // holds both files verified; it is not the record's and the resume
+        // removes it before use (the sweep would, a cycle later).
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        record.spool_host = Some("host-b:/var/spool".to_owned());
+        record.heartbeat_at = 1234.5;
+        record.file_index = Some(0);
+        record.items_applied = Some(2);
+        fake.restore_tables
+            .lock()
+            .unwrap()
+            .get_mut("tid-MusicRestored")
+            .unwrap()
+            .items
+            .truncate(2);
+    }
+    mem.gets.lock().unwrap().clear();
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    assert!(report.acted());
+    let after = fake.restore_job("MusicRestored").unwrap();
+    assert_ne!(after.owner_generation, before.owner_generation);
+    assert_eq!(after.spool_host.as_deref(), Some("host-a:/var/spool"));
+    assert!(
+        after.heartbeat_at > 1234.5,
+        "the takeover refreshed the heartbeat: {}",
+        after.heartbeat_at
+    );
+    assert_eq!(
+        fake.restore_takeovers.lock().unwrap().as_slice(),
+        [(
+            "tid-MusicRestored".to_owned(),
+            Some("host-a:/var/spool".to_owned())
+        )]
+    );
+    wait_for_jobs(&runtime2).await;
+    assert_eq!(fake.bulk_load_files(), [(1, 0, true, 2)]);
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        [
+            EXTENDDB_MANIFEST_FILE,
+            MANIFEST_CHECKSUM_FILE,
+            "data/000002.json.gz",
+        ],
+        "the manifest from the store; file 0 was recorded applied, so only file 1 is \
+         downloaded (the resume downloads only the files its progress leaves to load)"
+    );
+    assert_eq!(
+        lines
+            .containing(
+                "has no live owner; taken over by this instance and resumed with 2 items of data \
+                 file 0 recorded as applied"
+            )
+            .len(),
+        1,
+        "the reconciler's line states the record's progress"
+    );
+    assert_eq!(
+        lines
+            .containing("started, 2 data file(s), 4 items, key-ordered; resumed from data file 1 after 0 of its items")
+            .len(),
+        1,
+        "the job's line names the first open file"
+    );
+    assert_eq!(
+        lines
+            .containing("resumed by this instance; the manifest was read from the store")
+            .len(),
+        1
+    );
+    assert_eq!(
+        lines
+            .containing("is left from a run whose record moved to another host")
+            .len(),
+        1
+    );
+    assert!(!entry.exists());
+}
+
+/// The manifest arm's refusals: no free permit skips the record to the next
+/// cycle with no takeover; a held maintenance claim fails it `OWNER_DEAD`
+/// and removes its target like a legacy record; a record of another store
+/// is FAILED with `OTHER_STORE` and its target left to the FAILED-target
+/// duty, which removes it next cycle; an unhealthy store skips it.
+#[tokio::test]
+async fn the_reconciler_skips_or_fails_a_dead_manifest_restore_it_cannot_resume() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 1).await;
+    runtime.drain_jobs(Duration::from_millis(50)).await;
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    *fake.bulk_load_gate.lock().unwrap() = None;
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+
+    // No permit.
+    let full = job_runtime(&mem);
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(full.take_permit().await.unwrap());
+    }
+    let report = cycle_on(&fake, &full).await;
+    assert_eq!(report.restores_skipped_no_permit, ["MusicRestored"]);
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    assert!(!report.acted());
+    drop(held);
+
+    // The store unhealthy: the cycle's own check, which runs first, finds
+    // the store down.
+    mem.set_down(true);
+    let unhealthy = runtime_unhealthy(&mem, StoreProblem::Transport("down".to_owned()))
+        .with_job_settings(job_settings());
+    let report = cycle_on(&fake, &unhealthy).await;
+    assert_eq!(report.restores_skipped_store_unhealthy, ["MusicRestored"]);
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        lines.containing("dead store-backed restores are not resumed this cycle"),
+        [
+            "the configured backup store is unhealthy; dead store-backed restores are not \
+             resumed this cycle"
+        ]
+    );
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    mem.set_down(false);
+
+    // The maintenance claim held: counted once, as failed and removed.
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &full).await;
+    assert_eq!(
+        report.manifest_restores_failed_and_removed,
+        ["MusicRestored"]
+    );
+    assert!(report.manifest_restores_failed.is_empty());
+    assert!(report.legacy_restores_removed.is_empty());
+    assert!(report.acted());
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    *fake.maintenance_held.lock().unwrap() = false;
+
+    // Another store.
+    let mem2 = Arc::new(MemStore::default());
+    mem2.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem2,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem2);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(&fake, 1).await;
+    runtime.drain_jobs(Duration::from_millis(50)).await;
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+    let other = runtime_on(
+        &mem2,
+        StoreIdentity {
+            store_id: "store-2".to_owned(),
+            ..store()
+        },
+    )
+    .with_job_settings(job_settings());
+    let report = cycle_on(&fake, &other).await;
+    assert_eq!(
+        report.manifest_restores_failed,
+        [("MusicRestored".to_owned(), OTHER_STORE.to_owned())]
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
+    assert_eq!(record.failure_reason.as_deref(), Some(OTHER_STORE));
+    assert!(
+        fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target waits for the FAILED-target duty"
+    );
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    let report = cycle_on(&fake, &other).await;
+    assert_eq!(report.failed_targets_removed, ["MusicRestored"]);
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+}
+
+/// A dead record with no progress at all whose target already holds items
+/// is FAILED `target_not_empty` under the takeover and its target left in
+/// place; the FAILED-target duty skips it on the next cycle and logs the
+/// operator's command; a record with no progress into an empty target is
+/// resumed from the first file.
+#[tokio::test]
+async fn a_resume_without_progress_needs_an_empty_target() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    // The record as a dead owner that registered and recorded nothing left
+    // it, over a target that holds an item the record does not account for.
+    dead_record_without_progress(&fake, true);
+    fake.bulk_loads.lock().unwrap().clear();
+    let runtime = job_runtime(&mem);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_failed,
+        [("MusicRestored".to_owned(), TARGET_NOT_EMPTY.to_owned())]
+    );
+    assert_eq!(fake.restore_takeovers.lock().unwrap().len(), 1);
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
+    assert_eq!(record.failure_reason.as_deref(), Some(TARGET_NOT_EMPTY));
+    assert!(
+        fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target is left"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    // The FAILED-target duty leaves it to the operator.
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.targets_left_for_operator, ["MusicRestored"]);
+    assert!(report.failed_targets_removed.is_empty());
+    assert!(fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    let command = lines.containing(&format!(
+        "extenddb backup remove-target --account {ACCOUNT} MusicRestored"
+    ));
+    assert_eq!(
+        command.len(),
+        2,
+        "the takeover's line and the duty's: {command:?}"
+    );
+
+    // An empty target with no progress is resumed from the first file.
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    fake.bulk_loads.lock().unwrap().clear();
+    let runtime = job_runtime(&mem);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.bulk_load_files(), [(0, 0, true, 2)]);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+/// Under the maintenance claim a dead record with no progress at all whose
+/// target holds items is FAILED `target_not_empty` through the unclaimed
+/// write and its target left for the operator, not `OWNER_DEAD` with the
+/// target removed: the command's wait is satisfied (the record is no longer
+/// RUNNING) and `remove-target`, under the same claim, removes it; one
+/// whose target is empty is `OWNER_DEAD` and removed, as before.
+#[tokio::test]
+async fn a_dead_record_without_progress_under_the_maintenance_claim_keeps_its_target() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, true);
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_failed,
+        [("MusicRestored".to_owned(), TARGET_NOT_EMPTY.to_owned())]
+    );
+    assert!(report.manifest_restores_failed_and_removed.is_empty());
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Failed);
+    assert_eq!(record.failure_reason.as_deref(), Some(TARGET_NOT_EMPTY));
+    assert!(
+        fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target is left"
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert!(
+        fake.restore_takeovers.lock().unwrap().is_empty(),
+        "no takeover under the claim"
+    );
+    assert_eq!(
+        fake.failed_jobs.lock().unwrap().as_slice(),
+        [(record.target.clone(), TARGET_NOT_EMPTY.to_owned())],
+        "the unclaimed write"
+    );
+    assert_eq!(
+        lines
+            .containing(&format!(
+                "extenddb backup remove-target --account {ACCOUNT} MusicRestored"
+            ))
+            .len(),
+        1
+    );
+    // The command removes it under the same claim.
+    let removed = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("MusicRestored", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.failure_reason.as_deref(), Some(TARGET_NOT_EMPTY));
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+
+    // An empty target: `OWNER_DEAD` and removed.
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_failed_and_removed,
+        ["MusicRestored"]
+    );
+    assert!(report.manifest_restores_failed.is_empty());
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+}
+
+/// Once the server's shutdown has begun (the jobs' token is cancelled) a
+/// cycle takes no dead record over, writes no FAILED on the maintenance or
+/// other-store arms, and spawns nothing: the record stays RUNNING under its
+/// owner's generation with its heartbeat as it was, for the next instance's
+/// reconciler; the cycle's other duties still run.
+#[tokio::test]
+async fn the_reconciler_takes_nothing_over_once_the_shutdown_began() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    let before = fake.restore_job("MusicRestored").unwrap();
+    let checks_before = fake.maintenance_checks.lock().unwrap().len();
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let draining = job_runtime(&mem).with_shutdown(shutdown.clone());
+    shutdown.cancel();
+
+    // The takeover arm, the maintenance arm and the other-store arm, each
+    // with the token cancelled.
+    let report = cycle_on(&fake, &draining).await;
+    assert!(report.manifest_restores_resumed.is_empty(), "{report:?}");
+    assert!(!report.acted(), "{report:?}");
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &draining).await;
+    assert!(
+        report.manifest_restores_failed_and_removed.is_empty(),
+        "{report:?}"
+    );
+    assert!(report.manifest_restores_failed.is_empty(), "{report:?}");
+    *fake.maintenance_held.lock().unwrap() = false;
+    let mem2 = Arc::new(MemStore::default());
+    mem2.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let other = runtime_on(
+        &mem2,
+        StoreIdentity {
+            store_id: "store-2".to_owned(),
+            ..store()
+        },
+    )
+    .with_job_settings(job_settings())
+    .with_shutdown(shutdown.clone());
+    let report = cycle_on(&fake, &other).await;
+    assert!(report.manifest_restores_failed.is_empty(), "{report:?}");
+
+    assert!(
+        fake.restore_takeovers.lock().unwrap().is_empty(),
+        "no takeover"
+    );
+    assert!(
+        fake.failed_jobs.lock().unwrap().is_empty(),
+        "no FAILED write"
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert_eq!(draining.running_jobs(), 0, "nothing spawned");
+    assert_eq!(fake.restore_job("MusicRestored").unwrap(), before);
+    assert_eq!(
+        lines
+            .containing("has no live owner and the server is shutting down; it is left for the next reconciler")
+            .len(),
+        3
+    );
+    assert_eq!(
+        fake.maintenance_checks.lock().unwrap().len() - checks_before,
+        3,
+        "each cycle ran its other duties"
+    );
+
+    // The same runtime with the token intact takes it over.
+    let runtime = job_runtime(&mem);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+/// A reconciler whose own token has fired while the jobs' token has not
+/// (the server stopping its workers while it holds no serving
+/// registration, to start a new set once it holds one) takes no dead record
+/// over and spawns no resume: a resume is a job, on the jobs' token, which
+/// the workers' stop would not stop. The record stays as it was, the cycle's
+/// other duties still run, and the next set's reconciler (a fresh state)
+/// takes it over.
+#[tokio::test]
+async fn a_stopping_reconciler_takes_nothing_over() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    let before = fake.restore_job("MusicRestored").unwrap();
+    let checks_before = fake.maintenance_checks.lock().unwrap().len();
+    // The token fires once the cycle lists the dead records, after its
+    // store check, as a stop that lands mid-cycle does.
+    let stopped = extenddb_storage::CancellationToken::new();
+    *fake.cancel_on_list_dead.lock().unwrap() = Some(stopped.clone());
+
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut reconciler::ReconcilerState::with_shutdown(stopped.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(stopped.is_cancelled(), "the cycle reached the dead records");
+    assert!(report.manifest_restores_resumed.is_empty(), "{report:?}");
+    assert!(
+        !runtime.shutdown().is_cancelled(),
+        "the jobs' token is intact"
+    );
+    assert!(
+        fake.restore_takeovers.lock().unwrap().is_empty(),
+        "no takeover"
+    );
+    assert_eq!(runtime.running_jobs(), 0, "nothing spawned");
+    assert_eq!(fake.restore_job("MusicRestored").unwrap(), before);
+    assert_eq!(
+        lines
+            .containing("has no live owner and the reconciler is stopping; it is left for the next reconciler")
+            .len(),
+        1
+    );
+    assert_eq!(
+        fake.maintenance_checks.lock().unwrap().len() - checks_before,
+        1,
+        "the cycle ran its other duties"
+    );
+
+    // The next set's reconciler takes it over.
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+/// Rewrite the finished restore into `MusicRestored` as a dead owner's
+/// RUNNING record with no progress recorded, its target CREATING and
+/// holding three items, one more than the backup's two, when `with_item`,
+/// else empty.
+fn dead_record_without_progress(fake: &Fake, with_item: bool) {
+    let mut records = fake.restore_jobs.lock().unwrap();
+    let record = records.get_mut("tid-MusicRestored").unwrap();
+    record.status = JobStatus::Running;
+    record.completed_at = None;
+    record.file_index = None;
+    record.items_applied = None;
+    let mut targets = fake.restore_tables.lock().unwrap();
+    let target = targets.get_mut("tid-MusicRestored").unwrap();
+    target.active = false;
+    target.items.clear();
+    if with_item {
+        // Three items against the backup's two: more than the backup's total,
+        // which the `target_not_empty` rule requires (a count at or below it
+        // is a first file applied in part and is resumed).
+        target.items.push(song("x", "y"));
+        target.items.push(song("x", "z"));
+        target.items.push(song("y", "z"));
+    }
+    if let Some(desc) = fake.tables.lock().unwrap().get_mut("MusicRestored") {
+        desc.table_status = TableStatus::Creating;
+    }
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+}
+
+/// The two sweeps: progress rows of tables that are not RUNNING restore
+/// targets go, a RUNNING target's stay; spool entries of restores not
+/// RUNNING with this host's `spool_host` go (a dead one, one taken over by
+/// another host), a live one of this host and every other name stay; both
+/// run only without the maintenance claim; a backend that cannot list the
+/// records skips both and the cycle goes on.
+#[tokio::test]
+async fn the_reconciler_sweeps_progress_rows_and_spool_entries() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let runtime = spooled_runtime(&mem, scratch.path());
+    for (id, host) in [
+        ("live", "host-a:/var/spool"),
+        ("moved", "host-b:/var/spool"),
+    ] {
+        fake.restore_jobs.lock().unwrap().insert(
+            id.to_owned(),
+            RestoreJobRow {
+                target: RestoreTargetKey {
+                    account_id: ACCOUNT.to_owned(),
+                    table_name: id.to_owned(),
+                    table_id: id.to_owned(),
+                },
+                source_backup_arn: arn(ACCOUNT),
+                kind: RestoreKind::Manifest,
+                status: JobStatus::Running,
+                owner_generation: 1,
+                heartbeat_at: seconds_since_epoch(),
+                store: Some(s3_identity()),
+                spool_host: Some(host.to_owned()),
+                file_index: None,
+                items_applied: None,
+                failure_reason: None,
+                completed_at: None,
+            },
+        );
+    }
+    {
+        let mut rows = fake.progress_rows.lock().unwrap();
+        rows.insert("live".to_owned(), vec![(0, 10)]);
+        rows.insert("gone".to_owned(), vec![(0, 10), (1, 5)]);
+    }
+    for name in ["restore-live", "restore-moved", "restore-dead", "other"] {
+        std::fs::create_dir(scratch.path().join(name)).unwrap();
+    }
+    std::fs::write(scratch.path().join(".lock"), b"").unwrap();
+
+    *fake.maintenance_held.lock().unwrap() = true;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.progress_rows_swept, 0);
+    assert!(report.spool_entries_swept.is_empty());
+    assert!(fake.progress_sweeps.lock().unwrap().is_empty());
+    assert!(scratch.path().join("restore-dead").is_dir());
+    *fake.maintenance_held.lock().unwrap() = false;
+
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.progress_rows_swept, 1);
+    let mut swept = report.spool_entries_swept.clone();
+    swept.sort();
+    assert_eq!(swept, ["dead", "moved"]);
+    assert!(report.acted());
+    assert_eq!(
+        fake.progress_sweeps.lock().unwrap().as_slice(),
+        [vec!["live".to_owned(), "moved".to_owned()]],
+        "the RUNNING targets' ids, in id order"
+    );
+    assert_eq!(
+        fake.progress_rows
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["live"]
+    );
+    let mut left: Vec<String> = std::fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(left, [".lock", "other", "restore-live"]);
+    assert_eq!(
+        fake.restore_lists.lock().unwrap().as_slice(),
+        [Some(JobStatus::Running)]
+    );
+}
+
+/// The sweeps on a backend whose records cannot be listed yet: the cycle
+/// goes on, logs once, and sweeps nothing.
+#[tokio::test]
+async fn a_backend_that_cannot_list_restore_records_skips_the_sweeps() {
+    let (lines, _guard) = LogLines::capture();
+    let fake = Arc::new(Fake::default());
+    fake.progress_rows
+        .lock()
+        .unwrap()
+        .insert("gone".to_owned(), vec![(0, 1)]);
+    fake.restore_list_error
+        .store(true, std::sync::atomic::Ordering::Release);
+    let report = cycle_on(&fake, &runtime()).await;
+    assert_eq!(report.progress_rows_swept, 0);
+    assert_eq!(
+        lines
+            .containing("the restore job records could not be listed")
+            .len(),
+        1
+    );
+    assert_eq!(fake.progress_rows.lock().unwrap().len(), 1, "nothing swept");
+}
+
+// --- the restore's liveness checks, spool rule and load bounds -----------------
+
+/// The heartbeat's first confirmed beat is the instant `claim_restore`
+/// returned, not the instant before it: a registration that takes four
+/// periods answers CREATING to a job that runs to DONE, where a clock taken
+/// before the registration would end it at its first check as a lost claim.
+#[tokio::test]
+async fn a_slow_registration_does_not_end_the_job_at_its_first_check() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let period = job_settings().heartbeat_interval;
+    *fake.claim_restore_delay.lock().unwrap() = Some(4 * period);
+    let runtime = job_runtime(&mem);
+    let response = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response["TableDescription"]["TableStatus"], "CREATING");
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(fake.restored_items("MusicRestored").len(), 2);
+    assert_eq!(restore_outcomes(&runtime), [("succeeded".to_owned(), 1.0)]);
+}
+
+/// The job's first beat, sent right after the registration and before the
+/// reply, refreshes the record's `heartbeat_at`: a registration that
+/// stamped it three periods in the past (a transaction-start `now()` behind
+/// a lock, as on PostgreSQL) answers CREATING with the record's heartbeat of
+/// this instant, one beat received before the reply, and the job runs to
+/// DONE; a first beat that finds the claim lost fails the record before the
+/// job starts, with the reason, and answers `InternalServerError`. On a
+/// paused clock, so no timer beat runs between the reply and the read of
+/// the record.
+#[tokio::test(start_paused = true)]
+async fn the_jobs_first_beat_refreshes_the_registrations_heartbeat_before_the_reply() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let period = job_settings().heartbeat_interval;
+    *fake.registration_heartbeat_age.lock().unwrap() = Some(3.0 * period.as_secs_f64() + 10.0);
+    let runtime = job_runtime(&mem);
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let response = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response["TableDescription"]["TableStatus"], "CREATING");
+    let age = seconds_since_epoch() - fake.restore_job("MusicRestored").unwrap().heartbeat_at;
+    assert!(
+        age < 1.0,
+        "the record's heartbeat is this instant's by the reply, not the registration's: {age}"
+    );
+    assert!(
+        fake.heartbeats.load(std::sync::atomic::Ordering::Acquire) >= 1,
+        "one beat before the reply"
+    );
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(restore_outcomes(&runtime), [("succeeded".to_owned(), 1.0)]);
+
+    // The first beat finds the claim lost.
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+    let runtime = job_runtime(&mem);
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        restore_writes(&fake),
+        [(
+            JobStatus::Running,
+            JobStatus::Failed,
+            Some("the claim was lost before the job started".to_owned())
+        )]
+    );
+    assert!(fake.bulk_loads.lock().unwrap().is_empty(), "no load");
+    assert_eq!(
+        lines
+            .containing("FAILED (the claim was lost before the job started) before it started;")
+            .len(),
+        1
+    );
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The registration's bound: a `claim_restore` that takes longer than
+/// `RESTORE_REGISTRATION_TIMEOUT` has the request answer
+/// `InternalServerError` at the bound with the line naming it, while the
+/// task goes on and the job runs to DONE once the registration returns.
+#[tokio::test(start_paused = true)]
+async fn the_request_stops_waiting_at_the_registration_bound_and_the_task_goes_on() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    // The design's figure, 60 s on every backend; the registration takes
+    // one second longer.
+    assert_eq!(RESTORE_REGISTRATION_TIMEOUT, Duration::from_secs(60));
+    *fake.claim_restore_delay.lock().unwrap() = Some(Duration::from_secs(61));
+    let runtime = job_runtime(&mem);
+    let started = tokio::time::Instant::now();
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(60) && started.elapsed() < Duration::from_secs(61),
+        "answered at the bound: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(runtime.running_jobs(), 1, "the task goes on");
+    assert_eq!(
+        lines.containing("the registration did not answer within 60 s; the task goes on"),
+        [format!(
+            "RestoreTableFromBackup of {} into MusicRestored (account {ACCOUNT}): the \
+             registration did not answer within 60 s; the task goes on and the target, if \
+             registered, appears through DescribeTable",
+            arn(ACCOUNT)
+        )]
+    );
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(fake.restored_items("MusicRestored").len(), 2);
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The pre-write check's second clause on the restore: with the job held
+/// inside a `bulk_load` and its heartbeat timer ended without raising the
+/// loss, the next check (before the next file, before the count, before the
+/// DONE write) finds the last confirmed beat more than two periods old and
+/// ends the job as a lost claim naming what it was about to do, with no
+/// further `bulk_load`, no count, no `finish_restore` and no status write.
+#[tokio::test]
+async fn a_stopped_heartbeat_timer_stops_the_restore_before_its_next_write() {
+    let (lines, _guard) = LogLines::capture();
+    let period = job_settings().heartbeat_interval;
+    // (the target's name, the bulk_load the job is held in, the reason the
+    // next check names, the bulk_loads and counts made)
+    let cells: [(&str, usize, &str, usize, usize); 3] = [
+        (
+            "TimerStoppedBeforeFile",
+            1,
+            "no heartbeat confirmed the claim recently enough to load data/000002.json.gz",
+            1,
+            0,
+        ),
+        (
+            "TimerStoppedBeforeCount",
+            2,
+            "no heartbeat confirmed the claim recently enough to count the target",
+            2,
+            0,
+        ),
+        (
+            "TimerStoppedBeforeFlip",
+            0,
+            "no heartbeat confirmed the claim recently enough for the DONE write",
+            2,
+            1,
+        ),
+    ];
+    for (table, held_in, reason, loads, counts) in cells {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs_from(0, 2), songs_from(2, 2)],
+            true,
+        );
+        let runtime = job_runtime(&mem);
+        let gate = Arc::new(tokio::sync::Semaphore::new(held_in.saturating_sub(1)));
+        let count_gate = closed_gate();
+        if held_in > 0 {
+            *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        } else {
+            *fake.count_gate.lock().unwrap() = Some(Arc::clone(&count_gate));
+        }
+        restore_on(
+            &fake,
+            &runtime,
+            &restore_body(json!({ "TargetTableName": table })),
+        )
+        .await
+        .unwrap();
+        let table_id = format!("tid-{table}");
+        if held_in > 0 {
+            wait_for_bulk_loads_started(&fake, held_in).await;
+        } else {
+            // Both files loaded; the job waits in the count.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while fake.bulk_loads.lock().unwrap().len() < 2 {
+                assert!(tokio::time::Instant::now() < deadline, "{table}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(period / 2).await;
+        }
+        restore::test_support::stop_timer(&table_id);
+        tokio::time::sleep(3 * period).await;
+        gate.add_permits(10);
+        count_gate.add_permits(10);
+        wait_for_jobs(&runtime).await;
+        assert_eq!(fake.bulk_loads.lock().unwrap().len(), loads, "{table}");
+        assert_eq!(
+            fake.count_calls.load(std::sync::atomic::Ordering::Acquire),
+            counts,
+            "{table}"
+        );
+        assert!(restore_writes(&fake).is_empty(), "{table}: no status write");
+        assert!(fake.removed_targets.lock().unwrap().is_empty(), "{table}");
+        let record = fake.restore_job(table).unwrap();
+        assert_eq!(record.status, JobStatus::Running, "{table}");
+        let stopped = lines.containing(&format!(
+            "into {table} (account {ACCOUNT}): stopped with no further catalog or table access: \
+             {reason}"
+        ));
+        assert_eq!(stopped.len(), 1, "{table}: {stopped:?}");
+        assert_eq!(
+            restore_outcomes(&runtime),
+            [("failed".to_owned(), 1.0)],
+            "{table}"
+        );
+    }
+}
+
+/// The DONE write's `NotMatched` outcome: the generation moved after the
+/// last `bulk_load` returned (the job held in the count), so
+/// `finish_restore` matches no record; the job removes no target, writes no
+/// status, records `RestoreJobs{failed}` and the worker error, logs the
+/// "matched no record" line, and leaves its spool entry to the sweep (the
+/// record's owner may be reading it).
+#[tokio::test]
+async fn a_done_write_that_matches_no_record_removes_no_target_and_keeps_the_entry() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::AlwaysConfirm;
+    let count_gate = closed_gate();
+    *fake.count_gate.lock().unwrap() = Some(Arc::clone(&count_gate));
+    let runtime = spooled_runtime(&mem, scratch.path());
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fake.bulk_loads.lock().unwrap().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let other = {
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        record.owner_generation = new_generation();
+        record.owner_generation
+    };
+    count_gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.count_calls.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert!(
+        fake.removed_targets.lock().unwrap().is_empty(),
+        "no table access"
+    );
+    assert!(restore_writes(&fake).is_empty(), "no status write");
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert_eq!(record.owner_generation, other);
+    assert!(!fake.restore_tables.lock().unwrap()["tid-MusicRestored"].active);
+    let line = lines.containing("the DONE write matched no record");
+    assert_eq!(line.len(), 1, "{line:?}");
+    assert!(line[0].contains("no table access was made"), "{}", line[0]);
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("failed".to_owned(), 1.0)]
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob"),
+        "{metrics:?}"
+    );
+    assert!(
+        scratch.path().join("restore-tid-MusicRestored").is_dir(),
+        "the entry is left to the sweep"
+    );
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// A job that learnt the record is another's leaves its spool entry in
+/// place for the sweep: one whose claim is lost while it is held inside a
+/// `bulk_load`, and one whose FAILED write matches no record (the
+/// generation moved under it). Both end with no table access.
+#[tokio::test]
+async fn a_job_that_learnt_the_record_is_anothers_leaves_its_spool_entry() {
+    for lost_claim in [true, false] {
+        let scratch = restore::spool::tests::Scratch::new();
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs(2)],
+            true,
+        );
+        fake.rows
+            .lock()
+            .unwrap()
+            .get_mut(&arn(ACCOUNT))
+            .unwrap()
+            .store = s3_identity();
+        let gate = closed_gate();
+        *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let runtime = spooled_runtime(&mem, scratch.path());
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_bulk_loads_started(&fake, 1).await;
+        let entry = scratch.path().join("restore-tid-MusicRestored");
+        assert!(entry.join("000000.json.gz.verified").is_file());
+        if lost_claim {
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+        } else {
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::AlwaysConfirm;
+            fake.restore_jobs
+                .lock()
+                .unwrap()
+                .get_mut("tid-MusicRestored")
+                .unwrap()
+                .owner_generation = new_generation();
+            gate.add_permits(10);
+        }
+        wait_for_jobs(&runtime).await;
+        assert!(
+            fake.removed_targets.lock().unwrap().is_empty(),
+            "{lost_claim}: no table access"
+        );
+        assert_eq!(
+            restore_writes(&fake).len(),
+            usize::from(!lost_claim),
+            "{lost_claim}: a lost claim writes nothing, a failing job one FAILED write"
+        );
+        assert_eq!(
+            fake.restore_job("MusicRestored").unwrap().status,
+            JobStatus::Running,
+            "{lost_claim}"
+        );
+        assert!(
+            entry.join("000000.json.gz.verified").is_file(),
+            "{lost_claim}: the entry is left to the sweep"
+        );
+        assert_eq!(
+            restore_outcomes(&runtime),
+            [("failed".to_owned(), 1.0)],
+            "{lost_claim}"
+        );
+    }
+}
+
+/// `finish_restore` answering `Pending` (MongoDB: DONE with the index
+/// backfill left to the backend's worker) is a success: the backfill line,
+/// `RestoreJobs{succeeded}`, `WorkerLastSuccess{RestoreJob}`, the spool entry
+/// removed and the record DONE, the table not flipped by the job.
+#[tokio::test]
+async fn a_pending_finish_is_a_success_whose_flip_is_the_backends() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    fake.finish_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = spooled_runtime(&mem, scratch.path());
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done);
+    assert!(record.completed_at.is_some());
+    assert!(
+        !fake.restore_tables.lock().unwrap()["tid-MusicRestored"].active,
+        "the flip is the backend's worker's"
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert!(!scratch.path().join("restore-tid-MusicRestored").exists());
+    let pending =
+        lines.containing("index backfill pending, the backend's worker flips the table ACTIVE");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert!(
+        pending[0].contains(": DONE, 2 items (2 applied by this run)"),
+        "{}",
+        pending[0]
+    );
+    let metrics = drained(&runtime);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|(m, _, _)| *m == MetricName::RestoreJobs)
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect::<Vec<_>>(),
+        [("succeeded".to_owned(), 1.0)]
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerLastSuccess && op == "RestoreJob"),
+        "{metrics:?}"
+    );
+    assert!(
+        !metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob"),
+        "{metrics:?}"
+    );
+}
+
+/// The retry bound is the job's, from its first download attempt: the first
+/// file succeeds after ten minutes of transport failures, the second fails
+/// from then on, and the restore is FAILED naming the second file and the
+/// bound once fifteen minutes have passed since the job's first attempt
+/// (a clock per file would run it fifteen minutes longer).
+#[tokio::test(start_paused = true)]
+async fn the_download_retry_bound_is_the_jobs_not_each_files() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 2), songs_from(2, 2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    *mem.fail_data_gets_until.lock().unwrap() =
+        Some(tokio::time::Instant::now() + Duration::from_secs(10 * 60));
+    *mem.fail_gets_of.lock().unwrap() = Some("data/000002.json.gz".to_owned());
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    while runtime.running_jobs() > 0 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(15 * 60) && elapsed < Duration::from_secs(16 * 60 + 2),
+        "{elapsed:?}"
+    );
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("downloading data/000002.json.gz: transport error"),
+        "{reason}"
+    );
+    assert!(reason.contains("the bound is 900 s"), "{reason}");
+    let reads = gets_under(&mem, &arn(ACCOUNT));
+    let first: Vec<&String> = reads
+        .iter()
+        .filter(|k| k.ends_with("000001.json.gz"))
+        .collect();
+    let second: Vec<&String> = reads
+        .iter()
+        .filter(|k| k.ends_with("000002.json.gz"))
+        .collect();
+    // The backoff restarts per file (1+2+4+8+16+32 s, then 60 s each): about
+    // ten minutes of attempts on the first file, five on the second.
+    assert!(
+        (13..=18).contains(&first.len()),
+        "{} attempts on file 1",
+        first.len()
+    );
+    assert!(
+        (9..=13).contains(&second.len()),
+        "{} attempts on file 2",
+        second.len()
+    );
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// The download's own pre-attempt check: with the first attempt failed and
+/// the job in its backoff, a heartbeat timer ended without raising the loss
+/// stops the job before the next attempt, naming the file; no second
+/// attempt is made and nothing is written.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_heartbeat_timer_stops_the_download_before_its_next_attempt() {
+    let (lines, _guard) = LogLines::capture();
+    let period = job_settings().heartbeat_interval;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    mem.fail_gets_with(GetFailure::Transport, 1);
+    restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "TargetTableName": "TimerStoppedInBackoff" })),
+    )
+    .await
+    .unwrap();
+    // The first attempt failed; the job sleeps its first backoff (at least
+    // one second), during which the timer is ended.
+    while gets_under(&mem, &arn(ACCOUNT)).len() < 3 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    restore::test_support::stop_timer("tid-TimerStoppedInBackoff");
+    tokio::time::sleep(3 * period).await;
+    while runtime.running_jobs() > 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)).len(),
+        3,
+        "no second attempt"
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    let stopped = lines.containing(
+        "stopped with no further catalog or table access: no heartbeat confirmed the claim \
+         recently enough to download data/000001.json.gz",
+    );
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(
+        fake.restore_job("TimerStoppedInBackoff").unwrap().status,
+        JobStatus::Running
+    );
+}
+
+/// A decoder that dies on the blocking pool (its reader panics mid-file)
+/// drops the channel without an `Err` item, so the backend sees a clean end
+/// of a short stream; the job fails the file rather than reporting it
+/// applied, and the target is removed.
+#[tokio::test]
+async fn a_decoder_that_dies_fails_the_file_rather_than_completing_it() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    // The gets: the sidecar, the manifest, the file's hashing pass, then
+    // the file's load pass, whose body dies.
+    mem.panic_body_of_get
+        .store(4, std::sync::atomic::Ordering::Release);
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 1);
+    assert_eq!(loads[0].stream_error, None, "the backend saw a clean end");
+    assert!(loads[0].items.len() < 2, "{} items", loads[0].items.len());
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(
+        writes[0].2.as_deref(),
+        Some("data file data/000001.json.gz: the decoder stopped unexpectedly")
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+    assert!(fake.restore_job("MusicRestored").is_none());
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// Stop a restore into `MusicRestored` on `runtime` at its first `bulk_load`
+/// through the shutdown, so its spool entry holds every file verified; then
+/// rewrite its record as a dead owner's with no progress recorded over an
+/// empty target (the shutdown lets the held file finish, so the record
+/// would otherwise name file 0).
+async fn stop_a_spooled_restore_before_its_first_load(
+    fake: &Arc<Fake>,
+    runtime: &BackupRuntime,
+    gate: &Arc<tokio::sync::Semaphore>,
+) {
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(gate));
+    restore_on(fake, runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_bulk_loads_started(fake, 1).await;
+    runtime.drain_jobs(Duration::from_millis(100)).await;
+    gate.add_permits(10);
+    wait_for_jobs(runtime).await;
+    *fake.bulk_load_gate.lock().unwrap() = None;
+    fake.bulk_loads.lock().unwrap().clear();
+    {
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        assert_eq!(record.status, JobStatus::Running);
+        record.file_index = None;
+        record.items_applied = None;
+        record.heartbeat_at = 1234.5;
+        let mut targets = fake.restore_tables.lock().unwrap();
+        let target = targets.get_mut("tid-MusicRestored").unwrap();
+        target.items.clear();
+        target.active = false;
+    }
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+}
+
+/// A same-host resume with every file verified in the spool reads the
+/// manifest and sidecar from the spool and downloads nothing: no store
+/// read at all, no `RestoreBytesDownloaded`.
+#[tokio::test]
+async fn a_same_host_resume_reads_the_spool_and_downloads_nothing() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    stop_a_spooled_restore_before_its_first_load(&fake, &runtime, &closed_gate()).await;
+    mem.gets.lock().unwrap().clear();
+    let _ = drained(&runtime);
+
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime2).await;
+    assert!(
+        gets_under(&mem, &arn(ACCOUNT)).is_empty(),
+        "{:?}",
+        gets_under(&mem, &arn(ACCOUNT))
+    );
+    assert_eq!(fake.bulk_load_files(), [(0, 0, true, 2), (1, 0, false, 2)]);
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(
+        lines
+            .containing("resumed by this instance; the manifest was read from this host's spool")
+            .len(),
+        1
+    );
+    assert!(
+        !drained(&runtime2)
+            .iter()
+            .any(|(m, _, _)| *m == MetricName::RestoreBytesDownloaded),
+        "nothing downloaded"
+    );
+    let active = lines.containing(": ACTIVE, 4 items (4 applied by this run), 0 bytes downloaded");
+    assert_eq!(active.len(), 1, "{active:?}");
+}
+
+/// A `.verified` marker binds the digest: a marker naming another digest
+/// does not make its file verified, and a same-host resume downloads that
+/// file again and only it.
+#[tokio::test]
+async fn a_marker_naming_another_digest_has_its_file_downloaded_again() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    stop_a_spooled_restore_before_its_first_load(&fake, &runtime, &closed_gate()).await;
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    let marker = entry.join("000000.json.gz.verified");
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(recorded.trim_end(), files_sha256(&mem, &arn(ACCOUNT), 1));
+    std::fs::write(&marker, format!("{}\n", "0".repeat(64))).unwrap();
+    mem.gets.lock().unwrap().clear();
+
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime2).await;
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        ["data/000001.json.gz"],
+        "the file whose marker names another digest, and nothing else"
+    );
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert!(!entry.exists(), "the entry is removed with the job's end");
+}
+
+/// The lowercase hex sha256 of data file `n` (1-based key) of `arn` in `mem`.
+fn files_sha256(mem: &MemStore, arn: &str, n: u32) -> String {
+    use sha2::Digest;
+    let prefix = BackupArn::parse(arn).unwrap().store_prefix();
+    let key = format!("{prefix}{}", data_file_key(n));
+    let bytes = mem.objects.lock().unwrap()[&key].clone();
+    format!("{:x}", sha2::Sha256::digest(&bytes))
+}
+
+/// The spool states a crash can leave, and what a same-host resume
+/// downloads: file 0 verified (file and marker), file 1 a `.partial` only,
+/// file 2 a file without its marker, file 3 a marker without its file. The
+/// verified file is kept; the other three are downloaded again, every file
+/// is loaded and the restore completes.
+#[tokio::test]
+async fn a_resume_downloads_the_spool_files_a_crash_left_unverified() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [
+        songs_from(0, 2),
+        songs_from(2, 2),
+        songs_from(4, 2),
+        songs_from(6, 2),
+    ];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    stop_a_spooled_restore_before_its_first_load(&fake, &runtime, &closed_gate()).await;
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    for i in 0..4 {
+        assert!(entry.join(format!("{i:06}.json.gz.verified")).is_file());
+    }
+    std::fs::rename(
+        entry.join("000001.json.gz"),
+        entry.join("000001.json.gz.partial"),
+    )
+    .unwrap();
+    std::fs::remove_file(entry.join("000001.json.gz.verified")).unwrap();
+    std::fs::remove_file(entry.join("000002.json.gz.verified")).unwrap();
+    std::fs::remove_file(entry.join("000003.json.gz")).unwrap();
+    mem.gets.lock().unwrap().clear();
+
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime2).await;
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        [
+            "data/000002.json.gz",
+            "data/000003.json.gz",
+            "data/000004.json.gz"
+        ],
+        "the verified file is kept; the .partial, the unmarked file and the marker without a \
+         file are downloaded again"
+    );
+    assert_eq!(fake.bulk_load_files().len(), 4);
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert!(!entry.exists());
+}
+
+/// Songs `from..from + n` each carrying a `Blob` of `bytes` bytes.
+fn padded_songs(from: usize, n: usize, bytes: usize, pattern: impl Fn(usize) -> u8) -> Vec<Item> {
+    songs_from(from, n)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut item)| {
+            let blob: Vec<u8> = (0..bytes)
+                .map(|j| pattern(i * 7919 + j * 104_729))
+                .collect();
+            item.insert(
+                "Blob".to_owned(),
+                extenddb_core::types::AttributeValue::B(blob),
+            );
+            item
+        })
+        .collect()
+}
+
+/// `padded_songs` whose blob is `zeros` zero bytes followed by bytes from
+/// `pattern`: the zeros compress to nothing, so one item's `zeros` tunes the
+/// compressed length of a file by under a byte per step while the
+/// uncompressed length and the item count stay the same.
+fn padded_songs_with_zeros(
+    from: usize,
+    n: usize,
+    bytes: usize,
+    zeros_in_first: usize,
+    pattern: impl Fn(usize) -> u8,
+) -> Vec<Item> {
+    let mut items = padded_songs(from, n, bytes, pattern);
+    if let Some(first) = items.first_mut() {
+        let blob: Vec<u8> = (0..bytes)
+            .map(|j| {
+                if j < zeros_in_first {
+                    0
+                } else {
+                    (j.wrapping_mul(2_654_435_761) >> 7) as u8
+                }
+            })
+            .collect();
+        first.insert(
+            "Blob".to_owned(),
+            extenddb_core::types::AttributeValue::B(blob),
+        );
+    }
+    items
+}
+
+/// The blob byte pattern of `seed`: bytes with no structure a compressor
+/// finds, so two seeds give files of nearly the same compressed length.
+fn blob_pattern(seed: usize) -> impl Fn(usize) -> u8 + Copy {
+    move |x: usize| {
+        let mut z = (x as u64).wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) as u8
+    }
+}
+
+/// A data file of the same item count, uncompressed length and compressed
+/// length as `original` (the file of `blob_pattern(0)`), holding other items
+/// of the same keys and blob length (so only the digests differ): the blobs
+/// are seeded differently per try, and within a try the zeros at the head of
+/// the first item's blob are swept until the compressed length matches.
+fn same_length_replacement(original: &[u8], from: usize, n: usize, bytes: usize) -> Vec<u8> {
+    for seed in 1usize..200 {
+        let pattern = blob_pattern(seed);
+        let (base, _) =
+            encode_data_file(padded_songs_with_zeros(from, n, bytes, 0, pattern)).unwrap();
+        if base.len() < original.len() || base.len() > original.len() + bytes / 2 {
+            continue;
+        }
+        for zeros in 0..=bytes {
+            let (candidate, _) =
+                encode_data_file(padded_songs_with_zeros(from, n, bytes, zeros, pattern)).unwrap();
+            if candidate.len() == original.len() {
+                assert_ne!(candidate, original);
+                return candidate;
+            }
+            if candidate.len() + 8 < original.len() {
+                break;
+            }
+        }
+    }
+    panic!(
+        "no replacement of {} compressed bytes found",
+        original.len()
+    )
+}
+
+/// On an in-place (filesystem) store a data file replaced between the
+/// hashing pass and the load pass by another valid file of the same item
+/// count, uncompressed length and compressed length (so only its digests
+/// differ from the manifest's): the items of the replacement reach the
+/// backend as they decode (two chunks of a thousand), the end-of-stream
+/// check then fails the file on its sha256, since the load's second read is
+/// hashed again, the restore is FAILED naming the file and the target is
+/// removed.
+///
+/// The job runs at a 1 s heartbeat, not the 50 ms of `job_settings`: the
+/// hashing pass over both files runs before the first load's claim check,
+/// on this test's one runtime thread with the heartbeat's timer, and under
+/// a loaded host it can outlast two 50 ms periods, which ends the job as a
+/// lost claim before any load.
+#[tokio::test]
+async fn a_file_replaced_between_the_two_passes_fails_in_the_load() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    // Payloads that compress little, so the compressed body is long and the
+    // decoder's first chunks are sent before the stream ends.
+    let blob = 256;
+    let files = [
+        songs_from(0, 2),
+        padded_songs(2, 2500, blob, blob_pattern(0)),
+    ];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        false,
+    );
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let key = format!("{prefix}data/000002.json.gz");
+    let original = mem.objects.lock().unwrap()[&key].clone();
+    let replacement = same_length_replacement(&original, 2, 2500, blob);
+    assert_eq!(replacement.len(), original.len());
+    let runtime = job_runtime(&mem).with_job_settings(JobSettings {
+        heartbeat_interval: Duration::from_secs(1),
+        ..job_settings()
+    });
+    let gate = closed_gate();
+    *fake.bulk_load_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    // Both files hashed (pass 1) and file 1's second get made; file 2 not
+    // yet re-read.
+    wait_for_bulk_loads_started(&fake, 1).await;
+    let reads = gets_under(&mem, &arn(ACCOUNT));
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|k| k.ends_with("000002.json.gz"))
+            .count(),
+        1,
+        "{reads:?}"
+    );
+    mem.insert(&key, &replacement);
+    gate.add_permits(10);
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(
+        writes.len(),
+        1,
+        "the second pass hashes the file again and fails the restore: {writes:?}"
+    );
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("data file data/000002.json.gz: data file sha256 checksum mismatch"),
+        "the second pass hashes the file again: {reason}"
+    );
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 2);
+    assert_eq!(
+        loads[1].items.len(),
+        2000,
+        "two chunks of the replacement reached the backend before the end-of-stream check"
+    );
+    assert!(loads[1].stream_error.is_some(), "{loads:?}");
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "target removed"
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+}
+
+/// A file over one chunk by line bytes (the job's bound set small for the
+/// test; the items are well under the count bound) is fed in chunks that
+/// close at the byte bound, and the shutdown is read at each chunk boundary.
+/// The backend is held after it pulled the first item of the second chunk,
+/// so the decoder has sent two chunks and holds at most two more in the
+/// channel and one past its check; the shutdown fired then is seen at the
+/// close of a later chunk, so the backend receives a whole number of chunks
+/// (two to five of six) and then the shutdown's `Err` item, never the whole
+/// file.
+#[tokio::test]
+async fn a_file_over_one_chunk_by_bytes_is_fed_in_chunks_and_stops_at_a_boundary() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    // The job's chunk bound is 32 KiB (the production bound, 32 MiB, would
+    // make this a 192 MiB file); items of 1,500-byte blobs whose lines are
+    // the same length, so a chunk is a fixed number of items.
+    let chunk_bytes: u64 = 32 * 1024;
+    restore::test_support::set_chunk_bytes("tid-ChunkedByBytes", chunk_bytes);
+    let blob = 1500;
+    let line = line_bytes(&padded_songs(0, 1, blob, |_| b'a')[0]);
+    let per_chunk = usize::try_from(chunk_bytes.div_ceil(line)).unwrap();
+    assert!(
+        (10..=20).contains(&per_chunk),
+        "{per_chunk} items of {line} bytes per chunk"
+    );
+    let total = 6 * per_chunk;
+    let items = padded_songs(0, total, blob, |_| b'a');
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[items],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let item_gate = Arc::new(tokio::sync::Semaphore::new(per_chunk + 1));
+    *fake.bulk_load_item_gate.lock().unwrap() = Some(Arc::clone(&item_gate));
+    restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "TargetTableName": "ChunkedByBytes" })),
+    )
+    .await
+    .unwrap();
+    wait_for_items_seen(&fake, per_chunk + 1).await;
+    let left = runtime.drain_jobs(Duration::from_millis(100)).await;
+    assert_eq!(left, 1, "the job waits at the gate past the bound");
+    item_gate.add_permits(total + 10);
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 1);
+    let received = loads[0].items.len();
+    assert!(
+        received % per_chunk == 0 && received >= 2 * per_chunk && received < total,
+        "{received} items received of {total}, {per_chunk} per chunk"
+    );
+    assert_eq!(
+        loads[0].stream_error.as_deref(),
+        Some("Internal error: the restore was stopped by the server's shutdown"),
+        "{:?}",
+        loads[0].stream_error
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert_eq!(
+        fake.restore_job("ChunkedByBytes").unwrap().status,
+        JobStatus::Running
+    );
+    assert_eq!(restore_outcomes(&runtime), [("cancelled".to_owned(), 1.0)]);
+}
+
+/// Wait until `bulk_load` has pulled `n` items from its stream.
+async fn wait_for_items_seen(fake: &Fake, n: usize) {
+    // 120 s: the deadline covers the decoder's hashing pass over the file and
+    // the first chunk's decoding on the test's one runtime thread, which under
+    // a loaded machine (the suite runs beside the other crates' tests in CI)
+    // outlasted the 30 s this had, failing the two cells below while the code
+    // was right.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while fake
+        .bulk_load_items_seen
+        .load(std::sync::atomic::Ordering::Acquire)
+        < n
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the backend pulled no item"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The decoder's claim check at each chunk boundary: the backend is held
+/// after it pulled the first item of the second chunk (the decoder has sent
+/// two chunks of a thousand and holds at most two more and one past its
+/// check), the heartbeat timer is ended without raising the loss, and the
+/// decoder ends the stream at the close of a later chunk with the
+/// claim-lost reason: a whole number of chunks (two to five of six) reach
+/// the backend, then the `Err` item, and the job stops with no catalog
+/// write.
+#[tokio::test]
+async fn a_feeder_whose_timer_stopped_ends_the_stream_with_the_claim_lost_reason() {
+    let (lines, _guard) = LogLines::capture();
+    let period = job_settings().heartbeat_interval;
+    let per_chunk = restore::load::LOAD_CHUNK_ITEMS;
+    let total = 6 * per_chunk;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, total)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let item_gate = Arc::new(tokio::sync::Semaphore::new(per_chunk + 1));
+    *fake.bulk_load_item_gate.lock().unwrap() = Some(Arc::clone(&item_gate));
+    restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "TargetTableName": "FeederTimerStopped" })),
+    )
+    .await
+    .unwrap();
+    wait_for_items_seen(&fake, per_chunk + 1).await;
+    restore::test_support::stop_timer("tid-FeederTimerStopped");
+    tokio::time::sleep(3 * period).await;
+    item_gate.add_permits(total + 10);
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap().clone();
+    assert_eq!(loads.len(), 1);
+    let received = loads[0].items.len();
+    assert!(
+        received % per_chunk == 0 && received >= 2 * per_chunk && received < total,
+        "{received} items received of {total}"
+    );
+    assert_eq!(
+        loads[0].stream_error.as_deref(),
+        Some("Internal error: the claim was lost while the file was being decoded"),
+        "{:?}",
+        loads[0].stream_error
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    let stopped = lines.containing(
+        "stopped with no further catalog or table access: the claim was lost while the file \
+         was being decoded",
+    );
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(
+        fake.restore_job("FeederTimerStopped").unwrap().status,
+        JobStatus::Running
+    );
+}
+
+/// The manifest arm reads the health this cycle's check left: a store that
+/// passed a check once (its identity known) and is down when the cycle
+/// runs is unhealthy to the arm, which skips the record with the line
+/// naming the state; a store whose check cannot read the catalog and so has
+/// not yet been checked is skipped with "not yet checked"; once the store
+/// answers again the next cycle resumes the record.
+#[tokio::test]
+async fn an_unhealthy_or_unchecked_store_with_a_known_identity_skips_the_resume() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    fake.bulk_loads.lock().unwrap().clear();
+
+    // Healthy with its identity known, then down when the cycle runs.
+    let runtime = job_runtime(&mem);
+    assert_eq!(
+        runtime.configured_store().unwrap().identity(),
+        Some(store())
+    );
+    mem.set_down(true);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(report.restores_skipped_store_unhealthy, ["MusicRestored"]);
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    assert_eq!(
+        lines.containing("dead store-backed restores are not resumed this cycle"),
+        [
+            "the configured backup store is unhealthy; dead store-backed restores are not \
+             resumed this cycle"
+        ]
+    );
+    mem.set_down(false);
+
+    // Not yet checked: the store's first check cannot read the catalog.
+    let checking = self::runtime()
+        .with_store(ConfiguredStore::checking(
+            StoreKind::Filesystem,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+        ))
+        .with_job_settings(job_settings())
+        .with_metrics(Arc::new(extenddb_core::metrics::MetricsCollector::new()));
+    *fake.catalog_id_error.lock().unwrap() = true;
+    let report = cycle_on(&fake, &checking).await;
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(report.restores_skipped_store_unhealthy, ["MusicRestored"]);
+    assert!(fake.restore_takeovers.lock().unwrap().is_empty());
+    assert_eq!(
+        lines
+            .containing("the configured backup store is not yet checked; dead store-backed restores are not resumed this cycle")
+            .len(),
+        1
+    );
+    *fake.catalog_id_error.lock().unwrap() = false;
+
+    // The store answers again: resumed.
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+// --- the sweep's read order, the DONE write's unknown outcome, the resume's
+// instant and documents, the request's bounds -----------------------------------
+
+/// A restore that registers (RUNNING, this host's `spool_host`) and opens
+/// its spool entry after the reconciler read the RUNNING records: the spool
+/// was listed before the records, so the entry is not a candidate and the
+/// live job keeps it (the design: the sweep never removes the spool of the
+/// job that owns the record).
+#[tokio::test]
+async fn a_restore_registered_between_the_two_reads_keeps_its_spool_entry() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let runtime = spooled_runtime(&mem, scratch.path());
+    // An entry of a dead restore, so the sweep has work to do in the same
+    // cycle and the live entry's survival is not the sweep doing nothing.
+    std::fs::create_dir(scratch.path().join("restore-dead")).unwrap();
+    let spool_dir = scratch.path().to_path_buf();
+    *fake.sweep_hook.lock().unwrap() = Some(Box::new(move |fake: &Fake| {
+        fake.restore_jobs.lock().unwrap().insert(
+            "late".to_owned(),
+            RestoreJobRow {
+                target: RestoreTargetKey {
+                    account_id: ACCOUNT.to_owned(),
+                    table_name: "late".to_owned(),
+                    table_id: "late".to_owned(),
+                },
+                source_backup_arn: arn(ACCOUNT),
+                kind: RestoreKind::Manifest,
+                status: JobStatus::Running,
+                owner_generation: 1,
+                heartbeat_at: seconds_since_epoch(),
+                store: Some(s3_identity()),
+                spool_host: Some("host-a:/var/spool".to_owned()),
+                file_index: None,
+                items_applied: None,
+                failure_reason: None,
+                completed_at: None,
+            },
+        );
+        // The job's `Entry::open` and its first download.
+        let entry = restore::spool::Entry::open(
+            &spool_dir,
+            "late",
+            Some("host-a:/var/spool"),
+            "host-a:/var/spool",
+        )
+        .unwrap();
+        std::fs::write(entry.dir().join("000000.json.gz.partial"), b"bytes").unwrap();
+    }));
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(
+        fake.sweep_hook.lock().unwrap().is_none(),
+        "the registration landed between the two reads"
+    );
+    assert_eq!(
+        fake.restore_job("late").map(|r| r.status),
+        Some(JobStatus::Running),
+        "the record is RUNNING with this host's spool_host"
+    );
+    assert_eq!(
+        report.spool_entries_swept,
+        ["dead"],
+        "the dead entry went; the live restore's entry did not"
+    );
+    assert!(
+        scratch.path().join("restore-late").is_dir(),
+        "the live job's spool entry was removed from under it"
+    );
+    assert!(
+        scratch
+            .path()
+            .join("restore-late/000000.json.gz.partial")
+            .is_file()
+    );
+    // The next cycle, with the record RUNNING and this host's, keeps it too.
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.spool_entries_swept.is_empty());
+    assert!(scratch.path().join("restore-late").is_dir());
+}
+
+/// A `finish_restore` that returns an error is a write whose outcome is
+/// unknown, and the record decides: (a) the flip landed and the call then
+/// failed (PostgreSQL's progress delete after the commit): the re-read finds
+/// DONE under this generation, the restore is complete and `succeeded`, with
+/// a WARN naming the error, no FAILED write, no table access and the entry
+/// removed; (b) the call failed before anything was written: the re-read
+/// finds RUNNING, the write is sent once more and lands; (c) it fails twice:
+/// the record stays RUNNING for the reconciler, no FAILED write, no
+/// removal, the job `failed` with the worker error and the entry left; (d)
+/// it fails and a successor wrote DONE under its own generation before the
+/// re-read: the write matched no record, the job `failed`, no table access.
+#[tokio::test]
+async fn a_failed_done_write_is_re_read_and_the_record_decides() {
+    async fn run_with(
+        errors: &[FinishError],
+    ) -> (Arc<Fake>, Vec<(MetricName, String, f64)>, LogLines) {
+        let (lines, _guard) = LogLines::capture();
+        let scratch = restore::spool::tests::Scratch::new();
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs(2)],
+            true,
+        );
+        fake.rows
+            .lock()
+            .unwrap()
+            .get_mut(&arn(ACCOUNT))
+            .unwrap()
+            .store = s3_identity();
+        fake.finish_errors
+            .lock()
+            .unwrap()
+            .extend(errors.iter().copied());
+        let runtime = spooled_runtime(&mem, scratch.path());
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        let entry_left = scratch.path().join("restore-tid-MusicRestored").exists();
+        let mut metrics = drained(&runtime);
+        metrics.push((
+            MetricName::RestoreJobs,
+            format!("entry_left={entry_left}"),
+            0.0,
+        ));
+        (fake, metrics, lines)
+    }
+    fn restore_jobs(metrics: &[(MetricName, String, f64)]) -> Vec<(String, f64)> {
+        metrics
+            .iter()
+            .filter(|(m, op, _)| *m == MetricName::RestoreJobs && !op.starts_with("entry_left"))
+            .map(|(_, op, sum)| (op.clone(), *sum))
+            .collect()
+    }
+    fn entry_left(metrics: &[(MetricName, String, f64)]) -> bool {
+        metrics.iter().any(|(_, op, _)| op == "entry_left=true")
+    }
+
+    // (a) The flip landed, then the error.
+    let (fake, metrics, lines) = run_with(&[FinishError::AfterFlip]).await;
+    assert_eq!(fake.finish_sizes.lock().unwrap().len(), 1, "one DONE write");
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done);
+    assert!(fake.restore_tables.lock().unwrap()["tid-MusicRestored"].active);
+    assert!(
+        restore_writes(&fake).is_empty(),
+        "no FAILED write over a DONE record: {:?}",
+        restore_writes(&fake)
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert_eq!(restore_jobs(&metrics), [("succeeded".to_owned(), 1.0)]);
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerLastSuccess && op == "RestoreJob")
+    );
+    assert!(!entry_left(&metrics), "the entry is removed on a success");
+    let warned = lines.containing(
+        "the DONE write returned an error (Internal error: the data pool failed after the flip's \
+         commit) and the record is DONE under this job's generation: the write landed and the \
+         restore is complete",
+    );
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert_eq!(
+        lines
+            .containing(": complete (DONE), 2 items (2 applied by this run)")
+            .len(),
+        1,
+        "the line says DONE, not ACTIVE: the table's flip is the backend's"
+    );
+    assert!(lines.containing(": ACTIVE, ").is_empty());
+
+    // (b) The error before anything was written: once more, and it lands.
+    let (fake, metrics, lines) = run_with(&[FinishError::BeforeFlip]).await;
+    assert_eq!(
+        fake.finish_sizes.lock().unwrap().len(),
+        2,
+        "the write sent once more"
+    );
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert_eq!(restore_jobs(&metrics), [("succeeded".to_owned(), 1.0)]);
+    assert_eq!(
+        lines
+            .containing("the record is still RUNNING under this claim; writing once more")
+            .len(),
+        1
+    );
+
+    // (d) The error, and a takeover whose successor wrote DONE before the
+    // re-read: the record is DONE under another generation, so the write
+    // matched no record; no second write, no table access, the entry left.
+    let (fake, metrics, lines) = run_with(&[FinishError::TakenAndDone]).await;
+    assert_eq!(fake.finish_sizes.lock().unwrap().len(), 1, "one DONE write");
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    assert!(restore_writes(&fake).is_empty());
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert_eq!(restore_jobs(&metrics), [("failed".to_owned(), 1.0)]);
+    assert!(entry_left(&metrics), "the entry is left to the sweep");
+    let ended = lines.containing(
+        "the DONE write matched no record (the DONE write failed (Internal error: the claim \
+         connection failed before the DONE write) and the record carries generation",
+    );
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(
+        lines.containing("complete (DONE)").is_empty(),
+        "a successor's DONE is not this job's"
+    );
+
+    // (c) Twice: no third write, no FAILED write, no removal; the record is
+    // the reconciler's.
+    let (fake, metrics, lines) =
+        run_with(&[FinishError::BeforeFlip, FinishError::BeforeFlip]).await;
+    assert_eq!(
+        fake.finish_sizes.lock().unwrap().len(),
+        2,
+        "two writes at most"
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert!(
+        restore_writes(&fake).is_empty(),
+        "no FAILED write: {:?}",
+        restore_writes(&fake)
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert!(
+        fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target stands"
+    );
+    assert_eq!(restore_jobs(&metrics), [("failed".to_owned(), 1.0)]);
+    assert!(
+        metrics
+            .iter()
+            .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob")
+    );
+    assert!(entry_left(&metrics), "the entry is left to the sweep");
+    let ended = lines.containing(
+        "the DONE write matched no record (the DONE write failed twice (Internal error: the claim \
+         connection failed before the DONE write) and the record is still RUNNING under this \
+         claim; the reconciler resumes it once the record is stale); the record is not this \
+         job's to write and no table access was made",
+    );
+    assert_eq!(ended.len(), 1, "{ended:?}");
+}
+
+/// A resumed job's first confirmed beat is the instant the takeover
+/// returned, not the instant the job started: with the record read held
+/// three periods after the takeover, the job's first check finds the beat
+/// older than two periods and stops as a lost claim with no load and no
+/// status write (the record is one a second taker may hold by then); with
+/// the read held one period the job runs to DONE.
+#[tokio::test(start_paused = true)]
+async fn a_resumes_first_beat_is_the_takeovers_return() {
+    async fn resume_held(periods: u32) -> (Arc<Fake>, Arc<MemStore>, LogLines) {
+        let (lines, _guard) = LogLines::capture();
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs_from(0, 2), songs_from(2, 2)],
+            true,
+        );
+        let runtime = job_runtime(&mem);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        // The record as a dead owner left it after file 0.
+        {
+            let mut records = fake.restore_jobs.lock().unwrap();
+            let record = records.get_mut("tid-MusicRestored").unwrap();
+            record.status = JobStatus::Running;
+            record.completed_at = None;
+            record.file_index = Some(0);
+            record.items_applied = Some(2);
+            record.heartbeat_at = 1234.5;
+            let mut targets = fake.restore_tables.lock().unwrap();
+            let target = targets.get_mut("tid-MusicRestored").unwrap();
+            target.active = false;
+            target.items.truncate(2);
+            if let Some(desc) = fake.tables.lock().unwrap().get_mut("MusicRestored") {
+                desc.table_status = TableStatus::Creating;
+            }
+        }
+        fake.restore_dead
+            .lock()
+            .unwrap()
+            .insert("tid-MusicRestored".to_owned());
+        fake.bulk_loads.lock().unwrap().clear();
+        mem.gets.lock().unwrap().clear();
+        *fake.read_restore_job_delay.lock().unwrap() =
+            Some(job_settings().heartbeat_interval * periods);
+        let runtime = job_runtime(&mem);
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+        wait_for_jobs(&runtime).await;
+        (fake, mem, lines)
+    }
+
+    let (fake, mem, lines) = resume_held(3).await;
+    assert!(
+        fake.bulk_loads.lock().unwrap().is_empty(),
+        "no load under a beat three periods old: {:?}",
+        fake.bulk_load_files()
+    );
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Running,
+        "no status write"
+    );
+    assert!(restore_writes(&fake).is_empty());
+    let stopped = lines.containing(
+        "stopped with no further catalog or table access: no heartbeat confirmed the claim \
+         recently enough to download data/000002.json.gz",
+    );
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        [EXTENDDB_MANIFEST_FILE, MANIFEST_CHECKSUM_FILE],
+        "the two documents of the resume's preparation and no data file"
+    );
+
+    let (fake, _mem, _lines) = resume_held(1).await;
+    assert_eq!(fake.bulk_load_files(), [(1, 0, true, 2)]);
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+}
+
+/// A same-host resume whose spooled manifest a crash left short reads the
+/// store's manifest and sidecar instead (one WARN), writes them to the entry
+/// again, and resumes with the spooled files; the restore completes.
+#[tokio::test]
+async fn a_truncated_spooled_manifest_has_the_resume_read_the_store() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let files = [songs_from(0, 2), songs_from(2, 2)];
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    stop_a_spooled_restore_before_its_first_load(&fake, &runtime, &closed_gate()).await;
+    mem.gets.lock().unwrap().clear();
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    let spooled_manifest = std::fs::read(entry.join(EXTENDDB_MANIFEST_FILE)).unwrap();
+    // A crash during the manifest's write, as an in-place write leaves it.
+    std::fs::write(
+        entry.join(EXTENDDB_MANIFEST_FILE),
+        &spooled_manifest[..spooled_manifest.len() / 2],
+    )
+    .unwrap();
+
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime2).await;
+    assert_eq!(
+        fake.restore_job("MusicRestored").map(|r| r.status),
+        Some(JobStatus::Done),
+        "the resume read the store's documents and completed: {:?}",
+        restore_writes(&fake)
+    );
+    assert_eq!(
+        gets_under(&mem, &arn(ACCOUNT)),
+        [EXTENDDB_MANIFEST_FILE, MANIFEST_CHECKSUM_FILE],
+        "the two documents from the store, no data file (the spooled files are verified)"
+    );
+    assert_eq!(fake.bulk_load_files(), [(0, 0, true, 2), (1, 0, false, 2)]);
+    assert_eq!(
+        lines
+            .containing(
+                "the spooled manifest and sidecar of the restore into MusicRestored (account \
+                 123456789012) do not verify (the manifest's checksum sidecar does not match"
+            )
+            .len(),
+        1
+    );
+    assert_eq!(
+        lines
+            .containing("resumed by this instance; the manifest was read from the store")
+            .len(),
+        1
+    );
+}
+
+/// A resume whose store documents fail verification is FAILED with the
+/// reason, its target removed, and its duration recorded from the resume's
+/// start: a sidecar that does not match the manifest; a manifest naming
+/// another backup under a sidecar that matches it. A manifest that spells
+/// the row's backup in another region (a backup sync adopted from another
+/// region's prefix) verifies, and the resume completes.
+#[tokio::test]
+async fn a_resume_whose_store_documents_fail_verification_is_failed() {
+    async fn resume_over(tamper: impl Fn(&MemStore, &str)) -> (Arc<Fake>, BackupRuntime, LogLines) {
+        let (lines, _guard) = LogLines::capture();
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs_from(0, 2), songs_from(2, 2)],
+            true,
+        );
+        let runtime = job_runtime(&mem);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        {
+            let mut records = fake.restore_jobs.lock().unwrap();
+            let record = records.get_mut("tid-MusicRestored").unwrap();
+            record.status = JobStatus::Running;
+            record.completed_at = None;
+            record.file_index = Some(0);
+            record.items_applied = Some(2);
+            record.heartbeat_at = 1234.5;
+            let mut targets = fake.restore_tables.lock().unwrap();
+            let target = targets.get_mut("tid-MusicRestored").unwrap();
+            target.active = false;
+            target.items.truncate(2);
+        }
+        fake.restore_dead
+            .lock()
+            .unwrap()
+            .insert("tid-MusicRestored".to_owned());
+        fake.bulk_loads.lock().unwrap().clear();
+        let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+        tamper(&mem, &prefix);
+        let runtime = job_runtime(&mem);
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+        wait_for_jobs(&runtime).await;
+        drop(_guard);
+        (fake, runtime, lines)
+    }
+    fn failed_with(fake: &Fake, runtime: &BackupRuntime, reason_prefix: &str) {
+        let writes = restore_writes(fake);
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert_eq!(
+            (writes[0].0, writes[0].1),
+            (JobStatus::Running, JobStatus::Failed)
+        );
+        let reason = writes[0].2.clone().unwrap();
+        assert!(reason.starts_with(reason_prefix), "{reason}");
+        assert!(fake.bulk_loads.lock().unwrap().is_empty(), "no load");
+        assert!(
+            fake.restore_job("MusicRestored").is_none(),
+            "the target and its record are removed"
+        );
+        assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+        let metrics = drained(runtime);
+        let durations: Vec<f64> = metrics
+            .iter()
+            .filter(|(m, op, _)| *m == MetricName::RestoreJobDuration && op == "failed")
+            .map(|(_, _, sum)| *sum)
+            .collect();
+        assert_eq!(durations.len(), 1, "{metrics:?}");
+        assert!(
+            durations[0] > 0.0,
+            "the duration runs from the resume's start: {metrics:?}"
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|(m, op, _)| *m == MetricName::WorkerErrorCount && op == "RestoreJob")
+        );
+    }
+
+    // The sidecar names another digest.
+    let (fake, runtime, lines) = resume_over(|mem, prefix| {
+        mem.insert(
+            &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
+            format!("{}  {EXTENDDB_MANIFEST_FILE}\n", "0".repeat(64)).as_bytes(),
+        );
+    })
+    .await;
+    failed_with(
+        &fake,
+        &runtime,
+        "the manifest's checksum sidecar does not match",
+    );
+    assert_eq!(
+        lines
+            .containing("FAILED on resume (the manifest's checksum sidecar does not match")
+            .len(),
+        1
+    );
+
+    // The manifest names another backup of the same table and instant
+    // (another id; the parser's identity rule admits it), under a sidecar
+    // that matches it.
+    let (fake, runtime, lines) = resume_over(|mem, prefix| {
+        let other = BackupArn::parse(&arn(ACCOUNT).replace("73d8d5bc", "0badf00d")).unwrap();
+        let bytes =
+            mem.objects.lock().unwrap()[&format!("{prefix}{EXTENDDB_MANIFEST_FILE}")].clone();
+        let text = String::from_utf8(bytes).unwrap();
+        let own_id = BackupArn::parse(&arn(ACCOUNT)).unwrap();
+        let renamed = text.replace(
+            own_id.to_arn_string().as_str(),
+            other.to_arn_string().as_str(),
+        );
+        assert_ne!(renamed, text);
+        let manifest = renamed.into_bytes();
+        let sidecar = {
+            use sha2::Digest;
+            format!(
+                "{:x}  {EXTENDDB_MANIFEST_FILE}\n",
+                sha2::Sha256::digest(&manifest)
+            )
+        };
+        mem.insert(&format!("{prefix}{EXTENDDB_MANIFEST_FILE}"), &manifest);
+        mem.insert(
+            &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
+            sidecar.as_bytes(),
+        );
+    })
+    .await;
+    failed_with(&fake, &runtime, "the manifest names another backup, ");
+    assert_eq!(
+        lines
+            .containing("FAILED on resume (the manifest names another backup, ")
+            .len(),
+        1
+    );
+
+    // The same backup spelled in another region, under a sidecar that
+    // matches it.
+    let (fake, _runtime, lines) = resume_over(|mem, prefix| {
+        let key = format!("{prefix}{EXTENDDB_MANIFEST_FILE}");
+        let text = String::from_utf8(mem.objects.lock().unwrap()[&key].clone()).unwrap();
+        let own = arn(ACCOUNT);
+        let respelled = text.replace(own.as_str(), &own.replace(REGION, "eu-west-1"));
+        assert_ne!(respelled, text);
+        let manifest = respelled.into_bytes();
+        let sidecar = {
+            use sha2::Digest;
+            format!(
+                "{:x}  {EXTENDDB_MANIFEST_FILE}\n",
+                sha2::Sha256::digest(&manifest)
+            )
+        };
+        mem.insert(&key, &manifest);
+        mem.insert(
+            &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
+            sidecar.as_bytes(),
+        );
+    })
+    .await;
+    assert!(lines.containing("FAILED on resume").is_empty());
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done, "{record:?}");
+    assert_eq!(fake.restored_items("MusicRestored").len(), 4);
+}
+
+/// A same-host resume that fails before it runs (the spooled pair a crash
+/// left short, and the store's sidecar naming another digest) removes this
+/// host's spool entry with the failure path, as the job removes its entry
+/// at every failed end: the record is FAILED naming the mismatch, the
+/// target removed, and the entry gone with its verified files.
+#[tokio::test]
+async fn a_resume_that_fails_before_it_runs_removes_this_hosts_spool_entry() {
+    let (lines, _guard) = LogLines::capture();
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 2), songs_from(2, 2)],
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    stop_a_spooled_restore_before_its_first_load(&fake, &runtime, &closed_gate()).await;
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    assert!(entry.join("000000.json.gz.verified").is_file());
+    let spooled_manifest = std::fs::read(entry.join(EXTENDDB_MANIFEST_FILE)).unwrap();
+    std::fs::write(
+        entry.join(EXTENDDB_MANIFEST_FILE),
+        &spooled_manifest[..spooled_manifest.len() / 2],
+    )
+    .unwrap();
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    mem.insert(
+        &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
+        format!("{}  {EXTENDDB_MANIFEST_FILE}\n", "0".repeat(64)).as_bytes(),
+    );
+
+    let runtime2 = spooled_runtime(&mem, scratch.path());
+    let report = cycle_on(&fake, &runtime2).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime2).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(
+        (writes[0].0, writes[0].1),
+        (JobStatus::Running, JobStatus::Failed)
+    );
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with("the manifest's checksum sidecar does not match"),
+        "{reason}"
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert!(
+        !entry.exists(),
+        "this host's entry goes with the failed resume"
+    );
+    let ended =
+        lines.containing("FAILED on resume (the manifest's checksum sidecar does not match");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert!(ended[0].ends_with("; the target was removed"), "{ended:?}");
+}
+
+/// A spool document write that fails (the `.partial` path is taken by a
+/// directory, as a disk full fails the same arm) fails the restore naming
+/// the document, removes the target, and removes the entry the job had
+/// opened, as every failed end does.
+#[tokio::test]
+async fn a_spool_document_write_failure_fails_the_restore_and_removes_the_entry() {
+    let scratch = restore::spool::tests::Scratch::new();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&arn(ACCOUNT))
+        .unwrap()
+        .store = s3_identity();
+    let entry = scratch.path().join("restore-tid-MusicRestored");
+    std::fs::create_dir_all(entry.join(format!("{EXTENDDB_MANIFEST_FILE}.partial"))).unwrap();
+    let runtime = spooled_runtime(&mem, scratch.path());
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let reason = writes[0].2.clone().unwrap();
+    assert!(
+        reason.starts_with(&format!("writing {EXTENDDB_MANIFEST_FILE} to the spool: ")),
+        "{reason}"
+    );
+    assert_eq!(fake.removed_targets.lock().unwrap().len(), 1);
+    assert!(fake.bulk_loads.lock().unwrap().is_empty());
+    assert!(
+        !entry.exists(),
+        "the entry is removed after a FAILED write that matched"
+    );
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// `Progress::from_records` on each backend's record shape: PostgreSQL's
+/// (the record carries no `file_index`; the progress rows name each
+/// recorded file's count), MongoDB's (`file_index` with no `items_applied`:
+/// the recorded file is complete), and SQLite's and Cassandra's (both,
+/// mid-file); a `file_index` past the manifest records nothing more.
+#[test]
+fn progress_from_records_reads_each_backends_shape() {
+    let mem = MemStore::default();
+    let fake = Fake::default();
+    let manifest = seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 3), songs_from(3, 2), songs_from(5, 4)],
+        true,
+    );
+    let mut row = RestoreJobRow::reconciler_row(
+        RestoreTargetKey {
+            account_id: ACCOUNT.to_owned(),
+            table_name: "T".to_owned(),
+            table_id: "tid".to_owned(),
+        },
+        arn(ACCOUNT),
+        RestoreKind::Manifest,
+        JobStatus::Running,
+        1,
+        0.0,
+    );
+
+    // PostgreSQL: files 0 and 2 recorded whole, file 1 not; the resume
+    // opens file 1 from 0.
+    let progress = restore::Progress::from_records(&row, &[(0, 3), (2, 4)], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), None, Some(4)]);
+    assert_eq!(progress.first_open_in(&manifest), Some((1, 0)));
+    // A PostgreSQL row of a file a decoder panic left short (n1): the file
+    // opens from its row.
+    let progress = restore::Progress::from_records(&row, &[(0, 3), (1, 1)], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), Some(1), None]);
+    assert_eq!(progress.first_open_in(&manifest), Some((1, 1)));
+
+    // MongoDB: `file_index` 1 with no `items_applied`: files 0 and 1 are
+    // complete, file 2 opens from 0.
+    row.file_index = Some(1);
+    row.items_applied = None;
+    let progress = restore::Progress::from_records(&row, &[], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), Some(2), None]);
+    assert_eq!(progress.first_open_in(&manifest), Some((2, 0)));
+
+    // SQLite and Cassandra: file 1 after 1 of its items.
+    row.items_applied = Some(1);
+    let progress = restore::Progress::from_records(&row, &[], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), Some(1), None]);
+    assert_eq!(progress.first_open_in(&manifest), Some((1, 1)));
+
+    // Every file recorded: nothing opens.
+    row.file_index = Some(2);
+    row.items_applied = Some(4);
+    let progress = restore::Progress::from_records(&row, &[], &manifest);
+    assert_eq!(progress.first_open_in(&manifest), None);
+
+    // A `file_index` past the manifest: every file complete, the count
+    // decides.
+    row.file_index = Some(7);
+    row.items_applied = Some(1);
+    let progress = restore::Progress::from_records(&row, &[], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), Some(2), Some(4)]);
+    assert_eq!(progress.first_open_in(&manifest), None);
+
+    // Nothing recorded.
+    row.file_index = None;
+    row.items_applied = None;
+    let progress = restore::Progress::from_records(&row, &[], &manifest);
+    assert_eq!(progress.recorded(), [None, None, None]);
+    assert_eq!(progress.first_open_in(&manifest), Some((0, 0)));
+
+    // The record and a progress row for one file: the larger count is the
+    // file's, whichever source carries it (no backend writes both today).
+    row.file_index = Some(1);
+    row.items_applied = Some(2);
+    let progress = restore::Progress::from_records(&row, &[(1, 1)], &manifest);
+    assert_eq!(
+        progress.recorded(),
+        [Some(3), Some(2), None],
+        "a smaller progress row lowered the record's count"
+    );
+    row.items_applied = Some(1);
+    let progress = restore::Progress::from_records(&row, &[(1, 2)], &manifest);
+    assert_eq!(progress.recorded(), [Some(3), Some(2), None]);
+}
+
+/// A record gone between the takeover and the reads that follow (whoever
+/// moved it owns it) is left to its owner with the info line, not reported
+/// as a cycle error.
+#[tokio::test]
+async fn a_record_gone_after_the_takeover_is_left_to_its_owner() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    fake.takeover_removes_record
+        .store(true, std::sync::atomic::Ordering::Release);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(fake.restore_takeovers.lock().unwrap().len(), 1);
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(report.manifest_restores_failed.is_empty());
+    assert_eq!(
+        lines
+            .containing("was gone when its progress was read; left to whoever moved it")
+            .len(),
+        1
+    );
+    assert!(
+        lines
+            .containing("was taken over but its progress could not be read")
+            .is_empty()
+    );
+    assert_eq!(lines.at_level(tracing::Level::ERROR), Vec::<String>::new());
+}
+
+/// A registration that fails after the request stopped waiting for it
+/// (the 60 s bound answered `InternalServerError`) is logged at ERROR with
+/// the ARN, the target, the account and the error, since the request's own
+/// line told the operator the target appears if registered.
+#[tokio::test]
+async fn a_registration_that_fails_after_the_request_stopped_waiting_is_logged() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let manifest = seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let store = runtime.configured_store_arc().unwrap();
+    let env = job::JobEnv::new(&runtime, store).unwrap();
+    let permit = runtime.take_permit().await.unwrap();
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let manifest_bytes =
+        mem.objects.lock().unwrap()[&format!("{prefix}{EXTENDDB_MANIFEST_FILE}")].clone();
+    let sidecar_bytes =
+        mem.objects.lock().unwrap()[&format!("{prefix}{MANIFEST_CHECKSUM_FILE}")].clone();
+    let input = extenddb_storage::backup_definition::restore_input_from_manifest(
+        &manifest.source_table,
+        "MusicRestored",
+        &RestoreTableOverrides::default(),
+    );
+    let key_schema = extenddb_core::validation::RestorableKeySchema::resolve(
+        &manifest.source_table.key_schema,
+        &manifest.source_table.attribute_definitions,
+    )
+    .unwrap();
+    let parts = restore::RestoreRequestParts {
+        account_id: ACCOUNT.to_owned(),
+        arn: BackupArn::parse(&arn(ACCOUNT)).unwrap(),
+        backup: BackupKey::from_arn(&BackupArn::parse(&arn(ACCOUNT)).unwrap()),
+        manifest: Arc::new(manifest),
+        manifest_bytes,
+        sidecar_bytes,
+        input,
+        key_schema,
+        limits: (&LimitsConfig::default()).into(),
+        registration: None,
+    };
+    *fake.claim_restore_error.lock().unwrap() =
+        Some(StorageError::TableAlreadyExists("MusicRestored".to_owned()));
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    // The request gave up at its bound.
+    drop(answer);
+    restore::start(Arc::clone(&fake), env, permit, parts, reply).await;
+    let logged = lines.containing(
+        "the registration failed after the request had stopped waiting for it; no target was \
+         created",
+    );
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with(&format!(
+            "restore of {} into MusicRestored (account {ACCOUNT}): ",
+            arn(ACCOUNT)
+        )),
+        "{}",
+        logged[0]
+    );
+    assert!(logged[0].contains("MusicRestored"), "{}", logged[0]);
+    assert_eq!(runtime.free_slots(), 4, "the permit is returned");
+}
+
+/// The request's two document reads collect at most their bound: a sidecar
+/// over 4 KiB or a manifest over 16 MiB behind an AVAILABLE row is refused
+/// as a corrupt prefix (`ValidationException`), not read whole; a resume
+/// meeting one is FAILED with the same reason.
+#[tokio::test]
+async fn the_document_reads_are_bounded() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let sidecar_key = format!("{prefix}{MANIFEST_CHECKSUM_FILE}");
+    let good_sidecar = mem.objects.lock().unwrap()[&sidecar_key].clone();
+    let mut oversize = good_sidecar.clone();
+    oversize.extend(std::iter::repeat_n(b' ', 4 * 1024));
+    mem.insert(&sidecar_key, &oversize);
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        format!(
+            "Backup {} has a {MANIFEST_CHECKSUM_FILE} over 4096 bytes, which no backup this \
+             server wrote produces; the backup's prefix is corrupt",
+            arn(ACCOUNT)
+        )
+    );
+    assert!(fake.restore_claims.lock().unwrap().is_empty());
+    mem.insert(&sidecar_key, &good_sidecar);
+
+    // The manifest's bound, one byte over.
+    let manifest_key = format!("{prefix}{EXTENDDB_MANIFEST_FILE}");
+    let good_manifest = mem.objects.lock().unwrap()[&manifest_key].clone();
+    let mut oversize = good_manifest.clone();
+    oversize.resize(16 * 1024 * 1024 + 1, b' ');
+    mem.insert(&manifest_key, &oversize);
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        validation_message(err),
+        format!(
+            "Backup {} has a {EXTENDDB_MANIFEST_FILE} over 16777216 bytes, which no backup this \
+             server wrote produces; the backup's prefix is corrupt",
+            arn(ACCOUNT)
+        )
+    );
+    // At the bound, the read goes through and the checksum decides.
+    oversize.truncate(16 * 1024 * 1024);
+    mem.insert(&manifest_key, &oversize);
+    let err = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        validation_message(err).contains("whose checksum sidecar does not match"),
+        "a manifest at the bound is read and verified"
+    );
+    mem.insert(&manifest_key, &good_manifest);
+
+    // A resume over an oversize sidecar is FAILED with the reason.
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    let mut oversize = good_sidecar.clone();
+    oversize.extend(std::iter::repeat_n(b' ', 4 * 1024));
+    mem.insert(&sidecar_key, &oversize);
+    let runtime = job_runtime(&mem);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.manifest_restores_resumed, ["MusicRestored"]);
+    wait_for_jobs(&runtime).await;
+    let writes = restore_writes(&fake);
+    assert_eq!(
+        writes.last().and_then(|w| w.2.clone()).as_deref(),
+        Some(
+            "the store's extenddb-manifest.sha256 for the backup is over 4096 bytes, which no \
+             backup this server wrote produces"
+        ),
+        "{writes:?}"
+    );
+}
+
+// --- `backup remove-target` (`maintenance::remove_target`) ------------------------
+
+/// The request `remove_target` runs with, against the `Fake`.
+fn remove_target_request(table: &str, owner_window: Duration) -> maintenance::RemoveTarget {
+    maintenance::RemoveTarget {
+        account_id: ACCOUNT.to_owned(),
+        table_name: table.to_owned(),
+        holder: "extenddb backup remove-target on host-a (pid 1)".to_owned(),
+        stale_after: Duration::from_secs(300),
+        owner_window,
+        heartbeat_interval: Duration::from_millis(20),
+    }
+}
+
+/// `backup remove-target` under the maintenance claim: a FAILED record's
+/// CREATING target (`target_not_empty`, the reason the reconciler leaves
+/// for it) is removed with its record, and the claim was taken for the
+/// removal and released after it; a RUNNING record the backend's dead-job
+/// listing does not name is refused and nothing is removed, whatever its
+/// `heartbeat_at` reads on this host's clock (one second old; 1234.5, an
+/// age a host whose clock runs ahead of the catalog's would compute for a
+/// live owner); a RUNNING record the listing names is removed, with a
+/// heartbeat this host's clock reads as fresh; a DONE record (the table
+/// ACTIVE) and a table no record names are refused as "not a restore
+/// target"; a claim a live holder has refuses the command before any read.
+#[tokio::test]
+async fn remove_target_removes_a_failed_or_dead_target_under_the_claim_and_refuses_the_rest() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+
+    // DONE: the table is ACTIVE.
+    assert_eq!(
+        fake.restore_job("MusicRestored").unwrap().status,
+        JobStatus::Done
+    );
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("MusicRestored", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!(
+            "MusicRestored (account {ACCOUNT}) is not a restore target: its restore from {} is \
+             DONE (the table is ACTIVE, or awaits its index backfill)",
+            arn(ACCOUNT)
+        )
+    );
+    assert!(fake.removed_targets.lock().unwrap().is_empty());
+    assert_eq!(fake.maintenance_holders.lock().unwrap().len(), 1);
+    assert!(
+        *fake.maintenance_holders.lock().unwrap()[0]
+            .released
+            .lock()
+            .unwrap(),
+        "the claim is released after a refusal too"
+    );
+
+    // No record names the table.
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("Nothing", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!("Nothing (account {ACCOUNT}) is not a restore target: no restore record names it")
+    );
+
+    // RUNNING with a live owner: the dead-job listing does not name the
+    // record (the backend's age test on the catalog's clock), whatever its
+    // heartbeat reads against this host's clock.
+    dead_record_without_progress(&fake, true);
+    fake.restore_dead.lock().unwrap().clear();
+    for heartbeat_at in [seconds_since_epoch() - 1.0, 1234.5] {
+        fake.restore_jobs
+            .lock()
+            .unwrap()
+            .get_mut("tid-MusicRestored")
+            .unwrap()
+            .heartbeat_at = heartbeat_at;
+        let err = maintenance::remove_target(
+            &*fake,
+            &remove_target_request("MusicRestored", Duration::from_secs(300)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "the restore into MusicRestored (account {ACCOUNT}) from {} is RUNNING with a \
+                 live owner (a heartbeat within stale_job_after_secs); stop it or wait for it",
+                arn(ACCOUNT)
+            ),
+            "heartbeat_at {heartbeat_at}"
+        );
+        assert!(fake.removed_targets.lock().unwrap().is_empty());
+        assert!(fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    }
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+
+    // The reconciler finds the dead owner, no progress and a non-empty
+    // target: FAILED `target_not_empty`, the target left; the command
+    // removes it.
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_failed,
+        [("MusicRestored".to_owned(), TARGET_NOT_EMPTY.to_owned())]
+    );
+    assert!(fake.tables.lock().unwrap().contains_key("MusicRestored"));
+    let removed = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("MusicRestored", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        removed,
+        maintenance::RemovedTarget {
+            table_id: "tid-MusicRestored".to_owned(),
+            backup_arn: arn(ACCOUNT),
+            kind: RestoreKind::Manifest,
+            status: JobStatus::Failed,
+            failure_reason: Some(TARGET_NOT_EMPTY.to_owned()),
+        }
+    );
+    assert!(
+        !fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target is gone"
+    );
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the record is gone"
+    );
+    assert_eq!(
+        fake.removed_targets.lock().unwrap().as_slice(),
+        [RestoreTargetKey {
+            account_id: ACCOUNT.to_owned(),
+            table_name: "MusicRestored".to_owned(),
+            table_id: "tid-MusicRestored".to_owned(),
+        }]
+    );
+    {
+        let holders = fake.maintenance_holders.lock().unwrap();
+        assert_eq!(holders.len(), 5, "a claim per command");
+        assert!(
+            holders.iter().all(|h| *h.released.lock().unwrap()),
+            "every claim released"
+        );
+    }
+    assert!(
+        fake.maintenance_claim_held_by.lock().unwrap().is_none(),
+        "no claim left held"
+    );
+
+    // RUNNING with a dead owner: the listing names the record (under the
+    // 300 s window with a heartbeat this host's clock reads as fresh; under
+    // the zero window SQLite's serve lock gives, with a heartbeat an hour
+    // ahead): removed with its record, no FAILED write.
+    for window in [Duration::from_secs(300), Duration::ZERO] {
+        let fake = Arc::new(Fake::default());
+        let mem = Arc::new(MemStore::default());
+        seed_manifest_backup(
+            &fake,
+            &mem,
+            &arn(ACCOUNT),
+            music_source_table(),
+            &[songs(2)],
+            true,
+        );
+        let runtime = job_runtime(&mem);
+        restore_on(&fake, &runtime, &restore_body(json!({})))
+            .await
+            .unwrap();
+        wait_for_jobs(&runtime).await;
+        dead_record_without_progress(&fake, true);
+        if window.is_zero() {
+            fake.restore_jobs
+                .lock()
+                .unwrap()
+                .get_mut("tid-MusicRestored")
+                .unwrap()
+                .heartbeat_at = seconds_since_epoch() + 3600.0;
+        } else {
+            fake.restore_jobs
+                .lock()
+                .unwrap()
+                .get_mut("tid-MusicRestored")
+                .unwrap()
+                .heartbeat_at = seconds_since_epoch();
+        }
+        let removed =
+            maintenance::remove_target(&*fake, &remove_target_request("MusicRestored", window))
+                .await
+                .unwrap();
+        assert_eq!(removed.status, JobStatus::Running);
+        assert_eq!(removed.failure_reason, None);
+        assert!(fake.restore_job("MusicRestored").is_none());
+        assert!(!fake.tables.lock().unwrap().contains_key("MusicRestored"));
+        assert!(
+            fake.failed_jobs.lock().unwrap().is_empty(),
+            "no FAILED write"
+        );
+    }
+
+    // A claim a live holder has: refused before any read.
+    let fake = Arc::new(Fake::default());
+    *fake.maintenance_claim_held_by.lock().unwrap() = Some("extenddb backup purge".to_owned());
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("MusicRestored", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "the maintenance claim is held by \"extenddb backup purge\"; one maintenance command \
+         runs at a time, and a claim whose holder died expires after stale_job_after_secs (300 s)"
+    );
+    assert!(fake.restore_lists.lock().unwrap().is_empty(), "no read");
+}
+
+/// A legacy record's target is removed the same way: the reconciler would
+/// fail and remove it once stale; the command lets the operator do it now.
+#[tokio::test]
+async fn remove_target_removes_a_legacy_records_target() {
+    let fake = Arc::new(Fake::default());
+    let target = RestoreTargetKey {
+        account_id: ACCOUNT.to_owned(),
+        table_name: "Legacy".to_owned(),
+        table_id: "tid-legacy".to_owned(),
+    };
+    fake.restore_jobs.lock().unwrap().insert(
+        "tid-legacy".to_owned(),
+        RestoreJobRow::reconciler_row(
+            target.clone(),
+            arn(ACCOUNT),
+            RestoreKind::Legacy,
+            JobStatus::Running,
+            1,
+            1234.5,
+        ),
+    );
+    fake.restore_dead
+        .lock()
+        .unwrap()
+        .insert("tid-legacy".to_owned());
+    *fake.target_still_creating.lock().unwrap() = true;
+    let removed = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("Legacy", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.kind, RestoreKind::Legacy);
+    assert_eq!(removed.table_id, "tid-legacy");
+    assert_eq!(fake.removed_targets.lock().unwrap().as_slice(), [target]);
+
+    // A target the backend finds no longer a CREATING restore target: the
+    // record went with it, so the re-read finds none and the refusal is not
+    // the lock's.
+    *fake.target_still_creating.lock().unwrap() = false;
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("Legacy", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!(
+            "Legacy (account {ACCOUNT}) is not a restore target: it is no longer a CREATING \
+             restore target with table id tid-legacy"
+        )
+    );
+}
+
+/// `remove-target` of a CREATING restore target whose owner's lock is still
+/// held (a frozen owner whose session outlives its heartbeat, on
+/// PostgreSQL) reports the held lock as its own case, not "not a restore
+/// target": the backend refused the removal and the record is unchanged, so
+/// the table is still the target and the operator is told to wait for the
+/// owner or stop it. Nothing is removed. With the lock released the same
+/// command removes the target.
+#[tokio::test]
+async fn remove_target_reports_a_held_owner_lock_as_its_own_case() {
+    let fake = Arc::new(Fake::default());
+    seed_failed_target(&fake, ACCOUNT, "T", "tid-a");
+    *fake.owner_lock_held.lock().unwrap() = true;
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("T", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!(
+            "the restore into T (account {ACCOUNT}) from {} is a CREATING restore target (table \
+             id tid-a) whose owner's lock is still held: its owner's session is alive though \
+             its heartbeat is stale; wait for the owner to stop, or stop it, and run the \
+             command again",
+            arn(ACCOUNT)
+        )
+    );
+    assert!(
+        fake.restore_jobs.lock().unwrap().contains_key("tid-a"),
+        "the record stays"
+    );
+    assert!(
+        fake.restore_tables.lock().unwrap().contains_key("tid-a"),
+        "the target stays"
+    );
+
+    *fake.owner_lock_held.lock().unwrap() = false;
+    let removed = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("T", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.table_id, "tid-a");
+}
+
+// --- the manifest total, remove-target's scope and lost claim, a target without
+// --- tables, the registration retry ---------------------------------------------
+
+/// The final count above the manifest's total fails the restore and removes
+/// its target, as a count below it does: the count check is `!=`, not `<`
+/// (five restored against four listed). A fresh restore starts on an empty
+/// target, so a count over the total means the target holds items the
+/// backup does not account for.
+#[tokio::test]
+async fn a_count_above_the_manifest_total_fails_the_restore() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 2), songs_from(2, 2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    // The manifest lists four items; the backend reports five.
+    *fake.count_override.lock().unwrap() = Some(5);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.bulk_loads.lock().unwrap().len(),
+        2,
+        "every file was loaded before the count"
+    );
+    let writes = restore_writes(&fake);
+    assert_eq!(
+        writes[0].2.as_deref(),
+        Some(
+            "restored 5 items, the manifest lists 4: the target holds items the backup does not \
+             account for"
+        )
+    );
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the record and its target are removed"
+    );
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// Seed a FAILED `target_not_empty` restore record over a non-empty CREATING
+/// target of `(account, name, id)`, the state `remove-target` acts on.
+fn seed_failed_target(fake: &Fake, account: &str, name: &str, id: &str) {
+    fake.restore_jobs.lock().unwrap().insert(
+        id.to_owned(),
+        RestoreJobRow {
+            target: RestoreTargetKey {
+                account_id: account.to_owned(),
+                table_name: name.to_owned(),
+                table_id: id.to_owned(),
+            },
+            source_backup_arn: arn(account),
+            kind: RestoreKind::Manifest,
+            status: JobStatus::Failed,
+            owner_generation: 1,
+            heartbeat_at: seconds_since_epoch(),
+            store: Some(s3_identity()),
+            spool_host: None,
+            file_index: None,
+            items_applied: None,
+            failure_reason: Some(TARGET_NOT_EMPTY.to_owned()),
+            completed_at: Some(seconds_since_epoch()),
+        },
+    );
+    fake.restore_tables.lock().unwrap().insert(
+        id.to_owned(),
+        RestoreTable {
+            name: name.to_owned(),
+            key_attributes: vec!["pk".to_owned()],
+            items: vec![song("x", "y")],
+            active: false,
+        },
+    );
+}
+
+/// `remove-target --account A T` removes only account A's target: the record
+/// `find` compares the account, so account B's target of the same name is
+/// untouched, and a command for A when only B's target exists is refused:
+/// the record's table name alone would select either account's target.
+#[tokio::test]
+async fn remove_target_is_scoped_to_the_named_account() {
+    const OTHER: &str = "210987654321";
+    let fake = Arc::new(Fake::default());
+    seed_failed_target(&fake, ACCOUNT, "T", "tid-a");
+    seed_failed_target(&fake, OTHER, "T", "tid-b");
+
+    // The command for account A removes A's target alone.
+    let removed = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("T", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.table_id, "tid-a");
+    assert_eq!(
+        fake.removed_targets.lock().unwrap().as_slice(),
+        [RestoreTargetKey {
+            account_id: ACCOUNT.to_owned(),
+            table_name: "T".to_owned(),
+            table_id: "tid-a".to_owned(),
+        }],
+        "only the named account's target was removed"
+    );
+    assert!(
+        fake.restore_jobs.lock().unwrap().contains_key("tid-b"),
+        "the other account's record is untouched"
+    );
+
+    // With only account B's target left, the command for account A finds no
+    // record of its own.
+    let err = maintenance::remove_target(
+        &*fake,
+        &remove_target_request("T", Duration::from_secs(300)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!("T (account {ACCOUNT}) is not a restore target: no restore record names it")
+    );
+    assert!(fake.restore_jobs.lock().unwrap().contains_key("tid-b"));
+}
+
+/// `remove-target` whose maintenance claim is lost between the record checks
+/// and the removal stops before the removal, leaving the target and its
+/// record: the pre-removal `claim.lost()` check is what stops it.
+#[tokio::test]
+async fn remove_target_stops_before_the_removal_when_the_claim_is_lost() {
+    let fake = Arc::new(Fake::default());
+    seed_failed_target(&fake, ACCOUNT, "T", "tid-a");
+    // The claim this command takes reports lost at once; the read before the
+    // removal runs long enough for the HeldClaim's timer to observe it.
+    *fake.next_claim_lost.lock().unwrap() = true;
+    *fake.list_jobs_delay.lock().unwrap() = Some(Duration::from_millis(80));
+    let request = maintenance::RemoveTarget {
+        account_id: ACCOUNT.to_owned(),
+        table_name: "T".to_owned(),
+        holder: "extenddb backup remove-target on host-a (pid 1)".to_owned(),
+        stale_after: Duration::from_secs(300),
+        owner_window: Duration::from_secs(300),
+        heartbeat_interval: Duration::from_millis(5),
+    };
+    let err = maintenance::remove_target(&*fake, &request)
+        .await
+        .unwrap_err();
+    assert!(err.starts_with("stopped before the removal: "), "{err}");
+    assert!(
+        fake.removed_targets.lock().unwrap().is_empty(),
+        "nothing was removed"
+    );
+    assert!(
+        fake.restore_jobs.lock().unwrap().contains_key("tid-a"),
+        "the record stays"
+    );
+    assert!(
+        fake.restore_tables.lock().unwrap().contains_key("tid-a"),
+        "the target stays"
+    );
+}
+
+/// A dead manifest restore whose target has no data tables (its owner died
+/// between the registration's commit and the data DDL) is failed and its
+/// target removed, not retaken every stale window. Without the readiness
+/// check the count on the missing table errors and the refreshed heartbeat
+/// leaves the record to be retaken, never failing.
+#[tokio::test]
+async fn the_reconciler_fails_a_dead_restore_whose_target_has_no_tables() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    // The record is RUNNING with a dead owner, its target's data tables gone.
+    dead_record_without_progress(&fake, false);
+    fake.targets_without_tables
+        .lock()
+        .unwrap()
+        .insert("tid-MusicRestored".to_owned());
+    fake.bulk_loads.lock().unwrap().clear();
+
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_failed_and_removed,
+        ["MusicRestored"]
+    );
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the record is gone"
+    );
+    assert!(
+        !fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target is removed"
+    );
+    assert!(
+        fake.bulk_loads.lock().unwrap().is_empty(),
+        "no resume was spawned"
+    );
+}
+
+/// A retry that meets its own registration in flight waits for it and is
+/// answered the CREATING description, rather than registering a second
+/// target or being refused; a restore of another backup into the same name
+/// while that registration is in flight is `TableInUseException` (the 60 s
+/// registration bound equals botocore's default read timeout, so a client
+/// retries while the first registration still holds the lock).
+#[tokio::test]
+async fn a_retry_waits_on_its_registration_and_another_backup_is_refused() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let arn_b =
+        format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/01791976431439-aaaaaaaa");
+    seed_manifest_backup(&fake, &mem, &arn_b, music_source_table(), &[songs(2)], true);
+    let runtime = Arc::new(job_runtime(&mem));
+    // Hold the first registration mid-flight so the target is not yet
+    // created when the retry's name check runs.
+    *fake.claim_restore_delay.lock().unwrap() = Some(Duration::from_millis(400));
+
+    let first = {
+        let fake = Arc::clone(&fake);
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { restore_on(&fake, &runtime, &restore_body(json!({}))).await })
+    };
+    // Wait for the first request's registration to be in flight.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while fake.restore_claims.lock().unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "registration never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The retry of the same request waits and is answered CREATING.
+    let retry = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(retry["TableDescription"]["TableStatus"], "CREATING");
+    assert_eq!(
+        retry["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
+        arn(ACCOUNT)
+    );
+
+    // A different backup into the same name is refused while the first is in
+    // flight.
+    let other = restore_on(
+        &fake,
+        &runtime,
+        &restore_body(json!({ "BackupArn": arn_b })),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(other, DynamoDbError::TableInUseException(_)),
+        "{other:?}"
+    );
+
+    let first = first.await.unwrap().unwrap();
+    assert_eq!(first["TableDescription"]["TableStatus"], "CREATING");
+    wait_for_jobs(&runtime).await;
+    // One target, one record: the retry registered nothing of its own.
+    assert_eq!(fake.restore_claims.lock().unwrap().len(), 1);
+}
+
+// --- the count retry, the maintenance claim taken mid-cycle, the takeover
+// --- bound, the first file resumed with upserts ----------------------------------
+
+/// The final count that fails three times stops the job with the record
+/// RUNNING and no FAILED write: every item is loaded and recorded, so the
+/// reconciler's resume counts again rather than the restore failing and its
+/// loaded target being removed. The count is attempted `COUNT_ATTEMPTS`
+/// times (three), with a wait between them.
+#[tokio::test]
+async fn a_count_that_fails_three_times_leaves_the_record_running() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs_from(0, 2), songs_from(2, 2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    fake.count_errors
+        .store(3, std::sync::atomic::Ordering::Release);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs_within(&runtime, Duration::from_secs(20)).await;
+    assert_eq!(
+        fake.count_calls.load(std::sync::atomic::Ordering::Acquire),
+        3,
+        "the count was attempted three times"
+    );
+    assert_eq!(
+        fake.bulk_loads.lock().unwrap().len(),
+        2,
+        "every file was loaded before the count"
+    );
+    let record = fake.restore_job("MusicRestored").expect("the record stays");
+    assert_eq!(record.status, JobStatus::Running, "no FAILED was written");
+    assert_eq!(
+        (record.file_index, record.items_applied),
+        (Some(1), Some(2)),
+        "the progress of the last file stands for the resume"
+    );
+    assert!(
+        restore_writes(&fake)
+            .iter()
+            .all(|(_, to, _)| *to != JobStatus::Failed && *to != JobStatus::Done),
+        "no status write ended the job: {:?}",
+        restore_writes(&fake)
+    );
+    assert!(
+        fake.restore_tables
+            .lock()
+            .unwrap()
+            .contains_key("tid-MusicRestored"),
+        "the loaded target is kept"
+    );
+    assert_eq!(restore_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A command that takes the maintenance claim during the cycle, after the
+/// cycle's first read of it and before the takeover, is seen by the second
+/// read after `claim_restore_dead`: the record is taken over (its generation
+/// moved, its heartbeat fresh) but not resumed, and is left for the
+/// maintenance arm of a later cycle.
+#[tokio::test]
+async fn a_claim_taken_during_the_cycle_leaves_the_taken_over_record_unresumed() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    dead_record_without_progress(&fake, false);
+    fake.bulk_loads.lock().unwrap().clear();
+    let before = fake.restore_job("MusicRestored").unwrap().owner_generation;
+    // The command takes the claim inside the takeover, so the cycle's first
+    // read (not held) and its second read (held) disagree.
+    *fake.takeover_hook.lock().unwrap() = Some(Box::new(|fake: &Fake| {
+        *fake.maintenance_held.lock().unwrap() = true;
+    }));
+
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(!report.maintenance_held, "the first read found no claim");
+    assert!(
+        fake.takeover_hook.lock().unwrap().is_none(),
+        "the takeover ran"
+    );
+    assert!(
+        report.manifest_restores_resumed.is_empty(),
+        "the record was not resumed: {report:?}"
+    );
+    assert!(report.manifest_restores_failed.is_empty());
+    assert!(report.manifest_restores_failed_and_removed.is_empty());
+    wait_for_jobs(&runtime).await;
+    assert!(
+        fake.bulk_loads.lock().unwrap().is_empty(),
+        "no resume was spawned"
+    );
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Running);
+    assert_ne!(record.owner_generation, before, "the takeover itself stood");
+}
+
+/// A record whose every resume ends with it RUNNING again (here the final
+/// count fails on every attempt, so each resume stops `LeftRunning` and the
+/// record is retaken every stale window) is failed by the takeover after
+/// this instance's fifth: FAILED `TAKEOVERS_EXHAUSTED`, the target removed.
+/// Five cycles take it over and leave it RUNNING; the sixth fails it.
+#[tokio::test]
+async fn the_takeover_after_the_fifth_fails_a_record_that_never_ends() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    // The record is RUNNING with its progress and a dead owner; the target's
+    // count fails on every attempt, so every resume ends `LeftRunning`.
+    {
+        let mut records = fake.restore_jobs.lock().unwrap();
+        let record = records.get_mut("tid-MusicRestored").unwrap();
+        record.status = JobStatus::Running;
+        record.completed_at = None;
+        fake.restore_tables
+            .lock()
+            .unwrap()
+            .get_mut("tid-MusicRestored")
+            .unwrap()
+            .active = false;
+        if let Some(desc) = fake.tables.lock().unwrap().get_mut("MusicRestored") {
+            desc.table_status = TableStatus::Creating;
+        }
+        fake.restore_dead
+            .lock()
+            .unwrap()
+            .insert("tid-MusicRestored".to_owned());
+    }
+    fake.count_errors
+        .store(u32::MAX, std::sync::atomic::Ordering::Release);
+    let mut state = reconciler::ReconcilerState::default();
+    for cycle in 1..=reconciler::RESTORE_TAKEOVERS {
+        let report = reconciler::cycle(
+            &fake,
+            &runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.manifest_restores_resumed,
+            ["MusicRestored"],
+            "cycle {cycle} took the record over and resumed it"
+        );
+        wait_for_jobs_within(&runtime, Duration::from_secs(20)).await;
+        let record = fake.restore_job("MusicRestored").expect("the record stays");
+        assert_eq!(
+            record.status,
+            JobStatus::Running,
+            "cycle {cycle}: the resume ended with the record RUNNING"
+        );
+    }
+    assert_eq!(fake.restore_takeovers.lock().unwrap().len(), 5);
+
+    let report = reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::from_secs(300),
+        "test",
+        &mut state,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.manifest_restores_failed_and_removed,
+        ["MusicRestored"],
+        "the sixth takeover fails the record: {report:?}"
+    );
+    assert!(report.manifest_restores_resumed.is_empty());
+    assert!(
+        fake.restore_job("MusicRestored").is_none(),
+        "the record and its target are removed"
+    );
+    assert!(
+        !fake.tables.lock().unwrap().contains_key("MusicRestored"),
+        "the target is removed"
+    );
+    let writes = restore_writes(&fake);
+    assert!(
+        writes.iter().any(|(from, to, reason)| {
+            *from == JobStatus::Running
+                && *to == JobStatus::Failed
+                && reason.as_deref() == Some(reconciler::TAKEOVERS_EXHAUSTED)
+        }),
+        "the FAILED write names the exhausted takeovers: {writes:?}"
+    );
+}
+
+/// A dead record with no progress recorded over a target that holds items,
+/// no more of them than the backup's total, is the state a crash inside the
+/// first batch leaves on Cassandra (progress is recorded after the batch's
+/// writes): it is resumed, not failed `target_not_empty`, and the resume
+/// re-applies the first data file with `reapplying` set (idempotent
+/// upserts), so the restore ends ACTIVE with the exact count. Only a count
+/// above the backup's total is `target_not_empty`
+/// (`a_resume_without_progress_needs_an_empty_target`).
+#[tokio::test]
+async fn a_half_applied_first_file_with_no_progress_is_resumed_with_upserts() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &[songs(2)],
+        true,
+    );
+    let runtime = job_runtime(&mem);
+    restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    wait_for_jobs(&runtime).await;
+    // The record with no progress, the target holding one of the backup's
+    // two items (the first batch's writes landed, its progress did not).
+    dead_record_without_progress(&fake, false);
+    let first = songs(2).remove(0);
+    fake.restore_tables
+        .lock()
+        .unwrap()
+        .get_mut("tid-MusicRestored")
+        .unwrap()
+        .items
+        .push(first);
+    fake.bulk_loads.lock().unwrap().clear();
+
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.manifest_restores_resumed,
+        ["MusicRestored"],
+        "one item of two is resumed, not failed: {report:?}"
+    );
+    assert!(report.manifest_restores_failed.is_empty());
+    wait_for_jobs(&runtime).await;
+    let loads = fake.bulk_loads.lock().unwrap();
+    assert_eq!(loads.len(), 1, "the one file was loaded again");
+    assert!(
+        loads[0].file.reapplying,
+        "the first file is re-applied with upserts: {:?}",
+        loads[0].file
+    );
+    assert_eq!((loads[0].file.file_index, loads[0].file.start_at), (0, 0));
+    drop(loads);
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done, "{record:?}");
+    assert_eq!(
+        fake.restore_tables.lock().unwrap()["tid-MusicRestored"]
+            .items
+            .len(),
+        2,
+        "the duplicate of the half-applied item was suppressed and the count is exact"
+    );
+}
+
+// --- the review's cells (PR 8, Lee's items) -------------------------------
+
+/// An item of the `Music` table carrying `n` pseudo-random bytes (a `B`
+/// attribute gzip cannot shrink), under the default item limit at 300,000.
+fn song_with_noise(i: usize, n: usize) -> Item {
+    use extenddb_core::types::AttributeValue;
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (i as u64 + 1);
+    let noise: Vec<u8> = (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+    let mut item = song(&format!("artist-{i:05}"), &format!("title-{i:05}"));
+    item.insert("Noise".to_owned(), AttributeValue::B(noise));
+    item
+}
+
+/// The mid-file case of
+/// `a_put_failure_ends_the_job_without_waiting_for_the_streams_next_item`:
+/// the data file's first chunk is out during the third item (three
+/// incompressible items of 380,000 bytes, 1.15 MB once base64-encoded and
+/// gzipped), the stream is held before the fourth, and the put fails 200 ms
+/// after reading that chunk, by when the encoder has finished the third
+/// item and waits on the empty item channel while the feeder waits on the
+/// stream, which the test never releases. The uploader cancels the feeder's
+/// token before it awaits the encoder, so the feeder stops, closes the item
+/// channel, the encoder returns, and the row is FAILED naming the file
+/// within the test's bound; with the encoder awaited first the job runs for
+/// as long as the stream is held.
+#[tokio::test]
+async fn a_mid_file_put_failure_ends_the_job_while_the_stream_is_held() {
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts_after_first_chunk
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    let items: Vec<Item> = (0..5).map(|i| song_with_noise(i, 380_000)).collect();
+    let gate = Arc::new(tokio::sync::Semaphore::new(3));
+    snapshot_fixture(&fake, &music_table(), items, true, Some(Arc::clone(&gate)));
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs_within(&runtime, Duration::from_secs(10)).await;
+    assert_eq!(gate.available_permits(), 0, "the stream was never released");
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert!(
+        row.failure_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("writing data/000001.json.gz: "),
+        "{:?}",
+        row.failure_reason
+    );
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    assert_eq!(mem.deletes.lock().unwrap().as_slice(), [prefix]);
+    assert!(mem.puts.lock().unwrap().is_empty(), "the put never stored");
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The check before every put reads the store as the runtime holds it. A
+/// job held in its stream while the reconciler marks the store unhealthy
+/// (here `record_check` with the problem a check would report) fails its
+/// row with the store's reason and makes no store call: no put, no
+/// `delete_prefix` (the FAILED-prefix duty deletes the prefix once the store
+/// is healthy again). A store whose check passed with another id (the
+/// identity file names another store: a root swapped under the job) fails
+/// the row the same way, naming both ids.
+#[tokio::test]
+async fn a_store_marked_unhealthy_or_renamed_mid_job_fails_the_row_with_no_store_call() {
+    // Unhealthy.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    runtime
+        .configured_store()
+        .unwrap()
+        .record_check(Err(StoreProblem::FileUnreadable(
+            "not an identity file".to_owned(),
+        )));
+    assert!(!runtime.configured_store().unwrap().is_healthy());
+    gate.add_permits(3);
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.clone().unwrap();
+    assert!(
+        reason.starts_with("the filesystem backup store is unhealthy (")
+            && reason.contains("extenddb-store.json could not be read: not an identity file")
+            && reason.ends_with("); data/000001.json.gz was not written"),
+        "{reason}"
+    );
+    assert!(row.completed_at.is_some());
+    assert!(mem.puts.lock().unwrap().is_empty(), "no put");
+    assert!(mem.deletes.lock().unwrap().is_empty(), "no delete_prefix");
+    assert_eq!(
+        mem.keys(),
+        [STORE_IDENTITY_KEY],
+        "no object but the identity file"
+    );
+    assert_eq!(
+        writes(&fake),
+        [(JobStatus::Failed, Some(reason))],
+        "the FAILED write and nothing else"
+    );
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+    assert_eq!(runtime.free_slots(), 4);
+
+    // Another id.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    let swapped = StoreIdentity {
+        store_id: "store-2".to_owned(),
+        ..store()
+    };
+    runtime
+        .configured_store()
+        .unwrap()
+        .record_check(Ok(swapped));
+    assert!(runtime.configured_store().unwrap().is_healthy());
+    gate.add_permits(3);
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(
+            "the filesystem backup store's id is store-2 and the row's is store-1; \
+             data/000001.json.gz was not written"
+        )
+    );
+    assert!(mem.puts.lock().unwrap().is_empty(), "no put");
+    assert!(mem.deletes.lock().unwrap().is_empty(), "no delete_prefix");
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+/// A key-ordered stream that is not in key order: the manifest would say
+/// `KeyOrdered` over items a restore's key-range seek cannot trust, so the
+/// tracker refuses the item and the job fails `encoding data file 1` with
+/// an empty prefix (no chunk was out, so no put started). One cell with a
+/// lower key after a higher one, one with a key repeated.
+#[tokio::test]
+async fn a_key_ordered_stream_out_of_order_fails_the_first_data_file() {
+    let lower = vec![
+        song("artist-00002", "title-00002"),
+        song("artist-00001", "title-00001"),
+    ];
+    let repeated = vec![
+        song("artist-00001", "title-00001"),
+        song("artist-00001", "title-00001"),
+    ];
+    for (what, items) in [("a lower key", lower), ("a repeated key", repeated)] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        snapshot_fixture(&fake, &music_table(), items, true, None);
+        let runtime = job_runtime(&mem);
+        let details = create_music_backup(&fake, &runtime).await.unwrap();
+        wait_for_jobs(&runtime).await;
+        let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+        assert_eq!(row.status, BackupStatus::Failed, "{what}");
+        assert!(
+            row.failure_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("encoding data file 1: "),
+            "{what}: {:?}",
+            row.failure_reason
+        );
+        assert!(mem.puts.lock().unwrap().is_empty(), "{what}: no put");
+        assert!(
+            objects_under(&mem, &details.backup_arn).is_empty(),
+            "{what}: an empty prefix"
+        );
+        assert_eq!(
+            job_outcomes(&runtime),
+            [("failed".to_owned(), 1.0)],
+            "{what}"
+        );
+    }
+}
+
+/// `BackupStoreErrors` is recorded for the job's `delete_prefix` when its
+/// failure path's deletion fails (the row FAILED, the prefix left to the
+/// reconciler), and for the probe's `list` when the listing of a dead
+/// owner's prefix fails after its manifest read (the row left for the next
+/// cycle); each once, under the call's name.
+#[tokio::test]
+async fn the_jobs_failed_deletion_and_the_probes_failed_listing_are_counted() {
+    use extenddb_core::metrics::MetricName;
+    let errors = |drained: &[extenddb_core::metrics::FlushBucket]| {
+        let mut ops: Vec<(String, f64)> = drained
+            .iter()
+            .filter(|b| b.metric == MetricName::BackupStoreErrors)
+            .map(|b| (b.operation.clone(), b.sum))
+            .collect();
+        ops.sort_by(|a, b| a.0.cmp(&b.0));
+        ops
+    };
+
+    // The job's deletion.
+    let mem = Arc::new(MemStore::default());
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    let prefix = BackupArn::parse(&details.backup_arn)
+        .unwrap()
+        .store_prefix();
+    // Set before the job reaches its deletion: the put fails first and the
+    // FAILED write comes between; the prefix is known from the response.
+    *mem.fail_deletes_of.lock().unwrap() = Some(prefix.clone());
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    assert!(
+        mem.deletes.lock().unwrap().is_empty(),
+        "the deletion failed"
+    );
+    assert_eq!(
+        errors(&runtime.metrics().unwrap().drain(Duration::ZERO)),
+        [("delete_prefix".to_owned(), 1.0), ("put".to_owned(), 1.0)]
+    );
+
+    // The probe's listing.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    let dead_prefix = BackupArn::parse(&dead).unwrap().store_prefix();
+    *mem.fail_lists_of.lock().unwrap() = Some(dead_prefix);
+    let metrics = Arc::new(extenddb_core::metrics::MetricsCollector::new());
+    let runtime = runtime_on(&mem, store()).with_metrics(Arc::clone(&metrics));
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(report.creating_resolved.is_empty(), "{report:?}");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&dead].status,
+        BackupStatus::Creating,
+        "left for the next cycle"
+    );
+    assert_eq!(
+        errors(&metrics.drain(Duration::ZERO)),
+        [("list".to_owned(), 1.0)]
+    );
+    *mem.fail_lists_of.lock().unwrap() = None;
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.creating_resolved, [(dead, BackupStatus::Available)]);
+    assert!(errors(&metrics.drain(Duration::ZERO)).is_empty());
+}
+
+/// `write_status`'s generation check: a FAILED write whose outcome is
+/// unknown is re-read, and a row that shows FAILED under another generation
+/// is `NotMatched` (the reconciler resolved the same backup; the row is not
+/// this claim's), so the failure path makes no `delete_prefix`. Without the
+/// check the status alone would read as `Matched`.
+#[tokio::test]
+async fn a_re_read_showing_the_target_status_under_another_generation_is_not_matched() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Fake::default();
+    let arn = arn(ACCOUNT);
+    let prefix = BackupArn::parse(&arn).unwrap().store_prefix();
+    mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+    let mut r = row(&arn, BackupStatus::Failed);
+    r.owner_generation = 9;
+    fake.rows.lock().unwrap().insert(arn.clone(), r);
+    let claim = fake.claim_on(&arn, 7);
+    *fake.unknown_write.lock().unwrap() = Some(UnknownWrite::Lost);
+    let path = job::failure::fail_row(
+        &*claim,
+        &*mem,
+        &passing_fence(),
+        "catalog-1",
+        &prefix,
+        "a reason",
+        None,
+    )
+    .await;
+    match path {
+        job::failure::FailurePath::NoStoreAccess(why) => {
+            assert_eq!(why, "the row carries generation 9 (this claim's is 7)");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(mem.deletes.lock().unwrap().is_empty(), "no delete_prefix");
+    assert_eq!(objects_under(&mem, &arn).len(), 1);
+    assert_eq!(fake.status_writes.lock().unwrap().len(), 1, "one write");
+}
+
+/// A data file whose stored size, as the store reports it, differs from the
+/// encoder's compressed count fails the job: the manifest records the
+/// encoder's count, the reconciler's dead-owner probe refuses a data file
+/// whose stored size differs from the recorded one, and a live job must not
+/// commit a manifest that probe would call incomplete. FAILED names both
+/// figures; the prefix is deleted.
+#[tokio::test]
+async fn a_data_file_whose_stored_size_differs_from_the_encoders_fails_the_job() {
+    let mem = Arc::new(MemStore::default());
+    mem.misreport_put_size
+        .store(true, std::sync::atomic::Ordering::Release);
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(2), true, None);
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let stored = mem.put_sizes.lock().unwrap()[0].1;
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(
+            format!(
+                "the store reports {} bytes for data/000001.json.gz and the encoder wrote {stored}",
+                stored + 1
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(mem.puts.lock().unwrap().len(), 1, "no document followed");
+    assert!(objects_under(&mem, &details.backup_arn).is_empty());
+    assert_eq!(job_outcomes(&runtime), [("failed".to_owned(), 1.0)]);
+}
+
+// --- the maintainer's second round on PR 8: a beat parked on the write lock --
+
+mod review_round_3 {
+    use super::*;
+
+    /// The pre-put check's third clause: a beat parked outside its bound
+    /// (SQLite's engine write lock, held by a GSI build) confirms the claim
+    /// however old the last confirmed beat is, and stops confirming the
+    /// moment the beat returns `Lost`. A parked beat that confirms on its
+    /// release refreshes the last confirmed instant and clears the flight,
+    /// so a timer that then stops leaves the check to the two-period rule.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_parked_on_the_write_lock_confirms_the_claim_until_it_returns_lost() {
+        let fake = Arc::new(Fake::default());
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Creating));
+        // SQLite's shape: the park is the write lock's queue.
+        fake.parks_before_bound
+            .store(true, std::sync::atomic::Ordering::Release);
+        let claim: Arc<dyn JobClaim> = Arc::from(fake.claim_on(&arn(ACCOUNT), 7));
+        let period = Duration::from_secs(10);
+        *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Park;
+        let handle = job::heartbeat::HeartbeatHandle::start(
+            Arc::clone(&claim),
+            period,
+            job::heartbeat::HeartbeatMetric::None,
+            tokio::time::Instant::now(),
+        );
+        // The first tick's beat parks at one period; at two and a half the
+        // claim's insert is too old for the two-period clause alone.
+        tokio::time::sleep(2 * period + period / 2).await;
+        assert_eq!(
+            fake.heartbeats.load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert!(!handle.lost().is_cancelled());
+        assert!(
+            handle.confirms_the_claim(),
+            "a beat parked on the lock confirms the claim"
+        );
+        tokio::time::sleep(10 * period).await;
+        assert!(handle.confirms_the_claim(), "however long it is parked");
+        assert!(!handle.lost().is_cancelled());
+        // The lock is released and the beat finds the claim lost.
+        *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+        fake.park_release.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            fake.heartbeats.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert!(handle.lost().is_cancelled());
+        assert!(
+            !handle.confirms_the_claim(),
+            "the loss is read before the flight"
+        );
+        assert!(handle.reason().contains("the claim was lost"));
+        drop(handle);
+
+        // The same park, released with a confirmation: the check passes
+        // from the fresh beat, and once the timer stops the flight is gone
+        // and the two-period rule refuses two and a half periods later.
+        *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Park;
+        let handle = job::heartbeat::HeartbeatHandle::start(
+            claim,
+            period,
+            job::heartbeat::HeartbeatMetric::None,
+            tokio::time::Instant::now(),
+        );
+        tokio::time::sleep(5 * period).await;
+        assert!(handle.confirms_the_claim());
+        *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Confirm;
+        fake.park_release.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!handle.lost().is_cancelled());
+        assert!(handle.confirms_the_claim());
+        handle.stop_timer();
+        tokio::time::sleep(2 * period + period / 2).await;
+        assert!(
+            !handle.confirms_the_claim(),
+            "no beat in flight and the last confirmed beat too old"
+        );
+        assert!(!handle.lost().is_cancelled());
+    }
+
+    /// On a backend whose beat does not park before its bound (PostgreSQL,
+    /// MongoDB, Cassandra), a beat in flight does not confirm the claim, within
+    /// its bound or past it: the two-period rule already covers a beat in
+    /// flight there, and a process stopped mid-beat and resumed keeps the beat
+    /// in flight while another owner may hold the row. The same beat on a
+    /// backend whose beat parks (SQLite) confirms the claim for as long as it
+    /// waits, and on both the loss is read before the flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_in_flight_confirms_the_claim_only_where_the_beat_parks() {
+        let fake = Arc::new(Fake::default());
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Creating));
+        let period = Duration::from_secs(10);
+        for parks in [false, true] {
+            fake.parks_before_bound
+                .store(parks, std::sync::atomic::Ordering::Release);
+            let claim: Arc<dyn JobClaim> = Arc::from(fake.claim_on(&arn(ACCOUNT), 7));
+            // `Park` holds the beat outside the bound: the stop, on a backend
+            // that does not park, or the lock's queue on one that does.
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Park;
+            // The claim's insert is old enough that the two-period clause
+            // alone refuses from the first tick on.
+            let handle = job::heartbeat::HeartbeatHandle::start(
+                claim,
+                period,
+                job::heartbeat::HeartbeatMetric::None,
+                tokio::time::Instant::now() - 2 * period,
+            );
+            // The first tick's beat starts at one period; half a period in it
+            // is within its bound.
+            tokio::time::sleep(period + period / 2).await;
+            assert!(!handle.lost().is_cancelled());
+            assert_eq!(
+                handle.confirms_the_claim(),
+                parks,
+                "parks={parks}: a beat within its bound confirms the claim only where it parks"
+            );
+            // One and a half periods into the beat: past its bound.
+            tokio::time::sleep(period).await;
+            assert!(!handle.lost().is_cancelled(), "the timer has not run again");
+            assert_eq!(
+                handle.confirms_the_claim(),
+                parks,
+                "parks={parks}: a beat past its bound confirms the claim only where it parks"
+            );
+            // The beat returns Lost: the loss is read before the flight.
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+            fake.park_release.notify_one();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(handle.lost().is_cancelled());
+            assert!(!handle.confirms_the_claim());
+            drop(handle);
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Confirm;
+        }
+    }
+}
+
+/// The pre-put check after a process stopped between two beats.
+mod a_process_stopped_between_beats {
+    use super::*;
+
+    /// A process stopped between two beats (SIGSTOP, a paused VM) and resumed
+    /// starts the missed tick's beat at once. On a backend whose beat does not
+    /// park before its bound (PostgreSQL, MongoDB, Cassandra), no check passes
+    /// while that beat runs: the last confirmed beat is older than two periods
+    /// and another owner may hold the row by then. A bound of one period from
+    /// the beat's start let every check in the beat's round trip pass (the
+    /// maintainer measured 5 to 6 ms). On SQLite, where the beat parks only on
+    /// this process's lock and no takeover can happen, the beat in flight
+    /// confirms the claim as it does when parked behind a long writer.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_between_beats_passes_no_check_while_the_resumed_beat_runs() {
+        let fake = Arc::new(Fake::default());
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(arn(ACCOUNT), row(&arn(ACCOUNT), BackupStatus::Creating));
+        let period = Duration::from_secs(10);
+        for parks in [false, true] {
+            fake.parks_before_bound
+                .store(parks, std::sync::atomic::Ordering::Release);
+            let claim: Arc<dyn JobClaim> = Arc::from(fake.claim_on(&arn(ACCOUNT), 7));
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Confirm;
+            let beats_before = fake.heartbeats.load(std::sync::atomic::Ordering::Acquire);
+            let handle = job::heartbeat::HeartbeatHandle::start(
+                claim,
+                period,
+                job::heartbeat::HeartbeatMetric::None,
+                tokio::time::Instant::now(),
+            );
+            // Three beats confirm on time, the last at three periods.
+            tokio::time::sleep(3 * period + period / 10).await;
+            assert_eq!(
+                fake.heartbeats.load(std::sync::atomic::Ordering::Acquire) - beats_before,
+                3
+            );
+            assert!(handle.confirms_the_claim(), "parks={parks}: beats on time");
+
+            // The stop: the clock moves eight periods while no task of this
+            // runtime runs, so the timer misses its ticks. The resumed beat
+            // parks, as a beat whose round trip has not returned yet.
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Park;
+            tokio::time::advance(8 * period).await;
+            // The resume: the timer's missed tick starts its beat at once.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(
+                !handle.lost().is_cancelled(),
+                "the resumed beat has not returned"
+            );
+            assert_eq!(
+                handle.confirms_the_claim(),
+                parks,
+                "parks={parks}: after a stop between beats, the beat the missed tick \
+                 started confirms the claim only where the beat parks"
+            );
+            // Six milliseconds into the beat's round trip: well within its bound.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(handle.confirms_the_claim(), parks, "parks={parks}");
+
+            // The beat finds the row taken over: the loss ends every check.
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Lost;
+            fake.park_release.notify_one();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(handle.lost().is_cancelled());
+            assert!(!handle.confirms_the_claim());
+            assert!(handle.reason().contains("the claim was lost"));
+            drop(handle);
+            *fake.heartbeat_answer.lock().unwrap() = HeartbeatAnswer::Confirm;
+        }
+    }
+}
+
 /// A restore of a backup the catalog index has a row for checks the target
 /// name once the row is known to exist and AVAILABLE, before the backup's
 /// in-use rule and before the store checks, the service's order (measured on
@@ -5278,20 +20358,24 @@ async fn the_reconciler_leaves_a_record_whose_owner_heartbeated_after_the_listin
 /// `TableInUseException`): an existing table of the name answers
 /// `TableAlreadyExistsException` though the backup is in use, a CREATING
 /// restore target `TableInUseException` naming its source backup, and a free
-/// name reaches the in-use rule and then this release's refusal of a
-/// store-backed restore. A row that is not AVAILABLE answers for itself
-/// before the name is read.
+/// name reaches the in-use rule and then the manifest read (here
+/// `BackupNotFoundException`: the store holds nothing under the row's
+/// prefix). A row that is not AVAILABLE answers for itself before the name
+/// is read.
 #[tokio::test]
 async fn a_catalog_row_restore_checks_the_target_name_after_the_row_and_before_its_in_use_rule() {
-    let runtime = runtime().with_store(store());
-    let fake = fake_with_row(BackupStatus::Available);
+    // The row's store is the configured, healthy one, so a free name reaches
+    // the store after the in-use rule.
+    let mem = Arc::new(MemStore::default());
+    let runtime = runtime_on(&mem, store());
+    let fake = Arc::new(fake_with_row(BackupStatus::Available));
     fake.in_use
         .lock()
         .unwrap()
         .insert(arn(ACCOUNT), "Elsewhere".to_owned());
     let limits = LimitsConfig::default();
     let body = restore_body(json!({}));
-    let restore_on = async |fake: &Fake| {
+    let restore_on = async |fake: &Arc<Fake>| {
         restore_table_from_backup(fake, &runtime, ACCOUNT, REGION, &limits, &body).await
     };
 
@@ -5337,12 +20421,16 @@ async fn a_catalog_row_restore_checks_the_target_name_after_the_row_and_before_i
         "a free name reaches the in-use rule: {err:?}"
     );
     fake.in_use.lock().unwrap().clear();
+    assert!(
+        mem.gets().is_empty(),
+        "no store read before the in-use rule"
+    );
     let err = restore_on(&fake).await.unwrap_err();
     assert!(
-        matches!(err, DynamoDbError::ValidationException(ref m)
-            if m.contains("is in a backup store; this release restores in-catalog backups only")),
+        matches!(err, DynamoDbError::BackupNotFoundException(_)),
         "{err:?}"
     );
+    assert!(!mem.gets().is_empty(), "the free name reached the store");
 
     // A row that is not AVAILABLE: its own answer, the name unread. A
     // CREATING row is the backup being created (not measured on the service:
@@ -5351,7 +20439,7 @@ async fn a_catalog_row_restore_checks_the_target_name_after_the_row_and_before_i
         (BackupStatus::Deleted, "not found"),
         (BackupStatus::Creating, "being created"),
     ] {
-        let fake = fake_with_row(status);
+        let fake = Arc::new(fake_with_row(status));
         fake.tables.lock().unwrap().insert(
             "MusicRestored".to_owned(),
             TableDescription {
@@ -5410,4 +20498,7858 @@ async fn another_accounts_arn_in_another_region_is_access_denied_before_the_regi
         matches!(err, DynamoDbError::AccessDeniedException(ref m) if m == "Access is denied"),
         "{err:?}"
     );
+}
+
+// --- backup sync (`sync`) ------------------------------------------------------
+
+/// A backup ARN of `store()`'s account and table with a 14-digit id that
+/// carries an instant, one per `n`.
+fn sync_arn(n: u32) -> String {
+    format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Music/backup/0179197643{n:04}-0000{n:04}")
+}
+
+/// The objects of a complete backup of `arn`, keys relative to the root: the
+/// golden manifest's data files at their recorded sizes and the four
+/// documents `BackupDocuments::build` writes, the source table renamed to
+/// `arn`'s table, account, region and partition, the name `sync-<id>`.
+fn backup_objects(arn: &str) -> Vec<(String, Vec<u8>)> {
+    use extenddb_core::backup_format::{BackupDocuments, ExtenddbManifest, ManifestHeader};
+    let golden = ExtenddbManifest::from_json_bytes(include_bytes!(
+        "../../../core/testdata/extenddb-manifest/v1.json"
+    ))
+    .unwrap();
+    let parsed = BackupArn::parse(arn).unwrap();
+    let mut source_table = golden.source_table.clone();
+    source_table.table_name = parsed.table_name().to_owned();
+    source_table.table_arn = format!(
+        "arn:{}:dynamodb:{}:{}:table/{}",
+        parsed.partition(),
+        parsed.region(),
+        parsed.account_id(),
+        parsed.table_name()
+    );
+    let docs = BackupDocuments::build(
+        ManifestHeader {
+            backup_arn: parsed.clone(),
+            backup_name: format!("sync-{}", parsed.backup_id()),
+            source_backend: golden.source_backend.clone(),
+            source_extenddb_version: golden.source_extenddb_version.clone(),
+            snapshot: golden.snapshot.clone(),
+            item_order: golden.item_order,
+            source_table,
+        },
+        golden
+            .data_files
+            .iter()
+            .cloned()
+            .map(|entry| (entry, None))
+            .collect(),
+        "",
+        &store().store_root,
+    )
+    .unwrap();
+    let prefix = parsed.store_prefix();
+    let mut objects: Vec<(String, Vec<u8>)> = golden
+        .data_files
+        .iter()
+        .map(|file| {
+            (
+                format!("{prefix}{}", file.key),
+                vec![0u8; usize::try_from(file.bytes).unwrap()],
+            )
+        })
+        .collect();
+    for (name, bytes) in docs.documents() {
+        objects.push((format!("{prefix}{name}"), bytes.to_vec()));
+    }
+    objects
+}
+
+/// Write the objects of a backup of `arn` into `mem` with its manifest
+/// changed by `edit` and a sidecar that matches the changed manifest: a
+/// manifest whose digest checks and whose content the reader judges.
+fn put_backup_with_manifest(mem: &MemStore, arn: &str, edit: impl Fn(&mut Value)) {
+    use sha2::Digest as _;
+    for (key, bytes) in backup_objects(arn) {
+        if key.ends_with("extenddb-manifest.sha256") {
+            continue;
+        }
+        if key.ends_with("extenddb-manifest.json") {
+            let mut manifest: Value = serde_json::from_slice(&bytes).unwrap();
+            edit(&mut manifest);
+            let edited = serde_json::to_vec(&manifest).unwrap();
+            let sidecar = format!(
+                "{}  extenddb-manifest.json\n",
+                hex::encode(sha2::Sha256::digest(&edited))
+            );
+            mem.insert(&key.replace(".json", ".sha256"), sidecar.as_bytes());
+            mem.insert(&key, &edited);
+        } else {
+            mem.insert(&key, &bytes);
+        }
+    }
+}
+
+/// Write a complete backup of `arn` into `mem`.
+fn put_backup(mem: &MemStore, arn: &str) {
+    for (key, bytes) in backup_objects(arn) {
+        mem.insert(&key, &bytes);
+    }
+}
+
+fn prefix_of(arn: &str) -> String {
+    BackupArn::parse(arn).unwrap().store_prefix()
+}
+
+/// A sync of `mem` as `identity`, in the tests' region.
+fn sync_target<'a>(mem: &'a MemStore, identity: &'a StoreIdentity) -> super::sync::SyncTarget<'a> {
+    super::sync::SyncTarget {
+        store: mem,
+        identity,
+        metrics: None,
+        region: Some(REGION),
+        stop: None,
+        claim: None,
+    }
+}
+
+/// The reasons of a report's skipped prefixes, by prefix.
+fn skipped_by_prefix(report: &super::sync::SyncReport) -> HashMap<String, super::sync::SkipReason> {
+    report
+        .skipped
+        .iter()
+        .map(|s| (s.prefix.clone(), s.reason.clone()))
+        .collect()
+}
+
+/// A prefix with a verified manifest and no row gets an AVAILABLE row with
+/// the values CreateBackup's AVAILABLE write leaves: the manifest's name,
+/// ARN, size, item total and `source_table`, the configured store's
+/// identity, `created_at` the id's instant, unowned, `completed_at` and
+/// `heartbeat_at` the catalog's clock. A second sync finds the row and
+/// skips the prefix; a reconciler cycle then leaves the row as it is, as it
+/// leaves a created one.
+#[tokio::test]
+async fn sync_adopts_a_verified_prefix_with_the_row_a_create_writes() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let adopted = sync_arn(1);
+    put_backup(&mem, &adopted);
+    let identity = store();
+
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.adopted,
+        [super::sync::AdoptedBackup {
+            backup_arn: adopted.clone(),
+            foreign: None,
+        }]
+    );
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.missing_manifests.is_empty());
+    assert_eq!(report.stopped, None);
+    let manifest = stored_manifest(&mem, &adopted);
+    let parsed = BackupArn::parse(&adopted).unwrap();
+    let row = fake.rows.lock().unwrap()[&adopted].clone();
+    assert_eq!(row.status, BackupStatus::Available);
+    assert_eq!(row.backup_arn, adopted);
+    assert_eq!(row.account_id, parsed.account_id());
+    assert_eq!(row.table_name, parsed.table_name());
+    assert_eq!(row.backup_id, parsed.backup_id());
+    assert_eq!(row.backup_name, manifest.backup_name);
+    assert_eq!(row.backup_name, format!("sync-{}", parsed.backup_id()));
+    assert_eq!(row.store, identity);
+    assert_eq!(row.size_bytes, manifest.backup_size_bytes);
+    assert_eq!(row.item_count, 100_000);
+    assert_eq!(
+        Some(row.created_at),
+        extenddb_core::backup_format::backup_creation_date_time(parsed.backup_id())
+    );
+    assert_eq!(
+        row.source_table_details_json,
+        serde_json::to_value(&manifest.source_table).unwrap()
+    );
+    assert_eq!(row.owner_generation, UNOWNED_GENERATION);
+    assert!(row.completed_at.is_some());
+    assert_eq!(row.failure_reason, None);
+
+    let again = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(again.adopted.is_empty());
+    assert_eq!(
+        skipped_by_prefix(&again),
+        HashMap::from([(
+            prefix_of(&adopted),
+            super::sync::SkipReason::HasRow {
+                status: BackupStatus::Available,
+                store_id: "store-1".to_owned(),
+                other_table: None,
+            }
+        )])
+    );
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 1);
+
+    let runtime = runtime_on(&mem, store());
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert_eq!(cycle.store_healthy, Some(true));
+    assert_eq!(
+        fake.rows.lock().unwrap()[&adopted],
+        row,
+        "the cycle left it"
+    );
+}
+
+/// A manifest whose ARN names another region than the server's is adopted
+/// under the server's region's spelling of the ARN, and the report (and the
+/// log) says so, naming the manifest's region; the manifest keeps the
+/// spelling it carries. DescribeBackup finds the row under either spelling
+/// and answers the server's, ListBackups lists it in the server's region,
+/// and the dead-owner probe and the restore's manifest check accept the
+/// manifest's spelling. With no region known, the row carries the
+/// manifest's spelling and no region is compared.
+#[tokio::test]
+async fn sync_adopts_a_backup_of_another_region_under_this_servers_region() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let canonical = sync_arn(7);
+    let other = canonical.replace(REGION, "eu-west-1");
+    put_backup(&mem, &other);
+    let identity = store();
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(report.adopted.len(), 1, "{:?}", report.skipped);
+    assert_eq!(report.adopted[0].backup_arn, canonical);
+    let note = report.adopted[0].foreign.clone().unwrap();
+    assert!(note.contains("eu-west-1"), "{note}");
+    {
+        let rows = fake.rows.lock().unwrap();
+        assert_eq!(rows[&canonical].backup_arn, canonical);
+        assert!(
+            !rows.contains_key(&other),
+            "no row under the manifest's spelling"
+        );
+    }
+    assert_eq!(
+        stored_manifest(&mem, &other)
+            .backup_arn()
+            .unwrap()
+            .to_arn_string(),
+        other,
+        "the manifest keeps its spelling"
+    );
+    assert_eq!(
+        fake.insert_attempts.lock().unwrap()[0].backup_arn,
+        canonical
+    );
+    // Both spellings resolve to the row, which reads as the server's.
+    for spelling in [&canonical, &other] {
+        let (resolved, row) = read_catalog_row(&*fake, &own(spelling))
+            .await
+            .unwrap()
+            .expect("found under either spelling");
+        assert_eq!(resolved.to_arn_string(), canonical, "{spelling}");
+        assert_eq!(row.backup_arn, canonical, "{spelling}");
+    }
+    // The readers that compare a manifest's ARN with the row's.
+    let manifest = stored_manifest(&mem, &other);
+    let row_arn = BackupArn::parse(&canonical).unwrap();
+    assert!(manifest.backup_arn().unwrap().names_same_backup(&row_arn));
+
+    let fake = Arc::new(Fake::default());
+    let unknown_region = super::sync::SyncTarget {
+        region: None,
+        ..sync_target(&mem, &identity)
+    };
+    let report = super::sync::sync(&*fake, unknown_region).await.unwrap();
+    assert_eq!(report.adopted[0].foreign, None);
+    assert_eq!(report.adopted[0].backup_arn, other);
+    assert!(fake.rows.lock().unwrap().contains_key(&other));
+}
+
+/// A prefix copied from a server of another region, whose manifest spells
+/// the backup's ARN and the source table's in that region, is adopted by
+/// sync under this server's region: the row's `BackupArn` is this server's,
+/// and the source table's ARN keeps the manifest's region in the three
+/// fields that answer it (DescribeBackup's `SourceTableDetails.TableArn`,
+/// ListBackups' `BackupSummaries[].TableArn` and the restore's
+/// `RestoreSummary.SourceTableArn`). The request's manifest check and the
+/// job's accept the manifest's spelling, and the restore reaches ACTIVE
+/// with every item. A manifest of another backup is still refused
+/// (`the_manifest_request_refuses_in_order_before_the_registration`).
+#[tokio::test]
+async fn a_row_over_a_manifest_of_another_region_restores() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let files = [songs(2)];
+    let manifest = seed_manifest_backup(
+        &fake,
+        &mem,
+        &arn(ACCOUNT),
+        music_source_table(),
+        &files,
+        true,
+    );
+    // The copied prefix alone: the row is sync's to write.
+    fake.rows.lock().unwrap().clear();
+    let runtime = job_runtime(&mem);
+    let prefix = BackupArn::parse(&arn(ACCOUNT)).unwrap().store_prefix();
+    let manifest_key = format!("{prefix}{EXTENDDB_MANIFEST_FILE}");
+    let sidecar_key = format!("{prefix}{MANIFEST_CHECKSUM_FILE}");
+    let other = arn(ACCOUNT).replace(REGION, "eu-west-1");
+    assert_ne!(other, arn(ACCOUNT));
+    let other_table = manifest.source_table.table_arn.replace(REGION, "eu-west-1");
+    assert_ne!(other_table, manifest.source_table.table_arn);
+    let mut parsed: Value =
+        serde_json::from_slice(&mem.objects.lock().unwrap()[&manifest_key]).unwrap();
+    parsed["backup_arn"] = json!(other);
+    parsed["source_table"]["table_arn"] = json!(other_table);
+    let bytes = serde_json::to_vec(&parsed).unwrap();
+    let sidecar = {
+        use sha2::Digest;
+        format!(
+            "{:x}  {EXTENDDB_MANIFEST_FILE}\n",
+            sha2::Sha256::digest(&bytes)
+        )
+    };
+    mem.insert(&manifest_key, &bytes);
+    mem.insert(&sidecar_key, sidecar.as_bytes());
+
+    let report = super::sync::sync(&*fake, sync_target(&mem, &store()))
+        .await
+        .unwrap();
+    assert_eq!(report.adopted.len(), 1, "{:?}", report.skipped);
+    assert_eq!(report.adopted[0].backup_arn, arn(ACCOUNT));
+    let desc = describe_backup(&*fake, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_arn, arn(ACCOUNT));
+    assert_eq!(desc.source_table_details.table_arn, other_table);
+    let listed = list(&fake, json!({})).await.unwrap();
+    let summaries = listed["BackupSummaries"].as_array().unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["BackupArn"], arn(ACCOUNT));
+    assert_eq!(summaries[0]["TableArn"], other_table);
+
+    let response = restore_on(&fake, &runtime, &restore_body(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response["TableDescription"]["RestoreSummary"]["SourceBackupArn"],
+        arn(ACCOUNT)
+    );
+    assert_eq!(
+        response["TableDescription"]["RestoreSummary"]["SourceTableArn"],
+        other_table
+    );
+    wait_for_jobs(&runtime).await;
+    let record = fake.restore_job("MusicRestored").unwrap();
+    assert_eq!(record.status, JobStatus::Done, "{record:?}");
+    let all: Vec<Item> = files.iter().flatten().cloned().collect();
+    assert_eq!(fake.restored_items("MusicRestored"), all);
+    assert_eq!(
+        fake.tables.lock().unwrap()["MusicRestored"].table_status,
+        TableStatus::Active
+    );
+}
+
+/// Every prefix 4(g) says sync never adopts is skipped with its reason, and
+/// the run goes on to adopt the one complete prefix among them: no manifest,
+/// a manifest without its sidecar, a sidecar that does not match, a data
+/// file missing, a data file of another size, a manifest naming another
+/// backup than the path, a manifest the store fails to serve, a manifest
+/// whose sidecar matches and that the reader refuses (a `source_table` of
+/// another table, a creation time that is not the id's instant, a data-file
+/// key that leaves the prefix, a size total that is not the files' sum),
+/// the reserved `changelog` and `exports/` components, an id of an earlier
+/// build's shape, and a complete prefix with a row of each status. The
+/// manifest of a prefix with a row is never read: the row check comes
+/// first.
+#[tokio::test]
+async fn sync_skips_every_prefix_it_must_not_adopt() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    let manifest_name = "extenddb-manifest.json";
+    let sidecar_name = "extenddb-manifest.sha256";
+
+    let good = sync_arn(1);
+    put_backup(&mem, &good);
+    let none = sync_arn(2);
+    mem.insert(&format!("{}data/000001.json.gz", prefix_of(&none)), b"x");
+    let no_sidecar = sync_arn(3);
+    for (key, bytes) in backup_objects(&no_sidecar) {
+        if !key.ends_with(sidecar_name) {
+            mem.insert(&key, &bytes);
+        }
+    }
+    let bad_sidecar = sync_arn(4);
+    for (key, bytes) in backup_objects(&bad_sidecar) {
+        if key.ends_with(sidecar_name) {
+            mem.insert(
+                &key,
+                format!("{} {manifest_name}\n", "0".repeat(64)).as_bytes(),
+            );
+        } else {
+            mem.insert(&key, &bytes);
+        }
+    }
+    let missing_file = sync_arn(5);
+    let mut objects = backup_objects(&missing_file);
+    let dropped = objects
+        .iter()
+        .position(|(k, _)| k.contains("/data/"))
+        .unwrap();
+    objects.remove(dropped);
+    for (key, bytes) in objects {
+        mem.insert(&key, &bytes);
+    }
+    let short_file = sync_arn(6);
+    for (key, mut bytes) in backup_objects(&short_file) {
+        if key.contains("/data/") && bytes.len() > 1 {
+            bytes.pop();
+        }
+        mem.insert(&key, &bytes);
+    }
+    // The documents and files of backup 8, under backup 7's prefix.
+    let mismatched = sync_arn(7);
+    for (key, bytes) in backup_objects(&sync_arn(8)) {
+        let moved = key.replacen(&prefix_of(&sync_arn(8)), &prefix_of(&mismatched), 1);
+        mem.insert(&moved, &bytes);
+    }
+    let unreadable = sync_arn(9);
+    put_backup(&mem, &unreadable);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&unreadable));
+    let other_source = sync_arn(10);
+    put_backup_with_manifest(&mem, &other_source, |m| {
+        m["source_table"]["table_name"] = "Other".into();
+    });
+    let other_instant = sync_arn(11);
+    put_backup_with_manifest(&mem, &other_instant, |m| {
+        m["backup_creation_date_time"] = 1.5.into();
+    });
+    let traversal = sync_arn(12);
+    put_backup_with_manifest(&mem, &traversal, |m| {
+        m["data_files"][0]["key"] = "../../../../x/data/000001.json.gz".into();
+    });
+    let other_size = sync_arn(13);
+    put_backup_with_manifest(&mem, &other_size, |m| {
+        m["backup_size_bytes"] = 7.into();
+    });
+    mem.insert(&format!("{ACCOUNT}/Music/changelog/000001.json.gz"), b"x");
+    mem.insert("exports/01791976430001/manifest-summary.json", b"{}");
+    mem.insert(
+        &format!("{ACCOUNT}/Music/1791976431438/{manifest_name}"),
+        b"{}",
+    );
+    let mut with_rows = Vec::new();
+    for (n, status) in [
+        (20, BackupStatus::Creating),
+        (21, BackupStatus::Deleting),
+        (22, BackupStatus::Deleted),
+        (23, BackupStatus::Failed),
+        (24, BackupStatus::Available),
+    ] {
+        let a = sync_arn(n);
+        put_backup(&mem, &a);
+        fake.rows.lock().unwrap().insert(a.clone(), row(&a, status));
+        with_rows.push((a, status));
+    }
+    let rows_before: Vec<BackupRow> = fake.rows.lock().unwrap().values().cloned().collect();
+
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(
+        report
+            .adopted
+            .iter()
+            .map(|a| a.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&good)
+    );
+    let skipped = skipped_by_prefix(&report);
+    let incomplete = |arn: &str| match &skipped[&prefix_of(arn)] {
+        SkipReason::Incomplete(why) => why.clone(),
+        other => panic!("{arn}: {other:?}"),
+    };
+    assert_eq!(incomplete(&none), "no manifest");
+    assert_eq!(incomplete(&no_sidecar), "a manifest without its sidecar");
+    assert!(
+        incomplete(&bad_sidecar).starts_with("the sidecar does not match"),
+        "{}",
+        incomplete(&bad_sidecar)
+    );
+    assert!(
+        incomplete(&missing_file).contains("is not in the store"),
+        "{}",
+        incomplete(&missing_file)
+    );
+    assert!(
+        incomplete(&short_file).contains("bytes in the store"),
+        "{}",
+        incomplete(&short_file)
+    );
+    assert!(
+        matches!(&skipped[&prefix_of(&mismatched)], SkipReason::ArnMismatch(why) if why.contains(&sync_arn(8))),
+        "{:?}",
+        skipped[&prefix_of(&mismatched)]
+    );
+    assert!(
+        matches!(&skipped[&prefix_of(&unreadable)], SkipReason::Store(e) if e.contains("get refused")),
+        "{:?}",
+        skipped[&prefix_of(&unreadable)]
+    );
+    for (refused, says) in [
+        (&other_source, "source_table.table_name is \"Other\""),
+        (&other_instant, "does not match the instant in backup_arn"),
+        (&traversal, "must start with the data/ prefix"),
+        (
+            &other_size,
+            "backup_size_bytes is 7 but the data files total",
+        ),
+    ] {
+        let why = incomplete(refused);
+        assert!(
+            why.starts_with("the manifest is refused: ") && why.contains(says),
+            "{refused}: {why}"
+        );
+    }
+    assert_eq!(
+        skipped[&format!("{ACCOUNT}/Music/changelog/")],
+        SkipReason::Reserved("changelog")
+    );
+    assert_eq!(skipped["exports/"], SkipReason::Reserved("exports"));
+    assert!(
+        matches!(&skipped[&format!("{ACCOUNT}/Music/1791976431438/")], SkipReason::NotABackup(why) if why.contains("earlier build")),
+        "{:?}",
+        skipped[&format!("{ACCOUNT}/Music/1791976431438/")]
+    );
+    for (a, status) in &with_rows {
+        assert_eq!(
+            skipped[&prefix_of(a)],
+            SkipReason::HasRow {
+                status: *status,
+                store_id: "store-1".to_owned(),
+                other_table: None,
+            },
+            "{a}"
+        );
+        assert!(
+            !mem.gets().iter().any(|k| k.starts_with(&prefix_of(a))),
+            "{a}: read before its row was checked"
+        );
+    }
+    assert_eq!(report.skipped.len(), 19, "{:?}", report.skipped);
+    // One insert, the good prefix's; every row as it was.
+    assert_eq!(
+        fake.insert_attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&good)
+    );
+    let rows = fake.rows.lock().unwrap();
+    for before in &rows_before {
+        assert_eq!(rows[&before.backup_arn], *before);
+    }
+    assert_eq!(rows.len(), rows_before.len() + 1);
+}
+
+/// The report names the AVAILABLE rows of the configured store whose
+/// manifest the listing does not hold (no prefix at all, or a prefix
+/// without its manifest), not one whose prefix is complete, nor a row of
+/// the root under another store id, with its prefix complete (the prefix
+/// is skipped: the row check covers every id of the root) or gone (it is
+/// no candidate, and `--prune-missing` over the report leaves it). A
+/// prefix whose backup id a row of another root holds is skipped naming
+/// that store. Nothing is modified without `--prune-missing`.
+#[tokio::test]
+async fn sync_reports_missing_manifests_and_rows_of_other_stores_and_changes_none() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    let no_prefix = sync_arn(1);
+    let no_manifest = sync_arn(2);
+    let complete = sync_arn(3);
+    let other_id = sync_arn(4);
+    let other_root = sync_arn(5);
+    let other_id_gone = sync_arn(6);
+    for a in [
+        &no_prefix,
+        &no_manifest,
+        &complete,
+        &other_id,
+        &other_id_gone,
+    ] {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(a.clone(), row(a, BackupStatus::Available));
+    }
+    for a in [&other_id, &other_id_gone] {
+        fake.rows.lock().unwrap().get_mut(a).unwrap().store.store_id = "store-0".to_owned();
+    }
+    let mut elsewhere = row(&other_root, BackupStatus::Available);
+    elsewhere.store.store_root = "/srv/elsewhere".to_owned();
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(other_root.clone(), elsewhere.clone());
+    mem.insert(
+        &format!("{}data/000001.json.gz", prefix_of(&no_manifest)),
+        b"x",
+    );
+    // A key that ends in the manifest's name below the prefix is not the
+    // prefix's manifest: the row is still reported.
+    mem.insert(
+        &format!("{}data/x-extenddb-manifest.json", prefix_of(&no_manifest)),
+        b"{}",
+    );
+    for a in [&complete, &other_id, &other_root] {
+        put_backup(&mem, a);
+    }
+    let rows_before: Vec<BackupRow> = fake.rows.lock().unwrap().values().cloned().collect();
+
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+    let mut missing: Vec<String> = report
+        .missing_manifests
+        .iter()
+        .map(|r| r.backup_arn.clone())
+        .collect();
+    missing.sort();
+    assert_eq!(missing, [no_prefix.clone(), no_manifest.clone()]);
+    let skipped = skipped_by_prefix(&report);
+    assert_eq!(
+        skipped[&prefix_of(&other_id)],
+        SkipReason::HasRow {
+            status: BackupStatus::Available,
+            store_id: "store-0".to_owned(),
+            other_table: None,
+        }
+    );
+    assert!(
+        matches!(&skipped[&prefix_of(&other_root)], SkipReason::RowExists(what) if what.contains("of another store") && what.contains("/srv/elsewhere")),
+        "{:?}",
+        skipped[&prefix_of(&other_root)]
+    );
+    {
+        let rows = fake.rows.lock().unwrap();
+        assert_eq!(rows.len(), rows_before.len());
+        for before in &rows_before {
+            assert_eq!(rows[&before.backup_arn], *before);
+        }
+    }
+
+    // `--prune-missing` over the report removes the two candidates and
+    // leaves the row of the other store id, whose manifest is gone too.
+    let (outcomes, stopped) = super::sync::prune_missing(
+        &*fake,
+        &*mem,
+        &identity.store_root,
+        &report.missing_manifests,
+        &confirmed_claim(),
+        &|| None,
+    )
+    .await;
+    assert_eq!(stopped, None);
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    let rows = fake.rows.lock().unwrap();
+    assert!(!rows.contains_key(&no_prefix) && !rows.contains_key(&no_manifest));
+    assert_eq!(rows[&other_id_gone].status, BackupStatus::Available);
+    assert_eq!(rows[&other_id_gone].store.store_id, "store-0");
+}
+
+/// The insert-if-absent decides against what the read of the rows did not
+/// see, and each case leaves the row it met: a CreateBackup on another
+/// instance whose CREATING row landed between the read and the insert; a
+/// row the catalog holds that its listings do not return (Cassandra's
+/// insert that ended between its two writes); a row of the backup id under
+/// another account. The first two read the same: the row met is read by
+/// its ARN alone, with no listing of the rows of its status.
+#[tokio::test]
+async fn an_insert_that_meets_a_row_leaves_it_and_says_which() {
+    use super::sync::SkipReason;
+    let identity = store();
+    let reason = |report: &super::sync::SyncReport, arn: &str| match &skipped_by_prefix(report)
+        [&prefix_of(arn)]
+    {
+        SkipReason::RowExists(what) => what.clone(),
+        other => panic!("{arn}: {other:?}"),
+    };
+
+    // A CreateBackup racing the sync.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let racing = sync_arn(1);
+    put_backup(&mem, &racing);
+    let creating = row(&racing, BackupStatus::Creating);
+    fake.lands_before_insert
+        .lock()
+        .unwrap()
+        .push(creating.clone());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty());
+    let what = reason(&report, &racing);
+    assert!(
+        what.contains("(CREATING) exists that the catalog's read at the start did not return"),
+        "{what}"
+    );
+    assert!(
+        !fake
+            .row_listings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(Option::is_some),
+        "no listing of one status to word the line"
+    );
+    assert_eq!(fake.rows.lock().unwrap()[&racing], creating);
+
+    // A row the listings do not return.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let unlisted = sync_arn(2);
+    put_backup(&mem, &unlisted);
+    let available = row(&unlisted, BackupStatus::Available);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(unlisted.clone(), available.clone());
+    fake.unlisted.lock().unwrap().insert(unlisted.clone());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty());
+    let what = reason(&report, &unlisted);
+    assert!(
+        what.contains("(AVAILABLE) exists that the catalog's read at the start did not return"),
+        "{what}"
+    );
+    assert_eq!(fake.rows.lock().unwrap()[&unlisted], available);
+
+    // The backup id under another account.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let ours = sync_arn(3);
+    put_backup(&mem, &ours);
+    let theirs = ours.replace(ACCOUNT, "210987654321");
+    let other_account = row(&theirs, BackupStatus::Available);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(theirs.clone(), other_account.clone());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty());
+    let what = reason(&report, &ours);
+    assert!(what.contains("under another account"), "{what}");
+    assert_eq!(fake.rows.lock().unwrap().len(), 1);
+    assert_eq!(fake.rows.lock().unwrap()[&theirs], other_account);
+}
+
+/// A listing that fails stops the sync with no row written, and so does a
+/// read of the rows that fails.
+#[tokio::test]
+async fn a_failed_listing_or_row_read_stops_sync_with_no_row_written() {
+    let identity = store();
+    let mem = Arc::new(MemStore::default());
+    put_backup(&mem, &sync_arn(1));
+    let fake = Arc::new(Fake::default());
+    *mem.fail_lists_of.lock().unwrap() = Some(String::new());
+    let err = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, super::sync::SyncError::Listing { partial, .. } if partial.adopted.is_empty()),
+        "{err}"
+    );
+    assert!(err.to_string().contains("list refused"), "{err}");
+    *mem.fail_lists_of.lock().unwrap() = None;
+
+    *fake.list_error.lock().unwrap() = Some("pool exhausted".to_owned());
+    let err = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, super::sync::SyncError::Catalog(_)), "{err}");
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert!(fake.rows.lock().unwrap().is_empty());
+}
+
+/// `--prune-missing` over the rows a sync reported: a row whose manifest is
+/// gone is removed outright, with no DELETING or DELETED tombstone and no
+/// object deleted (the objects left under its prefix stay, as a host-local
+/// root's bytes on another host would); a row a restore is reading, a row
+/// another writer moved, a row whose manifest is back, a row gone meanwhile
+/// and a row whose manifest's `head` fails are each reported and left; the
+/// rows a restore is reading and the failed `head`'s row are the ones a
+/// later run may remove (the command exits 1 for them). A stop asked before
+/// the first row changes nothing. DeleteBackup's start is never called.
+#[tokio::test]
+async fn prune_missing_removes_rows_whose_manifest_is_gone_and_deletes_nothing() {
+    use super::sync::PruneOutcome;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let gone = sync_arn(1);
+    let leftover = sync_arn(2);
+    let in_use = sync_arn(3);
+    let moved = sync_arn(4);
+    let back = sync_arn(5);
+    let removed = sync_arn(6);
+    let unanswered = sync_arn(7);
+    let rows: Vec<BackupRow> = [
+        &gone,
+        &leftover,
+        &in_use,
+        &moved,
+        &back,
+        &removed,
+        &unanswered,
+    ]
+    .into_iter()
+    .map(|a| row(a, BackupStatus::Available))
+    .collect();
+    for r in &rows {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(r.backup_arn.clone(), r.clone());
+    }
+    let leftover_key = format!("{}data/000001.json.gz", prefix_of(&leftover));
+    mem.insert(&leftover_key, b"x");
+    fake.forget_answers
+        .lock()
+        .unwrap()
+        .insert(in_use.clone(), ForgetRow::InUse("Target".to_owned()));
+    fake.rows.lock().unwrap().get_mut(&moved).unwrap().status = BackupStatus::Deleting;
+    mem.insert(&manifest_key(&back), b"{}");
+    fake.rows.lock().unwrap().remove(&removed);
+    *mem.fail_heads_of.lock().unwrap() = Some(manifest_key(&unanswered));
+
+    let keys: Vec<BackupKey> = rows.iter().map(BackupRow::key).collect();
+    let root = store().store_root;
+    let (none, stopped) =
+        super::sync::prune_missing(&*fake, &*mem, &root, &keys, &confirmed_claim(), &|| {
+            Some("stopped".to_owned())
+        })
+        .await;
+    assert!(none.is_empty());
+    assert_eq!(stopped.as_deref(), Some("stopped"));
+    assert!(fake.forgets_seen.lock().unwrap().is_empty());
+
+    let keys_before = mem.keys();
+    let (outcomes, stopped) =
+        super::sync::prune_missing(&*fake, &*mem, &root, &keys, &confirmed_claim(), &|| None).await;
+    assert_eq!(stopped, None);
+    assert_eq!(
+        outcomes,
+        [
+            (gone.clone(), PruneOutcome::Pruned),
+            (leftover.clone(), PruneOutcome::Pruned),
+            (in_use.clone(), PruneOutcome::InUse("Target".to_owned())),
+            (moved.clone(), PruneOutcome::Status(BackupStatus::Deleting)),
+            (back.clone(), PruneOutcome::ManifestBack),
+            (removed.clone(), PruneOutcome::Gone),
+            (
+                unanswered.clone(),
+                PruneOutcome::Failed(
+                    "the manifest's head failed: transport error: dispatch failure: head refused"
+                        .to_owned()
+                ),
+            ),
+        ]
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|(_, outcome)| outcome.needs_another_run())
+            .collect::<Vec<_>>(),
+        [false, false, true, false, false, false, true]
+    );
+    assert!(
+        !fake
+            .forgets_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|key| key.backup_arn == unanswered),
+        "a failed head removes nothing"
+    );
+    let after = fake.rows.lock().unwrap();
+    assert!(!after.contains_key(&gone), "no tombstone is left");
+    assert!(!after.contains_key(&leftover), "no tombstone is left");
+    assert_eq!(after[&in_use].status, BackupStatus::Available);
+    assert_eq!(after[&moved].status, BackupStatus::Deleting);
+    assert_eq!(after[&back].status, BackupStatus::Available);
+    assert_eq!(after[&unanswered].status, BackupStatus::Available);
+    assert_eq!(mem.keys(), keys_before, "no object was deleted");
+    assert!(mem.keys().contains(&leftover_key));
+    assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+}
+
+/// A stop asked after the first removal (a SIGTERM during a long prune)
+/// ends the loop before the next row: one `Pruned` outcome, the reason
+/// returned, the later rows still AVAILABLE and never offered to the
+/// removal. The removal is logged under the audit target, once.
+#[tokio::test]
+async fn prune_missing_stops_after_a_removal_when_asked() {
+    use super::sync::PruneOutcome;
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let arns: Vec<String> = (1..=3).map(sync_arn).collect();
+    for a in &arns {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(a.clone(), row(a, BackupStatus::Available));
+    }
+    let keys: Vec<BackupKey> = arns
+        .iter()
+        .map(|a| row(a, BackupStatus::Available).key())
+        .collect();
+    let removals = || fake.forgets_seen.lock().unwrap().len();
+    let stop = || (removals() >= 1).then(|| "SIGTERM".to_owned());
+    let (outcomes, stopped) = super::sync::prune_missing(
+        &*fake,
+        &*mem,
+        &store().store_root,
+        &keys,
+        &confirmed_claim(),
+        &stop,
+    )
+    .await;
+    assert_eq!(outcomes, [(arns[0].clone(), PruneOutcome::Pruned)]);
+    assert_eq!(stopped.as_deref(), Some("SIGTERM"));
+    assert_eq!(removals(), 1);
+    let rows = fake.rows.lock().unwrap();
+    assert!(!rows.contains_key(&arns[0]));
+    for later in &arns[1..] {
+        assert_eq!(rows[later].status, BackupStatus::Available, "{later}");
+    }
+    assert_eq!(
+        lines
+            .containing("removed an AVAILABLE row whose manifest is not under the root")
+            .len(),
+        1
+    );
+}
+
+/// `--adopt-store`'s rewrite: the file names this catalog, keeps its store
+/// id and creation time, and is written once; the identity is the file's
+/// id; the previous owner's next check finds the root owned by another
+/// catalog. On a root this catalog owns nothing is written. A root whose
+/// rows in this catalog carry another id, and a root with no file, are
+/// refused with nothing written.
+#[tokio::test]
+async fn adopt_store_makes_this_catalog_the_owner_and_keeps_the_store_id() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, Adoption, adopt};
+    let file = StoreIdentityFile {
+        format_version: 1,
+        store_id: "store-7".to_owned(),
+        catalog_id: "previous".to_owned(),
+        backend: "postgres".to_owned(),
+        created_at_ms: 1234,
+        ephemeral_catalog: false,
+    };
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &file.to_bytes());
+    let fake = Fake::default();
+    let adopted = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap();
+    let identity = StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/r".to_owned(),
+        store_id: "store-7".to_owned(),
+    };
+    assert_eq!(
+        adopted,
+        Adoption::Adopted {
+            identity: identity.clone(),
+            previous_catalog_id: "previous".to_owned(),
+        }
+    );
+    let now = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(
+        now,
+        StoreIdentityFile {
+            catalog_id: "catalog-1".to_owned(),
+            backend: "sqlite".to_owned(),
+            ..file.clone()
+        }
+    );
+    assert_eq!(mem.puts.lock().unwrap().as_slice(), [STORE_IDENTITY_KEY]);
+    // The previous owner's next check.
+    let previous = Fake::default();
+    *previous.catalog_id.lock().unwrap() = Some("previous".to_owned());
+    assert_eq!(
+        store_identity::recheck(&mem, &identity, &previous, "postgres", false).await,
+        Err(StoreProblem::ForeignCatalog {
+            file_catalog_id: "catalog-1".to_owned(),
+            catalog_id: "previous".to_owned(),
+        })
+    );
+    // Already this catalog's: nothing written.
+    let again = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, Adoption::AlreadyOwned(identity.clone()));
+    assert_eq!(mem.puts.lock().unwrap().len(), 1);
+
+    // This catalog's rows for the root carry another id.
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &file.to_bytes());
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        AdoptRefusal::RowsCarryOtherIds {
+            file_id: "store-7".to_owned(),
+            row_ids: vec!["store-1".to_owned()],
+        }
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(
+        StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap(),
+        file
+    );
+
+    // No file.
+    let mem = MemStore::default();
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &Fake::default(),
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, AdoptRefusal::NoFile { row_ids: vec![] });
+    assert!(matches!(
+        err.into_problem("catalog-1"),
+        StoreProblem::FileUnreadable(_)
+    ));
+    assert!(mem.keys().is_empty());
+}
+
+/// Two adopters of one root race through a plain put: the one whose write
+/// is replaced before its re-read reports the race lost, naming the
+/// catalog the file names now.
+#[tokio::test]
+async fn an_adoption_overwritten_before_its_re_read_reports_the_race_lost() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, adopt};
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-7", "previous"));
+    let third = identity_file("store-7", "third");
+    let racer = Arc::clone(&mem);
+    *mem.on_put.lock().unwrap() = Some(Box::new(move |key: &str| {
+        if key == STORE_IDENTITY_KEY {
+            racer.insert(STORE_IDENTITY_KEY, &third);
+        }
+    }));
+    let err = adopt(
+        &*mem,
+        StoreKind::Filesystem,
+        "/r",
+        &Fake::default(),
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    *mem.on_put.lock().unwrap() = None;
+    assert_eq!(
+        err,
+        AdoptRefusal::RaceLost {
+            file_catalog_id: "third".to_owned(),
+            file_store_id: "store-7".to_owned(),
+        }
+    );
+    assert_eq!(
+        err.into_problem("catalog-1"),
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "third".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    // A re-read that names this catalog under another store id (the root
+    // replaced by another root of the same catalog between the put and the
+    // re-read) is lost too: the file is not the one this adoption wrote.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-7", "previous"));
+    let replaced = identity_file("store-8", "catalog-1");
+    let racer = Arc::clone(&mem);
+    *mem.on_put.lock().unwrap() = Some(Box::new(move |key: &str| {
+        if key == STORE_IDENTITY_KEY {
+            racer.insert(STORE_IDENTITY_KEY, &replaced);
+        }
+    }));
+    let err = adopt(
+        &*mem,
+        StoreKind::Filesystem,
+        "/r",
+        &Fake::default(),
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    *mem.on_put.lock().unwrap() = None;
+    assert_eq!(
+        err,
+        AdoptRefusal::RaceLost {
+            file_catalog_id: "catalog-1".to_owned(),
+            file_store_id: "store-8".to_owned(),
+        }
+    );
+}
+
+/// `--adopt-store` runs the check the server runs on the root as it will
+/// be once this catalog owns it before anything is written: with this
+/// catalog's newest AVAILABLE row of the root missing its manifest, the
+/// adoption is refused as `Unusable` naming the probe's problem, no put is
+/// made, the file still names its owner, and no audit line says a rewrite
+/// started.
+#[tokio::test]
+async fn adopt_store_refuses_a_root_this_catalog_cannot_use_with_nothing_written() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, adopt};
+    let (lines, _guard) = LogLines::capture();
+    let mem = MemStore::default();
+    let owned = identity_file("store-1", "previous");
+    mem.insert(STORE_IDENTITY_KEY, &owned);
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        &store().store_root,
+        &*fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        Some(&confirmed_claim()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, AdoptRefusal::Unusable { file_catalog_id, problem: StoreProblem::ManifestMissing { .. } }
+            if file_catalog_id == "previous"),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("nothing was written") && text.contains("still names catalog previous"),
+        "{text}"
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(mem.objects.lock().unwrap()[STORE_IDENTITY_KEY], owned);
+    assert!(lines.containing("to name this catalog").is_empty());
+    assert!(matches!(
+        err.into_problem("catalog-1"),
+        StoreProblem::ManifestMissing { .. }
+    ));
+}
+
+/// The refusals of `adopt`'s first read, for a file changed between the
+/// command's check and the read: a root whose file is gone under a row of
+/// this catalog names the rows' ids (`FileMissingWithRows`, which plain
+/// sync refuses too), and a file naming this catalog over rows under two
+/// store ids is `MultipleRowIds`; neither writes anything.
+#[tokio::test]
+async fn adopt_stores_first_read_refuses_a_missing_file_under_rows_and_rows_of_two_ids() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, adopt};
+    let root = store().store_root;
+    let mem = MemStore::default();
+    let fake = fake_with_row(BackupStatus::Available);
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        &root,
+        &*fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        AdoptRefusal::NoFile {
+            row_ids: vec!["store-1".to_owned()]
+        }
+    );
+    assert_eq!(
+        err.into_problem("catalog-1"),
+        StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()])
+    );
+    assert!(mem.keys().is_empty(), "nothing was written");
+
+    let mem = MemStore::default();
+    let file = identity_file("store-1", "catalog-1");
+    mem.insert(STORE_IDENTITY_KEY, &file);
+    let fake = fake_with_row(BackupStatus::Available);
+    let mut other = row(&newer_arn(ACCOUNT), BackupStatus::Available);
+    other.store.store_id = "store-9".to_owned();
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(other.backup_arn.clone(), other);
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        &root,
+        &*fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap_err();
+    let AdoptRefusal::Problem(StoreProblem::MultipleRowIds(mut ids)) = err else {
+        panic!("{err:?}");
+    };
+    ids.sort();
+    assert_eq!(ids, ["store-1", "store-9"]);
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(mem.objects.lock().unwrap()[STORE_IDENTITY_KEY], file);
+}
+
+/// `--adopt-store` on a store that stops answering ends at the store's
+/// bound, at the call that did not finish, and the refusal names that
+/// step: the first read of the file, the re-read after the rewrite (the
+/// put landed), or, on a root this catalog already owns, the manifest
+/// probe's `head`. The catalog's reads are not under the bound.
+#[tokio::test(start_paused = true)]
+async fn adopt_store_on_a_store_that_stops_answering_names_the_step() {
+    use super::store_identity::{AdoptRefusal, adopt_configured};
+    for (cell, step, puts) in [
+        ("the first read", "the first read of extenddb-store.json", 0),
+        (
+            "the re-read",
+            "the re-read after the rewrite of extenddb-store.json",
+            1,
+        ),
+        (
+            "the probe of an owned root",
+            "the manifest probe of extenddb-store.json",
+            0,
+        ),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        let owned = cell.contains("owned");
+        let file_catalog = if owned { "catalog-1" } else { "previous" };
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", file_catalog));
+        let configured = ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        );
+        let fake = if owned {
+            // The probe `head`s the newest AVAILABLE row's manifest, and
+            // that call never answers.
+            let manifest_key = format!("{}{EXTENDDB_MANIFEST_FILE}", prefix_of(&arn(ACCOUNT)));
+            *mem.stall_heads_of.lock().unwrap() = Some(manifest_key);
+            fake_with_row(BackupStatus::Available)
+        } else {
+            failing_identity(&mem, puts, IdentityFailure::Stall);
+            Arc::new(Fake::default())
+        };
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(300),
+            adopt_configured(&configured, &*fake, "sqlite", None),
+        )
+        .await
+        .expect("the adoption is bounded")
+        .unwrap_err();
+        assert_eq!(started.elapsed(), configured.check_timeout(), "{cell}");
+        let AdoptRefusal::Problem(StoreProblem::Transport(text)) = &err else {
+            panic!("{cell}: {err:?}");
+        };
+        assert!(
+            text.starts_with(step) && text.contains("did not finish within 5 s"),
+            "{cell}: {text}"
+        );
+        assert!(err.to_string().contains(step), "{cell}: {err}");
+        assert_eq!(mem.puts.lock().unwrap().len(), puts, "{cell}");
+        assert!(configured.check_call_in_flight(), "{cell}: parked");
+    }
+}
+
+/// A server whose own catalog is in memory adopts, in its startup check, a
+/// root whose file another in-memory catalog wrote, keeping the store id
+/// and writing the marker; a root a durable catalog owns stays owned by
+/// another catalog, its file untouched; a durable server never adopts a
+/// marked root; and once the identity is known the re-check never adopts,
+/// so a second in-memory server's later adoption leaves the first one's
+/// store owned by another catalog.
+#[tokio::test]
+async fn an_in_memory_catalog_adopts_only_a_root_another_in_memory_catalog_owned() {
+    // Marked: adopted.
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "previous-start", true),
+    );
+    let fake = Fake::default();
+    let identity =
+        store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "sqlite", true)
+            .await
+            .unwrap();
+    assert_eq!(identity.store_id, "store-7");
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.catalog_id, "catalog-1");
+    assert_eq!(file.store_id, "store-7");
+    assert!(file.ephemeral_catalog);
+
+    // A durable owner: unhealthy, nothing written.
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "durable", false),
+    );
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "sqlite", true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "durable".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+
+    // A durable server and a marked root: unhealthy, nothing written.
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "previous-start", true),
+    );
+    let err =
+        store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "postgres", false)
+            .await
+            .unwrap_err();
+    assert!(matches!(err, StoreProblem::ForeignCatalog { .. }), "{err}");
+    assert!(mem.puts.lock().unwrap().is_empty());
+
+    // An empty root: the file an in-memory catalog creates carries the
+    // marker.
+    let mem = MemStore::default();
+    store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "sqlite", true)
+        .await
+        .unwrap();
+    let created =
+        StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert!(created.ephemeral_catalog);
+
+    // The identity known: another in-memory server took the root since.
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "second-server", true),
+    );
+    let known = StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/r".to_owned(),
+        store_id: "store-7".to_owned(),
+    };
+    let err = store_identity::recheck(&mem, &known, &fake, "sqlite", true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreProblem::ForeignCatalog { .. }), "{err}");
+    assert!(mem.puts.lock().unwrap().is_empty());
+}
+
+/// A runtime whose store `mem` is unchecked, for an in-memory catalog when
+/// `ephemeral` is set (`store()`'s kind and root).
+fn runtime_checking(mem: &Arc<MemStore>, ephemeral: bool) -> BackupRuntime {
+    runtime().with_store(
+        ConfiguredStore::checking(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+        )
+        .with_ephemeral_catalog(ephemeral),
+    )
+}
+
+/// The startup of a server whose catalog is in memory, against the root
+/// the previous start owned: the first reconciler cycle's check adopts the
+/// root and the startup sync gives the previous start's backup its row
+/// again, under the file's store id; the next cycle syncs no more. A root a
+/// durable catalog owns stays unhealthy and nothing is synced, the sync
+/// left pending. A listing that fails leaves the sync pending, and the next
+/// cycle runs it.
+#[tokio::test]
+async fn the_startup_sync_of_an_in_memory_catalog_serves_the_previous_starts_backups() {
+    let previous = sync_arn(1);
+
+    let mem = Arc::new(MemStore::default());
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "previous-start", true),
+    );
+    put_backup(&mem, &previous);
+    // A prefix with no manifest: skipped, and no later run adopts it
+    // unless the store changes, so it leaves the sync done.
+    let incomplete = sync_arn(2);
+    mem.insert(
+        &format!("{}data/000001.json.gz", prefix_of(&incomplete)),
+        b"x",
+    );
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_checking(&mem, true);
+    let store_of =
+        |runtime: &BackupRuntime| runtime.configured_store().unwrap().startup_sync_pending();
+    assert!(store_of(&runtime));
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    let row = fake.rows.lock().unwrap()[&previous].clone();
+    assert_eq!(row.status, BackupStatus::Available);
+    assert_eq!(row.store.store_id, "store-7");
+    assert!(!fake.rows.lock().unwrap().contains_key(&incomplete));
+    assert!(
+        !store_of(&runtime),
+        "an incomplete prefix leaves the sync done"
+    );
+    cycle_on(&fake, &runtime).await;
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 1, "synced once");
+
+    // A durable owner.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "durable", false),
+    );
+    put_backup(&mem, &previous);
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_checking(&mem, true);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(false));
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert!(store_of(&runtime));
+
+    // The listing fails once.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "previous-start", true),
+    );
+    put_backup(&mem, &previous);
+    *mem.fail_lists_of.lock().unwrap() = Some(String::new());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_checking(&mem, true);
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(store_of(&runtime));
+    *mem.fail_lists_of.lock().unwrap() = None;
+    cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&previous].status,
+        BackupStatus::Available
+    );
+    assert!(!store_of(&runtime));
+
+    // A durable catalog has no startup sync.
+    let mem = Arc::new(MemStore::default());
+    put_backup(&mem, &previous);
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_checking(&mem, false);
+    assert!(!store_of(&runtime));
+    cycle_on(&fake, &runtime).await;
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+}
+
+/// The server's own call of the startup sync (before it serves, a
+/// filesystem store whose check passed) runs it once; a run abandoned at
+/// the server's bound (its future dropped while the store does not answer)
+/// leaves it pending for the reconciler.
+#[tokio::test]
+async fn a_startup_sync_abandoned_at_its_bound_stays_pending() {
+    let mem = Arc::new(MemStore::default());
+    put_backup(&mem, &sync_arn(1));
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let pending = || runtime.configured_store().unwrap().startup_sync_pending();
+    mem.set_stalled(true);
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(50),
+        super::sync::startup_sync(&*fake, &runtime),
+    )
+    .await;
+    assert!(abandoned.is_err());
+    assert!(mem.stalls.load(std::sync::atomic::Ordering::Acquire) > 0);
+    assert!(pending(), "left pending");
+    let configured = runtime.configured_store().unwrap();
+    assert!(
+        configured.check_call_in_flight(),
+        "the dropped run's call is marked in flight"
+    );
+    mem.set_stalled(false);
+    for _ in 0..200 {
+        if !configured.check_call_in_flight() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!configured.check_call_in_flight(), "the call returned");
+    let ran = super::sync::startup_sync(&*fake, &runtime).await;
+    assert!(matches!(ran, Some(Ok(ref report)) if report.adopted.len() == 1));
+    assert!(!pending());
+    assert!(super::sync::startup_sync(&*fake, &runtime).await.is_none());
+}
+
+/// A reconciler cycle whose startup sync meets a root listing that does
+/// not answer within the sync's bound returns once that bound passes. The
+/// listing runs as the store's bounded calls run a filesystem call, so the
+/// abandoned walk is marked in flight: the cycle's store duties are refused
+/// at once rather than starting a call beside it (the DELETING row stays
+/// for a later cycle), the sync stays pending, and the next cycle's check
+/// is refused at once with no second listing of the root, recording the
+/// store unreachable with a text that names the startup sync's call. Once
+/// the walk ends, the next cycle's check passes, the sync runs and adopts,
+/// and the deletion is finished.
+#[tokio::test(start_paused = true)]
+async fn a_cycles_startup_sync_cut_at_its_bound_leaves_its_walk_in_flight() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let deleting = arn(ACCOUNT);
+    seed(&fake, &mem, &deleting, BackupStatus::Deleting);
+    put_backup(&mem, &sync_arn(1));
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let configured = runtime.configured_store().unwrap();
+    mem.hold_root_list
+        .store(true, std::sync::atomic::Ordering::Release);
+    let started = tokio::time::Instant::now();
+    // A guard far past the bound, so a startup sync with no bound fails
+    // here instead of hanging.
+    let report = tokio::time::timeout(
+        super::sync::STARTUP_SYNC_TIMEOUT * 5,
+        cycle_on(&fake, &runtime),
+    )
+    .await
+    .expect("the startup sync is bounded");
+    let took = started.elapsed();
+    assert_eq!(
+        report.store_healthy,
+        Some(true),
+        "{:?}",
+        configured.health()
+    );
+    assert!(took >= super::sync::STARTUP_SYNC_TIMEOUT, "{took:?}");
+    assert!(
+        took < super::sync::STARTUP_SYNC_TIMEOUT + Duration::from_secs(1),
+        "{took:?}: the duties after the sync waited for nothing"
+    );
+    assert!(configured.check_call_in_flight(), "the walk is marked");
+    assert!(report.deletions_finished.is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+    assert!(configured.startup_sync_pending(), "left pending");
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    let root_lists = || {
+        mem.lists
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.is_empty())
+            .count()
+    };
+    assert_eq!(root_lists(), 1);
+
+    let started = tokio::time::Instant::now();
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(report.store_healthy, Some(false));
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::Transport(
+            "an abandoned startup sync's store call has not returned".to_owned()
+        ))
+    );
+    assert_eq!(runtime.store_health().unwrap().reason, Some("unreachable"));
+    assert_eq!(root_lists(), 1, "no second walk beside the first");
+    assert!(configured.startup_sync_pending());
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+
+    // The walk ends: its task clears the mark, and the next cycle's check
+    // passes, runs the sync and finishes the deletion.
+    mem.hold_root_list
+        .store(false, std::sync::atomic::Ordering::Release);
+    for _ in 0..200 {
+        if !configured.check_call_in_flight() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!configured.check_call_in_flight(), "the walk returned");
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        report.store_healthy,
+        Some(true),
+        "{:?}",
+        configured.health()
+    );
+    assert!(!configured.startup_sync_pending(), "the sync ran");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&sync_arn(1)].status,
+        BackupStatus::Available,
+        "adopted by the later cycle's run"
+    );
+    assert_eq!(report.deletions_finished, vec![deleting.clone()]);
+    assert_eq!(
+        mem.deletes.lock().unwrap().as_slice(),
+        [manifest_key(&deleting), prefix_of(&deleting)],
+        "the manifest first, then the prefix"
+    );
+}
+
+/// The startup sync's per-prefix lines: the first run, which lists the
+/// whole root, logs each prefix it skipped (INFO, or WARN for a store
+/// error); a second run of the sync left pending logs the store error's
+/// WARN again and the other skips at DEBUG, so its INFO and WARN lines are
+/// the transient skip's and the line of counts.
+#[tokio::test]
+async fn a_second_startup_sync_run_logs_only_the_transient_skips_and_the_counts() {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    // Three prefixes skipped for good (a row of each) and one whose
+    // manifest the store fails to serve.
+    for n in 1..=3 {
+        let held = sync_arn(n);
+        put_backup(&mem, &held);
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(held.clone(), row(&held, BackupStatus::Available));
+    }
+    let failing = sync_arn(4);
+    put_backup(&mem, &failing);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&failing));
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let configured = runtime.configured_store().unwrap();
+    let ours = |level| {
+        lines
+            .at_level(level)
+            .into_iter()
+            .filter(|m| m.contains("startup sync"))
+            .collect::<Vec<_>>()
+    };
+
+    let first = super::sync::startup_sync(&*fake, &runtime).await;
+    assert!(matches!(first, Some(Ok(ref r)) if r.transient_skips() == 1));
+    assert!(configured.startup_sync_pending(), "left pending");
+    let first_info = ours(tracing::Level::INFO);
+    let first_warn = ours(tracing::Level::WARN);
+    assert_eq!(
+        first_info.len(),
+        3 + 1,
+        "three skips and the counts: {first_info:?}"
+    );
+    assert_eq!(first_warn.len(), 1, "{first_warn:?}");
+
+    let second = super::sync::startup_sync(&*fake, &runtime).await;
+    assert!(matches!(second, Some(Ok(ref r)) if r.skipped.len() == 4));
+    let info = ours(tracing::Level::INFO);
+    let warn = ours(tracing::Level::WARN);
+    assert_eq!(
+        info.len() - first_info.len(),
+        1,
+        "the line of counts alone: {:?}",
+        &info[first_info.len()..]
+    );
+    assert!(
+        info.last().unwrap().contains("4 prefix(es) skipped"),
+        "{info:?}"
+    );
+    assert_eq!(
+        warn.len() - first_warn.len(),
+        1,
+        "the transient skip: {warn:?}"
+    );
+    assert!(
+        warn.last().unwrap().contains(&prefix_of(&failing)),
+        "{warn:?}"
+    );
+    assert_eq!(
+        ours(tracing::Level::DEBUG).len(),
+        3,
+        "the second run's lasting skips"
+    );
+    assert!(configured.startup_sync_reported());
+}
+
+/// Three startup sync runs over a root with one prefix skipped for good (a
+/// row holds its backup) and one whose manifest the store fails to serve,
+/// the first run ending before it reports: listing the root fails
+/// (`cut_at_bound` false) or the listing stalls past
+/// [`super::sync::STARTUP_SYNC_TIMEOUT`] (true). That run names no prefix.
+/// The second run lists the whole root and is the first to report, so it
+/// logs the lasting skip at INFO; the third logs it at DEBUG. The transient
+/// skip is a WARN line in the second and third runs.
+async fn startup_sync_logs_its_skips_at_info_until_a_run_has_reported(cut_at_bound: bool) {
+    let (lines, _guard) = LogLines::capture();
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let held = sync_arn(1);
+    put_backup(&mem, &held);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(held.clone(), row(&held, BackupStatus::Available));
+    let failing = sync_arn(2);
+    put_backup(&mem, &failing);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&failing));
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let configured = runtime.configured_store().unwrap();
+    let naming = |level, prefix: &str| {
+        lines
+            .at_level(level)
+            .into_iter()
+            .filter(|m| m.contains("startup sync") && m.contains(prefix))
+            .count()
+    };
+
+    if cut_at_bound {
+        mem.hold_root_list
+            .store(true, std::sync::atomic::Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let first = tokio::time::timeout(
+            super::sync::STARTUP_SYNC_TIMEOUT * 5,
+            super::sync::startup_sync(&*fake, &runtime),
+        )
+        .await
+        .expect("the startup sync is bounded");
+        // The run's bound and its listing call's bound are one length: the
+        // run ends at the bound either way, with no report.
+        assert!(matches!(first, None | Some(Err(_))), "{first:?}");
+        assert!(started.elapsed() >= super::sync::STARTUP_SYNC_TIMEOUT);
+        assert!(
+            configured.check_call_in_flight(),
+            "the abandoned walk is marked"
+        );
+        mem.hold_root_list
+            .store(false, std::sync::atomic::Ordering::Release);
+        for _ in 0..200 {
+            if !configured.check_call_in_flight() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!configured.check_call_in_flight(), "the walk returned");
+    } else {
+        *mem.fail_lists_of.lock().unwrap() = Some(String::new());
+        let first = super::sync::startup_sync(&*fake, &runtime).await;
+        assert!(matches!(first, Some(Err(_))), "{first:?}");
+        *mem.fail_lists_of.lock().unwrap() = None;
+    }
+    assert!(configured.startup_sync_pending(), "left pending");
+    assert!(!configured.startup_sync_reported());
+    let held_prefix = prefix_of(&held);
+    let failing_prefix = prefix_of(&failing);
+    for level in [
+        tracing::Level::INFO,
+        tracing::Level::WARN,
+        tracing::Level::DEBUG,
+    ] {
+        assert_eq!(naming(level, &held_prefix), 0, "{level}: no prefix named");
+    }
+
+    let second = super::sync::startup_sync(&*fake, &runtime).await;
+    assert!(
+        matches!(second, Some(Ok(ref r)) if r.skipped.len() == 2),
+        "{second:?}"
+    );
+    assert!(configured.startup_sync_reported());
+    assert!(configured.startup_sync_pending(), "the transient skip");
+    assert_eq!(
+        naming(tracing::Level::INFO, &held_prefix),
+        1,
+        "the first run to report names the lasting skip at INFO"
+    );
+    assert_eq!(naming(tracing::Level::DEBUG, &held_prefix), 0);
+    assert_eq!(naming(tracing::Level::WARN, &failing_prefix), 1);
+
+    let third = super::sync::startup_sync(&*fake, &runtime).await;
+    assert!(
+        matches!(third, Some(Ok(ref r)) if r.skipped.len() == 2),
+        "{third:?}"
+    );
+    assert_eq!(
+        naming(tracing::Level::INFO, &held_prefix),
+        1,
+        "no second INFO line"
+    );
+    assert_eq!(naming(tracing::Level::DEBUG, &held_prefix), 1);
+    assert_eq!(naming(tracing::Level::WARN, &failing_prefix), 2);
+}
+
+#[tokio::test]
+async fn a_startup_sync_whose_first_run_fails_logs_its_skips_at_info_on_the_next() {
+    startup_sync_logs_its_skips_at_info_until_a_run_has_reported(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_startup_sync_whose_first_run_is_cut_at_its_bound_logs_its_skips_at_info_on_the_next() {
+    startup_sync_logs_its_skips_at_info_until_a_run_has_reported(true).await;
+}
+
+/// The line a startup sync cut short ends with says that the store is
+/// unreachable until the abandoned call returns exactly when a store call
+/// is still in flight, on a filesystem root, on either arm, and names the
+/// caller the in-flight mark names: the root's listing held past the bound
+/// (the listing's own bound, as long as the run's, ends the run with a
+/// listing error, the walk marked in flight), the sidecar's read stalled
+/// once the run's first second has passed (the run's bound ends it before
+/// the read's own, the read marked in flight), the row's insert stalled
+/// after every store call of the run returned (the run's bound ends it with
+/// nothing marked, and the line says nothing of the store), the root's
+/// listing failing at once (a listing error with nothing marked, and the
+/// line says nothing of the store), a deletion's call holding the slot
+/// the listing waits for (the deletion abandoned at its own bound and
+/// marked, the listing's wait ending at the run's bound, and the line names
+/// the deletion), and a deletion's call that takes the slot while the
+/// manifest's read holds it (each call takes a second and the deletion
+/// starts at 500 ms, so it holds the slot from the first second on, is
+/// abandoned and marked at its own bound, and the run's bound ends the run
+/// while the sidecar's read still waits for the slot; the line names the
+/// deletion).
+#[tokio::test(start_paused = true)]
+async fn a_cut_startup_sync_names_the_store_unreachable_only_while_its_call_is_in_flight() {
+    #[derive(Debug, Clone, Copy)]
+    enum Cut {
+        ListingHeld,
+        SidecarReadStalled,
+        InsertStalled,
+        ListingFails,
+        DeletionInFlight,
+        DeletionAheadOfTheSidecarRead,
+    }
+    const DELETION_CLAUSE: &str = "(once the abandoned deletion has returned; until then the \
+                                   store is unreachable)";
+    const OWN_CALL: &str = "startup sync's store call";
+    const CLAUSE: &str = "(once the abandoned startup sync's store call has returned; until \
+                          then the store is unreachable)";
+    let (lines, _guard) = LogLines::capture();
+    for cut in [
+        Cut::ListingHeld,
+        Cut::SidecarReadStalled,
+        Cut::InsertStalled,
+        Cut::ListingFails,
+        Cut::DeletionInFlight,
+        Cut::DeletionAheadOfTheSidecarRead,
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let backup = sync_arn(1);
+        put_backup(&mem, &backup);
+        let runtime = runtime().with_store(
+            ConfiguredStore::new(
+                store().store_kind,
+                store().store_root,
+                Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+                None,
+                Ok(store()),
+            )
+            .with_ephemeral_catalog(true),
+        );
+        let configured = runtime.configured_store().unwrap();
+        match cut {
+            Cut::ListingHeld => mem
+                .hold_root_list
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::SidecarReadStalled => {
+                // Each call takes a second, so the sidecar's read, the
+                // run's second call after its listing, starts once a
+                // second has passed and its own bound ends after the run's.
+                mem.set_delay(Some(Duration::from_secs(1)));
+                *mem.stall_gets_of.lock().unwrap() =
+                    Some(format!("{}{MANIFEST_CHECKSUM_FILE}", prefix_of(&backup)));
+            }
+            Cut::InsertStalled => fake
+                .stall_inserts
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::ListingFails => *mem.fail_lists_of.lock().unwrap() = Some(String::new()),
+            Cut::DeletionInFlight => mem
+                .stall_deletes
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::DeletionAheadOfTheSidecarRead => {
+                mem.set_delay(Some(Duration::from_secs(1)));
+                mem.stall_deletes
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let before = lines
+            .containing("startup sync of the in-memory catalog")
+            .len();
+        let run = tokio::time::timeout(
+            super::sync::STARTUP_SYNC_TIMEOUT * 5,
+            super::sync::startup_sync(&*fake, &runtime),
+        );
+        let deletion_after = match cut {
+            // The deletion's call takes the slot first; the run's listing
+            // waits for it.
+            Cut::DeletionInFlight => Some(Duration::ZERO),
+            // The deletion waits for the slot behind the manifest's read
+            // and takes it before the sidecar's read.
+            Cut::DeletionAheadOfTheSidecarRead => Some(Duration::from_millis(500)),
+            _ => None,
+        };
+        let ran = if let Some(after) = deletion_after {
+            let deletion = configured.calls("deletion");
+            let prefix = prefix_of(&backup);
+            let delete = async {
+                if !after.is_zero() {
+                    tokio::time::sleep(after).await;
+                }
+                extenddb_backup_store::BackupStore::delete_prefix(&deletion, &prefix).await
+            };
+            let (deleted, ran) = futures::future::join(delete, run).await;
+            assert!(deleted.is_err(), "the deletion is abandoned: {deleted:?}");
+            ran
+        } else {
+            run.await
+        }
+        .expect("the startup sync is bounded");
+        let logged = lines.containing("startup sync of the in-memory catalog")[before..].to_vec();
+        let [line] = logged.as_slice() else {
+            panic!("{cut:?}: one line: {logged:?}");
+        };
+        assert_eq!(
+            lines
+                .at_level(tracing::Level::WARN)
+                .last()
+                .map(String::as_str),
+            Some(line.as_str()),
+            "{cut:?}"
+        );
+        assert!(configured.startup_sync_pending(), "{cut:?}: left pending");
+        match cut {
+            Cut::ListingHeld => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some(OWN_CALL),
+                    "the walk is marked"
+                );
+                assert!(line.ends_with(CLAUSE), "{line}");
+                mem.hold_root_list
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the walk returned");
+            }
+            Cut::SidecarReadStalled => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some(OWN_CALL),
+                    "the read is marked"
+                );
+                assert!(line.ends_with(CLAUSE), "{line}");
+            }
+            Cut::InsertStalled => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(
+                    fake.insert_attempts.lock().unwrap().len(),
+                    1,
+                    "cut in the insert"
+                );
+                assert!(!configured.check_call_in_flight(), "nothing is marked");
+                assert!(line.ends_with("from the first key of the root"), "{line}");
+            }
+            Cut::ListingFails => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert!(!configured.check_call_in_flight(), "nothing is marked");
+                assert!(
+                    line.ends_with("a later reconciler cycle runs it again"),
+                    "{line}"
+                );
+            }
+            Cut::DeletionInFlight => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some("deletion"),
+                    "the deletion is marked"
+                );
+                assert!(line.ends_with(DELETION_CLAUSE), "{line}");
+                // The listing's error names the run's call; the clause
+                // names the deletion's.
+                assert!(!line.contains(&format!("abandoned {OWN_CALL}")), "{line}");
+                mem.stall_deletes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the deletion returned");
+            }
+            Cut::DeletionAheadOfTheSidecarRead => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                // The manifest's read reached the store; the sidecar's
+                // never held the slot.
+                let prefix = prefix_of(&backup);
+                let gets = mem.gets.lock().unwrap().clone();
+                assert!(
+                    gets.contains(&format!("{prefix}{EXTENDDB_MANIFEST_FILE}")),
+                    "{gets:?}"
+                );
+                assert!(
+                    !gets.contains(&format!("{prefix}{MANIFEST_CHECKSUM_FILE}")),
+                    "{gets:?}"
+                );
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some("deletion"),
+                    "the deletion is marked"
+                );
+                assert!(line.ends_with(DELETION_CLAUSE), "{line}");
+                assert!(!line.contains(&format!("abandoned {OWN_CALL}")), "{line}");
+                mem.stall_deletes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the deletion returned");
+            }
+        }
+    }
+}
+
+/// A startup sync another caller has taken is not run again: with the
+/// pending sync taken, `startup_sync` answers `None` with no listing of the
+/// root and no row read, and the sync is not handed back.
+#[tokio::test]
+async fn a_taken_startup_sync_is_not_run_by_a_second_caller() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    put_backup(&mem, &sync_arn(1));
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let configured = runtime.configured_store().unwrap();
+    assert!(configured.startup_sync_pending());
+    assert!(configured.take_startup_sync(), "the first caller takes it");
+    assert!(super::sync::startup_sync(&*fake, &runtime).await.is_none());
+    assert!(mem.lists.lock().unwrap().is_empty(), "no listing");
+    assert!(fake.row_listings.lock().unwrap().is_empty(), "no row read");
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert!(!configured.startup_sync_pending(), "not handed back");
+}
+
+/// A manifest the path does not name is skipped whatever component differs
+/// (another account, another table), and so is one in another partition
+/// whose components match the path: every request refuses an ARN outside
+/// `aws` before it reads a row, so no request could address the row.
+/// Nothing is inserted.
+#[tokio::test]
+async fn sync_skips_a_manifest_of_another_account_table_or_partition() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    let moved_under = |from: &str, to: &str| {
+        for (key, bytes) in backup_objects(from) {
+            mem.insert(&key.replacen(&prefix_of(from), &prefix_of(to), 1), &bytes);
+        }
+    };
+    let account_path = sync_arn(1);
+    let other_account = account_path.replace(ACCOUNT, "210987654321");
+    moved_under(&other_account, &account_path);
+    let table_path = sync_arn(2);
+    let other_table = table_path.replace("table/Music", "table/Other");
+    moved_under(&other_table, &table_path);
+    let partition = sync_arn(3)
+        .replace("arn:aws:", "arn:aws-cn:")
+        .replace(REGION, "cn-north-1");
+    put_backup(&mem, &partition);
+    assert_eq!(prefix_of(&partition), prefix_of(&sync_arn(3)));
+
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+    let skipped = skipped_by_prefix(&report);
+    assert!(
+        matches!(&skipped[&prefix_of(&account_path)], SkipReason::ArnMismatch(why) if why.contains(&other_account)),
+        "{:?}",
+        skipped[&prefix_of(&account_path)]
+    );
+    assert!(
+        matches!(&skipped[&prefix_of(&table_path)], SkipReason::ArnMismatch(why) if why.contains(&other_table)),
+        "{:?}",
+        skipped[&prefix_of(&table_path)]
+    );
+    assert!(
+        matches!(&skipped[&prefix_of(&partition)], SkipReason::OtherPartition(why)
+            if why.contains("aws-cn") && why.contains("no request")),
+        "{:?}",
+        skipped[&prefix_of(&partition)]
+    );
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert!(fake.rows.lock().unwrap().is_empty());
+}
+
+/// Only an AVAILABLE row of the configured store is reported with a missing
+/// manifest: a CREATING, DELETING, DELETED or FAILED row with no prefix is
+/// not, so `--prune-missing` never examines it.
+#[tokio::test]
+async fn only_available_rows_are_reported_with_a_missing_manifest() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    for (n, status) in [
+        (1, BackupStatus::Creating),
+        (2, BackupStatus::Failed),
+        (3, BackupStatus::Deleting),
+        (4, BackupStatus::Deleted),
+        (5, BackupStatus::Available),
+    ] {
+        let a = sync_arn(n);
+        fake.rows.lock().unwrap().insert(a.clone(), row(&a, status));
+    }
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(
+        report
+            .missing_manifests
+            .iter()
+            .map(|r| r.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        [sync_arn(5)]
+    );
+}
+
+/// A prefix whose backup id a row of this root holds under another table
+/// (the prefix copied under a second table directory) is skipped naming
+/// the row's table, never read.
+#[tokio::test]
+async fn a_prefix_under_another_table_with_a_rows_backup_id_is_skipped_naming_the_table() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    let original = sync_arn(1);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(original.clone(), row(&original, BackupStatus::Available));
+    put_backup(&mem, &original);
+    let copy = original.replace("table/Music", "table/Copy");
+    for (key, bytes) in backup_objects(&original) {
+        mem.insert(
+            &key.replacen(&prefix_of(&original), &prefix_of(&copy), 1),
+            &bytes,
+        );
+    }
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    let skipped = skipped_by_prefix(&report);
+    assert_eq!(
+        skipped[&prefix_of(&copy)],
+        SkipReason::HasRow {
+            status: BackupStatus::Available,
+            store_id: "store-1".to_owned(),
+            other_table: Some("Music".to_owned()),
+        }
+    );
+    assert!(
+        skipped[&prefix_of(&copy)]
+            .to_string()
+            .contains("under table Music"),
+        "{}",
+        skipped[&prefix_of(&copy)]
+    );
+    assert!(!mem.gets().iter().any(|k| k.starts_with(&prefix_of(&copy))));
+}
+
+/// Before the insert the row is read under each spelling of the manifest's
+/// ARN: a row of another root under the manifest's own spelling (another
+/// region's) holds the backup though sync would write the row under this
+/// server's region, and the prefix is skipped naming that store, with no
+/// insert (on Cassandra the insert alone would not see it). A row of
+/// another root under this server's spelling, the one the insert writes,
+/// is met by the insert, which answers `false`, and the prefix is skipped
+/// naming that store too.
+#[tokio::test]
+async fn sync_skips_a_backup_a_row_holds_under_another_spelling_of_its_arn() {
+    use super::sync::SkipReason;
+    let identity = store();
+    let canonical = sync_arn(1);
+    let spelled = canonical.replace(REGION, "eu-west-1");
+    for (cell, held_under, inserts) in [
+        ("the manifest's spelling", &spelled, 0),
+        ("this server's spelling", &canonical, 1),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        let mut elsewhere = row(held_under, BackupStatus::Available);
+        elsewhere.store.store_root = "/srv/elsewhere".to_owned();
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(held_under.clone(), elsewhere.clone());
+        put_backup(&mem, &spelled);
+        let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+            .await
+            .unwrap();
+        assert!(report.adopted.is_empty(), "{cell}");
+        assert!(
+            matches!(&skipped_by_prefix(&report)[&prefix_of(&spelled)], SkipReason::RowExists(what)
+                if what.contains("of another store") && what.contains("/srv/elsewhere")),
+            "{cell}: {:?}",
+            report.skipped
+        );
+        assert_eq!(
+            fake.insert_attempts.lock().unwrap().len(),
+            inserts,
+            "{cell}"
+        );
+        let reads = fake.row_reads.lock().unwrap().clone();
+        assert!(
+            reads.contains(&canonical) && (inserts == 1 || reads.contains(&spelled)),
+            "{cell}: the spellings were read in turn: {reads:?}"
+        );
+        assert_eq!(fake.rows.lock().unwrap().len(), 1, "{cell}");
+        assert_eq!(fake.rows.lock().unwrap()[held_under], elsewhere, "{cell}");
+    }
+}
+
+/// An adopted row whose list and status entries are gone (a Cassandra
+/// insert that stopped between the row and its entries) is not in the rows
+/// sync reads first, and the read under the manifest's own spelling finds
+/// it: the next sync passes it to the insert, which completes it, and the
+/// backup is adopted and listed again. A row under the other spelling of
+/// the ARN still skips the prefix with no insert.
+#[tokio::test]
+async fn the_next_sync_completes_its_own_insert_that_stopped_before_its_entries() {
+    use super::sync::SkipReason;
+    let identity = store();
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.completes_own_insert
+        .store(true, std::sync::atomic::Ordering::Release);
+    let torn = sync_arn(1);
+    put_backup(&mem, &torn);
+    let first = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(first.adopted.len(), 1);
+    fake.unlisted.lock().unwrap().insert(torn.clone());
+    let stored = fake.rows.lock().unwrap()[&torn].clone();
+
+    let second = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.adopted,
+        [super::sync::AdoptedBackup {
+            backup_arn: torn.clone(),
+            foreign: None,
+        }],
+        "{:?}",
+        second.skipped
+    );
+    assert!(second.skipped.is_empty(), "{:?}", second.skipped);
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 2);
+    assert!(
+        !fake.unlisted.lock().unwrap().contains(&torn),
+        "listed again"
+    );
+    assert_eq!(fake.rows.lock().unwrap()[&torn], stored);
+
+    // The other spelling: a row under the manifest's spelling (another
+    // region's) is unlisted; sync writes this server's spelling, so the
+    // row is not its own, and the prefix is skipped with no insert.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.completes_own_insert
+        .store(true, std::sync::atomic::Ordering::Release);
+    let canonical = sync_arn(2);
+    let spelled = canonical.replace(REGION, "eu-west-1");
+    let mut held = row(&spelled, BackupStatus::Available);
+    held.owner_generation = UNOWNED_GENERATION;
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(spelled.clone(), held.clone());
+    fake.unlisted.lock().unwrap().insert(spelled.clone());
+    put_backup(&mem, &spelled);
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty());
+    assert!(
+        matches!(&skipped_by_prefix(&report)[&prefix_of(&spelled)], SkipReason::RowExists(what)
+            if what.contains("the catalog's read at the start did not return")),
+        "{:?}",
+        report.skipped
+    );
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap()[&spelled], held);
+    assert!(!fake.rows.lock().unwrap().contains_key(&canonical));
+}
+
+/// An insert that fails is a catalog skip for its prefix, and sync goes on
+/// to the next; the report counts it as transient, so the command exits 1
+/// and a startup sync stays pending.
+#[tokio::test]
+async fn an_insert_that_fails_is_reported_and_sync_goes_on() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    put_backup(&mem, &sync_arn(1));
+    put_backup(&mem, &sync_arn(2));
+    *fake.insert_error.lock().unwrap() = Some("pool exhausted".to_owned());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty());
+    let skipped = skipped_by_prefix(&report);
+    for n in [1, 2] {
+        assert!(
+            matches!(&skipped[&prefix_of(&sync_arn(n))], SkipReason::Catalog(e) if e.contains("pool exhausted")),
+            "{:?}",
+            skipped[&prefix_of(&sync_arn(n))]
+        );
+    }
+    assert_eq!(report.transient_skips(), 2);
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 2);
+}
+
+/// A stop asked before a prefix ends the run there: the prefixes before it
+/// keep their rows, nothing after it is read, and no missing-manifest report
+/// is made (the listing did not reach every prefix). The stop comes at the
+/// second of three prefixes, so the run ends inside the listing's loop, not
+/// at the last group.
+#[tokio::test]
+async fn a_stop_ends_sync_before_the_next_prefix_with_no_missing_manifest_report() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    for n in 1..=3 {
+        put_backup(&mem, &sync_arn(n));
+    }
+    let gone = sync_arn(9);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(gone.clone(), row(&gone, BackupStatus::Available));
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        (asked.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 1)
+            .then(|| "SIGTERM received".to_owned())
+    };
+    let target = super::sync::SyncTarget {
+        stop: Some(&stop),
+        ..sync_target(&mem, &identity)
+    };
+    let report = super::sync::sync(&*fake, target).await.unwrap();
+    assert_eq!(report.stopped.as_deref(), Some("SIGTERM received"));
+    assert_eq!(
+        report
+            .adopted
+            .iter()
+            .map(|a| a.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        [sync_arn(1)]
+    );
+    assert!(report.missing_manifests.is_empty());
+    for n in 2..=3 {
+        assert!(
+            !mem.gets()
+                .iter()
+                .any(|k| k.starts_with(&prefix_of(&sync_arn(n)))),
+            "prefix {n} not read"
+        );
+    }
+}
+
+/// A listing that fails part-way keeps the rows of the prefixes it passed
+/// (each verified), reports them, and makes no missing-manifest report. The
+/// prefix it was listing when it failed (here the second) is not read: its
+/// keys may be cut short.
+#[tokio::test]
+async fn a_listing_that_fails_part_way_keeps_the_rows_before_it() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    for n in 1..=3 {
+        put_backup(&mem, &sync_arn(n));
+    }
+    let gone = sync_arn(9);
+    fake.rows
+        .lock()
+        .unwrap()
+        .insert(gone.clone(), row(&gone, BackupStatus::Available));
+    *mem.fail_root_list_at.lock().unwrap() = Some(prefix_of(&sync_arn(3)));
+    let err = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap_err();
+    let super::sync::SyncError::Listing { partial, .. } = &err else {
+        panic!("{err}");
+    };
+    assert_eq!(partial.adopted.len(), 1, "{:?}", partial.adopted);
+    assert_eq!(partial.adopted[0].backup_arn, sync_arn(1));
+    assert!(partial.missing_manifests.is_empty());
+    assert!(
+        err.to_string().contains("1 backup(s) listed before it"),
+        "{err}"
+    );
+    assert!(fake.rows.lock().unwrap().contains_key(&sync_arn(1)));
+    assert!(!fake.rows.lock().unwrap().contains_key(&sync_arn(2)));
+    assert!(
+        !mem.gets()
+            .iter()
+            .any(|k| k.starts_with(&prefix_of(&sync_arn(2))))
+    );
+}
+
+/// The startup sync of an in-memory catalog stays pending when a prefix
+/// was skipped for a store error, and the next cycle adopts it once its
+/// reads answer; the prefixes adopted in the first run are skipped on the
+/// row check then.
+#[tokio::test]
+async fn a_startup_sync_with_a_store_error_on_a_prefix_stays_pending() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "previous-start", true),
+    );
+    let ok = sync_arn(1);
+    let flaky = sync_arn(2);
+    put_backup(&mem, &ok);
+    put_backup(&mem, &flaky);
+    *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&flaky));
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_checking(&mem, true);
+    let pending = || runtime.configured_store().unwrap().startup_sync_pending();
+    cycle_on(&fake, &runtime).await;
+    assert!(fake.rows.lock().unwrap().contains_key(&ok));
+    assert!(!fake.rows.lock().unwrap().contains_key(&flaky));
+    assert!(pending(), "a store error leaves the sync pending");
+    *mem.fail_gets_under.lock().unwrap() = None;
+    cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&flaky].status,
+        BackupStatus::Available
+    );
+    assert!(!pending());
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 2);
+}
+
+/// A startup sync never runs while the store is unhealthy, though its
+/// identity is known: a recheck that found the root owned by another
+/// catalog (a second in-memory server took it) leaves the sync pending and
+/// nothing inserted.
+#[tokio::test]
+async fn a_startup_sync_does_not_run_while_a_recheck_finds_the_root_foreign() {
+    let mem = Arc::new(MemStore::default());
+    put_backup(&mem, &sync_arn(1));
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    let configured = runtime.configured_store().unwrap();
+    configured.record_check(Err(StoreProblem::ForeignCatalog {
+        file_catalog_id: "second-server".to_owned(),
+        catalog_id: "catalog-1".to_owned(),
+    }));
+    assert!(configured.identity().is_some(), "the identity is known");
+    assert!(super::sync::startup_sync(&*fake, &runtime).await.is_none());
+    assert!(configured.startup_sync_pending());
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+}
+
+/// The dead-owner probe requires the manifest's ARN to name the row's
+/// backup: a complete prefix whose manifest spells the row's backup in
+/// another region makes the dead CREATING row AVAILABLE (sync adopts such a
+/// manifest under this server's region, and the probe reads it the same
+/// way), and one whose manifest names the backup id in another partition
+/// leaves it FAILED.
+#[tokio::test]
+async fn the_dead_owner_probe_accepts_another_region_and_refuses_another_partition() {
+    for (cell, spelled, expected) in [
+        (
+            "another region",
+            sync_arn(1).replace(REGION, "eu-west-1"),
+            BackupStatus::Available,
+        ),
+        (
+            "another partition",
+            sync_arn(1).replace("arn:aws:", "arn:aws-cn:"),
+            BackupStatus::Failed,
+        ),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let dead = sync_arn(1);
+        put_backup(&mem, &spelled);
+        assert_eq!(prefix_of(&spelled), prefix_of(&dead), "{cell}: one prefix");
+        let mut creating = row(&dead, BackupStatus::Creating);
+        creating.heartbeat_at = 1234.5;
+        fake.rows.lock().unwrap().insert(dead.clone(), creating);
+        fake.dead.lock().unwrap().insert(dead.clone());
+        let runtime = runtime_on(&mem, store());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(
+            report.creating_resolved,
+            [(dead.clone(), expected)],
+            "{cell}"
+        );
+        assert_eq!(fake.rows.lock().unwrap()[&dead].status, expected, "{cell}");
+    }
+}
+
+// --- the deletion fence ------------------------------------------------------
+
+/// The identity file of `store()` after catalog `adopter` adopted the root.
+fn adopted_file() -> Vec<u8> {
+    identity_file("store-1", "adopter")
+}
+
+/// The store `runtime` is configured with is unhealthy because its root's
+/// identity file names `adopter`, as the fence recorded it.
+fn assert_fenced(runtime: &BackupRuntime) {
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Unhealthy(StoreProblem::ForeignCatalog {
+            file_catalog_id: "adopter".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        })
+    );
+}
+
+/// DeleteBackup on a store whose last check passed, after another catalog
+/// adopted the root: the fence re-reads the identity file before the
+/// DELETING write and refuses. No object is deleted, the request is refused
+/// as an unhealthy store's, the row stays AVAILABLE (so DescribeBackup does
+/// not answer a refused request with DELETED), and the store is unhealthy,
+/// so the next request is refused at the gate with no read.
+#[tokio::test]
+async fn delete_backup_on_a_root_another_catalog_adopted_deletes_nothing() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    mem.insert(STORE_IDENTITY_KEY, &adopted_file());
+    let err = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        validation_message(err).contains("unhealthy (owned by another catalog)"),
+        "the refusal names the store's problem"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(objects_under(&mem, &arn(ACCOUNT)).len(), 2);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Available
+    );
+    assert!(
+        fake.delete_starts_seen.lock().unwrap().is_empty(),
+        "no DELETING write"
+    );
+    assert_fenced(&runtime);
+    let gets = mem.gets().len();
+    assert!(
+        delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+            .await
+            .is_err()
+    );
+    assert_eq!(mem.gets().len(), gets, "refused at the gate");
+    // The fence of a store already unhealthy refuses with no read.
+    let fence = runtime.configured_store().unwrap().fence();
+    assert!(matches!(
+        fence.check("catalog-1").await,
+        Err(StoreProblem::ForeignCatalog { .. })
+    ));
+    assert_eq!(mem.gets().len(), gets, "the fence read nothing");
+}
+
+/// The fence keeps the catalog id it read first for the process: a
+/// catalog destroyed and re-created beside a running process gets a new
+/// id, and a root whose file names the new catalog is foreign to this
+/// process. DeleteBackup is refused with `ForeignCatalog` recorded and
+/// nothing deleted, though the catalog now answers the new id.
+#[tokio::test]
+async fn the_fence_keeps_the_catalog_id_it_read_first() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    seed(&fake, &mem, &newer_arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    let desc = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    let deletes = mem.deletes.lock().unwrap().len();
+    assert!(deletes > 0, "the first deletion ran");
+
+    *fake.catalog_id.lock().unwrap() = Some("catalog-2".to_owned());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-2"));
+    let err = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&newer_arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        validation_message(err).contains("unhealthy (owned by another catalog)"),
+        "the refusal names the store's problem"
+    );
+    assert_eq!(
+        mem.deletes.lock().unwrap().len(),
+        deletes,
+        "nothing deleted"
+    );
+    assert_eq!(objects_under(&mem, &newer_arn(ACCOUNT)).len(), 2);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&newer_arn(ACCOUNT)].status,
+        BackupStatus::Available
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Unhealthy(StoreProblem::ForeignCatalog {
+            file_catalog_id: "catalog-2".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        })
+    );
+}
+
+/// The log line of a deletion the fence refused after the DELETING write
+/// says what the fence found: an adoption only for a file that names
+/// another catalog, a read that failed or found no file as such (the
+/// reconciler finishes it once it can), and any other problem as the
+/// store's.
+#[test]
+fn a_fenced_deletions_line_is_worded_from_the_problem() {
+    let adopted = fenced_deletion_note(&StoreProblem::ForeignCatalog {
+        file_catalog_id: "adopter".to_owned(),
+        catalog_id: "catalog-1".to_owned(),
+    });
+    assert!(
+        adopted.starts_with("another catalog adopted the root"),
+        "{adopted}"
+    );
+    for problem in [
+        StoreProblem::Transport("the fence did not finish within 5 s".to_owned()),
+        StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()]),
+        StoreProblem::Denied("permission denied".to_owned()),
+        StoreProblem::FileUnreadable("not a store identity file".to_owned()),
+    ] {
+        let note = fenced_deletion_note(&problem);
+        assert!(
+            note.starts_with("the store's identity file could not be read")
+                && note.contains("the reconciler finishes the deletion once it can")
+                && !note.contains("adopted"),
+            "{note}"
+        );
+    }
+    let note = fenced_deletion_note(&StoreProblem::IdMismatch {
+        file_id: "store-2".to_owned(),
+        row_ids: vec!["store-1".to_owned()],
+    });
+    assert!(note.starts_with("the store is unhealthy"), "{note}");
+    assert!(!note.contains("adopted"), "{note}");
+}
+
+/// The adoption lands between DeleteBackup's two fences: the first passes,
+/// the row moves to DELETING, and the fence before the first `delete_prefix`
+/// refuses. The request answers DELETED, as for any deletion that fails
+/// after the DELETING write; nothing is deleted, the row stays DELETING, the
+/// store is unhealthy; the reconciler's DELETING duty acts on no row of it.
+#[tokio::test]
+async fn an_adoption_between_delete_backups_two_fences_leaves_the_row_deleting() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    *mem.identity_after_read.lock().unwrap() = Some(adopted_file());
+    let desc = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(objects_under(&mem, &arn(ACCOUNT)).len(), 2);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+    assert_fenced(&runtime);
+    let report = cycle_on(&fake, &runtime).await;
+    assert!(report.deletions_finished.is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+}
+
+/// Each reconciler duty that deletes a prefix or removes a tombstone, on a
+/// root another catalog adopts right after the cycle's check read the
+/// identity file: the fence re-reads it before the deletion or removal and
+/// refuses. No `delete_prefix` is called, no row is moved or removed, and
+/// the store is unhealthy at once.
+#[tokio::test]
+async fn each_reconciler_deletion_on_a_root_adopted_after_the_check_is_refused() {
+    let now = seconds_since_epoch();
+    let settings = JobSettings {
+        failed_row_retention: Duration::from_secs(600),
+        ..job_settings()
+    };
+    // (cell, status, heartbeat_at, completed_at, objects under the prefix)
+    for (cell, status, heartbeat_at, completed_at, objects) in [
+        ("DELETING row", BackupStatus::Deleting, now, None, true),
+        (
+            "stale FAILED row",
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now),
+            true,
+        ),
+        ("DELETED row", BackupStatus::Deleted, now, Some(now), true),
+        (
+            "tombstone",
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now - 1000.0),
+            false,
+        ),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let backup = arn(ACCOUNT);
+        let mut r = row(&backup, status);
+        r.heartbeat_at = heartbeat_at;
+        r.completed_at = completed_at;
+        fake.rows.lock().unwrap().insert(backup.clone(), r);
+        if objects {
+            let prefix = BackupArn::parse(&backup).unwrap().store_prefix();
+            mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+        }
+        let runtime = runtime_on(&mem, store()).with_job_settings(settings);
+        *mem.identity_after_read.lock().unwrap() = Some(adopted_file());
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(true), "{cell}: the check passed");
+        assert!(report.deletions_finished.is_empty(), "{cell}");
+        assert!(report.failed_prefixes_deleted.is_empty(), "{cell}");
+        assert!(report.deleted_prefixes_swept.is_empty(), "{cell}");
+        assert!(report.tombstones_removed.is_empty(), "{cell}");
+        assert!(mem.deletes.lock().unwrap().is_empty(), "{cell}");
+        assert_eq!(
+            objects_under(&mem, &backup).len(),
+            usize::from(objects),
+            "{cell}"
+        );
+        assert_eq!(fake.rows.lock().unwrap()[&backup].status, status, "{cell}");
+        assert!(fake.set_deleted.lock().unwrap().is_empty(), "{cell}");
+        assert!(fake.removed_rows.lock().unwrap().is_empty(), "{cell}");
+        assert_eq!(
+            mem.gets()
+                .iter()
+                .filter(|k| *k == STORE_IDENTITY_KEY)
+                .count(),
+            2,
+            "{cell}: the check's read and the fence's"
+        );
+        assert_fenced(&runtime);
+    }
+}
+
+/// CreateBackup on a store whose last check passed, after another catalog
+/// adopted the root: the fence before the row and the first put refuses.
+/// No row is claimed, nothing is put, and the store is unhealthy.
+#[tokio::test]
+async fn create_backup_on_a_root_another_catalog_adopted_writes_nothing() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    let runtime = job_runtime(&mem);
+    mem.insert(STORE_IDENTITY_KEY, &adopted_file());
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        validation_message(err).contains("unhealthy (owned by another catalog)"),
+        "the refusal names the store's problem"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(fake.claims.lock().unwrap().is_empty());
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 4, "the slot is released");
+    assert_fenced(&runtime);
+}
+
+/// The backup job's failure path on a root another catalog adopted while
+/// the job ran, after its first put: FAILED is written, the fence before
+/// the deletion refuses, and no `delete_prefix` is called; the store is
+/// unhealthy.
+#[tokio::test]
+async fn the_job_failure_path_on_a_root_adopted_while_the_job_ran_deletes_nothing() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    let runtime = job_runtime(&mem);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    // The adoption lands with the job's first stored object, and the puts
+    // after it fail.
+    let hook = Arc::clone(&mem);
+    *mem.on_put.lock().unwrap() = Some(Box::new(move |_key| {
+        hook.insert(STORE_IDENTITY_KEY, &adopted_file());
+        hook.fail_puts
+            .store(true, std::sync::atomic::Ordering::Release);
+    }));
+    gate.add_permits(3);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&details.backup_arn].status,
+        BackupStatus::Failed
+    );
+    assert!(
+        !mem.puts.lock().unwrap().is_empty(),
+        "the first put passed the job's fence"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_fenced(&runtime);
+}
+
+/// Purge of a row on a root another catalog adopted after the command's
+/// check: the fence before the first `delete_prefix` refuses, nothing is
+/// deleted, the reason names the problem, and the store is unhealthy.
+#[tokio::test]
+async fn purge_on_a_root_another_catalog_adopted_deletes_nothing() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &adopted_file());
+    let fake = Fake::default();
+    let backup = arn_n(1);
+    seed(&fake, &mem, &backup, BackupStatus::Available);
+    let configured = ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(store()),
+    );
+    let read = fake.rows.lock().unwrap()[&backup].clone();
+    let err = maintenance::purge_row(
+        &fake,
+        &*mem,
+        &configured.fence(),
+        &read,
+        Duration::from_secs(300),
+        &confirmed_claim(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.starts_with("the deletion was refused: ") && err.contains("names catalog adopter"),
+        "{err}"
+    );
+    assert!(err.ends_with("the row is unchanged"), "{err}");
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(objects_under(&mem, &backup).len(), 2);
+    assert!(fake.removed_rows.lock().unwrap().is_empty());
+    assert!(
+        fake.delete_starts_seen.lock().unwrap().is_empty(),
+        "no DELETING write"
+    );
+    assert_eq!(fake.rows.lock().unwrap()[&backup], read);
+    assert_eq!(
+        configured.health(),
+        StoreHealth::Unhealthy(StoreProblem::ForeignCatalog {
+            file_catalog_id: "adopter".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        })
+    );
+}
+
+/// The marker follows the owner. A durable catalog's `--adopt-store` of a
+/// root an in-memory catalog owned writes `ephemeral_catalog: false`; an
+/// in-memory server's startup check then finds the root owned by a durable
+/// catalog and writes nothing; and the re-check of an in-memory server
+/// whose root lost its file (no rows for it) writes the file back with the
+/// marker.
+#[tokio::test]
+async fn the_marker_is_the_owners_after_an_adoption_and_a_rewrite() {
+    use super::store_identity::{AdoptRule, Adoption, adopt};
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "in-memory-start", true),
+    );
+    let durable = Fake::default();
+    *durable.catalog_id.lock().unwrap() = Some("durable".to_owned());
+    let adopted = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &durable,
+        "postgres",
+        false,
+        AdoptRule::Command,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(adopted, Adoption::Adopted { .. }), "{adopted:?}");
+    let file = StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(file.catalog_id, "durable");
+    assert!(!file.ephemeral_catalog, "the durable adopter's marker");
+
+    let puts = mem.puts.lock().unwrap().len();
+    let in_memory = Fake::default();
+    let err = store_identity::establish(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &in_memory,
+        "sqlite",
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "durable".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    assert_eq!(mem.puts.lock().unwrap().len(), puts, "nothing written");
+    assert_eq!(
+        StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap(),
+        file
+    );
+
+    let lost = MemStore::default();
+    let known = StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/r".to_owned(),
+        store_id: "store-7".to_owned(),
+    };
+    store_identity::recheck(&lost, &known, &in_memory, "sqlite", true)
+        .await
+        .unwrap();
+    let rewritten =
+        StoreIdentityFile::parse(&lost.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap();
+    assert_eq!(rewritten.store_id, "store-7");
+    assert_eq!(rewritten.catalog_id, "catalog-1");
+    assert!(rewritten.ephemeral_catalog, "the in-memory owner's marker");
+}
+
+// --- the deletion fence when its read fails -----------------------------------
+
+/// A healthy store whose identity file reads fail after the first `pass`.
+fn failing_identity(mem: &MemStore, pass: usize, failure: IdentityFailure) {
+    *mem.identity_get_failure.lock().unwrap() = Some((pass, failure));
+}
+
+/// The fence's read of the identity file fails in transport (the store
+/// answers every other call) at each call site: DeleteBackup, CreateBackup,
+/// the job's failure path and purge. Each call is refused as a failed store
+/// call would be (CreateBackup answers `InternalServerError`, the one
+/// fence answer that is not the unhealthy-store refusal), nothing is
+/// deleted or put, and the store's health is left as the last check set
+/// it. DeleteBackup, as for any store failure, goes on to the DELETING
+/// write and answers DELETED, its deletion refused by the second fence and
+/// the row left DELETING; the other calls move no row.
+#[tokio::test]
+async fn a_fence_whose_read_fails_in_transport_refuses_each_call_and_leaves_the_health() {
+    // DeleteBackup.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    failing_identity(&mem, 0, IdentityFailure::Transport);
+    let desc = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert!(mem.deletes.lock().unwrap().is_empty(), "DeleteBackup");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Healthy
+    );
+
+    // CreateBackup.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    let runtime = job_runtime(&mem);
+    failing_identity(&mem, 0, IdentityFailure::Transport);
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(err, DynamoDbError::InternalServerError(_)),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert!(fake.claims.lock().unwrap().is_empty(), "CreateBackup");
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Healthy
+    );
+
+    // The job's failure path: the job's fence before its first put reads
+    // the file, a put fails, FAILED is written, the failure path's fence
+    // read fails, nothing is deleted.
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let gate = closed_gate();
+    snapshot_fixture(
+        &fake,
+        &music_table(),
+        songs(3),
+        true,
+        Some(Arc::clone(&gate)),
+    );
+    let runtime = job_runtime(&mem);
+    // The request's fence and the job's pass; the failure path's fails.
+    failing_identity(&mem, 2, IdentityFailure::Transport);
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    mem.fail_puts
+        .store(true, std::sync::atomic::Ordering::Release);
+    gate.add_permits(3);
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&details.backup_arn].status,
+        BackupStatus::Failed
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty(), "fail_row");
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Healthy
+    );
+
+    // Purge, of an AVAILABLE and of a dead CREATING row.
+    for status in [BackupStatus::Available, BackupStatus::Creating] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Fake::default();
+        let backup = arn_n(1);
+        seed(&fake, &mem, &backup, status);
+        let configured = ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        );
+        failing_identity(&mem, 0, IdentityFailure::Transport);
+        let read = fake.rows.lock().unwrap()[&backup].clone();
+        let err = maintenance::purge_row(
+            &fake,
+            &*mem,
+            &configured.fence(),
+            &read,
+            Duration::from_secs(300),
+            &confirmed_claim(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.starts_with("the deletion was refused: "), "{err}");
+        assert!(mem.deletes.lock().unwrap().is_empty(), "purge {status}");
+        assert_eq!(fake.rows.lock().unwrap()[&backup], read, "purge {status}");
+        assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+        assert_eq!(configured.health(), StoreHealth::Healthy);
+    }
+}
+
+/// The fence's read fails at each reconciler duty that deletes a prefix or
+/// removes a tombstone (the cycle's check read the file first): nothing is
+/// deleted, no row moves, and the store stays healthy.
+#[tokio::test]
+async fn each_reconciler_deletion_whose_fence_read_fails_is_refused_with_the_health_left() {
+    let now = seconds_since_epoch();
+    let settings = JobSettings {
+        failed_row_retention: Duration::from_secs(600),
+        ..job_settings()
+    };
+    for (cell, status, heartbeat_at, completed_at, objects) in [
+        ("DELETING row", BackupStatus::Deleting, now, None, true),
+        (
+            "stale FAILED row",
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now),
+            true,
+        ),
+        ("DELETED row", BackupStatus::Deleted, now, Some(now), true),
+        (
+            "tombstone",
+            BackupStatus::Failed,
+            now - 1000.0,
+            Some(now - 1000.0),
+            false,
+        ),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let backup = arn(ACCOUNT);
+        let mut r = row(&backup, status);
+        r.heartbeat_at = heartbeat_at;
+        r.completed_at = completed_at;
+        fake.rows.lock().unwrap().insert(backup.clone(), r);
+        if objects {
+            let prefix = BackupArn::parse(&backup).unwrap().store_prefix();
+            mem.insert(&format!("{prefix}data/000001.json.gz"), b"x");
+        }
+        let runtime = runtime_on(&mem, store()).with_job_settings(settings);
+        failing_identity(&mem, 1, IdentityFailure::Transport);
+        let report = cycle_on(&fake, &runtime).await;
+        assert_eq!(report.store_healthy, Some(true), "{cell}: the check passed");
+        assert!(report.deletions_finished.is_empty(), "{cell}");
+        assert!(report.failed_prefixes_deleted.is_empty(), "{cell}");
+        assert!(report.deleted_prefixes_swept.is_empty(), "{cell}");
+        assert!(report.tombstones_removed.is_empty(), "{cell}");
+        assert!(mem.deletes.lock().unwrap().is_empty(), "{cell}");
+        assert_eq!(fake.rows.lock().unwrap()[&backup].status, status, "{cell}");
+        assert!(fake.set_deleted.lock().unwrap().is_empty(), "{cell}");
+        assert!(fake.removed_rows.lock().unwrap().is_empty(), "{cell}");
+        assert_eq!(
+            runtime.configured_store().unwrap().health(),
+            StoreHealth::Healthy,
+            "{cell}"
+        );
+    }
+}
+
+/// A root with no identity file under the catalog's rows (removed since
+/// the last check) is recorded by the fence as the next check would record
+/// it, `FileMissingWithRows` with the store's id, and DeleteBackup is
+/// refused as an unhealthy store's: the row stays AVAILABLE, nothing is
+/// deleted, and the next request is refused at the gate.
+#[tokio::test]
+async fn a_fence_on_a_root_with_no_identity_file_records_it_and_refuses() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    mem.objects.lock().unwrap().remove(STORE_IDENTITY_KEY);
+    let err = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        validation_message(err).contains("unhealthy (identity file missing)"),
+        "the refusal names the store's problem"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(objects_under(&mem, &arn(ACCOUNT)).len(), 2);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Available
+    );
+    assert!(fake.delete_starts_seen.lock().unwrap().is_empty());
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Unhealthy(StoreProblem::FileMissingWithRows(vec![
+            "store-1".to_owned()
+        ]))
+    );
+}
+
+/// CreateBackup on a store `/health` reports healthy whose identity file
+/// was removed, that the store refuses to serve (an S3 `AccessDenied`), or
+/// that a filesystem root may not open (mode 000, which the filesystem
+/// store reports as an I/O error), since the last check: the fence before
+/// the row records the problem the next check would record and CreateBackup
+/// answers the unhealthy-store `ValidationException` naming it, with no row
+/// claimed and nothing put; the next request is refused at the gate with no
+/// read.
+#[tokio::test]
+async fn create_backup_on_a_root_whose_identity_file_is_missing_or_denied_is_refused_as_unhealthy()
+{
+    for (cell, reason, expected) in [
+        (
+            "missing",
+            "unhealthy (identity file missing)",
+            Some(StoreProblem::FileMissingWithRows(vec![
+                "store-1".to_owned(),
+            ])),
+        ),
+        (
+            "a denied read (S3 AccessDenied)",
+            "unhealthy (permission denied)",
+            Some(StoreProblem::Denied(format!(
+                "GetObject {STORE_IDENTITY_KEY}: permission denied"
+            ))),
+        ),
+        // The filesystem store's mode-000 file: a `Validate` problem whose
+        // text is the store error's.
+        (
+            "a filesystem read refused (mode 000)",
+            "unhealthy (failed validation)",
+            None,
+        ),
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+        let runtime = job_runtime(&mem);
+        match cell {
+            "missing" => {
+                mem.objects.lock().unwrap().remove(STORE_IDENTITY_KEY);
+            }
+            "a denied read (S3 AccessDenied)" => {
+                failing_identity(&mem, 0, IdentityFailure::Denied);
+            }
+            _ => failing_identity(&mem, 0, IdentityFailure::Unreadable),
+        }
+        let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+        let message = validation_message(err);
+        assert!(message.contains(reason), "{cell}: {message}");
+        wait_for_jobs(&runtime).await;
+        assert!(fake.claims.lock().unwrap().is_empty(), "{cell}");
+        assert!(mem.puts.lock().unwrap().is_empty(), "{cell}");
+        assert_eq!(runtime.free_slots(), 4, "{cell}: the slot is released");
+        let health = runtime.configured_store().unwrap().health();
+        match expected {
+            Some(expected) => {
+                assert_eq!(health, StoreHealth::Unhealthy(expected), "{cell}");
+            }
+            None => assert!(
+                matches!(
+                    &health,
+                    StoreHealth::Unhealthy(StoreProblem::Validate(text))
+                        if text.contains(STORE_IDENTITY_KEY)
+                ),
+                "{cell}: {health:?}"
+            ),
+        }
+        let gets = mem.gets().len();
+        assert!(
+            create_music_backup(&fake, &runtime).await.is_err(),
+            "{cell}"
+        );
+        assert_eq!(mem.gets().len(), gets, "{cell}: refused at the gate");
+    }
+}
+
+/// The fence's read of the identity file has a slot of its own: a
+/// DeleteBackup whose deletion holds the root's call slot for 4 s (a prefix
+/// of many objects) does not hold a CreateBackup sent 1 s into it, which
+/// answers CREATING at once and whose job completes; the deletion
+/// completes too. With the fence in the calls' slot the CreateBackup
+/// waited out the deletion.
+#[tokio::test(start_paused = true)]
+async fn create_backup_during_a_long_deletion_answers_at_once() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    let runtime = job_runtime(&mem);
+    *mem.delete_delay.lock().unwrap() = Some(Duration::from_secs(4));
+    let started = tokio::time::Instant::now();
+    let spellings = own(&arn(ACCOUNT));
+    let delete = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &spellings);
+    let create = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let sent = tokio::time::Instant::now();
+        let created = create_music_backup(&fake, &runtime).await;
+        (created, sent.elapsed())
+    };
+    let (deleted, (created, took)) = futures::future::join(delete, create).await;
+    assert_eq!(took, Duration::ZERO, "the CreateBackup waited for nothing");
+    let created = created.unwrap();
+    assert_eq!(created.backup_status, "CREATING");
+    assert_eq!(deleted.unwrap().backup_details.backup_status, "DELETED");
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the deletion held the slot"
+    );
+    wait_for_jobs(&runtime).await;
+    assert_eq!(
+        fake.rows.lock().unwrap()[&created.backup_arn].status,
+        BackupStatus::Available
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleted
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Healthy
+    );
+}
+
+/// A root adopted between CreateBackup's fence, at the request, and the
+/// job's first write: the job runs the fence again right before its first
+/// put, which refuses. The row is FAILED with the fence's reason, no object
+/// is put or deleted, and the store is unhealthy.
+#[tokio::test]
+async fn a_root_adopted_after_the_request_gets_no_object_of_the_job() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    let runtime = job_runtime(&mem);
+    // The request's read sees this catalog's file; the next read, the job's,
+    // sees the adopter's.
+    *mem.identity_after_read.lock().unwrap() = Some(adopted_file());
+    let details = create_music_backup(&fake, &runtime).await.unwrap();
+    wait_for_jobs(&runtime).await;
+    let row = fake.rows.lock().unwrap()[&details.backup_arn].clone();
+    assert_eq!(row.status, BackupStatus::Failed);
+    let reason = row.failure_reason.unwrap_or_default();
+    assert!(
+        reason.contains("re-read before the first write") && reason.contains("adopter"),
+        "{reason}"
+    );
+    assert!(mem.puts.lock().unwrap().is_empty(), "no object was put");
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        objects_under(&mem, &details.backup_arn),
+        Vec::<String>::new()
+    );
+    assert_fenced(&runtime);
+}
+
+/// A fence whose read of the identity file never answers is refused at the
+/// store's check bound: DeleteBackup answers DELETED once the bound passes
+/// (the second fence is refused at once, the first read still parked), with
+/// nothing deleted, the row DELETING and the health left.
+#[tokio::test(start_paused = true)]
+async fn a_fence_whose_read_stalls_is_refused_at_its_bound() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    let bound = runtime.configured_store().unwrap().check_timeout();
+    failing_identity(&mem, 0, IdentityFailure::Stall);
+    let started = tokio::time::Instant::now();
+    // A guard far past the bound, so a fence with no bound fails here
+    // instead of hanging.
+    let desc = tokio::time::timeout(
+        bound * 10,
+        delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT))),
+    )
+    .await
+    .expect("the fence's read is bounded")
+    .unwrap();
+    assert_eq!(desc.backup_details.backup_status, "DELETED");
+    assert!(started.elapsed() >= bound, "{:?}", started.elapsed());
+    assert!(started.elapsed() < bound + Duration::from_secs(1));
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Deleting
+    );
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Healthy
+    );
+}
+
+/// A fence refusal in the cycle's DELETING duty makes the store unhealthy,
+/// and the cycle runs no later store duty on the root: the dead-owner duty
+/// reads nothing under the dead CREATING row's prefix and leaves the row,
+/// and the FAILED-prefix, DELETED-prefix and tombstone duties list nothing
+/// under a stale FAILED row's and a DELETED row's prefixes, both past their
+/// windows.
+#[tokio::test]
+async fn a_fence_refusal_in_the_deleting_duty_stops_the_dead_owner_duty() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let dead = seed_dead_creating_with_manifest(&fake, &mem, true);
+    let deleting = arn_n(1);
+    assert_ne!(dead, deleting);
+    seed(&fake, &mem, &deleting, BackupStatus::Deleting);
+    let stale_failed = arn_n(2);
+    let deleted = arn_n(3);
+    let now = seconds_since_epoch();
+    for (a, status) in [
+        (&stale_failed, BackupStatus::Failed),
+        (&deleted, BackupStatus::Deleted),
+    ] {
+        let mut r = row(a, status);
+        r.heartbeat_at = now - 1_000_000.0;
+        r.completed_at = Some(now - 1_000_000.0);
+        fake.rows.lock().unwrap().insert(a.clone(), r);
+        mem.insert(&format!("{}data/000001.json.gz", prefix_of(a)), b"x");
+    }
+    let runtime = runtime_on(&mem, store());
+    *mem.identity_after_read.lock().unwrap() = Some(adopted_file());
+    let report = cycle_on(&fake, &runtime).await;
+    assert_eq!(report.store_healthy, Some(true), "the check passed");
+    assert!(report.deletions_finished.is_empty());
+    assert!(report.creating_resolved.is_empty());
+    assert_fenced(&runtime);
+    let dead_prefix = prefix_of(&dead);
+    assert!(
+        !mem.gets().iter().any(|k| k.starts_with(&dead_prefix)),
+        "{:?}",
+        mem.gets()
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&dead].status,
+        BackupStatus::Creating
+    );
+    assert!(fake.takeovers.lock().unwrap().is_empty());
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    for a in [&stale_failed, &deleted] {
+        let prefix = prefix_of(a);
+        assert!(
+            !mem.lists.lock().unwrap().contains(&prefix),
+            "{a}: listed after the refusal: {:?}",
+            mem.lists.lock().unwrap()
+        );
+        assert!(fake.rows.lock().unwrap().contains_key(a.as_str()));
+    }
+}
+
+/// A read of the row under the ARN's spellings that fails skips the prefix
+/// as a catalog error, which a later run may adopt: no insert is sent,
+/// since the read is what keeps a second row of the id out on Cassandra.
+/// The next sync, with the read answering, adopts the prefix.
+#[tokio::test]
+async fn sync_skips_a_prefix_whose_row_read_fails_and_inserts_nothing() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let identity = store();
+    let backup = sync_arn(1);
+    put_backup(&mem, &backup);
+    *fake.read_row_error.lock().unwrap() = Some("read timed out".to_owned());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert!(report.adopted.is_empty(), "{:?}", report.adopted);
+    assert!(
+        matches!(&skipped_by_prefix(&report)[&prefix_of(&backup)], SkipReason::Catalog(e) if e.contains("read timed out")),
+        "{:?}",
+        report.skipped
+    );
+    assert_eq!(report.transient_skips(), 1);
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+    assert!(fake.rows.lock().unwrap().is_empty());
+
+    *fake.read_row_error.lock().unwrap() = None;
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(report.adopted.len(), 1);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&backup].status,
+        BackupStatus::Available
+    );
+}
+
+/// On a catalog whose rows are unique by ARN alone (Cassandra's rule), two
+/// prefixes of one account and backup id under two tables, each with a
+/// complete manifest naming its own path, are not both adopted in one run:
+/// the first gets its row, and the second is skipped on the row check as
+/// the id's row under the other table. Without the row check the insert
+/// would accept the second, since no backup-id uniqueness refuses it.
+#[tokio::test]
+async fn one_run_adopts_one_prefix_of_a_backup_id_where_rows_are_unique_by_arn() {
+    use super::sync::SkipReason;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.unique_by_arn
+        .store(true, std::sync::atomic::Ordering::Release);
+    let identity = store();
+    let music = sync_arn(1);
+    let other = music.replace("table/Music", "table/Other");
+    put_backup(&mem, &music);
+    put_backup(&mem, &other);
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    // `Music` sorts before `Other`, so the listing reaches it first.
+    assert_eq!(
+        report
+            .adopted
+            .iter()
+            .map(|a| a.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&music)
+    );
+    assert_eq!(
+        skipped_by_prefix(&report)[&prefix_of(&other)],
+        SkipReason::HasRow {
+            status: BackupStatus::Available,
+            store_id: "store-1".to_owned(),
+            other_table: Some("Music".to_owned()),
+        }
+    );
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 1);
+    assert!(!fake.rows.lock().unwrap().contains_key(&other));
+}
+
+/// A cycle whose startup sync meets a root listing that never answers
+/// returns as soon as the shutdown token is cancelled, well before the
+/// sync's own bound, with the sync left pending and no later duty run.
+#[tokio::test(start_paused = true)]
+async fn a_cycles_startup_sync_ends_at_the_shutdown_and_stays_pending() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let deleting = arn(ACCOUNT);
+    seed(&fake, &mem, &deleting, BackupStatus::Deleting);
+    put_backup(&mem, &sync_arn(1));
+    let runtime = runtime().with_store(
+        ConfiguredStore::new(
+            store().store_kind,
+            store().store_root,
+            Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+            None,
+            Ok(store()),
+        )
+        .with_ephemeral_catalog(true),
+    );
+    mem.stall_root_list
+        .store(true, std::sync::atomic::Ordering::Release);
+    let shutdown = extenddb_storage::CancellationToken::new();
+    let cancel = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        cancel.cancel();
+    });
+    let started = tokio::time::Instant::now();
+    // A guard past the bound, so a cycle that ignores the token fails here
+    // instead of hanging.
+    let report = tokio::time::timeout(
+        super::sync::STARTUP_SYNC_TIMEOUT * 5,
+        reconciler::cycle(
+            &fake,
+            &runtime,
+            Duration::from_secs(300),
+            "test",
+            &mut reconciler::ReconcilerState::with_shutdown(shutdown.clone()),
+        ),
+    )
+    .await
+    .expect("the cycle ends")
+    .unwrap();
+    let took = started.elapsed();
+    assert!(shutdown.is_cancelled());
+    assert!(took < super::sync::STARTUP_SYNC_TIMEOUT, "{took:?}");
+    assert_eq!(report.store_healthy, Some(true));
+    assert!(report.deletions_finished.is_empty(), "{report:?}");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+    assert!(
+        runtime.configured_store().unwrap().startup_sync_pending(),
+        "left pending"
+    );
+    assert!(fake.insert_attempts.lock().unwrap().is_empty());
+}
+
+/// The adoption under the in-memory rule refuses a root whose file was
+/// written by a durable catalog, with nothing written; the check of an
+/// in-memory catalog does not hand such a root to the adoption at all (one
+/// read of the file) and leaves it owned by another catalog.
+#[tokio::test]
+async fn the_in_memory_adoption_refuses_a_durable_owners_root() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, adopt};
+    let mem = MemStore::default();
+    mem.insert(
+        STORE_IDENTITY_KEY,
+        &identity_file_of("store-7", "durable", false),
+    );
+    let fake = Fake::default();
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &fake,
+        "sqlite",
+        true,
+        AdoptRule::EphemeralOwner,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        AdoptRefusal::DurableOwner {
+            file_catalog_id: "durable".to_owned(),
+        }
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+
+    let err = store_identity::establish(&mem, StoreKind::Filesystem, "/r", &fake, "sqlite", true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreProblem::ForeignCatalog {
+            file_catalog_id: "durable".to_owned(),
+            catalog_id: "catalog-1".to_owned(),
+        }
+    );
+    let file_reads = |mem: &MemStore| {
+        mem.gets()
+            .iter()
+            .filter(|k| *k == STORE_IDENTITY_KEY)
+            .count()
+    };
+    assert_eq!(file_reads(&mem), 2, "the adoption's read, then the check's");
+    assert!(mem.puts.lock().unwrap().is_empty());
+}
+
+/// The fence refuses a file that names this catalog under another store id
+/// than the one the store's check settled (the root replaced by another
+/// root of the same catalog), and records the mismatch on the store; a file
+/// with the settled id passes.
+#[tokio::test]
+async fn a_fence_refuses_a_file_of_this_catalog_under_another_store_id() {
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    seed(&fake, &mem, &arn(ACCOUNT), BackupStatus::Available);
+    let runtime = runtime_on(&mem, store());
+    let fence = runtime.configured_store().unwrap().fence();
+    fence.check("catalog-1").await.unwrap();
+
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-2", "catalog-1"));
+    let mismatch = StoreProblem::IdMismatch {
+        file_id: "store-2".to_owned(),
+        row_ids: vec!["store-1".to_owned()],
+    };
+    assert_eq!(fence.check("catalog-1").await, Err(mismatch.clone()));
+    assert_eq!(
+        runtime.configured_store().unwrap().health(),
+        StoreHealth::Unhealthy(mismatch)
+    );
+    let err = delete_backup(&*fake, &runtime, ACCOUNT, REGION, &own(&arn(ACCOUNT)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if m.contains("identity mismatch")),
+        "{err:?}"
+    );
+    assert!(mem.deletes.lock().unwrap().is_empty());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn(ACCOUNT)].status,
+        BackupStatus::Available
+    );
+}
+
+// --- the claim re-checked before each step that cannot be undone ------------
+
+/// A maintenance claim whose first `confirms` beats confirm and every later
+/// one answers `Lost` (another holder took the claim over), counting the
+/// beats.
+struct ScriptedClaim {
+    confirms: usize,
+    beats: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl extenddb_storage::MaintenanceClaim for ScriptedClaim {
+    fn generation(&self) -> u64 {
+        13
+    }
+    fn heartbeat(
+        &self,
+    ) -> BoxedFuture<'_, Result<extenddb_storage::backup_catalog::Heartbeat, StorageError>> {
+        let n = self.beats.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(if n < self.confirms {
+                extenddb_storage::backup_catalog::Heartbeat::Confirmed
+            } else {
+                extenddb_storage::backup_catalog::Heartbeat::Lost
+            })
+        })
+    }
+    fn release(&self) -> BoxedFuture<'_, Result<(), StorageError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A held claim over a [`ScriptedClaim`] with a period long enough that the
+/// timer sends no beat during the test: every beat counted is a re-check's.
+fn scripted_claim(
+    confirms: usize,
+) -> (maintenance::HeldClaim, Arc<std::sync::atomic::AtomicUsize>) {
+    let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let held = maintenance::HeldClaim::start(
+        Box::new(ScriptedClaim {
+            confirms,
+            beats: Arc::clone(&beats),
+        }),
+        Duration::from_secs(3600),
+    );
+    (held, beats)
+}
+
+fn beats_of(beats: &std::sync::atomic::AtomicUsize) -> usize {
+    beats.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Purge re-checks the claim with a beat right before it removes a dead
+/// CREATING row and again right before it deletes that row's prefix, which
+/// no row names once the row is gone: a claim another holder took over
+/// (a command stopped past the stale window on MongoDB or Cassandra, whose
+/// claim a sync then took) leaves the row and its objects when the first
+/// beat finds it lost, and the objects when the second does, for a later
+/// sync to adopt. Two beats with the claim kept delete both. A row of
+/// another status keeps its row through the deletion and needs no beat.
+#[tokio::test]
+async fn purge_rechecks_the_claim_before_a_dead_creating_rows_removal_and_its_prefix() {
+    let window = Duration::from_secs(300);
+    // Lost at the first beat: the row and its objects stay.
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    let dead = arn_n(1);
+    seed(&fake, &mem, &dead, BackupStatus::Creating);
+    let keys = mem.keys();
+    let read = fake.rows.lock().unwrap()[&dead].clone();
+    let (claim, beats) = scripted_claim(0);
+    let err = maintenance::purge_row(&fake, &mem, &passing_fence(), &read, window, &claim)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("stopped before the CREATING row's removal")
+            && err.contains("another holder took it over"),
+        "{err}"
+    );
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&dead].status,
+        BackupStatus::Creating
+    );
+    assert_eq!(mem.keys(), keys, "nothing deleted");
+    assert!(mem.deletes.lock().unwrap().is_empty());
+
+    // Lost at the second beat: the row is removed, its objects stay.
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    seed(&fake, &mem, &dead, BackupStatus::Creating);
+    let keys = mem.keys();
+    let read = fake.rows.lock().unwrap()[&dead].clone();
+    let (claim, beats) = scripted_claim(1);
+    let err = maintenance::purge_row(&fake, &mem, &passing_fence(), &read, window, &claim)
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("stopped before the prefix's deletion")
+            && err.contains("its objects are left"),
+        "{err}"
+    );
+    assert_eq!(beats_of(&beats), 2);
+    assert!(fake.rows.lock().unwrap().is_empty(), "the row was removed");
+    assert_eq!(mem.keys(), keys, "the prefix is left whole");
+    assert!(mem.deletes.lock().unwrap().is_empty());
+
+    // Both beats confirm: the row and the prefix are gone.
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    seed(&fake, &mem, &dead, BackupStatus::Creating);
+    let read = fake.rows.lock().unwrap()[&dead].clone();
+    let (claim, beats) = scripted_claim(2);
+    maintenance::purge_row(&fake, &mem, &passing_fence(), &read, window, &claim)
+        .await
+        .unwrap();
+    assert_eq!(beats_of(&beats), 2);
+    assert!(fake.rows.lock().unwrap().is_empty());
+    assert!(mem.keys().is_empty());
+
+    // An AVAILABLE row: no beat.
+    let fake = Fake::default();
+    let mem = MemStore::default();
+    seed(&fake, &mem, &dead, BackupStatus::Available);
+    let read = fake.rows.lock().unwrap()[&dead].clone();
+    let (claim, beats) = scripted_claim(0);
+    maintenance::purge_row(&fake, &mem, &passing_fence(), &read, window, &claim)
+        .await
+        .unwrap();
+    assert_eq!(beats_of(&beats), 0);
+    assert!(mem.keys().is_empty());
+}
+
+/// Sync re-checks the claim with a beat right before each insert: the
+/// prefix whose beat finds the claim lost is not adopted, and the run stops
+/// there as at a signal, with the rows inserted before it kept. With no
+/// claim (the startup sync of an in-memory catalog) no beat is sent.
+#[tokio::test]
+async fn sync_rechecks_the_claim_before_each_insert_and_stops_once_it_is_lost() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let first = sync_arn(1);
+    let second = sync_arn(2);
+    put_backup(&mem, &first);
+    put_backup(&mem, &second);
+    let identity = store();
+    let (claim, beats) = scripted_claim(1);
+    let target = super::sync::SyncTarget {
+        claim: Some(&claim),
+        ..sync_target(&mem, &identity)
+    };
+    let report = super::sync::sync(&*fake, target).await.unwrap();
+    assert_eq!(beats_of(&beats), 2, "one beat per insert");
+    assert_eq!(
+        report
+            .adopted
+            .iter()
+            .map(|a| a.backup_arn.clone())
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&first)
+    );
+    let stopped = report.stopped.clone().expect("the run stopped");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(&format!("before the insert for {}", prefix_of(&second))),
+        "{stopped}"
+    );
+    assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+    assert!(report.missing_manifests.is_empty());
+    assert_eq!(fake.insert_attempts.lock().unwrap().len(), 1);
+    assert!(!fake.rows.lock().unwrap().contains_key(&second));
+
+    let fake = Arc::new(Fake::default());
+    let report = super::sync::sync(&*fake, sync_target(&mem, &identity))
+        .await
+        .unwrap();
+    assert_eq!(report.adopted.len(), 2);
+    assert_eq!(beats_of(&beats), 2, "no claim, no beat");
+}
+
+/// `--prune-missing` re-checks the claim with a beat right before each
+/// removal: a claim found lost there ends the loop with the reason, that
+/// row and the rest left AVAILABLE and nothing forgotten after it.
+#[tokio::test]
+async fn prune_missing_rechecks_the_claim_before_each_removal() {
+    use super::sync::PruneOutcome;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let arns = [sync_arn(1), sync_arn(2), sync_arn(3)];
+    for a in &arns {
+        fake.rows
+            .lock()
+            .unwrap()
+            .insert(a.clone(), row(a, BackupStatus::Available));
+    }
+    let keys: Vec<BackupKey> = arns
+        .iter()
+        .map(|a| row(a, BackupStatus::Available).key())
+        .collect();
+    let (claim, beats) = scripted_claim(1);
+    let root = store().store_root;
+    let (outcomes, stopped) =
+        super::sync::prune_missing(&*fake, &*mem, &root, &keys, &claim, &|| None).await;
+    assert_eq!(outcomes, [(arns[0].clone(), PruneOutcome::Pruned)]);
+    let stopped = stopped.expect("stopped at the second row");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(&format!("before the removal of {}", arns[1])),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 2);
+    let forgets: Vec<String> = fake
+        .forgets_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|k| k.backup_arn.clone())
+        .collect();
+    assert_eq!(forgets, [arns[0].clone()]);
+    let after = fake.rows.lock().unwrap();
+    assert!(!after.contains_key(&arns[0]));
+    assert_eq!(after[&arns[1]].status, BackupStatus::Available);
+    assert_eq!(after[&arns[2]].status, BackupStatus::Available);
+}
+
+/// `--adopt-store` re-checks the claim with a beat right before it rewrites
+/// `extenddb-store.json`: a claim found lost leaves the file naming its
+/// owner, with nothing put; a confirmed beat rewrites it.
+#[tokio::test]
+async fn adopt_store_rechecks_the_claim_before_the_rewrite() {
+    use super::store_identity::{AdoptRefusal, AdoptRule, Adoption, adopt};
+    let file = StoreIdentityFile {
+        format_version: 1,
+        store_id: "store-7".to_owned(),
+        catalog_id: "previous".to_owned(),
+        backend: "postgres".to_owned(),
+        created_at_ms: 1234,
+        ephemeral_catalog: false,
+    };
+    let mem = MemStore::default();
+    mem.insert(STORE_IDENTITY_KEY, &file.to_bytes());
+    let fake = Fake::default();
+    let (claim, beats) = scripted_claim(0);
+    let err = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        Some(&claim),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, AdoptRefusal::ClaimLost(reason) if reason.contains("another holder")),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("nothing was written"), "{err}");
+    assert_eq!(beats_of(&beats), 1);
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(
+        StoreIdentityFile::parse(&mem.objects.lock().unwrap()[STORE_IDENTITY_KEY]).unwrap(),
+        file
+    );
+
+    let (claim, beats) = scripted_claim(1);
+    let adopted = adopt(
+        &mem,
+        StoreKind::Filesystem,
+        "/r",
+        &fake,
+        "sqlite",
+        false,
+        AdoptRule::Command,
+        Some(&claim),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(adopted, Adoption::Adopted { .. }), "{adopted:?}");
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(mem.puts.lock().unwrap().as_slice(), [STORE_IDENTITY_KEY]);
+}
+
+// --- backup sync --move-store, --forget-store, --forget-backup ---------------
+
+/// The root the rows were written under before the store moved.
+fn old_store() -> StoreIdentity {
+    StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/srv/old".to_owned(),
+        store_id: "store-0".to_owned(),
+    }
+}
+
+/// A row of `arn` under the old root.
+fn old_row(arn: &str, status: BackupStatus) -> BackupRow {
+    let mut row = row(arn, status);
+    row.store = old_store();
+    row
+}
+
+fn seed_rows(fake: &Fake, rows: &[BackupRow]) {
+    let mut held = fake.rows.lock().unwrap();
+    for row in rows {
+        held.insert(row.backup_arn.clone(), row.clone());
+    }
+}
+
+/// The stop of a run nothing stops.
+fn never() -> Option<String> {
+    None
+}
+
+/// What a run told of its wait ignores.
+fn no_wait(_: Duration) {}
+
+/// A forget run with `owner_window` and `stop` that waits for nothing
+/// before its FAILED and DELETED removals (as on SQLite).
+fn forget_run<'a>(
+    owner_window: Duration,
+    stop: super::sync::Stop<'a>,
+) -> super::store_maintenance::ForgetRun<'a> {
+    super::store_maintenance::ForgetRun {
+        owner_window,
+        removals_from: None,
+        on_wait: &no_wait,
+        stop,
+        claim: None,
+        configured: None,
+        unmounted_root: None,
+        deletions_finished: &[],
+    }
+}
+
+/// `--move-store /srv/old` into the store `runtime` is configured with,
+/// with the servers' 300 s owner window.
+async fn move_old(fake: &Fake, runtime: &BackupRuntime) -> super::store_maintenance::MoveReport {
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    super::store_maintenance::move_store(
+        fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &never,
+            claim: None,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+fn sorted(mut arns: Vec<String>) -> Vec<String> {
+    arns.sort();
+    arns
+}
+
+/// `--move-store` over a copied tree, one row of each status the move
+/// resolves or carries: a dead CREATING row whose copied prefix is complete
+/// is resolved AVAILABLE against the configured store; a DELETING row whose copy holds no verified manifest has its
+/// deletion finished in the configured store (the copied leftover deleted)
+/// and moves DELETED; DELETED and FAILED rows without a verified manifest
+/// and a complete AVAILABLE row move. Every row then names the configured
+/// store, which serves it (`is_store_of`), the rewrite is one call from the
+/// old root, and the old root lists nothing. A reconciler cycle afterwards
+/// (no claim) cleans the moved tombstones' leftovers in the configured
+/// store and removes the tombstones past their retention.
+#[tokio::test]
+async fn move_store_resolves_checks_and_moves_each_status_of_the_old_root() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+
+    let resolved_available = seed_dead_creating_with_manifest(&fake, &mem, true);
+    fake.rows
+        .lock()
+        .unwrap()
+        .get_mut(&resolved_available)
+        .unwrap()
+        .store = old_store();
+    let deleting = sync_arn(2);
+    let deleting_leftover = format!("{}data/000001.json.gz", prefix_of(&deleting));
+    mem.insert(&deleting_leftover, b"x");
+    let deleted = sync_arn(3);
+    let deleted_leftover = format!("{}data/000001.json.gz", prefix_of(&deleted));
+    mem.insert(&deleted_leftover, b"x");
+    let failed = sync_arn(4);
+    let failed_leftover = format!("{}data/000001.json.gz", prefix_of(&failed));
+    mem.insert(&failed_leftover, b"x");
+    let available = sync_arn(5);
+    put_backup(&mem, &available);
+    let mut rows = vec![
+        old_row(&deleting, BackupStatus::Deleting),
+        old_row(&deleted, BackupStatus::Deleted),
+        old_row(&failed, BackupStatus::Failed),
+        old_row(&available, BackupStatus::Available),
+    ];
+    for row in &mut rows[1..3] {
+        row.completed_at = Some(1.0);
+    }
+    seed_rows(&fake, &rows);
+
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.rows, 5);
+    assert_eq!(
+        report.resolved,
+        [(resolved_available.clone(), BackupStatus::Available)]
+    );
+    assert_eq!(report.finished, std::slice::from_ref(&deleting));
+    assert_eq!(report.rewritten, 5);
+    assert!(report.left.is_empty());
+    assert!(report.gone.is_empty());
+    let all = sorted(vec![
+        resolved_available.clone(),
+        deleting.clone(),
+        deleted.clone(),
+        failed.clone(),
+        available.clone(),
+    ]);
+    assert_eq!(sorted(report.moved.clone()), all);
+    let configured = runtime.configured_store().unwrap();
+    {
+        let held = fake.rows.lock().unwrap();
+        for arn in &all {
+            assert_eq!(held[arn].store, store(), "{arn}");
+            assert!(configured.is_store_of(&held[arn].store), "{arn}");
+        }
+        assert_eq!(held[&resolved_available].status, BackupStatus::Available);
+        assert_eq!(held[&deleting].status, BackupStatus::Deleted);
+        assert_eq!(held[&available].status, BackupStatus::Available);
+    }
+    let calls = fake.rewrites_seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, StoreKind::Filesystem);
+    assert_eq!(calls[0].1, "/srv/old");
+    assert_eq!(calls[0].3, store());
+    assert!(
+        !mem.keys().contains(&deleting_leftover),
+        "the deletion was finished"
+    );
+    assert!(mem.keys().contains(&deleted_leftover));
+    assert!(mem.keys().contains(&failed_leftover));
+
+    // The configured store's reconciler cleans the moved tombstones.
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert_eq!(cycle.store_healthy, Some(true));
+    assert!(!mem.keys().contains(&deleted_leftover), "{cycle:?}");
+    assert!(!mem.keys().contains(&failed_leftover), "{cycle:?}");
+    let held = fake.rows.lock().unwrap();
+    assert!(
+        !held.contains_key(&deleted),
+        "the DELETED tombstone is removed"
+    );
+    assert!(
+        !held.contains_key(&failed),
+        "the FAILED tombstone is removed"
+    );
+    assert_eq!(held[&available].status, BackupStatus::Available);
+}
+
+/// Every row that stops the move is named in one pass and no row is
+/// moved: a CREATING row with a live owner; a DELETING, a DELETED and a
+/// FAILED row whose copied prefix holds a verified manifest (the
+/// DELETING row's copy is not deleted); AVAILABLE rows with no copy, a data
+/// file missing, a data file of another size, no sidecar, a manifest naming
+/// another backup, and a manifest whose size is not the row's. The one
+/// complete AVAILABLE row is not moved either, and `rewrite_store` is never
+/// called.
+#[tokio::test]
+async fn move_store_names_every_row_that_stops_it_and_moves_none() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+
+    let live = sync_arn(1);
+    let deleting = sync_arn(2);
+    let deleted = sync_arn(3);
+    let failed = sync_arn(4);
+    for arn in [&deleting, &deleted, &failed] {
+        put_backup(&mem, arn);
+    }
+    let no_copy = sync_arn(5);
+    let missing_file = sync_arn(6);
+    let mut objects = backup_objects(&missing_file);
+    let dropped = objects
+        .iter()
+        .position(|(k, _)| k.contains("/data/"))
+        .unwrap();
+    objects.remove(dropped);
+    for (key, bytes) in objects {
+        mem.insert(&key, &bytes);
+    }
+    let short_file = sync_arn(7);
+    for (key, mut bytes) in backup_objects(&short_file) {
+        if key.contains("/data/") && bytes.len() > 1 {
+            bytes.pop();
+        }
+        mem.insert(&key, &bytes);
+    }
+    let no_sidecar = sync_arn(8);
+    for (key, bytes) in backup_objects(&no_sidecar) {
+        if !key.ends_with("extenddb-manifest.sha256") {
+            mem.insert(&key, &bytes);
+        }
+    }
+    let other_backup = sync_arn(9);
+    for (key, bytes) in backup_objects(&sync_arn(19)) {
+        mem.insert(
+            &key.replacen(&prefix_of(&sync_arn(19)), &prefix_of(&other_backup), 1),
+            &bytes,
+        );
+    }
+    let other_size = sync_arn(10);
+    put_backup(&mem, &other_size);
+    let complete = sync_arn(11);
+    put_backup(&mem, &complete);
+
+    let mut sized = old_row(&other_size, BackupStatus::Available);
+    sized.size_bytes += 1;
+    let rows = vec![
+        old_row(&live, BackupStatus::Creating),
+        old_row(&deleting, BackupStatus::Deleting),
+        old_row(&deleted, BackupStatus::Deleted),
+        old_row(&failed, BackupStatus::Failed),
+        old_row(&no_copy, BackupStatus::Available),
+        old_row(&missing_file, BackupStatus::Available),
+        old_row(&short_file, BackupStatus::Available),
+        old_row(&no_sidecar, BackupStatus::Available),
+        old_row(&other_backup, BackupStatus::Available),
+        sized,
+        old_row(&complete, BackupStatus::Available),
+    ];
+    seed_rows(&fake, &rows);
+    let keys_before = mem.keys();
+
+    let report = move_old(&fake, &runtime).await;
+    assert!(!report.complete());
+    let why: HashMap<String, String> = report
+        .stopping
+        .iter()
+        .map(|(row, why)| (row.backup_arn.clone(), why.clone()))
+        .collect();
+    assert_eq!(report.stopping.len(), 10, "{why:#?}");
+    assert!(why[&live].contains("live owner"), "{}", why[&live]);
+    for (arn, status) in [
+        (&deleting, "DELETING"),
+        (&deleted, "DELETED"),
+        (&failed, "FAILED"),
+    ] {
+        assert!(
+            why[arn].starts_with(&format!(
+                "{status} whose prefix under the configured root holds a verified manifest"
+            )),
+            "{}",
+            why[arn]
+        );
+        assert!(why[arn].contains("--forget-backup"), "{}", why[arn]);
+        // A deleted backup's remedy is the prefix's removal; the adoption
+        // route is named only as what brings it back.
+        let deleted_by_a_client = status != "FAILED";
+        assert_eq!(
+            why[arn].contains("The backup was deleted: remove that prefix"),
+            deleted_by_a_client,
+            "{}",
+            why[arn]
+        );
+        assert_eq!(
+            why[arn].contains("bringing back AVAILABLE a backup a client deleted"),
+            deleted_by_a_client,
+            "{}",
+            why[arn]
+        );
+        assert_eq!(
+            why[arn].contains("let backup sync adopt the prefix"),
+            !deleted_by_a_client,
+            "{}",
+            why[arn]
+        );
+    }
+    assert!(why[&no_copy].contains("no manifest"), "{}", why[&no_copy]);
+    assert!(
+        why[&missing_file].contains("is not in the store"),
+        "{}",
+        why[&missing_file]
+    );
+    assert!(
+        why[&short_file].contains("bytes in the store"),
+        "{}",
+        why[&short_file]
+    );
+    assert!(
+        why[&no_sidecar].contains("without its sidecar"),
+        "{}",
+        why[&no_sidecar]
+    );
+    assert!(
+        why[&other_backup].contains("not the row's backup"),
+        "{}",
+        why[&other_backup]
+    );
+    assert!(
+        why[&other_size].contains("another backup under the same ARN"),
+        "{}",
+        why[&other_size]
+    );
+    assert!(!why.contains_key(&complete));
+    assert!(report.moved.is_empty());
+    assert!(
+        fake.rewrites_seen.lock().unwrap().is_empty(),
+        "nothing is rewritten after a stop"
+    );
+    let held = fake.rows.lock().unwrap();
+    for row in &rows {
+        assert_eq!(held[&row.backup_arn], *row, "{}", row.backup_arn);
+    }
+    assert_eq!(mem.keys(), keys_before, "no object was deleted");
+}
+
+/// The rewrite moves only what is still the old root's: a CreateBackup of a
+/// server still on the old root whose CREATING row lands after the checks
+/// is left there and reported (the move is not complete), and a rewrite
+/// that stops part way leaves the rest under the old root, listed, with
+/// the rows moved before the stop counted as moved.
+#[tokio::test]
+async fn rows_the_rewrite_does_not_move_are_listed_as_left() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let rows: Vec<BackupRow> = (1..=3)
+        .map(|n| {
+            let arn = sync_arn(n);
+            put_backup(&mem, &arn);
+            old_row(&arn, BackupStatus::Available)
+        })
+        .collect();
+    seed_rows(&fake, &rows);
+    let landed = old_row(&sync_arn(4), BackupStatus::Creating);
+    fake.lands_before_rewrite
+        .lock()
+        .unwrap()
+        .push(landed.clone());
+
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.stopping.is_empty(), "{:?}", report.stopping);
+    assert_eq!(report.rewritten, 3);
+    assert_eq!(report.moved.len(), 3);
+    assert_eq!(
+        report.left,
+        [super::store_maintenance::NamedRow {
+            status: BackupStatus::Creating,
+            backup_arn: landed.backup_arn.clone(),
+            account_id: ACCOUNT.to_owned(),
+        }]
+    );
+    assert!(!report.complete());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&landed.backup_arn].store,
+        old_store()
+    );
+
+    // A rewrite that stops after one row.
+    let fake = Arc::new(Fake::default());
+    seed_rows(&fake, &rows);
+    *fake.fail_rewrite_after.lock().unwrap() = Some(1);
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.rewrite_error.is_some());
+    assert_eq!(report.moved.len(), 1);
+    assert_eq!(report.left.len(), 2);
+    assert!(!report.complete());
+}
+
+/// The fence runs once before the rewrite: a root another catalog adopted
+/// after the store's check gets no row, though every row passed its check.
+#[tokio::test]
+async fn move_store_on_a_root_another_catalog_adopted_moves_nothing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = sync_arn(1);
+    put_backup(&mem, &arn);
+    seed_rows(&fake, &[old_row(&arn, BackupStatus::Available)]);
+    mem.insert(STORE_IDENTITY_KEY, &adopted_file());
+
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.stopping.is_empty(), "{:?}", report.stopping);
+    let stopped = report.stopped.clone().unwrap();
+    assert!(stopped.contains("fence refused"), "{stopped}");
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap()[&arn].store, old_store());
+    assert_fenced(&runtime);
+}
+
+/// Where rows are unique by ARN alone (Cassandra), a moved row whose
+/// account and backup id a row of the configured root holds under another
+/// spelling stops the move, naming that row: no account holds two rows of
+/// one backup id.
+#[tokio::test]
+async fn move_store_refuses_a_second_row_of_one_backup_id() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.unique_by_arn
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let ours = sync_arn(1);
+    let other_spelling = ours.replace(REGION, "eu-west-1");
+    put_backup(&mem, &other_spelling);
+    seed_rows(
+        &fake,
+        &[
+            row(&ours, BackupStatus::Available),
+            old_row(&other_spelling, BackupStatus::Available),
+        ],
+    );
+
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.stopping.len(), 1, "{:?}", report.stopping);
+    assert_eq!(report.stopping[0].0.backup_arn, other_spelling);
+    assert!(
+        report.stopping[0].1.contains("two rows of backup id")
+            && report.stopping[0].1.contains(&ours),
+        "{}",
+        report.stopping[0].1
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+}
+
+/// The wait of `--move-store` and `--forget-store` covers the old root's
+/// store ids as well as the configured store's: a live CreateBackup of a
+/// server still configured with the old root is waited on.
+#[tokio::test(start_paused = true)]
+async fn the_wait_covers_every_store_it_is_given() {
+    use maintenance::{Interrupt, Wait, WaitOutcome, wait_for_quiet};
+    let fake = Fake::default();
+    let mut live = old_row(&sync_arn(1), BackupStatus::Creating);
+    live.heartbeat_at = seconds_since_epoch();
+    seed_rows(&fake, &[live.clone()]);
+    let holder = Arc::new(FakeHolder::default());
+    let claim = held(&holder);
+    let wait = Wait {
+        owner_window: Duration::from_secs(300),
+        limit: Duration::ZERO,
+        poll: Duration::from_secs(1),
+    };
+    let (_tx, mut quiet) = Interrupt::new();
+    assert_eq!(
+        wait_for_quiet(&fake, &[store()], &claim, wait, &mut quiet, |_| {}).await,
+        WaitOutcome::Quiet
+    );
+    assert_eq!(
+        wait_for_quiet(
+            &fake,
+            &[store(), old_store()],
+            &claim,
+            wait,
+            &mut quiet,
+            |_| {}
+        )
+        .await,
+        WaitOutcome::Busy(vec![format!(
+            "CreateBackup {} has a live owner (heartbeat within stale_job_after_secs)",
+            live.backup_arn
+        )])
+    );
+    assert_eq!(
+        wait_for_quiet(&fake, &[], &claim, wait, &mut quiet, |_| {}).await,
+        WaitOutcome::Quiet
+    );
+}
+
+/// The root an option names: the configured root is refused; a root with
+/// no row, of either kind, is refused with the stores the catalog knows,
+/// a root that differs from one by a trailing `/` or by the `?endpoint=`
+/// suffix among them; an S3 label's rows are found as S3 rows, with their
+/// store ids.
+#[tokio::test]
+async fn locate_root_finds_the_kind_and_ids_and_refuses_the_rest() {
+    use super::store_maintenance::{RootRefusal, locate_root};
+    let fake = Fake::default();
+    let s3_root = "s3://bucket/prefix?endpoint=http://127.0.0.1:9000".to_owned();
+    let mut s3_row = row(&sync_arn(1), BackupStatus::Available);
+    s3_row.store = StoreIdentity {
+        store_kind: StoreKind::S3,
+        store_root: s3_root.clone(),
+        store_id: "s3-id".to_owned(),
+    };
+    seed_rows(
+        &fake,
+        &[
+            s3_row,
+            old_row(&sync_arn(2), BackupStatus::Failed),
+            row(&sync_arn(3), BackupStatus::Available),
+        ],
+    );
+    let configured = store().store_root;
+    assert!(matches!(
+        locate_root(&fake, &configured, Some(&configured)).await,
+        Err(RootRefusal::ConfiguredRoot)
+    ));
+    let found = locate_root(&fake, &s3_root, Some(&configured))
+        .await
+        .unwrap();
+    assert_eq!(found.kind, StoreKind::S3);
+    assert_eq!(found.store_ids, ["s3-id"]);
+    let found = locate_root(&fake, "/srv/old", None).await.unwrap();
+    assert_eq!(found.kind, StoreKind::Filesystem);
+    assert_eq!(found.identities(), [old_store()]);
+    for absent in ["/srv/old/", "s3://bucket/prefix", "/srv/none"] {
+        match locate_root(&fake, absent, Some(&configured)).await {
+            Err(RootRefusal::NoRows(known)) => {
+                let roots: Vec<&str> = known.iter().map(|c| c.store.store_root.as_str()).collect();
+                assert_eq!(
+                    roots,
+                    ["/srv/old", "/var/lib/extenddb/backups", s3_root.as_str()],
+                    "{absent}"
+                );
+            }
+            other => panic!("{absent}: {other:?}"),
+        }
+    }
+}
+
+/// `--forget-store`: every row of the root is removed outright, each status
+/// by its removal (no DELETED tombstone is left, and no object is deleted),
+/// except a row a restore is reading, a FAILED row and a CREATING row whose
+/// owner is alive, which are left and reported; the configured store's row
+/// is untouched. Once the root is configured again, a reconciler cycle
+/// deletes none of its bytes: no row is left for a duty to act on.
+#[tokio::test]
+async fn forget_store_removes_the_roots_rows_outright_and_reports_what_it_left() {
+    use super::store_maintenance::{Forgotten, forget_store};
+    let fake = Arc::new(Fake::default());
+    let now = seconds_since_epoch();
+    let available = sync_arn(1);
+    let in_use = sync_arn(2);
+    let deleting = sync_arn(3);
+    let deleted = sync_arn(4);
+    let failed = sync_arn(5);
+    let failed_live = sync_arn(6);
+    let creating = sync_arn(7);
+    let creating_live = sync_arn(8);
+    let ours = sync_arn(9);
+    let mut rows = vec![
+        old_row(&available, BackupStatus::Available),
+        old_row(&in_use, BackupStatus::Available),
+        old_row(&deleting, BackupStatus::Deleting),
+        old_row(&deleted, BackupStatus::Deleted),
+        old_row(&failed, BackupStatus::Failed),
+        old_row(&failed_live, BackupStatus::Failed),
+        old_row(&creating, BackupStatus::Creating),
+        old_row(&creating_live, BackupStatus::Creating),
+    ];
+    rows[5].heartbeat_at = now;
+    rows[7].heartbeat_at = now;
+    for row in &mut rows {
+        row.completed_at = Some(1.0);
+    }
+    seed_rows(&fake, &rows);
+    seed_rows(&fake, &[row(&ours, BackupStatus::Available)]);
+    fake.forget_answers
+        .lock()
+        .unwrap()
+        .insert(in_use.clone(), ForgetRow::InUse("Target".to_owned()));
+    let old_mem = Arc::new(MemStore::default());
+    for arn in [&available, &in_use, &deleting, &deleted, &failed, &creating] {
+        put_backup(&old_mem, arn);
+    }
+
+    let report = forget_store(
+        &*fake,
+        StoreKind::Filesystem,
+        "/srv/old",
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await
+    .unwrap();
+    let outcome: HashMap<String, Forgotten> = report
+        .rows
+        .iter()
+        .map(|(row, f)| (row.backup_arn.clone(), f.clone()))
+        .collect();
+    assert_eq!(
+        outcome[&available],
+        Forgotten::Removed(BackupStatus::Available)
+    );
+    assert_eq!(
+        outcome[&deleting],
+        Forgotten::Removed(BackupStatus::Deleting)
+    );
+    assert_eq!(outcome[&deleted], Forgotten::Removed(BackupStatus::Deleted));
+    assert_eq!(outcome[&failed], Forgotten::Removed(BackupStatus::Failed));
+    assert_eq!(
+        outcome[&creating],
+        Forgotten::Removed(BackupStatus::Creating)
+    );
+    assert_eq!(
+        outcome[&in_use],
+        Forgotten::InUse("Target".to_owned(), ACCOUNT.to_owned())
+    );
+    assert_eq!(
+        outcome[&failed_live],
+        Forgotten::LiveOwner(BackupStatus::Failed)
+    );
+    assert_eq!(
+        outcome[&creating_live],
+        Forgotten::LiveOwner(BackupStatus::Creating)
+    );
+    assert_eq!(report.removed(), 5);
+    assert_eq!(
+        report
+            .rows_left
+            .as_ref()
+            .map(|left| sorted(left.iter().map(|r| r.backup_arn.clone()).collect())),
+        Some(sorted(vec![
+            in_use.clone(),
+            failed_live.clone(),
+            creating_live.clone()
+        ]))
+    );
+    assert!(!report.complete());
+    {
+        let held = fake.rows.lock().unwrap();
+        for arn in [&available, &deleting, &deleted, &failed, &creating] {
+            assert!(!held.contains_key(arn), "{arn}: no tombstone is left");
+        }
+        assert_eq!(held[&ours].store, store());
+        assert_eq!(held[&ours].status, BackupStatus::Available);
+    }
+
+    // The store's return: no duty acts on its bytes.
+    let runtime = runtime_on(&old_mem, old_store());
+    let keys_before = old_mem.keys();
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert_eq!(cycle.store_healthy, Some(true), "{cycle:?}");
+    assert_eq!(old_mem.keys(), keys_before);
+}
+
+/// `--forget-backup`, in the order given, up to the first ARN whose row is
+/// not removed: an AVAILABLE, a DELETING, a dead FAILED and a dead CREATING
+/// row are removed outright; a CREATING row with a live owner stops the
+/// run, and the ARN after it is not reached. Alone, each refusal leaves its
+/// row: a backup a restore target is reading, a FAILED row whose owner is
+/// alive, a row under another spelling of the ARN (named), an earlier
+/// release's in-catalog backup (said so, nothing changed), an ARN with no
+/// row and a string that is no ARN.
+#[tokio::test]
+async fn forget_backup_removes_each_row_in_order_and_stops_at_the_first_refusal() {
+    use super::store_maintenance::{ForgetBackup, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let now = seconds_since_epoch();
+    let [available, deleting, failed, creating, live, after] = [1, 2, 3, 4, 5, 6].map(sync_arn);
+    let mut live_row = old_row(&live, BackupStatus::Creating);
+    live_row.heartbeat_at = now;
+    seed_rows(
+        &fake,
+        &[
+            row(&available, BackupStatus::Available),
+            old_row(&deleting, BackupStatus::Deleting),
+            row(&failed, BackupStatus::Failed),
+            old_row(&creating, BackupStatus::Creating),
+            live_row,
+            row(&after, BackupStatus::Available),
+        ],
+    );
+    let asked = [&available, &deleting, &failed, &creating, &live, &after].map(|a| a.clone());
+    let report = forget_backups(
+        &*fake,
+        &asked,
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [
+            (
+                available.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            ),
+            (
+                deleting.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Deleting,
+                    Forgotten::Removed(BackupStatus::Deleting)
+                )
+            ),
+            (
+                failed.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Failed,
+                    Forgotten::Removed(BackupStatus::Failed)
+                )
+            ),
+            (
+                creating.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Creating,
+                    Forgotten::Removed(BackupStatus::Creating)
+                )
+            ),
+            (
+                live.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Creating,
+                    Forgotten::LiveOwner(BackupStatus::Creating)
+                )
+            ),
+        ]
+    );
+    assert!(!report.complete(asked.len()));
+    {
+        let held = fake.rows.lock().unwrap();
+        for arn in [&available, &deleting, &failed, &creating] {
+            assert!(!held.contains_key(arn), "{arn}");
+        }
+        assert!(held.contains_key(&live));
+        assert!(held.contains_key(&after), "not reached");
+    }
+
+    let one = |arn: &str| vec![arn.to_owned()];
+    let in_use = sync_arn(7);
+    let failed_live = sync_arn(8);
+    let stored = sync_arn(9);
+    let legacy = sync_arn(10);
+    let mut live_failed = row(&failed_live, BackupStatus::Failed);
+    live_failed.heartbeat_at = now;
+    seed_rows(
+        &fake,
+        &[
+            row(&in_use, BackupStatus::Available),
+            live_failed,
+            row(&stored, BackupStatus::Available),
+        ],
+    );
+    fake.forget_answers
+        .lock()
+        .unwrap()
+        .insert(in_use.clone(), ForgetRow::InUse("Target".to_owned()));
+    fake.descriptions.lock().unwrap().insert(
+        legacy.clone(),
+        backup_description("AVAILABLE", "PAY_PER_REQUEST"),
+    );
+    let written = stored.replace(REGION, "eu-west-1");
+    for (asked, expected) in [
+        (
+            in_use.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Available,
+                Forgotten::InUse("Target".to_owned(), ACCOUNT.to_owned()),
+            ),
+        ),
+        (
+            failed_live.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Failed,
+                Forgotten::LiveOwner(BackupStatus::Failed),
+            ),
+        ),
+        (
+            written.clone(),
+            ForgetBackup::OtherSpelling(stored.clone(), BackupStatus::Available),
+        ),
+        (legacy.clone(), ForgetBackup::Legacy),
+    ] {
+        let report = forget_backups(
+            &*fake,
+            &one(&asked),
+            REGION,
+            forget_run(Duration::from_secs(300), &never),
+        )
+        .await;
+        assert_eq!(report.done, [(asked.clone(), expected)], "{asked}");
+        assert!(!report.complete(1));
+    }
+    let report = forget_backups(
+        &*fake,
+        &one("not-an-arn"),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert!(
+        matches!(&report.done[0].1, ForgetBackup::Invalid(_)),
+        "{:?}",
+        report.done
+    );
+    let none = forget_backups(
+        &*fake,
+        &one(&sync_arn(11)),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(none.done, [(sync_arn(11), ForgetBackup::NoRow)]);
+    assert!(none.complete(1), "an ARN no row carries counts as done");
+    let held = fake.rows.lock().unwrap();
+    for arn in [&in_use, &failed_live, &stored] {
+        assert!(held.contains_key(arn), "{arn}");
+    }
+    assert!(fake.descriptions.lock().unwrap().contains_key(&legacy));
+}
+
+/// A stop asked before the first ARN or row changes nothing.
+#[tokio::test]
+async fn a_stop_before_the_first_row_forgets_nothing() {
+    use super::store_maintenance::{forget_backups, forget_store};
+    let fake = Arc::new(Fake::default());
+    let arn = sync_arn(1);
+    seed_rows(&fake, &[old_row(&arn, BackupStatus::Available)]);
+    let stop = || Some("SIGINT received".to_owned());
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&arn),
+        REGION,
+        forget_run(Duration::ZERO, &stop),
+    )
+    .await;
+    assert_eq!(report.stopped.as_deref(), Some("SIGINT received"));
+    assert!(report.done.is_empty());
+    let report = forget_store(
+        &*fake,
+        StoreKind::Filesystem,
+        "/srv/old",
+        forget_run(Duration::ZERO, &stop),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.stopped.as_deref(), Some("SIGINT received"));
+    assert!(report.rows.is_empty());
+    assert!(fake.rows.lock().unwrap().contains_key(&arn));
+    assert!(fake.forgets_seen.lock().unwrap().is_empty());
+}
+
+/// A restored catalog whose newest AVAILABLE row's backup was deleted after
+/// the dump: the store's check fails naming it ("manifest probe failed");
+/// `--forget-backup` of that ARN removes the row, and the next check passes
+/// on the next-newest row, whose manifest is there.
+#[tokio::test]
+async fn forget_backup_of_the_newest_rows_deleted_backup_heals_the_store() {
+    use super::store_maintenance::forget_backups;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let kept = sync_arn(1);
+    let gone = sync_arn(2);
+    put_backup(&mem, &kept);
+    seed_rows(
+        &fake,
+        &[
+            row(&kept, BackupStatus::Available),
+            row(&gone, BackupStatus::Available),
+        ],
+    );
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let check = super::check_configured_store(configured, &*fake, "test").await;
+    assert!(
+        matches!(&check, Err(StoreProblem::ManifestMissing { backup_arn }) if *backup_arn == gone),
+        "{check:?}"
+    );
+    configured.record_check(check);
+    assert!(!configured.is_healthy());
+
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&gone),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert!(report.complete(1), "{:?}", report.done);
+    let check = super::check_configured_store(configured, &*fake, "test").await;
+    assert_eq!(check.unwrap(), store());
+    assert!(fake.rows.lock().unwrap().contains_key(&kept));
+}
+
+/// A deletion duty that listed a row before a maintenance command removed
+/// it, or moved it to another store, acts on nothing (the row is read once
+/// more after the fence): the FAILED-prefix duty keeps the prefix of a row
+/// `--forget-backup` removed after the listing, and the tombstone duty
+/// keeps a row `--move-store` moved after the listing.
+#[tokio::test]
+async fn a_duty_whose_row_is_forgotten_or_moved_after_its_listing_acts_on_nothing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let forgotten = sync_arn(1);
+    let moved = sync_arn(2);
+    let leftover = format!("{}data/000001.json.gz", prefix_of(&forgotten));
+    mem.insert(&leftover, b"x");
+    seed_rows(&fake, &[row(&forgotten, BackupStatus::Failed)]);
+    let gone = forgotten.clone();
+    *fake.after_older_than.lock().unwrap() = Some((
+        BackupStatus::Failed,
+        StaleClock::Heartbeat,
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().remove(&gone);
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert!(
+        mem.keys().contains(&leftover),
+        "the forgotten row's bytes are kept"
+    );
+
+    let mut tombstone = row(&moved, BackupStatus::Deleted);
+    tombstone.completed_at = Some(1.0);
+    seed_rows(&fake, &[tombstone]);
+    let elsewhere = moved.clone();
+    *fake.after_older_than.lock().unwrap() = Some((
+        BackupStatus::Deleted,
+        StaleClock::Completed,
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().get_mut(&elsewhere).unwrap().store = old_store();
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.tombstones_removed.is_empty(), "{cycle:?}");
+    assert_eq!(fake.rows.lock().unwrap()[&moved].store, old_store());
+    assert!(
+        fake.after_older_than.lock().unwrap().is_none(),
+        "the hook ran"
+    );
+}
+
+/// Plain sync's report of other stores: per store other than the
+/// configured one (another root, another kind, the configured root under
+/// another id), the rows per status and each CREATING and DELETING row by
+/// ARN; the configured store's rows are not in it. A reconciler cycle of
+/// the configured store deletes none of the other stores' prefixes.
+#[tokio::test]
+async fn the_report_of_other_stores_counts_and_names_their_rows_and_nothing_acts_on_them() {
+    use super::store_maintenance::{NamedRow, other_stores};
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let s3 = StoreIdentity {
+        store_kind: StoreKind::S3,
+        store_root: "s3://bucket/p".to_owned(),
+        store_id: "s3-id".to_owned(),
+    };
+    let other_id = StoreIdentity {
+        store_id: "store-9".to_owned(),
+        ..store()
+    };
+    let mut s3_failed = row(&sync_arn(5), BackupStatus::Failed);
+    s3_failed.store = s3.clone();
+    let mut other_id_row = row(&sync_arn(6), BackupStatus::Available);
+    other_id_row.store = other_id.clone();
+    let mut old_failed = old_row(&sync_arn(3), BackupStatus::Failed);
+    old_failed.completed_at = Some(1.0);
+    let mut old_deleted = old_row(&sync_arn(4), BackupStatus::Deleted);
+    old_deleted.completed_at = Some(1.0);
+    seed_rows(
+        &fake,
+        &[
+            row(&sync_arn(10), BackupStatus::Available),
+            row(&sync_arn(11), BackupStatus::Creating),
+            old_row(&sync_arn(1), BackupStatus::Creating),
+            old_row(&sync_arn(2), BackupStatus::Deleting),
+            old_failed,
+            old_deleted,
+            old_row(&sync_arn(7), BackupStatus::Available),
+            old_row(&sync_arn(8), BackupStatus::Available),
+            s3_failed,
+            other_id_row,
+        ],
+    );
+    for n in [3, 4, 5] {
+        mem.insert(
+            &format!("{}data/000001.json.gz", prefix_of(&sync_arn(n))),
+            b"x",
+        );
+    }
+    put_backup(&mem, &sync_arn(10));
+
+    let others = other_stores(&*fake, &store()).await.unwrap();
+    let stores: Vec<&StoreIdentity> = others.iter().map(|o| &o.store).collect();
+    assert_eq!(stores, [&old_store(), &other_id, &s3]);
+    assert_eq!(
+        others[0].counts,
+        [
+            (BackupStatus::Creating, 1),
+            (BackupStatus::Available, 2),
+            (BackupStatus::Deleting, 1),
+            (BackupStatus::Deleted, 1),
+            (BackupStatus::Failed, 1),
+        ]
+    );
+    let named = |status, n| NamedRow {
+        status,
+        backup_arn: sync_arn(n),
+        account_id: ACCOUNT.to_owned(),
+    };
+    assert_eq!(
+        others[0].unresolved,
+        [
+            named(BackupStatus::Creating, 1),
+            named(BackupStatus::Deleting, 2)
+        ]
+    );
+    assert_eq!(others[1].counts, [(BackupStatus::Available, 1)]);
+    assert!(others[1].unresolved.is_empty());
+    assert_eq!(others[2].counts, [(BackupStatus::Failed, 1)]);
+
+    // The configured root under a second id would make the store unhealthy;
+    // the cycle is about the other roots' prefixes.
+    fake.rows.lock().unwrap().remove(&sync_arn(6));
+    let keys_before = mem.keys();
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert_eq!(cycle.store_healthy, Some(true));
+    assert_eq!(
+        mem.keys(),
+        keys_before,
+        "no prefix of another store is deleted"
+    );
+}
+
+/// A dead CREATING row of the old root whose copy under the configured root
+/// holds no complete backup stops the move, and the move writes no status
+/// for it: the copy proves nothing about the old root's prefix, and a FAILED
+/// row would have the reconciler delete the copy (and a server still on the
+/// old root the original). Each shape of copy: none at all, a data file
+/// missing, one short, one long, no sidecar, a manifest of another backup.
+/// Each row is named with the reason and the two ways out, keeps its
+/// status, heartbeat and store, and nothing is rewritten or deleted.
+#[tokio::test]
+async fn a_dead_creating_row_whose_copy_is_incomplete_stops_the_move_unwritten() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let no_copy = sync_arn(1);
+    let missing = sync_arn(2);
+    let short = sync_arn(3);
+    let long = sync_arn(4);
+    let no_sidecar = sync_arn(5);
+    let other = sync_arn(6);
+    let mut objects = backup_objects(&missing);
+    let dropped = objects
+        .iter()
+        .position(|(k, _)| k.contains("/data/"))
+        .unwrap();
+    objects.remove(dropped);
+    for (key, bytes) in objects {
+        mem.insert(&key, &bytes);
+    }
+    for (key, mut bytes) in backup_objects(&short) {
+        if key.contains("/data/") && bytes.len() > 1 {
+            bytes.pop();
+        }
+        mem.insert(&key, &bytes);
+    }
+    for (key, mut bytes) in backup_objects(&long) {
+        if key.contains("/data/") {
+            bytes.push(0);
+        }
+        mem.insert(&key, &bytes);
+    }
+    for (key, bytes) in backup_objects(&no_sidecar) {
+        if !key.ends_with("extenddb-manifest.sha256") {
+            mem.insert(&key, &bytes);
+        }
+    }
+    for (key, bytes) in backup_objects(&sync_arn(19)) {
+        mem.insert(
+            &key.replacen(&prefix_of(&sync_arn(19)), &prefix_of(&other), 1),
+            &bytes,
+        );
+    }
+    let arns = [&no_copy, &missing, &short, &long, &no_sidecar, &other];
+    let rows: Vec<BackupRow> = arns
+        .iter()
+        .map(|arn| {
+            let mut row = old_row(arn, BackupStatus::Creating);
+            row.heartbeat_at = 1.0;
+            fake.dead.lock().unwrap().insert((*arn).clone());
+            row
+        })
+        .collect();
+    seed_rows(&fake, &rows);
+    let keys_before = mem.keys();
+
+    let report = move_old(&fake, &runtime).await;
+    assert!(!report.complete());
+    assert!(report.resolved.is_empty(), "{:?}", report.resolved);
+    let why: HashMap<String, String> = report
+        .stopping
+        .iter()
+        .map(|(row, why)| (row.backup_arn.clone(), why.clone()))
+        .collect();
+    assert_eq!(report.stopping.len(), 6, "{why:#?}");
+    for (arn, detail) in [
+        (&no_copy, "no manifest"),
+        (&missing, "is not in the store"),
+        (&short, "bytes in the store"),
+        (&long, "bytes in the store"),
+        (&no_sidecar, "without its sidecar"),
+        (&other, "not the row's backup"),
+    ] {
+        let why = &why[arn];
+        assert!(
+            why.starts_with("CREATING, its owner dead, and the copy under the configured root")
+                && why.contains(detail)
+                && why.contains("the move writes no status for it")
+                && why.contains("configured with the old root")
+                && why.contains("--forget-backup"),
+            "{arn}: {why}"
+        );
+    }
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+    let held = fake.rows.lock().unwrap();
+    for row in &rows {
+        let now = &held[&row.backup_arn];
+        assert_eq!(
+            (
+                now.status,
+                now.heartbeat_at,
+                &now.store,
+                &now.failure_reason
+            ),
+            (BackupStatus::Creating, 1.0, &old_store(), &None),
+            "{}",
+            row.backup_arn
+        );
+    }
+    drop(held);
+    assert_eq!(mem.keys(), keys_before, "no object was deleted");
+}
+
+/// The owner window the move is given is the one the takeover reads: a
+/// CREATING row whose last beat is 100 s old has a live owner under the
+/// servers' 300 s window and stops the move as such, and is resolved under
+/// SQLite's zero window (the serve lock held, no job of another process can
+/// be alive), its complete copy making it AVAILABLE.
+#[tokio::test]
+async fn the_moves_owner_window_is_the_one_the_takeover_reads() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.dead_by_heartbeat
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let arn = seed_dead_creating_with_manifest(&fake, &mem, true);
+    {
+        let mut rows = fake.rows.lock().unwrap();
+        let row = rows.get_mut(&arn).unwrap();
+        row.store = old_store();
+        row.heartbeat_at = seconds_since_epoch() - 100.0;
+    }
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.stopping.len(), 1, "{report:?}");
+    assert!(report.stopping[0].1.contains("live owner"), "{report:?}");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn].status,
+        BackupStatus::Creating
+    );
+
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let report = super::store_maintenance::move_store(
+        &*fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::ZERO,
+            stop: &never,
+            claim: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.resolved, [(arn.clone(), BackupStatus::Available)]);
+    let row = fake.rows.lock().unwrap()[&arn].clone();
+    assert_eq!((row.status, row.store), (BackupStatus::Available, store()));
+}
+
+/// The manifest's item total must be the row's too: a copy whose manifest
+/// records the row's size and another item total is another backup under
+/// the same ARN, and stops the move.
+#[tokio::test]
+async fn an_available_row_whose_manifest_counts_other_items_stops_the_move() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = sync_arn(1);
+    put_backup(&mem, &arn);
+    let mut row = old_row(&arn, BackupStatus::Available);
+    row.item_count += 1;
+    seed_rows(&fake, &[row]);
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.stopping.len(), 1, "{report:?}");
+    assert!(
+        report.stopping[0]
+            .1
+            .contains("another backup under the same ARN"),
+        "{}",
+        report.stopping[0].1
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+}
+
+/// Where rows are unique by ARN alone (Cassandra), two rows of one backup
+/// id among the old root's rows (two spellings of the ARN, two FAILED rows
+/// with no copy, each of which passes its own check) stop the move: each
+/// is named with the other.
+#[tokio::test]
+async fn two_rows_of_one_backup_id_among_the_moved_stop_the_move() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.unique_by_arn
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let ours = sync_arn(1);
+    let other_spelling = ours.replace(REGION, "eu-west-1");
+    seed_rows(
+        &fake,
+        &[
+            old_row(&ours, BackupStatus::Failed),
+            old_row(&other_spelling, BackupStatus::Failed),
+        ],
+    );
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.stopping.len(), 2, "{:?}", report.stopping);
+    let both = sorted(vec![ours.clone(), other_spelling.clone()]);
+    for ((row, why), (arn, other)) in report
+        .stopping
+        .iter()
+        .zip([(&both[0], &both[1]), (&both[1], &both[0])])
+    {
+        assert_eq!(&row.backup_arn, arn);
+        assert!(
+            why.contains("two rows of backup id") && why.contains(other.as_str()),
+            "{why}"
+        );
+    }
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+}
+
+/// The stop is asked before each row: a stop that fires after the first
+/// row's check leaves the second unchecked (its dead CREATING row not taken
+/// over, its DELETING row's deletion not finished) and nothing rewritten.
+#[tokio::test]
+async fn a_stop_during_the_checks_leaves_the_later_rows_unchecked() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let first = sync_arn(1);
+    let deleting = sync_arn(2);
+    put_backup(&mem, &first);
+    let leftover = format!("{}data/000001.json.gz", prefix_of(&deleting));
+    mem.insert(&leftover, b"x");
+    let mut first_row = old_row(&first, BackupStatus::Available);
+    first_row.created_at = 1.0;
+    let mut deleting_row = old_row(&deleting, BackupStatus::Deleting);
+    deleting_row.created_at = 2.0;
+    seed_rows(&fake, &[first_row, deleting_row]);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        (asked.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 1)
+            .then(|| "SIGTERM received".to_owned())
+    };
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let report = super::store_maintenance::move_store(
+        &*fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &stop,
+            claim: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.stopped.as_deref(), Some("SIGTERM received"));
+    assert!(report.finished.is_empty(), "{report:?}");
+    assert!(
+        mem.keys().contains(&leftover),
+        "the second row was not checked"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+}
+
+/// A key the old root no longer lists counts as moved only when its row,
+/// read by its ARN, names the configured store: a row another writer
+/// removed during the move (a tombstone duty of a server on the old root)
+/// or moved to a third store is gone, not moved, and gets no audit line. A
+/// re-list of the old root that fails after a rewrite that counted every
+/// key takes every key as moved, and so does a read of a key's row that
+/// fails, for that key and the rest; either leaves the move incomplete.
+#[tokio::test]
+async fn a_key_counts_as_moved_only_when_its_row_names_the_configured_store() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let kept = sync_arn(1);
+    let removed = sync_arn(2);
+    put_backup(&mem, &kept);
+    seed_rows(
+        &fake,
+        &[
+            old_row(&kept, BackupStatus::Available),
+            old_row(&removed, BackupStatus::Failed),
+        ],
+    );
+    fake.removed_before_rewrite
+        .lock()
+        .unwrap()
+        .push(removed.clone());
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rewritten, 1);
+    assert_eq!(report.moved, std::slice::from_ref(&kept));
+    assert_eq!(report.gone, std::slice::from_ref(&removed));
+    assert!(report.complete(), "{report:?}");
+
+    // Moved to a third store by another writer before the rewrite: read by
+    // its ARN, the row names that store, so it is gone, not moved.
+    let fake = Arc::new(Fake::default());
+    seed_rows(
+        &fake,
+        &[
+            old_row(&kept, BackupStatus::Available),
+            old_row(&removed, BackupStatus::Failed),
+        ],
+    );
+    let third = StoreIdentity {
+        store_kind: StoreKind::Filesystem,
+        store_root: "/srv/third".to_owned(),
+        store_id: "third-1".to_owned(),
+    };
+    fake.lands_before_rewrite.lock().unwrap().push(BackupRow {
+        store: third.clone(),
+        ..old_row(&removed, BackupStatus::Failed)
+    });
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rewritten, 1);
+    assert_eq!(report.moved, std::slice::from_ref(&kept));
+    assert_eq!(report.gone, std::slice::from_ref(&removed));
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(fake.rows.lock().unwrap()[&removed].store, third);
+
+    // A read of a moved key's row that fails: the count is all there is,
+    // so that key and the rest are taken as moved, and the move is not
+    // complete.
+    let fake = Arc::new(Fake::default());
+    seed_rows(
+        &fake,
+        &[
+            old_row(&kept, BackupStatus::Available),
+            old_row(&removed, BackupStatus::Failed),
+        ],
+    );
+    fake.read_row_error_after_rewrite
+        .store(true, std::sync::atomic::Ordering::Release);
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rewritten, 2);
+    let relist = report.relist_error.clone().expect("the read's error");
+    assert!(
+        relist.contains("could not be read after the rewrite: ")
+            && relist.contains("read timed out"),
+        "{relist}"
+    );
+    assert_eq!(
+        sorted(report.moved.clone()),
+        sorted(vec![kept.clone(), removed.clone()])
+    );
+    assert!(report.gone.is_empty(), "{report:?}");
+    assert!(!report.complete());
+
+    let fake = Arc::new(Fake::default());
+    seed_rows(
+        &fake,
+        &[
+            old_row(&kept, BackupStatus::Available),
+            old_row(&removed, BackupStatus::Failed),
+        ],
+    );
+    fake.by_root_error_after_rewrite
+        .store(true, std::sync::atomic::Ordering::Release);
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rewritten, 2);
+    assert!(report.relist_error.is_some(), "{report:?}");
+    assert_eq!(
+        sorted(report.moved.clone()),
+        sorted(vec![kept.clone(), removed.clone()])
+    );
+    assert!(!report.complete());
+
+    // With a key the rewrite did not count, a failed re-list takes none as
+    // moved.
+    let fake = Arc::new(Fake::default());
+    seed_rows(
+        &fake,
+        &[
+            old_row(&kept, BackupStatus::Available),
+            old_row(&removed, BackupStatus::Failed),
+        ],
+    );
+    fake.removed_before_rewrite
+        .lock()
+        .unwrap()
+        .push(removed.clone());
+    fake.by_root_error_after_rewrite
+        .store(true, std::sync::atomic::Ordering::Release);
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rewritten, 1);
+    assert!(report.moved.is_empty(), "{report:?}");
+    assert!(!report.complete());
+}
+
+/// A row left for its heartbeat: a CREATING row has a live owner to wait
+/// for; a FAILED row's job ended with its FAILED write, so its text gives
+/// the condition to run again on, the heartbeat's age, and no job to wait
+/// for.
+#[test]
+fn a_failed_row_left_for_its_heartbeat_names_the_heartbeats_age() {
+    use super::store_maintenance::Forgotten;
+    assert_eq!(
+        Forgotten::LiveOwner(BackupStatus::Failed).to_string(),
+        "left: the FAILED row was written less than stale_job_after_secs ago (its heartbeat is \
+         within the window); run the command again once its heartbeat is older than \
+         stale_job_after_secs"
+    );
+    assert_eq!(
+        Forgotten::LiveOwner(BackupStatus::Creating).to_string(),
+        "left: the CREATING row has a live owner (its heartbeat is within \
+         stale_job_after_secs); run the command again once its job has ended"
+    );
+}
+
+/// A removal that meets another status reads the row once more and applies
+/// that status's removal: an AVAILABLE row a DeleteBackup moves to DELETING
+/// under `--forget-backup` is removed as DELETING. A row moved to another
+/// store under the removal is left and named as changed.
+#[tokio::test]
+async fn a_removal_that_meets_another_status_or_store_reads_the_row_again() {
+    use super::store_maintenance::{ForgetBackup, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let arn = sync_arn(1);
+    seed_rows(&fake, &[row(&arn, BackupStatus::Available)]);
+    let deleting = arn.clone();
+    *fake.after_row_read.lock().unwrap() = Some((
+        arn.clone(),
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().get_mut(&deleting).unwrap().status = BackupStatus::Deleting;
+        }),
+    ));
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&arn),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            arn.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Available,
+                Forgotten::Removed(BackupStatus::Deleting)
+            )
+        )]
+    );
+    assert!(!fake.rows.lock().unwrap().contains_key(&arn));
+
+    let moved = sync_arn(2);
+    seed_rows(&fake, &[row(&moved, BackupStatus::Available)]);
+    let elsewhere = moved.clone();
+    *fake.after_row_read.lock().unwrap() = Some((
+        moved.clone(),
+        Box::new(move |fake: &Fake| {
+            let mut rows = fake.rows.lock().unwrap();
+            let row = rows.get_mut(&elsewhere).unwrap();
+            row.status = BackupStatus::Deleting;
+            row.store = old_store();
+        }),
+    ));
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&moved),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            moved.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Available,
+                Forgotten::Changed(BackupStatus::Deleting, old_store())
+            )
+        )]
+    );
+    assert!(fake.rows.lock().unwrap().contains_key(&moved));
+}
+
+/// `--forget-backup` given again after a stop: an ARN no row and no
+/// in-catalog backup carries counts as done ("nothing to remove") and the
+/// run goes on to the next ARN, whose row is removed.
+#[tokio::test]
+async fn forget_backup_goes_past_an_arn_no_row_carries() {
+    use super::store_maintenance::{ForgetBackup, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let gone = sync_arn(1);
+    let kept = sync_arn(2);
+    seed_rows(&fake, &[row(&kept, BackupStatus::Available)]);
+    let asked = [gone.clone(), kept.clone()];
+    let report = forget_backups(
+        &*fake,
+        &asked,
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [
+            (gone.clone(), ForgetBackup::NoRow),
+            (
+                kept.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            )
+        ]
+    );
+    assert!(report.complete(2));
+    assert_eq!(
+        ForgetBackup::NoRow.to_string(),
+        "no row carries this ARN; nothing to remove"
+    );
+    assert!(!fake.rows.lock().unwrap().contains_key(&kept));
+}
+
+/// The form of every ARN is checked before the command takes the claim:
+/// a string that is no ARN and an ARN whose backup id is no id are refused,
+/// each with why, said once; a well-formed ARN passes.
+#[test]
+fn the_arns_are_checked_before_the_claim() {
+    use super::store_maintenance::check_arns;
+    let bad_id = sync_arn(1).replace("/backup/", "/backup/x");
+    let refused = check_arns(&[
+        "not-an-arn".to_owned(),
+        String::new(),
+        sync_arn(2),
+        bad_id.clone(),
+    ]);
+    assert_eq!(
+        refused,
+        [
+            ("not-an-arn".to_owned(), "not a backup ARN".to_owned()),
+            (String::new(), "not a backup ARN".to_owned()),
+            (bad_id, "not a backup id".to_owned()),
+        ]
+    );
+    assert_eq!(
+        super::store_maintenance::ForgetBackup::Invalid("not a backup ARN".to_owned()).to_string(),
+        "refused: not a backup ARN"
+    );
+}
+
+/// A deletion duty that listed a FAILED row and re-read it before a
+/// maintenance command took the claim reads the claim once more after the
+/// re-read, finds it held, and deletes nothing; so does a tombstone duty
+/// whose listing comes after the command took it. The claim's read is the
+/// last step before the call.
+#[tokio::test]
+async fn a_duty_that_finds_the_claim_held_after_its_reread_acts_on_nothing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let failed = sync_arn(1);
+    put_backup(&mem, &failed);
+    let mut failed_row = row(&failed, BackupStatus::Failed);
+    failed_row.heartbeat_at = 1.0;
+    seed_rows(&fake, &[failed_row]);
+    *fake.after_row_read.lock().unwrap() = Some((
+        failed.clone(),
+        Box::new(|fake: &Fake| *fake.maintenance_held.lock().unwrap() = true),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(!cycle.maintenance_held, "the cycle began without the claim");
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert!(
+        objects_under(&mem, &failed).len() > 1,
+        "the row's bytes are kept"
+    );
+    assert!(
+        fake.after_row_read.lock().unwrap().is_none(),
+        "the hook ran"
+    );
+
+    *fake.maintenance_held.lock().unwrap() = false;
+    fake.rows.lock().unwrap().clear();
+    let tombstone = sync_arn(2);
+    let mut tombstone_row = row(&tombstone, BackupStatus::Deleted);
+    tombstone_row.completed_at = Some(1.0);
+    seed_rows(&fake, &[tombstone_row]);
+    *fake.after_older_than.lock().unwrap() = Some((
+        BackupStatus::Deleted,
+        StaleClock::Completed,
+        Box::new(|fake: &Fake| *fake.maintenance_held.lock().unwrap() = true),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.tombstones_removed.is_empty(), "{cycle:?}");
+    assert!(fake.rows.lock().unwrap().contains_key(&tombstone));
+}
+
+/// The status half of the duty's re-read: a FAILED row forgotten and its
+/// complete prefix adopted again (an AVAILABLE row under the same ARN)
+/// between the FAILED-prefix duty's listing and its deletion keeps its
+/// prefix.
+#[tokio::test]
+async fn a_duty_keeps_the_prefix_of_a_row_that_turned_available_after_its_listing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = sync_arn(1);
+    put_backup(&mem, &arn);
+    let mut failed = row(&arn, BackupStatus::Failed);
+    failed.heartbeat_at = 1.0;
+    seed_rows(&fake, &[failed]);
+    let adopted = arn.clone();
+    *fake.after_older_than.lock().unwrap() = Some((
+        BackupStatus::Failed,
+        StaleClock::Heartbeat,
+        Box::new(move |fake: &Fake| {
+            let mut rows = fake.rows.lock().unwrap();
+            let row = rows.get_mut(&adopted).unwrap();
+            row.status = BackupStatus::Available;
+            row.owner_generation = UNOWNED_GENERATION;
+        }),
+    ));
+    let whole = objects_under(&mem, &arn).len();
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert_eq!(
+        objects_under(&mem, &arn).len(),
+        whole,
+        "the backup is whole"
+    );
+}
+
+/// A deletion that read the claim free just before a command took it runs
+/// at most `DUTY_DELETION_BOUND`: a prefix deletion that would take longer
+/// is dropped at the bound, nothing of the prefix is deleted, and the duty
+/// stops for this cycle (the next FAILED row's prefix is not even listed);
+/// the next cycle continues.
+#[tokio::test(start_paused = true)]
+async fn a_duty_deletion_that_outlasts_the_bound_stops_the_duty_for_the_cycle() {
+    use super::reconciler::DUTY_DELETION_BOUND;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let first = sync_arn(1);
+    let second = sync_arn(2);
+    for (n, arn) in [&first, &second].into_iter().enumerate() {
+        put_backup(&mem, arn);
+        let mut failed = row(arn, BackupStatus::Failed);
+        failed.heartbeat_at = 1.0;
+        failed.created_at = n as f64;
+        seed_rows(&fake, &[failed]);
+    }
+    *mem.delete_delay.lock().unwrap() = Some(DUTY_DELETION_BOUND + Duration::from_secs(10));
+    // The cycle's own read is the first; the first row's after its re-read
+    // the second: a command takes the claim right after it.
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        2,
+        Box::new(|fake: &Fake| *fake.maintenance_held.lock().unwrap() = true),
+    ));
+    let whole = objects_under(&mem, &first).len();
+    let started = tokio::time::Instant::now();
+    let cycle = cycle_on(&fake, &runtime).await;
+    let took = started.elapsed();
+    assert!(
+        took >= DUTY_DELETION_BOUND && took < DUTY_DELETION_BOUND + Duration::from_secs(10),
+        "{took:?}"
+    );
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert_eq!(
+        objects_under(&mem, &first).len(),
+        whole,
+        "nothing was deleted"
+    );
+    assert_eq!(objects_under(&mem, &second).len(), whole);
+    assert!(
+        !mem.lists.lock().unwrap().contains(&prefix_of(&second)),
+        "the duty stopped before the next row"
+    );
+
+    // The next cycle, without the claim and with a store that answers,
+    // continues.
+    *fake.maintenance_held.lock().unwrap() = false;
+    *mem.delete_delay.lock().unwrap() = None;
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert_eq!(
+        sorted(cycle.failed_prefixes_deleted.clone()),
+        sorted(vec![first.clone(), second.clone()])
+    );
+}
+
+/// Beside servers the forget options wait `FORGET_WAIT` from the claim
+/// before their first FAILED or DELETED removal, told once; an AVAILABLE
+/// row's removal does not wait; a stop during the wait leaves the FAILED
+/// row and ends the run; with no wait (SQLite) nothing waits. The wait is
+/// the duty's bound and one store call's.
+#[tokio::test(start_paused = true)]
+async fn the_forget_options_wait_out_the_duties_before_a_failed_removal() {
+    use super::reconciler::DUTY_DELETION_BOUND;
+    use super::store_maintenance::{FORGET_WAIT, ForgetRun, Forgotten, forget_store};
+    assert_eq!(FORGET_WAIT, DUTY_DELETION_BOUND + super::S3_CHECK_TIMEOUT);
+    assert!(DUTY_DELETION_BOUND < extenddb_backup_store::S3_ATTEMPT_TIMEOUT);
+    let told = Mutex::new(Vec::new());
+    let tell = |remaining: Duration| told.lock().unwrap().push(remaining);
+    let seed = |fake: &Fake| {
+        let mut available = old_row(&sync_arn(1), BackupStatus::Available);
+        available.created_at = 1.0;
+        let mut failed = old_row(&sync_arn(2), BackupStatus::Failed);
+        failed.created_at = 2.0;
+        seed_rows(fake, &[available, failed]);
+    };
+
+    let fake = Arc::new(Fake::default());
+    seed(&fake);
+    let claimed = tokio::time::Instant::now();
+    let run = ForgetRun {
+        owner_window: Duration::ZERO,
+        removals_from: Some(claimed + FORGET_WAIT),
+        on_wait: &tell,
+        stop: &never,
+        claim: None,
+        configured: None,
+        unmounted_root: None,
+        deletions_finished: &[],
+    };
+    let report = forget_store(&*fake, StoreKind::Filesystem, "/srv/old", run)
+        .await
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(claimed.elapsed() >= FORGET_WAIT);
+    assert_eq!(*told.lock().unwrap(), [FORGET_WAIT]);
+
+    // Only an AVAILABLE row: no wait.
+    told.lock().unwrap().clear();
+    let fake = Arc::new(Fake::default());
+    seed_rows(&fake, &[old_row(&sync_arn(1), BackupStatus::Available)]);
+    let claimed = tokio::time::Instant::now();
+    let run = ForgetRun {
+        removals_from: Some(claimed + FORGET_WAIT),
+        ..run
+    };
+    let report = forget_store(&*fake, StoreKind::Filesystem, "/srv/old", run)
+        .await
+        .unwrap();
+    assert!(report.complete());
+    assert!(claimed.elapsed() < FORGET_WAIT);
+    assert!(told.lock().unwrap().is_empty());
+
+    // A stop during the wait.
+    let fake = Arc::new(Fake::default());
+    seed(&fake);
+    let claimed = tokio::time::Instant::now();
+    let stop =
+        || (claimed.elapsed() >= Duration::from_secs(5)).then(|| "SIGINT received".to_owned());
+    let run = ForgetRun {
+        removals_from: Some(claimed + FORGET_WAIT),
+        stop: &stop,
+        ..run
+    };
+    let report = forget_store(&*fake, StoreKind::Filesystem, "/srv/old", run)
+        .await
+        .unwrap();
+    assert_eq!(report.stopped.as_deref(), Some("SIGINT received"));
+    assert_eq!(
+        report
+            .rows
+            .iter()
+            .map(|(_, f)| f.clone())
+            .collect::<Vec<_>>(),
+        [Forgotten::Removed(BackupStatus::Available)]
+    );
+    assert!(fake.rows.lock().unwrap().contains_key(&sync_arn(2)));
+    assert!(claimed.elapsed() < FORGET_WAIT);
+
+    // No wait: SQLite, under the serve lock.
+    let fake = Arc::new(Fake::default());
+    seed(&fake);
+    let claimed = tokio::time::Instant::now();
+    let report = forget_store(
+        &*fake,
+        StoreKind::Filesystem,
+        "/srv/old",
+        forget_run(Duration::ZERO, &never),
+    )
+    .await
+    .unwrap();
+    assert!(report.complete());
+    assert_eq!(claimed.elapsed(), Duration::ZERO);
+}
+
+/// The store-backed create reads the maintenance claim again immediately
+/// before its insert: a claim a command took after the request's check
+/// (while the job opened the table, say) refuses the request as a held
+/// claim does, with no row inserted and every slot free.
+#[tokio::test]
+async fn a_claim_taken_after_the_requests_check_refuses_the_create_before_its_row() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    snapshot_fixture(&fake, &music_table(), songs(3), true, None);
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        1,
+        Box::new(|fake: &Fake| *fake.maintenance_held.lock().unwrap() = true),
+    ));
+    let runtime = job_runtime(&mem);
+    let err = create_music_backup(&fake, &runtime).await.unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::LimitExceededException(m)
+            if m.contains("A backup maintenance command holds")),
+        "{err:?}"
+    );
+    wait_for_jobs(&runtime).await;
+    assert_eq!(fake.maintenance_checks.lock().unwrap().len(), 2);
+    assert!(fake.rows.lock().unwrap().is_empty(), "no row is inserted");
+    assert!(fake.claims.lock().unwrap().is_empty());
+    assert!(mem.puts.lock().unwrap().is_empty());
+    assert_eq!(runtime.free_slots(), 4);
+}
+
+/// The read-only check after `--forget-backup` writes nothing: on a root
+/// with no identity file and no rows it creates no file (`Ok(None)`); on
+/// a root whose file holds another id than the one the command opened it
+/// with it is an identity mismatch; otherwise it passes, the manifest
+/// probe included.
+#[tokio::test]
+async fn the_read_only_check_writes_nothing_to_the_root() {
+    let fake = Arc::new(Fake::default());
+    let mem = Arc::new(MemStore::default());
+    let configured = ConfiguredStore::new(
+        store().store_kind,
+        store().store_root,
+        Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+        None,
+        Ok(store()),
+    );
+    let check = super::check_configured_store_read_only(&configured, &*fake, None).await;
+    assert_eq!(check, Ok(None));
+    assert!(mem.keys().is_empty(), "no identity file is created");
+    assert!(mem.puts.lock().unwrap().is_empty());
+
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+    let check = super::check_configured_store_read_only(&configured, &*fake, Some(&store())).await;
+    assert_eq!(check, Ok(Some(store())));
+    let other = StoreIdentity {
+        store_id: "store-9".to_owned(),
+        ..store()
+    };
+    let check = super::check_configured_store_read_only(&configured, &*fake, Some(&other)).await;
+    assert!(
+        matches!(&check, Err(StoreProblem::IdMismatch { file_id, .. }) if file_id == "store-1"),
+        "{check:?}"
+    );
+    let gone = sync_arn(1);
+    seed_rows(&fake, &[row(&gone, BackupStatus::Available)]);
+    let check = super::check_configured_store_read_only(&configured, &*fake, Some(&store())).await;
+    assert!(
+        matches!(&check, Err(StoreProblem::ManifestMissing { backup_arn }) if *backup_arn == gone),
+        "{check:?}"
+    );
+    assert!(mem.puts.lock().unwrap().is_empty());
+}
+
+/// The DELETED-prefix deletion and the tombstone removal run under the same
+/// bound: a deletion of a DELETED row's prefix that would outlast it is
+/// dropped with nothing deleted and the DELETED-prefix duty stops for the
+/// cycle (the next DELETED row's prefix is not listed); a tombstone
+/// removal held past it is dropped with the row kept and the tombstone duty
+/// stops (the next tombstone is not tried).
+#[tokio::test(start_paused = true)]
+async fn the_deleted_prefix_and_tombstone_calls_stop_their_duty_at_the_bound() {
+    use super::reconciler::DUTY_DELETION_BOUND;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let swept = [sync_arn(1), sync_arn(2)];
+    for (n, arn) in swept.iter().enumerate() {
+        put_backup(&mem, arn);
+        let mut deleted = row(arn, BackupStatus::Deleted);
+        deleted.created_at = n as f64;
+        seed_rows(&fake, &[deleted]);
+    }
+    *mem.delete_delay.lock().unwrap() = Some(DUTY_DELETION_BOUND + Duration::from_secs(10));
+    let whole = objects_under(&mem, &swept[0]).len();
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.deleted_prefixes_swept.is_empty(), "{cycle:?}");
+    assert_eq!(objects_under(&mem, &swept[0]).len(), whole);
+    assert!(
+        !mem.lists.lock().unwrap().contains(&prefix_of(&swept[1])),
+        "the duty stopped before the next row"
+    );
+
+    *mem.delete_delay.lock().unwrap() = None;
+    fake.rows.lock().unwrap().clear();
+    let tombstones = [sync_arn(3), sync_arn(4)];
+    for (n, arn) in tombstones.iter().enumerate() {
+        let mut failed = row(arn, BackupStatus::Failed);
+        failed.completed_at = Some(1.0);
+        failed.heartbeat_at = seconds_since_epoch();
+        failed.created_at = n as f64;
+        seed_rows(&fake, &[failed]);
+    }
+    *fake.remove_delay.lock().unwrap() = Some(DUTY_DELETION_BOUND + Duration::from_secs(10));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.tombstones_removed.is_empty(), "{cycle:?}");
+    let held = fake.rows.lock().unwrap();
+    assert!(held.contains_key(&tombstones[0]) && held.contains_key(&tombstones[1]));
+    drop(held);
+    assert_eq!(
+        *fake.remove_attempts.lock().unwrap(),
+        [tombstones[0].clone()],
+        "the duty stopped before the next tombstone"
+    );
+}
+
+// --- the duties' deadline, the move's order, the forget's configured store ---
+
+/// A duty's claim read that answers "free" after its deadline (the query
+/// ran before a command took the claim; its answer came two minutes later,
+/// after the command had waited and removed the row) starts no prefix
+/// deletion and no tombstone removal: the duty stops for this cycle.
+#[tokio::test(start_paused = true)]
+async fn a_claim_read_answered_after_the_bound_starts_no_deletion() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = sync_arn(1);
+    put_backup(&mem, &arn);
+    let mut failed = row(&arn, BackupStatus::Failed);
+    failed.heartbeat_at = 1.0;
+    seed_rows(&fake, &[failed]);
+    let gone = arn.clone();
+    // The cycle's own read is the first; the duty's, after its re-read, the
+    // second.
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        2,
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().remove(&gone);
+            *fake.maintenance_delay.lock().unwrap() = Some(Duration::from_secs(120));
+        }),
+    ));
+    let whole = objects_under(&mem, &arn).len();
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert_eq!(
+        objects_under(&mem, &arn).len(),
+        whole,
+        "a deletion whose claim read answered after the bound must not start"
+    );
+
+    *fake.maintenance_delay.lock().unwrap() = None;
+    let tombstone = sync_arn(2);
+    let mut tombstone_row = row(&tombstone, BackupStatus::Deleted);
+    tombstone_row.completed_at = Some(1.0);
+    seed_rows(&fake, &[tombstone_row]);
+    let checks = fake.maintenance_checks.lock().unwrap().len();
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        checks + 2,
+        Box::new(|fake: &Fake| {
+            *fake.maintenance_delay.lock().unwrap() = Some(Duration::from_secs(120));
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.tombstones_removed.is_empty(), "{cycle:?}");
+    assert!(fake.rows.lock().unwrap().contains_key(&tombstone));
+}
+
+/// On a catalog keyed by ARN (Cassandra), an old-root DELETING row under
+/// another spelling of a configured-root row's ARN shares that row's
+/// prefix: the two-rows check stops it before any check, so the configured
+/// row's prefix, incomplete, keeps every object. A configured root whose
+/// rows cannot be read stops the move before anything changed: the dead
+/// CREATING row of the old root is not resolved, and the DELETING row not
+/// finished.
+#[tokio::test]
+async fn the_two_rows_check_comes_before_any_row_of_the_old_root_is_checked() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.unique_by_arn
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let ours = sync_arn(1);
+    let other_spelling = ours.replace(REGION, "eu-west-1");
+    let mut objects = backup_objects(&ours);
+    let dropped = objects
+        .iter()
+        .position(|(k, _)| k.contains("/data/"))
+        .unwrap();
+    objects.remove(dropped);
+    for (key, bytes) in objects {
+        mem.insert(&key, &bytes);
+    }
+    let before = objects_under(&mem, &ours).len();
+    seed_rows(
+        &fake,
+        &[
+            row(&ours, BackupStatus::Available),
+            old_row(&other_spelling, BackupStatus::Deleting),
+        ],
+    );
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.finished.is_empty(), "{report:?}");
+    assert_eq!(report.stopping.len(), 1, "{report:?}");
+    assert!(
+        report.stopping[0].1.contains("two rows of backup id"),
+        "{report:?}"
+    );
+    assert_eq!(objects_under(&mem, &ours).len(), before);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&other_spelling].status,
+        BackupStatus::Deleting
+    );
+
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let creating = sync_arn(2);
+    let deleting = sync_arn(3);
+    put_backup(&mem, &creating);
+    let leftover = format!("{}data/000001.json.gz", prefix_of(&deleting));
+    mem.insert(&leftover, b"x");
+    let mut creating_row = old_row(&creating, BackupStatus::Creating);
+    creating_row.heartbeat_at = 1.0;
+    fake.dead_by_heartbeat
+        .store(true, std::sync::atomic::Ordering::Release);
+    seed_rows(
+        &fake,
+        &[creating_row, old_row(&deleting, BackupStatus::Deleting)],
+    );
+    *fake.by_root_error_for.lock().unwrap() = Some(store().store_root);
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let outcome = super::store_maintenance::move_store(
+        &*fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &never,
+            claim: None,
+        },
+    )
+    .await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    let held = fake.rows.lock().unwrap();
+    assert_eq!(held[&creating].status, BackupStatus::Creating);
+    assert_eq!(held[&deleting].status, BackupStatus::Deleting);
+    assert!(mem.keys().contains(&leftover));
+}
+
+/// The stop asked after the last row's check and before the fence ends the
+/// move with nothing rewritten (the claim lost, or a signal, during the
+/// configured root's listing or the last check).
+#[tokio::test]
+async fn a_stop_after_the_last_check_rewrites_nothing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let arn = sync_arn(1);
+    put_backup(&mem, &arn);
+    seed_rows(&fake, &[old_row(&arn, BackupStatus::Available)]);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    // Asked before the one row, then before the fence.
+    let stop = || {
+        (asked.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= 1)
+            .then(|| "the maintenance claim was lost".to_owned())
+    };
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let report = super::store_maintenance::move_store(
+        &*fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &stop,
+            claim: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert_eq!(
+        report.stopped.as_deref(),
+        Some("the maintenance claim was lost")
+    );
+    assert!(report.stopping.is_empty(), "{report:?}");
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap()[&arn].store.store_root, "/srv/old");
+}
+
+/// The wait before the first FAILED or DELETED removal covers a DELETED
+/// row as it covers a FAILED one.
+#[tokio::test(start_paused = true)]
+async fn the_forget_options_wait_out_the_duties_before_a_deleted_removal() {
+    use super::store_maintenance::{FORGET_WAIT, ForgetRun, forget_store};
+    let told = Mutex::new(Vec::new());
+    let tell = |remaining: Duration| told.lock().unwrap().push(remaining);
+    let fake = Arc::new(Fake::default());
+    let mut available = old_row(&sync_arn(1), BackupStatus::Available);
+    available.created_at = 1.0;
+    let mut deleted = old_row(&sync_arn(2), BackupStatus::Deleted);
+    deleted.created_at = 2.0;
+    seed_rows(&fake, &[available, deleted]);
+    let claimed = tokio::time::Instant::now();
+    let run = ForgetRun {
+        owner_window: Duration::ZERO,
+        removals_from: Some(claimed + FORGET_WAIT),
+        on_wait: &tell,
+        stop: &never,
+        claim: None,
+        configured: None,
+        unmounted_root: None,
+        deletions_finished: &[],
+    };
+    let report = forget_store(&*fake, StoreKind::Filesystem, "/srv/old", run)
+        .await
+        .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(claimed.elapsed() >= FORGET_WAIT);
+    assert_eq!(*told.lock().unwrap(), [FORGET_WAIT]);
+}
+
+/// A failed read in the duty's fence is left for the next cycle: the claim
+/// read failing, or the row's re-read failing, deletes nothing.
+#[tokio::test]
+async fn a_duty_whose_claim_read_or_reread_fails_deletes_nothing() {
+    for cell in ["the claim read fails", "the re-read fails"] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        let runtime = runtime_on(&mem, store());
+        let arn = sync_arn(1);
+        put_backup(&mem, &arn);
+        let mut failed = row(&arn, BackupStatus::Failed);
+        failed.heartbeat_at = 1.0;
+        seed_rows(&fake, &[failed]);
+        if cell == "the claim read fails" {
+            *fake.after_row_read.lock().unwrap() = Some((
+                arn.clone(),
+                Box::new(|fake: &Fake| {
+                    *fake.maintenance_error.lock().unwrap() = Some("timed out".to_owned());
+                }),
+            ));
+        } else {
+            *fake.after_older_than.lock().unwrap() = Some((
+                BackupStatus::Failed,
+                StaleClock::Heartbeat,
+                Box::new(|fake: &Fake| {
+                    *fake.read_row_error.lock().unwrap() = Some("timed out".to_owned());
+                }),
+            ));
+        }
+        let whole = objects_under(&mem, &arn).len();
+        let cycle = cycle_on(&fake, &runtime).await;
+        assert!(
+            cycle.failed_prefixes_deleted.is_empty(),
+            "{cell}: {cycle:?}"
+        );
+        assert_eq!(objects_under(&mem, &arn).len(), whole, "{cell}");
+    }
+}
+
+/// `--forget-backup` of an earlier release's in-catalog backup given under
+/// a spelling of its ARN that is not the server's region reads the legacy
+/// backup under the ARN as written, and changes nothing.
+#[tokio::test]
+async fn forget_backup_reads_a_legacy_backup_under_the_arn_as_written() {
+    use super::store_maintenance::{ForgetBackup, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let written = sync_arn(12).replace(REGION, "eu-west-1");
+    fake.descriptions.lock().unwrap().insert(
+        written.clone(),
+        backup_description("AVAILABLE", "PAY_PER_REQUEST"),
+    );
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&written),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(report.done, [(written.clone(), ForgetBackup::Legacy)]);
+    assert!(!report.complete(1));
+    assert!(fake.descriptions.lock().unwrap().contains_key(&written));
+}
+
+/// The FAILED live-owner rule reads each store's dead rows: dead FAILED
+/// rows of two stores in one run are both removed.
+#[tokio::test]
+async fn forget_backup_tells_dead_failed_rows_of_two_stores_apart() {
+    use super::store_maintenance::{ForgetBackup, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let ours = sync_arn(1);
+    let theirs = sync_arn(2);
+    seed_rows(
+        &fake,
+        &[
+            row(&ours, BackupStatus::Failed),
+            old_row(&theirs, BackupStatus::Failed),
+        ],
+    );
+    let asked = [ours.clone(), theirs.clone()];
+    let report = forget_backups(
+        &*fake,
+        &asked,
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    let removed = ForgetBackup::Row(
+        BackupStatus::Failed,
+        Forgotten::Removed(BackupStatus::Failed),
+    );
+    assert_eq!(
+        report.done,
+        [(ours, removed.clone()), (theirs, removed)],
+        "{report:?}"
+    );
+    assert!(fake.rows.lock().unwrap().is_empty());
+}
+
+/// `--forget-store` lists a row whose one status entry is under an
+/// earlier status (a DELETING row with an AVAILABLE entry) and removes it.
+/// After its removals it sweeps the root's status entries: the entry with
+/// no row behind it and the removed row's stale entry are deleted and
+/// counted; the entry a row left in use keeps under an earlier status is
+/// repaired and counted apart. An entry written after the root's listing
+/// (`late_entries`) has its id reported.
+#[tokio::test]
+async fn forget_store_removes_the_roots_entries_with_no_row_and_reports_the_rest() {
+    use super::store_maintenance::{Forgotten, forget_store};
+    let fake = Arc::new(Fake::default());
+    let available = sync_arn(1);
+    let deleting = sync_arn(2);
+    seed_rows(
+        &fake,
+        &[
+            old_row(&available, BackupStatus::Available),
+            old_row(&deleting, BackupStatus::Deleting),
+        ],
+    );
+    fake.set_stale_entry(&deleting, BackupStatus::Available);
+    fake.orphan_entries
+        .lock()
+        .unwrap()
+        .push((old_store(), BackupStatus::Deleting));
+    let mut late = old_store();
+    late.store_id = "old-2".to_owned();
+    fake.late_entries.lock().unwrap().push(late);
+    let report = forget_store(
+        &*fake,
+        StoreKind::Filesystem,
+        "/srv/old",
+        forget_run(Duration::ZERO, &never),
+    )
+    .await
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.removed(), 2);
+    assert_eq!(
+        report.entries_swept,
+        Some(StatusEntrySweep {
+            removed: 2,
+            repaired: 0
+        })
+    );
+    assert_eq!(report.entries_left, ["old-2"]);
+    assert!(fake.orphan_entries.lock().unwrap().is_empty());
+    assert!(fake.stale_entries.lock().unwrap().is_empty());
+
+    // A row left in use, its entry under an earlier status: repaired.
+    let in_use = sync_arn(3);
+    seed_rows(&fake, &[old_row(&in_use, BackupStatus::Available)]);
+    fake.set_stale_entry(&in_use, BackupStatus::Creating);
+    fake.forget_answers
+        .lock()
+        .unwrap()
+        .insert(in_use.clone(), ForgetRow::InUse("Target".to_owned()));
+    let report = forget_store(
+        &*fake,
+        StoreKind::Filesystem,
+        "/srv/old",
+        forget_run(Duration::ZERO, &never),
+    )
+    .await
+    .unwrap();
+    assert!(!report.complete(), "{report:?}");
+    assert_eq!(
+        report.rows[0].1,
+        Forgotten::InUse("Target".to_owned(), ACCOUNT.to_owned())
+    );
+    assert_eq!(
+        report.entries_swept,
+        Some(StatusEntrySweep {
+            removed: 0,
+            repaired: 1
+        })
+    );
+    assert!(
+        fake.list_backup_rows(Some(BackupStatus::Available), &old_store())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.backup_arn == in_use),
+        "the repaired row is listed under its own status"
+    );
+}
+
+/// A DELETING row of the configured store has its deletion finished behind
+/// the fence before its removal when the store's check passed, and is left
+/// otherwise; a DELETING row of another store is removed and keeps its
+/// bytes; a DELETED row whose deletion the command's own pass finished says
+/// so.
+#[tokio::test]
+async fn forget_backup_finishes_a_deleting_row_of_the_configured_store_first() {
+    use super::store_maintenance::{
+        ForgetBackup, ForgetConfigured, ForgetRun, Forgotten, forget_backups,
+    };
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let identity = &identity;
+    fn run<'a>(
+        store: &'a ConfiguredStore,
+        healthy: Option<&'a StoreIdentity>,
+        finished: &'a [String],
+    ) -> ForgetRun<'a> {
+        ForgetRun {
+            configured: Some(ForgetConfigured {
+                store,
+                healthy,
+                mismatch_row_ids: &[],
+                file_missing_with_rows: false,
+            }),
+            deletions_finished: finished,
+            ..forget_run(Duration::from_secs(300), &never)
+        }
+    }
+
+    // The store's check passed: the deletion is finished, then the row goes.
+    let deleting = sync_arn(1);
+    put_backup(&mem, &deleting);
+    seed_rows(&fake, &[row(&deleting, BackupStatus::Deleting)]);
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&deleting),
+        REGION,
+        run(configured, Some(identity), &[]),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            deleting.clone(),
+            ForgetBackup::Row(BackupStatus::Deleting, Forgotten::RemovedAfterDeletion)
+        )]
+    );
+    assert!(
+        objects_under(&mem, &deleting).is_empty(),
+        "the prefix is deleted"
+    );
+    assert!(!fake.rows.lock().unwrap().contains_key(&deleting));
+
+    // Unhealthy (or the id unknown): left, bytes and row.
+    let pending = sync_arn(2);
+    put_backup(&mem, &pending);
+    seed_rows(&fake, &[row(&pending, BackupStatus::Deleting)]);
+    let whole = objects_under(&mem, &pending).len();
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&pending),
+        REGION,
+        run(configured, None, &[]),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            pending.clone(),
+            ForgetBackup::Row(BackupStatus::Deleting, Forgotten::DeletionPending)
+        )]
+    );
+    assert_eq!(objects_under(&mem, &pending).len(), whole);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&pending].status,
+        BackupStatus::Deleting
+    );
+
+    // Another store's DELETING row: removed, nothing deleted.
+    let theirs = sync_arn(3);
+    put_backup(&mem, &theirs);
+    seed_rows(&fake, &[old_row(&theirs, BackupStatus::Deleting)]);
+    let whole = objects_under(&mem, &theirs).len();
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&theirs),
+        REGION,
+        run(configured, Some(identity), &[]),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            theirs.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Deleting,
+                Forgotten::Removed(BackupStatus::Deleting)
+            )
+        )]
+    );
+    assert_eq!(objects_under(&mem, &theirs).len(), whole);
+
+    // A DELETED row the command's own pass finished.
+    let finished = sync_arn(4);
+    seed_rows(&fake, &[row(&finished, BackupStatus::Deleted)]);
+    let list = [finished.clone()];
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&finished),
+        REGION,
+        run(configured, Some(identity), &list),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            finished.clone(),
+            ForgetBackup::Row(BackupStatus::Deleted, Forgotten::RemovedAfterDeletion)
+        )]
+    );
+}
+
+/// While the configured root has no identity file and the catalog holds
+/// rows for it (an unmounted volume), its rows are refused and kept; a row
+/// of another root in the same run is removed.
+#[tokio::test]
+async fn forget_backup_refuses_the_rows_of_a_configured_root_without_its_file() {
+    use super::store_maintenance::{
+        ForgetBackup, ForgetConfigured, ForgetRun, Forgotten, forget_backups,
+    };
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_unhealthy(
+        &mem,
+        StoreProblem::FileMissingWithRows(vec!["store-1".to_owned()]),
+    );
+    let configured = runtime.configured_store().unwrap();
+    let theirs = sync_arn(1);
+    let ours = sync_arn(2);
+    seed_rows(
+        &fake,
+        &[
+            old_row(&theirs, BackupStatus::Available),
+            row(&ours, BackupStatus::Available),
+        ],
+    );
+    let run = ForgetRun {
+        configured: Some(ForgetConfigured {
+            store: configured,
+            healthy: None,
+            mismatch_row_ids: &[],
+            file_missing_with_rows: true,
+        }),
+        ..forget_run(Duration::from_secs(300), &never)
+    };
+    let asked = [theirs.clone(), ours.clone()];
+    let report = forget_backups(&*fake, &asked, REGION, run).await;
+    assert_eq!(
+        report.done,
+        [
+            (
+                theirs.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            ),
+            (
+                ours.clone(),
+                ForgetBackup::Row(BackupStatus::Available, Forgotten::RootWithoutFile)
+            ),
+        ]
+    );
+    assert!(fake.rows.lock().unwrap().contains_key(&ours));
+    assert!(
+        Forgotten::RootWithoutFile
+            .to_string()
+            .contains("point [backup.store] at the root that holds these backups")
+    );
+}
+
+/// On a backend whose summary counts status entries (Cassandra), the report
+/// of other stores checks each count against the store's listing: what no
+/// row stands behind is reported as status entries, not rows.
+#[tokio::test]
+async fn the_report_of_other_stores_names_status_entries_with_no_row() {
+    let fake = Arc::new(Fake::default());
+    fake.counts_entries
+        .store(true, std::sync::atomic::Ordering::Release);
+    seed_rows(&fake, &[old_row(&sync_arn(1), BackupStatus::Available)]);
+    fake.orphan_entries
+        .lock()
+        .unwrap()
+        .push((old_store(), BackupStatus::Deleting));
+    let others = super::store_maintenance::other_stores(&*fake, &store())
+        .await
+        .unwrap();
+    assert_eq!(others.len(), 1, "{others:?}");
+    assert_eq!(others[0].counts, [(BackupStatus::Available, 1)]);
+    assert_eq!(others[0].entries, [(BackupStatus::Deleting, 1)]);
+    assert!(others[0].unresolved.is_empty());
+
+    // Elsewhere the counts are rows, taken as they are.
+    fake.counts_entries
+        .store(false, std::sync::atomic::Ordering::Release);
+    fake.orphan_entries.lock().unwrap().clear();
+    let others = super::store_maintenance::other_stores(&*fake, &store())
+        .await
+        .unwrap();
+    assert!(others[0].entries.is_empty());
+}
+
+/// The tombstone duty's removal names the store it listed the row with: a
+/// row a move rewrote to another store after the duty's fence is left for
+/// that store's duties.
+#[tokio::test]
+async fn the_tombstone_duty_leaves_a_row_moved_after_its_fence() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let tombstone = sync_arn(1);
+    let mut tombstone_row = row(&tombstone, BackupStatus::Deleted);
+    tombstone_row.completed_at = Some(1.0);
+    seed_rows(&fake, &[tombstone_row]);
+    let moved = tombstone.clone();
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        2,
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().get_mut(&moved).unwrap().store = old_store();
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.tombstones_removed.is_empty(), "{cycle:?}");
+    assert_eq!(fake.rows.lock().unwrap()[&tombstone].store, old_store());
+    assert_eq!(*fake.remove_attempts.lock().unwrap(), [tombstone]);
+}
+
+/// A prefix deletion the store stopped at its deadline (it answers what it
+/// removed, unfinished) stops the duty for this cycle: the row is not
+/// reported deleted, and the next row's prefix is not listed. The deadline
+/// the duty hands the store is `DUTY_DELETION_BOUND` after its read of the
+/// claim was sent, not after the answer (the read here answers 5 s later).
+#[tokio::test(start_paused = true)]
+async fn a_deletion_the_store_stopped_at_its_deadline_stops_the_duty() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let first = sync_arn(1);
+    let second = sync_arn(2);
+    for (n, arn) in [&first, &second].into_iter().enumerate() {
+        put_backup(&mem, arn);
+        let mut failed = row(arn, BackupStatus::Failed);
+        failed.heartbeat_at = 1.0;
+        failed.created_at = n as f64;
+        seed_rows(&fake, &[failed]);
+    }
+    mem.deadline_reached
+        .store(true, std::sync::atomic::Ordering::Release);
+    // The cycle's own read is the first; the duty's, after its re-read, the
+    // second.
+    let read_sent = Arc::new(Mutex::new(None));
+    *fake.after_maintenance_check.lock().unwrap() = Some((
+        2,
+        Box::new({
+            let read_sent = Arc::clone(&read_sent);
+            move |fake: &Fake| {
+                *read_sent.lock().unwrap() = Some(tokio::time::Instant::now());
+                *fake.maintenance_delay.lock().unwrap() = Some(Duration::from_secs(5));
+            }
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert!(
+        !mem.lists.lock().unwrap().contains(&prefix_of(&second)),
+        "the duty stopped before the next row"
+    );
+    let read_sent = read_sent.lock().unwrap().expect("the duty read the claim");
+    assert_eq!(
+        *mem.deadlines_seen.lock().unwrap(),
+        [(
+            prefix_of(&first),
+            read_sent + super::reconciler::DUTY_DELETION_BOUND
+        )]
+    );
+}
+
+/// The cycle a forget option runs on SQLite (the claim held, no store
+/// check) writes nothing to the root: a root that lost its identity file
+/// is not given a new one, and the store's health stays as the command
+/// recorded it.
+#[tokio::test]
+async fn a_cycle_without_the_store_check_writes_nothing_to_the_root() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    mem.objects.lock().unwrap().remove(STORE_IDENTITY_KEY);
+    super::reconciler::cycle(
+        &fake,
+        &runtime,
+        Duration::ZERO,
+        "sqlite",
+        &mut super::reconciler::ReconcilerState::for_maintenance_holder_without_store_check(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !mem.objects.lock().unwrap().contains_key(STORE_IDENTITY_KEY),
+        "no identity file is written"
+    );
+    assert!(mem.puts.lock().unwrap().is_empty(), "nothing is put");
+    assert!(runtime.configured_store().unwrap().is_healthy());
+}
+
+/// Every row of one backup id among the moved (rows unique by ARN alone, as
+/// on Cassandra) is set aside before any row is checked: the first in
+/// listing order is DELETING and the second AVAILABLE, and the copy of
+/// their shared prefix lacks a data file. Neither is checked, so the
+/// DELETING row's deletion is not finished and the shared prefix keeps
+/// every object; both are named.
+#[tokio::test]
+async fn every_row_of_one_backup_id_among_the_moved_is_checked_no_further() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    fake.unique_by_arn
+        .store(true, std::sync::atomic::Ordering::Release);
+    let runtime = runtime_on(&mem, store());
+    let ours = sync_arn(1);
+    let other = ours.replace(REGION, "eu-west-1");
+    let mut objects = backup_objects(&other);
+    let dropped = objects
+        .iter()
+        .position(|(k, _)| k.contains("/data/"))
+        .unwrap();
+    objects.remove(dropped);
+    for (key, bytes) in objects {
+        mem.insert(&key, &bytes);
+    }
+    let before = objects_under(&mem, &other).len();
+    let mut deleting = old_row(&ours, BackupStatus::Deleting);
+    deleting.created_at = 1.0;
+    let mut available = old_row(&other, BackupStatus::Available);
+    available.created_at = 2.0;
+    seed_rows(&fake, &[deleting, available]);
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.finished.is_empty(), "{report:?}");
+    let named: Vec<&str> = report
+        .stopping
+        .iter()
+        .map(|(row, _)| row.backup_arn.as_str())
+        .collect();
+    assert_eq!(named, [ours.as_str(), other.as_str()], "{report:?}");
+    assert!(
+        report
+            .stopping
+            .iter()
+            .all(|(_, why)| why.contains("two rows of backup id")),
+        "{report:?}"
+    );
+    assert_eq!(objects_under(&mem, &other).len(), before);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&ours].status,
+        BackupStatus::Deleting
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+}
+
+/// The FAILED-prefix duty keeps the prefix of a row that a move rewrote to
+/// another store after the duty listed it, its status unchanged: only the
+/// store half of `Duty::fenced`'s re-read stands between them (the prefix
+/// deletion has no store condition of its own).
+#[tokio::test]
+async fn the_failed_prefix_duty_keeps_a_row_moved_after_its_listing() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let moved = sync_arn(1);
+    let leftover = format!("{}data/000001.json.gz", prefix_of(&moved));
+    mem.insert(&leftover, b"x");
+    seed_rows(&fake, &[row(&moved, BackupStatus::Failed)]);
+    let elsewhere = moved.clone();
+    *fake.after_older_than.lock().unwrap() = Some((
+        BackupStatus::Failed,
+        StaleClock::Heartbeat,
+        Box::new(move |fake: &Fake| {
+            fake.rows.lock().unwrap().get_mut(&elsewhere).unwrap().store = old_store();
+        }),
+    ));
+    let cycle = cycle_on(&fake, &runtime).await;
+    assert!(
+        fake.after_older_than.lock().unwrap().is_none(),
+        "the hook ran"
+    );
+    assert!(cycle.failed_prefixes_deleted.is_empty(), "{cycle:?}");
+    assert!(
+        mem.keys().contains(&leftover),
+        "the moved row's prefix is kept"
+    );
+}
+
+/// A row of the old root whose one status entry is under an earlier status
+/// (on Cassandra, a DeleteBackup whose entry batch failed: the row
+/// DELETING, its entry AVAILABLE) is listed by the root's listing and
+/// checked like any other: with a complete copy under the configured root
+/// it stops the move; with none, its deletion is finished and it moves.
+#[tokio::test]
+async fn move_store_checks_a_row_whose_status_entry_is_under_an_earlier_status() {
+    let deleting = sync_arn(1);
+
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    put_backup(&mem, &deleting);
+    seed_rows(&fake, &[old_row(&deleting, BackupStatus::Deleting)]);
+    fake.set_stale_entry(&deleting, BackupStatus::Available);
+    let report = move_old(&fake, &runtime).await;
+    assert_eq!(report.rows, 1, "{report:?}");
+    assert_eq!(report.stopping.len(), 1, "{report:?}");
+    assert!(
+        report.stopping[0].1.contains("verified manifest"),
+        "{report:?}"
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    seed_rows(&fake, &[old_row(&deleting, BackupStatus::Deleting)]);
+    fake.set_stale_entry(&deleting, BackupStatus::Available);
+    let report = move_old(&fake, &runtime).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.finished, std::slice::from_ref(&deleting));
+    assert_eq!(report.moved, std::slice::from_ref(&deleting));
+    let row = fake.rows.lock().unwrap()[&deleting].clone();
+    assert_eq!((row.status, row.store), (BackupStatus::Deleted, store()));
+}
+
+/// On a backend whose summary counts status entries (Cassandra), a row
+/// whose one entry is under an earlier status counts as a row under its own
+/// status in the report of other stores (and a DELETING one is named),
+/// while its stale entry is reported as a status entry.
+#[tokio::test]
+async fn the_report_of_other_stores_counts_a_row_whose_entry_is_under_an_earlier_status() {
+    let fake = Arc::new(Fake::default());
+    fake.counts_entries
+        .store(true, std::sync::atomic::Ordering::Release);
+    let available = sync_arn(1);
+    let deleting = sync_arn(2);
+    seed_rows(
+        &fake,
+        &[
+            old_row(&available, BackupStatus::Available),
+            old_row(&deleting, BackupStatus::Deleting),
+        ],
+    );
+    fake.set_stale_entry(&deleting, BackupStatus::Available);
+    let others = super::store_maintenance::other_stores(&*fake, &store())
+        .await
+        .unwrap();
+    assert_eq!(others.len(), 1, "{others:?}");
+    assert_eq!(
+        others[0].counts,
+        [(BackupStatus::Available, 1), (BackupStatus::Deleting, 1)]
+    );
+    assert_eq!(others[0].entries, [(BackupStatus::Available, 1)]);
+    let named: Vec<&str> = others[0]
+        .unresolved
+        .iter()
+        .map(|r| r.backup_arn.as_str())
+        .collect();
+    assert_eq!(named, [deleting.as_str()]);
+}
+
+/// A stop during the wait before a DELETING row's finished deletion leaves
+/// the row DELETING and its objects untouched: the ARN is not reached.
+#[tokio::test]
+async fn a_stop_during_the_wait_before_a_deleting_rows_finish_deletes_nothing() {
+    use super::store_maintenance::{ForgetConfigured, ForgetRun, forget_backups};
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let deleting = sync_arn(1);
+    put_backup(&mem, &deleting);
+    seed_rows(&fake, &[row(&deleting, BackupStatus::Deleting)]);
+    let whole = objects_under(&mem, &deleting).len();
+    let waiting = std::sync::atomic::AtomicBool::new(false);
+    let on_wait = |_: Duration| waiting.store(true, std::sync::atomic::Ordering::Release);
+    let stop = || {
+        waiting
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| "SIGTERM received".to_owned())
+    };
+    let run = ForgetRun {
+        removals_from: Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+        on_wait: &on_wait,
+        configured: Some(ForgetConfigured {
+            store: configured,
+            healthy: Some(&identity),
+            mismatch_row_ids: &[],
+            file_missing_with_rows: false,
+        }),
+        ..forget_run(Duration::from_secs(300), &stop)
+    };
+    let report = forget_backups(&*fake, std::slice::from_ref(&deleting), REGION, run).await;
+    assert_eq!(report.stopped.as_deref(), Some("SIGTERM received"));
+    assert!(report.done.is_empty(), "{report:?}");
+    assert_eq!(objects_under(&mem, &deleting).len(), whole);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+}
+
+/// The backup manual's copied-identity-file case with a DELETING row among
+/// the new root's rows: the root's file names the old root's id
+/// (`store-old`) and its rows carry `store-1`, so the store's check fails
+/// (`IdMismatch`). `--forget-backup` removes the AVAILABLE row and refuses
+/// the DELETING one, saying that its own id takes part in the mismatch and
+/// naming the way out (the same command with no store configured); the
+/// check still fails afterwards.
+#[tokio::test]
+async fn a_deleting_row_behind_an_identity_mismatch_is_refused_naming_the_way_out() {
+    use super::store_maintenance::{
+        ForgetBackup, ForgetConfigured, ForgetRun, Forgotten, forget_backups,
+    };
+    let mem = Arc::new(MemStore::default());
+    mem.insert(STORE_IDENTITY_KEY, &identity_file("store-old", "catalog-1"));
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let available = sync_arn(1);
+    let deleting = sync_arn(2);
+    put_backup(&mem, &available);
+    put_backup(&mem, &deleting);
+    seed_rows(
+        &fake,
+        &[
+            row(&available, BackupStatus::Available),
+            row(&deleting, BackupStatus::Deleting),
+        ],
+    );
+    let problem = super::check_configured_store_read_only(configured, &*fake, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(problem, StoreProblem::IdMismatch { .. }),
+        "{problem:?}"
+    );
+    let run = ForgetRun {
+        configured: Some(ForgetConfigured {
+            store: configured,
+            healthy: None,
+            mismatch_row_ids: problem.mismatch_row_ids(),
+            file_missing_with_rows: false,
+        }),
+        ..forget_run(Duration::from_secs(300), &never)
+    };
+    let asked = [available.clone(), deleting.clone()];
+    let report = forget_backups(&*fake, &asked, REGION, run).await;
+    let refused = Forgotten::DeletionBehindMismatch("store-1".to_owned());
+    assert_eq!(
+        report.done,
+        [
+            (
+                available.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            ),
+            (
+                deleting.clone(),
+                ForgetBackup::Row(BackupStatus::Deleting, refused.clone())
+            ),
+        ]
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains("store id store-1")
+            && text.contains("kind = \"disabled\"")
+            && text.contains("DeleteBackup it again"),
+        "{text}"
+    );
+    assert_eq!(
+        objects_under(&mem, &deleting).len(),
+        backup_objects(&deleting).len()
+    );
+    assert!(matches!(
+        super::check_configured_store_read_only(configured, &*fake, None).await,
+        Err(StoreProblem::IdMismatch { .. })
+    ));
+}
+
+/// A filesystem root the command found missing with rows for it (the
+/// defaulted root moved away, or a link to a volume that is gone): its rows
+/// are refused as an unmounted root's, with no store configured; a row of
+/// another root in the same run is removed, one whose root's label extends
+/// the missing one's included (the root is matched byte for byte).
+#[tokio::test]
+async fn forget_backup_refuses_the_rows_of_a_missing_root_with_rows() {
+    use super::store_maintenance::{ForgetBackup, ForgetRun, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let theirs = sync_arn(1);
+    let ours = sync_arn(2);
+    let longer = sync_arn(3);
+    let mut longer_row = row(&longer, BackupStatus::Available);
+    longer_row.store.store_root = format!("{}2", store().store_root);
+    seed_rows(
+        &fake,
+        &[
+            old_row(&theirs, BackupStatus::Available),
+            longer_row,
+            row(&ours, BackupStatus::Available),
+        ],
+    );
+    let configured = store();
+    let run = ForgetRun {
+        unmounted_root: Some(&configured.store_root),
+        ..forget_run(Duration::from_secs(300), &never)
+    };
+    let asked = [theirs.clone(), longer.clone(), ours.clone()];
+    let report = forget_backups(&*fake, &asked, REGION, run).await;
+    assert_eq!(
+        report.done,
+        [
+            (
+                theirs.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            ),
+            (
+                longer.clone(),
+                ForgetBackup::Row(
+                    BackupStatus::Available,
+                    Forgotten::Removed(BackupStatus::Available)
+                )
+            ),
+            (
+                ours.clone(),
+                ForgetBackup::Row(BackupStatus::Available, Forgotten::RootWithoutFile)
+            ),
+        ]
+    );
+    assert!(fake.rows.lock().unwrap().contains_key(&ours));
+}
+
+/// A store error while the move checks a row of the old root whose copy is
+/// complete stops the move with that row named, for a DELETED, a FAILED, a
+/// DELETING and an AVAILABLE row: no row is rewritten, no object is
+/// deleted (the DELETING row's deletion is not finished) and the row is as
+/// it was.
+#[tokio::test]
+async fn a_store_error_during_the_moves_checks_stops_it() {
+    for status in [
+        BackupStatus::Deleted,
+        BackupStatus::Failed,
+        BackupStatus::Deleting,
+        BackupStatus::Available,
+    ] {
+        let mem = Arc::new(MemStore::default());
+        let fake = Arc::new(Fake::default());
+        let runtime = runtime_on(&mem, store());
+        let arn = sync_arn(1);
+        put_backup(&mem, &arn);
+        let mut row = old_row(&arn, status);
+        if matches!(status, BackupStatus::Deleted | BackupStatus::Failed) {
+            row.completed_at = Some(1.0);
+        }
+        seed_rows(&fake, std::slice::from_ref(&row));
+        *mem.fail_gets_under.lock().unwrap() = Some(prefix_of(&arn));
+        let keys_before = mem.keys();
+        let report = move_old(&fake, &runtime).await;
+        assert!(!report.complete(), "{status}: {report:?}");
+        assert!(report.finished.is_empty(), "{status}: {report:?}");
+        assert_eq!(report.stopping.len(), 1, "{status}: {report:?}");
+        assert!(
+            report.stopping[0]
+                .1
+                .contains("the configured store could not be read"),
+            "{status}: {}",
+            report.stopping[0].1
+        );
+        assert!(
+            fake.rewrites_seen.lock().unwrap().is_empty(),
+            "{status}: nothing is rewritten"
+        );
+        assert_eq!(mem.keys(), keys_before, "{status}: no object was deleted");
+        assert_eq!(fake.rows.lock().unwrap()[&arn], row, "{status}");
+    }
+}
+
+/// A failed read of the FAILED rows whose owner is dead leaves the row: a
+/// job that may still write under its prefix is not taken for dead.
+#[tokio::test]
+async fn a_failed_read_of_the_failed_rows_owners_removes_nothing() {
+    use super::store_maintenance::{ForgetBackup, Forgotten, forget_backups};
+    let fake = Arc::new(Fake::default());
+    let failed = sync_arn(1);
+    let mut failed_row = old_row(&failed, BackupStatus::Failed);
+    failed_row.heartbeat_at = 1.0;
+    seed_rows(&fake, &[failed_row]);
+    *fake.older_than_error.lock().unwrap() = Some("pool exhausted".to_owned());
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&failed),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert_eq!(report.done.len(), 1, "{report:?}");
+    let ForgetBackup::Row(BackupStatus::Failed, Forgotten::Failed(why)) = &report.done[0].1 else {
+        panic!("the FAILED row is left as a failure: {report:?}");
+    };
+    assert!(
+        why.contains("the row's owner could not be tested") && why.contains("pool exhausted"),
+        "{why}"
+    );
+    assert!(!report.complete(1));
+    assert!(fake.rows.lock().unwrap().contains_key(&failed));
+    assert!(fake.remove_attempts.lock().unwrap().is_empty());
+
+    // With the listing answering, the same row (its owner long dead) goes.
+    *fake.older_than_error.lock().unwrap() = None;
+    let report = forget_backups(
+        &*fake,
+        std::slice::from_ref(&failed),
+        REGION,
+        forget_run(Duration::from_secs(300), &never),
+    )
+    .await;
+    assert!(report.complete(1), "{report:?}");
+    assert!(!fake.rows.lock().unwrap().contains_key(&failed));
+}
+
+/// A DELETING row of the configured store that a server's reconciler
+/// finishes during the forget's wait (it deletes the prefix and sets the
+/// row DELETED under the claim): the forget's own finish then finds the row
+/// no longer DELETING, reads it again and removes the DELETED row, so the
+/// ARN is done with no row left behind.
+#[tokio::test(start_paused = true)]
+async fn a_deleting_row_a_server_finishes_during_the_wait_is_removed_deleted() {
+    use super::store_maintenance::{
+        ForgetBackup, ForgetConfigured, ForgetRun, Forgotten, forget_backups,
+    };
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let deleting = sync_arn(1);
+    put_backup(&mem, &deleting);
+    seed_rows(&fake, &[row(&deleting, BackupStatus::Deleting)]);
+    let prefix = prefix_of(&deleting);
+    let server_finishes = |_: Duration| {
+        mem.objects
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        fake.rows.lock().unwrap().get_mut(&deleting).unwrap().status = BackupStatus::Deleted;
+    };
+    let run = ForgetRun {
+        removals_from: Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+        on_wait: &server_finishes,
+        configured: Some(ForgetConfigured {
+            store: configured,
+            healthy: Some(&identity),
+            mismatch_row_ids: &[],
+            file_missing_with_rows: false,
+        }),
+        ..forget_run(Duration::from_secs(300), &never)
+    };
+    let report = forget_backups(&*fake, std::slice::from_ref(&deleting), REGION, run).await;
+    assert_eq!(
+        report.done,
+        [(
+            deleting.clone(),
+            ForgetBackup::Row(
+                BackupStatus::Deleting,
+                Forgotten::Removed(BackupStatus::Deleted)
+            )
+        )]
+    );
+    assert!(report.complete(1));
+    assert!(!fake.rows.lock().unwrap().contains_key(&deleting));
+    assert!(
+        fake.set_deleted.lock().unwrap().is_empty(),
+        "the forget's own write found the row DELETED"
+    );
+}
+
+/// On a backend whose summary counts status entries (Cassandra), the report
+/// of other stores keeps each store id of a root to its own rows: with two
+/// ids under one root (what an identity mismatch leaves), each id counts
+/// and names only the rows that carry it.
+#[tokio::test]
+async fn the_report_of_other_stores_keeps_two_ids_of_one_root_apart() {
+    let fake = Arc::new(Fake::default());
+    fake.counts_entries
+        .store(true, std::sync::atomic::Ordering::Release);
+    let available = sync_arn(1);
+    let deleting = sync_arn(2);
+    let second = StoreIdentity {
+        store_id: "store-9".to_owned(),
+        ..old_store()
+    };
+    let mut deleting_row = old_row(&deleting, BackupStatus::Deleting);
+    deleting_row.store = second.clone();
+    seed_rows(
+        &fake,
+        &[old_row(&available, BackupStatus::Available), deleting_row],
+    );
+    let others = super::store_maintenance::other_stores(&*fake, &store())
+        .await
+        .unwrap();
+    assert_eq!(others.len(), 2, "{others:?}");
+    let of = |store: &StoreIdentity| {
+        others
+            .iter()
+            .find(|other| other.store == *store)
+            .unwrap_or_else(|| panic!("{others:?}"))
+    };
+    let first = of(&old_store());
+    assert_eq!(first.counts, [(BackupStatus::Available, 1)]);
+    assert!(first.unresolved.is_empty(), "{first:?}");
+    assert!(first.entries.is_empty(), "{first:?}");
+    let other = of(&second);
+    assert_eq!(other.counts, [(BackupStatus::Deleting, 1)]);
+    assert_eq!(
+        other
+            .unresolved
+            .iter()
+            .map(|r| r.backup_arn.as_str())
+            .collect::<Vec<_>>(),
+        [deleting.as_str()]
+    );
+    assert!(other.entries.is_empty(), "{other:?}");
+}
+
+// --- the claim re-checked before the options' steps that cannot be undone --
+
+/// `--forget-store` re-checks the claim with a beat right before each
+/// removal, before a DELETING row's DELETED write and again before that
+/// row's removal, and before the sweep of the root's status entries. A
+/// claim another holder took over stops the run at the step its beat
+/// precedes: the row is as the steps before it left it, and the run's stop
+/// says so.
+#[tokio::test]
+async fn forget_store_rechecks_the_claim_before_each_step_that_cannot_be_undone() {
+    use super::store_maintenance::{ForgetRun, forget_store};
+    async fn forget(
+        fake: &Fake,
+        claim: &maintenance::HeldClaim,
+    ) -> super::store_maintenance::ForgetStoreReport {
+        forget_store(
+            fake,
+            StoreKind::Filesystem,
+            "/srv/old",
+            ForgetRun {
+                claim: Some(claim),
+                ..forget_run(Duration::ZERO, &never)
+            },
+        )
+        .await
+        .unwrap()
+    }
+    let arn = sync_arn(1);
+    for status in [
+        BackupStatus::Available,
+        BackupStatus::Creating,
+        BackupStatus::Failed,
+        BackupStatus::Deleted,
+    ] {
+        let mut seeded = old_row(&arn, status);
+        seeded.completed_at = Some(1.0);
+        // Lost at the removal's beat: the row stays.
+        let fake = Fake::default();
+        seed_rows(&fake, std::slice::from_ref(&seeded));
+        let (claim, beats) = scripted_claim(0);
+        let report = forget(&fake, &claim).await;
+        let stopped = report.stopped.clone().expect("stopped");
+        assert!(
+            stopped.contains("another holder took it over")
+                && stopped.contains(&format!("before the {status} row's removal")),
+            "{status}: {stopped}"
+        );
+        assert_eq!(beats_of(&beats), 1, "{status}");
+        assert!(report.rows.is_empty(), "{status}: {report:?}");
+        assert_eq!(fake.rows.lock().unwrap()[&arn].status, status);
+        assert!(report.entries_swept.is_none());
+
+        // Lost at the sweep's beat: the row is removed, the sweep not run.
+        let fake = Fake::default();
+        seed_rows(&fake, std::slice::from_ref(&seeded));
+        let (claim, beats) = scripted_claim(1);
+        let report = forget(&fake, &claim).await;
+        assert_eq!(beats_of(&beats), 2, "{status}");
+        assert_eq!(report.removed(), 1, "{status}: {report:?}");
+        assert!(!fake.rows.lock().unwrap().contains_key(&arn));
+        let stopped = report.stopped.clone().expect("stopped");
+        assert!(
+            stopped.contains("before the sweep of the root's status entries"),
+            "{status}: {stopped}"
+        );
+        assert!(report.entries_swept.is_none(), "{status}");
+        assert!(!report.complete());
+
+        // Every beat confirms.
+        let fake = Fake::default();
+        seed_rows(&fake, std::slice::from_ref(&seeded));
+        let (claim, beats) = scripted_claim(2);
+        let report = forget(&fake, &claim).await;
+        assert!(report.complete(), "{status}: {report:?}");
+        assert_eq!(beats_of(&beats), 2, "{status}");
+    }
+
+    // A DELETING row of another store: a beat before its DELETED write and
+    // one before its removal.
+    let seeded = old_row(&arn, BackupStatus::Deleting);
+    let fake = Fake::default();
+    seed_rows(&fake, std::slice::from_ref(&seeded));
+    let (claim, beats) = scripted_claim(0);
+    let report = forget(&fake, &claim).await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("before the DELETING row's DELETED write; the row is unchanged"),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn].status,
+        BackupStatus::Deleting
+    );
+
+    let fake = Fake::default();
+    seed_rows(&fake, std::slice::from_ref(&seeded));
+    let (claim, beats) = scripted_claim(1);
+    let report = forget(&fake, &claim).await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("before the DELETED row's removal; the row is DELETED"),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 2);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&arn].status,
+        BackupStatus::Deleted
+    );
+
+    let fake = Fake::default();
+    seed_rows(&fake, std::slice::from_ref(&seeded));
+    let (claim, beats) = scripted_claim(3);
+    let report = forget(&fake, &claim).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(beats_of(&beats), 3);
+    assert!(fake.rows.lock().unwrap().is_empty());
+}
+
+/// `--forget-backup` of a DELETING row of the configured store re-checks the
+/// claim right before it finishes the row's deletion and again right before
+/// it removes the DELETED row: lost at the first, the row and its objects
+/// stay; lost at the second, the objects are deleted and the row is left
+/// DELETED for a second run.
+#[tokio::test]
+async fn forget_backup_rechecks_the_claim_before_a_deleting_rows_deletion_and_its_removal() {
+    use super::store_maintenance::{
+        ForgetBackup, ForgetConfigured, ForgetRun, Forgotten, forget_backups,
+    };
+    let mem = Arc::new(MemStore::default());
+    let runtime = runtime_on(&mem, store());
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let deleting = sync_arn(1);
+    fn run<'a>(
+        store: &'a ConfiguredStore,
+        healthy: &'a StoreIdentity,
+        claim: &'a maintenance::HeldClaim,
+    ) -> ForgetRun<'a> {
+        ForgetRun {
+            configured: Some(ForgetConfigured {
+                store,
+                healthy: Some(healthy),
+                mismatch_row_ids: &[],
+                file_missing_with_rows: false,
+            }),
+            claim: Some(claim),
+            ..forget_run(Duration::from_secs(300), &never)
+        }
+    }
+
+    // Lost before the deletion.
+    put_backup(&mem, &deleting);
+    let whole = objects_under(&mem, &deleting).len();
+    assert!(whole > 0);
+    let fake = Fake::default();
+    seed_rows(&fake, &[row(&deleting, BackupStatus::Deleting)]);
+    let (claim, beats) = scripted_claim(0);
+    let report = forget_backups(
+        &fake,
+        std::slice::from_ref(&deleting),
+        REGION,
+        run(configured, &identity, &claim),
+    )
+    .await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(
+                "before the DELETING row's deletion in the configured store; the row and its \
+                 objects are unchanged"
+            ),
+        "{stopped}"
+    );
+    assert!(report.done.is_empty(), "{report:?}");
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(objects_under(&mem, &deleting).len(), whole);
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+
+    // Lost before the DELETED row's removal.
+    let (claim, beats) = scripted_claim(1);
+    let report = forget_backups(
+        &fake,
+        std::slice::from_ref(&deleting),
+        REGION,
+        run(configured, &identity, &claim),
+    )
+    .await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("before the DELETED row's removal; its deletion is finished"),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 2);
+    assert!(
+        objects_under(&mem, &deleting).is_empty(),
+        "the prefix is deleted"
+    );
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleted
+    );
+
+    // Both confirm: a fresh DELETING row is finished and removed.
+    put_backup(&mem, &deleting);
+    let fake = Fake::default();
+    seed_rows(&fake, &[row(&deleting, BackupStatus::Deleting)]);
+    let (claim, beats) = scripted_claim(2);
+    let report = forget_backups(
+        &fake,
+        std::slice::from_ref(&deleting),
+        REGION,
+        run(configured, &identity, &claim),
+    )
+    .await;
+    assert_eq!(
+        report.done,
+        [(
+            deleting.clone(),
+            ForgetBackup::Row(BackupStatus::Deleting, Forgotten::RemovedAfterDeletion)
+        )]
+    );
+    assert_eq!(beats_of(&beats), 2);
+    assert!(!fake.rows.lock().unwrap().contains_key(&deleting));
+}
+
+/// `--move-store` under `claim` into the store `runtime` is configured
+/// with, with the servers' 300 s owner window.
+async fn move_old_under(
+    fake: &Fake,
+    runtime: &BackupRuntime,
+    claim: &maintenance::HeldClaim,
+) -> super::store_maintenance::MoveReport {
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    super::store_maintenance::move_store(
+        fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &never,
+            claim: Some(claim),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// `--move-store` re-checks the claim with a beat right before it resolves
+/// a dead CREATING row, right before it finishes a DELETING row's deletion
+/// in the configured store, and right before the rewrite. A claim another
+/// holder took over stops the move there: the row keeps its status, the
+/// copy its objects, and no row is moved.
+#[tokio::test]
+async fn move_store_rechecks_the_claim_before_each_resolution_deletion_and_the_rewrite() {
+    // A dead CREATING row whose copy is complete: lost before its
+    // resolution.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let creating = seed_dead_creating_with_manifest(&fake, &mem, true);
+    fake.rows.lock().unwrap().get_mut(&creating).unwrap().store = old_store();
+    let (claim, beats) = scripted_claim(0);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(&format!(
+                "before the resolution of the CREATING row {creating}; no row was moved"
+            )),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 1);
+    assert!(report.resolved.is_empty());
+    assert_eq!(
+        fake.rows.lock().unwrap()[&creating].status,
+        BackupStatus::Creating
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+
+    // Its resolution confirmed, lost before the rewrite.
+    let (claim, beats) = scripted_claim(1);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert_eq!(beats_of(&beats), 2);
+    assert_eq!(
+        report.resolved,
+        [(creating.clone(), BackupStatus::Available)]
+    );
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("before the rewrite; no row was moved"),
+        "{stopped}"
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+    assert_eq!(fake.rows.lock().unwrap()[&creating].store, old_store());
+
+    // Now AVAILABLE: one beat, before the rewrite, which moves it.
+    let (claim, beats) = scripted_claim(1);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(fake.rewrites_seen.lock().unwrap().len(), 1);
+    assert_eq!(fake.rows.lock().unwrap()[&creating].store, store());
+
+    // A DELETING row whose copy holds no verified manifest: lost before its
+    // deletion in the configured store.
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let deleting = sync_arn(2);
+    let leftover = format!("{}data/000001.json.gz", prefix_of(&deleting));
+    mem.insert(&leftover, b"x");
+    seed_rows(&fake, &[old_row(&deleting, BackupStatus::Deleting)]);
+    let (claim, beats) = scripted_claim(0);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains(&format!(
+            "before the deletion of the DELETING row {deleting} in the configured store; no row \
+             was moved"
+        )),
+        "{stopped}"
+    );
+    assert_eq!(beats_of(&beats), 1);
+    assert!(report.finished.is_empty());
+    assert!(mem.keys().contains(&leftover), "the copy's object is left");
+    assert_eq!(
+        fake.rows.lock().unwrap()[&deleting].status,
+        BackupStatus::Deleting
+    );
+    assert!(fake.rewrites_seen.lock().unwrap().is_empty());
+
+    // Both confirm: finished, then moved.
+    let (claim, beats) = scripted_claim(2);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(beats_of(&beats), 2);
+    assert_eq!(report.finished, std::slice::from_ref(&deleting));
+    assert!(!mem.keys().contains(&leftover));
+    assert_eq!(fake.rows.lock().unwrap()[&deleting].store, store());
+}
+
+/// The rewrite runs in slices of `REWRITE_SLICE` keys with a beat of the
+/// claim before each: a claim another holder took after the first slice
+/// (a command stopped past the stale window on MongoDB or Cassandra, whose
+/// rewrites run key by key or in chunks) stops the move there, with the
+/// first slice's rows moved and the rest left under the old root and
+/// listed, and the stop says which rows it came before. A claim kept
+/// through every slice moves them all, one `rewrite_store` call per slice.
+#[tokio::test]
+async fn move_store_rechecks_the_claim_before_each_slice_of_the_rewrite() {
+    use super::store_maintenance::REWRITE_SLICE;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let count = REWRITE_SLICE + 1;
+    let rows: Vec<BackupRow> = (1..=count)
+        .map(|n| {
+            let mut row = old_row(&sync_arn(u32::try_from(n).unwrap()), BackupStatus::Failed);
+            row.completed_at = Some(1.0);
+            row
+        })
+        .collect();
+    seed_rows(&fake, &rows);
+    let last = rows.last().unwrap().backup_arn.clone();
+
+    // Confirmed before the first slice, lost before the second.
+    let (claim, beats) = scripted_claim(1);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert_eq!(beats_of(&beats), 2);
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(&format!(
+                "before the rewrite of row {count} of {count}; the {REWRITE_SLICE} row(s) \
+                 rewritten before it are moved, and the rest are left under the old root"
+            )),
+        "{stopped}"
+    );
+    assert!(!report.complete());
+    assert_eq!(report.rewritten, REWRITE_SLICE as u64);
+    assert_eq!(report.moved.len(), REWRITE_SLICE);
+    assert!(!report.moved.contains(&last));
+    assert_eq!(
+        report.left,
+        [super::store_maintenance::NamedRow {
+            status: BackupStatus::Failed,
+            backup_arn: last.clone(),
+            account_id: ACCOUNT.to_owned(),
+        }]
+    );
+    {
+        let calls = fake.rewrites_seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one slice was sent");
+        assert_eq!(calls[0].2.len(), REWRITE_SLICE);
+        assert!(!calls[0].2.iter().any(|k| k.backup_arn == last));
+    }
+    {
+        let held = fake.rows.lock().unwrap();
+        assert_eq!(held[&last].store, old_store(), "the last row is left");
+        for row in &rows[..REWRITE_SLICE] {
+            assert_eq!(held[&row.backup_arn].store, store(), "{}", row.backup_arn);
+        }
+    }
+
+    // The claim kept: the row left is moved in one slice of one key.
+    fake.rewrites_seen.lock().unwrap().clear();
+    let (claim, beats) = scripted_claim(2);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(beats_of(&beats), 1);
+    assert_eq!(report.moved, std::slice::from_ref(&last));
+    assert_eq!(fake.rewrites_seen.lock().unwrap().len(), 1);
+
+    // Every slice confirmed from the start: two calls, the second of one key.
+    let fake = Arc::new(Fake::default());
+    seed_rows(&fake, &rows);
+    let (claim, beats) = scripted_claim(2);
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(beats_of(&beats), 2);
+    assert_eq!(report.rewritten, count as u64);
+    assert_eq!(report.moved.len(), count);
+    let calls = fake.rewrites_seen.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].2.len(), REWRITE_SLICE);
+    assert_eq!(calls[1].2.len(), 1);
+    assert_eq!(calls[1].2[0].backup_arn, last);
+}
+
+/// `count` FAILED rows of the old root, each with no prefix in the
+/// configured store, so each moves.
+fn failed_old_rows(count: u32) -> Vec<BackupRow> {
+    (1..=count)
+        .map(|n| {
+            let mut row = old_row(&sync_arn(n), BackupStatus::Failed);
+            row.completed_at = Some(1.0);
+            row
+        })
+        .collect()
+}
+
+/// On a backend that rewrites key by key (Cassandra) the move calls
+/// `rewrite_store` with one key at a time and reads the claim's local state
+/// before each call, with no beat. A command stopped inside the rewrite of
+/// a root of fewer than `REWRITE_SLICE` rows (here 10, stopped in the
+/// second key's call) whose claim another holder took during the stop
+/// reads the claim lost as it resumes and stops before the third key: the
+/// two keys rewritten are moved, the eight others are left under the old
+/// root and listed, and no further call is sent. The beat before the first
+/// call confirmed the claim; the timer's beat during the stop found it
+/// lost.
+#[tokio::test(start_paused = true)]
+async fn move_store_on_a_key_by_key_backend_stops_at_the_next_key_once_the_claim_reads_lost() {
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let rows = failed_old_rows(10);
+    seed_rows(&fake, &rows);
+    fake.rewrites_key_by_key
+        .store(true, std::sync::atomic::Ordering::Release);
+    *fake.rewrite_sleep.lock().unwrap() = Some((2, Duration::from_secs(10)));
+    let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let claim = maintenance::HeldClaim::start(
+        Box::new(ScriptedClaim {
+            confirms: 1,
+            beats: Arc::clone(&beats),
+        }),
+        Duration::from_secs(1),
+    );
+    let report = move_old_under(&fake, &runtime, &claim).await;
+    assert_eq!(
+        beats_of(&beats),
+        2,
+        "the beat before the rewrite, the timer's"
+    );
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.contains("another holder took it over")
+            && stopped.contains(
+                "before the rewrite of row 3 of 10; the 2 row(s) rewritten before it are moved, \
+                 and the rest are left under the old root"
+            ),
+        "{stopped}"
+    );
+    assert_eq!(report.rewritten, 2);
+    assert_eq!(
+        report.moved,
+        [rows[0].backup_arn.clone(), rows[1].backup_arn.clone()]
+    );
+    let left: Vec<&str> = report.left.iter().map(|r| r.backup_arn.as_str()).collect();
+    let expected: Vec<&str> = rows[2..].iter().map(|r| r.backup_arn.as_str()).collect();
+    assert_eq!(left, expected);
+    {
+        let calls = fake.rewrites_seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "no call after the claim read lost");
+        assert!(
+            calls.iter().all(|call| call.2.len() == 1),
+            "one key per call"
+        );
+    }
+    let held = fake.rows.lock().unwrap();
+    for (n, row) in rows.iter().enumerate() {
+        let want = if n < 2 { store() } else { old_store() };
+        assert_eq!(held[&row.backup_arn].store, want, "{}", row.backup_arn);
+    }
+}
+
+/// A signal (Ctrl-C, SIGTERM) received during the rewrite stops the move
+/// before its next call, as a claim lost there does: the first slice's rows
+/// are moved, the rest are left under the old root and listed, and the
+/// stop says which row it came before. No beat is sent for the slice not
+/// started.
+#[tokio::test]
+async fn a_signal_during_the_rewrite_stops_the_move_before_its_next_slice() {
+    use super::store_maintenance::REWRITE_SLICE;
+    let mem = Arc::new(MemStore::default());
+    let fake = Arc::new(Fake::default());
+    let runtime = runtime_on(&mem, store());
+    let count = REWRITE_SLICE + 1;
+    let rows = failed_old_rows(u32::try_from(count).unwrap());
+    seed_rows(&fake, &rows);
+    let last = rows.last().unwrap().backup_arn.clone();
+    let signalled =
+        || (!fake.rewrites_seen.lock().unwrap().is_empty()).then(|| "SIGTERM received".to_owned());
+    let (claim, beats) = scripted_claim(5);
+    let configured = runtime.configured_store().unwrap();
+    let identity = configured.identity().unwrap();
+    let report = super::store_maintenance::move_store(
+        &*fake,
+        super::store_maintenance::MoveTarget {
+            configured,
+            identity: &identity,
+            from_kind: StoreKind::Filesystem,
+            from_root: "/srv/old",
+            owner_window: Duration::from_secs(300),
+            stop: &signalled,
+            claim: Some(&claim),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(beats_of(&beats), 1, "the beat before the first slice only");
+    let stopped = report.stopped.clone().expect("stopped");
+    assert!(
+        stopped.starts_with("SIGTERM received")
+            && stopped.contains(&format!(
+                "before the rewrite of row {count} of {count}; the {REWRITE_SLICE} row(s) \
+                 rewritten before it are moved"
+            )),
+        "{stopped}"
+    );
+    assert!(!report.complete());
+    assert_eq!(report.moved.len(), REWRITE_SLICE);
+    assert_eq!(
+        report.left,
+        [super::store_maintenance::NamedRow {
+            status: BackupStatus::Failed,
+            backup_arn: last.clone(),
+            account_id: ACCOUNT.to_owned(),
+        }]
+    );
+    assert_eq!(fake.rewrites_seen.lock().unwrap().len(), 1);
+    assert_eq!(fake.rows.lock().unwrap()[&last].store, old_store());
 }

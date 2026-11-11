@@ -634,16 +634,11 @@ impl ManagementStore for MongoCatalogStore {
                     OpError::Internal("Database error".to_owned())
                 })?;
 
-            let Some(user_doc) = doc else {
-                return Ok(false);
-            };
-
-            let Some(hash) = user_doc.get_str("password_hash").ok() else {
-                return Ok(false);
-            };
-
-            let hash = hash.to_owned();
-            extenddb_storage::password::verify_password(password, hash).await
+            // `None` when the user is absent or has no console password, which
+            // still runs one bcrypt check (see `verify_stored_password`), as a
+            // wrong password does.
+            let hash = doc.and_then(|d| d.get_str("password_hash").ok().map(str::to_owned));
+            extenddb_storage::password::verify_stored_password(password, hash).await
         })
     }
 
@@ -2148,6 +2143,7 @@ impl extenddb_storage::management_store::SettingsStore for MongoCatalogStore {
 
 // ── MetricsStore ────────────────────────────────────────────────────────
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
@@ -2155,7 +2151,7 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
             if rows.is_empty() {
                 return Ok(());
             }
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let docs: Vec<Document> = rows
                 .into_iter()
                 .map(|r| {
@@ -2167,6 +2163,9 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
                         "min": r.min,
                         "max": r.max,
                     };
+                    if let Some(ref account) = r.account_id {
+                        d.insert("account_id", account.as_str());
+                    }
                     if let Some(ref tn) = r.table_name {
                         d.insert("table_name", tn.as_str());
                     }
@@ -2191,24 +2190,26 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &extenddb_storage::management_store::MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(std::borrow::ToOwned::to_owned);
-        let metric = metric.map(std::borrow::ToOwned::to_owned);
+        let fields: Vec<(&'static str, String)> = [
+            ("account_id", filter.account_id()),
+            ("table_name", filter.table_name()),
+            ("metric", filter.metric()),
+        ]
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|v| (field, v.to_owned())))
+        .collect();
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let start_bson = BsonDateTime::from_millis(start.unix_timestamp() * 1000);
             let end_bson = BsonDateTime::from_millis(end.unix_timestamp() * 1000);
 
             let mut filter = doc! {
                 "bucket": { "$gte": start_bson, "$lte": end_bson }
             };
-            if let Some(ref tn) = table_name {
-                filter.insert("table_name", tn.as_str());
-            }
-            if let Some(ref m) = metric {
-                filter.insert("metric", m.as_str());
+            for (field, value) in fields {
+                filter.insert(field, value);
             }
 
             let cursor = coll.find(filter).await.map_err(|e| {
@@ -2219,24 +2220,17 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
                 tracing::error!("query_metrics cursor: {e}");
                 OpError::Internal("Database error".to_owned())
             })?;
+            let text = |d: &Document, field: &str| d.get_str(field).ok().map(ToOwned::to_owned);
             Ok(docs
                 .into_iter()
                 .filter_map(|d| {
                     Some(MetricsRow {
                         bucket: to_offset_dt(d.get_datetime("bucket").ok()?.to_owned()),
+                        account_id: text(&d, "account_id"),
                         metric: d.get_str("metric").ok()?.to_owned(),
-                        table_name: d
-                            .get_str("table_name")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
-                        index_name: d
-                            .get_str("index_name")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
-                        operation: d
-                            .get_str("operation")
-                            .ok()
-                            .map(std::borrow::ToOwned::to_owned),
+                        table_name: text(&d, "table_name"),
+                        index_name: text(&d, "index_name"),
+                        operation: text(&d, "operation"),
                         sum: d.get_f64("sum").ok()?,
                         count: d
                             .get_i64("count")
@@ -2252,7 +2246,7 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
 
     fn prune_metrics(&self, retention: std::time::Duration) -> BoxFuture<'_, OpResult<()>> {
         Box::pin(async move {
-            let coll = self.catalog_db().collection::<Document>("metrics");
+            let coll = self.catalog_db().collection::<Document>(METRICS_COLLECTION);
             let cutoff = time::OffsetDateTime::now_utc() - retention;
             let cutoff_bson = BsonDateTime::from_millis(cutoff.unix_timestamp() * 1000);
             coll.delete_many(doc! { "bucket": { "$lt": cutoff_bson } })
@@ -2265,6 +2259,10 @@ impl extenddb_storage::management_store::MetricsStore for MongoCatalogStore {
         })
     }
 }
+
+/// The catalog collection of the metrics rows, which migration 10 created
+/// in place of `metrics`.
+const METRICS_COLLECTION: &str = "account_metrics";
 
 // ── RateLimitStore ──────────────────────────────────────────────────────
 

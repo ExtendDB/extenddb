@@ -130,6 +130,33 @@ pub struct ServerComponentsOptions {
     /// sizes it from this ([`crate::backup_catalog::pool_size_for_jobs`]);
     /// `0` (the default outside a server) asks for no job capacity.
     pub max_concurrent_jobs: usize,
+    /// The caller is a command that reads the catalog beside a running
+    /// server (`extenddb backup list`), not a server: no serve lock is taken
+    /// (on SQLite the file is opened as another reader of a served
+    /// database) and none of the startup recovery a server runs (see
+    /// `startup_recovery`, which this implies off), since the server that
+    /// owns the catalog does that. A command that writes (`backup purge`)
+    /// leaves this `false`: on SQLite it takes the serve lock, as a server
+    /// does.
+    pub beside_server: bool,
+    /// Whether the factory runs the startup recovery a server runs
+    /// (interrupted control-plane transitions, incomplete indexes,
+    /// PostgreSQL's GSI queue workers, MongoDB's repair of documents stored
+    /// without their key, SQLite's expiry of interrupted restores and of a
+    /// left-behind maintenance claim). `true` for a server; a command that
+    /// writes (`backup purge`) sets it `false` beside `beside_server =
+    /// false`, so on PostgreSQL, MongoDB and Cassandra it runs none of that
+    /// work beside the live servers and exits with none of it half done,
+    /// and on SQLite it holds the serve lock and resolves what it needs
+    /// itself. Read only when `beside_server` is `false`.
+    pub startup_recovery: bool,
+    /// The command that opens the catalog, when it is not `serve`
+    /// (`extenddb backup list`, `extenddb backup purge`). A backend whose
+    /// factory takes a serving registration names it after the command
+    /// (PostgreSQL's session `application_name`, MongoDB's and Cassandra's
+    /// `extenddb_servers` entry), which a migration waiting for the
+    /// registrations prints; `None` is `extenddb serve`.
+    pub command: Option<&'static str>,
 }
 
 impl Default for ServerComponentsOptions {
@@ -139,6 +166,9 @@ impl Default for ServerComponentsOptions {
             max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
             release: "",
             max_concurrent_jobs: 0,
+            beside_server: false,
+            startup_recovery: true,
+            command: None,
         }
     }
 }

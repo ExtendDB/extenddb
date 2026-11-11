@@ -57,12 +57,19 @@ fn parse(json: &str) -> PolicyDocument {
     PolicyDocument::from_json(json).unwrap()
 }
 
+mod arn_value_tokens;
 mod case_three;
 mod combined;
 mod condition_variable_scope;
+mod condition_variables;
+mod condition_variables_arn;
+mod condition_variables_arn_context;
+mod condition_variables_operators;
 mod core;
 mod empty_values;
+mod quoted_defaults;
 mod resource_variables;
 mod resource_variables_fields;
+mod stored_unterminated;
 mod variable_spelling;
 mod variable_values;

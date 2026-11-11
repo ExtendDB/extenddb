@@ -9,9 +9,9 @@ use clap::Args;
 #[cfg(unix)]
 use daemonize::Daemonize;
 
-use crate::serve_helpers::check_config_permissions;
 #[cfg(unix)]
 use crate::serve_helpers::verify_daemon_started;
+use crate::serve_helpers::{check_config_permissions, narrow_served_tls_key};
 use extenddb_config as config;
 use extenddb_config::pid_file_path;
 use extenddb_server::{BuildInfo, LogTarget, ServeParams};
@@ -78,6 +78,14 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // serves plain HTTP on loopback for frictionless local/CI use.
     if !cfg!(feature = "dev-mode") && !app_config.server.tls.enabled {
         anyhow::bail!("TLS is mandatory. Remove `tls.enabled = false` from your config file.");
+    }
+
+    // The TLS private key must not be readable by other users. Like the
+    // config check above, a wider key is set to 0600 rather than refused.
+    // Printed to stderr directly: tracing is set up only inside `serve`, and
+    // before daemonizing stderr still reaches the invoking terminal.
+    if let Some(warning) = narrow_served_tls_key(&app_config.server.tls) {
+        eprintln!("{warning}");
     }
 
     // D6: Auth is mandatory. Only "builtin" is supported.
@@ -174,6 +182,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         backend,
         config::redact_password(app_config.storage.connection_config()),
     );
+    let banner_line3 = format!(
+        "  {}",
+        extenddb_server::backup_store::banner_line(
+            &app_config.backup,
+            app_config.storage.database_file().as_deref(),
+        )
+    );
     let mut warnings = app_config.storage.startup_warnings();
     warnings.extend(app_config.server.startup_warnings());
     let startup_warnings = render_startup_warnings(&warnings);
@@ -181,11 +196,13 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
         eprint!("{wordmark}");
         eprintln!("{banner_line1}");
         eprintln!("{banner_line2}");
+        eprintln!("{banner_line3}");
         eprint!("{startup_warnings}");
     } else {
         print!("{wordmark}");
         println!("{banner_line1}");
         println!("{banner_line2}");
+        println!("{banner_line3}");
         print!("{startup_warnings}");
     }
     if cfg!(feature = "dev-mode") {
@@ -275,10 +292,14 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     if config_exists {
         params = params.with_config_path(&args.config);
     }
-    let result = tokio::runtime::Builder::new_multi_thread()
+    // The runtime is ended with a bound (`run_then_shut_down`): a backup
+    // store check abandoned on a mount that has stopped answering leaves a
+    // blocking thread parked there, and a plain drop of the runtime would
+    // join it, holding the process open after the drain until SIGKILL.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(extenddb_server::serve(params));
+        .build()?;
+    let result = crate::run_then_shut_down(runtime, extenddb_server::serve(params));
     // `serve` has printed the refusal; end with its code, which `migrate`
     // and `verify` use for the same status.
     if let Err(e) = &result
