@@ -109,8 +109,9 @@ pub(crate) enum Stop {
     /// or catalog access.
     ClaimLost(String),
     /// The store, as the runtime holds it, is unhealthy or is no longer the
-    /// store the row records ([`Pipeline::store_check`]): FAILED with this
-    /// reason and no store call, the prefix's deletion included.
+    /// store the row records ([`Pipeline::store_check`]), or the fence's
+    /// read right before the first put refused it: FAILED with this reason
+    /// and no store write, the prefix's deletion included.
     StoreUnhealthy(String),
 }
 

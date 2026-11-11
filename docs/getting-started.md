@@ -269,7 +269,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 8
+  OK: Current: the catalog is at migration 10
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -287,7 +287,7 @@ extenddb runs as a daemon (background process) and logs to syslog. On startup it
 
 ```bash
 ./target/release/extenddb serve --config extenddb.toml
-# extenddb 0.1.14 (catalog migration 8) starting on 127.0.0.1:18443
+# extenddb 0.1.14 (catalog migration 10) starting on 127.0.0.1:18443
 #   storage: postgres (postgresql://extenddb:***@localhost:5432/extenddb_catalog)
 ```
 
@@ -353,18 +353,22 @@ By default, control plane operations (CreateTable, DeleteTable) emulate real Dyn
     control_plane_delay_seconds 10
 ```
 
+### Warm Throughput
+
+`WarmThroughput` on `CreateTable`, `UpdateTable` and `GlobalSecondaryIndexUpdates` is stored and reported on `DescribeTable` with the shape, defaults (12000 read and 4000 write units on an on-demand table, the provisioned units on a provisioned one) and validation of Amazon DynamoDB, and `Status` reads `UPDATING` for the control plane delay after a change, then `ACTIVE`. Nothing acts on the values: there is no pre-warming and no scaling at the database level, and they have no effect on throughput, throttling or storage.
+
 ### Credential Import
 
-Controls whether `extenddb manage import-access-key` is allowed (default: `true`).
+Controls whether `extenddb manage import-access-key` is allowed (default: `false`). An import stores an access key ID and secret that the caller chooses, so only a deployment that sets this to `true` accepts imported keys.
 
 ```bash
-# Disable credential import
-./target/release/extenddb settings --config extenddb.toml set \
-    allow_credential_import false
-
-# Re-enable
+# Enable credential import
 ./target/release/extenddb settings --config extenddb.toml set \
     allow_credential_import true
+
+# Disable it again
+./target/release/extenddb settings --config extenddb.toml set \
+    allow_credential_import false
 ```
 
 ### GSI Propagation Delay
@@ -796,7 +800,7 @@ The management API is available at `/management/*` on the running extenddb serve
 
 Admin commands require admin credentials (the username and password printed during `extenddb init`). IAM user self-service commands accept `account_id/user_name` as the `--user` value.
 
-**Note:** The `--password` flag is visible in process listings (`ps aux`). For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable instead.
+**Note:** The `--password` flag is visible in process listings (`ps aux`) and shell history. For sensitive environments, leave out `--password` and set the `EXTENDDB_PASSWORD` environment variable instead, with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD`, which keeps the password out of shell history. `extenddb manage` reads the password from `EXTENDDB_PASSWORD`, and it prints a warning on stderr when it gets `--password`. `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have no environment variable.
 
 ### List admin users
 
@@ -918,6 +922,13 @@ Admins can also create access keys on behalf of any user:
 
 Import real AWS credentials (or any AKIA* key) into extenddb. This enables the "just change the endpoint URL" workflow — use the same credentials against both extenddb and real DynamoDB.
 
+The `allow_credential_import` runtime setting gates credential import (default: `false`). Enable it before the first import:
+
+```bash
+./target/release/extenddb settings --config extenddb.toml set \
+    allow_credential_import true
+```
+
 Both `--secret-access-key` and `--yes` are required:
 
 ```bash
@@ -928,16 +939,11 @@ Both `--secret-access-key` and `--yes` are required:
     --yes
 ```
 
-> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, use the `EXTENDDB_ADMIN_PASSWORD` environment variable for the password.
+> **Security note:** `--secret-access-key` and `--password` are visible in `ps` output and shell history. For sensitive environments, set the password with `read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD` and leave out `--password`. `--secret-access-key` has no environment variable.
 
-Credential import is gated by the `allow_credential_import` runtime setting (default: `true`). To disable:
+Set `allow_credential_import` back to `false` to refuse further imports. Keys already imported keep working.
 
-```bash
-./target/release/extenddb settings --config extenddb.toml set \
-    allow_credential_import false
-```
-
-Every import is logged to syslog (access key ID, account, user — never the secret).
+Credential import is not audit-logged. See [9. Audit logging](#9-audit-logging).
 
 ### Change IAM user password
 
@@ -1270,7 +1276,7 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 
 ### Features
 
-- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own account).
+- **Dashboard:** Overview of accounts and admin users (admin sessions only; an IAM-user session gets a link to its own user page).
 - **Account management:** Create, view, and delete accounts (admin only).
 - **User management:** Create and delete IAM users, view access keys, policies, tags, and group memberships.
 - **Access key management:** Create and delete access keys. The secret key is shown once at creation time.
@@ -1279,23 +1285,36 @@ Navigate to `https://127.0.0.1:18443/console/` in your browser (adjust the host 
 - **Policy management:** Add and delete inline policies for users, groups, and roles. Includes a JSON editor with a default policy template.
 - **Metrics dashboard:** Operation metrics for every account, with charts (admin only).
 
-Admin users have full access to all management operations. IAM users can view their own details and manage their own access keys.
+Admin users have full access to all management operations. IAM users open their own user page, which lists their access keys, and create and delete their own access keys there. These are the access key reads and writes the management API gives an IAM user. The console has no form to change the password or import a key. Every other page under `/console/accounts`, the account list included, redirects an IAM-user session to the dashboard.
 
 Sessions end 8 hours after login. Click "Logout" to end a session immediately. Deleting a user or changing its password ends that user's sessions at their next request.
 
 ## 9. Audit logging
 
-All management and settings operations are logged to syslog at WARN level with structured targets for filtering:
+The server writes audit entries at WARN level to its log: syslog when it runs as a daemon, and stderr with `--foreground`. Two targets cover some management operations and the settings changes made through the management API:
 
-- **Management operations:** `extenddb::audit::manage` — covers admin CRUD, account CRUD, IAM user/group/role/policy CRUD, access key lifecycle, permissions boundaries, assume-role, and credential import.
-- **Settings operations:** `extenddb::audit::settings` — covers `extenddb settings set` changes.
+- `extenddb::audit::manage`: DeleteAdmin, user and role tag changes, and AssumeRole, both granted and refused by the role's trust policy.
+- `extenddb::audit::settings`: each settings change made through the management API (`PUT /management/settings/{key}`).
+
+`extenddb settings set` changes the catalog without the server and prints its `extenddb::audit::settings` entry on its own standard output, so the server writes no audit entry for that change. A running server logs, under no audit target, when it applies a new `log_level`, `sqlx_log_level` or `throttling_enabled` value.
+
+Other management changes are not audit-logged. These include creating admin users, group membership and permissions boundary changes, password changes and credential import. Creating and deleting accounts, IAM users, groups, roles, access keys and policies are not audit-logged either.
+
+Audit entries are WARN events, so the server writes none of them while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off.
 
 Secrets (passwords, secret keys) are never included in audit log entries.
 
 View audit entries:
 
 ```bash
+# Linux
 journalctl -t extenddb | grep 'extenddb::audit'
+
+# macOS
+log show --predicate 'processImagePath ENDSWITH "extenddb"' --last 1d | grep 'extenddb::audit'
+
+# Docker Compose (--foreground)
+docker compose logs extenddb | grep 'extenddb::audit'
 ```
 
 ## 10. External test suites
@@ -1367,7 +1386,7 @@ Each runner requires its tools to be installed. The runner checks prerequisites 
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog migration 8 (postgres)
+# catalog migration 10 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 ```

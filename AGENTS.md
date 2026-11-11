@@ -151,7 +151,7 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 This creates:
-- Databases (`extenddb_catalog`, `extenddb_data`)
+- Databases (`extenddb_catalog` and `extenddb` on PostgreSQL; `extenddb_catalog` and `extenddb_data` on MongoDB)
 - Admin user credentials (printed to stdout — save the password!)
 - Self-signed TLS certificate at `~/.extenddb/tls/cert.pem`
 - Config file `extenddb.toml`
@@ -212,6 +212,8 @@ export EXTENDDB_TEST_ENDPOINT=https://127.0.0.1:18443
 export EXTENDDB_ADMIN_USER=admin
 export EXTENDDB_ADMIN_PASSWORD=<password-from-init>
 eval $(python3 devtools/provision-test-credentials)
+# The access key import tests need import enabled. devtools/run-tests sets it.
+./target/release/extenddb settings --config extenddb.toml set allow_credential_import true
 pytest tests/ -v
 ```
 
@@ -395,6 +397,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Admin Guide | `docs/manuals/05-admin-guide.md`                  | Server lifecycle, configuration, IAM   |
 | Security Model | `docs/manuals/10-security-model.md`               | Threat model, auth, authz              |
 | Deployment Guide | `docs/manuals/11-deployment-guide.md`             | Self-hosted, multi-cloud, air-gapped   |
+| Backup and Restore | `docs/manuals/14-backup-and-restore.md`           | Backup strategy, drills, recovery      |
 | Differences from DynamoDB | `docs/differences-from-dynamodb.md`               | Behavioral differences                 |
 | Troubleshooting | `docs/troubleshooting.md`                         | Common errors and solutions            |
 | Storage Component Design | `docs/design/04-component-storage.md`             | Storage trait design                   |
@@ -404,7 +407,7 @@ Expression parsing lives in `crates/core/src/expression/`. This is pure sync Rus
 | Local MongoDB Setup | `docs/local-mongodb-setup.md`                     | MongoDB installation and config        |
 | Cassandra Setup | `docs/cassandra-setup.md`                         | Cassandra install, config, and deployment (experimental) |
 | Testing Design | `docs/design/09-testing.md`                       | Test strategy and infrastructure       |
-| Extending Storage | `12-backend-plugin-architecture.md` | Guide to implementing storage backends |
+| Extending Storage | `docs/manuals/12-extending-extenddb-storage.md` | Guide to implementing storage backends |
 
 Build PDFs:
 

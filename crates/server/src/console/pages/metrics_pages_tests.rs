@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::http::header::LOCATION;
 use axum::response::Response;
 use extenddb_core::metrics::{LatencySegments, MetricsCollector, MetricsQuery, TimeWindow};
-use extenddb_storage::management_store::{MetricsRow, MetricsStore, OpResult};
+use extenddb_storage::management_store::{MetricsFilter, MetricsRow, MetricsStore, OpResult};
 use futures::future::BoxFuture;
 
 use super::{metrics_json, render_metrics_page};
@@ -20,9 +20,12 @@ use crate::console::html;
 use crate::console::pages::{SessionData, identity_label};
 use crate::management::CallerIdentity;
 
-/// A table in each of two accounts. The `metrics` table has no account
-/// column, so both accounts' rows come back from one store read.
-const TABLES: [&str; 2] = ["orders-account-a", "orders-account-b"];
+/// A table in each of two accounts, as (account, table). The admin feed reads
+/// every account's rows in one store read.
+const TABLES: [(&str, &str); 2] = [
+    ("111111111111", "orders-account-a"),
+    ("222222222222", "orders-account-b"),
+];
 
 /// The index every fake row is recorded against, so a test can check that a
 /// response carries no index name.
@@ -44,15 +47,15 @@ impl MetricsStore for FakeMetricsStore {
         &self,
         _start: time::OffsetDateTime,
         _end: time::OffsetDateTime,
-        _table_name: Option<&str>,
-        _metric: Option<&str>,
+        _filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         let bucket = time::OffsetDateTime::now_utc() - time::Duration::minutes(2);
         let rows = TABLES
             .iter()
-            .map(|table| MetricsRow {
+            .map(|(account, table)| MetricsRow {
                 bucket,
+                account_id: Some((*account).to_owned()),
                 metric: "SuccessfulRequestLatency".to_owned(),
                 table_name: Some((*table).to_owned()),
                 index_name: Some(INDEX.to_owned()),
@@ -93,8 +96,9 @@ fn session(identity: CallerIdentity) -> SessionData {
 fn collector() -> Arc<MetricsCollector> {
     let collector = Arc::new(MetricsCollector::new());
     collector.record_segments(
+        TABLES[0].0,
         "GetItem",
-        Some(TABLES[0]),
+        Some(TABLES[0].1),
         LatencySegments {
             dispatch_us: 500.0,
             total_us: 500.0,
@@ -127,8 +131,9 @@ async fn iam_user_gets_403_and_no_metrics_from_the_data_feed() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = body_text(response).await;
     assert!(!body.contains("TableName"), "403 body: {body}");
-    for table in TABLES {
+    for (account, table) in TABLES {
         assert!(!body.contains(table), "403 body names {table}: {body}");
+        assert!(!body.contains(account), "403 body names an account: {body}");
     }
     assert!(!body.contains(INDEX), "403 body names an index: {body}");
     assert!(
@@ -159,10 +164,22 @@ async fn admin_gets_every_accounts_rows_from_the_data_feed() {
         .flatten()
         .filter_map(|d| d["TableName"].as_str())
         .collect();
-    for table in TABLES {
+    let accounts: Vec<&str> = body["metrics"]
+        .as_array()
+        .expect("metrics array")
+        .iter()
+        .filter_map(|m| m["dimensions"].as_array())
+        .flatten()
+        .filter_map(|d| d["AccountId"].as_str())
+        .collect();
+    for (account, table) in TABLES {
         assert!(
             tables.contains(&table),
             "admin feed lacks {table}: {tables:?}"
+        );
+        assert!(
+            accounts.contains(&account),
+            "admin feed lacks the account of {table}"
         );
     }
     let indexes: Vec<&str> = body["metrics"]
@@ -201,6 +218,9 @@ async fn admin_gets_the_metrics_page() {
     assert!(body.contains("<h1>Metrics</h1>"), "{body}");
     assert!(body.contains("/console/metrics-data"), "{body}");
     assert!(!body.contains("accountFilter"), "{body}");
+    // The raw metrics table names each row's account.
+    assert!(body.contains("<th>Metric</th><th>Account</th><th>Table</th>"));
+    assert!(body.contains("d.AccountId"));
 }
 
 #[test]
@@ -219,12 +239,16 @@ fn nav_bar_links_the_admin_only_pages_for_admins_only() {
     let admin_row = format!("{accounts}\n{}\n{spacer}", admin_links.join("\n"));
     assert!(admin_nav.contains(&admin_row), "{admin_nav}");
 
+    // An IAM user's bar has no Accounts link either: Dashboard comes right
+    // before the spacer.
+    let dashboard = r#"<a href="/console">Dashboard</a>"#;
     let user_nav = html::nav_bar(&identity_label(&iam_user()));
     for link in admin_links {
         assert!(!user_nav.contains(link), "{user_nav}");
     }
+    assert!(!user_nav.contains(accounts), "{user_nav}");
     assert!(
-        user_nav.contains(&format!("{accounts}\n{spacer}")),
+        user_nav.contains(&format!("{dashboard}\n{spacer}")),
         "{user_nav}"
     );
     assert!(user_nav.contains("444455556666/bob"), "{user_nav}");

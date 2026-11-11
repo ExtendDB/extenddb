@@ -41,6 +41,9 @@ mod m0005_drop_continuous_backups;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0010_account_metrics;
 mod postcheck;
 
 use std::time::Duration;
@@ -169,6 +172,19 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
              (restore_job.file_index); the restore_progress table is PostgreSQL's data \
              database's",
         ),
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0010_account_metrics::AccountMetrics,
+                m0010_account_metrics::SOURCE,
+            )],
+        },
     }
 }
 

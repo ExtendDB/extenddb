@@ -78,8 +78,8 @@
 //! document is gone the target is removed (the name and the backup are
 //! free, and no record is left for a later cycle), so a drop that fails
 //! after it is logged with the collections' names and leaves them in the
-//! data database for `backup sync` to sweep, as nothing in the catalog
-//! points at them.
+//! data database, where nothing in the catalog points at them and no sweep
+//! removes them yet; the log line names them for an operator to drop.
 
 use std::time::{Duration, Instant};
 
@@ -1480,6 +1480,7 @@ impl LegacyBackupReader for MongoEngine {
                                 &index_doc,
                                 "provisioned_throughput",
                             )?,
+                            warm_throughput: None,
                         });
                     }
                     "LSI" => {
@@ -1868,6 +1869,7 @@ mod tests {
                 read_capacity_units: 7,
                 write_capacity_units: 8,
             }),
+            warm_throughput: None,
         };
         let kept = restore_gsi_throughput("PROVISIONED", Some(vec![gsi.clone()])).expect("gsis");
         assert!(kept[0].provisioned_throughput.is_some());

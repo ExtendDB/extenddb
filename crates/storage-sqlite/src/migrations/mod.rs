@@ -32,6 +32,9 @@ mod m0004_index_table_base_key;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0009_warm_throughput;
 mod postcheck;
 
 use std::time::Duration;
@@ -126,6 +129,24 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
             "the restore progress of a store-backed restore is on table_restores (file_index, \
              items_applied) on SQLite; the table is PostgreSQL's data database's",
         ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0009_warm_throughput::WarmThroughput,
+                m0009_warm_throughput::SOURCE,
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
     }
 }
 

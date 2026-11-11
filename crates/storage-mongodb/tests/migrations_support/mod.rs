@@ -37,9 +37,13 @@ pub const CATALOG_BASELINE: &str =
 pub const CATALOG_MIGRATION_6: &str =
     include_str!("../fixtures/0006_backup_catalog_index.expected.json");
 
+/// The collection migration 10 creates in place of `metrics`, which it drops.
+pub const CATALOG_MIGRATION_10: &str =
+    include_str!("../fixtures/0010_account_metrics.expected.json");
+
 /// The catalog database's definitions after every migration: migration 1's,
-/// without `continuous_backups`, which migration 5 drops, and with what
-/// migration 6 adds.
+/// without `continuous_backups`, which migration 5 drops, and `metrics`,
+/// which migration 10 drops, with what migrations 6 and 10 add.
 ///
 /// # Panics
 ///
@@ -48,12 +52,16 @@ pub const CATALOG_MIGRATION_6: &str =
 pub fn expected_catalog() -> Definitions {
     let mut expected: Definitions = serde_json::from_str(CATALOG_BASELINE).expect("migration 1");
     expected.remove("continuous_backups");
-    let added: Definitions = serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
-    for (name, collection) in added {
-        match expected.get_mut(&name) {
-            Some(existing) => existing.indexes.extend(collection.indexes),
-            None => {
-                expected.insert(name, collection);
+    expected.remove("metrics");
+    for (file, id) in [(CATALOG_MIGRATION_6, 6), (CATALOG_MIGRATION_10, 10)] {
+        let added: Definitions =
+            serde_json::from_str(file).unwrap_or_else(|e| panic!("migration {id}: {e}"));
+        for (name, collection) in added {
+            match expected.get_mut(&name) {
+                Some(existing) => existing.indexes.extend(collection.indexes),
+                None => {
+                    expected.insert(name, collection);
+                }
             }
         }
     }

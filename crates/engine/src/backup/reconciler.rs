@@ -42,6 +42,13 @@
 //!   one thread and not one per cycle. The check is also selected against
 //!   the shutdown token, so a cycle that is checking when the server stops
 //!   returns at once with no further duty and the drain finishes.
+//! - With the startup sync of an in-memory catalog pending and the store
+//!   healthy after the check: the sync (`super::sync::startup_sync`),
+//!   bounded by `super::sync::STARTUP_SYNC_TIMEOUT` (60 s) and selected
+//!   against the shutdown token, so a store that stalls during it delays
+//!   the duties below by at most the bound; one that stops before it has
+//!   listed the whole root, reaches the bound, or skips a prefix for a store
+//!   or catalog error stays pending for the next cycle.
 //! - Over the records `list_dead_restore_jobs` returns: a RUNNING restore
 //!   job record whose `heartbeat_at` is older than `stale_job_after` (on
 //!   the catalog's clock) has a dead owner. One of kind `legacy` is marked
@@ -67,9 +74,13 @@
 //!   unclaimed write and its target left for the operator, as below (the
 //!   command's wait is satisfied either way: the record is no longer
 //!   RUNNING); a record of a store other than the
-//!   configured one (no store configured included) is failed naming
-//!   `backup sync --move-store`, its target removed by the FAILED-target
-//!   duty next; while the configured store is unhealthy, or not yet checked,
+//!   configured one (no store configured included) is failed with
+//!   [`OTHER_STORE`] (configure that store, or copy its tree under the
+//!   configured root and move the backup's rows to the configured store
+//!   with `extenddb backup sync --move-store`, and
+//!   restore again: the move re-points backup rows, never a restore
+//!   record), its target removed by the FAILED-target duty
+//!   next; while the configured store is unhealthy, or not yet checked,
 //!   the record is skipped (one line per cycle, naming which); with no free
 //!   job permit it is skipped to the next cycle; then the backend's
 //!   `claim_restore_dead` is the test and the takeover (a fresh generation,
@@ -145,6 +156,43 @@
 //!     nothing and whose `completed_at` is older than `failed_row_retention`
 //!     (the completed clock) is removed. Every age is the database's
 //!     comparison; the engine holds no clock.
+//!   - Each deletion of a prefix and each removal of a tombstone, the
+//!     DELETING rows' included, runs the deletion fence first
+//!     ([`super::StoreFence`]): `extenddb-store.json` is re-read, and a
+//!     file that names another catalog (a root adopted since this cycle's
+//!     check) marks the store unhealthy with nothing deleted. The cycle
+//!     re-tests the store's health after each store duty, so the duties
+//!     after the refusal (the dead-owner duty's reads and writes among
+//!     them) do not run on the root; the refusing duty's later rows are
+//!     refused with no read of the file (the FAILED-prefix and
+//!     DELETED-prefix duties still list each prefix first). The FAILED,
+//!     DELETED and tombstone duties then read the row once more after the
+//!     fence passed, skip a row that is gone or whose status or store
+//!     changed since the duty listed it, and read the maintenance claim
+//!     again, starting nothing while a command holds it. The claim is read
+//!     once at the cycle's start, so a cycle that began just before a
+//!     maintenance command took it may still be running its duties when
+//!     the command removes a row (`backup sync --forget-backup`,
+//!     `--forget-store`) or moves it (`--move-store`). A deletion or
+//!     removal that read the claim free must end by its deadline,
+//!     [`DUTY_DELETION_BOUND`] after that read was sent: a read answered
+//!     after the deadline starts nothing, the prefix deletion checks the
+//!     deadline inside the store before each removal (each request on S3,
+//!     `delete_prefix_before`), and a call still running at it is dropped;
+//!     the duty then stops for this cycle, the row left for the next. A
+//!     command that removes FAILED or DELETED rows beside servers waits the
+//!     bound and one store call after it takes the claim, so what a
+//!     deletion duty can still do to a row such a command removes is the
+//!     step in flight at the deadline: one removal on a filesystem root, one
+//!     request on S3 (up to 1,000 keys for a `DeleteObjects`). The bound,
+//!     like every lease in the design, assumes the server's process keeps
+//!     running: one paused past the wait (SIGSTOP, a frozen cgroup, a VM
+//!     pause) between its last check of the deadline and a call it has
+//!     already sent runs that call when it resumes. The exception is a
+//!     DELETING row of the configured store: its deletion is finished
+//!     before its removal (by the command, or by `finish_deleting_rows`,
+//!     which runs under the claim), the deletion its DeleteBackup asked
+//!     for.
 //! - Not while the maintenance claim is held, on every backend: the
 //!   backend's `sweep_restore_registrations` (a no-op but on Cassandra);
 //!   the progress-row sweep (`sweep_restore_progress` with the table ids of
@@ -210,7 +258,7 @@ use futures::TryStreamExt;
 use super::job::JobEnv;
 use super::job::failure::{Written, write_status};
 use super::restore::{self, OTHER_STORE, TARGET_NOT_EMPTY};
-use super::{BackupRuntime, ConfiguredStore};
+use super::{BackupRuntime, ConfiguredStore, StoreFence};
 
 /// The two durations a reconciler reads from `[backup]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +391,11 @@ pub struct ReconcilerState {
     /// takes the held branch and does not read the claim. `None` reads it
     /// through `check_maintenance_claim`.
     maintenance_held: Option<bool>,
+    /// Whether the cycle leaves the store's check out and reads the health
+    /// as the caller recorded it: a command that writes nothing to the root
+    /// (`backup sync --forget-backup`, `--forget-store`), whose own check
+    /// writes no identity file.
+    skip_store_check: bool,
     /// How many times this instance took over each store-backed restore
     /// record, by target table id, for the bound [`RESTORE_TAKEOVERS`]; an
     /// entry is removed when the record is failed by the bound.
@@ -369,6 +422,18 @@ impl ReconcilerState {
         Self {
             maintenance_held: Some(true),
             ..Self::default()
+        }
+    }
+
+    /// [`Self::for_maintenance_holder`] for a command that writes nothing
+    /// to the root: the cycle runs no store check (which may write
+    /// `extenddb-store.json` or a probe file), and the duties read the
+    /// store's health as the command's own check recorded it.
+    #[must_use]
+    pub fn for_maintenance_holder_without_store_check() -> Self {
+        Self {
+            skip_store_check: true,
+            ..Self::for_maintenance_holder()
         }
     }
 }
@@ -476,15 +541,25 @@ where
         ..CycleReport::default()
     };
     if report.maintenance_held {
-        tracing::info!(
-            "backup reconciler: a maintenance claim is held; running only the duties that \
-             resolve rows whose owner is dead, the store's check and the DELETING rows"
-        );
+        if state.maintenance_held.is_some() {
+            tracing::info!(
+                "backup reconciler: run by a maintenance command before its own work; running \
+                 only the duties that resolve rows whose owner is dead, the store's check and \
+                 the DELETING rows"
+            );
+        } else {
+            tracing::info!(
+                "backup reconciler: a maintenance claim is held; running only the duties that \
+                 resolve rows whose owner is dead, the store's check and the DELETING rows"
+            );
+        }
     }
 
     // The store's check first, so every duty of this cycle that reads the
     // store's health reads what this cycle's check left.
-    if let Some(store) = runtime.configured_store() {
+    if let Some(store) = runtime.configured_store()
+        && !state.skip_store_check
+    {
         let check = super::check_configured_store(store, &**storage, backend);
         let outcome = match &state.shutdown {
             Some(shutdown) => tokio::select! {
@@ -534,6 +609,22 @@ where
             }
         }
         report.store_healthy = Some(store.is_healthy());
+        // The startup sync of an in-memory catalog, once its store is
+        // healthy: an S3 store's first check is this cycle's, and a sync
+        // the server's start did not finish is left pending for here
+        // (`super::sync::startup_sync`).
+        if store.startup_sync_pending() {
+            let sync = super::sync::startup_sync(&**storage, runtime);
+            match &state.shutdown {
+                Some(shutdown) => tokio::select! {
+                    _ = sync => {}
+                    () = shutdown.cancelled() => return Ok(report),
+                },
+                None => {
+                    sync.await;
+                }
+            }
+        }
     }
 
     let mut store_not_ready_logged = false;
@@ -669,17 +760,33 @@ where
             store: &*store.store,
             metrics: runtime.metrics().map(|m| &**m),
         };
-        report.deletions_finished = finish_deleting_rows(&**storage, store, &identity).await?;
-        (report.creating_resolved, report.creating_left_to_owner) =
-            resolve_dead_creating_rows(&**storage, calls, &identity, stale_job_after).await?;
-        if !report.maintenance_held {
+        let fence = store.fence();
+        // A fence refusal makes the store unhealthy (a root another catalog
+        // adopted since this cycle's check): the store duties after it do
+        // not run on the root, the dead-owner duty's reads included.
+        let healthy = || store.is_healthy();
+        report.deletions_finished =
+            finish_deleting_rows(&**storage, store, &fence, &identity).await?;
+        if healthy() {
+            (report.creating_resolved, report.creating_left_to_owner) =
+                resolve_dead_creating_rows(&**storage, calls, &identity, stale_job_after).await?;
+        }
+        if !report.maintenance_held && healthy() {
             let retention = runtime.job_settings().failed_row_retention;
+            let duty = Duty {
+                storage: &**storage,
+                store: calls,
+                fence: &fence,
+                stale_job_after,
+            };
             report.failed_prefixes_deleted =
-                delete_stale_failed_prefixes(&**storage, calls, &identity, stale_job_after).await?;
-            report.deleted_prefixes_swept =
-                sweep_deleted_prefixes(&**storage, calls, &identity).await?;
-            report.tombstones_removed =
-                remove_tombstones(&**storage, calls, &identity, retention).await?;
+                delete_stale_failed_prefixes(duty, &identity, stale_job_after).await?;
+            if healthy() {
+                report.deleted_prefixes_swept = sweep_deleted_prefixes(duty, &identity).await?;
+            }
+            if healthy() {
+                report.tombstones_removed = remove_tombstones(duty, &identity, retention).await?;
+            }
         }
     }
 
@@ -1242,87 +1349,158 @@ async fn resolve_dead_creating_rows<S: BackupCatalog + ?Sized>(
     let mut resolved = Vec::new();
     let mut left_to_owner = Vec::new();
     for row in rows {
-        let claim = match storage.claim_dead_backup(&row.key(), stale_job_after).await {
-            Ok(Some(claim)) => claim,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::error!(
-                    "could not test whether the owner of CREATING backup {} (account {}) is \
-                     dead; the next cycle retries: {e}",
-                    row.backup_arn,
-                    row.account_id
-                );
-                continue;
-            }
-        };
-        let arn = match BackupArn::parse(&row.backup_arn) {
-            Ok(arn) => arn,
-            Err(e) => {
-                tracing::error!(
-                    "CREATING row {} carries an ARN this build cannot parse; left as it is: {e}",
-                    row.backup_arn
-                );
-                continue;
-            }
-        };
-        let (to, fields) = match probe_manifest(store, &arn).await {
-            Ok(Probe::Complete(fields)) => (JobStatus::Available, fields),
-            Ok(Probe::Incomplete(why)) => {
-                tracing::warn!(
-                    "backup {} (account {}): its owner is dead and the store holds no complete \
-                     manifest ({why}); the row is FAILED and its prefix is deleted once the row's \
-                     heartbeat is stale",
-                    row.backup_arn,
-                    row.account_id
-                );
-                (
-                    JobStatus::Failed,
-                    StatusFields {
-                        failure_reason: Some(OWNER_DEAD_NO_MANIFEST.to_owned()),
-                        completed: true,
-                        ..StatusFields::default()
-                    },
-                )
-            }
-            Err(e) => {
-                tracing::error!(
-                    "backup {} (account {}): its owner is dead and the store could not be \
-                     probed for its manifest; the next cycle retries: {e}",
-                    row.backup_arn,
-                    row.account_id
-                );
-                continue;
-            }
-        };
-        match write_status(&*claim, JobStatus::Creating, to, &fields).await {
-            Written::Matched => {
-                tracing::info!(
-                    "backup {} (account {}): its owner was dead; the row is now {to}",
-                    row.backup_arn,
-                    row.account_id
-                );
-                let status = match to {
-                    JobStatus::Available => BackupStatus::Available,
-                    _ => BackupStatus::Failed,
-                };
-                resolved.push((row.backup_arn, status));
-            }
-            Written::NotMatched(why) => {
-                tracing::info!(
-                    "backup {} was no longer this cycle's to resolve ({why}); left to its owner",
-                    row.backup_arn
-                );
-                left_to_owner.push(row.backup_arn);
-            }
-            Written::Error(e) => tracing::error!(
+        match resolve_dead_creating_row(storage, store, &row, stale_job_after, OnIncomplete::Fail)
+            .await
+        {
+            CreatingOutcome::Resolved(status) => resolved.push((row.backup_arn, status)),
+            CreatingOutcome::LeftToOwner(_) => left_to_owner.push(row.backup_arn),
+            CreatingOutcome::NotHandedOver
+            | CreatingOutcome::Incomplete(_)
+            | CreatingOutcome::Failed(_) => {}
+        }
+    }
+    Ok((resolved, left_to_owner))
+}
+
+/// What [`resolve_dead_creating_row`] did with one CREATING row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CreatingOutcome {
+    /// The backend did not hand the row over: its owner is alive, or
+    /// another taker has it.
+    NotHandedOver,
+    /// The row was written AVAILABLE (the store holds its complete
+    /// manifest) or FAILED ([`OWNER_DEAD_NO_MANIFEST`]).
+    Resolved(BackupStatus),
+    /// The write matched no row: another owner took it over since the
+    /// takeover (why).
+    LeftToOwner(String),
+    /// With [`OnIncomplete::Leave`], the store holds no complete manifest
+    /// (why): no status was written, the row is CREATING under the
+    /// takeover's generation with its heartbeat as it was.
+    Incomplete(String),
+    /// A catalog or store call failed, or the row's ARN does not parse
+    /// (why); the row is left as it was and logged.
+    Failed(String),
+}
+
+/// What [`resolve_dead_creating_row`] writes when the store holds no
+/// complete manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnIncomplete {
+    /// FAILED ([`OWNER_DEAD_NO_MANIFEST`]): the store probed is the row's.
+    Fail,
+    /// Nothing ([`CreatingOutcome::Incomplete`]): the store probed holds a
+    /// copy, and the row's own store may hold the complete backup.
+    Leave,
+}
+
+/// One CREATING row whose owner may be dead: the backend's takeover
+/// (`claim_dead_backup` with `stale_job_after`), the manifest probe of
+/// `store` ([`probe_manifest`]), and the CREATING to AVAILABLE write under
+/// the taken generation, or to FAILED when the probe finds no complete
+/// manifest and `on_incomplete` is [`OnIncomplete::Fail`]. The dead-owner
+/// duty runs it on the configured store's rows with `Fail`; `backup sync
+/// --move-store` on the old root's rows with `Leave`, probing the
+/// configured store, to which the copied prefix belongs: a copy without a
+/// complete backup proves nothing about the old root's prefix (a copy's
+/// order is arbitrary), so the move writes no FAILED.
+pub(super) async fn resolve_dead_creating_row<S: BackupCatalog + ?Sized>(
+    storage: &S,
+    store: StoreCalls<'_>,
+    row: &BackupRow,
+    stale_job_after: Duration,
+    on_incomplete: OnIncomplete,
+) -> CreatingOutcome {
+    let claim = match storage.claim_dead_backup(&row.key(), stale_job_after).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return CreatingOutcome::NotHandedOver,
+        Err(e) => {
+            tracing::error!(
+                "could not test whether the owner of CREATING backup {} (account {}) is dead; \
+                 the next cycle retries: {e}",
+                row.backup_arn,
+                row.account_id
+            );
+            return CreatingOutcome::Failed(format!(
+                "could not test whether its owner is dead: {e}"
+            ));
+        }
+    };
+    let arn = match BackupArn::parse(&row.backup_arn) {
+        Ok(arn) => arn,
+        Err(e) => {
+            tracing::error!(
+                "CREATING row {} carries an ARN this build cannot parse; left as it is: {e}",
+                row.backup_arn
+            );
+            return CreatingOutcome::Failed(format!("the row's ARN does not parse: {e}"));
+        }
+    };
+    let (to, fields) = match probe_manifest(store, &arn).await {
+        Ok(Probe::Complete(fields)) => (JobStatus::Available, fields),
+        Ok(Probe::Incomplete(why)) if on_incomplete == OnIncomplete::Leave => {
+            drop(claim);
+            return CreatingOutcome::Incomplete(why);
+        }
+        Ok(Probe::Incomplete(why)) => {
+            tracing::warn!(
+                "backup {} (account {}): its owner is dead and the store holds no complete \
+                 manifest ({why}); the row is FAILED and its prefix is deleted once the row's \
+                 heartbeat is stale",
+                row.backup_arn,
+                row.account_id
+            );
+            (
+                JobStatus::Failed,
+                StatusFields {
+                    failure_reason: Some(OWNER_DEAD_NO_MANIFEST.to_owned()),
+                    completed: true,
+                    ..StatusFields::default()
+                },
+            )
+        }
+        Err(e) => {
+            tracing::error!(
+                "backup {} (account {}): its owner is dead and the store could not be probed \
+                 for its manifest; the next cycle retries: {e}",
+                row.backup_arn,
+                row.account_id
+            );
+            return CreatingOutcome::Failed(format!(
+                "the store could not be probed for its manifest: {e}"
+            ));
+        }
+    };
+    let outcome = match write_status(&*claim, JobStatus::Creating, to, &fields).await {
+        Written::Matched => {
+            tracing::info!(
+                "backup {} (account {}): its owner was dead; the row is now {to}",
+                row.backup_arn,
+                row.account_id
+            );
+            CreatingOutcome::Resolved(match to {
+                JobStatus::Available => BackupStatus::Available,
+                _ => BackupStatus::Failed,
+            })
+        }
+        Written::NotMatched(why) => {
+            tracing::info!(
+                "backup {} was no longer this cycle's to resolve ({why}); left to its owner",
+                row.backup_arn
+            );
+            CreatingOutcome::LeftToOwner(why)
+        }
+        Written::Error(e) => {
+            tracing::error!(
                 "backup {} (account {}): the {to} write failed; the next cycle retries: {e}",
                 row.backup_arn,
                 row.account_id
-            ),
+            );
+            CreatingOutcome::Failed(format!("the {to} write failed: {e}"))
         }
-        drop(claim);
-    }
-    Ok((resolved, left_to_owner))
+    };
+    drop(claim);
+    outcome
 }
 
 /// The configured store as the reconciler's duties call it: each failed
@@ -1331,13 +1509,15 @@ async fn resolve_dead_creating_rows<S: BackupCatalog + ?Sized>(
 /// a store that refuses the reconciler's calls moves the metric even when
 /// every cycle completes.
 #[derive(Clone, Copy)]
-struct StoreCalls<'a> {
-    store: &'a dyn BackupStore,
-    metrics: Option<&'a MetricsCollector>,
+pub(super) struct StoreCalls<'a> {
+    pub(super) store: &'a dyn BackupStore,
+    pub(super) metrics: Option<&'a MetricsCollector>,
 }
 
 impl StoreCalls<'_> {
-    fn failed(self, op: &str, e: StoreError) -> StoreError {
+    /// `e`, with `BackupStoreErrors` recorded under `op` when metrics are
+    /// collected.
+    pub(super) fn failed(self, op: &str, e: StoreError) -> StoreError {
         if let Some(metrics) = self.metrics {
             metrics.record_backup_store_error(op);
         }
@@ -1372,16 +1552,22 @@ impl StoreCalls<'_> {
         }
     }
 
-    async fn delete_prefix(self, prefix: &str) -> Result<u64, StoreError> {
+    /// The prefix deleted, no removal started at or after `deadline`
+    /// ([`BackupStore::delete_prefix_before`]).
+    async fn delete_prefix_before(
+        self,
+        prefix: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<extenddb_backup_store::PrefixDeletion, StoreError> {
         self.store
-            .delete_prefix(prefix)
+            .delete_prefix_before(prefix, deadline)
             .await
             .map_err(|e| self.failed("delete_prefix", e))
     }
 }
 
 /// What the manifest probe found under a dead owner's prefix.
-enum Probe {
+pub(super) enum Probe {
     /// A complete, verified manifest: the AVAILABLE write's fields.
     Complete(StatusFields),
     /// No manifest, or one the reader refuses, or a data file missing or of
@@ -1389,55 +1575,25 @@ enum Probe {
     Incomplete(String),
 }
 
-/// The manifest probe of the dead-owner duty (module doc). A store error
-/// other than an absent object is the `Err`.
-async fn probe_manifest(store: StoreCalls<'_>, arn: &BackupArn) -> Result<Probe, StoreError> {
+/// The manifest probe of the dead-owner duty (module doc): the checks of
+/// [`verify_prefix`], with the manifest's ARN required to name the row's
+/// backup (its partition included; the region may differ, as it does for a
+/// backup `backup sync` adopted from a manifest another region's server
+/// wrote, `BackupArn::names_same_backup`) before the prefix is listed.
+/// `backup sync --move-store` probes each AVAILABLE row of the old root with
+/// it in the configured store. A store error other than an absent object is
+/// the `Err`.
+pub(super) async fn probe_manifest(
+    store: StoreCalls<'_>,
+    arn: &BackupArn,
+) -> Result<Probe, StoreError> {
     let prefix = arn.store_prefix();
-    let manifest = match store
-        .read_object(
-            &format!("{prefix}{EXTENDDB_MANIFEST_FILE}"),
-            MANIFEST_READ_BOUND,
-        )
-        .await?
-    {
-        ReadObject::Bytes(bytes) => bytes,
-        ReadObject::Absent => return Ok(Probe::Incomplete("no manifest".to_owned())),
-        ReadObject::Oversize => {
-            return Ok(Probe::Incomplete(format!(
-                "a manifest over {MANIFEST_READ_BOUND} bytes"
-            )));
-        }
-    };
-    let sidecar = match store
-        .read_object(
-            &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
-            SIDECAR_READ_BOUND,
-        )
-        .await?
-    {
-        ReadObject::Bytes(bytes) => bytes,
-        ReadObject::Absent => {
-            return Ok(Probe::Incomplete(
-                "a manifest without its sidecar".to_owned(),
-            ));
-        }
-        ReadObject::Oversize => {
-            return Ok(Probe::Incomplete(format!(
-                "a sidecar over {SIDECAR_READ_BOUND} bytes"
-            )));
-        }
-    };
-    if let Err(e) = verify_manifest_checksum(&manifest, &sidecar) {
-        return Ok(Probe::Incomplete(format!(
-            "the sidecar does not match: {e}"
-        )));
-    }
-    let manifest = match ExtenddbManifest::from_json_bytes(&manifest) {
-        Ok(manifest) => manifest,
-        Err(e) => return Ok(Probe::Incomplete(format!("the manifest is refused: {e}"))),
+    let manifest = match read_verified_manifest(store, &prefix).await? {
+        Verified::Complete(manifest) => manifest,
+        Verified::Incomplete(why) => return Ok(Probe::Incomplete(why)),
     };
     match manifest.backup_arn() {
-        Ok(found) if found == *arn => {}
+        Ok(found) if found.names_same_backup(arn) => {}
         Ok(found) => {
             return Ok(Probe::Incomplete(format!(
                 "the manifest names {}, not the row's backup",
@@ -1451,35 +1607,146 @@ async fn probe_manifest(store: StoreCalls<'_>, arn: &BackupArn) -> Result<Probe,
         }
     }
     let listed = store.list_sizes(&prefix).await?;
-    for file in &manifest.data_files {
-        match listed.get(&format!("{prefix}{}", file.key)) {
-            Some(size) if *size == file.bytes => {}
-            Some(size) => {
-                return Ok(Probe::Incomplete(format!(
-                    "data file {} has {size} bytes in the store and {} in the manifest",
-                    file.key, file.bytes
-                )));
-            }
-            None => {
-                return Ok(Probe::Incomplete(format!(
-                    "data file {} is not in the store",
-                    file.key
-                )));
-            }
-        }
+    if let Some(why) = missing_data_file(&manifest, &prefix, &listed) {
+        return Ok(Probe::Incomplete(why));
     }
-    let item_count = manifest
-        .data_files
-        .iter()
-        .map(|f| f.item_count)
-        .sum::<u64>();
     Ok(Probe::Complete(StatusFields {
         size_bytes: Some(manifest.backup_size_bytes),
-        item_count: Some(i64::try_from(item_count).unwrap_or(i64::MAX)),
+        item_count: Some(manifest_item_count(&manifest)),
         failure_reason: None,
         source_table_details_json: serde_json::to_value(&manifest.source_table).ok(),
         completed: true,
     }))
+}
+
+/// What [`verify_prefix`] found under a prefix.
+pub(super) enum Verified {
+    /// A manifest whose sidecar agrees, that the reader accepts, and whose
+    /// every data file is listed under the prefix at its recorded size.
+    Complete(Box<ExtenddbManifest>),
+    /// No manifest, or one without its sidecar or not matching it, or one
+    /// the reader refuses, or a data file missing or of another size; the
+    /// text says which.
+    Incomplete(String),
+}
+
+/// The checks a prefix must pass before anything reads it as a backup, in
+/// order: `extenddb-manifest.json` read within [`MANIFEST_READ_BOUND`], its
+/// sidecar within [`SIDECAR_READ_BOUND`], the sidecar's digest equal to the
+/// manifest's, the manifest accepted by
+/// [`ExtenddbManifest::from_json_bytes`] (which also checks that its ARN,
+/// `source_table` and creation instant agree), then every `data_files` key
+/// present under the prefix with its `bytes`. `listed` is the prefix's
+/// objects (key to size) when the caller already listed them (sync, which
+/// lists the whole root); `None` lists the prefix here. The manifest's ARN
+/// is the caller's to compare: the dead-owner duty requires the row's ARN,
+/// sync the listed path's components.
+///
+/// # Errors
+///
+/// A store error other than an absent object.
+pub(super) async fn verify_prefix(
+    store: StoreCalls<'_>,
+    prefix: &str,
+    listed: Option<&std::collections::HashMap<String, u64>>,
+) -> Result<Verified, StoreError> {
+    let manifest = match read_verified_manifest(store, prefix).await? {
+        Verified::Complete(manifest) => manifest,
+        incomplete @ Verified::Incomplete(_) => return Ok(incomplete),
+    };
+    let listed_here;
+    let listed = match listed {
+        Some(listed) => listed,
+        None => {
+            listed_here = store.list_sizes(prefix).await?;
+            &listed_here
+        }
+    };
+    Ok(match missing_data_file(&manifest, prefix, listed) {
+        Some(why) => Verified::Incomplete(why),
+        None => Verified::Complete(manifest),
+    })
+}
+
+/// The first three checks of [`verify_prefix`]: the manifest and its
+/// sidecar read within their bounds, the digest, the reader's acceptance.
+async fn read_verified_manifest(
+    store: StoreCalls<'_>,
+    prefix: &str,
+) -> Result<Verified, StoreError> {
+    let manifest = match store
+        .read_object(
+            &format!("{prefix}{EXTENDDB_MANIFEST_FILE}"),
+            MANIFEST_READ_BOUND,
+        )
+        .await?
+    {
+        ReadObject::Bytes(bytes) => bytes,
+        ReadObject::Absent => return Ok(Verified::Incomplete("no manifest".to_owned())),
+        ReadObject::Oversize => {
+            return Ok(Verified::Incomplete(format!(
+                "a manifest over {MANIFEST_READ_BOUND} bytes"
+            )));
+        }
+    };
+    let sidecar = match store
+        .read_object(
+            &format!("{prefix}{MANIFEST_CHECKSUM_FILE}"),
+            SIDECAR_READ_BOUND,
+        )
+        .await?
+    {
+        ReadObject::Bytes(bytes) => bytes,
+        ReadObject::Absent => {
+            return Ok(Verified::Incomplete(
+                "a manifest without its sidecar".to_owned(),
+            ));
+        }
+        ReadObject::Oversize => {
+            return Ok(Verified::Incomplete(format!(
+                "a sidecar over {SIDECAR_READ_BOUND} bytes"
+            )));
+        }
+    };
+    if let Err(e) = verify_manifest_checksum(&manifest, &sidecar) {
+        return Ok(Verified::Incomplete(format!(
+            "the sidecar does not match: {e}"
+        )));
+    }
+    Ok(match ExtenddbManifest::from_json_bytes(&manifest) {
+        Ok(manifest) => Verified::Complete(Box::new(manifest)),
+        Err(e) => Verified::Incomplete(format!("the manifest is refused: {e}")),
+    })
+}
+
+/// The first `data_files` entry `listed` lacks or holds at another size, as
+/// the reason a prefix is incomplete; `None` when every one is there.
+fn missing_data_file(
+    manifest: &ExtenddbManifest,
+    prefix: &str,
+    listed: &std::collections::HashMap<String, u64>,
+) -> Option<String> {
+    manifest
+        .data_files
+        .iter()
+        .find_map(|file| match listed.get(&format!("{prefix}{}", file.key)) {
+            Some(size) if *size == file.bytes => None,
+            Some(size) => Some(format!(
+                "data file {} has {size} bytes in the store and {} in the manifest",
+                file.key, file.bytes
+            )),
+            None => Some(format!("data file {} is not in the store", file.key)),
+        })
+}
+
+/// The manifest's item total, the sum over its data files.
+pub(super) fn manifest_item_count(manifest: &ExtenddbManifest) -> i64 {
+    let total = manifest
+        .data_files
+        .iter()
+        .map(|f| f.item_count)
+        .sum::<u64>();
+    i64::try_from(total).unwrap_or(i64::MAX)
 }
 
 /// The most bytes a manifest read collects: a manifest this server wrote is
@@ -1527,15 +1794,197 @@ pub(super) async fn read_object(
     Ok(ReadObject::Bytes(bytes))
 }
 
+/// How long one FAILED-prefix or DELETED-prefix deletion, or one tombstone
+/// removal, may run from the duty's read of the maintenance claim
+/// ([`Duty::fenced`]), counted from before that read was sent: a read
+/// answered after it starts nothing, the prefix deletion checks it inside
+/// the store before each removal (the filesystem walk before each entry,
+/// the S3 loop before each request: `delete_prefix_before`), and a call
+/// still running at it is dropped. The duty then stops for this cycle, the
+/// row left as it is for the next cycle to continue. It is the bound an S3
+/// store's calls run under ([`super::S3_CHECK_TIMEOUT`], the larger of the
+/// two kinds' bounds), so a deletion of an S3 prefix stopped at it is
+/// dropped before the SDK starts a retry of a request that stalled
+/// ([`extenddb_backup_store::S3_ATTEMPT_TIMEOUT`]). A maintenance command
+/// that removes FAILED or DELETED rows beside servers waits this bound plus
+/// one store call's after it takes the claim
+/// ([`super::store_maintenance::FORGET_WAIT`]), so what remains of a
+/// deletion a duty began before the claim when the command removes a row is
+/// the step in flight at the deadline (one removal, or one S3 request).
+/// The bound assumes the duty's process keeps running: one paused past the
+/// wait between its last check and a call already sent is outside it, as
+/// it is for every lease in the design.
+pub const DUTY_DELETION_BOUND: Duration = super::S3_CHECK_TIMEOUT;
+
+/// What the duties that delete a prefix or remove a tombstone act through:
+/// the catalog, the store's calls, the deletion fence each runs right
+/// before its deletion or removal, and the dead-owner window the
+/// maintenance claim is read with.
+struct Duty<'a, S: ?Sized> {
+    storage: &'a S,
+    store: StoreCalls<'a>,
+    fence: &'a StoreFence,
+    stale_job_after: Duration,
+}
+
+impl<S: ?Sized> Clone for Duty<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: ?Sized> Copy for Duty<'_, S> {}
+
+/// What [`Duty::fenced`] decided for one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fenced {
+    /// Act, ending by this instant.
+    Until(tokio::time::Instant),
+    /// Act on nothing for this row; the duty goes on to the next.
+    Skip,
+    /// The claim's read answered after the deadline: the duty stops for
+    /// this cycle.
+    OutOfTime,
+}
+
+/// What one deletion or removal of a duty came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acted {
+    /// The prefix was deleted, or the row removed.
+    Done,
+    /// Nothing was done for this row; the duty goes on to the next.
+    Skipped,
+    /// The call did not end within [`DUTY_DELETION_BOUND`]: the duty stops
+    /// for this cycle.
+    OutOfTime,
+}
+
+impl<S: BackupCatalog + ?Sized> Duty<'_, S> {
+    /// The fence before `row`'s deletion or removal, the row read once
+    /// more, then the maintenance claim read again: the instant the call
+    /// must end by ([`DUTY_DELETION_BOUND`] after the claim's read) when the
+    /// fence passed, the row is still of the status and the store the duty
+    /// listed it with, and no maintenance command holds the claim
+    /// ([`Fenced::Until`]); [`Fenced::OutOfTime`] when the claim's read
+    /// answered at or after that instant; [`Fenced::Skip`] otherwise, logged,
+    /// acting on nothing. The cycle reads the claim once,
+    /// at its start, so a duty that listed the row before a maintenance
+    /// command took the claim may reach its row after the command has
+    /// removed it (`backup sync --forget-backup`, `--forget-store`) or moved
+    /// it to another store (`--move-store`): the re-read skips a row that is
+    /// gone, of another status or of another store, and the claim's read
+    /// after it starts no deletion once a command holds the claim. A
+    /// deletion that read the claim free just before a command took it ends
+    /// by the bound ([`DUTY_DELETION_BOUND`], counted from before the read
+    /// was sent, so a read answered late starts nothing), and a command that
+    /// removes FAILED or DELETED rows waits the bound and one store call
+    /// before its first removal (`store_maintenance::FORGET_WAIT`). A failed
+    /// read is left for the next cycle.
+    async fn fenced(self, row: &BackupRow, status: &str, what: &str) -> Fenced {
+        if let Err(problem) = self.fence.check_catalog(self.storage).await {
+            tracing::error!(
+                "did not {what} of {status} backup {} (account {}): {problem}",
+                row.backup_arn,
+                row.account_id
+            );
+            return Fenced::Skip;
+        }
+        let arn = match BackupArn::parse(&row.backup_arn) {
+            Ok(arn) => arn,
+            Err(e) => {
+                tracing::error!(
+                    "did not {what} of {status} backup {}: its ARN does not parse: {e}",
+                    row.backup_arn
+                );
+                return Fenced::Skip;
+            }
+        };
+        match self.storage.read_backup_row(&arn).await {
+            Ok(Some(now)) if now.status == row.status && now.store == row.store => {}
+            Ok(Some(now)) => {
+                tracing::info!(
+                    "did not {what} of {status} backup {} (account {}): the row is now {} in \
+                     the {} store {} (store id {}); left to whoever changed it",
+                    row.backup_arn,
+                    row.account_id,
+                    now.status,
+                    now.store.store_kind,
+                    now.store.store_root,
+                    now.store.store_id
+                );
+                return Fenced::Skip;
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "did not {what} of {status} backup {} (account {}): the row is gone (removed \
+                     since the duty listed it); its objects are left",
+                    row.backup_arn,
+                    row.account_id
+                );
+                return Fenced::Skip;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "did not {what} of {status} backup {} (account {}): the row could not be read \
+                     again; the next cycle retries: {e}",
+                    row.backup_arn,
+                    row.account_id
+                );
+                return Fenced::Skip;
+            }
+        }
+        // The bound counts from before the claim's read: a command that
+        // takes the claim after the read was answered waits out the bound,
+        // and a read answered after it (a slow catalog) acts on nothing.
+        let deadline = tokio::time::Instant::now() + DUTY_DELETION_BOUND;
+        match self
+            .storage
+            .check_maintenance_claim(self.stale_job_after)
+            .await
+        {
+            Ok(false) if tokio::time::Instant::now() >= deadline => {
+                tracing::warn!(
+                    "did not {what} of {status} backup {} (account {}): the maintenance claim's \
+                     read answered after the {} s bound; the duty stops for this cycle and the \
+                     next cycle continues",
+                    row.backup_arn,
+                    row.account_id,
+                    DUTY_DELETION_BOUND.as_secs()
+                );
+                Fenced::OutOfTime
+            }
+            Ok(false) => Fenced::Until(deadline),
+            Ok(true) => {
+                tracing::info!(
+                    "did not {what} of {status} backup {} (account {}): a maintenance claim is \
+                     held now; the next cycle without one acts on it",
+                    row.backup_arn,
+                    row.account_id
+                );
+                Fenced::Skip
+            }
+            Err(e) => {
+                tracing::error!(
+                    "did not {what} of {status} backup {} (account {}): the maintenance claim \
+                     could not be read again; the next cycle retries: {e}",
+                    row.backup_arn,
+                    row.account_id
+                );
+                Fenced::Skip
+            }
+        }
+    }
+}
+
 /// The FAILED-prefix duty (module doc): FAILED rows whose heartbeat is older
 /// than `stale_job_after`, their prefix deleted while it lists objects.
 async fn delete_stale_failed_prefixes<S: BackupCatalog + ?Sized>(
-    storage: &S,
-    store: StoreCalls<'_>,
+    duty: Duty<'_, S>,
     identity: &StoreIdentity,
     stale_job_after: Duration,
 ) -> Result<Vec<String>, StorageError> {
-    let rows: Vec<BackupRow> = storage
+    let rows: Vec<BackupRow> = duty
+        .storage
         .list_backup_rows_older_than(
             BackupStatus::Failed,
             identity,
@@ -1546,8 +1995,10 @@ async fn delete_stale_failed_prefixes<S: BackupCatalog + ?Sized>(
         .await?;
     let mut deleted = Vec::new();
     for row in rows {
-        if delete_prefix_if_listed(store, &row, "FAILED").await {
-            deleted.push(row.backup_arn);
+        match delete_prefix_if_listed(duty, &row, "FAILED").await {
+            Acted::Done => deleted.push(row.backup_arn),
+            Acted::Skipped => {}
+            Acted::OutOfTime => break,
         }
     }
     Ok(deleted)
@@ -1556,26 +2007,35 @@ async fn delete_stale_failed_prefixes<S: BackupCatalog + ?Sized>(
 /// The DELETED-prefix duty (module doc): DELETED rows whose prefix still
 /// lists objects, the prefix deleted.
 async fn sweep_deleted_prefixes<S: BackupCatalog + ?Sized>(
-    storage: &S,
-    store: StoreCalls<'_>,
+    duty: Duty<'_, S>,
     identity: &StoreIdentity,
 ) -> Result<Vec<String>, StorageError> {
-    let rows: Vec<BackupRow> = storage
+    let rows: Vec<BackupRow> = duty
+        .storage
         .list_backup_rows(Some(BackupStatus::Deleted), identity)
         .try_collect()
         .await?;
     let mut swept = Vec::new();
     for row in rows {
-        if delete_prefix_if_listed(store, &row, "DELETED").await {
-            swept.push(row.backup_arn);
+        match delete_prefix_if_listed(duty, &row, "DELETED").await {
+            Acted::Done => swept.push(row.backup_arn),
+            Acted::Skipped => {}
+            Acted::OutOfTime => break,
         }
     }
     Ok(swept)
 }
 
-/// Delete `row`'s prefix when it lists objects; returns whether a deletion
-/// ran. A store failure is logged and left for the next cycle.
-async fn delete_prefix_if_listed(store: StoreCalls<'_>, row: &BackupRow, status: &str) -> bool {
+/// Delete `row`'s prefix when it lists objects, once [`Duty::fenced`]
+/// passed, within [`DUTY_DELETION_BOUND`]. A store failure or a refusal is
+/// logged and left for the next cycle; a deletion that outlasts the bound
+/// is dropped ([`Acted::OutOfTime`]).
+async fn delete_prefix_if_listed<S: BackupCatalog + ?Sized>(
+    duty: Duty<'_, S>,
+    row: &BackupRow,
+    status: &str,
+) -> Acted {
+    let store = duty.store;
     let prefix = match BackupArn::parse(&row.backup_arn) {
         Ok(arn) => arn.store_prefix(),
         Err(e) => {
@@ -1583,50 +2043,83 @@ async fn delete_prefix_if_listed(store: StoreCalls<'_>, row: &BackupRow, status:
                 "{status} row {} carries an ARN this build cannot parse; left as it is: {e}",
                 row.backup_arn
             );
-            return false;
+            return Acted::Skipped;
         }
     };
     match store.prefix_has_objects(&prefix).await {
         Ok(true) => {}
-        Ok(false) => return false,
+        Ok(false) => return Acted::Skipped,
         Err(e) => {
             tracing::error!(
                 "could not list the prefix of {status} backup {}; the next cycle retries: {e}",
                 row.backup_arn
             );
-            return false;
+            return Acted::Skipped;
         }
     }
-    match store.delete_prefix(&prefix).await {
-        Ok(n) => {
+    let deadline = match duty.fenced(row, status, "delete the prefix").await {
+        Fenced::Until(deadline) => deadline,
+        Fenced::Skip => return Acted::Skipped,
+        Fenced::OutOfTime => return Acted::OutOfTime,
+    };
+    // The store checks the deadline before each removal, so a call that
+    // resumes past it (a paused process) starts no other; the timeout ends
+    // a step that does not answer.
+    match tokio::time::timeout_at(deadline, store.delete_prefix_before(&prefix, deadline)).await {
+        Ok(Ok(done)) if done.finished => {
             tracing::info!(
-                "deleted {n} object(s) left under the prefix of {status} backup {} (account {})",
+                "deleted {} object(s) left under the prefix of {status} backup {} (account {})",
+                done.deleted,
                 row.backup_arn,
                 row.account_id
             );
-            true
+            Acted::Done
         }
-        Err(e) => {
+        Ok(Ok(done)) => {
+            tracing::warn!(
+                "the deletion of the prefix of {status} backup {} (account {}) reached its {} s \
+                 bound after {} object(s) and stopped; the duty stops for this cycle and the \
+                 next cycle continues",
+                row.backup_arn,
+                row.account_id,
+                DUTY_DELETION_BOUND.as_secs(),
+                done.deleted
+            );
+            Acted::OutOfTime
+        }
+        Ok(Err(e)) => {
             tracing::error!(
                 "could not delete the prefix of {status} backup {} (account {}); the next cycle \
                  retries: {e}",
                 row.backup_arn,
                 row.account_id
             );
-            false
+            Acted::Skipped
+        }
+        Err(_) => {
+            tracing::warn!(
+                "the deletion of the prefix of {status} backup {} (account {}) did not end \
+                 within {} s and was stopped; the duty stops for this cycle and the next cycle \
+                 continues",
+                row.backup_arn,
+                row.account_id,
+                DUTY_DELETION_BOUND.as_secs()
+            );
+            Acted::OutOfTime
         }
     }
 }
 
 /// The tombstone duty (module doc): FAILED and DELETED rows whose
 /// `completed_at` is older than `retention` and whose prefix lists nothing
-/// are removed.
+/// are removed, each removal within [`DUTY_DELETION_BOUND`] of the claim's
+/// read; one that outlasts it stops the duty for this cycle.
 async fn remove_tombstones<S: BackupCatalog + ?Sized>(
-    storage: &S,
-    store: StoreCalls<'_>,
+    duty: Duty<'_, S>,
     identity: &StoreIdentity,
     retention: Duration,
 ) -> Result<Vec<String>, StorageError> {
+    let Duty { storage, store, .. } = duty;
     let mut removed = Vec::new();
     for status in [BackupStatus::Failed, BackupStatus::Deleted] {
         let rows: Vec<BackupRow> = storage
@@ -1657,8 +2150,24 @@ async fn remove_tombstones<S: BackupCatalog + ?Sized>(
                     continue;
                 }
             }
-            match storage.remove_backup_row(&row.key()).await {
-                Ok(true) => {
+            // The empty listing is a fact about this catalog's root only
+            // while the root is this catalog's.
+            let deadline = match duty
+                .fenced(&row, &status.to_string(), "remove the row")
+                .await
+            {
+                Fenced::Until(deadline) => deadline,
+                Fenced::Skip => continue,
+                Fenced::OutOfTime => return Ok(removed),
+            };
+            // Conditioned on the store the duty listed the row with: a row
+            // `--move-store` moved since is the configured store's to
+            // finish.
+            let key = row.key();
+            let removal =
+                storage.remove_backup_row(&key, row.store.store_kind, &row.store.store_root);
+            match tokio::time::timeout_at(deadline, removal).await {
+                Ok(Ok(true)) => {
                     tracing::info!(
                         "removed the {status} row of backup {} (account {}): its prefix is empty \
                          and its retention has passed",
@@ -1667,13 +2176,24 @@ async fn remove_tombstones<S: BackupCatalog + ?Sized>(
                     );
                     removed.push(row.backup_arn);
                 }
-                Ok(false) => {}
-                Err(e) => tracing::error!(
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => tracing::error!(
                     "could not remove the {status} row of backup {} (account {}); the next cycle \
                      retries: {e}",
                     row.backup_arn,
                     row.account_id
                 ),
+                Err(_) => {
+                    tracing::warn!(
+                        "the removal of the {status} row of backup {} (account {}) did not end \
+                         within {} s and was stopped; the duty stops for this cycle and the next \
+                         cycle continues",
+                        row.backup_arn,
+                        row.account_id,
+                        DUTY_DELETION_BOUND.as_secs()
+                    );
+                    return Ok(removed);
+                }
             }
         }
     }
@@ -1686,6 +2206,7 @@ async fn remove_tombstones<S: BackupCatalog + ?Sized>(
 async fn finish_deleting_rows<S: BackupCatalog + ?Sized>(
     storage: &S,
     store: &super::ConfiguredStore,
+    fence: &StoreFence,
     identity: &extenddb_storage::backup_catalog::StoreIdentity,
 ) -> Result<Vec<String>, StorageError> {
     let rows: Vec<_> = storage
@@ -1704,7 +2225,7 @@ async fn finish_deleting_rows<S: BackupCatalog + ?Sized>(
                 continue;
             }
         };
-        match super::finish_backup_delete(storage, &store.calls("deletion"), &arn).await {
+        match super::finish_backup_delete(storage, &store.calls("deletion"), fence, &arn).await {
             Ok(true) => {
                 tracing::info!(
                     "finished the deletion of backup {} (account {})",

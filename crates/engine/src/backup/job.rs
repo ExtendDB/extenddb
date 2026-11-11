@@ -7,17 +7,23 @@
 //! The task ([`start`]) opens the table snapshot, mints the backup id from
 //! the millisecond the open returned, reads the table's TTL, builds the
 //! manifest's `source_table` from the snapshot's description
-//! ([`source_table_schema`]), inserts the CREATING row under the job's
-//! claim (`claim_backup`), answers the request through a one-shot channel
+//! ([`source_table_schema`]), runs the deletion fence (a root another
+//! catalog adopted since the store's last check is refused before the row,
+//! `StoreFence`; a fence read that recorded a problem answers the
+//! unhealthy-store refusal, one that failed in transport an internal
+//! error), inserts the CREATING row under the job's claim
+//! (`claim_backup`), answers the request through a one-shot channel
 //! (`BackupDetails` CREATING, or the refusal) and then goes on as the job
 //! ([`run`]) with the same owned values: nothing crosses a thread or a
 //! channel between the request and the job but the response (the
 //! pipeline's item and chunk channels are the job's own), and a client that
 //! disconnects mid-request cannot leave a row whose owner was never
 //! spawned. The maintenance claim is checked by the request before the
-//! permit, as the in-catalog paths check it, so a held claim refuses the
-//! request and inserts no row (a FAILED row written for the refusal was
-//! counted by `backup purge`'s wait as a live job for the stale window).
+//! permit, as the in-catalog paths check it, and again immediately before
+//! `claim_backup`, so a held claim refuses the request and inserts no row
+//! (a FAILED row written for the refusal was counted by `backup purge`'s
+//! wait as a live job for the stale window), and a claim taken while the
+//! open waited (on a lock the table holds, say) refuses it too.
 //! The open and the insert are selected against the shutdown token, so a
 //! server that is stopping neither waits on an open the table's lock holds
 //! nor inserts a row it would fail at once. The `ServiceUnavailable` that
@@ -29,7 +35,11 @@
 //! `CreateBackup` waiting in the open: its connection closed 8.2 s after it
 //! was sent), so there the refusal's effect is the row not written.
 //!
-//! The job: the data files through the pipeline ([`writer`]), then the
+//! The job: the fence once more, right before the first put (a root
+//! adopted between the request's read and the job's first write gets no
+//! object of this job's; the refusal fails the row with the fence's reason
+//! and makes no store write), the data files through the pipeline
+//! ([`writer`]), then the
 //! three documents `BackupDocuments::build` returns in its order, a re-check
 //! of the claim, the manifest (the commit record), and the AVAILABLE write
 //! with the size, the count and the manifest's `source_table`
@@ -47,7 +57,7 @@
 //! period, ends the job with no further store or catalog access. Any other
 //! failure, and the shutdown token (reason `shutdown`), runs the failure
 //! path ([`failure::fail_row`]): FAILED, then the prefix's deletion only
-//! when that write matched.
+//! when that write matched and the fence passed.
 //!
 //! Each job records `BackupJobs` and `BackupJobDuration` (microseconds,
 //! from the snapshot's open to the end of its last catalog or store call:
@@ -93,8 +103,8 @@ use extenddb_storage::{
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool};
-use super::{create_backup_storage_err_to_dynamo, storage_err_to_dynamo};
+use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool, StoreFence};
+use super::{create_backup_storage_err_to_dynamo, maintenance_held, storage_err_to_dynamo};
 use failure::{FailurePath, Written};
 use heartbeat::{HeartbeatHandle, HeartbeatMetric};
 use writer::{DataFiles, Pipeline, Stop};
@@ -115,6 +125,10 @@ pub(crate) const SHUTDOWN: &str = "shutdown";
 pub(crate) struct JobEnv {
     pub configured: Arc<ConfiguredStore>,
     pub store: Arc<dyn BackupStore>,
+    /// The store's deletion fence, which CreateBackup runs before its row,
+    /// the job right before its first put and the failure path before its
+    /// deletion.
+    pub fence: StoreFence,
     pub identity: StoreIdentity,
     pub bucket: String,
     pub key_prefix: String,
@@ -144,6 +158,7 @@ impl JobEnv {
         Ok(Self {
             configured: Arc::clone(store),
             store: Arc::clone(&store.store),
+            fence: store.fence(),
             identity,
             bucket: store.bucket.clone(),
             key_prefix: store.key_prefix.clone(),
@@ -210,6 +225,9 @@ pub(crate) struct Job {
     key_order: Option<KeyOrder>,
     limits: RestorableLimits,
     env: JobEnv,
+    /// This instance's catalog id, which the fence before the first put and
+    /// the failure path's fence compare the identity file with.
+    catalog_id: String,
     /// The id's instant, the row's `created_at`.
     created_at: f64,
     started: Instant,
@@ -319,6 +337,41 @@ where
         owner_generation: UNOWNED_GENERATION,
         heartbeat_at: 0.0,
     };
+    // The fence before the row: a root another catalog adopted since the
+    // store's last check gets no row from this catalog, and the store is
+    // marked unhealthy. A read that recorded a problem (the file names
+    // another catalog, is missing, or cannot be served) answers as the
+    // unhealthy store the next request meets; only a read that failed in
+    // transport, which recorded nothing, answers as a failed store call.
+    // The job runs the fence again right before its first put.
+    let catalog_id = env
+        .fence
+        .catalog_id(storage)
+        .await
+        .map_err(|e| internal(&format!("the catalog id could not be read: {e}")))?;
+    if let Err(problem) = env.fence.check(&catalog_id).await {
+        return Err(env.fence.refusal().unwrap_or_else(|| {
+            internal(&format!(
+                "{table_name}: the store's identity file could not be read before the row: \
+                 {problem}"
+            ))
+        }));
+    }
+    // The maintenance claim once more, immediately before the insert: the
+    // request's check ran before the open, the TTL read and the fence, any
+    // of which can wait (an open behind the table's lock), and a command
+    // that took the claim since gets no row of this job. A claim taken
+    // between this read and the insert is not seen: the CREATING row lands
+    // under the claim, where the command's wait lists it, the move's re-list
+    // of the old root reports it, or (an insert after that re-list) the
+    // move's closing report of other stores or a later plain sync does.
+    if storage
+        .check_maintenance_claim(env.settings.stale_job_after)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return Err(maintenance_held());
+    }
     let claimed_at = Instant::now();
     // The insert too is selected against the token: a server that is
     // stopping inserts no row it would have to fail at once.
@@ -346,6 +399,7 @@ where
         key_order,
         limits: *limits,
         env: env.clone(),
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -395,6 +449,7 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         key_order,
         limits,
         env,
+        catalog_id,
         created_at,
         started,
         claimed_at,
@@ -439,31 +494,40 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
     };
     let tracker = key_order.as_ref().map(KeyRangeTracker::new);
     let mut item_count = 0;
-    let end = match writer::write_data_files(&pipeline, items, key_schema, limits, tracker).await {
-        Ok(files) => {
-            item_count = files.item_count;
-            // Both figures are the stream's: the items written and their
-            // DynamoDB sizes summed, not the statistics pass's (which can
-            // be stale, or 0 on a fresh table).
-            source_table.item_count = i64::try_from(files.item_count).unwrap_or(i64::MAX);
-            source_table.table_size_bytes = i64::try_from(files.item_bytes).unwrap_or(i64::MAX);
-            let header = ManifestHeader {
-                backup_arn: arn.clone(),
-                backup_name,
-                source_backend: env.source_backend.clone(),
-                source_extenddb_version: env.source_extenddb_version.clone(),
-                snapshot: info,
-                item_order: if key_order.is_some() {
-                    ItemOrder::KeyOrdered
-                } else {
-                    ItemOrder::Unordered
-                },
-                source_table,
-            };
-            write_documents(&pipeline, &claim, header, files).await
-        }
-        Err(stop) => Err(stop),
-    };
+    let end = async {
+        // The fence right before the first put (`StoreFence`'s doc): the
+        // request's read was before the row, and a root another catalog
+        // adopted since gets no object of this job's. The refusal, recorded
+        // or not, fails the row with no store write.
+        env.fence.check(&catalog_id).await.map_err(|problem| {
+            Stop::StoreUnhealthy(format!(
+                "the store's identity file was re-read before the first write and refused \
+                     it ({problem}); no object was written"
+            ))
+        })?;
+        let files = writer::write_data_files(&pipeline, items, key_schema, limits, tracker).await?;
+        item_count = files.item_count;
+        // Both figures are the stream's: the items written and their
+        // DynamoDB sizes summed, not the statistics pass's (which can
+        // be stale, or 0 on a fresh table).
+        source_table.item_count = i64::try_from(files.item_count).unwrap_or(i64::MAX);
+        source_table.table_size_bytes = i64::try_from(files.item_bytes).unwrap_or(i64::MAX);
+        let header = ManifestHeader {
+            backup_arn: arn.clone(),
+            backup_name,
+            source_backend: env.source_backend.clone(),
+            source_extenddb_version: env.source_extenddb_version.clone(),
+            snapshot: info,
+            item_order: if key_order.is_some() {
+                ItemOrder::KeyOrdered
+            } else {
+                ItemOrder::Unordered
+            },
+            source_table,
+        };
+        write_documents(&pipeline, &claim, header, files).await
+    }
+    .await;
     let (outcome, bytes) = match end {
         Ok(bytes) => {
             tracing::info!(
@@ -480,14 +544,15 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
             (BackupJobOutcome::Failed, 0)
         }
         Err(Stop::StoreUnhealthy(reason)) => {
-            // The store is not to be called: FAILED with the store's reason,
-            // the prefix left to the FAILED-prefix duty once the store is
-            // healthy again.
+            // The store is not to be written: FAILED with the store's
+            // reason, the prefix left to the FAILED-prefix duty once the
+            // store is healthy again.
             fail_without_store_access(&*claim, &arn, &reason).await;
             tracing::error!(
-                "backup {arn_text}: FAILED ({reason}); no store call was made and its objects \
-                 are deleted by the reconciler once the store's check passes and the row's \
-                 heartbeat is stale"
+                "backup {arn_text}: FAILED ({reason}); no store write was made and its objects, \
+                 if any, are deleted by the reconciler once the store's check passes and the \
+                 row's heartbeat is stale (never, while another catalog has adopted the root: \
+                 the objects then stay under it)"
             );
             (BackupJobOutcome::Failed, 0)
         }
@@ -497,9 +562,22 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
                 Stop::Fail(reason) => (reason, BackupJobOutcome::Failed),
                 Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) => unreachable!("matched above"),
             };
-            match failure::fail_row(&*claim, &*env.store, &prefix, &reason, metrics).await {
+            match failure::fail_row(
+                &*claim,
+                &*env.store,
+                &env.fence,
+                &catalog_id,
+                &prefix,
+                &reason,
+                metrics,
+            )
+            .await
+            {
                 FailurePath::Deleted => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects were deleted"
+                ),
+                FailurePath::Fenced(why) => tracing::error!(
+                    "backup {arn_text}: FAILED ({reason}); its objects were not deleted: {why}"
                 ),
                 FailurePath::DeleteFailed(e) => tracing::error!(
                     "backup {arn_text}: FAILED ({reason}); its objects could not be deleted and \
