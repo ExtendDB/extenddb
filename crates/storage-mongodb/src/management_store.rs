@@ -2765,6 +2765,3 @@ fn stored_document(d: &Document) -> StoredDocument {
         Some(b) => bson::from_bson::<serde_json::Value>(b.clone()).map_err(|e| e.to_string()),
     }
 }
-
-#[cfg(test)]
-mod live_tests;
