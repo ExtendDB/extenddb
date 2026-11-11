@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unicode decimal digits (general category `Nd`) folded to ASCII for the
-//! request-time number check.
+//! Unicode decimal digits (general category `Nd`) in the Basic Multilingual
+//! Plane, folded to ASCII for the request-time number check.
 //!
 //! Measured 2026-10-25 (us-east-1, each request twice): the service reads a
 //! fullwidth, Arabic-Indic or Devanagari digit in an `N` value as the digit it
@@ -10,34 +10,37 @@
 //! digits in a Number`), and refuses a superscript (`\u{b2}`), a vulgar
 //! fraction (`\u{bd}`), a fullwidth minus (`\u{ff0d}`) and a fullwidth full
 //! stop (`\u{ff0e}`) with `The parameter cannot be converted to a numeric
-//! value: <value>`. The accepted characters are exactly those of category `Nd`;
-//! the refused ones are `No` or `Pd` and `Po`.
+//! value: <value>`. The refused ones are `No` or `Pd` and `Po`.
+//!
+//! The service accepts a category `Nd` digit only below U+10000 (measured
+//! 2026-11-11, each request twice): digit one of each of the 37 `Nd` runs up
+//! to U+FF10 is accepted as a `FilterExpression` value, and digit one of each
+//! of the 31 runs from U+104A0 up answers `The parameter cannot be converted to
+//! a numeric value: <value>`.
 //!
 //! Every `Nd` run in Unicode 15.0 is ten consecutive code points starting at
-//! its zero, so the table below holds the 68 zeros (generated with Python's
-//! `unicodedata`, Unicode 15.0.0) and a digit's value is its offset from the
-//! run's zero.
+//! its zero, so the table below holds the 37 zeros below U+10000 (generated
+//! with Python's `unicodedata`, Unicode 15.0.0) and a digit's value is its
+//! offset from the run's zero.
 //!
-//! The fold applies to the check only. The handler and the server's
-//! `dynamodb:LeadingKeys` binding read the value as the request wrote it, so
-//! both see the same text; reading a Unicode digit as the digit has to change
-//! both together.
+//! The fold applies to the check and the text of its refusal only. The handler
+//! and the server's `dynamodb:LeadingKeys` binding read the value as the
+//! request wrote it, so both see the same text; reading a Unicode digit as the
+//! digit has to change both together.
 
 use std::borrow::Cow;
 
-/// The zero of every `Nd` run in Unicode 15.0, ascending.
-const ND_ZEROS: [u32; 68] = [
+/// The zero of every `Nd` run in Unicode 15.0 below U+10000, ascending.
+const ND_ZEROS: [u32; 37] = [
     0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
     0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
     0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
-    0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
-    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60,
-    0x16AC0, 0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0,
-    0x1E950, 0x1FBF0,
+    0xFF10,
 ];
 
 /// The ASCII digit `c` stands for when `c` is a Unicode decimal digit
-/// (general category `Nd`), or `None` for every other character.
+/// (general category `Nd`) below U+10000, or `None` for every other
+/// character.
 pub(crate) fn ascii_digit(c: char) -> Option<char> {
     let cp = u32::from(c);
     // The zero of the run that could hold `cp`: the last zero at or below it.
@@ -91,10 +94,26 @@ mod tests {
         assert_eq!(ascii_digit('a'), None);
         assert_eq!(ascii_digit('.'), None);
         assert_eq!(ascii_digit('e'), None);
-        assert_eq!(ascii_digit('\u{1FBF9}'), Some('9'));
-        assert_eq!(ascii_digit('\u{1FBFA}'), None);
         assert_eq!(ascii_digit(char::MAX), None);
         assert_eq!(ascii_digit('\u{0}'), None);
+    }
+
+    #[test]
+    fn digits_from_u_104a0_up_are_not_folded() {
+        // Measured 2026-11-11: digit one of each run from U+104A0 up is refused,
+        // and digit one of the last run below U+10000 is accepted.
+        for c in [
+            '\u{104A1}',
+            '\u{11067}',
+            '\u{1D7CF}',
+            '\u{1D7F7}',
+            '\u{1E951}',
+            '\u{1FBF1}',
+        ] {
+            assert_eq!(ascii_digit(c), None, "{c:?}");
+        }
+        assert_eq!(ascii_digit('\u{ABF1}'), Some('1'));
+        assert_eq!(fold_decimal_digits("\u{ff11}\u{1D7CF}"), "1\u{1D7CF}");
     }
 
     #[test]

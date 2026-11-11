@@ -9,20 +9,22 @@ value: <value>``) or when a key condition value's type is not the key
 attribute's ``AttributeDefinitions`` type (``One or more parameter values were
 invalid: Condition parameter type does not match schema type``). Every expected
 answer below was measured against the service on 2026-10-24 (15:10, 21:00,
-21:06 and 23:42 UTC), 2026-10-25 (11:31 UTC) and 2026-11-06 (the begins_with
-rows after b20) on tables with S/S, S/N and B/B keys, a GSI and an LSI. A
-Unicode decimal digit in an N value counts as the digit it stands for; a field
-of the wrong JSON type anywhere in the body answers SerializationException
-ahead of every check.
+21:06 and 23:42 UTC), 2026-10-25 (11:31 UTC), 2026-11-06 (the begins_with
+rows after b20) and 2026-11-11 (rows b48 to b50, f8, f9, g9 and g10, and the
+digit runs) on tables with S/S, S/N and B/B keys, a GSI, an LSI and a GSI with
+two HASH attributes. A Unicode decimal digit below U+10000 in an N value counts
+as the digit it stands for.
 The rows also pin where the two checks fall against the other Query checks:
-the numeric check after Limit, the expression parameter mix check and the
-ReturnConsumedCapacity enum, and before the Select enum and the table lookup;
-the type check after the key schema, filter, projection, unused value and
-Select checks and before the ExclusiveStartKey check.
+the numeric check after Limit, the ReturnConsumedCapacity enum and the
+expression parameter mix check, and before the Select enum and the table
+lookup; the type check after the key schema, filter, projection, unused value
+and Select checks and before the ExclusiveStartKey check.
 
 Dual-target: runs against the service and against extenddb with the same
-assertions. The LeadingKeys class needs the extenddb management API and is
-skipped against the service.
+assertions. test_query_value_shapes.py holds the bodies of the wrong JSON
+shape and the values the service cannot read as one type, and
+test_query_leading_keys_values.py the LeadingKeys fences, which need the
+extenddb management API.
 
 Run:
   EXTENDDB_TEST_ENDPOINT=https://localhost:18443 \\
@@ -32,16 +34,10 @@ Run:
 
 from __future__ import annotations
 
-import os
-import uuid
-from typing import Any
-
-import boto3
 import pytest
-from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import scoped_table, wait_for_active
+from conftest import scoped_table
 
 NUMERIC = "The parameter cannot be converted to a numeric value: "
 TYPE_MISMATCH = (
@@ -144,6 +140,31 @@ def bb_table(dynamodb_client):
         yield name
 
 
+@pytest.fixture(scope="module")
+def mp_table(dynamodb_client):
+    """pk S; GSI mpi with HASH h1 S and h2 N, RANGE r S."""
+    with scoped_table(
+        dynamodb_client,
+        attribute_definitions=[
+            {"AttributeName": "pk", **S},
+            {"AttributeName": "h1", **S},
+            {"AttributeName": "h2", "AttributeType": "N"},
+            {"AttributeName": "r", **S},
+        ],
+        key_schema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "mpi",
+            "KeySchema": [
+                {"AttributeName": "h1", "KeyType": "HASH"},
+                {"AttributeName": "h2", "KeyType": "HASH"},
+                {"AttributeName": "r", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }],
+    ) as name:
+        yield name
+
+
 NB = {"N": "bob"}
 N5 = {"N": "5"}
 SX = {"S": "x"}
@@ -207,6 +228,32 @@ RCC_MSG = (
 )
 V = "ValidationException"
 RNF = "ResourceNotFoundException"
+LEGACY_PK_N5 = {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [N5]}}
+MISSED_R = "Query condition missed key schema element: r"
+# Digit one of every decimal digit (category Nd) run in Unicode 15.0: the
+# service accepts the 36 runs below U+10000 outside ASCII and refuses the 31
+# runs from U+104A0 up (measured 2026-11-11, each twice).
+BMP_ONES = [chr(zero + 1) for zero in (
+    0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0,
+    0x1A80, 0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0,
+    0xAA50, 0xABF0, 0xFF10)]
+HIGH_ONES = [chr(zero + 1) for zero in (
+    0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0, 0x11650,
+    0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60, 0x16AC0,
+    0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E950,
+    0x1FBF0)]
+# A refused value is echoed with each decimal digit below U+10000 folded.
+FOLDED_ECHOES = [
+    ("\uff11bob", "1bob"), ("\u0661\u0662x", "12x"), ("bob\uff11", "bob1"),
+    ("\u0967\u0968a\u0969", "12a3"), ("\uff11\U0001d7cf", "1\U0001d7cf"),
+]
+MIXES = {
+    "AttributesToGet": {"AttributesToGet": ["a"]},
+    "QueryFilter": {"QueryFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": [SX]}}},
+    "ConditionalOperator": {"ConditionalOperator": "AND"},
+    "KeyConditions": {"KeyConditions": LEGACY_PK},
+}
 
 
 def kce(expr, values, **extra):
@@ -433,6 +480,36 @@ ROWS = [
     ("pk = BOOL", "ss", kce("pk = :u", {":u": {"BOOL": True}}), V, TYPE_MISMATCH),
     ("pk = N bob AND pk > S alice", "ss",
      kce("pk = :u AND pk > :v", {":u": NB, ":v": {"S": "alice"}}), V, NUMERIC + "bob"),
+    # An invalid ReturnConsumedCapacity is reported ahead of each
+    # non-expression parameter beside KeyConditionExpression, and the mix
+    # ahead of the numbers (measured 2026-11-11).
+    *[(f"f8 invalid ReturnConsumedCapacity with {name}", "ss",
+       kce("pk = :u", {":u": NB}, ReturnConsumedCapacity="bad", **extra), V, RCC_MSG)
+      for name, extra in MIXES.items()],
+    *[(f"f9 {name} with N bob", "ss", kce("pk = :u", {":u": NB}, **extra), V,
+       "Can not use both expression and non-expression parameters in the same request: "
+       f"Non-expression parameters: {{{name}}} Expression parameters: {{KeyConditionExpression}}")
+      for name, extra in MIXES.items() if name != "KeyConditions"],
+    # A refused value is echoed with its decimal digits folded to ASCII, and a
+    # digit from U+104A0 up is not a digit (measured 2026-11-11).
+    *[(f"g9 {raw!r} echoed with ASCII digits", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": raw}}),
+       V, NUMERIC + echo)
+      for raw, echo in FOLDED_ECHOES],
+    *[(f"g10 U+{ord(one):X} in filter", "ns",
+       kce("pk = :u AND sk = :s", {":u": CAROL, ":s": {"N": "1"}, ":f": {"N": one}},
+           FilterExpression="a = :f"), V, NUMERIC + one)
+      for one in HIGH_ONES],
+    # Legacy KeyConditions, and a key schema with two HASH attributes, where
+    # the type is reported ahead of the clause on a non-key attribute
+    # (measured 2026-11-11).
+    ("b48 legacy KeyConditions pk EQ N 5", "ss", {"KeyConditions": LEGACY_PK_N5}, V, TYPE_MISMATCH),
+    ("b49 two HASH attributes, h2 = S beside a non-key clause", "mp",
+     kce("h1 = :a AND h2 = :b AND z = :c", {":a": SX, ":b": {"S": "1"}, ":c": SX},
+         IndexName="mpi"), V, TYPE_MISMATCH),
+    ("b50 two HASH attributes, h2 = N beside a non-key clause", "mp",
+     kce("h1 = :a AND h2 = :b AND z = :c", {":a": SX, ":b": {"N": "1"}, ":c": SX},
+         IndexName="mpi"), V, MISSED_R),
 ]
 
 
@@ -440,8 +517,8 @@ class TestKeyConditionValueTypes:
     """Each row: a Query and the service's answer."""
 
     @pytest.fixture
-    def tables(self, ss_table, ns_table, bb_table):
-        return {"ss": ss_table, "ns": ns_table, "bb": bb_table, "missing": MISSING}
+    def tables(self, ss_table, ns_table, bb_table, mp_table):
+        return {"ss": ss_table, "ns": ns_table, "bb": bb_table, "mp": mp_table, "missing": MISSING}
 
     @pytest.mark.parametrize("row,table,kwargs,code,expected", ROWS, ids=[r[0] for r in ROWS])
     def test_rows(self, dynamodb_client_no_validation, tables, row, table, kwargs, code, expected):
@@ -500,216 +577,10 @@ class TestUnicodeDecimalDigitsPassTheCheck:
             ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"NS": [FW_ONE]}})
         assert (resp["Count"], resp["ScannedCount"]) == (0, 1)
 
-
-def _raw_query(client, body: dict):
-    """POST ``body`` as the Query JSON exactly as written, signed with the
-    client's credentials, so a field of the wrong JSON type reaches the server
-    (boto3 would refuse or reshape it)."""
-    import json
-
-    from botocore.awsrequest import AWSRequest
-
-    req = AWSRequest(method="POST", url=client.meta.endpoint_url, data=json.dumps(body),
-                     headers={"Content-Type": "application/x-amz-json-1.0",
-                              "X-Amz-Target": "DynamoDB_20120810.Query"})
-    client._request_signer.sign("Query", req)
-    resp = client._endpoint.http_session.send(req.prepare())
-    return resp.status_code, json.loads(resp.content.decode("utf-8", "replace") or "{}")
-
-
-SHAPE_FAULTS = [
-    ("Limit 0 with ExpressionAttributeValues string",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0, "ExpressionAttributeValues": "x"}),
-    ("ExpressionAttributeNames string with N bob",
-     {"KeyConditionExpression": "pk = :p", "ExpressionAttributeNames": "x",
-      "ExpressionAttributeValues": {":p": NB}}),
-    ("Limit string with N bob",
-     {"KeyConditionExpression": "pk = :p", "Limit": "1", "ExpressionAttributeValues": {":p": NB}}),
-    ("AttributesToGet object with ProjectionExpression",
-     {"KeyConditionExpression": "pk = :p", "AttributesToGet": {"a": 1}, "ProjectionExpression": "a",
-      "ExpressionAttributeValues": {":p": SX}}),
-    ("QueryFilter array with FilterExpression",
-     {"KeyConditionExpression": "pk = :p", "QueryFilter": [1], "FilterExpression": "a = :p",
-      "ExpressionAttributeValues": {":p": SX}}),
-    ("Select number with N bob",
-     {"KeyConditionExpression": "pk = :p", "Select": 5, "ExpressionAttributeValues": {":p": NB}}),
-    ("Limit 0 with Select number",
-     {"KeyConditionExpression": "pk = :p", "Limit": 0, "Select": 5,
-      "ExpressionAttributeValues": {":p": SX}}),
-]
-
-
-class TestShapeFaultsAreReportedFirst:
-    """A field of the wrong JSON type anywhere in the body answers
-    SerializationException ahead of the Limit, parameter mix, enum and number
-    checks (measured 2026-10-25 11:31 UTC). The message texts differ between
-    the service and extenddb, so only the error type is asserted."""
-
-    @pytest.mark.parametrize("row,body", SHAPE_FAULTS, ids=[r[0] for r in SHAPE_FAULTS])
-    def test_rows(self, dynamodb_client, ss_table, row, body):
-        status, payload = _raw_query(dynamodb_client, {"TableName": ss_table, **body})
-        assert status == 400
-        assert payload.get("__type", "").endswith("SerializationException"), payload
-
-    def test_control_without_a_shape_fault_answers_the_check(self, dynamodb_client, ss_table):
-        status, payload = _raw_query(dynamodb_client, {
-            "TableName": ss_table, "KeyConditionExpression": "pk = :p", "Limit": 0,
-            "ExpressionAttributeValues": {":p": NB}})
-        assert status == 400
-        assert payload.get("__type", "").endswith("ValidationException")
-        assert payload.get("message", payload.get("Message")) == LIMIT_MSG
-
-
-class TestLeadingKeysWithAnInvalidKeyValue:
-    """A principal under each LeadingKeys fence form gets ValidationException and
-    no items for a Query whose ExpressionAttributeValues carries an N value that
-    is not a number, whether the key condition, the filter or nothing reads it.
-
-    extenddb only: the fences need users created through the management API."""
-
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
-        admin_user = os.environ.get("EXTENDDB_ADMIN_USER", "").strip()
-        admin_pass = os.environ.get("EXTENDDB_ADMIN_PASSWORD", "").strip()
-        if not endpoint:
-            pytest.skip("LeadingKeys fences need the extenddb management API")
-        if not admin_user or not admin_pass:
-            pytest.fail("MISCONFIGURED: EXTENDDB_ADMIN_USER and EXTENDDB_ADMIN_PASSWORD are required")
-        from management_helpers import ManagementClient
-
-        self.endpoint = endpoint
-        self.region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-        self.mgmt = ManagementClient(endpoint, admin_user, admin_pass)
-        self.account_id = f"{uuid.uuid4().int % 10**12:012d}"
-        resp = self.mgmt.create_account(self.account_id, f"kv-test-{self.account_id}")
-        assert resp.status_code == 201, resp.text
-        self._users: list[str] = []
-        yield
-        for u in self._users:
-            try:
-                self.mgmt.delete_user(self.account_id, u)
-            except Exception:
-                pass
-        self.mgmt.delete_account(self.account_id)
-
-    def _client(self, policy: dict | None) -> Any:
-        name = f"kv-{uuid.uuid4().hex[:8]}"
-        resp = self.mgmt.create_user(self.account_id, name, "TestPass123!")
-        assert resp.status_code == 201, resp.text
-        self._users.append(name)
-        resp = self.mgmt.create_access_key(self.account_id, name)
-        assert resp.status_code == 201, resp.text
-        creds = resp.json()
-        if policy is not None:
-            resp = self.mgmt.put_user_policy(self.account_id, name, "p", policy)
-            assert resp.status_code == 204, resp.text
-        return boto3.client(
-            "dynamodb", endpoint_url=self.endpoint, region_name=self.region,
-            aws_access_key_id=creds["access_key_id"],
-            aws_secret_access_key=creds["secret_access_key"],
-            verify=False,
-            config=BotoConfig(retries={"max_attempts": 0}, parameter_validation=False))
-
-    def _fence(self, condition: dict, table: str) -> dict:
-        arn = f"arn:aws:dynamodb:{self.region}:{self.account_id}:table/{table}"
-        return {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Action": "dynamodb:*",
-                "Resource": [arn, arn + "/index/*"],
-                "Condition": condition,
-            }],
-        }
-
-    def test_every_fence_form_gets_validation_exception_and_no_items(self):
-        owner = self._client({
-            "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
-        })
-        table = f"kv-{uuid.uuid4().hex[:8]}"
-        owner.create_table(
-            TableName=table,
-            AttributeDefinitions=[{"AttributeName": "pk", **S}],
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-            BillingMode="PAY_PER_REQUEST")
-        wait_for_active(owner, table)
-        for pk in ("alice", "bob"):
-            owner.put_item(TableName=table, Item={"pk": {"S": pk}})
-
-        fences = {
-            "ForAllValues": {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}},
-            "ForAnyValue": {"ForAnyValue:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}},
-            "Null false": {"Null": {"dynamodb:LeadingKeys": "false"},
-                           "ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["alice"]}},
-            "StringEquals": {"StringEquals": {"dynamodb:LeadingKeys": "alice"}},
-            "StringLike": {"StringLike": {"dynamodb:LeadingKeys": "ali*"}},
-            "StringNotEquals": {"StringNotEquals": {"dynamodb:LeadingKeys": "bob"}},
-        }
-        # The reported shape, and an N value that only the filter reads or
-        # nothing reads beside a key value the fence would bind.
-        requests = {
-            "pk = N bob": {"TableName": table, "KeyConditionExpression": "pk = :u",
-                           "ExpressionAttributeValues": {":u": NB}},
-            "pk = S alice, N bob in filter": {
-                "TableName": table, "KeyConditionExpression": "pk = :u",
-                "FilterExpression": "a = :n",
-                "ExpressionAttributeValues": {":u": {"S": "alice"}, ":n": NB}},
-            "pk = S bob, N bob unused": {
-                "TableName": table, "KeyConditionExpression": "pk = :u",
-                "ExpressionAttributeValues": {":u": {"S": "bob"}, ":n": NB}},
-            "pk = N bob, invalid Select": {
-                "TableName": table, "KeyConditionExpression": "pk = :u",
-                "ExpressionAttributeValues": {":u": NB}, "Select": "bad"},
-        }
-        failures = []
-        clients = {label: self._client(self._fence(condition, table))
-                   for label, condition in fences.items()}
-        clients["owner"] = owner
-        for shape, request in requests.items():
-            for label, client in clients.items():
-                try:
-                    resp = client.query(**request)
-                    failures.append(f"{shape} / {label}: {resp['Count']} items returned")
-                except ClientError as exc:
-                    err = exc.response["Error"]
-                    if (err["Code"], err["Message"]) != ("ValidationException", NUMERIC + "bob"):
-                        failures.append(f"{shape} / {label}: {err['Code']} {err['Message']}")
-        owner.delete_table(TableName=table)
-        assert not failures, "\n".join(failures)
-
-    def test_a_unicode_digit_key_value_reads_no_fenced_partition(self):
-        """A partition key value written with Unicode digits is not bound to a
-        LeadingKeys value, so it must not read a partition the fence keeps the
-        principal from. The service's answer for a fenced principal cannot be
-        measured here; the test asserts only that no item of partition 20 is
-        returned, whatever the answer is."""
-        owner = self._client({
-            "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow", "Action": "dynamodb:*", "Resource": "*"}],
-        })
-        table = f"kv-{uuid.uuid4().hex[:8]}"
-        owner.create_table(
-            TableName=table,
-            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "N"}],
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
-            BillingMode="PAY_PER_REQUEST")
-        wait_for_active(owner, table)
-        for pk in ("10", "20"):
-            owner.put_item(TableName=table, Item={"pk": {"N": pk}, "v": {"S": "p" + pk}})
-        fenced = self._client(self._fence(
-            {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": ["10"]}}, table))
-        leaks = []
-        for label, value in (("fullwidth", "\uff12\uff10"), ("arabic-indic", "\u0662\u0660"),
-                             ("devanagari", "\u0968\u0966")):
-            try:
-                resp = fenced.query(
-                    TableName=table, KeyConditionExpression="pk = :p",
-                    ExpressionAttributeValues={":p": {"N": value}})
-            except ClientError:
-                continue
-            if any(item.get("v") == {"S": "p20"} for item in resp["Items"]):
-                leaks.append(label)
-        owner.delete_table(TableName=table)
-        assert not leaks, leaks
+    @pytest.mark.parametrize("one", BMP_ONES, ids=[f"U+{ord(one):04X}" for one in BMP_ONES])
+    def test_digit_one_of_every_run_below_u_10000_is_accepted(self, dynamodb_client, ns_table, one):
+        resp = dynamodb_client.query(
+            TableName=ns_table, KeyConditionExpression="pk = :u AND sk = :s",
+            FilterExpression="a = :f",
+            ExpressionAttributeValues={":u": CAROL, ":s": {"N": "1"}, ":f": {"N": one}})
+        assert resp["ScannedCount"] == 1

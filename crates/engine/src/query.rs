@@ -48,8 +48,8 @@ pub async fn handle_query(
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Request-time checks on the raw body, in the service's order: Limit, the
-    // expression and non-expression parameter mix, the ReturnConsumedCapacity
-    // enum, every number in ExpressionAttributeValues, the Select enum. They
+    // ReturnConsumedCapacity enum, the expression and non-expression parameter
+    // mix, every number in ExpressionAttributeValues, the Select enum. They
     // run before typed deserialization so a field that does not deserialize
     // does not stop the ones before it. The server runs the same function
     // ahead of the IAM decision; see `query_key_values`.
@@ -247,10 +247,10 @@ pub async fn handle_query(
     // :n` on an S key with a second clause on a non-key attribute reports the
     // type, not a missing key schema element (measured 2026-10-21). This path
     // has no non-key rule, so that query also reaches the check below.
-    // Legacy `KeyConditions` do not go through the check below, so the
-    // classifier still checks their values: against the key schema's
-    // definitions on a multi-attribute key schema and against the table's on a
-    // single-attribute one.
+    // Legacy `KeyConditions` are checked by the classifier: against the key
+    // schema's definitions on a multi-attribute key schema and against the
+    // table's on a single-attribute one. The check below runs only where the
+    // classifier did not check (`!check_types_here`).
     let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
     let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
         .attribute_definitions
@@ -450,8 +450,8 @@ pub async fn handle_query(
     // refused after the key schema, filter, projection, unused value and
     // Select checks and before the ExclusiveStartKey check (measured
     // 2026-10-24). The classifier above checked the values of legacy
-    // `KeyConditions`.
-    if legacy_kc_maps.is_none() {
+    // `KeyConditions` and of every multi-attribute key schema.
+    if !check_types_here {
         crate::query_key_values::validate_key_condition_types(
             &key_condition,
             effective_maps,
@@ -778,3 +778,7 @@ mod empty_key_condition_tests {
 #[cfg(test)]
 #[path = "query_begins_with_tests.rs"]
 mod begins_with_tests;
+
+#[cfg(test)]
+#[path = "query_gate_tests.rs"]
+mod gate_tests;

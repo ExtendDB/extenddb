@@ -7,11 +7,22 @@ use extenddb_core::expression::{
     ExpressionMaps, KeyCondition, parse_key_condition, tokenize_with_limit,
 };
 use extenddb_core::types::{AttributeDefinition, AttributeValue, ScalarAttributeType};
+use serde_json::{Value, json};
 
 use super::{
-    KEY_CONDITION_TYPE_MISMATCH, LIMIT_BELOW_ONE, validate_expression_attribute_value_numbers,
-    validate_key_condition_types, validate_query_request_body,
+    KEY_CONDITION_TYPE_MISMATCH, validate_key_condition_types, validate_query_request_body,
 };
+
+/// The request-time number check on typed values, serialized as a request
+/// carries them.
+fn validate_expression_attribute_value_numbers(
+    values: &HashMap<String, AttributeValue>,
+) -> Result<(), DynamoDbError> {
+    let Value::Object(raw) = serde_json::to_value(values).expect("the values serialize") else {
+        panic!("a map serializes to an object");
+    };
+    super::validate_expression_attribute_value_numbers(&raw)
+}
 
 fn defs(pairs: &[(&str, ScalarAttributeType)]) -> Vec<AttributeDefinition> {
     pairs
@@ -49,7 +60,7 @@ fn n(v: &str) -> AttributeValue {
     AttributeValue::N(v.to_owned())
 }
 
-fn message(result: Result<(), DynamoDbError>) -> Option<String> {
+pub(super) fn message(result: Result<(), DynamoDbError>) -> Option<String> {
     match result {
         Ok(()) => None,
         Err(DynamoDbError::ValidationException(msg)) => Some(msg),
@@ -325,120 +336,6 @@ fn first_invalid_number_in_placeholder_order_is_reported() {
 }
 
 #[test]
-fn request_time_checks_run_limit_then_mix_then_numbers() {
-    let bad_number = serde_json::json!({
-        "TableName": "t",
-        "KeyConditionExpression": "pk = :u",
-        "ExpressionAttributeValues": {":u": {"N": "bob"}},
-    });
-
-    let mut with_limit = bad_number.clone();
-    with_limit["Limit"] = serde_json::json!(0);
-    assert_eq!(
-        message(validate_query_request_body(&with_limit)).as_deref(),
-        Some(LIMIT_BELOW_ONE)
-    );
-
-    let mut with_mix = bad_number.clone();
-    with_mix["KeyConditions"] = serde_json::json!({
-        "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}
-    });
-    assert_eq!(
-        message(validate_query_request_body(&with_mix)).as_deref(),
-        Some(
-            "Can not use both expression and non-expression parameters in the same request: \
-             Non-expression parameters: {KeyConditions} Expression parameters: {KeyConditionExpression}"
-        )
-    );
-
-    assert_eq!(
-        message(validate_query_request_body(&bad_number)).as_deref(),
-        Some("The parameter cannot be converted to a numeric value: bob")
-    );
-
-    // A number only a FilterExpression reads, and one nothing reads.
-    for body in [
-        serde_json::json!({
-            "TableName": "t",
-            "KeyConditionExpression": "pk = :p",
-            "FilterExpression": "a = :n",
-            "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}},
-        }),
-        serde_json::json!({
-            "TableName": "t",
-            "KeyConditionExpression": "pk = :p",
-            "ExpressionAttributeValues": {":p": {"S": "x"}, ":n": {"N": "bob"}},
-        }),
-    ] {
-        assert_eq!(
-            message(validate_query_request_body(&body)).as_deref(),
-            Some("The parameter cannot be converted to a numeric value: bob")
-        );
-    }
-
-    // Legacy KeyConditions alone does not join the mix check; a well-formed
-    // request passes.
-    let legacy = serde_json::json!({
-        "TableName": "t",
-        "KeyConditions": {
-            "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "x"}]}
-        },
-        "FilterExpression": "a = :n",
-        "ExpressionAttributeValues": {":n": {"N": "5"}},
-        "Limit": 1,
-    });
-    assert!(validate_query_request_body(&legacy).is_ok());
-}
-
-#[test]
-fn enum_checks_sit_on_either_side_of_the_numbers() {
-    // Measured 2026-10-24: an invalid ReturnConsumedCapacity is reported ahead
-    // of an N value that is not a number, and that value ahead of an invalid
-    // Select; a Limit of 0 and a parameter mix ahead of either enum.
-    let bad_number = serde_json::json!({
-        "TableName": "t",
-        "KeyConditionExpression": "pk = :u",
-        "ExpressionAttributeValues": {":u": {"N": "bob"}},
-    });
-    let mut rcc = bad_number.clone();
-    rcc["ReturnConsumedCapacity"] = serde_json::json!("bad");
-    assert_eq!(
-        message(validate_query_request_body(&rcc)).as_deref(),
-        Some(
-            "1 validation error detected: Value 'bad' at 'returnConsumedCapacity' failed to \
-             satisfy constraint: Member must satisfy enum value set: [INDEXES, TOTAL, NONE]"
-        )
-    );
-    let mut select = bad_number.clone();
-    select["Select"] = serde_json::json!("bad");
-    assert_eq!(
-        message(validate_query_request_body(&select)).as_deref(),
-        Some("The parameter cannot be converted to a numeric value: bob")
-    );
-    for field in ["ReturnConsumedCapacity", "Select"] {
-        let mut limit = bad_number.clone();
-        limit[field] = serde_json::json!("bad");
-        limit["Limit"] = serde_json::json!(0);
-        assert_eq!(
-            message(validate_query_request_body(&limit)).as_deref(),
-            Some(LIMIT_BELOW_ONE),
-            "{field}"
-        );
-    }
-    // With the numbers valid, an invalid Select is still reported.
-    let mut only_select = serde_json::json!({
-        "TableName": "t",
-        "KeyConditionExpression": "pk = :u",
-        "ExpressionAttributeValues": {":u": {"S": "bob"}},
-    });
-    only_select["Select"] = serde_json::json!("bad");
-    assert!(
-        message(validate_query_request_body(&only_select))
-            .is_some_and(|m| m.contains("at 'select' failed to satisfy constraint"))
-    );
-}
-
-#[test]
 fn unicode_decimal_digits_count_as_the_digits_they_stand_for() {
     // Measured 2026-10-25: a fullwidth, Arabic-Indic or Devanagari digit is accepted as a
     // key condition, filter or unused value; thirty nine Devanagari ones answer
@@ -475,7 +372,7 @@ fn characters_that_are_not_decimal_digits_are_refused_with_the_text_as_sent() {
     // Measured 2026-10-25: a superscript,
     // a vulgar fraction, a fullwidth minus and a fullwidth full stop are refused
     // and the message echoes the value as the request wrote it.
-    for raw in ["\u{b2}", "\u{bd}", "\u{ff0d}1", "1\u{ff0e}5", "\u{ff11}bob"] {
+    for raw in ["\u{b2}", "\u{bd}", "\u{ff0d}1", "1\u{ff0e}5"] {
         let values = HashMap::from([(":u".to_owned(), n(raw))]);
         assert_eq!(
             message(validate_expression_attribute_value_numbers(&values)).as_deref(),
@@ -486,99 +383,93 @@ fn characters_that_are_not_decimal_digits_are_refused_with_the_text_as_sent() {
 }
 
 #[test]
-fn a_shape_fault_in_another_field_is_reported_ahead_of_the_checks() {
-    // Measured 2026-10-25: a field of the wrong JSON type
-    // anywhere in the body answers SerializationException even when a Limit,
-    // mix, enum or number check would fail.
-    let shape_faults = [
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "Limit": 0, "ExpressionAttributeValues": "x",
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "ExpressionAttributeNames": "x",
-            "ExpressionAttributeValues": {":p": {"N": "bob"}},
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "Limit": "1", "ExpressionAttributeValues": {":p": {"N": "bob"}},
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "AttributesToGet": {"a": 1}, "ProjectionExpression": "a",
-            "ExpressionAttributeValues": {":p": {"S": "x"}},
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "QueryFilter": [1], "FilterExpression": "a = :p",
-            "ExpressionAttributeValues": {":p": {"S": "x"}},
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "Select": 5, "ExpressionAttributeValues": {":p": {"N": "bob"}},
-        }),
-        serde_json::json!({
-            "TableName": "t", "KeyConditionExpression": "pk = :p",
-            "Limit": 0, "Select": 5, "ExpressionAttributeValues": {":p": {"S": "x"}},
-        }),
-    ];
-    for body in shape_faults {
-        assert!(
-            matches!(
-                validate_query_request_body(&body),
-                Err(DynamoDbError::SerializationException(_))
-            ),
-            "{body}"
+fn a_refused_value_is_echoed_with_each_decimal_digit_folded_to_ascii() {
+    // Measured 2026-11-11: the service folds every decimal digit below U+10000
+    // in the echoed value, and a digit from U+104A0 up is refused and echoed
+    // as sent.
+    for (raw, echo) in [
+        ("\u{ff11}bob", "1bob"),
+        ("\u{661}\u{662}x", "12x"),
+        ("bob\u{ff11}", "bob1"),
+        ("\u{967}\u{968}a\u{969}", "12a3"),
+        ("\u{ff11}\u{1d7cf}", "1\u{1d7cf}"),
+        ("\u{1d7cf}", "\u{1d7cf}"),
+        ("\u{104a1}", "\u{104a1}"),
+    ] {
+        let values = HashMap::from([(":u".to_owned(), n(raw))]);
+        assert_eq!(
+            message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+            Some(format!("The parameter cannot be converted to a numeric value: {echo}").as_str()),
+            "{raw:?}"
         );
     }
+}
 
-    // A string enum value that is not a member is the checks' own answer, not a
-    // shape fault.
-    let mut select = serde_json::json!({
-        "TableName": "t", "KeyConditionExpression": "pk = :p",
-        "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}},
-    });
-    select["Select"] = serde_json::json!("bad");
-    assert_eq!(
-        message(validate_query_request_body(&select)).as_deref(),
-        Some(LIMIT_BELOW_ONE)
-    );
-    select["ReturnConsumedCapacity"] = serde_json::json!("bad");
-    select["Limit"] = serde_json::json!(1);
-    assert!(
-        message(validate_query_request_body(&select))
-            .is_some_and(|m| m.contains("at 'returnConsumedCapacity' failed to satisfy constraint"))
-    );
+#[test]
+fn decimal_digits_from_u_104a0_up_are_not_numbers() {
+    // Measured 2026-11-11: digit one of each of the 31 decimal digit runs from
+    // U+104A0 up is refused as a filter value, and digit one of the last run
+    // below U+10000 is accepted.
+    for raw in [
+        "\u{104a1}",
+        "\u{11067}",
+        "\u{1d7cf}",
+        "\u{1e951}",
+        "\u{1fbf1}",
+    ] {
+        let values = HashMap::from([(":u".to_owned(), n(raw))]);
+        assert_eq!(
+            message(validate_expression_attribute_value_numbers(&values)).as_deref(),
+            Some(format!("The parameter cannot be converted to a numeric value: {raw}").as_str()),
+            "{raw:?}"
+        );
+    }
+    let values = HashMap::from([(":u".to_owned(), n("\u{abf1}"))]);
+    assert!(validate_expression_attribute_value_numbers(&values).is_ok());
+}
 
-    // A ValidationException the deserializer raises does not preempt a check:
-    // an empty NS beside a Limit of 0 answers the Limit text.
-    let empty_set = serde_json::json!({
-        "TableName": "t", "KeyConditionExpression": "pk = :p",
-        "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":s": {"NS": []}},
+/// A Query body with `values` as its `ExpressionAttributeValues` and `extra`
+/// beside them.
+pub(super) fn body_with(values: Value, extra: Value) -> Value {
+    let mut body = json!({
+        "TableName": "t",
+        "KeyConditionExpression": "pk = :p",
+        "ExpressionAttributeValues": values,
     });
-    assert_eq!(
-        message(validate_query_request_body(&empty_set)).as_deref(),
-        Some(LIMIT_BELOW_ONE)
-    );
+    if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
+        body.extend(extra);
+    }
+    body
+}
 
-    // Neither does an unknown type descriptor, which the deserializer reports
-    // as a SerializationException: the service answers the Limit
-    // ValidationException (measured 2026-10-25), in its older
-    // `Value '0' at 'limit'` form; ExtendDB answers its usual Limit text.
-    let unknown_type = serde_json::json!({
-        "TableName": "t", "KeyConditionExpression": "pk = :p",
-        "Limit": 0, "ExpressionAttributeValues": {":p": {"S": "x"}, ":a": {"X": "1"}},
-    });
-    assert_eq!(
-        message(validate_query_request_body(&unknown_type)).as_deref(),
-        Some(LIMIT_BELOW_ONE)
+#[test]
+fn a_value_that_does_not_deserialize_does_not_stop_the_number_check_of_another() {
+    // Measured 2026-11-11: beside `:u = {"N": "bob"}`, an empty set, a
+    // duplicate set member or a NULL of false answered either that value's
+    // fault or the numeric fault over ten requests each, and a B that is not
+    // base64 answered SerializationException.
+    for other in [
+        json!({"NS": []}),
+        json!({"SS": ["a", "a"]}),
+        json!({"NULL": false}),
+        json!({"L": [{"NS": []}]}),
+    ] {
+        let body = body_with(
+            json!({":p": {"S": "x"}, ":u": {"N": "bob"}, ":z": other}),
+            json!({}),
+        );
+        assert_eq!(
+            message(validate_query_request_body(&body)).as_deref(),
+            Some("The parameter cannot be converted to a numeric value: bob"),
+            "{other}"
+        );
+    }
+    let body = body_with(
+        json!({":p": {"S": "x"}, ":u": {"N": "bob"}, ":z": {"B": "!!"}}),
+        json!({}),
     );
-
-    // A body that passes every check is left to the handler's deserializer.
-    let shape_fault_only = serde_json::json!({
-        "TableName": "t", "KeyConditionExpression": "pk = :p",
-        "ExpressionAttributeValues": "x",
-    });
-    assert!(validate_query_request_body(&shape_fault_only).is_ok());
+    assert!(matches!(
+        validate_query_request_body(&body),
+        Err(DynamoDbError::SerializationException(_))
+    ));
 }
