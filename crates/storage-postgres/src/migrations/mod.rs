@@ -167,6 +167,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0009_warm_throughput.sql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
     }
 }
 
@@ -192,7 +201,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::BackupCatalogIndex
         | MigrationId::StreamPending
         | MigrationId::RestoreProgress
-        | MigrationId::WarmThroughput => RunsIn::Transaction,
+        | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

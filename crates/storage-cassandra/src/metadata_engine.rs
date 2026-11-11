@@ -646,7 +646,7 @@ impl CassandraEngine {
                     {
                         Ok(true) => {
                             repaired += 1;
-                            metrics.record_ttl_audit_repair(table_name);
+                            metrics.record_ttl_audit_repair(account_id, table_name);
                         }
                         Ok(false) => {}
                         // Claimed work owns this key right now; skip rather

@@ -35,6 +35,12 @@ impl MetricsCollector {
 
         let mut results = Vec::new();
         for (key, acc) in map.iter() {
+            // Filter by account if specified.
+            if let Some(ref account) = params.account_id
+                && key.account_id.as_deref() != Some(account.as_str())
+            {
+                continue;
+            }
             // Filter by table name if specified.
             if let Some(ref tn) = params.table_name
                 && key.table_name.as_deref() != Some(tn.as_str())
@@ -53,6 +59,9 @@ impl MetricsCollector {
             };
 
             let mut dimensions = Vec::new();
+            if let Some(ref account) = key.account_id {
+                dimensions.push(Dimension::AccountId(account.clone()));
+            }
             if let Some(ref tn) = key.table_name {
                 dimensions.push(Dimension::TableName(tn.clone()));
             }
@@ -282,6 +291,7 @@ pub(super) fn aggregate(drained: Drained) -> Vec<FlushBucket> {
                     bucket: SystemTime::UNIX_EPOCH
                         + Duration::from_secs(u64::try_from(minute).unwrap_or(0)),
                     metric: key.metric,
+                    account_id: key.account_id.clone().unwrap_or_default(),
                     table_name: key.table_name.clone().unwrap_or_default(),
                     index_name: key.index_name.clone().unwrap_or_default(),
                     operation: key.operation.clone().unwrap_or_default(),

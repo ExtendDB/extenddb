@@ -1,3 +1,4 @@
+index idx_account_metrics_bucket on account_metrics: CREATE INDEX idx_account_metrics_bucket ON account_metrics (bucket)
 index idx_backup_index_account_table on backup_index: CREATE INDEX idx_backup_index_account_table ON backup_index (account_id, table_name)
 index idx_backup_index_backup_id on backup_index: CREATE UNIQUE INDEX idx_backup_index_backup_id ON backup_index (backup_id)
 index idx_backup_index_store_status on backup_index: CREATE INDEX idx_backup_index_store_status ON backup_index (store_kind, store_root, store_id, status)
@@ -7,7 +8,6 @@ index idx_gsi_pending_claim on gsi_pending: CREATE INDEX idx_gsi_pending_claim O
 index idx_idempotency_tokens_created on idempotency_tokens: CREATE INDEX idx_idempotency_tokens_created ON idempotency_tokens (created_at)
 index idx_login_attempts_principal_time on login_attempts: CREATE INDEX idx_login_attempts_principal_time ON login_attempts (principal, attempted_at DESC)
 index idx_login_attempts_source_ip_time on login_attempts: CREATE INDEX idx_login_attempts_source_ip_time ON login_attempts (source_ip, attempted_at DESC) WHERE source_ip IS NOT NULL
-index idx_metrics_bucket on metrics: CREATE INDEX idx_metrics_bucket ON metrics (bucket)
 index idx_stream_records_created on stream_records: CREATE INDEX idx_stream_records_created ON stream_records (created_at)
 index idx_stream_shards_table on stream_shards: CREATE INDEX idx_stream_shards_table ON stream_shards (table_id)
 index idx_table_restores_backup on table_restores: CREATE INDEX idx_table_restores_backup ON table_restores (source_backup_arn)
@@ -15,6 +15,7 @@ index idx_table_restores_status on table_restores: CREATE INDEX idx_table_restor
 index idx_tables_pending_transition on tables: CREATE INDEX idx_tables_pending_transition ON tables (status_transition_at) WHERE status_transition_at IS NOT NULL
 index idx_vector_indexes_index_id on vector_indexes: CREATE UNIQUE INDEX idx_vector_indexes_index_id ON vector_indexes (index_id)
 table access_keys on access_keys: CREATE TABLE access_keys ( access_key_id TEXT PRIMARY KEY, secret_key_encrypted BLOB NOT NULL, account_id TEXT NOT NULL, user_name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE )
+table account_metrics on account_metrics: CREATE TABLE account_metrics ( bucket TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', metric TEXT NOT NULL, table_name TEXT NOT NULL DEFAULT '', index_name TEXT NOT NULL DEFAULT '', operation TEXT NOT NULL DEFAULT '', sum REAL NOT NULL DEFAULT 0, count INTEGER NOT NULL DEFAULT 0, min REAL NOT NULL DEFAULT 9e999, max REAL NOT NULL DEFAULT -9e999, PRIMARY KEY (bucket, account_id, metric, table_name, index_name, operation) )
 table accounts on accounts: CREATE TABLE accounts ( account_id TEXT PRIMARY KEY, account_name TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')) )
 table admin_users on admin_users: CREATE TABLE admin_users ( admin_name TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')) )
 table backup_definitions on backup_definitions: CREATE TABLE backup_definitions ( backup_arn TEXT PRIMARY KEY REFERENCES backups(backup_arn) ON DELETE CASCADE, definition TEXT NOT NULL )
@@ -36,7 +37,6 @@ table iam_users on iam_users: CREATE TABLE iam_users ( account_id TEXT NOT NULL 
 table idempotency_tokens on idempotency_tokens: CREATE TABLE idempotency_tokens ( account_id TEXT NOT NULL, token TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), PRIMARY KEY (account_id, token) )
 table indexes on indexes: CREATE TABLE indexes ( table_id TEXT NOT NULL, index_id TEXT NOT NULL, index_name TEXT NOT NULL, index_type TEXT NOT NULL, key_schema TEXT NOT NULL, projection TEXT NOT NULL, index_status TEXT NOT NULL DEFAULT 'ACTIVE', provisioned_throughput TEXT, propagation_delay_ms INTEGER, warm_throughput TEXT, PRIMARY KEY (table_id, index_name), CONSTRAINT indexes_table_id_fkey FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE, CONSTRAINT chk_propagation_delay_ms_non_negative CHECK (propagation_delay_ms IS NULL OR propagation_delay_ms >= 0) )
 table login_attempts on login_attempts: CREATE TABLE login_attempts ( principal TEXT NOT NULL, attempted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), success INTEGER NOT NULL, source_ip TEXT )
-table metrics on metrics: CREATE TABLE metrics ( bucket TEXT NOT NULL, metric TEXT NOT NULL, table_name TEXT NOT NULL DEFAULT '', index_name TEXT NOT NULL DEFAULT '', operation TEXT NOT NULL DEFAULT '', sum REAL NOT NULL DEFAULT 0, count INTEGER NOT NULL DEFAULT 0, min REAL NOT NULL DEFAULT 9e999, max REAL NOT NULL DEFAULT -9e999, PRIMARY KEY (bucket, metric, table_name, index_name, operation) )
 table schema_history on schema_history: CREATE TABLE schema_history ( filename TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')) )
 table seq_counters on seq_counters: CREATE TABLE seq_counters ( name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0 )
 table settings on settings: CREATE TABLE settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL )

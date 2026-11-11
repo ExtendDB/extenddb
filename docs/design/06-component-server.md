@@ -312,6 +312,8 @@ schema that uses DynamoDB CloudWatch-style metric names and dimensions.
 - `window`: `LastMinute` | `Last5Minutes` | `LastHour` | `LastDay` | `AllTime`
 - `start`, `end`: ISO 8601 (custom range, alternative to `window`)
 - `granularity`: `1m` | `5m` | `15m` | `1h` (auto-selected if omitted)
+- `account_id`: only the metrics of this account (leaves out the metrics of
+  the whole deployment, which have no account)
 - `table_name`: filter by table
 - `metric`: filter by metric name
 
@@ -320,13 +322,15 @@ schema that uses DynamoDB CloudWatch-style metric names and dimensions.
 ```json
 {
   "metrics":  [ { "metric": "SuccessfulRequestLatency",
-                  "dimensions": [ { "TableName": "Users" },
+                  "dimensions": [ { "AccountId": "123456789012" },
+                                  { "TableName": "Users" },
                                   { "Operation":  "GetItem" } ],
                   "window": "Last5Minutes",
                   "sum": 26033.0, "count": 50, "min": 321.0, "max": 714.0 } ],
   "buckets": [ { "timestamp": "2026-05-29T00:02:00Z",
                   "metric": "SuccessfulRequestLatency",
-                  "dimensions": [ { "TableName": "Users" } ],
+                  "dimensions": [ { "AccountId": "123456789012" },
+                                  { "TableName": "Users" } ],
                   "sum": 1234.0, "count": 5, "min": 200.0, "max": 410.0 } ],
   "segments": [ { "operation": "GetItem", "count": 50,
                   "avg": { "auth_us": 12.0, "authz_us": 4.0,
@@ -363,6 +367,10 @@ ExtendDB-internal:
 
 **Dimensions** (from the `Dimension` enum):
 
+- `AccountId(String)`: the account of the request or table the metric
+  belongs to; absent on a metric of the whole deployment (pool, worker,
+  storage query and backup job metrics). Each stored row is keyed by it, so
+  two accounts' tables of the same name have their own rows.
 - `TableName(String)`
 - `GlobalSecondaryIndexName(String)`
 - `Operation(String)`

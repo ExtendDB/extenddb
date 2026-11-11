@@ -83,26 +83,28 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
 /// rules. A failed condition counts in `ConditionalCheckFailedRequests` and not
 /// in `UserErrors`, as CloudWatch's metrics page says. `table_name` is the name
 /// `request_helpers::metric_table_name` checked, used by the metrics that carry
-/// one.
+/// one. Every metric carries `account_id`, the account the request was
+/// authenticated for.
 pub(crate) fn record_error_metrics(
     metrics: &extenddb_core::metrics::MetricsCollector,
     error: &DynamoDbError,
+    account_id: &str,
     table_name: Option<&str>,
     operation: &str,
 ) {
     match error {
         DynamoDbError::InternalServerError(_) | DynamoDbError::ServiceUnavailable(_) => {
-            metrics.record_system_error(table_name, operation);
+            metrics.record_system_error(account_id, table_name, operation);
         }
         DynamoDbError::ConditionalCheckFailedException(..) => {
-            metrics.record_conditional_check_failure(table_name, operation);
+            metrics.record_conditional_check_failure(account_id, table_name, operation);
         }
         DynamoDbError::TransactionConflictException(_) => {
-            metrics.record_user_error(None, operation);
-            metrics.record_transaction_conflict(operation);
+            metrics.record_user_error(account_id, None, operation);
+            metrics.record_transaction_conflict(account_id, operation);
         }
         _ => {
-            metrics.record_user_error(None, operation);
+            metrics.record_user_error(account_id, None, operation);
         }
     }
 }
@@ -114,6 +116,8 @@ mod tests {
     };
 
     use super::*;
+
+    const ACCOUNT: &str = "111111111111";
 
     /// The dimensions of every snapshot of `metric` in `collector`.
     fn dimensions_of(collector: &MetricsCollector, metric: MetricName) -> Vec<Vec<Dimension>> {
@@ -142,11 +146,16 @@ mod tests {
             DynamoDbError::ResourceNotFoundException("missing".to_owned()),
             DynamoDbError::TransactionConflictException("conflict".to_owned()),
         ] {
-            record_error_metrics(&collector, &error, Some("Orders"), "PutItem");
+            record_error_metrics(&collector, &error, ACCOUNT, Some("Orders"), "PutItem");
         }
         let user_errors = dimensions_of(&collector, MetricName::UserErrors);
         assert_eq!(user_errors.len(), 1, "{user_errors:?}");
         assert!(!has_table(&user_errors[0]), "{user_errors:?}");
+        // The error still names the account the request was made for.
+        assert!(
+            user_errors[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{user_errors:?}"
+        );
     }
 
     /// A failed condition counts in `ConditionalCheckFailedRequests` only.
@@ -156,6 +165,7 @@ mod tests {
         record_error_metrics(
             &collector,
             &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );
@@ -172,12 +182,14 @@ mod tests {
         record_error_metrics(
             &collector,
             &DynamoDbError::ConditionalCheckFailedException("failed".to_owned(), None),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );
         record_error_metrics(
             &collector,
             &DynamoDbError::InternalServerError("boom".to_owned()),
+            ACCOUNT,
             Some("Orders"),
             "PutItem",
         );

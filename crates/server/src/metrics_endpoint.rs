@@ -179,11 +179,14 @@ pub(crate) async fn query_metrics_from_store(
         .and_then(parse_granularity)
         .unwrap_or_else(|| auto_granularity(range_secs));
 
-    let table_filter = params.table_name.as_deref().filter(|s| !s.is_empty());
-    let metric_filter = params.metric.map(|m| m.to_string());
+    let filter = extenddb_storage::management_store::MetricsFilter {
+        account_id: params.account_id.clone(),
+        table_name: params.table_name.clone(),
+        metric: params.metric.map(|m| m.to_string()),
+    };
 
     let rows = store
-        .query_metrics(start_ts, end_ts, table_filter, metric_filter.as_deref())
+        .query_metrics(start_ts, end_ts, &filter)
         .await
         .map_err(|e| {
             tracing::warn!("Failed to query metrics from store: {e:?}");
@@ -215,8 +218,10 @@ fn aggregate_rows(
     use extenddb_core::metrics::{Dimension, MetricName, MetricSnapshot, MetricsBucket};
     use std::collections::HashMap;
 
-    // Key: (metric, table_name, index_name, operation)
-    type DimKey = (String, String, String, String);
+    // Key: (metric, account_id, table_name, index_name, operation). The
+    // account is part of the key, so two accounts' tables of the same name
+    // are never added together.
+    type DimKey = (String, String, String, String, String);
 
     // Aggregate snapshots (overall).
     let mut snap_map: HashMap<DimKey, (f64, u64, f64, f64)> = HashMap::new();
@@ -224,11 +229,13 @@ fn aggregate_rows(
     let mut bucket_map: HashMap<(DimKey, i64), (f64, u64, f64, f64)> = HashMap::new();
 
     for row in rows {
-        // CloudWatch-style dimensions: metrics are keyed per table and per
-        // index. The endpoint is authenticated (admin Basic auth), so per-table
-        // dimensions are only returned to an authorized caller.
+        // CloudWatch-style dimensions: metrics are keyed per account, per
+        // table and per index. The endpoint is authenticated (admin Basic
+        // auth), so per-table dimensions are only returned to an authorized
+        // caller.
         let key = (
             row.metric.clone(),
+            row.account_id.clone().unwrap_or_default(),
             row.table_name.clone().unwrap_or_default(),
             row.index_name.clone().unwrap_or_default(),
             row.operation.clone().unwrap_or_default(),
@@ -269,13 +276,16 @@ fn aggregate_rows(
     let make_dims = |key: &DimKey| -> Vec<Dimension> {
         let mut dims = Vec::new();
         if !key.1.is_empty() {
-            dims.push(Dimension::TableName(key.1.clone()));
+            dims.push(Dimension::AccountId(key.1.clone()));
         }
         if !key.2.is_empty() {
-            dims.push(Dimension::GlobalSecondaryIndexName(key.2.clone()));
+            dims.push(Dimension::TableName(key.2.clone()));
         }
         if !key.3.is_empty() {
-            dims.push(Dimension::Operation(key.3.clone()));
+            dims.push(Dimension::GlobalSecondaryIndexName(key.3.clone()));
+        }
+        if !key.4.is_empty() {
+            dims.push(Dimension::Operation(key.4.clone()));
         }
         dims
     };
@@ -337,6 +347,7 @@ mod tests {
     fn aggregate_rows_retains_table_and_index_dimensions() {
         let rows = vec![MetricsRow {
             bucket: time::OffsetDateTime::UNIX_EPOCH,
+            account_id: Some("111111111111".to_owned()),
             metric: "SystemErrors".to_owned(),
             table_name: Some("MyTable".to_owned()),
             index_name: Some("MyIndex".to_owned()),
@@ -363,6 +374,61 @@ mod tests {
             )),
             "GSI-name dimension must be retained, got {dims:?}"
         );
+        assert!(
+            dims.contains(&Dimension::AccountId("111111111111".to_owned())),
+            "AccountId dimension must be retained, got {dims:?}"
+        );
+    }
+
+    /// Rows of two accounts with a table of the same name stay two groups,
+    /// in the snapshots and in every bucket, each under its own account. A
+    /// row of the whole deployment has no account dimension.
+    #[test]
+    fn aggregate_rows_keeps_two_accounts_with_the_same_table_name_apart() {
+        let row = |account: Option<&str>, table: Option<&str>, sum: f64| MetricsRow {
+            bucket: time::OffsetDateTime::UNIX_EPOCH,
+            account_id: account.map(ToOwned::to_owned),
+            metric: "ConsumedWriteCapacityUnits".to_owned(),
+            table_name: table.map(ToOwned::to_owned),
+            index_name: None,
+            operation: Some("PutItem".to_owned()),
+            sum,
+            count: 1,
+            min: sum,
+            max: sum,
+        };
+        let rows = vec![
+            row(Some("111111111111"), Some("Orders"), 1.0),
+            row(Some("222222222222"), Some("Orders"), 5.0),
+            row(None, None, 7.0),
+        ];
+
+        let (snapshots, buckets) = aggregate_rows(&rows, 60, TimeWindow::LastHour);
+
+        let account_of = |dims: &[Dimension]| {
+            dims.iter().find_map(|d| match d {
+                Dimension::AccountId(a) => Some(a.clone()),
+                _ => None,
+            })
+        };
+        let mut sums: Vec<(Option<String>, f64)> = snapshots
+            .iter()
+            .map(|s| (account_of(&s.dimensions), s.sum))
+            .collect();
+        sums.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            sums,
+            [
+                (None, 7.0),
+                (Some("111111111111".to_owned()), 1.0),
+                (Some("222222222222".to_owned()), 5.0),
+            ]
+        );
+        assert_eq!(
+            buckets.len(),
+            3,
+            "one bucket per account and the deployment"
+        );
     }
 
     /// The backup job's metric names round-trip through the store's string
@@ -386,6 +452,7 @@ mod tests {
             .iter()
             .map(|name| MetricsRow {
                 bucket: time::OffsetDateTime::UNIX_EPOCH,
+                account_id: None,
                 metric: name.to_string(),
                 table_name: None,
                 index_name: None,

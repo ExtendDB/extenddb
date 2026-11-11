@@ -8,9 +8,9 @@
 //! availability chart (D16), and CSV/JSON data export (D19). Charts use
 //! inline `<canvas>` and no external dependencies.
 //!
-//! The dashboard and its data feed are for admins only. The `metrics` table
-//! has no account column, so the feed holds the table names, index names,
-//! operations, request counts and latencies of every account.
+//! The dashboard and its data feed are for admins only. The feed holds the
+//! table names, index names, operations, request counts and latencies of
+//! every account, each row under its `AccountId`.
 //!
 //! HTML and JS content live in `metrics_content` to stay under the 500-line
 //! file limit.

@@ -122,6 +122,9 @@ pub struct AdminEntry {
 #[derive(Debug, Clone)]
 pub struct MetricsRow {
     pub bucket: time::OffsetDateTime,
+    /// The account the row was recorded for; `None` for a metric of the
+    /// whole deployment. Stored as the empty string.
+    pub account_id: Option<String>,
     pub metric: String,
     pub table_name: Option<String>,
     pub index_name: Option<String>,
@@ -130,4 +133,36 @@ pub struct MetricsRow {
     pub count: i64,
     pub min: f64,
     pub max: f64,
+}
+
+/// The optional filters of [`super::MetricsStore::query_metrics`]. A `None`
+/// field matches every row, and an empty string counts as `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsFilter {
+    /// Only the rows recorded for this account.
+    pub account_id: Option<String>,
+    /// Only the rows of this table name.
+    pub table_name: Option<String>,
+    /// Only the rows of this metric.
+    pub metric: Option<String>,
+}
+
+impl MetricsFilter {
+    /// The account filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// The table name filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn table_name(&self) -> Option<&str> {
+        self.table_name.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// The metric filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn metric(&self) -> Option<&str> {
+        self.metric.as_deref().filter(|s| !s.is_empty())
+    }
 }

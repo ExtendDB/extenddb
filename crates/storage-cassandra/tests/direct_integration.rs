@@ -38,6 +38,8 @@ mod index;
 mod keyspace_migrations;
 #[path = "direct/metadata_engine.rs"]
 mod metadata_engine;
+#[path = "direct/metrics_store.rs"]
+mod metrics_store;
 #[path = "direct/policies.rs"]
 mod policies;
 #[path = "direct/pool_size.rs"]
