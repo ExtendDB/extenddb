@@ -29,7 +29,12 @@ was reported, a #name or a :value, with or without a duplicate; `<>` and
 `contains` beside a duplicate answered the duplicate; and a number in
 begins_with answered its operand type error ahead of it. On 2026-11-10 an
 undefined reference was reported ahead of an unused name or value, on a table
-keyed on pk (S) alone.
+keyed on pk (S) alone. At 11:22Z and 11:23Z the same day, on the table with
+the index: ConditionalOperator or KeyConditions beside the expression
+answered the parameter mixing error ahead of the duplicate; an undefined name,
+a later syntax error and a duplicate on sk were each reported ahead of `<>`
+and contains; and a number in begins_with answered its operand type error
+without a duplicate too.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -59,6 +64,10 @@ UNDEFINED_NAME_EXACT = (
 UNDEFINED_VALUE_A = (
     "Invalid KeyConditionExpression: An expression attribute value used in "
     "expression is not defined; attribute value: :a"
+)
+BEGINS_WITH_N = (
+    "Invalid KeyConditionExpression: Incorrect operand type for operator or "
+    "function; operator or function: begins_with, operand type: N"
 )
 
 A = {"S": "alice"}
@@ -530,8 +539,15 @@ class TestReferenceAndOperatorOrder:
             (
                 "pk = :a AND begins_with(sk, :n) AND sk = :b",
                 {":a": A, ":b": B, ":n": N1},
-                "Invalid KeyConditionExpression: Incorrect operand type for operator "
-                "or function; operator or function: begins_with, operand type: N",
+                BEGINS_WITH_N,
+            ),
+            # Measured 2026-11-11T11:23Z: `<>` or contains beside a second
+            # condition on sk.
+            ("pk = :a AND sk <> :b AND sk = :c", {":a": A, ":b": B, ":c": C}, ONE_PER_KEY),
+            (
+                "pk = :a AND contains(sk, :b) AND sk = :c",
+                {":a": A, ":b": B, ":c": C},
+                ONE_PER_KEY,
             ),
         ],
     )
@@ -547,3 +563,54 @@ class TestReferenceAndOperatorOrder:
         )
         assert code == "ValidationException"
         assert msg == want
+
+    @pytest.mark.parametrize(
+        ("expr", "values", "want"),
+        [
+            # A number in begins_with on an S sort key, with no duplicate: the
+            # operand type, not the key value type.
+            ("pk = :a AND begins_with(sk, :n)", {":a": A, ":n": N1}, BEGINS_WITH_N),
+            # An undefined name beside `<>` or contains: the name.
+            (
+                "pk = :a AND sk <> :b AND #u = :c",
+                {":a": A, ":b": B, ":c": C},
+                _undefined("#u"),
+            ),
+            (
+                "pk = :a AND contains(sk, :b) AND #u = :c",
+                {":a": A, ":b": B, ":c": C},
+                _undefined("#u"),
+            ),
+        ],
+    )
+    def test_operators_and_operands_without_a_duplicate(
+        self, dynamodb_client, range_table, expr, values, want
+    ):
+        """Measured 2026-11-11T11:22Z."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression=expr,
+                ExpressionAttributeValues=values,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == want
+
+    def test_syntax_error_after_ne_reported_ahead_of_it(
+        self, dynamodb_client, range_table
+    ):
+        """Measured 2026-11-11T11:23Z: the service answers `Invalid
+        KeyConditionExpression: Syntax error; token: "<EOF>", near: "AND"`.
+        extenddb words its syntax errors differently, so the test checks
+        that a syntax error is reported and not the operator."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND sk <> :b AND",
+                ExpressionAttributeValues={":a": A, ":b": B},
+            )
+        )
+        assert code == "ValidationException"
+        assert msg.startswith("Invalid KeyConditionExpression: "), msg
+        assert "operator" not in msg, msg
