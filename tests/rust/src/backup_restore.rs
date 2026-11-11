@@ -381,9 +381,9 @@ async fn enable_point_in_time_recovery_is_refused() {
     let table = format!("PITREnable_{}", ts());
     make_table(&table).await;
 
-    // Point-in-time recovery is not supported by any storage backend, so
-    // enabling it must fail with the typed exception rather than report a
-    // recovery capability that can never restore.
+    // Point-in-time recovery is not in this release, so enabling it fails
+    // with the typed exception rather than report a recovery capability that
+    // can never restore.
     let err = c
         .update_continuous_backups()
         .table_name(&table)
@@ -397,8 +397,11 @@ async fn enable_point_in_time_recovery_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(
-        err_code(&err),
-        Some("ContinuousBackupsUnavailableException"),
+        (err_code(&err), err_msg(&err).as_str()),
+        (
+            Some("ContinuousBackupsUnavailableException"),
+            "Point-in-time recovery is not supported by this storage backend"
+        ),
         "unexpected error: {err:?}"
     );
 
@@ -462,9 +465,9 @@ async fn restore_table_to_point_in_time_is_refused() {
     let table = format!("PITRRestore_{}", ts());
     make_table(&table).await;
 
-    // Point-in-time recovery is not supported, so the restore must fail with
-    // the typed exception the service models on this operation rather than
-    // fabricate a restore of current state.
+    // Point-in-time recovery is not in this release, so every restore fails
+    // with the typed exception the service models on this operation rather
+    // than fabricate a restore of current state.
     let restored = format!("PITRRestored_{}", ts());
     let err = c
         .restore_table_to_point_in_time()
@@ -475,14 +478,19 @@ async fn restore_table_to_point_in_time_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(
-        err_code(&err),
-        Some("PointInTimeRecoveryUnavailableException"),
+        (err_code(&err), err_msg(&err).as_str()),
+        (
+            Some("PointInTimeRecoveryUnavailableException"),
+            "Point-in-time recovery is not supported by this storage backend"
+        ),
         "unexpected error: {err:?}"
     );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
 
+/// A describe and a disable look the table up; an enable and a restore are
+/// refused before any table is read.
 #[tokio::test]
 async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_found() {
     let c = client();
@@ -504,21 +512,38 @@ async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_f
         .unwrap_err();
     check("describe", err_code(&err), err_msg(&err));
 
-    for enabled in [false, true] {
-        let err = c
-            .update_continuous_backups()
-            .table_name(&missing)
-            .point_in_time_recovery_specification(
-                PointInTimeRecoverySpecification::builder()
-                    .point_in_time_recovery_enabled(enabled)
-                    .build()
-                    .unwrap(),
-            )
-            .send()
-            .await
-            .unwrap_err();
-        check("update", err_code(&err), err_msg(&err));
-    }
+    let err = c
+        .update_continuous_backups()
+        .table_name(&missing)
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(false)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    check("disable", err_code(&err), err_msg(&err));
+
+    let refused = "Point-in-time recovery is not supported by this storage backend";
+    let err = c
+        .update_continuous_backups()
+        .table_name(&missing)
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(true)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (Some("ContinuousBackupsUnavailableException"), refused),
+        "enable"
+    );
 
     let err = c
         .restore_table_to_point_in_time()
@@ -528,5 +553,9 @@ async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_f
         .send()
         .await
         .unwrap_err();
-    check("restore", err_code(&err), err_msg(&err));
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (Some("PointInTimeRecoveryUnavailableException"), refused),
+        "restore"
+    );
 }

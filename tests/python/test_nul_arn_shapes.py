@@ -29,7 +29,14 @@ import time
 import pytest
 from botocore.exceptions import ClientError
 
-from helpers import assert_validation, unique_name, wait_for_active, wait_for_deleted
+from helpers import (
+    assert_point_in_time_recovery_refused,
+    assert_validation,
+    on_the_service,
+    unique_name,
+    wait_for_active,
+    wait_for_deleted,
+)
 
 NUL = "\u0000"
 FRAME = (
@@ -290,7 +297,11 @@ class TestAccountSegmentInArnFields:
                 SourceTableArn=arn, TargetTableName="t830target"
             )
         )
-        assert_validation(exc, OWNER_ONLY)
+        if on_the_service():
+            assert_validation(exc, OWNER_ONLY)
+        else:
+            # Every restore is refused before the account is looked at.
+            assert_point_in_time_recovery_refused(exc, "PointInTimeRecoveryUnavailableException")
 
     @pytest.mark.parametrize("account", BAD_ACCOUNTS, ids=BAD_IDS)
     def test_tag_stream_and_backup_arn_fields(self, raw_client, raw_streams_client, caller, account):

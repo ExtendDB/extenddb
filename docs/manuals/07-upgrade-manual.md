@@ -398,7 +398,7 @@ shard ids the new release writes.
 
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 
-**What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` checks the source table and then returns `PointInTimeRecoveryUnavailableException`. Authorization of `RestoreTableToPointInTime` checks the item actions on the target table before the restore action on the source, as the service does, so a caller with no policy is denied naming `dynamodb:Scan` on the target table, where earlier builds named `dynamodb:RestoreTableToPointInTime` on the source table. A table that does not exist is `TableNotFoundException` on all three operations, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.
+**What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and every `RestoreTableToPointInTime` returns `PointInTimeRecoveryUnavailableException`. Both carry "Point-in-time recovery is not supported by this storage backend" and come before authorization and before any check of the request, so every caller gets them, with or without permissions; earlier builds denied a caller with no policy on `dynamodb:RestoreTableToPointInTime` on the source table. A table that does not exist is `TableNotFoundException` on `DescribeContinuousBackups` and on a disable, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.
 
 **Who is affected.** Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it. A restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`.
 
@@ -683,7 +683,9 @@ effect where it was previously bypassed.
   at all still returns `ValidationException` `Invalid ShardIterator`.
 - **Restores.** RestoreTableFromBackup and RestoreTableToPointInTime require the
   item read and write actions on the target table in addition to the restore
-  action, because a restore writes into the target.
+  action, because a restore writes into the target. From v0.1.15,
+  RestoreTableToPointInTime is refused before authorization (see the
+  point-in-time recovery entry under v0.1.15).
 - **Export.** `ExportTableToPointInTime` requires `TableArn` to be exactly a
   table ARN. An ARN carrying a sub-resource or an extra `table/` segment is
   rejected with `ValidationException` before authorization.

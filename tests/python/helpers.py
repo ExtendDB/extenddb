@@ -115,6 +115,22 @@ def assert_validation(exc, message: str) -> None:
     assert resp["Error"]["Message"] == message, resp["Error"]["Message"]
 
 
+PITR_UNSUPPORTED = "Point-in-time recovery is not supported by this storage backend"
+
+
+def on_the_service() -> bool:
+    """True when the suite runs against DynamoDB (validation mode)."""
+    return os.environ.get("EXTENDDB_VALIDATION_MODE", "").lower() == "true"
+
+
+def assert_point_in_time_recovery_refused(exc, code: str) -> None:
+    """A 400 with the refusal ExtendDB gives a restore or an enable before any
+    check: point-in-time recovery is not in this release."""
+    resp = exc.response
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
+    assert (resp["Error"]["Code"], resp["Error"]["Message"]) == (code, PITR_UNSUPPORTED), resp["Error"]
+
+
 def assert_member_pattern(exc, location: str, value: str) -> None:
     """The service's one-constraint member pattern sentence, byte for byte.
 

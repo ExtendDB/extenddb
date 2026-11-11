@@ -691,11 +691,11 @@ DynamoDB. The `Resource` element of a policy is matched field by field, and a
 | GetRecords | the stream the shard iterator reads |
 | ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
 | DescribeBackup, DeleteBackup | the `BackupArn` |
-| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` (an `UpdateContinuousBackups` that enables point-in-time recovery is refused before authorization) |
 | ExportTableToPointInTime | the source `table/<name>` |
 | ImportTable | the new `table/<name>` |
 | RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
-| RestoreTableToPointInTime | the same item actions on the target `table/<name>`, then the source `table/<name>` |
+| RestoreTableToPointInTime | refused before authorization (point-in-time recovery is not supported) |
 | ListTables | `table/*` |
 | DescribeLimits | `*` |
 | DescribeEndpoints | not authorized (signed request, no IAM permission) |
@@ -762,10 +762,9 @@ upgrading:
   RestoreTableFromBackup and RestoreTableToPointInTime require the item write
   and read actions on the target table in addition to the restore action. A
   principal that could previously restore with only the restore permission now
-  also needs those actions on the target table name. RestoreTableToPointInTime
-  checks the item actions on the target before the restore action, as DynamoDB
-  does, so a principal with no policy is denied naming `dynamodb:Scan` on the
-  target table.
+  also needs those actions on the target table name. From v0.1.15,
+  RestoreTableToPointInTime is refused before authorization, for every
+  principal, because point-in-time recovery is not supported.
 - **Denial messages.** An AccessDeniedException now ends with the clause the
   service uses: "with an explicit deny in an identity-based policy" when an
   explicit Deny matched the request, or "because no identity-based policy allows

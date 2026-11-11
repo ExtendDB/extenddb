@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    NO_RESTORE_TIME, SOURCE_NAMED_TWICE, TABLE_NAME_REQUIRED, TWO_RESTORE_TIMES,
-    check_restore_time_members, default_continuous_backups_description,
+    NO_RESTORE_TIME, PITR_UNSUPPORTED_MESSAGE, SOURCE_NAMED_TWICE, TABLE_NAME_REQUIRED,
+    TWO_RESTORE_TIMES, check_restore_time_members, default_continuous_backups_description,
     pitr_restore_unavailable_error, pitr_unsupported_error, point_in_time_recovery_enabled,
-    restore_source_table_name, table_name_member,
+    refuse_before_authorization, restore_source_table_name, table_name_member,
 };
 use super::{check_source_table_name, check_table_name};
 use extenddb_core::error::DynamoDbError;
@@ -61,10 +61,10 @@ fn the_enable_refusal_is_the_typed_continuous_backups_exception() {
 
 /// The restore refusal is the typed exception the service models on
 /// `RestoreTableToPointInTime`, distinct from the enable refusal, with the
-/// service's message.
+/// message of every point-in-time recovery refusal.
 #[test]
 fn the_restore_refusal_is_the_typed_point_in_time_recovery_exception() {
-    let err = pitr_restore_unavailable_error("Music");
+    let err = pitr_restore_unavailable_error();
     assert_eq!(err.status_code(), 400);
     assert_eq!(
         err.full_error_type(),
@@ -72,8 +72,83 @@ fn the_restore_refusal_is_the_typed_point_in_time_recovery_exception() {
     );
     assert_eq!(
         err.message(),
-        "Point in time recovery is not enabled for table 'Music'"
+        "Point-in-time recovery is not supported by this storage backend"
     );
+}
+
+/// Before authorization, every restore and every enable is refused, whatever
+/// the request names; a disable, a malformed specification and every other
+/// operation go on to authorization.
+#[test]
+fn a_restore_and_an_enable_are_refused_before_authorization() {
+    let restores = [
+        json!({}),
+        json!({"SourceTableName": "Music", "TargetTableName": "Copy", "UseLatestRestorableTime": true}),
+        json!({"SourceTableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/Music/index/g",
+               "TargetTableName": "Copy"}),
+    ];
+    for body in &restores {
+        let err = refuse_before_authorization("RestoreTableToPointInTime", body).expect("refused");
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#PointInTimeRecoveryUnavailableException",
+            "{body}"
+        );
+        assert_eq!(err.message(), PITR_UNSUPPORTED_MESSAGE, "{body}");
+    }
+    for flag in [
+        json!(true),
+        json!("true"),
+        json!("TRUE"),
+        json!("yes"),
+        json!("y"),
+        json!("1"),
+    ] {
+        let body = json!({"TableName": "Music",
+                          "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": flag}});
+        let err = refuse_before_authorization("UpdateContinuousBackups", &body).expect("refused");
+        assert_eq!(
+            err.full_error_type(),
+            "com.amazonaws.dynamodb.v20120810#ContinuousBackupsUnavailableException",
+            "{body}"
+        );
+        assert_eq!(err.message(), PITR_UNSUPPORTED_MESSAGE, "{body}");
+    }
+    let passed = [
+        (
+            "UpdateContinuousBackups",
+            json!({"TableName": "Music",
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": false}}),
+        ),
+        ("UpdateContinuousBackups", json!({"TableName": "Music"})),
+        (
+            "UpdateContinuousBackups",
+            json!({"TableName": "Music",
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": 1}}),
+        ),
+        (
+            "UpdateContinuousBackups",
+            json!({"TableName": "Music",
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": "No"}}),
+        ),
+        (
+            "UpdateContinuousBackups",
+            json!({"TableName": "Music",
+            "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": "on"}}),
+        ),
+        ("DescribeContinuousBackups", json!({"TableName": "Music"})),
+        (
+            "ExportTableToPointInTime",
+            json!({"TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/Music"}),
+        ),
+        ("RestoreTableFromBackup", json!({"TargetTableName": "Copy"})),
+    ];
+    for (operation, body) in &passed {
+        assert!(
+            refuse_before_authorization(operation, body).is_none(),
+            "{operation} {body}"
+        );
+    }
 }
 
 /// A missing table name member is the service's routing text, not the model
@@ -135,12 +210,37 @@ fn the_recovery_specification_and_its_flag_are_required() {
     }
 }
 
-/// The flag given as the JSON string `"true"` or `"false"` is taken as the
-/// boolean: the service answers 200 for `"false"` (M335 probe 54). Any other
-/// value that is not a boolean is refused as a missing flag.
+/// The flag given as a JSON string is read as the service reads it, ignoring
+/// case (measured, two samples each). Any other value that is not a boolean
+/// is refused as a missing flag.
 #[test]
 fn the_recovery_flag_as_a_true_or_false_string_is_the_boolean() {
-    for (flag, expected) in [("true", true), ("false", false)] {
+    let spellings = [
+        ("true", true),
+        ("TRUE", true),
+        ("True", true),
+        ("tRuE", true),
+        ("t", true),
+        ("T", true),
+        ("yes", true),
+        ("Yes", true),
+        ("YES", true),
+        ("y", true),
+        ("Y", true),
+        ("1", true),
+        ("false", false),
+        ("FALSE", false),
+        ("False", false),
+        ("f", false),
+        ("F", false),
+        ("no", false),
+        ("No", false),
+        ("NO", false),
+        ("n", false),
+        ("N", false),
+        ("0", false),
+    ];
+    for (flag, expected) in spellings {
         let body = json!({
             "TableName": "t",
             "PointInTimeRecoverySpecification": { "PointInTimeRecoveryEnabled": flag },
@@ -152,8 +252,13 @@ fn the_recovery_flag_as_a_true_or_false_string_is_the_boolean() {
         );
     }
     for flag in [
-        json!("TRUE"),
-        json!("yes"),
+        json!(" true"),
+        json!("true "),
+        json!("on"),
+        json!("2"),
+        json!("01"),
+        json!("1.0"),
+        json!("null"),
         json!(""),
         json!(1),
         json!([true]),

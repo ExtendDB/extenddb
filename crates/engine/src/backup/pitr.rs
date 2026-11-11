@@ -24,6 +24,13 @@
 //! A table that does not exist is `TableNotFoundException` with the service's
 //! text, `Table not found: <name>`, on all three. A table in any status
 //! resolves, CREATING and DELETING included.
+//!
+//! Point-in-time recovery is not in this release, so the server refuses a
+//! restore and an enable before it authorizes them
+//! ([`refuse_before_authorization`]). Every caller gets the same refusal,
+//! with or without permissions, and the refusal reads no table, so it tells a
+//! caller nothing about which tables exist. The service authorizes first; the
+//! handlers below keep its order for the time when recovery is implemented.
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
@@ -136,14 +143,28 @@ fn pitr_unsupported_error() -> DynamoDbError {
 
 /// The typed refusal for `RestoreTableToPointInTime`.
 ///
-/// The service models `PointInTimeRecoveryUnavailableException` on this
-/// operation and returns it whenever recovery is not enabled on the source
-/// table, which for ExtendDB is always. The message is the service's
-/// ("Point in time recovery is not enabled for table '<name>'").
-fn pitr_restore_unavailable_error(table_name: &str) -> DynamoDbError {
-    DynamoDbError::PointInTimeRecoveryUnavailableException(format!(
-        "Point in time recovery is not enabled for table '{table_name}'"
-    ))
+/// `PointInTimeRecoveryUnavailableException` is the exception the service
+/// models on this operation, with the message of every point-in-time recovery
+/// refusal.
+fn pitr_restore_unavailable_error() -> DynamoDbError {
+    DynamoDbError::PointInTimeRecoveryUnavailableException(PITR_UNSUPPORTED_MESSAGE.to_owned())
+}
+
+/// The refusal of a point-in-time recovery request, given before the request
+/// is authorized: every `RestoreTableToPointInTime`, and an
+/// `UpdateContinuousBackups` that enables recovery. `None` for every other
+/// request, which is then authorized and handled as before; a disable and a
+/// request whose `PointInTimeRecoverySpecification` is malformed included.
+/// It reads only the request body.
+#[must_use]
+pub fn refuse_before_authorization(operation: &str, body: &Value) -> Option<DynamoDbError> {
+    match operation {
+        "RestoreTableToPointInTime" => Some(pitr_restore_unavailable_error()),
+        "UpdateContinuousBackups" if matches!(point_in_time_recovery_enabled(body), Ok(true)) => {
+            Some(pitr_unsupported_error())
+        }
+        _ => None,
+    }
 }
 
 /// The continuous-backups description every table reports.
@@ -197,9 +218,11 @@ async fn require_table_exists(
 /// `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled`, which the
 /// model requires: a request without the specification, or with one that
 /// does not hold the flag, is refused with the service's text for the
-/// missing member. The JSON strings `"true"` and `"false"` are taken as the
-/// booleans (the service answers 200 for `"false"`, measured); any other
-/// value that is not a boolean is refused as a missing flag.
+/// missing member. A JSON string is read as the service reads it, ignoring
+/// case: `true`, `t`, `yes`, `y` and `1` are true, and `false`, `f`, `no`,
+/// `n` and `0` are false (measured, two samples each: each enable spelling
+/// enabled recovery and each disable spelling answered 200). Any other value
+/// that is not a boolean is refused as a missing flag.
 fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
     let spec = body
         .get("PointInTimeRecoverySpecification")
@@ -207,12 +230,16 @@ fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
         .ok_or_else(|| member_null("pointInTimeRecoverySpecification"))?;
     match spec.get("PointInTimeRecoveryEnabled") {
         Some(Value::Bool(flag)) => Ok(*flag),
-        Some(Value::String(s)) if s == "true" => Ok(true),
-        Some(Value::String(s)) if s == "false" => Ok(false),
+        Some(Value::String(s)) if is_one_of(s, &["true", "t", "yes", "y", "1"]) => Ok(true),
+        Some(Value::String(s)) if is_one_of(s, &["false", "f", "no", "n", "0"]) => Ok(false),
         _ => Err(member_null(
             "pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled",
         )),
     }
+}
+
+fn is_one_of(s: &str, spellings: &[&str]) -> bool {
+    spellings.iter().any(|w| s.eq_ignore_ascii_case(w))
 }
 
 /// The restore's source table name, from `SourceTableName`, checked against
@@ -301,9 +328,10 @@ pub(crate) async fn handle_update_continuous_backups(
 
 /// Handle `RestoreTableToPointInTime`.
 ///
-/// An existing source table is refused with
-/// `PointInTimeRecoveryUnavailableException`, the exception the service models
-/// on this operation (`ContinuousBackupsUnavailableException` belongs to
+/// The server refuses every restore before this runs
+/// ([`refuse_before_authorization`]). An existing source table is refused
+/// with `PointInTimeRecoveryUnavailableException`, the exception the service
+/// models on this operation (`ContinuousBackupsUnavailableException` belongs to
 /// `UpdateContinuousBackups`). A previous implementation faked a restore by
 /// snapshotting the current table state and ignoring `RestoreDateTime`, which
 /// violates tenet 1 (fidelity over features): a restore that silently returns
@@ -319,7 +347,7 @@ pub(crate) async fn handle_restore_table_to_point_in_time(
         restore_source_table_name(&body, super::table_name_bounds(&ctx.limits))?;
     require_table_exists(ctx, &source_table_name).await?;
     check_restore_time_members(&body)?;
-    Err(pitr_restore_unavailable_error(&source_table_name))
+    Err(pitr_restore_unavailable_error())
 }
 
 #[cfg(test)]

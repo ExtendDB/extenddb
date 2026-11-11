@@ -20,7 +20,9 @@ from botocore.exceptions import ClientError
 from helpers import (
     MEMBER_PATTERN,
     assert_member_pattern,
+    assert_point_in_time_recovery_refused,
     assert_validation,
+    on_the_service,
     unique_name,
     wait_for_active,
     wait_for_deleted,
@@ -86,17 +88,22 @@ class TestTableNameFieldsBeyondTableName:
                 pass
 
     def test_restore_table_to_point_in_time_names(self, raw_client, nul_table):
+        # The service checks each name; ExtendDB refuses every restore before
+        # its names are checked, because point-in-time recovery is not in this
+        # release.
         name, _ = nul_table
-        with pytest.raises(ClientError) as exc:
-            raw_client.restore_table_to_point_in_time(
-                SourceTableName=BAD, TargetTableName=unique_name("tgt"), UseLatestRestorableTime=True
-            )
-        assert_member_pattern(exc.value, "sourceTableName", BAD)
-        with pytest.raises(ClientError) as exc:
-            raw_client.restore_table_to_point_in_time(
-                SourceTableName=name, TargetTableName=BAD, UseLatestRestorableTime=True
-            )
-        assert_member_pattern(exc.value, "targetTableName", BAD)
+        for location, params in (
+            ("sourceTableName", {"SourceTableName": BAD, "TargetTableName": unique_name("tgt")}),
+            ("targetTableName", {"SourceTableName": name, "TargetTableName": BAD}),
+        ):
+            with pytest.raises(ClientError) as exc:
+                raw_client.restore_table_to_point_in_time(UseLatestRestorableTime=True, **params)
+            if on_the_service():
+                assert_member_pattern(exc.value, location, BAD)
+            else:
+                assert_point_in_time_recovery_refused(
+                    exc.value, "PointInTimeRecoveryUnavailableException"
+                )
 
     def test_import_table_creation_parameters_table_name(self, raw_client):
         with pytest.raises(ClientError) as exc:
@@ -142,12 +149,25 @@ class TestTableNameFieldsBeyondTableName:
                 ),
                 id="UpdateContinuousBackups",
             ),
+            pytest.param(
+                lambda c, t: c.update_continuous_backups(
+                    TableName=t,
+                    PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
+                ),
+                id="UpdateContinuousBackups-disable",
+            ),
         ],
     )
-    def test_other_operations_with_a_bare_table_name(self, raw_client, call):
+    def test_other_operations_with_a_bare_table_name(self, raw_client, call, request):
         with pytest.raises(ClientError) as exc:
             call(raw_client, BAD)
-        assert_member_pattern(exc.value, "tableName", BAD)
+        if request.node.callspec.id == "UpdateContinuousBackups" and not on_the_service():
+            # An enable is refused before its table name is checked.
+            assert_point_in_time_recovery_refused(
+                exc.value, "ContinuousBackupsUnavailableException"
+            )
+        else:
+            assert_member_pattern(exc.value, "tableName", BAD)
 
     def test_list_streams_has_its_own_sentence(self, raw_streams_client):
         with pytest.raises(ClientError) as exc:

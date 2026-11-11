@@ -54,6 +54,12 @@ NO_POLICY = {
     "Version": "2012-10-17",
     "Statement": [{"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}],
 }
+# Point-in-time recovery is not in this release: every restore is refused
+# before authorization, so before the account is looked at.
+PITR_REFUSED = (
+    "PointInTimeRecoveryUnavailableException",
+    "Point-in-time recovery is not supported by this storage backend",
+)
 OWNER_ONLY = (
     "ValidationException",
     "This action is only supported by accounts that match the resource owner\u2019s account.",
@@ -176,7 +182,8 @@ def _requests(t: str, table: dict) -> list[tuple[str, str, str, str, Any]]:
     that exists and "Access is denied" for one that does not; "item" answers
     the same denial and "The caller is not authorized ..."; "owner" answers
     the owner-only ValidationException and "Access is denied"; "pitr" answers
-    the owner-only ValidationException for both.
+    the point-in-time recovery refusal for both, which ExtendDB gives before
+    authorization (the service answers the owner-only ValidationException).
     """
     stream = f"{t}/stream/{table['stream_label']}"
     backup = f"{t}/backup/{table['backup_id']}"
@@ -262,7 +269,9 @@ def test_other_account_answer_depends_on_operation_and_account(env, table, polic
         for label, family, action, resource, call in _requests(t, table):
             code, msg = _error(lambda: call(clients))
             where = (label, "known" if known else "unknown", code, msg)
-            if family == "pitr" or (family == "owner" and known):
+            if family == "pitr":
+                assert (code, msg) == PITR_REFUSED, where
+            elif family == "owner" and known:
                 assert (code, msg) == OWNER_ONLY, where
             elif known:
                 assert code == "AccessDeniedException", where

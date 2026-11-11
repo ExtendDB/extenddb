@@ -122,6 +122,17 @@ pub(crate) async fn handle_request(
         }
     };
 
+    // Point-in-time recovery is not in this release: a restore and an enable
+    // are refused here, for every caller and before any table is read, where
+    // the service would authorize them first.
+    // The request is counted as a user error with no table, since none is
+    // read.
+    if let Some(e) = extenddb_engine::refuse_point_in_time_recovery(&operation, &input) {
+        record_error_metrics(&state.metrics, &e, None, &operation);
+        state.metrics.record_request_count(&operation);
+        return error_response(&e, &request_id);
+    }
+
     // --- Authz segment ---
     let authz_start = std::time::Instant::now();
     let authorized_key_info;

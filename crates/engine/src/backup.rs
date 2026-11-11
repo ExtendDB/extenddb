@@ -2053,6 +2053,7 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
     handle_update_continuous_backups,

@@ -13,7 +13,7 @@ pub use backup::{
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
     StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
     check_configured_store, check_configured_store_read_only, maintenance, read_identity_bounded,
-    reconciler, store_identity, store_maintenance, sync,
+    reconciler, refuse_point_in_time_recovery, store_identity, store_maintenance, sync,
 };
 mod batch_get_item;
 mod batch_write_item;
