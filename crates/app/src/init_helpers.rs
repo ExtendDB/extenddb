@@ -45,6 +45,12 @@ fn generate_tls_cert_in(
     }
 
     if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
+        // The kept key may predate init creating it 0600, or have been copied
+        // in with the umask mode. Narrowed before the SAN check, which can
+        // refuse the run and would leave the key as it was.
+        if let Some(warning) = crate::serve_helpers::narrow_tls_key_permissions(&key_path) {
+            eprintln!("    {warning}");
+        }
         ensure_cert_covers_sans(&cert_path, &key_path, &requested)?;
         println!("--- TLS certificate already exists, skipping generation.");
         return Ok(());
@@ -482,6 +488,46 @@ mod write_owner_only_tests {
         assert_eq!(seen, "old");
 
         drop(old);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// When cert.pem and key.pem both exist, init keeps them, and a key.pem
+    /// readable by others is set to 0600 without being regenerated.
+    #[test]
+    fn a_kept_key_readable_by_others_is_set_to_0600() {
+        let dir = scratch_dir("kept");
+        let tls_dir = dir.to_str().expect("utf-8 path");
+        super::generate_tls_cert_in(tls_dir, "127.0.0.1", &[]).expect("first init");
+        let key = dir.join("key.pem");
+        let cert = dir.join("cert.pem");
+        let key_before = std::fs::read(&key).expect("key");
+        let cert_before = std::fs::read(&cert).expect("cert");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        super::generate_tls_cert_in(tls_dir, "127.0.0.1", &[]).expect("second init");
+
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(std::fs::read(&key).expect("key"), key_before);
+        assert_eq!(std::fs::read(&cert).expect("cert"), cert_before);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A run that the SAN check refuses still narrows the key it keeps: the
+    /// existing certificate does not cover the new `--tls-san`, so init
+    /// fails, and the key it found is 0600 anyway.
+    #[test]
+    fn a_kept_key_is_narrowed_even_when_the_san_check_refuses_the_run() {
+        let dir = scratch_dir("kept-san");
+        let tls_dir = dir.to_str().expect("utf-8 path");
+        super::generate_tls_cert_in(tls_dir, "127.0.0.1", &[]).expect("first init");
+        let key = dir.join("key.pem");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let refused =
+            super::generate_tls_cert_in(tls_dir, "127.0.0.1", &["db.example.test".to_owned()]);
+
+        assert!(refused.is_err(), "the SAN check should refuse the run");
+        assert_eq!(mode(&key), 0o600);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
