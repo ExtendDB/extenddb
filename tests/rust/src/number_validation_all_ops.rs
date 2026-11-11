@@ -409,10 +409,15 @@ fn expected_value(value: &str) -> ExpectedAttributeValue {
         .build()
 }
 
-/// The two values measured in `Expected` on 2026-11-11, with the message
-/// each one answers after the prefix.
-fn expected_rows() -> [(&'static str, &'static str); 2] {
-    [("abc", NUMERIC), ("1E2147483648", OVERFLOW)]
+/// The three values measured in `Expected` on 2026-11-11, with the message
+/// each one answers after the prefix. An empty N answers the message with
+/// nothing after the colon.
+fn expected_rows() -> [(&'static str, &'static str); 3] {
+    [
+        ("abc", NUMERIC),
+        ("1E2147483648", OVERFLOW),
+        ("", "The parameter cannot be converted to a numeric value: "),
+    ]
 }
 
 #[tokio::test]

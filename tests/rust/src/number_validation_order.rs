@@ -267,9 +267,11 @@ fn assert_name_or_overflow(err: &str) {
     );
 }
 
-/// Assert the refusal of a 37-character `ClientRequestToken`. The member name
-/// in the service's message was `ClientRequestToken` on 2026-11-11 and
-/// `clientRequestToken` on 2026-10-27, so the check ignores its case.
+/// Assert the refusal of a 37-character `ClientRequestToken`. The service's
+/// message names the member `ClientRequestToken`, measured twice on
+/// 2026-11-11 (06:34 and 08:25 UTC), where it named it `clientRequestToken`
+/// on 2026-10-27. ExtendDB still writes `clientRequestToken`, which issue
+/// #959 tracks, so the check ignores the case of the member name.
 pub(crate) fn assert_token_refused(err: &str) {
     let lower = err.to_ascii_lowercase();
     assert!(

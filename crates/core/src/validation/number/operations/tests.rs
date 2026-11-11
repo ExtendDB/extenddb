@@ -427,7 +427,8 @@ fn transact_write_item_checks_values_then_key_or_item() {
         "ExpressionAttributeValues": {":v": {"L": [{"N": "1E126"}]}},
     }}));
     assert_eq!(refused(transact_write_item(&put)), OVERFLOW);
-    // Measured 2026-11-11: `1E2147483647` is a `Number overflow`.
+    // Measured 2026-11-11 on a TransactWriteItems Delete key: `1E2147483647`
+    // is a `Number overflow`, with no prefix.
     let delete = transact(json!({"Delete": {
         "TableName": "t",
         "Key": {"pk": {"N": "1E2147483647"}},
@@ -536,12 +537,14 @@ fn expected(map: Value) -> HashMap<String, ExpectedAttributeValue> {
 #[test]
 fn expected_values_carry_the_prefix() {
     // Measured 2026-11-11 on items that do not exist: a Value on PutItem,
-    // DeleteItem and UpdateItem, and an EQ AttributeValueList on PutItem.
-    // The last two rows pin a choice of these checks: a later list member
-    // and a number nested in a map are read too.
+    // DeleteItem and UpdateItem, and an EQ AttributeValueList on PutItem,
+    // each with `abc`, `1E2147483648` and an empty N. The last two rows pin
+    // a choice of these checks: a later list member and a number nested in
+    // a map are read too.
     for (entry, want) in [
         (json!({"Value": {"N": "abc"}}), format!("{NUMERIC}: abc")),
         (json!({"Value": {"N": "1E2147483648"}}), OVERFLOW.to_owned()),
+        (json!({"Value": {"N": ""}}), format!("{NUMERIC}: ")),
         (
             json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "abc"}]}),
             format!("{NUMERIC}: abc"),
@@ -549,6 +552,10 @@ fn expected_values_carry_the_prefix() {
         (
             json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1E2147483648"}]}),
             OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": ""}]}),
+            format!("{NUMERIC}: "),
         ),
         (
             json!({"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "1"}, {"N": "1E126"}]}),

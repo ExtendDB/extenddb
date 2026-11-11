@@ -135,7 +135,9 @@ pub fn put_item_values(input: &PutItemInput) -> Result<(), DynamoDbError> {
 /// exist: `abc` and `1E2147483648` in `Expected {a: {Value: N}}` answer a
 /// `ValidationException` on `PutItem`, `DeleteItem` and `UpdateItem`, and in
 /// `Expected {a: {ComparisonOperator: EQ, AttributeValueList: [N]}}` on
-/// `PutItem`, with the prefix and the number message. `1E125` in the same
+/// `PutItem`, with the prefix and the number message. An empty `N` in the
+/// same places answers the prefix and `The parameter cannot be converted to a
+/// numeric value: `, with nothing after the colon. `1E125` in the same
 /// `PutItem` request answers `ConditionalCheckFailedException`, so the number
 /// is read ahead of the condition. Attributes are visited in name order, and
 /// a `Value` ahead of the list.
