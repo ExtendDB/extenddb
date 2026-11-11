@@ -661,10 +661,7 @@ fn query_unreadable_partition_equality_binds_no_other_clause() {
 /// measured.
 #[test]
 fn query_duplicate_key_condition_binds_the_partition_equality() {
-    for kce in [
-        "pk = :own AND sk = :b AND sk = :c",
-        "pk = :own AND pk = :b",
-    ] {
+    for kce in ["pk = :own AND sk = :b AND sk = :c", "pk = :own AND pk = :b"] {
         let input = json!({
             "TableName": "t",
             "KeyConditionExpression": kce,

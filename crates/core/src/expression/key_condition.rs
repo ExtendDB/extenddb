@@ -1025,8 +1025,8 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 
     // Comparison operator
-    let op =
-        try_comparator(&tokens[*pos]).ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
+    let op = try_comparator(&tokens[*pos])
+        .ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
     *pos += 1;
 
     let value = parse_key_value(tokens, pos)?;
@@ -1044,7 +1044,8 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
 /// this. A second condition on the same attribute is reported first
 /// (measured 2026-11-11: `pk = :a AND pk <> :b` answers the
 /// one-condition-per-key message).
-const NE_UNSUPPORTED: &str = "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE";
+const NE_UNSUPPORTED: &str =
+    "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE";
 
 /// The refusal of a clause with no comparison operator, and of a `contains`
 /// clause. A second condition on the same attribute is reported ahead of
@@ -2198,8 +2199,16 @@ mod tests {
         let none = HashMap::new();
         for (expr, values, want) in [
             // Every placeholder defined, `#u` the only undefined reference.
-            ("#u = :a AND #u = :b", values_of("#u = :a AND #u = :b"), "#u"),
-            ("#u = :a AND #u > :b", values_of("#u = :a AND #u > :b"), "#u"),
+            (
+                "#u = :a AND #u = :b",
+                values_of("#u = :a AND #u = :b"),
+                "#u",
+            ),
+            (
+                "#u = :a AND #u > :b",
+                values_of("#u = :a AND #u > :b"),
+                "#u",
+            ),
             (
                 "#u = :a AND sk = :b AND sk = :c",
                 values_of("#u = :a AND sk = :b AND sk = :c"),
@@ -2221,11 +2230,7 @@ mod tests {
             ("sk = :b AND pk = :a", no_values(), ":b"),
             ("pk = :b AND pk = :a", no_values(), ":b"),
             ("pk = :a AND pk = :b AND #u = :c", no_values(), ":a"),
-            (
-                "pk = :q AND pk = :b AND #u = :c",
-                values_of(":b :c"),
-                ":q",
-            ),
+            ("pk = :q AND pk = :b AND #u = :c", values_of(":b :c"), ":q"),
             ("pk = :a AND pk = :missing", values_of(":a"), ":missing"),
             ("#k = :v", no_values(), "#k"),
             ("pk = :v", no_values(), ":v"),
@@ -2309,7 +2314,10 @@ mod tests {
         for expr in ["pk = :a AND pk <> :b", "pk = :a AND contains(pk, :b)"] {
             let tokens = tokenize(expr).unwrap();
             assert!(parse_key_condition(&tokens).is_err(), "expr {expr}");
-            assert!(key_condition_clause_operands(&tokens).is_err(), "expr {expr}");
+            assert!(
+                key_condition_clause_operands(&tokens).is_err(),
+                "expr {expr}"
+            );
         }
     }
 
