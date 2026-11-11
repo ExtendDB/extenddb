@@ -962,25 +962,40 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         ));
     }
 
-    // begins_with(path, :val), and contains(path, :val), which a key condition
-    // refuses once a second condition on its attribute has been looked for.
+    // begins_with(path, :val)
     if let Token::Ident(name) = &tokens[*pos]
-        && (name.eq_ignore_ascii_case("begins_with") || name.eq_ignore_ascii_case("contains"))
+        && name.eq_ignore_ascii_case("begins_with")
         && *pos + 1 < tokens.len()
         && tokens[*pos + 1] == Token::LParen
     {
-        let begins_with = name.eq_ignore_ascii_case("begins_with");
         *pos += 1; // skip function name
         parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
         let path = parse_key_operand_path(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
         let prefix = parse_key_value(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
-        return Ok(if begins_with {
-            RawClause::BeginsWith(path, prefix)
-        } else {
-            RawClause::Unsupported(path, EXPECTED_COMPARISON_OPERATOR)
-        });
+        return Ok(RawClause::BeginsWith(path, prefix));
+    }
+
+    // contains(name, :val), with one top-level attribute and one value, is
+    // refused once a second condition on that attribute has been looked for
+    // (measured 2026-11-11 for that spelling). Any other contains clause is
+    // refused here with the message the parser gave it before.
+    if let Token::Ident(name) = &tokens[*pos]
+        && name == "contains"
+        && tokens.get(*pos + 1) == Some(&Token::LParen)
+    {
+        let path = match tokens.get(*pos + 2..*pos + 6) {
+            Some([attr, Token::Comma, Token::Placeholder(_), Token::RParen]) => {
+                single_attribute_path(attr)
+            }
+            _ => None,
+        };
+        let Some(path) = path else {
+            return Err(validation_err(EXPECTED_COMPARISON_OPERATOR));
+        };
+        *pos += 6;
+        return Ok(RawClause::Unsupported(path, EXPECTED_COMPARISON_OPERATOR));
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi
@@ -999,10 +1014,16 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
                 .ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
             *pos += 1;
 
-            let path = parse_key_operand_path(tokens, pos)?;
+            // `:value <> name` with one top-level attribute is refused once a
+            // second condition on that attribute has been looked for. Any
+            // other `<>` clause is refused here, as before.
             if op == CompareOp::Ne {
-                return Ok(RawClause::Unsupported(path, NE_UNSUPPORTED));
+                return match parse_key_operand_path(tokens, pos) {
+                    Ok(path) if path.len() == 1 => Ok(RawClause::Unsupported(path, NE_UNSUPPORTED)),
+                    _ => Err(validation_err(NE_UNSUPPORTED)),
+                };
             }
+            let path = parse_key_operand_path(tokens, pos)?;
             // Key conditions are stored path-first, so reverse the operator when
             // the source expression puts the value placeholder on the left.
             let op = reverse_comparator(op);
@@ -1029,14 +1050,35 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         .ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
     *pos += 1;
 
+    // `name <> :value` with one top-level attribute is refused once a second
+    // condition on that attribute has been looked for. Any other `<>` clause
+    // is refused here, as before.
+    if op == CompareOp::Ne {
+        return match tokens.get(*pos) {
+            Some(Token::Placeholder(_)) if path.len() == 1 => {
+                *pos += 1;
+                Ok(RawClause::Unsupported(path, NE_UNSUPPORTED))
+            }
+            _ => Err(validation_err(NE_UNSUPPORTED)),
+        };
+    }
+
     let value = parse_key_value(tokens, pos)?;
 
-    if op == CompareOp::Ne {
-        Ok(RawClause::Unsupported(path, NE_UNSUPPORTED))
-    } else if op == CompareOp::Eq {
+    if op == CompareOp::Eq {
         Ok(RawClause::Eq(path, value))
     } else {
         Ok(RawClause::Compare(path, op, value))
+    }
+}
+
+/// The path of a `#name` or plain attribute token, or `None` for any other
+/// token.
+fn single_attribute_path(token: &Token) -> Option<Vec<PathElement>> {
+    match token {
+        Token::Ident(name) => Some(vec![PathElement::Attribute(name.clone())]),
+        Token::NameRef(name) => Some(vec![PathElement::Attribute(format!("#{name}"))]),
+        _ => None,
     }
 }
 
@@ -2319,6 +2361,46 @@ mod tests {
                 "expr {expr}"
             );
         }
+    }
+
+    /// Only `name <> :value`, `:value <> name` and `contains(name, :value)`,
+    /// with one top-level attribute, wait for the duplicate check. Any other
+    /// `<>` or `contains` clause is refused where the parser meets it, with
+    /// the message it gave before, ahead of a duplicate. The service's text
+    /// for these shapes differs and is not changed here (measured 2026-11-11
+    /// for `pk = :a AND contains(sk)`).
+    #[test]
+    fn other_ne_and_contains_clauses_keep_their_refusal() {
+        let values = values_of(":a :b :c");
+        let none = HashMap::new();
+        for (expr, want) in [
+            ("pk = :a AND contains(sk)", EXPECTED_COMPARISON_OPERATOR),
+            ("pk = :a AND contains(pk)", EXPECTED_COMPARISON_OPERATOR),
+            (
+                "pk = :a AND contains(sk, :b, :c)",
+                EXPECTED_COMPARISON_OPERATOR,
+            ),
+            ("pk = :a AND contains(:b, sk)", EXPECTED_COMPARISON_OPERATOR),
+            ("pk = :a AND contains(sk, sk)", EXPECTED_COMPARISON_OPERATOR),
+            (
+                "pk = :a AND contains(pk.x, :b)",
+                EXPECTED_COMPARISON_OPERATOR,
+            ),
+            ("pk = :a AND CONTAINS(pk, :b)", EXPECTED_COMPARISON_OPERATOR),
+            ("pk = :a AND pk <> pk", NE_UNSUPPORTED),
+            ("pk = :a AND pk.x <> :b", NE_UNSUPPORTED),
+            ("pk = :a AND :b <> pk.x", NE_UNSUPPORTED),
+            ("pk = :a AND :b <> :c", NE_UNSUPPORTED),
+        ] {
+            assert_refused(parse_with(expr, &none, &values), want, expr);
+        }
+        // A `<>` with nothing after it.
+        let tokens = tokenize("pk = :a AND pk <>").unwrap();
+        assert_refused(
+            parse_key_condition_with_maps(&tokens, &ExpressionMaps::new(none, values)),
+            NE_UNSUPPORTED,
+            "pk = :a AND pk <>",
+        );
     }
 
     #[test]
