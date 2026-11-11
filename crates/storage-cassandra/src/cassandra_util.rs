@@ -119,7 +119,9 @@ impl PolicySession for CassandraSession {
         let query = query.as_ref().to_owned();
         debug_assert!(
             shape_error(kind, &query).is_none(),
-            "{kind:?} statement: {}: {query}",
+            // The CQL text is not in the message: it can hold a password
+            // (CREATE ROLE) or account names.
+            "{kind:?} statement: {}",
             shape_error(kind, &query).unwrap_or_default()
         );
         async move { self.query_with_params(query, params(kind, values)).await }

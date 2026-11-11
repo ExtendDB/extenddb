@@ -41,6 +41,10 @@ mod tests {
             message.contains("an LWT must have an IF condition"),
             "{message}"
         );
+        assert!(
+            !message.contains("ks.t"),
+            "the message must not hold the CQL text: {message}"
+        );
     }
 
     /// `run_batch` panics on a batch that was not built by
