@@ -9,6 +9,79 @@ use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::is_fk_violation;
 
+/// Delete the inline policies and the permissions boundary stored under a
+/// principal's name, inside the caller's transaction.
+///
+/// `iam_policies` and `iam_permissions_boundaries` name their principal by
+/// `(principal_type, principal_name)` and have no foreign key to it, so the
+/// cascades that remove a principal's tags, access keys and memberships do not
+/// reach them. A principal's delete calls this so that a later principal with
+/// the same name does not get them, and a principal's create calls it so that
+/// rows a delete left behind before this existed are removed too.
+pub(super) async fn delete_principal_attachments(
+    conn: &mut sqlx::PgConnection,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> OpResult<()> {
+    for table in ["iam_policies", "iam_permissions_boundaries"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} \
+             WHERE account_id = $1 AND principal_type = $2 AND principal_name = $3"
+        ))
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            database_error(
+                &format!("delete {principal_type} {principal_name}'s rows in {table}"),
+                &e,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Delete the failed logins recorded under a user's sign-in name,
+/// `account_id/user_name`, inside the caller's transaction.
+///
+/// `login_attempts` is keyed by the name a login gave, not by the user, so a
+/// user created with the name of a deleted one would otherwise start with the
+/// deleted user's failures and could be refused with 429 on its first correct
+/// password. A user's delete and its create both call this: the create also
+/// clears failures recorded against the name while no user had it.
+pub(super) async fn delete_login_history(
+    conn: &mut sqlx::PgConnection,
+    account_id: &str,
+    user_name: &str,
+) -> OpResult<()> {
+    sqlx::query("DELETE FROM login_attempts WHERE principal = $1")
+        .bind(format!("{account_id}/{user_name}"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| database_error(&format!("delete user {user_name}'s login attempts"), &e))?;
+    Ok(())
+}
+
+/// Delete the failed logins recorded under every sign-in name of an account,
+/// `account_id/<anything>`, inside the caller's transaction. `starts_with`,
+/// not `LIKE`, so no character of the name is a wildcard.
+pub(super) async fn delete_account_login_history(
+    conn: &mut sqlx::PgConnection,
+    account_id: &str,
+) -> OpResult<()> {
+    sqlx::query("DELETE FROM login_attempts WHERE starts_with(principal, $1)")
+        .bind(format!("{account_id}/"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            database_error(&format!("delete account {account_id}'s login attempts"), &e)
+        })?;
+    Ok(())
+}
+
 impl PostgresCatalogStore {
     // ── Policies ───────────────────────────────────────────────────
 

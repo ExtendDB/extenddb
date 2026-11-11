@@ -364,6 +364,51 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: a deleted principal or account leaves nothing behind
+
+**What changed.** Deleting a user, group, role or account now removes
+everything it owns, on every backend:
+
+- A user's access keys, group memberships, tags, inline policies and
+  permissions boundary. Before, SQLite and PostgreSQL kept its inline policies
+  and boundary, and MongoDB and Cassandra kept its boundary and, on MongoDB,
+  its tags.
+- A group's inline policies and memberships. Before, every backend kept its
+  inline policies, and MongoDB and Cassandra kept its memberships.
+- A role's inline policies, boundary, tags and sessions. Before, every backend
+  kept its inline policies and boundary, and MongoDB and Cassandra kept its
+  tags and sessions.
+- On MongoDB and Cassandra, an account's users, groups, roles and all they
+  own. Before, only the account record (and on Cassandra its backups) was
+  removed, and the rest stayed in the catalog.
+- A user's failed login attempts, which the login rate limit counts by
+  sign-in name (`account_id/user_name`), and on an account's delete those of
+  every sign-in name in the account. Before, every backend kept them until they
+  aged out, so a user created with the name within the 15-minute window could
+  be refused with HTTP 429 on its first correct password.
+
+A user, group or role created later with the same name got what the deleted
+one left, and so its permissions. Now creating a user, group or role also
+removes anything stored under its name, and creating an account on MongoDB or
+Cassandra removes anything stored under its id, so records an earlier release
+left behind are cleared when the name or id is used again. On MongoDB and
+Cassandra a user, access key, session or role of an account that no longer
+exists is treated as unknown.
+
+The management API and the console also refuse an inline policy or
+permissions boundary put on a user, group or role that does not exist, with
+HTTP 404 and `IAM user not found` (or `group`, `role`), where they answered
+204 and stored it under the name. On MongoDB, `create-account` refuses an
+account ID that is already in use with `Account already exists`, as the other
+backends do; before, it created a second account with that ID.
+
+**Who is affected.** A script that attaches a policy or boundary before it
+creates the principal now gets HTTP 404 and must create the principal first.
+A deployment that relied on a deleted principal's policies coming back when it
+was created again must attach them again. No catalog migration is required.
+
+---
+
 ### v0.1.15: metrics carry their account (catalog migration required)
 
 **What changed.** The metrics of a request (capacity, latency, errors, throttles, returned items and bytes, `RequestCount`), and the TTL metrics of a table, now carry the account they were recorded for. The catalog stores the account with each metrics row (migration 10, `account_metrics`), so two accounts that each have a table of the same name keep their own rows: before this release they wrote to one row, and the counts and latencies `/metrics` reported for that name were the two tables' added together. `/metrics` and the console's `/console/metrics-data` report the account as an `AccountId` dimension, beside `TableName`, `GlobalSecondaryIndexName` and `Operation`, and `/metrics` takes an `account_id` query parameter that returns one account's metrics only. Metrics of the whole deployment, such as the connection pool, worker, storage query and backup job metrics, have no `AccountId` dimension, and the `account_id` filter leaves them out. The filter also applies to the latency `segments` of the response. `AccountId` is ExtendDB's own dimension, not one of CloudWatch's DynamoDB dimensions. The console dashboard still serves admin sessions only and shows every account's metrics: its raw metrics table names each row's account, and its charts add the accounts together.
