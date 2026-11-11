@@ -41,8 +41,8 @@ use super::{
 };
 use crate::error::DynamoDbError;
 use crate::types::{
-    AttributeValue, BatchWriteItemInput, DeleteItemInput, GetItemInput, Item, PutItemInput,
-    TransactGetItem, TransactWriteItem, UpdateItemInput,
+    AttributeValue, BatchWriteItemInput, DeleteItemInput, ExpectedAttributeValue, GetItemInput,
+    Item, PutItemInput, TransactGetItem, TransactWriteItem, UpdateItemInput,
 };
 
 /// The service's text for a value that is not a number.
@@ -121,6 +121,42 @@ pub fn update_item_key(input: &UpdateItemInput) -> Result<(), DynamoDbError> {
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn put_item_values(input: &PutItemInput) -> Result<(), DynamoDbError> {
     values_nesting_then_numbers(input.expression_attribute_values.as_ref()).map_err(single_write)
+}
+
+/// Refuse a legacy `Expected` map of `PutItem`, `DeleteItem` or `UpdateItem`
+/// holding a number the service cannot read in a `Value` or an
+/// `AttributeValueList` member.
+///
+/// Measured 2026-11-11 (us-east-1, each request twice) on items that do not
+/// exist: `abc` and `1E2147483648` in `Expected {a: {Value: N}}` answer a
+/// `ValidationException` on `PutItem`, `DeleteItem` and `UpdateItem`, and in
+/// `Expected {a: {ComparisonOperator: EQ, AttributeValueList: [N]}}` on
+/// `PutItem`, with the prefix and the number message. `1E125` in the same
+/// `PutItem` request answers `ConditionalCheckFailedException`, so the number
+/// is read ahead of the condition. Attributes are visited in name order, and
+/// a `Value` ahead of the list.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's text.
+pub fn expected_values(
+    expected: Option<&HashMap<String, ExpectedAttributeValue>>,
+) -> Result<(), DynamoDbError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let mut names: Vec<&String> = expected.keys().collect();
+    names.sort();
+    for name in names {
+        let entry = &expected[name];
+        entry
+            .value
+            .iter()
+            .chain(entry.attribute_value_list.iter().flatten())
+            .try_for_each(|value| attribute_numbers(EmptyText::WithColon, value))
+            .map_err(single_write)?;
+    }
+    Ok(())
 }
 
 /// Refuse a `PutItem` item holding a number the service cannot read or a

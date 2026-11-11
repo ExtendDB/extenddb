@@ -88,6 +88,9 @@ pub async fn handle_delete_item(
     // check; the service answered either on two sends.
     // The later nesting check repeats this one and cannot fail after it.
     extenddb_core::validation::number::operations::delete_item_values(&input)?;
+    // A legacy Expected value's number is read ahead of the condition
+    // (measured 2026-11-11).
+    extenddb_core::validation::number::operations::expected_values(input.expected.as_ref())?;
     extenddb_core::expression::validate_expression_param_usage(
         input.expression_attribute_names.as_ref(),
         has_condition,

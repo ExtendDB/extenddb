@@ -4,12 +4,14 @@
 //! Number (`N`) validation on the operations that did not read a number at
 //! all (#618): the keys of `GetItem`, `DeleteItem`, `UpdateItem`,
 //! `BatchGetItem` and `TransactGetItems`, the items and keys of
-//! `BatchWriteItem` and `TransactWriteItems`, and the
+//! `BatchWriteItem` and `TransactWriteItems`, the
 //! `ExpressionAttributeValues` of `PutItem`, `DeleteItem` and
-//! `TransactWriteItems`.
+//! `TransactWriteItems`, and the legacy `Expected` values of `PutItem`,
+//! `DeleteItem` and `UpdateItem`.
 //!
 //! Every message below was measured against DynamoDB on 2026-10-27
-//! (us-east-1), each request sent twice with the same answer both times.
+//! (us-east-1), each request sent twice with the same answer both times,
+//! except where a test gives another date.
 //! `PutItem`, `UpdateItem` and `DeleteItem` start the message with
 //! "1 validation error detected: " and the other operations do not.
 //! `TransactWriteItems` reports a value in `ExpressionAttributeValues` as
@@ -21,7 +23,8 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, ConditionCheck, Delete, DeleteRequest, Get, KeysAndAttributes, Put, PutRequest,
+    AttributeAction, AttributeValue, AttributeValueUpdate, ComparisonOperator, ConditionCheck,
+    Delete, DeleteRequest, ExpectedAttributeValue, Get, KeysAndAttributes, Put, PutRequest,
     TransactGetItem, TransactWriteItem, Update, WriteRequest,
 };
 use aws_smithy_runtime_api::client::result::SdkError;
@@ -397,6 +400,98 @@ async fn transact_write_items_rejects_a_delete_condition_value_out_of_range() {
         .expect("delete");
     let err = transact_write(vec![txn_delete(delete)]).await;
     assert_refused(&err.unwrap_err(), &in_values(OVERFLOW));
+}
+
+// ---- legacy Expected ----
+
+fn expected_value(value: &str) -> ExpectedAttributeValue {
+    ExpectedAttributeValue::builder()
+        .value(n_raw(value))
+        .build()
+}
+
+/// The two values measured in `Expected` on 2026-11-11, with the message
+/// each one answers after the prefix.
+fn expected_rows() -> [(&'static str, &'static str); 2] {
+    [("abc", NUMERIC), ("1E2147483648", OVERFLOW)]
+}
+
+#[tokio::test]
+async fn put_item_rejects_a_number_in_a_legacy_expected_value_or_list() {
+    // Measured 2026-11-11 on an item that does not exist: a
+    // ValidationException with the prefix, not ConditionalCheckFailedException.
+    let t = tables().await;
+    for (value, message) in expected_rows() {
+        let result = client()
+            .put_item()
+            .table_name(&t.simple_key_string)
+            .set_item(Some(string_key("e618")))
+            .expected("amount", expected_value(value))
+            .send()
+            .await;
+        assert_refused(&refused(result), &format!("{PREFIX}{message}"));
+
+        let eq = ExpectedAttributeValue::builder()
+            .comparison_operator(ComparisonOperator::Eq)
+            .attribute_value_list(n_raw(value))
+            .build();
+        let result = client()
+            .put_item()
+            .table_name(&t.simple_key_string)
+            .set_item(Some(string_key("e618")))
+            .expected("amount", eq)
+            .send()
+            .await;
+        assert_refused(&refused(result), &format!("{PREFIX}{message}"));
+    }
+}
+
+#[tokio::test]
+async fn delete_and_update_item_reject_a_number_in_a_legacy_expected_value() {
+    // Measured 2026-11-11 on items that do not exist.
+    let t = tables().await;
+    for (value, message) in expected_rows() {
+        let result = client()
+            .delete_item()
+            .table_name(&t.simple_key_string)
+            .set_key(Some(string_key("e618")))
+            .expected("amount", expected_value(value))
+            .send()
+            .await;
+        assert_refused(&refused(result), &format!("{PREFIX}{message}"));
+
+        let put_a = AttributeValueUpdate::builder()
+            .action(AttributeAction::Put)
+            .value(s("x"))
+            .build();
+        let result = client()
+            .update_item()
+            .table_name(&t.simple_key_string)
+            .set_key(Some(string_key("e618")))
+            .attribute_updates("amount", put_a)
+            .expected("amount", expected_value(value))
+            .send()
+            .await;
+        assert_refused(&refused(result), &format!("{PREFIX}{message}"));
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_expected_number_in_range_reaches_the_condition() {
+    // Measured 2026-11-11: `1E125` in the same PutItem request fails the
+    // condition, since the item does not exist.
+    let t = tables().await;
+    let result = client()
+        .put_item()
+        .table_name(&t.simple_key_string)
+        .set_item(Some(string_key("e618")))
+        .expected("amount", expected_value("1E125"))
+        .send()
+        .await;
+    assert_eq!(
+        refused(result),
+        "ConditionalCheckFailedException:The conditional request failed"
+    );
 }
 
 // ---- behaviour around the checks ----

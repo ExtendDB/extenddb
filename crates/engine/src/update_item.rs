@@ -116,6 +116,9 @@ pub(crate) async fn handle_update_item_with(
             ("ConditionExpression", has_condition),
         ],
     )?;
+    // A legacy Expected value's number is read ahead of the condition
+    // (measured 2026-11-11).
+    extenddb_core::validation::number::operations::expected_values(input.expected.as_ref())?;
 
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =

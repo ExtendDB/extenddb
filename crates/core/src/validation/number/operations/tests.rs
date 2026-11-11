@@ -470,6 +470,62 @@ fn several_malformed_values_are_reported_in_placeholder_order() {
     );
 }
 
+fn expected(map: Value) -> HashMap<String, ExpectedAttributeValue> {
+    serde_json::from_value(map).unwrap()
+}
+
+#[test]
+fn expected_values_carry_the_prefix() {
+    // Measured 2026-11-11 on items that do not exist: a Value on PutItem,
+    // DeleteItem and UpdateItem, and an EQ AttributeValueList on PutItem.
+    // The last two rows pin a choice of these checks: a later list member
+    // and a number nested in a map are read too.
+    for (entry, want) in [
+        (json!({"Value": {"N": "abc"}}), format!("{NUMERIC}: abc")),
+        (json!({"Value": {"N": "1E2147483648"}}), OVERFLOW.to_owned()),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "abc"}]}),
+            format!("{NUMERIC}: abc"),
+        ),
+        (
+            json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1E2147483648"}]}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "1"}, {"N": "1E126"}]}),
+            OVERFLOW.to_owned(),
+        ),
+        (
+            json!({"Value": {"M": {"x": {"N": "abc"}}}}),
+            format!("{NUMERIC}: abc"),
+        ),
+    ] {
+        let map = expected(json!({"a": entry.clone()}));
+        assert_eq!(
+            refused(expected_values(Some(&map))),
+            format!("1 validation error detected: {want}"),
+            "{entry}"
+        );
+    }
+    // `1E125` answered ConditionalCheckFailedException: it passes this check.
+    expected_values(Some(&expected(json!({"a": {"Value": {"N": "1E125"}}})))).unwrap();
+    expected_values(Some(&expected(json!({"a": {"Exists": false}})))).unwrap();
+    expected_values(None).unwrap();
+}
+
+#[test]
+fn expected_values_are_read_in_attribute_name_order() {
+    // Pins a choice of these checks, as for the placeholders above.
+    let map = expected(json!({
+        "b": {"Value": {"N": "abc"}},
+        "a": {"Value": {"N": "xyz"}},
+    }));
+    assert_eq!(
+        refused(expected_values(Some(&map))),
+        format!("1 validation error detected: {NUMERIC}: xyz")
+    );
+}
+
 /// A value nested `levels` maps deep.
 fn deep(levels: usize) -> Value {
     let mut value = json!({"S": "leaf"});
