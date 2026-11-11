@@ -32,21 +32,17 @@
 //! service named a different one on two sends of the same request, so these
 //! checks visit placeholders in name order. The attributes of a key or an item
 //! are visited in the order of the map.
+//!
+//! [`validate_and_normalize_number`]: super::validate_and_normalize_number
 
 use std::collections::HashMap;
 
-use super::{
-    MAX_MAGNITUDE, MAX_SIGNIFICANT_DIGITS, MIN_MAGNITUDE, overflow_err, too_many_digits_err,
-    underflow_err, validate_and_normalize_number,
-};
+use super::{MAX_MAGNITUDE, MAX_SIGNIFICANT_DIGITS, MIN_MAGNITUDE, NumberFault, normalize_number};
 use crate::error::DynamoDbError;
 use crate::types::{
     AttributeValue, BatchWriteItemInput, DeleteItemInput, ExpectedAttributeValue, GetItemInput,
     Item, PutItemInput, TransactGetItem, TransactWriteItem, UpdateItemInput,
 };
-
-/// The service's text for a value that is not a number.
-const NUMERIC_VALUE: &str = "The parameter cannot be converted to a numeric value";
 
 /// The prefix `PutItem`, `UpdateItem` and `DeleteItem` put on the message.
 const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
@@ -264,9 +260,8 @@ pub enum ImportRowFault {
     /// file will not be processed.").
     Malformed,
     /// A number outside the supported range or with more than 38 digits, with
-    /// the service's message for it. The service refuses the row and imports
-    /// the rows after it.
-    OutOfRange(String),
+    /// its fault. The service refuses the row and imports the rows after it.
+    OutOfRange(NumberFault),
 }
 
 /// Refuse an `ImportTable` row holding a number the service cannot read.
@@ -314,18 +309,13 @@ pub fn import_row(item: &Item) -> Result<(), ImportRowFault> {
     for n in numbers {
         match validate_number_i32_scale(n) {
             Ok(()) => {}
-            // Every message that check gives for a value that is not a number
-            // starts with this text, and none of its range messages does; the
-            // tests pin the split for every measured value.
-            Err(message) if message.starts_with(NUMERIC_VALUE) => {
-                return Err(ImportRowFault::Malformed);
-            }
-            Err(message) => {
-                out_of_range.get_or_insert(message);
+            Err(fault) if fault.is_not_a_number() => return Err(ImportRowFault::Malformed),
+            Err(fault) => {
+                out_of_range.get_or_insert(fault);
             }
         }
     }
-    out_of_range.map_or(Ok(()), |message| Err(ImportRowFault::OutOfRange(message)))
+    out_of_range.map_or(Ok(()), |fault| Err(ImportRowFault::OutOfRange(fault)))
 }
 
 /// Every number in `value`: an `N`, the members of an `NS`, and the numbers
@@ -393,10 +383,11 @@ fn attribute_numbers(empty: EmptyText, value: &AttributeValue) -> Result<(), Str
 /// it, with the operation's text for an empty value.
 fn number_text(empty: EmptyText, n: &str) -> Result<(), String> {
     match empty {
-        EmptyText::WithColon if n.is_empty() => Err(format!("{NUMERIC_VALUE}: ")),
-        // `validate_and_normalize_number` answers an empty value without the
-        // colon.
-        _ => validate_and_normalize_number(n).map(drop).map_err(message),
+        EmptyText::WithColon if n.is_empty() => Err(format!("{}: ", NumberFault::Empty.text())),
+        // `NumberFault::message` gives an empty value without the colon.
+        _ => normalize_number(n)
+            .map(drop)
+            .map_err(|fault| fault.message(n)),
     }
 }
 
@@ -433,14 +424,20 @@ fn number_text(empty: EmptyText, n: &str) -> Result<(), String> {
 /// Unicode decimal digit as a digit, and so does the service (`\u{ff15}` is
 /// stored as `5` on every operation measured). This check refuses those, as
 /// [`validate_and_normalize_number`] does.
-fn validate_number_i32_scale(s: &str) -> Result<(), String> {
+///
+/// [`validate_and_normalize_number`]: super::validate_and_normalize_number
+fn validate_number_i32_scale(s: &str) -> Result<(), NumberFault> {
     if s.is_empty() {
-        return Err(NUMERIC_VALUE.to_owned());
+        return Err(NumberFault::Empty);
     }
-    let malformed = || format!("{NUMERIC_VALUE}: {s}");
     let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
     let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().map_err(|_| malformed())?),
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .map_err(|_| NumberFault::Malformed)?,
+        ),
         None => (unsigned, 0),
     };
     let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -449,25 +446,25 @@ fn validate_number_i32_scale(s: &str) -> Result<(), String> {
         || !digits_only(int_part)
         || !digits_only(frac_part)
     {
-        return Err(malformed());
+        return Err(NumberFault::Malformed);
     }
     let scale = i64::try_from(frac_part.len())
         .ok()
         .and_then(|fraction_digits| i32::try_from(fraction_digits - i64::from(exponent)).ok())
-        .ok_or_else(malformed)?;
+        .ok_or(NumberFault::Malformed)?;
 
     let digits = format!("{int_part}{frac_part}");
     let unscaled = digits.trim_start_matches('0');
-    let precision = i32::try_from(unscaled.len().max(1)).map_err(|_| malformed())?;
+    let precision = i32::try_from(unscaled.len().max(1)).map_err(|_| NumberFault::Malformed)?;
     let magnitude = precision.wrapping_sub(scale);
     if i64::from(magnitude) > MAX_MAGNITUDE {
-        return Err(message(overflow_err()));
+        return Err(NumberFault::Overflow);
     }
     if i64::from(magnitude) < MIN_MAGNITUDE {
-        return Err(message(underflow_err()));
+        return Err(NumberFault::Underflow);
     }
     if unscaled.trim_end_matches('0').len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(message(too_many_digits_err()));
+        return Err(NumberFault::TooManyDigits);
     }
     Ok(())
 }

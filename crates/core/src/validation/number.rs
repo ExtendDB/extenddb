@@ -15,14 +15,95 @@ const MIN_EXPONENT: i32 = -130;
 pub(super) const MAX_MAGNITUDE: i64 = MAX_EXPONENT as i64 + 1;
 pub(super) const MIN_MAGNITUDE: i64 = MIN_EXPONENT as i64 + 1;
 
+/// The service's text for a value that is not a number. A malformed value
+/// is named after a colon; an empty one is not.
+const NOT_A_NUMBER: &str = "The parameter cannot be converted to a numeric value";
+
+/// Why a string is not a number `DynamoDB` can store, as
+/// [`normalize_number`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberFault {
+    /// An empty string, e.g. `{"N":""}`.
+    Empty,
+    /// A string that is not a number.
+    Malformed,
+    /// A magnitude above the supported range.
+    Overflow,
+    /// A magnitude below the supported range.
+    Underflow,
+    /// More than 38 significant digits.
+    TooManyDigits,
+}
+
+impl NumberFault {
+    /// Whether the string is not a number at all, where the other faults are
+    /// numbers out of range or with too many digits.
+    #[must_use]
+    pub fn is_not_a_number(self) -> bool {
+        matches!(self, Self::Empty | Self::Malformed)
+    }
+
+    /// The service's message for this fault, without the offending value.
+    /// `DynamoDB` names the value only for a malformed one; see
+    /// [`NumberFault::message`].
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Empty | Self::Malformed => NOT_A_NUMBER,
+            Self::Overflow => {
+                "Number overflow. Attempting to store a number with magnitude larger than supported range"
+            }
+            Self::Underflow => {
+                "Number underflow. Attempting to store a number with magnitude smaller than supported range"
+            }
+            Self::TooManyDigits => {
+                "Attempting to store more than 38 significant digits in a Number"
+            }
+        }
+    }
+
+    /// The service's message for this fault in the number `s`: a malformed
+    /// value is appended after a colon, as `DynamoDB` reports it, and the
+    /// other faults carry no value.
+    #[must_use]
+    pub fn message(self, s: &str) -> String {
+        match self {
+            Self::Malformed => format!("{NOT_A_NUMBER}: {s}"),
+            _ => self.text().to_owned(),
+        }
+    }
+
+    /// The fault in the number `s` as the `ValidationException` the service
+    /// answers.
+    #[must_use]
+    pub fn error(self, s: &str) -> DynamoDbError {
+        DynamoDbError::ValidationException(self.message(s))
+    }
+}
+
 /// Validate and normalize a `DynamoDB` number string.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with the service's message
+/// for the number's [`NumberFault`].
 pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
+    normalize_number(s).map_err(|fault| fault.error(s))
+}
+
+/// Validate and normalize a `DynamoDB` number string, with the fault as a
+/// [`NumberFault`] for a caller that acts on its kind.
+///
+/// # Errors
+///
+/// Returns the [`NumberFault`] of the first rule `s` breaks.
+pub fn normalize_number(s: &str) -> Result<String, NumberFault> {
     // DynamoDB does not trim: leading or trailing whitespace makes the number
     // malformed rather than acceptable (e.g. " 5" and "5 " are rejected). A
     // genuinely empty string is reported with a distinct message from a
     // malformed-but-non-empty one.
     if s.is_empty() {
-        return Err(empty_numeric_err());
+        return Err(NumberFault::Empty);
     }
 
     let (negative, rest) = match s.strip_prefix('-') {
@@ -34,19 +115,19 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // range is malformed (`1E9223372036854775808`), one inside it is range
     // checked below (`1E2147483648` is an overflow).
     let (mantissa_str, explicit_exp) = match rest.split_once(['e', 'E']) {
-        Some((m, e)) => (m, e.parse::<i64>().map_err(|_| numeric_value_err(s))?),
+        Some((m, e)) => (m, e.parse::<i64>().map_err(|_| NumberFault::Malformed)?),
         None => (rest, 0),
     };
 
     if mantissa_str.is_empty() || !mantissa_str.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return Err(numeric_value_err(s));
+        return Err(NumberFault::Malformed);
     }
 
     // The mantissa must contain at least one digit. A bare "." (also "+.",
     // ".e5") passes the character check above since '.' is allowed, but has no
     // digits and is not a valid number.
     if !mantissa_str.bytes().any(|b| b.is_ascii_digit()) {
-        return Err(numeric_value_err(s));
+        return Err(NumberFault::Malformed);
     }
 
     // Split into integer and fractional parts
@@ -58,7 +139,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
     {
-        return Err(numeric_value_err(s));
+        return Err(NumberFault::Malformed);
     }
 
     // Combine into a single digit string and track where the decimal point is.
@@ -90,7 +171,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
             // is an underflow, while `0E9223372036854775806` and
             // `0.0E9223372036854775807` are overflows.
             if normalized_exponent_exceeds_i64(point_offset) {
-                return Err(underflow_err());
+                return Err(NumberFault::Underflow);
             }
             check_magnitude(point_offset)?;
         }
@@ -124,7 +205,7 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // digits. The one-digit `1E9223372036854775807` (i64::MAX) and
     // `10E9223372036854775807` (i64::MAX + 1) are overflows as well.
     if normalized_exponent_exceeds_i64(magnitude_exp) {
-        return Err(overflow_err());
+        return Err(NumberFault::Overflow);
     }
 
     // The small side mirrors it: an underflow is reported before the digits
@@ -140,18 +221,18 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
     // `<digits>E-9223372036854775808` (i64::MIN + 40). The answers are the
     // same with 39 digits and with a minus sign.
     if normalized_exponent_is_below_i64(magnitude_exp) {
-        return Err(underflow_err());
+        return Err(NumberFault::Underflow);
     }
 
     if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(too_many_digits_err());
+        return Err(NumberFault::TooManyDigits);
     }
 
     check_magnitude(magnitude_exp)?;
 
     // The magnitude is in range and `sig_trimmed` has at most 38 digits, so
     // `exp` is between MIN_EXPONENT - 37 and MAX_EXPONENT and fits in an i32.
-    let exp = i32::try_from(exp).map_err(|_| overflow_err())?;
+    let exp = i32::try_from(exp).map_err(|_| NumberFault::Overflow)?;
 
     // Format the normalized number
     // sig_trimmed represents an integer, and we multiply by 10^exp
@@ -194,12 +275,12 @@ fn normalized_exponent_is_below_i64(magnitude_exp: i128) -> bool {
 }
 
 /// Refuse an order of magnitude outside `DynamoDB`'s supported range.
-fn check_magnitude(magnitude_exp: i128) -> Result<(), DynamoDbError> {
+fn check_magnitude(magnitude_exp: i128) -> Result<(), NumberFault> {
     if magnitude_exp > i128::from(MAX_EXPONENT) {
-        return Err(overflow_err());
+        return Err(NumberFault::Overflow);
     }
     if magnitude_exp < i128::from(MIN_EXPONENT) {
-        return Err(underflow_err());
+        return Err(NumberFault::Underflow);
     }
     Ok(())
 }
@@ -237,52 +318,6 @@ fn format_plain(negative: bool, digits: &str, exp: i32) -> String {
     }
 
     result
-}
-
-/// Empty number string, e.g. `{"N":""}`. Real `DynamoDB` reports the generic
-/// numeric-conversion failure with no offending value appended (distinct from
-/// the malformed-but-non-empty message, which appends the input).
-fn empty_numeric_err() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "The parameter cannot be converted to a numeric value".to_owned(),
-    )
-}
-
-/// More than 38 significant digits. Real `DynamoDB`:
-/// "Attempting to store more than 38 significant digits in a Number".
-fn too_many_digits_err() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "Attempting to store more than 38 significant digits in a Number".to_owned(),
-    )
-}
-
-/// Magnitude above the supported exponent ceiling. Real `DynamoDB`:
-/// "Number overflow. Attempting to store a number with magnitude larger than
-/// supported range".
-fn overflow_err() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "Number overflow. Attempting to store a number with magnitude larger than supported range"
-            .to_owned(),
-    )
-}
-
-/// Magnitude below the supported exponent floor. Real `DynamoDB`:
-/// "Number underflow. Attempting to store a number with magnitude smaller than
-/// supported range".
-fn underflow_err() -> DynamoDbError {
-    DynamoDbError::ValidationException(
-        "Number underflow. Attempting to store a number with magnitude smaller than supported range"
-            .to_owned(),
-    )
-}
-
-/// Error for a non-empty but malformed number string. Mirrors real DynamoDB,
-/// which reports `The parameter cannot be converted to a numeric value: <input>`
-/// for syntactically invalid numbers, distinct from the empty-value message.
-fn numeric_value_err(s: &str) -> DynamoDbError {
-    DynamoDbError::ValidationException(format!(
-        "The parameter cannot be converted to a numeric value: {s}"
-    ))
 }
 
 #[cfg(test)]
@@ -452,6 +487,54 @@ mod tests {
             err.to_string(),
             "The parameter cannot be converted to a numeric value"
         );
+    }
+
+    #[test]
+    fn normalize_number_names_the_fault() {
+        // The kind of fault, which callers act on, and the message each kind
+        // gives, which is the text `validate_and_normalize_number` reports.
+        for (input, fault, message) in [
+            (
+                "",
+                NumberFault::Empty,
+                "The parameter cannot be converted to a numeric value",
+            ),
+            (
+                "abc",
+                NumberFault::Malformed,
+                "The parameter cannot be converted to a numeric value: abc",
+            ),
+            (
+                "1E126",
+                NumberFault::Overflow,
+                "Number overflow. Attempting to store a number with magnitude larger than supported range",
+            ),
+            (
+                "1E-131",
+                NumberFault::Underflow,
+                "Number underflow. Attempting to store a number with magnitude smaller than supported range",
+            ),
+            (
+                "1234567890123456789012345678901234567890",
+                NumberFault::TooManyDigits,
+                "Attempting to store more than 38 significant digits in a Number",
+            ),
+        ] {
+            assert_eq!(normalize_number(input), Err(fault), "{input:?}");
+            assert_eq!(fault.message(input), message, "{input:?}");
+            assert_eq!(
+                validate_and_normalize_number(input)
+                    .unwrap_err()
+                    .to_string(),
+                message,
+                "{input:?}"
+            );
+            assert_eq!(
+                fault.is_not_a_number(),
+                message.starts_with("The parameter")
+            );
+        }
+        assert_eq!(normalize_number("1.50E2").unwrap(), "150");
     }
 
     // Every value in these tests was sent to DynamoDB's PutItem twice on

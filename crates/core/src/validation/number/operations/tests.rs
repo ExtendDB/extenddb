@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::types::{BatchWriteItemInput, TransactGetItem, TransactWriteItem};
+use crate::validation::number::validate_and_normalize_number;
 
 // Every value below was sent to DynamoDB twice on 2026-10-27 (us-east-1) on
 // the operation path the test names, with the same answer both times, except
@@ -30,7 +31,7 @@ fn refused(result: Result<(), DynamoDbError>) -> String {
 // same rules.
 
 fn i32_scale(n: &str) -> Result<(), String> {
-    validate_number_i32_scale(n)
+    validate_number_i32_scale(n).map_err(|fault| fault.message(n))
 }
 
 #[test]
@@ -662,38 +663,53 @@ fn import_row_stops_at_a_value_that_is_not_a_number() {
 #[test]
 fn import_row_refuses_a_number_out_of_range() {
     let ones = "1".repeat(39);
-    for (row, message) in [
-        (json!({"pk": {"S": "a"}, "n": {"N": "1E126"}}), OVERFLOW),
+    for (row, fault) in [
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E126"}}),
+            NumberFault::Overflow,
+        ),
         (
             json!({"pk": {"S": "a"}, "n": {"N": "1E999999999"}}),
-            OVERFLOW,
+            NumberFault::Overflow,
         ),
-        (json!({"pk": {"S": "a"}, "n": {"N": "1E-131"}}), UNDERFLOW),
-        (json!({"pk": {"S": "a"}, "n": {"N": "-1E-131"}}), UNDERFLOW),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "1E-131"}}),
+            NumberFault::Underflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "-1E-131"}}),
+            NumberFault::Underflow,
+        ),
         // The magnitude passes the 32-bit maximum and wraps to a negative.
         (
             json!({"pk": {"S": "a"}, "n": {"N": "1E2147483647"}}),
-            UNDERFLOW,
+            NumberFault::Underflow,
         ),
-        (json!({"pk": {"S": "a"}, "n": {"N": ones}}), DIGITS),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": ones}}),
+            NumberFault::TooManyDigits,
+        ),
         (
             json!({"pk": {"S": "a"}, "s": {"NS": ["1", "1E126"]}}),
-            OVERFLOW,
+            NumberFault::Overflow,
         ),
         (
             json!({"pk": {"S": "a"}, "m": {"M": {"x": {"N": "1E126"}}}}),
-            OVERFLOW,
+            NumberFault::Overflow,
         ),
         (
             json!({"pk": {"S": "a"}, "l": {"L": [{"N": "1E-131"}]}}),
-            UNDERFLOW,
+            NumberFault::Underflow,
         ),
-        (json!({"pk": {"N": "1E126"}}), OVERFLOW),
-        (json!({"other": {"S": "x"}, "n": {"N": "1E126"}}), OVERFLOW),
+        (json!({"pk": {"N": "1E126"}}), NumberFault::Overflow),
+        (
+            json!({"other": {"S": "x"}, "n": {"N": "1E126"}}),
+            NumberFault::Overflow,
+        ),
     ] {
         assert_eq!(
             import_row(&import_item(&row)),
-            Err(ImportRowFault::OutOfRange(message.to_owned())),
+            Err(ImportRowFault::OutOfRange(fault)),
             "{row}"
         );
     }

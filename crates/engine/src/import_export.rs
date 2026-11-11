@@ -134,12 +134,12 @@ pub async fn handle_import_table(
         // `import_row`).
         match import_row(&item) {
             Ok(()) => {}
-            Err(ImportRowFault::OutOfRange(message)) => {
+            Err(ImportRowFault::OutOfRange(fault)) => {
                 tracing::warn!(
                     import_arn = ?import_arn,
                     table_name = ?table_name,
                     item_number = processed_count,
-                    error = %message,
+                    error = %fault.text(),
                     "import: skipping item with a number out of range"
                 );
                 error_count += 1;

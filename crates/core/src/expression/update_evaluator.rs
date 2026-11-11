@@ -194,15 +194,16 @@ fn evaluate_arithmetic(
 /// the service's text for one, without the value: it can come from the
 /// stored item, which the caller may not be allowed to read.
 fn arithmetic_operand(n: &str) -> Result<bigdecimal::BigDecimal, DynamoDbError> {
-    const NUMERIC_VALUE: &str = "The parameter cannot be converted to a numeric value";
-    let not_a_number = || DynamoDbError::ValidationException(NUMERIC_VALUE.to_owned());
-    let normalized =
-        crate::validation::number::validate_and_normalize_number(n).map_err(|err| match err {
-            DynamoDbError::ValidationException(message) if message.starts_with(NUMERIC_VALUE) => {
-                not_a_number()
-            }
-            other => other,
-        })?;
+    use crate::validation::number::NumberFault;
+    let not_a_number =
+        || DynamoDbError::ValidationException(NumberFault::Malformed.text().to_owned());
+    let normalized = crate::validation::number::normalize_number(n).map_err(|fault| {
+        if fault.is_not_a_number() {
+            not_a_number()
+        } else {
+            fault.error(n)
+        }
+    })?;
     // Normalized text always parses; the error is not reachable.
     normalized.parse().map_err(|_| not_a_number())
 }
