@@ -15,6 +15,12 @@ Every launcher, in every language:
   loopback-only, plain HTTP, seeded with AWS's documented example credential).
   Resolution order: explicit option, `EXTENDDB_BINARY` env var, the platform
   package installed alongside the wrapper, then `PATH`.
+- Runs only a binary of its own release: before `serve`, it runs
+  `<binary> version` and compares the `extenddb <release>` line with the
+  wrapper's version. Another release, a failing `version`, or output with no
+  release line stops the start. The error names the wrapper's release, and
+  the binary's release when the wrapper could read it. It also says where the
+  binary came from and how to get a binary of the wrapper's release.
 - Configures the server exclusively through environment variables
   (`EXTENDDB__SERVER__PORT`, `EXTENDDB__STORAGE__SQLITE__PATH`), from a scratch
   working directory, so a config file in the project cannot leak in.
@@ -56,7 +62,9 @@ await db.stop();
 Platform binaries ship as `optionalDependencies`
 (`@extenddb/<platform>-<arch>`), so `npm install` is copy-only: no compiler,
 no node-gyp, no postinstall downloads. On an unsupported platform the wrapper
-falls back to `EXTENDDB_BINARY` or `PATH`.
+falls back to `EXTENDDB_BINARY` or `PATH`, and that binary must be the
+wrapper's release too. To use a binary that you build, build it from tag
+`v<release>`, where `<release>` is the wrapper's version.
 
 ## Testing
 
@@ -69,6 +77,8 @@ EXTENDDB_BINARY=/path/to/extenddb node test/launcher.test.js
 It proves the contract's load-bearing clauses: file mode is the default and
 persists across two server lifetimes, memory mode creates no files and is
 genuinely ephemeral, and contradictory options are refused.
+With fake binaries, it also proves that the wrapper refuses a binary of
+another release before `serve` runs.
 
 ## Releasing
 
@@ -98,15 +108,18 @@ deliberate second step):
 1. Land the release state on `main`. Bump the workspace version and the 13
    `=X.Y.Z` pins in the root `[workspace.dependencies]`, regenerate the four
    license notices, and bump `npm/package.json` to match. Tag that commit
-   `vX.Y.Z` and push the tag. The container release uses the same tag. A
-   maintainer dispatches the container and npm publish workflows
-   independently against it. The crates.io workflow runs last, after
-   `promote-image`. For a release that ships a catalog migration, the
-   release commit also raises `RELEASED_THROUGH` to the last migration. That
-   commit holds the checksum lines that the checksum test prints
-   (CONTRIBUTING.md, "Adding a catalog migration"). The gate jobs of the
-   release workflows run `devtools/check-released-through` on the tag and
-   refuse it otherwise.
+   `vX.Y.Z` and push the tag. The tagged commit itself must carry the matching
+   `npm/package.json`. The launcher runs only a binary of its own release.
+   On a tag whose `package.json` lags the workspace version, the launcher
+   tests would fail on every build leg. The publish gate refuses such a tag
+   before any build. The container release uses the same tag. A maintainer
+   dispatches the container and npm publish workflows independently against
+   it. The crates.io workflow runs last, after `promote-image`. For a release
+   that ships a catalog migration, the release commit also raises
+   `RELEASED_THROUGH` to the last migration. That commit holds the checksum
+   lines that the checksum test prints (CONTRIBUTING.md, "Adding a catalog
+   migration"). The gate jobs of the release workflows run
+   `devtools/check-released-through` on the tag and refuse it otherwise.
 2. Dispatch the `npm-publish` workflow from `main` with the tag as input.
    The gate validates shape, existence, ancestry against `main`, and the
    version match. Five native runners build, smoke test, and run the full
@@ -391,9 +404,6 @@ publish, so an owner yanks a version.
   spawned server survives it, holding its port and storage. `stop()` and
   normal process exit shut it down; after a hard kill, kill the `extenddb`
   process yourself.
-- The prebuilt Linux binaries are glibc builds. On musl systems (Alpine,
-  `node:alpine`) they fail to execute even though the file exists; build a
-  musl binary and point `EXTENDDB_BINARY` at it.
 - Two servers cannot share one database file: a second `start()` on the same
   path fails at startup with a lock error. Use distinct `dbPath`s or memory
   mode for parallel test workers.

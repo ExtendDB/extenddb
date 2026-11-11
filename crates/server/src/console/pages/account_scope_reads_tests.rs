@@ -188,7 +188,7 @@ impl RateLimitStore for CountingStore {
 impl AuthorizationStore for CountingStore {
     counted_calls! {
         fetch_user_policies(&str, &str) -> Vec<String>;
-        fetch_user_group_policies(&str, &str) -> Vec<String>;
+        fetch_user_group_policies(&str, &str) -> Vec<(String, String)>;
         fetch_user_boundary(&str, &str) -> Option<String>;
         fetch_role_policies(&str, &str) -> Vec<String>;
         fetch_role_boundary(&str, &str) -> Option<String>;

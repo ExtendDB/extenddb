@@ -32,15 +32,65 @@
 //! DeleteBackup's lock is the lightweight transaction on the `backups_by_arn`
 //! row, `IF backup_status = 'AVAILABLE' AND active_restores = null`, on the
 //! same partition a restore registers on, so the two order wholly one before
-//! the other, as the in-catalog paths do.
+//! the other, as the in-catalog paths do. The condition also carries the
+//! store kind and root the delete read, as does `set_backup_deleted`'s
+//! `IF backup_status = 'DELETING'`: each moves the row's status entry under
+//! the root it read, so a row `rewrite_store` moved after the read fails the
+//! condition, is read again, and gets its entry under the root it names.
 //!
 //! A status change moves the row's `backup_index_by_status` entry with a
 //! plain batch after the lightweight transaction on the row. A process that
-//! dies between the two leaves an entry whose status the row no longer
-//! matches; every reader of the status table re-reads the row and skips such
-//! an entry, and `remove_backup_row` deletes the entry under the status it
-//! read, so the orphan costs a wasted read until then. The sweep that
-//! removes orphan entries is `backup sync`'s, in a later release.
+//! dies between the two, or a batch that fails (it is logged, not sent
+//! again), leaves the row's only entry under the earlier status; every
+//! reader of one status partition re-reads the row and skips such an entry,
+//! one wasted read each, so `list_backup_rows` does not list that row until
+//! its entry is repaired. `list_backup_rows_by_root` reads all five
+//! partitions of the root and lists the row under its own status.
+//! `remove_backup_row` deletes the entries under the status it read, so an
+//! entry under an earlier status stays.
+//! Three paths leave such entries without a crash or a failed batch:
+//! - `insert_backup_row`'s row is AVAILABLE from its lightweight transaction
+//!   on, so a DeleteBackup between that transaction and the insert's entry
+//!   batch moves a status entry the batch has not written yet, and the batch
+//!   then writes an AVAILABLE entry that no later write removes (an insert
+//!   completed by a later sync has the same window).
+//! - A deleter (`start_backup_delete`'s DELETING, `set_backup_deleted`'s
+//!   DELETED) whose lightweight transaction lands before a `rewrite_store`
+//!   of the row and whose entry batch lands after it writes the new status's
+//!   entry under the old root, where no row stands behind it.
+//! - A `rewrite_store` whose answer was lost and whose row changed status
+//!   before the retry leaves the new root's entry under the earlier status.
+//!
+//! Every reader skips them. Plain sync's report of other stores verifies
+//! the summary's counts against the rows on this backend
+//! (`summary_counts_status_entries`, through `list_backup_rows_by_root`)
+//! and names the counts no row of that status stands behind as status
+//! entries, and `backup sync --forget-store <root>`, under the maintenance
+//! claim, deletes the root's entries whose row is gone or names another
+//! store, and repairs those whose row is of the root under another status
+//! (`remove_orphan_status_entries`). The second case
+//! cannot arise for the tombstone removal: `remove_backup_row`'s
+//! transaction is conditioned on the store it read.
+//!
+//! `rewrite_store` (`backup sync --move-store`) is the one writer that
+//! writes an entry before its row: per row it writes the new root's status
+//! entry, then the lightweight transaction that rewrites the row's kind,
+//! root and id (conditioned on the old kind and root and the status it
+//! read), then deletes the old root's entry. With the row first, a stop
+//! before the new entry would leave a moved row that no listing of the
+//! configured store returns, so the reconciler, sync's row read and the
+//! manifest probe would not see it. With the entry first, a stop before the
+//! transaction leaves an entry under the new root whose row still names the
+//! old root, which every reader skips, and the row still listed under the
+//! old root, so the move runs again; a stop after it leaves the old root's
+//! entry, which readers skip and `read_store_ids` of the old root counts,
+//! until `--forget-store` of the old root deletes it. A transaction that does not
+//! apply (another writer changed the row after the read) is followed by a
+//! serial read of the row: one that already names the new store keeps the
+//! new entry and counts as moved; one of the new root under another store
+//! id with the status read (another move to that root, whose entry has the
+//! new entry's key) has that entry written again with its own store id and
+//! is not counted; and only otherwise is the new entry removed.
 //!
 //! A conditional write whose error is the driver's `Io` or `Timeout`, or the
 //! server's `WriteTimeout` or `WriteFailure`, has an unknown outcome
@@ -75,10 +125,11 @@ use cdrs_tokio::types::value::Value;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::CreateTableInput;
 use extenddb_storage::backup_catalog::{
-    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
-    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, WriteOutcome, billing_mode_name, new_generation,
+    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
+    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusEntrySweep, StatusFields,
+    StoreIdentity, StoreKind, StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
+    billing_mode_name, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::future::BoxFuture;
@@ -87,9 +138,19 @@ use futures::stream::BoxStream;
 use crate::CassandraEngine;
 use crate::engine::CassandraSession;
 
-/// Attempts `start_backup_delete` makes when a restore registers or
-/// unregisters between its in-use check and the DELETING claim.
+/// Attempts `start_backup_delete` and `forget_available_backup_row` make
+/// when a restore registers or unregisters between their in-use check and
+/// their write.
 const DELETE_CLAIM_ATTEMPTS: usize = 3;
+
+/// The condition of the DELETING write and of the outright removal: the row
+/// is AVAILABLE, no restore is registered on it, and it still names the
+/// store (kind and root) the writer read, bound after the key. With the
+/// store in the condition, a row `rewrite_store` moved after the read is not
+/// matched, and the re-read moves its status entry under the root it now
+/// names, not the one read.
+const DELETE_CLAIM_CONDITION: &str = "IF backup_status = 'AVAILABLE' AND active_restores = null \
+     AND store_kind = ? AND store_root = ?";
 
 /// The `owner_generation` column value of a generation: the column is a
 /// signed 64-bit integer and `new_generation` never exceeds `i64::MAX`.
@@ -263,6 +324,23 @@ fn index_row_from_row(row: &Row) -> Result<Option<BackupRow>, StorageError> {
     }))
 }
 
+/// Whether `read`, the row a serial read found, is the row
+/// `insert_backup_row(row)` writes: unowned, with every column the insert
+/// takes from `row` equal (`created_at` to the stored millisecond).
+fn is_unowned_insert_of(read: &BackupRow, row: &BackupRow) -> bool {
+    read.owner_generation == UNOWNED_GENERATION
+        && read.backup_id == row.backup_id
+        && read.table_name == row.table_name
+        && read.backup_name == row.backup_name
+        && read.status == row.status
+        && read.store == row.store
+        && read.size_bytes == row.size_bytes
+        && read.item_count == row.item_count
+        && seconds_to_millis(read.created_at) == seconds_to_millis(row.created_at)
+        && read.failure_reason == row.failure_reason
+        && read.source_table_details_json == row.source_table_details_json
+}
+
 /// The rows `read` fetches, as a stream: the read runs once, on the first
 /// poll, and a failed read is one `Err` item.
 fn rows_stream<'a, F>(read: F) -> BoxStream<'a, Result<BackupRow, StorageError>>
@@ -419,6 +497,9 @@ impl CassandraEngine {
     async fn remove_index_entries(&self, row: &BackupRow) -> Result<(), StorageError> {
         let catalog = self.catalog_keyspace();
         let created_at = seconds_to_millis(row.created_at);
+        if let Some(error) = crate::test_hooks::index_entry_removal_error(&row.backup_arn) {
+            return Err(error);
+        }
         let batch = BatchQueryBuilder::new()
             .with_consistency(Consistency::LocalQuorum)
             .add_query(
@@ -466,6 +547,107 @@ impl CassandraEngine {
         Ok(())
     }
 
+    /// Write the three index entries of a `backups_by_arn` row this process
+    /// has just inserted, after it: its account listing, its table listing
+    /// and its status partition under `status`, in one logged batch.
+    async fn write_index_entries(
+        &self,
+        row: &BackupRow,
+        table_id: &str,
+        table_arn: &str,
+        status: BackupStatus,
+    ) -> Result<(), StorageError> {
+        let catalog = self.catalog_keyspace();
+        let created_at = seconds_to_millis(row.created_at);
+        if let Some(error) = crate::test_hooks::index_entry_batch_error(&row.backup_arn) {
+            return Err(error);
+        }
+        let batch = BatchQueryBuilder::new()
+            .with_consistency(Consistency::LocalQuorum)
+            .add_query(
+                format!(
+                    "INSERT INTO {catalog}.backups_by_account (account_id, created_at, \
+                     backup_arn, backup_name, table_id, table_name, table_arn, \
+                     backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    row.account_id.as_str(),
+                    created_at,
+                    row.backup_arn.as_str(),
+                    row.backup_name.as_str(),
+                    table_id,
+                    row.table_name.as_str(),
+                    table_arn,
+                    row.size_bytes
+                ),
+            )
+            .add_query(
+                format!(
+                    "INSERT INTO {catalog}.backups_by_table (account_id, table_name, \
+                     created_at, backup_arn, backup_name, table_id, table_arn, \
+                     backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    row.account_id.as_str(),
+                    row.table_name.as_str(),
+                    created_at,
+                    row.backup_arn.as_str(),
+                    row.backup_name.as_str(),
+                    table_id,
+                    table_arn,
+                    row.size_bytes
+                ),
+            )
+            .add_query(
+                format!(
+                    "INSERT INTO {catalog}.backup_index_by_status \
+                     (store_root, backup_status, backup_arn, account_id, store_kind, store_id) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    row.store.store_root.as_str(),
+                    status.as_str(),
+                    row.backup_arn.as_str(),
+                    row.account_id.as_str(),
+                    row.store.store_kind.as_str(),
+                    row.store.store_id.as_str()
+                ),
+            );
+        self.session
+            .batch(
+                batch
+                    .build()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            )
+            .await
+            .map_err(|e| StorageError::Internal(format!("Backup index rows: {e}")))?;
+        Ok(())
+    }
+
+    /// [`Self::read_index_row`] at `LOCAL_SERIAL`, so a row a lightweight
+    /// transaction committed, or one whose round is in progress, is seen.
+    async fn read_index_row_serial(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> Result<Option<BackupRow>, StorageError> {
+        let query = format!(
+            "SELECT * FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows_serial::<StorageError>(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id, backup_arn),
+            "backup index row",
+        )
+        .await?;
+        rows.first()
+            .map(index_row_from_row)
+            .transpose()
+            .map(|row| row.flatten().filter(|r| r.account_id == account_id))
+    }
+
     async fn read_index_row(
         &self,
         account_id: &str,
@@ -490,8 +672,10 @@ impl CassandraEngine {
 
     /// Move the `backup_index_by_status` entry of a row from one status
     /// partition to another, after the authoritative row changed. A failure
-    /// is logged: a reader of the status index re-reads the authoritative
-    /// row and skips an entry whose status it no longer matches.
+    /// is logged and the batch is not sent again: the row's entry stays
+    /// under `from`, readers of one status partition re-read the row and
+    /// skip it, `list_backup_rows_by_root` lists the row under its own
+    /// status, and `remove_orphan_status_entries` of the root repairs it.
     async fn move_status_index_row(
         &self,
         key: &BackupKey,
@@ -537,10 +721,183 @@ impl CassandraEngine {
         }
     }
 
+    /// DeleteBackup's first step, and with `remove` the outright removal of
+    /// `forget_available_backup_row`, as one body: read the row, check its
+    /// status, run the in-use rule, then one lightweight transaction under
+    /// [`DELETE_CLAIM_CONDITION`] that writes DELETING or, with `remove`,
+    /// deletes the row (`Deleting` then means removed); then the row's index
+    /// entries. Every writer of `active_restores` is conditional, so the
+    /// condition orders the write wholly before or after a registration; the
+    /// condition also carries the store read, so a row `rewrite_store`
+    /// moved between the read and the write is read again and its entry is
+    /// moved under the root it names.
+    ///
+    /// A lost answer of the removal is settled by a serial read: no row
+    /// means removed, a row means the loop runs again (a lost answer on
+    /// every attempt is an error). A lost answer of the DELETING write is an
+    /// error (another delete may have written the same status). After the
+    /// removal a failed entry batch is logged: the row is gone, and every
+    /// reader of an entry re-reads the row and skips it.
+    async fn start_backup_delete_lwt(
+        &self,
+        key: &BackupKey,
+        remove: bool,
+    ) -> Result<DeleteStart, StorageError> {
+        let catalog = self.catalog_keyspace();
+        let write = if remove {
+            format!(
+                "DELETE FROM {catalog}.backups_by_arn WHERE account_id = ? AND backup_arn = ? \
+                 {DELETE_CLAIM_CONDITION}"
+            )
+        } else {
+            format!(
+                "UPDATE {catalog}.backups_by_arn SET backup_status = 'DELETING' \
+                 WHERE account_id = ? AND backup_arn = ? {DELETE_CLAIM_CONDITION}"
+            )
+        };
+        let mut attempt = 0;
+        loop {
+            let stored = self
+                .load_stored_backup(&key.account_id, &key.backup_arn)
+                .await?
+                .filter(|stored| !stored.is_in_catalog())
+                .ok_or_else(|| not_found(&key.backup_arn))?;
+            let status = BackupStatus::parse(&stored.backup_status)?;
+            if status != BackupStatus::Available {
+                return Ok(DeleteStart::Status(status));
+            }
+            // The in-use rule reads the target's status; a registration whose
+            // target is no longer being restored is cleared here so it cannot
+            // hold the row's lock.
+            if let Some(target) = self.creating_restore_target(&stored).await? {
+                return Ok(DeleteStart::InUse(target));
+            }
+            // The removal's entries are keyed by the row's columns, so the
+            // row is read before it goes.
+            let removed_row = if remove {
+                Some(
+                    self.read_index_row(&key.account_id, &key.backup_arn)
+                        .await?
+                        .ok_or_else(|| not_found(&key.backup_arn))?,
+                )
+            } else {
+                None
+            };
+            crate::test_hooks::before_delete_claim(&key.backup_arn).await;
+            let read_kind = stored.store_kind.as_deref().unwrap_or("");
+            let read_root = stored.store_root.as_deref().unwrap_or("");
+            let values = || {
+                cdrs_tokio::query_values!(
+                    key.account_id.as_str(),
+                    key.backup_arn.as_str(),
+                    read_kind,
+                    read_root
+                )
+            };
+            let fault = if remove {
+                crate::test_hooks::forget_write_fault(&key.backup_arn)
+            } else {
+                None
+            };
+            let outcome = if fault == Some(crate::test_hooks::ProgressWriteFault::Lost) {
+                WriteOutcome::Unknown
+            } else {
+                let outcome = conditional_write(&self.session, &write, values()).await?;
+                if fault.is_some() {
+                    WriteOutcome::Unknown
+                } else {
+                    outcome
+                }
+            };
+            let applied = match outcome {
+                WriteOutcome::Matched => true,
+                WriteOutcome::NotMatched => false,
+                WriteOutcome::Unknown if remove => self
+                    .read_index_row_serial(&key.account_id, &key.backup_arn)
+                    .await?
+                    .is_none(),
+                WriteOutcome::Unknown => {
+                    return Err(StorageError::Internal(format!(
+                        "the DELETING write of backup {} has an unknown outcome",
+                        key.backup_arn
+                    )));
+                }
+            };
+            let lost = outcome == WriteOutcome::Unknown;
+            if applied {
+                if let Some(row) = removed_row {
+                    if let Err(error) = self.remove_index_entries(&row).await {
+                        tracing::warn!(
+                            "backup {}: the row is removed and its list and status entries \
+                             are not ({error}); readers verify against the row and skip them",
+                            key.backup_arn
+                        );
+                    }
+                } else {
+                    crate::test_hooks::after_delete_claim(&key.backup_arn).await;
+                    let store = StoreIdentity {
+                        store_kind: StoreKind::parse(stored.store_kind.as_deref().unwrap_or(""))
+                            .unwrap_or(StoreKind::Filesystem),
+                        store_root: stored.store_root.clone().unwrap_or_default(),
+                        store_id: stored.store_id.clone().unwrap_or_default(),
+                    };
+                    self.move_status_index_row(key, &store, "AVAILABLE", "DELETING")
+                        .await;
+                }
+                return Ok(DeleteStart::Deleting);
+            }
+            attempt += 1;
+            if attempt >= DELETE_CLAIM_ATTEMPTS {
+                if lost {
+                    return Err(StorageError::Internal(format!(
+                        "the removal of backup {} has an unknown outcome on every attempt",
+                        key.backup_arn
+                    )));
+                }
+                // A registration or another writer (a move of the row to
+                // another store included) landed between the check and the
+                // write on every attempt.
+                let stored = self
+                    .load_stored_backup(&key.account_id, &key.backup_arn)
+                    .await?
+                    .ok_or_else(|| not_found(&key.backup_arn))?;
+                let status = BackupStatus::parse(&stored.backup_status)?;
+                if status != BackupStatus::Available {
+                    return Ok(DeleteStart::Status(status));
+                }
+                let target = stored
+                    .active_restores
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_default();
+                return Ok(DeleteStart::InUse(target));
+            }
+        }
+    }
+
     /// The ARNs the status index lists for `store` under `status`.
     async fn status_index_arns(
         &self,
         store: &StoreIdentity,
+        status: BackupStatus,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        self.root_index_arns(
+            store.store_kind,
+            &store.store_root,
+            Some(&store.store_id),
+            status,
+        )
+        .await
+    }
+
+    /// The ARNs the status index lists under `store_root` and `status` whose
+    /// entry carries `store_kind`, and `store_id` when given.
+    async fn root_index_arns(
+        &self,
+        store_kind: StoreKind,
+        store_root: &str,
+        store_id: Option<&str>,
         status: BackupStatus,
     ) -> Result<Vec<(String, String)>, StorageError> {
         let query = format!(
@@ -551,16 +908,16 @@ impl CassandraEngine {
         let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
             &self.session,
             &query,
-            cdrs_tokio::query_values!(store.store_root.as_str(), status.as_str()),
+            cdrs_tokio::query_values!(store_root, status.as_str()),
             "status index",
         )
         .await?;
         let mut arns = Vec::with_capacity(rows.len());
         for row in rows {
-            let store_kind: Option<String> = row.get_by_name("store_kind").ok().flatten();
-            let store_id: Option<String> = row.get_by_name("store_id").ok().flatten();
-            if store_kind.as_deref() != Some(store.store_kind.as_str())
-                || store_id.as_deref() != Some(store.store_id.as_str())
+            let entry_kind: Option<String> = row.get_by_name("store_kind").ok().flatten();
+            let entry_id: Option<String> = row.get_by_name("store_id").ok().flatten();
+            if entry_kind.as_deref() != Some(store_kind.as_str())
+                || store_id.is_some_and(|id| entry_id.as_deref() != Some(id))
             {
                 continue;
             }
@@ -571,6 +928,225 @@ impl CassandraEngine {
             arns.push((account_id, backup_arn));
         }
         Ok(arns)
+    }
+
+    /// Write one `backup_index_by_status` entry, or with `remove` delete it,
+    /// at `LOCAL_QUORUM`: `rewrite_store`'s two entry writes.
+    async fn write_status_entry(
+        &self,
+        key: &BackupKey,
+        store: &StoreIdentity,
+        status: BackupStatus,
+        remove: bool,
+    ) -> Result<(), StorageError> {
+        let catalog = self.catalog_keyspace();
+        if remove {
+            crate::cassandra_util::query_rows_quorum::<StorageError>(
+                &self.session,
+                &format!(
+                    "DELETE FROM {catalog}.backup_index_by_status \
+                     WHERE store_root = ? AND backup_status = ? AND backup_arn = ?"
+                ),
+                cdrs_tokio::query_values!(
+                    store.store_root.as_str(),
+                    status.as_str(),
+                    key.backup_arn.as_str()
+                ),
+                "remove a status entry",
+            )
+            .await?;
+        } else {
+            crate::cassandra_util::query_rows_quorum::<StorageError>(
+                &self.session,
+                &format!(
+                    "INSERT INTO {catalog}.backup_index_by_status \
+                     (store_root, backup_status, backup_arn, account_id, store_kind, store_id) \
+                     VALUES (?, ?, ?, ?, ?, ?)"
+                ),
+                cdrs_tokio::query_values!(
+                    store.store_root.as_str(),
+                    status.as_str(),
+                    key.backup_arn.as_str(),
+                    key.account_id.as_str(),
+                    store.store_kind.as_str(),
+                    store.store_id.as_str()
+                ),
+                "write a status entry",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// `rewrite_store` for one key, in the order the module doc gives: the
+    /// row read at `LOCAL_SERIAL` and skipped unless it is of the old kind
+    /// and root and not CREATING; the new root's status entry; the
+    /// lightweight transaction on the row, conditioned on the old kind and
+    /// root and the status read; then the old root's entry deleted.
+    /// `NotMatched` (another writer changed the row in between) reads the
+    /// row again at `LOCAL_SERIAL`: a row that already carries `to` (kind,
+    /// root and store id) counts as this call's write and keeps the new
+    /// entry; a row of `to`'s root under another store id with the status
+    /// read has its entry, which shares the new entry's key, written again
+    /// with its own store; otherwise the new entry is removed; then the loop
+    /// reads again, up to [`DELETE_CLAIM_ATTEMPTS`];
+    /// a lost answer reads again, and a row that then carries `to` whole
+    /// (kind, root and store id; `to`'s root under another store id is
+    /// another store, left and not counted) is this call's write. `true`
+    /// when this call rewrote the row.
+    async fn rewrite_store_row(
+        &self,
+        from_kind: StoreKind,
+        from_root: &str,
+        key: &BackupKey,
+        to: &StoreIdentity,
+    ) -> Result<bool, StorageError> {
+        let update = format!(
+            "UPDATE {}.backups_by_arn SET store_kind = ?, store_root = ?, store_id = ? \
+             WHERE account_id = ? AND backup_arn = ? \
+             IF store_kind = ? AND store_root = ? AND backup_status = ?",
+            self.catalog_keyspace()
+        );
+        let mut lost: Option<BackupStatus> = None;
+        for _ in 0..DELETE_CLAIM_ATTEMPTS {
+            let Some(row) = self
+                .read_index_row_serial(&key.account_id, &key.backup_arn)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if let Some(status) = lost
+                && row.store == *to
+            {
+                // The lost answer was this call's write.
+                self.remove_old_status_entry(key, from_kind, from_root, status)
+                    .await;
+                return Ok(true);
+            }
+            if row.store.store_kind != from_kind
+                || row.store.store_root != from_root
+                || row.status == BackupStatus::Creating
+            {
+                return Ok(false);
+            }
+            // The new root's entry before the row: a stop after it leaves an
+            // entry readers skip, and the row still listed under the old root.
+            self.write_status_entry(key, to, row.status, false).await?;
+            crate::test_hooks::rewrite_stop(
+                &key.backup_arn,
+                crate::test_hooks::RewriteStop::AfterNewEntry,
+            )?;
+            crate::test_hooks::before_rewrite_write(&key.backup_arn).await;
+            let values = || {
+                cdrs_tokio::query_values!(
+                    to.store_kind.as_str(),
+                    to.store_root.as_str(),
+                    to.store_id.as_str(),
+                    key.account_id.as_str(),
+                    key.backup_arn.as_str(),
+                    from_kind.as_str(),
+                    from_root,
+                    row.status.as_str()
+                )
+            };
+            let fault = crate::test_hooks::rewrite_write_fault(&key.backup_arn);
+            let outcome = if fault == Some(crate::test_hooks::ProgressWriteFault::Lost) {
+                WriteOutcome::Unknown
+            } else {
+                let outcome = conditional_write(&self.session, &update, values()).await?;
+                if fault.is_some() {
+                    WriteOutcome::Unknown
+                } else {
+                    outcome
+                }
+            };
+            match outcome {
+                WriteOutcome::Matched => {
+                    crate::test_hooks::rewrite_stop(
+                        &key.backup_arn,
+                        crate::test_hooks::RewriteStop::AfterRow,
+                    )?;
+                    self.remove_old_status_entry(key, from_kind, from_root, row.status)
+                        .await;
+                    return Ok(true);
+                }
+                WriteOutcome::NotMatched => {
+                    lost = None;
+                    // Read again before the new entry goes: a row that
+                    // already carries `to` is this call's write (an earlier
+                    // answer lost in transit whose proposal the retry's own
+                    // Paxos prepare completed) or another move to the same store,
+                    // and the new entry is its only correct one.
+                    let now = self
+                        .read_index_row_serial(&key.account_id, &key.backup_arn)
+                        .await?;
+                    if now.as_ref().is_some_and(|now| now.store == *to) {
+                        self.remove_old_status_entry(key, from_kind, from_root, row.status)
+                            .await;
+                        return Ok(true);
+                    }
+                    // A row now of `to`'s root under another store id, with
+                    // the status read (another move to that root), has its
+                    // entry under the new entry's key: it is written again
+                    // with the row's store rather than removed. Any other
+                    // row has the new entry removed.
+                    let entry = match &now {
+                        Some(now)
+                            if now.store.store_kind == to.store_kind
+                                && now.store.store_root == to.store_root
+                                && now.status == row.status =>
+                        {
+                            self.write_status_entry(key, &now.store, now.status, false)
+                                .await
+                        }
+                        _ => self.write_status_entry(key, to, row.status, true).await,
+                    };
+                    if let Err(error) = entry {
+                        tracing::warn!(
+                            "backup {}: the status entry written under {} for a move that \
+                             did not apply is left ({error}); readers verify against the row",
+                            key.backup_arn,
+                            to.store_root
+                        );
+                    }
+                }
+                WriteOutcome::Unknown => lost = Some(row.status),
+            }
+        }
+        if lost.is_some() {
+            return Err(StorageError::Internal(format!(
+                "the store rewrite of backup {} has an unknown outcome on every attempt",
+                key.backup_arn
+            )));
+        }
+        // Another writer changed the row between the read and the write on
+        // every attempt: left, and the caller's re-list names it.
+        Ok(false)
+    }
+
+    /// Delete the old root's status entry of a row `rewrite_store` moved,
+    /// under the status the move read. A failure is logged: readers skip
+    /// the entry, and `read_store_ids` of the old root counts it until
+    /// `--forget-store` of the old root deletes it.
+    async fn remove_old_status_entry(
+        &self,
+        key: &BackupKey,
+        from_kind: StoreKind,
+        from_root: &str,
+        status: BackupStatus,
+    ) {
+        let old = StoreIdentity {
+            store_kind: from_kind,
+            store_root: from_root.to_owned(),
+            store_id: String::new(),
+        };
+        if let Err(error) = self.write_status_entry(key, &old, status, true).await {
+            tracing::warn!(
+                "backup {}: moved, and its status entry under {from_root} is left ({error}); \
+                 readers verify against the row",
+                key.backup_arn
+            );
+        }
     }
 
     /// Re-apply the target's `active_restores[table_id] = table_name` entry
@@ -968,71 +1544,138 @@ impl BackupCatalog for CassandraEngine {
                 )));
             }
             // The index rows, after the authoritative row.
-            let created_at = seconds_to_millis(row.created_at);
-            let batch = BatchQueryBuilder::new()
-                .with_consistency(Consistency::LocalQuorum)
-                .add_query(
-                    format!(
-                        "INSERT INTO {catalog}.backups_by_account (account_id, created_at, \
-                         backup_arn, backup_name, table_id, table_name, table_arn, \
-                         backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                    ),
-                    cdrs_tokio::query_values!(
-                        row.account_id.as_str(),
-                        created_at,
-                        row.backup_arn.as_str(),
-                        row.backup_name.as_str(),
-                        source.table_id.as_str(),
-                        row.table_name.as_str(),
-                        source.table_arn.as_str(),
-                        row.size_bytes
-                    ),
-                )
-                .add_query(
-                    format!(
-                        "INSERT INTO {catalog}.backups_by_table (account_id, table_name, \
-                         created_at, backup_arn, backup_name, table_id, table_arn, \
-                         backup_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                    ),
-                    cdrs_tokio::query_values!(
-                        row.account_id.as_str(),
-                        row.table_name.as_str(),
-                        created_at,
-                        row.backup_arn.as_str(),
-                        row.backup_name.as_str(),
-                        source.table_id.as_str(),
-                        source.table_arn.as_str(),
-                        row.size_bytes
-                    ),
-                )
-                .add_query(
-                    format!(
-                        "INSERT INTO {catalog}.backup_index_by_status \
-                         (store_root, backup_status, backup_arn, account_id, store_kind, store_id) \
-                         VALUES (?, 'CREATING', ?, ?, ?, ?)"
-                    ),
-                    cdrs_tokio::query_values!(
-                        row.store.store_root.as_str(),
-                        row.backup_arn.as_str(),
-                        row.account_id.as_str(),
-                        row.store.store_kind.as_str(),
-                        row.store.store_id.as_str()
-                    ),
-                );
-            self.session
-                .batch(
-                    batch
-                        .build()
-                        .map_err(|e| StorageError::Internal(e.to_string()))?,
-                )
-                .await
-                .map_err(|e| StorageError::Internal(format!("Backup index rows: {e}")))?;
+            self.write_index_entries(
+                row,
+                &source.table_id,
+                &source.table_arn,
+                BackupStatus::Creating,
+            )
+            .await?;
             Ok(Box::new(CassandraBackupClaim {
                 engine: self.clone(),
                 key: row.key(),
                 store: row.store.clone(),
                 generation,
             }) as Box<dyn JobClaim>)
+        })
+    }
+
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            Self::validate_account_id(&row.account_id)?;
+            let source = row.source_table()?;
+            let key_schema = serde_json::to_string(&source.key_schema)
+                .map_err(|e| StorageError::Internal(format!("Serialize key schema: {e}")))?;
+            let attribute_definitions = serde_json::to_string(&source.attribute_definitions)
+                .map_err(|e| StorageError::Internal(format!("Serialize attributes: {e}")))?;
+            let source_table_details_json = row.source_table_details_json.to_string();
+            let catalog = self.catalog_keyspace();
+            // `claim_backup`'s insert, unowned and complete. The partition is
+            // (`account_id`, `backup_arn`) and no table indexes the backup id,
+            // so a row for the id under another ARN spelling does not stop it.
+            let insert = format!(
+                "INSERT INTO {catalog}.backups_by_arn (account_id, backup_arn, backup_id, \
+                 backup_name, table_id, table_name, table_arn, backup_status, backup_type, \
+                 backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, \
+                 table_created_at, created_at, completed_at, failure_reason, store_kind, \
+                 store_root, store_id, source_table_details_json, owner_generation, heartbeat_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USER', ?, ?, ?, ?, ?, ?, ?, toTimestamp(now()), \
+                 ?, ?, ?, ?, ?, ?, toTimestamp(now())) IF NOT EXISTS"
+            );
+            let values = || {
+                cdrs_tokio::query_values!(
+                    row.account_id.as_str(),
+                    row.backup_arn.as_str(),
+                    row.backup_id.as_str(),
+                    row.backup_name.as_str(),
+                    source.table_id.as_str(),
+                    row.table_name.as_str(),
+                    source.table_arn.as_str(),
+                    row.status.as_str(),
+                    row.size_bytes,
+                    row.item_count,
+                    key_schema.as_str(),
+                    attribute_definitions.as_str(),
+                    billing_mode_name(source.billing_mode),
+                    seconds_to_millis(source.table_creation_date_time),
+                    seconds_to_millis(row.created_at),
+                    row.failure_reason.as_deref(),
+                    row.store.store_kind.as_str(),
+                    row.store.store_root.as_str(),
+                    row.store.store_id.as_str(),
+                    source_table_details_json.as_str(),
+                    generation_column(UNOWNED_GENERATION)
+                )
+            };
+            // A lost answer, and an insert that finds a row, are settled by a
+            // serial read. The row as this call writes it counts as inserted:
+            // another `insert_backup_row` of the same verified prefix writes
+            // the same row, either call may count it, and one that stopped
+            // (or whose batch failed) between the row and its index entries
+            // left it with no entries, which this call then writes. Any other
+            // row is one that existed. No row after a lost answer means the
+            // proposal did not commit, so the write is sent once more, as
+            // design 4(e) allows; no row after `NotMatched` is a legacy
+            // in-catalog row at the ARN, which `read_index_row_serial` does
+            // not return.
+            let mut inserted = None;
+            for _ in 0..2 {
+                let fault = crate::test_hooks::insert_write_fault(&row.backup_arn);
+                let outcome = if fault == Some(crate::test_hooks::ProgressWriteFault::Lost) {
+                    WriteOutcome::Unknown
+                } else {
+                    let outcome = conditional_write(&self.session, &insert, values()).await?;
+                    if fault.is_some() {
+                        WriteOutcome::Unknown
+                    } else {
+                        outcome
+                    }
+                };
+                let read = || self.read_index_row_serial(&row.account_id, &row.backup_arn);
+                match outcome {
+                    WriteOutcome::Matched => inserted = Some(true),
+                    WriteOutcome::NotMatched => {
+                        inserted = Some(
+                            read()
+                                .await?
+                                .is_some_and(|read| is_unowned_insert_of(&read, row)),
+                        );
+                    }
+                    WriteOutcome::Unknown => {
+                        inserted = read().await?.map(|read| is_unowned_insert_of(&read, row));
+                    }
+                }
+                if inserted.is_some() {
+                    break;
+                }
+            }
+            let Some(inserted) = inserted else {
+                return Err(StorageError::Internal(format!(
+                    "the insert of backup {} has an unknown outcome",
+                    row.backup_arn
+                )));
+            };
+            if inserted {
+                // The index entries, after the authoritative row, the status
+                // entry under the row's status. The batch is idempotent
+                // upserts; a failed one is sent once more, and one that fails
+                // twice is an error the next insert of the row repairs.
+                if let Err(first) = self
+                    .write_index_entries(row, &source.table_id, &source.table_arn, row.status)
+                    .await
+                {
+                    tracing::warn!(
+                        "backup {}: index entries not written, sending them once more: {first}",
+                        row.backup_arn
+                    );
+                    self.write_index_entries(row, &source.table_id, &source.table_arn, row.status)
+                        .await?;
+                }
+            }
+            Ok(inserted)
         })
     }
 
@@ -1059,6 +1702,43 @@ impl BackupCatalog for CassandraEngine {
                     if let Some(row) = self.read_index_row(&account_id, &backup_arn).await?
                         && row.status == status
                         && row.store == *store
+                    {
+                        rows.push(row);
+                    }
+                }
+            }
+            sort_listing(&mut rows);
+            Ok(rows)
+        })
+    }
+
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        rows_stream(async move {
+            // Every status partition of the root, whatever `status` is: the
+            // entry is a hint and the authoritative row decides, so a row
+            // whose entry is under an earlier status (a status change whose
+            // entry batch failed, or whose writer died between its
+            // transaction and its batch) is found and listed under its own
+            // status. Each row is read once, however many entries it has.
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for entry_status in BackupStatus::ALL {
+                for (account_id, backup_arn) in self
+                    .root_index_arns(store_kind, store_root, None, entry_status)
+                    .await?
+                {
+                    if !seen.insert((account_id.clone(), backup_arn.clone())) {
+                        continue;
+                    }
+                    if let Some(row) = self.read_index_row(&account_id, &backup_arn).await?
+                        && status.is_none_or(|status| row.status == status)
+                        && row.store.store_kind == store_kind
+                        && row.store.store_root == store_root
                     {
                         rows.push(row);
                     }
@@ -1191,70 +1871,47 @@ impl BackupCatalog for CassandraEngine {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
+        Box::pin(self.start_backup_delete_lwt(key, false))
+    }
+
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
         Box::pin(async move {
-            let mark_deleting = format!(
-                "UPDATE {}.backups_by_arn SET backup_status = 'DELETING' \
-                 WHERE account_id = ? AND backup_arn = ? \
-                 IF backup_status = 'AVAILABLE' AND active_restores = null",
-                self.catalog_keyspace()
-            );
-            let mut attempt = 0;
-            loop {
-                let stored = self
-                    .load_stored_backup(&key.account_id, &key.backup_arn)
+            Ok(match self.start_backup_delete_lwt(key, true).await? {
+                DeleteStart::Deleting => ForgetRow::Removed,
+                DeleteStart::InUse(table) => ForgetRow::InUse(table),
+                DeleteStart::Status(status) => ForgetRow::Status(status),
+            })
+        })
+    }
+
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            let mut rewritten = 0;
+            for key in keys {
+                if self
+                    .rewrite_store_row(from_kind, from_root, key, to)
                     .await?
-                    .filter(|stored| !stored.is_in_catalog())
-                    .ok_or_else(|| not_found(&key.backup_arn))?;
-                let status = BackupStatus::parse(&stored.backup_status)?;
-                if status != BackupStatus::Available {
-                    return Ok(DeleteStart::Status(status));
-                }
-                // The in-use rule reads the target's status; a registration
-                // whose target is no longer being restored is cleared here so
-                // it cannot hold the row's lock.
-                if let Some(target) = self.creating_restore_target(&stored).await? {
-                    return Ok(DeleteStart::InUse(target));
-                }
-                crate::test_hooks::before_delete_claim(&key.backup_arn).await;
-                let result = crate::cassandra_util::query_lwt(
-                    &self.session,
-                    &mark_deleting,
-                    cdrs_tokio::query_values!(key.account_id.as_str(), key.backup_arn.as_str()),
-                )
-                .await?;
-                if crate::cassandra_util::lwt_applied(&result)? {
-                    let store = StoreIdentity {
-                        store_kind: StoreKind::parse(stored.store_kind.as_deref().unwrap_or(""))
-                            .unwrap_or(StoreKind::Filesystem),
-                        store_root: stored.store_root.clone().unwrap_or_default(),
-                        store_id: stored.store_id.clone().unwrap_or_default(),
-                    };
-                    self.move_status_index_row(key, &store, "AVAILABLE", "DELETING")
-                        .await;
-                    return Ok(DeleteStart::Deleting);
-                }
-                attempt += 1;
-                if attempt >= DELETE_CLAIM_ATTEMPTS {
-                    // A registration landed between the check and the claim
-                    // on every attempt: the backup is in use by it.
-                    let stored = self
-                        .load_stored_backup(&key.account_id, &key.backup_arn)
-                        .await?
-                        .ok_or_else(|| not_found(&key.backup_arn))?;
-                    let status = BackupStatus::parse(&stored.backup_status)?;
-                    if status != BackupStatus::Available {
-                        return Ok(DeleteStart::Status(status));
-                    }
-                    let target = stored
-                        .active_restores
-                        .values()
-                        .next()
-                        .cloned()
-                        .unwrap_or_default();
-                    return Ok(DeleteStart::InUse(target));
+                {
+                    rewritten += 1;
                 }
             }
+            Ok(rewritten)
         })
+    }
+
+    /// Each key is a serial read, the new entry, the lightweight transaction
+    /// and the old entry's delete, so the move calls with one key at a time.
+    fn rewrite_store_runs_key_by_key(&self) -> bool {
+        true
     }
 
     fn set_backup_deleted<'a>(
@@ -1268,30 +1925,64 @@ impl BackupCatalog for CassandraEngine {
             else {
                 return Ok(false);
             };
+            // The store read is in the condition, so a row `rewrite_store`
+            // moved after the read is not matched: it is read once more at
+            // `LOCAL_SERIAL` and, still DELETING under the root it now
+            // names, written again with that root, and its status entry
+            // moves there.
             let query = format!(
                 "UPDATE {}.backups_by_arn SET backup_status = 'DELETED', \
                  completed_at = toTimestamp(now()) \
-                 WHERE account_id = ? AND backup_arn = ? IF backup_status = 'DELETING'",
+                 WHERE account_id = ? AND backup_arn = ? \
+                 IF backup_status = 'DELETING' AND store_kind = ? AND store_root = ?",
                 self.catalog_keyspace()
             );
-            let result = crate::cassandra_util::query_lwt(
-                &self.session,
-                &query,
-                cdrs_tokio::query_values!(key.account_id.as_str(), key.backup_arn.as_str()),
-            )
-            .await?;
-            let applied = crate::cassandra_util::lwt_applied(&result)?;
-            if applied {
-                self.move_status_index_row(key, &row.store, "DELETING", "DELETED")
-                    .await;
+            crate::test_hooks::before_deleted_write(&key.backup_arn).await;
+            let mut row = row;
+            for attempt in 0..2 {
+                let result = crate::cassandra_util::query_lwt(
+                    &self.session,
+                    &query,
+                    cdrs_tokio::query_values!(
+                        key.account_id.as_str(),
+                        key.backup_arn.as_str(),
+                        row.store.store_kind.as_str(),
+                        row.store.store_root.as_str()
+                    ),
+                )
+                .await?;
+                if crate::cassandra_util::lwt_applied(&result)? {
+                    crate::test_hooks::after_deleted_write(&key.backup_arn).await;
+                    self.move_status_index_row(key, &row.store, "DELETING", "DELETED")
+                        .await;
+                    return Ok(true);
+                }
+                if attempt > 0 {
+                    break;
+                }
+                match self
+                    .read_index_row_serial(&key.account_id, &key.backup_arn)
+                    .await?
+                {
+                    Some(now)
+                        if now.status == BackupStatus::Deleting
+                            && (now.store.store_kind != row.store.store_kind
+                                || now.store.store_root != row.store.store_root) =>
+                    {
+                        row = now;
+                    }
+                    _ => break,
+                }
             }
-            Ok(applied)
+            Ok(false)
         })
     }
 
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let Some(row) = self
@@ -1300,14 +1991,20 @@ impl BackupCatalog for CassandraEngine {
             else {
                 return Ok(false);
             };
-            if !matches!(row.status, BackupStatus::Deleted | BackupStatus::Failed) {
+            if !matches!(row.status, BackupStatus::Deleted | BackupStatus::Failed)
+                || row.store.store_kind != store_kind
+                || row.store.store_root != store_root
+            {
                 return Ok(false);
             }
+            crate::test_hooks::before_tombstone_removal(&key.backup_arn).await;
             // The authoritative row first, conditioned on the tombstone
-            // status read; then its index entries.
+            // status and the store read, so a row `rewrite_store` moved
+            // after the read is left (`NotMatched` answers `false`); then
+            // its index entries.
             let delete = format!(
                 "DELETE FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ? \
-                 IF backup_status = ?",
+                 IF backup_status = ? AND store_kind = ? AND store_root = ?",
                 self.catalog_keyspace()
             );
             let result = crate::cassandra_util::query_lwt(
@@ -1316,7 +2013,9 @@ impl BackupCatalog for CassandraEngine {
                 cdrs_tokio::query_values!(
                     key.account_id.as_str(),
                     key.backup_arn.as_str(),
-                    row.status.as_str()
+                    row.status.as_str(),
+                    store_kind.as_str(),
+                    store_root
                 ),
             )
             .await?;
@@ -2069,7 +2768,8 @@ impl BackupCatalog for CassandraEngine {
             // `backup_index_by_status` is partitioned by (root, status), so a
             // root's rows are its five status partitions; the entry carries
             // the kind and id, which is all this read needs (an orphan entry
-            // left by a crash names the same store its row did).
+            // left by a crash names the store its row had or was being
+            // moved to).
             let query = format!(
                 "SELECT store_kind, store_id FROM {}.backup_index_by_status \
                  WHERE store_root = ? AND backup_status = ?",
@@ -2103,6 +2803,120 @@ impl BackupCatalog for CassandraEngine {
             }
             ids.sort();
             Ok(ids)
+        })
+    }
+
+    fn summary_counts_status_entries(&self) -> bool {
+        true
+    }
+
+    fn remove_orphan_status_entries<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+    ) -> BoxFuture<'a, Result<StatusEntrySweep, StorageError>> {
+        Box::pin(async move {
+            // The root's five status partitions; each entry's row is read at
+            // `LOCAL_SERIAL` (a lightweight transaction in progress is
+            // seen). An entry whose row is gone or names another store is
+            // deleted. An entry whose row is of this root under another
+            // status (a status change whose entry batch failed, or whose
+            // writer died between its transaction and its batch) is
+            // repaired: the entry under the row's status is written (an
+            // idempotent upsert), then the stale one is deleted.
+            let delete = format!(
+                "DELETE FROM {}.backup_index_by_status \
+                 WHERE store_root = ? AND backup_status = ? AND backup_arn = ?",
+                self.catalog_keyspace()
+            );
+            let mut sweep = StatusEntrySweep::default();
+            for status in BackupStatus::ALL {
+                for (account_id, backup_arn) in self
+                    .root_index_arns(store_kind, store_root, None, status)
+                    .await?
+                {
+                    match self.read_index_row_serial(&account_id, &backup_arn).await? {
+                        Some(row)
+                            if row.store.store_kind == store_kind
+                                && row.store.store_root == store_root =>
+                        {
+                            if row.status == status {
+                                continue;
+                            }
+                            self.write_status_entry(&row.key(), &row.store, row.status, false)
+                                .await?;
+                            sweep.repaired += 1;
+                        }
+                        _ => sweep.removed += 1,
+                    }
+                    crate::cassandra_util::query_rows_quorum::<StorageError>(
+                        &self.session,
+                        &delete,
+                        cdrs_tokio::query_values!(store_root, status.as_str(), backup_arn.as_str()),
+                        "remove an orphan status entry",
+                    )
+                    .await?;
+                }
+            }
+            Ok(sweep)
+        })
+    }
+
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        Box::pin(async move {
+            // The status table's partitions are (root, status): a scan of
+            // its partition keys, then each partition's entries counted by
+            // the kind and id they carry. Hints, not verified against the
+            // rows (the trait doc).
+            let catalog = self.catalog_keyspace();
+            let partitions = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                &self.session,
+                &format!("SELECT DISTINCT store_root, backup_status FROM {catalog}.backup_index_by_status"),
+                cdrs_tokio::query_values!(),
+                "status index partitions",
+            )
+            .await?;
+            let entries_query = format!(
+                "SELECT store_kind, store_id FROM {catalog}.backup_index_by_status \
+                 WHERE store_root = ? AND backup_status = ?"
+            );
+            let mut entries = Vec::new();
+            for partition in partitions {
+                let root: String =
+                    crate::cassandra_util::get_column(&partition, "store_root", "status index")?;
+                let status: String =
+                    crate::cassandra_util::get_column(&partition, "backup_status", "status index")?;
+                let status = BackupStatus::parse(&status)?;
+                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                    &self.session,
+                    &entries_query,
+                    cdrs_tokio::query_values!(root.as_str(), status.as_str()),
+                    "status index",
+                )
+                .await?;
+                for row in rows {
+                    let kind: Option<String> = row.get_by_name("store_kind").ok().flatten();
+                    let id: Option<String> = row.get_by_name("store_id").ok().flatten();
+                    let (Some(kind), Some(id)) = (kind, id) else {
+                        continue;
+                    };
+                    let store_kind = StoreKind::parse(&kind).ok_or_else(|| {
+                        StorageError::Internal(format!(
+                            "a status entry of root {root:?} carries an unknown store kind \
+                             {kind:?}"
+                        ))
+                    })?;
+                    entries.push((
+                        StoreIdentity {
+                            store_kind,
+                            store_root: root.clone(),
+                            store_id: id,
+                        },
+                        status,
+                    ));
+                }
+            }
+            Ok(StoreRootCount::tally(entries))
         })
     }
 
@@ -2403,5 +3217,63 @@ mod tests {
         sort_listing(&mut rows);
         let arns: Vec<&str> = rows.iter().map(|r| r.backup_arn.as_str()).collect();
         assert_eq!(arns, ["z", "a", "b"]);
+    }
+
+    /// The settle of an insert whose answer was lost: the row read back is
+    /// this insert only when it is unowned and every column the insert takes
+    /// from the row is equal; the columns the insert sets itself
+    /// (`completed_at`, `heartbeat_at`) and the ARN, which the read was
+    /// keyed by, do not count.
+    #[test]
+    fn a_lost_insert_is_settled_only_by_the_row_it_writes() {
+        let row = BackupRow {
+            backup_id: "01757500000123-0badcafe".to_owned(),
+            account_id: "123456789012".to_owned(),
+            table_name: "Music".to_owned(),
+            backup_arn:
+                "arn:aws:dynamodb:us-east-1:123456789012:table/Music/backup/01757500000123-0badcafe"
+                    .to_owned(),
+            backup_name: "nightly".to_owned(),
+            status: BackupStatus::Available,
+            store: StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/backups".to_owned(),
+                store_id: "store-1".to_owned(),
+            },
+            size_bytes: 1234,
+            item_count: 5,
+            created_at: 1_757_500_000.123,
+            completed_at: None,
+            failure_reason: None,
+            source_table_details_json: serde_json::json!({ "table_name": "Music" }),
+            owner_generation: 99,
+            heartbeat_at: 0.0,
+        };
+        let read = BackupRow {
+            owner_generation: UNOWNED_GENERATION,
+            completed_at: Some(1_757_500_001.0),
+            heartbeat_at: 1_757_500_001.0,
+            created_at: 1_757_500_000.123_4,
+            ..row.clone()
+        };
+        assert!(is_unowned_insert_of(&read, &row));
+        let differing: [fn(&mut BackupRow); 11] = [
+            |r| r.owner_generation = 7,
+            |r| r.backup_id = "01757500000123-00000000".to_owned(),
+            |r| r.table_name = "Other".to_owned(),
+            |r| r.backup_name = "other".to_owned(),
+            |r| r.status = BackupStatus::Creating,
+            |r| r.store.store_id = "store-2".to_owned(),
+            |r| r.size_bytes = 1,
+            |r| r.item_count = 1,
+            |r| r.created_at = 1_757_500_000.124,
+            |r| r.failure_reason = Some("x".to_owned()),
+            |r| r.source_table_details_json = serde_json::json!({ "table_name": "Other" }),
+        ];
+        for (i, change) in differing.iter().enumerate() {
+            let mut other = read.clone();
+            change(&mut other);
+            assert!(!is_unowned_insert_of(&other, &row), "change {i}");
+        }
     }
 }

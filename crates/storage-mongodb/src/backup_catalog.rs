@@ -42,10 +42,10 @@ use std::time::Duration;
 use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{CreateTableInput, RestoreSummary, TableDescription};
 use extenddb_storage::backup_catalog::{
-    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, Heartbeat, JobClaim, JobRow,
-    JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
+    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusFields, StoreIdentity, StoreKind,
-    TimeBounds, WriteOutcome, new_generation,
+    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
 };
 use extenddb_storage::error::StorageError;
 use futures::TryStreamExt;
@@ -69,6 +69,10 @@ pub(crate) const BACKUP_MAINTENANCE: &str = "backup_maintenance";
 pub(crate) const CATALOG_ID: &str = "catalog_id";
 /// The counter a row-locking transaction `$inc`s so two of them conflict.
 pub(crate) const LOCK_SEQ: &str = "lock_seq";
+/// Keys per `update_many` of `rewrite_store`: one statement's `$or` stays
+/// far below the 16 MiB command bound, and a root of any size is a few
+/// statements.
+pub(crate) const REWRITE_CHUNK_KEYS: usize = 1_000;
 
 /// The restore job record, a subdocument of a restore target's `tables`
 /// document, with the field names the job record has on every backend.
@@ -196,16 +200,17 @@ fn row_from_doc(doc: &Document) -> Result<BackupRow, StorageError> {
     })
 }
 
-/// The fields of `row` the claim's insert sets, status CREATING; the
-/// generation and the heartbeat are added by the caller.
-fn row_fields(row: &BackupRow) -> Result<Document, StorageError> {
+/// The fields of `row` an insert sets, with `status` (the claim's CREATING,
+/// or the row's own for `insert_backup_row`); the generation, the heartbeat
+/// and any completion are added by the caller.
+fn row_fields(row: &BackupRow, status: BackupStatus) -> Result<Document, StorageError> {
     let source = bson::to_bson(&row.source_table_details_json)
         .map_err(|e| StorageError::Internal(format!("serialize source_table_details_json: {e}")))?;
     Ok(doc! {
         "table_name": &row.table_name,
         "backup_arn": &row.backup_arn,
         "backup_name": &row.backup_name,
-        "status": BackupStatus::Creating.as_str(),
+        "status": status.as_str(),
         "store_kind": row.store.store_kind.as_str(),
         "store_root": &row.store.store_root,
         "store_id": &row.store.store_id,
@@ -609,8 +614,14 @@ impl MongoEngine {
 
     /// DeleteBackup's first step as one session transaction: `$inc` the
     /// row's `lock_seq` (the lock), read the status, run the in-use rule,
-    /// write DELETING. A transaction that lost a write conflict is re-run.
-    async fn start_backup_delete_tx(&self, key: &BackupKey) -> Result<DeleteStart, StorageError> {
+    /// write DELETING, or, with `remove`, delete the row
+    /// (`forget_available_backup_row`; `Deleting` then means removed). A
+    /// transaction that lost a write conflict is re-run.
+    async fn start_backup_delete_tx(
+        &self,
+        key: &BackupKey,
+        remove: bool,
+    ) -> Result<DeleteStart, StorageError> {
         let index = self.backup_index();
         let mut session = self.client.start_session().await.map_err(internal)?;
         let tx_options = self.write_transaction_options();
@@ -640,14 +651,22 @@ impl MongoEngine {
                 }
                 let mut filter = key_filter(key);
                 filter.insert("status", BackupStatus::Available.as_str());
-                index
-                    .update_one(
-                        filter,
-                        doc! { "$set": { "status": BackupStatus::Deleting.as_str() } },
-                    )
-                    .session(&mut session)
-                    .await
-                    .map_err(TxErr::from)?;
+                if remove {
+                    index
+                        .delete_one(filter)
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                } else {
+                    index
+                        .update_one(
+                            filter,
+                            doc! { "$set": { "status": BackupStatus::Deleting.as_str() } },
+                        )
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                }
                 Ok(DeleteStart::Deleting)
             }
             .await;
@@ -667,8 +686,12 @@ impl MongoEngine {
             }
         }
         Err(StorageError::Internal(format!(
-            "DeleteBackup of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting \
-             attempts",
+            "{} of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting attempts",
+            if remove {
+                "The backup sync --prune-missing removal"
+            } else {
+                "DeleteBackup"
+            },
             key.backup_arn
         )))
     }
@@ -841,7 +864,7 @@ impl BackupCatalog for MongoEngine {
             // server's clock on the heartbeat; an existing row never matches
             // the filter (every row carries a generation), so the upsert's
             // insert hits the unique index and the claim is refused.
-            let mut set = row_fields(row)?;
+            let mut set = row_fields(row, BackupStatus::Creating)?;
             set.insert("owner_generation", generation_field(generation));
             set.insert("heartbeat_at", "$$NOW");
             let set = literal_set(set);
@@ -874,6 +897,38 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn insert_backup_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            // The claim's upsert, unowned: an existing row never matches the
+            // filter (every row carries a generation, this one 0), so the
+            // upsert's insert hits a unique index, (`account_id`,
+            // `backup_id`) or `backup_id`, and nothing is written.
+            let mut filter = key_filter(&row.key());
+            filter.insert("owner_generation", doc! { "$exists": false });
+            let mut set = row_fields(row, row.status)?;
+            if let Some(reason) = &row.failure_reason {
+                set.insert("failure_reason", reason);
+            }
+            set.insert("owner_generation", generation_field(UNOWNED_GENERATION));
+            set.insert("heartbeat_at", "$$NOW");
+            set.insert("completed_at", "$$NOW");
+            let set = literal_set(set);
+            match self
+                .backup_index()
+                .update_one(filter, vec![doc! { "$set": set }])
+                .upsert(true)
+                .await
+            {
+                Ok(result) => Ok(result.upserted_id.is_some()),
+                Err(e) if is_duplicate_key(&e) => Ok(false),
+                Err(e) => Err(internal(e)),
+            }
+        })
+    }
+
     fn list_backup_rows<'a>(
         &'a self,
         status: Option<BackupStatus>,
@@ -881,6 +936,30 @@ impl BackupCatalog for MongoEngine {
     ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
         rows_stream(async move {
             let mut filter = store_filter(store);
+            if let Some(status) = status {
+                filter.insert("status", status.as_str());
+            }
+            self.backup_index()
+                .find(filter)
+                .sort(listing_sort())
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)
+        })
+    }
+
+    fn list_backup_rows_by_root<'a>(
+        &'a self,
+        store_kind: StoreKind,
+        store_root: &'a str,
+        status: Option<BackupStatus>,
+    ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+        // The `{store_kind, store_root}` prefix of the store index; the
+        // status is a residual filter.
+        rows_stream(async move {
+            let mut filter = doc! { "store_kind": store_kind.as_str(), "store_root": store_root };
             if let Some(status) = status {
                 filter.insert("status", status.as_str());
             }
@@ -968,7 +1047,71 @@ impl BackupCatalog for MongoEngine {
         &'a self,
         key: &'a BackupKey,
     ) -> BoxFuture<'a, Result<DeleteStart, StorageError>> {
-        Box::pin(self.start_backup_delete_tx(key))
+        Box::pin(self.start_backup_delete_tx(key, false))
+    }
+
+    fn forget_available_backup_row<'a>(
+        &'a self,
+        key: &'a BackupKey,
+    ) -> BoxFuture<'a, Result<ForgetRow, StorageError>> {
+        Box::pin(async move {
+            Ok(match self.start_backup_delete_tx(key, true).await? {
+                DeleteStart::Deleting => ForgetRow::Removed,
+                DeleteStart::InUse(table) => ForgetRow::InUse(table),
+                DeleteStart::Status(status) => ForgetRow::Status(status),
+            })
+        })
+    }
+
+    fn rewrite_store<'a>(
+        &'a self,
+        from_kind: StoreKind,
+        from_root: &'a str,
+        keys: &'a [BackupKey],
+        to: &'a StoreIdentity,
+    ) -> BoxFuture<'a, Result<u64, StorageError>> {
+        Box::pin(async move {
+            // One `update_many` per chunk, no transaction: one over every key
+            // of a large root would meet the transaction size and lifetime
+            // limits. Each document's update is atomic. This update and a
+            // transaction that writes the document (a DeleteBackup's
+            // `start_backup_delete_tx`, a restore's `claim_restore_tx`) are
+            // serialized: when the update commits after the transaction's
+            // snapshot and before its write, the transaction conflicts and
+            // re-runs, reading the row as the update left it; when the
+            // transaction wrote the document first, the update waits for it
+            // to end and then applies its filter to the committed document.
+            // A registration keeps the store its server is configured with.
+            // The `$inc` of `lock_seq` is a convention, not what serializes
+            // them: a write that moves the row also advances its lock
+            // counter.
+            let mut rewritten = 0;
+            for chunk in keys.chunks(REWRITE_CHUNK_KEYS) {
+                let any_key: Vec<Document> = chunk.iter().map(key_filter).collect();
+                let result = self
+                    .backup_index()
+                    .update_many(
+                        doc! {
+                            "$or": any_key,
+                            "store_kind": from_kind.as_str(),
+                            "store_root": from_root,
+                            "status": { "$ne": BackupStatus::Creating.as_str() },
+                        },
+                        doc! {
+                            "$set": {
+                                "store_kind": to.store_kind.as_str(),
+                                "store_root": &to.store_root,
+                                "store_id": &to.store_id,
+                            },
+                            "$inc": { LOCK_SEQ: 1_i64 },
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                rewritten += result.modified_count;
+            }
+            Ok(rewritten)
+        })
     }
 
     fn set_backup_deleted<'a>(
@@ -996,6 +1139,8 @@ impl BackupCatalog for MongoEngine {
     fn remove_backup_row<'a>(
         &'a self,
         key: &'a BackupKey,
+        store_kind: StoreKind,
+        store_root: &'a str,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
             let mut filter = key_filter(key);
@@ -1003,6 +1148,8 @@ impl BackupCatalog for MongoEngine {
                 "status",
                 doc! { "$in": [BackupStatus::Deleted.as_str(), BackupStatus::Failed.as_str()] },
             );
+            filter.insert("store_kind", store_kind.as_str());
+            filter.insert("store_root", store_root);
             let result = self
                 .backup_index()
                 .delete_one(filter)
@@ -1115,8 +1262,8 @@ impl BackupCatalog for MongoEngine {
             // provenance keeps the source backup in use, whatever the
             // collection drops do, and the target counts as removed: a drop
             // that fails then is logged, naming the collections, and leaves
-            // them for `backup sync` (no record remains for a later cycle to
-            // retry from).
+            // them in the data database (no record remains for a later cycle
+            // to retry from, and no sweep removes them yet).
             let removed = self
                 .tables()
                 .find_one_and_delete(doc! {
@@ -1143,7 +1290,8 @@ impl BackupCatalog for MongoEngine {
                 tracing::error!(
                     "the restore target {} (account {}) was removed from the catalog, but \
                      dropping its data collection {} or the index collections of table id {} \
-                     failed; they are left in the data database for `backup sync` to sweep: {e}",
+                     failed; they are left in the data database, where nothing removes them, \
+                     and can be dropped by hand: {e}",
                     key.table_name,
                     key.account_id,
                     crate::data::data_collection_name(&key.table_id),
@@ -1354,6 +1502,49 @@ impl BackupCatalog for MongoEngine {
         })
     }
 
+    fn summarize_store_roots(&self) -> BoxFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+        Box::pin(async move {
+            let groups: Vec<Document> = self
+                .backup_index()
+                .aggregate([doc! { "$group": {
+                    "_id": {
+                        "store_kind": "$store_kind",
+                        "store_root": "$store_root",
+                        "store_id": "$store_id",
+                        "status": "$status",
+                    },
+                    "rows": { "$sum": 1_i64 },
+                } }])
+                .await
+                .map_err(internal)?
+                .try_collect()
+                .await
+                .map_err(internal)?;
+            let mut counts = Vec::with_capacity(groups.len());
+            for group in groups {
+                let id = group.get_document("_id").map_err(internal)?;
+                let rows = match group.get("rows") {
+                    Some(Bson::Int64(n)) => *n,
+                    Some(Bson::Int32(n)) => i64::from(*n),
+                    other => {
+                        return Err(StorageError::Internal(format!(
+                            "a root summary count is not an integer: {other:?}"
+                        )));
+                    }
+                };
+                counts.push(StoreRootCount::from_columns(
+                    &required_str(id, "store_kind")?,
+                    required_str(id, "store_root")?,
+                    required_str(id, "store_id")?,
+                    &required_str(id, "status")?,
+                    rows,
+                )?);
+            }
+            StoreRootCount::sort(&mut counts);
+            Ok(counts)
+        })
+    }
+
     fn maintenance_claim<'a>(
         &'a self,
         holder: &'a str,
@@ -1553,7 +1744,7 @@ mod tests {
     #[test]
     fn a_row_round_trips_through_its_document() {
         let row = row();
-        let mut doc = row_fields(&row).unwrap();
+        let mut doc = row_fields(&row, row.status).unwrap();
         doc.insert("account_id", &row.account_id);
         doc.insert("backup_id", &row.backup_id);
         doc.insert("owner_generation", generation_field(row.owner_generation));
@@ -1566,7 +1757,7 @@ mod tests {
     #[test]
     fn a_document_with_an_unknown_store_kind_or_status_is_internal() {
         let row = row();
-        let mut doc = row_fields(&row).unwrap();
+        let mut doc = row_fields(&row, row.status).unwrap();
         doc.insert("account_id", &row.account_id);
         doc.insert("backup_id", &row.backup_id);
         doc.insert("owner_generation", 7_i64);

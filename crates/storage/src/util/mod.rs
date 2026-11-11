@@ -14,9 +14,9 @@ mod shard_stream;
 mod warm_throughput;
 
 pub use arn::{
-    ARN_PARTITION, STREAM_DOES_NOT_EXIST, format_stream_label, index_arn, new_stream_label,
-    parse_stream_arn, shard_not_in_stream, stream_arn, stream_does_not_exist, stream_not_found,
-    table_arn,
+    ARN_PARTITION, SHARD_DOES_NOT_EXIST, STREAM_DOES_NOT_EXIST, format_stream_label, index_arn,
+    new_stream_label, parse_stream_arn, shard_does_not_exist, stream_arn, stream_does_not_exist,
+    stream_not_found, table_arn,
 };
 pub use backup_id::{
     BackupArnError, BackupArnParts, MAX_BACKUP_ARN_LEN, backup_arn, backup_creation_date_time,
