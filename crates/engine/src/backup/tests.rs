@@ -317,6 +317,9 @@ struct Fake {
     /// When set, `insert_backup_row` fails with this error and writes
     /// nothing.
     insert_error: Mutex<Option<String>>,
+    /// When set, `insert_backup_row` never answers (a catalog write that
+    /// hangs) and writes nothing.
+    stall_inserts: std::sync::atomic::AtomicBool,
     /// Every key `forget_available_backup_row` received.
     forgets_seen: Mutex<Vec<BackupKey>>,
     /// Preset answers of `forget_available_backup_row`, by ARN; the row is
@@ -884,6 +887,8 @@ struct MemStore {
     /// When set, every `get` of a key ending in this text fails at the call
     /// as a transport error (one object the store never serves).
     fail_gets_of: Mutex<Option<String>>,
+    /// When set, `get` of this key never answers; every other call answers.
+    stall_gets_of: Mutex<Option<String>>,
     /// When set, the body of the `get` with this ordinal (1-based, over
     /// every `get` the store saw) panics after its first chunk: a reader on
     /// the blocking pool that dies mid-file.
@@ -1178,6 +1183,11 @@ impl extenddb_backup_store::BackupStore for MemStore {
             self.gets.lock().unwrap().push(key.to_owned());
             self.stall().await;
             self.check()?;
+            if self.stall_gets_of.lock().unwrap().as_deref() == Some(key) {
+                self.stalls
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                std::future::pending::<()>().await;
+            }
             if key == STORE_IDENTITY_KEY {
                 let failure = {
                     let mut slot = self.identity_get_failure.lock().unwrap();
@@ -1712,6 +1722,12 @@ impl BackupCatalog for Fake {
         row: &'a BackupRow,
     ) -> BoxedFuture<'a, Result<bool, StorageError>> {
         self.insert_attempts.lock().unwrap().push(row.clone());
+        if self
+            .stall_inserts
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(std::future::pending());
+        }
         if let Some(e) = self.insert_error.lock().unwrap().clone() {
             return Box::pin(async move { Err(StorageError::Internal(e)) });
         }
@@ -21931,6 +21947,257 @@ async fn a_startup_sync_whose_first_run_fails_logs_its_skips_at_info_on_the_next
 #[tokio::test(start_paused = true)]
 async fn a_startup_sync_whose_first_run_is_cut_at_its_bound_logs_its_skips_at_info_on_the_next() {
     startup_sync_logs_its_skips_at_info_until_a_run_has_reported(true).await;
+}
+
+/// The line a startup sync cut short ends with says that the store is
+/// unreachable until the abandoned call returns exactly when a store call
+/// is still in flight, on a filesystem root, on either arm, and names the
+/// caller the in-flight mark names: the root's listing held past the bound
+/// (the listing's own bound, as long as the run's, ends the run with a
+/// listing error, the walk marked in flight), the sidecar's read stalled
+/// once the run's first second has passed (the run's bound ends it before
+/// the read's own, the read marked in flight), the row's insert stalled
+/// after every store call of the run returned (the run's bound ends it with
+/// nothing marked, and the line says nothing of the store), the root's
+/// listing failing at once (a listing error with nothing marked, and the
+/// line says nothing of the store), a deletion's call holding the slot
+/// the listing waits for (the deletion abandoned at its own bound and
+/// marked, the listing's wait ending at the run's bound, and the line names
+/// the deletion), and a deletion's call that takes the slot while the
+/// manifest's read holds it (each call takes a second and the deletion
+/// starts at 500 ms, so it holds the slot from the first second on, is
+/// abandoned and marked at its own bound, and the run's bound ends the run
+/// while the sidecar's read still waits for the slot; the line names the
+/// deletion).
+#[tokio::test(start_paused = true)]
+async fn a_cut_startup_sync_names_the_store_unreachable_only_while_its_call_is_in_flight() {
+    #[derive(Debug, Clone, Copy)]
+    enum Cut {
+        ListingHeld,
+        SidecarReadStalled,
+        InsertStalled,
+        ListingFails,
+        DeletionInFlight,
+        DeletionAheadOfTheSidecarRead,
+    }
+    const DELETION_CLAUSE: &str = "(once the abandoned deletion has returned; until then the \
+                                   store is unreachable)";
+    const OWN_CALL: &str = "startup sync's store call";
+    const CLAUSE: &str = "(once the abandoned startup sync's store call has returned; until \
+                          then the store is unreachable)";
+    let (lines, _guard) = LogLines::capture();
+    for cut in [
+        Cut::ListingHeld,
+        Cut::SidecarReadStalled,
+        Cut::InsertStalled,
+        Cut::ListingFails,
+        Cut::DeletionInFlight,
+        Cut::DeletionAheadOfTheSidecarRead,
+    ] {
+        let mem = Arc::new(MemStore::default());
+        mem.insert(STORE_IDENTITY_KEY, &identity_file("store-1", "catalog-1"));
+        let fake = Arc::new(Fake::default());
+        let backup = sync_arn(1);
+        put_backup(&mem, &backup);
+        let runtime = runtime().with_store(
+            ConfiguredStore::new(
+                store().store_kind,
+                store().store_root,
+                Arc::clone(&mem) as Arc<dyn extenddb_backup_store::BackupStore>,
+                None,
+                Ok(store()),
+            )
+            .with_ephemeral_catalog(true),
+        );
+        let configured = runtime.configured_store().unwrap();
+        match cut {
+            Cut::ListingHeld => mem
+                .hold_root_list
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::SidecarReadStalled => {
+                // Each call takes a second, so the sidecar's read, the
+                // run's second call after its listing, starts once a
+                // second has passed and its own bound ends after the run's.
+                mem.set_delay(Some(Duration::from_secs(1)));
+                *mem.stall_gets_of.lock().unwrap() =
+                    Some(format!("{}{MANIFEST_CHECKSUM_FILE}", prefix_of(&backup)));
+            }
+            Cut::InsertStalled => fake
+                .stall_inserts
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::ListingFails => *mem.fail_lists_of.lock().unwrap() = Some(String::new()),
+            Cut::DeletionInFlight => mem
+                .stall_deletes
+                .store(true, std::sync::atomic::Ordering::Release),
+            Cut::DeletionAheadOfTheSidecarRead => {
+                mem.set_delay(Some(Duration::from_secs(1)));
+                mem.stall_deletes
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let before = lines
+            .containing("startup sync of the in-memory catalog")
+            .len();
+        let run = tokio::time::timeout(
+            super::sync::STARTUP_SYNC_TIMEOUT * 5,
+            super::sync::startup_sync(&*fake, &runtime),
+        );
+        let deletion_after = match cut {
+            // The deletion's call takes the slot first; the run's listing
+            // waits for it.
+            Cut::DeletionInFlight => Some(Duration::ZERO),
+            // The deletion waits for the slot behind the manifest's read
+            // and takes it before the sidecar's read.
+            Cut::DeletionAheadOfTheSidecarRead => Some(Duration::from_millis(500)),
+            _ => None,
+        };
+        let ran = if let Some(after) = deletion_after {
+            let deletion = configured.calls("deletion");
+            let prefix = prefix_of(&backup);
+            let delete = async {
+                if !after.is_zero() {
+                    tokio::time::sleep(after).await;
+                }
+                extenddb_backup_store::BackupStore::delete_prefix(&deletion, &prefix).await
+            };
+            let (deleted, ran) = futures::future::join(delete, run).await;
+            assert!(deleted.is_err(), "the deletion is abandoned: {deleted:?}");
+            ran
+        } else {
+            run.await
+        }
+        .expect("the startup sync is bounded");
+        let logged = lines.containing("startup sync of the in-memory catalog")[before..].to_vec();
+        let [line] = logged.as_slice() else {
+            panic!("{cut:?}: one line: {logged:?}");
+        };
+        assert_eq!(
+            lines
+                .at_level(tracing::Level::WARN)
+                .last()
+                .map(String::as_str),
+            Some(line.as_str()),
+            "{cut:?}"
+        );
+        assert!(configured.startup_sync_pending(), "{cut:?}: left pending");
+        match cut {
+            Cut::ListingHeld => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some(OWN_CALL),
+                    "the walk is marked"
+                );
+                assert!(line.ends_with(CLAUSE), "{line}");
+                mem.hold_root_list
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the walk returned");
+            }
+            Cut::SidecarReadStalled => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some(OWN_CALL),
+                    "the read is marked"
+                );
+                assert!(line.ends_with(CLAUSE), "{line}");
+            }
+            Cut::InsertStalled => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(
+                    fake.insert_attempts.lock().unwrap().len(),
+                    1,
+                    "cut in the insert"
+                );
+                assert!(!configured.check_call_in_flight(), "nothing is marked");
+                assert!(line.ends_with("from the first key of the root"), "{line}");
+            }
+            Cut::ListingFails => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert!(!configured.check_call_in_flight(), "nothing is marked");
+                assert!(
+                    line.ends_with("a later reconciler cycle runs it again"),
+                    "{line}"
+                );
+            }
+            Cut::DeletionInFlight => {
+                assert!(
+                    matches!(ran, Some(Err(super::sync::SyncError::Listing { .. }))),
+                    "{ran:?}"
+                );
+                assert!(line.contains("stopped: "), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some("deletion"),
+                    "the deletion is marked"
+                );
+                assert!(line.ends_with(DELETION_CLAUSE), "{line}");
+                // The listing's error names the run's call; the clause
+                // names the deletion's.
+                assert!(!line.contains(&format!("abandoned {OWN_CALL}")), "{line}");
+                mem.stall_deletes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the deletion returned");
+            }
+            Cut::DeletionAheadOfTheSidecarRead => {
+                assert!(ran.is_none(), "{ran:?}");
+                assert!(line.contains("did not finish within 60 s"), "{line}");
+                assert_eq!(mem.stalls.load(std::sync::atomic::Ordering::Acquire), 1);
+                // The manifest's read reached the store; the sidecar's
+                // never held the slot.
+                let prefix = prefix_of(&backup);
+                let gets = mem.gets.lock().unwrap().clone();
+                assert!(
+                    gets.contains(&format!("{prefix}{EXTENDDB_MANIFEST_FILE}")),
+                    "{gets:?}"
+                );
+                assert!(
+                    !gets.contains(&format!("{prefix}{MANIFEST_CHECKSUM_FILE}")),
+                    "{gets:?}"
+                );
+                assert_eq!(
+                    configured.call_in_flight_caller(),
+                    Some("deletion"),
+                    "the deletion is marked"
+                );
+                assert!(line.ends_with(DELETION_CLAUSE), "{line}");
+                assert!(!line.contains(&format!("abandoned {OWN_CALL}")), "{line}");
+                mem.stall_deletes
+                    .store(false, std::sync::atomic::Ordering::Release);
+                for _ in 0..200 {
+                    if !configured.check_call_in_flight() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(!configured.check_call_in_flight(), "the deletion returned");
+            }
+        }
+    }
 }
 
 /// A startup sync another caller has taken is not run again: with the
