@@ -1197,9 +1197,10 @@ pub fn validate_update_item(
     // numbers raw and defers rejection to the validation layer. Real DynamoDB
     // wraps the error as:
     //   "ExpressionAttributeValues contains invalid value: <inner> for key <k>"
-    if let Some(values) = &input.expression_attribute_values {
-        validate_expression_attribute_value_numbers(values)?;
-    }
+    // The check is the one TransactWriteItems runs on its actions' values.
+    number::operations::expression_attribute_value_numbers(
+        input.expression_attribute_values.as_ref(),
+    )?;
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
@@ -1212,29 +1213,6 @@ pub fn validate_update_item(
         }
     }
 
-    Ok(())
-}
-
-/// Validate number values provided via `ExpressionAttributeValues`, matching the
-/// service's wrapped message: `ExpressionAttributeValues contains invalid value:
-/// <inner> for key <placeholder>`. Keys are visited in sorted order so the
-/// reported placeholder is deterministic when several values are invalid.
-fn validate_expression_attribute_value_numbers(
-    values: &std::collections::HashMap<String, AttributeValue>,
-) -> Result<(), DynamoDbError> {
-    let mut keys: Vec<&String> = values.keys().collect();
-    keys.sort();
-    for key in keys {
-        match validate_attribute_number(&values[key]) {
-            Ok(()) => {}
-            Err(DynamoDbError::ValidationException(inner)) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                )));
-            }
-            Err(other) => return Err(other),
-        }
-    }
     Ok(())
 }
 

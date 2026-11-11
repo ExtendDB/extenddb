@@ -4,6 +4,7 @@
 use super::*;
 use crate::expression::parser::parse_condition;
 use crate::expression::resolver::ExpressionMaps;
+use crate::expression::test_timeout::within_10_s;
 use crate::expression::tokenizer::tokenize;
 use std::collections::HashMap;
 
@@ -446,17 +447,9 @@ fn eval_within_10_s(
     item: BTreeMap<String, AttributeValue>,
     values: HashMap<String, AttributeValue>,
 ) -> Result<bool, DynamoDbError> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let _ = tx.send(eval(expr_str, &item, HashMap::new(), values));
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(answer) => answer,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("`{expr_str}` ran for 10 s"),
-    }
+    within_10_s(&format!("`{expr_str}`"), move || {
+        eval(expr_str, &item, HashMap::new(), values)
+    })
 }
 
 /// A number with millions of digits, in a placeholder or in the item, is not
@@ -482,29 +475,19 @@ fn a_number_with_millions_of_digits_is_not_parsed() {
 #[test]
 fn a_refused_placeholder_is_read_once_per_request() {
     let long = format!("1{}", "0".repeat(2_000_000));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let matched = within_10_s("100 items against one refused placeholder", move || {
         let tokens = tokenize("n < :v").unwrap();
         let expr = parse_condition(&tokens).unwrap();
         let values = HashMap::from([("v".to_owned(), AttributeValue::N(long))]);
         let maps = ExpressionMaps::new(HashMap::new(), values);
         // The refusal is recorded, whatever the build's speed.
         assert_eq!(maps.get_parsed_numeric("v"), Some(ParsedNumber::Refused));
-        let matched = (0..100)
+        (0..100)
             .map(|i| BTreeMap::from([("n".to_owned(), AttributeValue::N(i.to_string()))]))
             .filter(|item| evaluate_condition(&expr, item, &maps).unwrap())
-            .count();
-        let _ = tx.send(matched);
+            .count()
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(matched) => assert_eq!(matched, 0),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            std::panic::resume_unwind(worker.join().expect_err("no answer and no panic"))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            panic!("100 items against one refused placeholder ran for 10 s")
-        }
-    }
+    assert_eq!(matched, 0);
 }
 
 /// A stored number the service cannot store, as an older release could

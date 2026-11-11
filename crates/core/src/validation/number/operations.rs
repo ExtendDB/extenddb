@@ -226,15 +226,15 @@ pub fn batch_write_item(input: &BatchWriteItemInput) -> Result<(), DynamoDbError
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError> {
     let (values, key_or_item) = if let Some(put) = &item.put {
-        let values = put.condition_expression.as_ref();
+        let values = put.expression_attribute_values.as_ref();
         (
-            values.and(put.expression_attribute_values.as_ref()),
+            values.filter(|_| put.condition_expression.is_some()),
             &put.item,
         )
     } else if let Some(delete) = &item.delete {
-        let values = delete.condition_expression.as_ref();
+        let values = delete.expression_attribute_values.as_ref();
         (
-            values.and(delete.expression_attribute_values.as_ref()),
+            values.filter(|_| delete.condition_expression.is_some()),
             &delete.key,
         )
     } else if let Some(update) = &item.update {
@@ -244,12 +244,32 @@ pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError
     } else {
         return Ok(());
     };
+    expression_attribute_value_numbers(values)?;
+    item_numbers(EmptyText::WithoutColon, key_or_item).map_err(bare)
+}
+
+/// Refuse `ExpressionAttributeValues` holding a number the service cannot
+/// read, as `ExpressionAttributeValues contains invalid value: <message> for
+/// key <placeholder>`. Placeholders are visited in name order, and an empty
+/// value answers the message without the colon.
+///
+/// `TransactWriteItems` gives this text (measured 2026-10-27), and the
+/// `UpdateItem` check in `validate_update_item` uses it too. On 2026-11-11 the
+/// service answered an `UpdateItem` value out of range, such as
+/// `0E2147483648`, with the prefix `1 validation error detected: ` and no
+/// wrapper.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` with that text.
+pub(crate) fn expression_attribute_value_numbers(
+    values: Option<&HashMap<String, AttributeValue>>,
+) -> Result<(), DynamoDbError> {
     value_numbers(EmptyText::WithoutColon, values).map_err(|(message, key)| {
         DynamoDbError::ValidationException(format!(
             "ExpressionAttributeValues contains invalid value: {message} for key {key}"
         ))
-    })?;
-    item_numbers(EmptyText::WithoutColon, key_or_item).map_err(bare)
+    })
 }
 
 /// Why `ImportTable` refuses a row holding a number the service cannot read.

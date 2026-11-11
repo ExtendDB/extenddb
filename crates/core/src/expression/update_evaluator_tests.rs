@@ -665,8 +665,7 @@ fn set_parenthesised_arithmetic() {
 /// the sum is built, and the result is stored as the service spells it.
 mod number_arithmetic {
     use super::*;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::Duration;
+    use crate::expression::test_timeout::within_10_s;
 
     const OVERFLOW: &str =
         "Number overflow. Attempting to store a number with magnitude larger than supported range";
@@ -685,23 +684,10 @@ mod number_arithmetic {
     ) -> (Result<(), DynamoDbError>, Option<AttributeValue>) {
         let mut item = BTreeMap::from([("n".to_owned(), AttributeValue::N(stored.to_owned()))]);
         let values = HashMap::from([("v".to_owned(), AttributeValue::N(value.to_owned()))]);
-        let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        within_10_s(&format!("`{expression}` with n = {stored}"), move || {
             let result = apply(expression, &mut item, HashMap::new(), values);
-            let _ = tx.send((result, item.remove("n")));
-        });
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(answer) => answer,
-            Err(RecvTimeoutError::Disconnected) => {
-                let panic = worker
-                    .join()
-                    .expect_err("the update ended without an answer");
-                std::panic::resume_unwind(panic)
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                panic!("`{expression}` with n = {stored} ran for 10 s")
-            }
-        }
+            (result, item.remove("n"))
+        })
     }
 
     fn validation_message(result: Result<(), DynamoDbError>) -> String {
