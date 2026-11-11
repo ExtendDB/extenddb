@@ -40,7 +40,9 @@ The order of a Query's checks without a duplicate was measured
 2026-11-11T12:42Z to 12:44Z in us-east-1 on the table with the index, two
 sends each: the parameter mixing error first, then every FilterExpression
 fault, then every KeyConditionExpression fault, then Select, the table, the
-index and ConsistentRead.
+index and ConsistentRead. At 13:26Z, with the SDK's own checks off, Limit 0
+answered its own message ahead of every other fault sent beside it, and the
+other parameter checks answered ahead of a missing table.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -773,3 +775,112 @@ class TestQueryCheckOrder:
         )
         assert code == "ValidationException"
         assert msg == FILTER_UNDEFINED_ZZ
+
+
+LIMIT_ZERO = (
+    "1 validation error detected: Value at 'Limit' failed to satisfy constraint: "
+    "Member must have value greater than or equal to 1"
+)
+MISSING_TABLE = "extenddb-test-484-no-such-table"
+LEGACY_PK = {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [A]}}
+
+
+class TestLimitAndParameterChecksFirst:
+    """Limit and the other parameter checks against the rest (2026-11-11T13:26Z)."""
+
+    @pytest.mark.parametrize(
+        ("kwargs", "missing_table"),
+        [
+            ({"KeyConditionExpression": "pk = :a", "ExpressionAttributeValues": {":a": A}}, False),
+            (
+                {"KeyConditionExpression": "pk = :a AND", "ExpressionAttributeValues": {":a": A}},
+                False,
+            ),
+            (
+                {
+                    "KeyConditionExpression": "pk = :a AND pk = :b",
+                    "ExpressionAttributeValues": {":a": A, ":b": B},
+                },
+                False,
+            ),
+            (
+                {
+                    "KeyConditionExpression": "pk = :a",
+                    "ExpressionAttributeValues": {":a": A},
+                    "FilterExpression": "#q = :a",
+                },
+                False,
+            ),
+            (
+                {
+                    "KeyConditionExpression": "pk = :a",
+                    "ExpressionAttributeValues": {":a": A},
+                    "ConditionalOperator": "AND",
+                },
+                False,
+            ),
+            ({"KeyConditionExpression": "pk = :a", "ExpressionAttributeValues": {":a": A}}, True),
+            (
+                {
+                    "KeyConditionExpression": "pk = :a",
+                    "ExpressionAttributeValues": {":a": A},
+                    "Select": "BOGUS",
+                },
+                False,
+            ),
+        ],
+        ids=["L1", "L2", "L3", "L4", "L5", "L6", "L7"],
+    )
+    def test_limit_zero_reported_first(
+        self, dynamodb_client_no_validation, range_table, kwargs, missing_table
+    ):
+        """Limit 0 answers its own message ahead of a key condition syntax
+        error, a duplicate, a filter fault, a parameter mixing error, a
+        missing table and Select BOGUS. The SDK refuses Limit 0 before it
+        sends the request, so this client has its checks off."""
+        code, msg = _error(
+            lambda: dynamodb_client_no_validation.query(
+                TableName=MISSING_TABLE if missing_table else range_table,
+                Limit=0,
+                **kwargs,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == LIMIT_ZERO
+
+    def test_begins_with_number_on_the_partition_key(self, dynamodb_client, range_table):
+        """P1: the operand type, ahead of the partition key equality rule."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="begins_with(pk, :n)",
+                ExpressionAttributeValues={":n": N1},
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == BEGINS_WITH_N
+
+    @pytest.mark.parametrize(
+        ("kwargs", "want"),
+        [
+            (
+                {"KeyConditions": LEGACY_PK, "ExpressionAttributeValues": {":a": A}},
+                "ExpressionAttributeValues can only be specified when using expressions",
+            ),
+            (
+                {"KeyConditionExpression": ""},
+                "Invalid KeyConditionExpression: The expression can not be empty;",
+            ),
+            (
+                {"KeyConditions": LEGACY_PK, "ConditionalOperator": "AND"},
+                "ConditionalOperator cannot be used without Filter or Expected",
+            ),
+        ],
+        ids=["M1", "M2", "M3"],
+    )
+    def test_parameter_check_reported_ahead_of_a_missing_table(
+        self, dynamodb_client, kwargs, want
+    ):
+        code, msg = _error(lambda: dynamodb_client.query(TableName=MISSING_TABLE, **kwargs))
+        assert code == "ValidationException"
+        assert msg == want

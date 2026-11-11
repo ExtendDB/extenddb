@@ -60,10 +60,10 @@ pub async fn handle_query(
             clause: crate::EnumClause::Named("returnConsumedCapacity"),
         }],
     )?;
-    // The service checks Select after the request's parameters, its
+    // The service checks Select after Limit, the request's parameters, its
     // FilterExpression and its KeyConditionExpression (measured 2026-11-11:
-    // with Select `BOGUS`, a parameter mixing error, an undefined filter
-    // `#name` and a second condition on one key attribute each answer
+    // with Select `BOGUS`, Limit 0, a parameter mixing error, an undefined
+    // filter `#name` and a second condition on one key attribute each answer
     // first), so an invalid Select is left out of the typed input and its
     // error waits for those checks below.
     let select_check = crate::validate_enum_fields(
@@ -94,6 +94,19 @@ pub async fn handle_query(
         }
     };
 
+    // Validate Limit >= 1 (REQ-QUERY-001). The service checks Limit ahead of
+    // every other fault measured (2026-11-11, us-east-1: Limit 0 answers this
+    // beside a key condition syntax error, a second condition on one key
+    // attribute, an undefined filter `#name`, a parameter mixing error, a
+    // missing table and Select `BOGUS`).
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
+                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
+            ));
+    }
+
     // Build expression maps from request (used for expression-based parameters)
     let maps = build_expression_maps(
         input.expression_attribute_names.as_ref(),
@@ -101,14 +114,14 @@ pub async fn handle_query(
     );
 
     // The service checks a Query in this order (measured 2026-11-11 in
-    // us-east-1): the request's parameters, then every FilterExpression
-    // fault, then every KeyConditionExpression fault, then Select, the table,
-    // the index and ConsistentRead. A parameter mixing error answers ahead of
-    // a filter fault, and ahead of a missing table, IndexName `nope`, Select
-    // `BOGUS` and ConsistentRead on a GSI. A filter fault answers ahead of an
-    // undefined key condition reference, a key condition syntax error, a
-    // number in `begins_with` and those four. A key condition fault answers
-    // ahead of those four. Limit stays below, where it was checked before.
+    // us-east-1): Limit, then the request's parameters, then every
+    // FilterExpression fault, then every KeyConditionExpression fault, then
+    // Select, the table, the index and ConsistentRead. A parameter check
+    // answers ahead of a filter fault, and ahead of a missing table,
+    // IndexName `nope`, Select `BOGUS` and ConsistentRead on a GSI. A filter
+    // fault answers ahead of an undefined key condition reference, a key
+    // condition syntax error, a number in `begins_with` and those four. A key
+    // condition fault answers ahead of those four.
     check_request_parameters(&input)?;
     let filter_expression = parse_filter_expression(&input, &maps, &ctx.limits)?;
     let key_condition_expression = input
@@ -178,15 +191,6 @@ pub async fn handle_query(
     // With an ExclusiveStartKey this runs after the start key checks below.
     if input.exclusive_start_key.is_none() {
         validate_query_select_index_support(input.select, index_info.as_ref())?;
-    }
-
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
     }
 
     // For index queries, build a key_info that reflects the index's key schema
@@ -669,12 +673,15 @@ fn refuse_begins_with_on_number(
 /// `ExpressionAttributeValues` with no expression that uses them, and
 /// `ConditionalOperator` without a `QueryFilter` of two or more conditions.
 ///
-/// `handle_query` runs these first, ahead of the `FilterExpression`, the
-/// `KeyConditionExpression` and the `Select`, table, index and
-/// `ConsistentRead` checks (measured 2026-11-11: `ConditionalOperator` `AND`
-/// beside `pk = :a` answers the mixing error with a missing table, IndexName
-/// `nope`, Select `BOGUS`, ConsistentRead on a GSI or an undefined filter
-/// `#name`, and beside `pk = :a AND pk = :b`).
+/// `handle_query` runs these right after the `Limit` check, ahead of the
+/// `FilterExpression`, the `KeyConditionExpression` and the `Select`, table,
+/// index and `ConsistentRead` checks (measured 2026-11-11: `ConditionalOperator`
+/// `AND` beside `pk = :a` answers the mixing error with a missing table,
+/// IndexName `nope`, Select `BOGUS`, ConsistentRead on a GSI or an undefined
+/// filter `#name`, and beside `pk = :a AND pk = :b`; on a missing table,
+/// `ExpressionAttributeValues` beside legacy `KeyConditions`, an empty
+/// `KeyConditionExpression` and `ConditionalOperator` without a `QueryFilter`
+/// each answer their own message).
 fn check_request_parameters(input: &QueryInput) -> Result<(), DynamoDbError> {
     // --- Legacy vs expression mutual exclusivity checks ---
     let kce_present = input.key_condition_expression.is_some();
