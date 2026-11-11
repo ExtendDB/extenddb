@@ -282,10 +282,12 @@ async fn expected_rows(db: &PgPool, table_id: &str) -> BTreeSet<(String, String,
     rows.into_iter().collect()
 }
 
-/// Three writes that read "no index", then write after the GSI is ACTIVE: a new
-/// item, an overwrite that changes the index key, and a delete. Paused at `at`;
-/// with `conditional` the last two carry a condition, which puts them on the
-/// transaction path whatever the pause.
+/// Four writes that read "no index", then write after the GSI is ACTIVE: a new
+/// item, an overwrite that changes the index key, a delete, and a create-only
+/// put of a new item (`attribute_not_exists(pk)`). Paused at `at`; with
+/// `conditional` the overwrite and the delete carry a condition, which puts them
+/// on the transaction path whatever the pause. The create-only put writes
+/// without a transaction when it is not slow, like the unconditional put.
 async fn drive(at: PauseWrites, conditional: bool) {
     let s = scratch().await;
     let key_info = create_table(&s).await;
@@ -298,6 +300,10 @@ async fn drive(at: PauseWrites, conditional: bool) {
     let maps = ExpressionMaps::default();
     let cond = extenddb_core::expression::parse_condition(
         &extenddb_core::expression::tokenize("attribute_exists(pk)").expect("tokenize"),
+    )
+    .expect("parse");
+    let create_only = extenddb_core::expression::parse_condition(
+        &extenddb_core::expression::tokenize("attribute_not_exists(pk)").expect("tokenize"),
     )
     .expect("parse");
     let writes = async {
@@ -317,10 +323,19 @@ async fn drive(at: PauseWrites, conditional: bool) {
         let c = s
             .engine
             .delete_item(&ki, &key2, false, conditional.then_some(&cond), &maps, None);
-        let (a, b, c) = tokio::join!(a, b, c);
+        let create = s.engine.put_item(
+            &ki,
+            item(101, Some("late create"), None),
+            false,
+            Some(&create_only),
+            &maps,
+            None,
+        );
+        let (a, b, c, create) = tokio::join!(a, b, c, create);
         a.expect("late put");
         b.expect("late overwrite");
         c.expect("late delete");
+        create.expect("late create-only put");
     };
     let build = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -355,15 +370,15 @@ async fn writes_that_missed_a_new_gsi_are_repaired() {
     // One test for the three paths, run in sequence, because the pause is
     // process-wide.
     //
-    // Unconditional writes on a table with no index write without a transaction.
-    // Paused between that decision and the statement, they stay on that path: the
-    // statement lands after the backfill, and the repair runs after the statement,
-    // on its own (`fix_up_autocommit`).
+    // Unconditional writes and create-only puts on a table with no index write
+    // without a transaction. Paused between that decision and the statement, they
+    // stay on that path: the statement lands after the backfill, and the repair
+    // runs after the statement, on its own (`fix_up_autocommit`).
     drive(PauseWrites::BeforeAutocommitStatement, false).await;
     // Paused after the catalog read instead, the same writes are already slow
     // when the decision is made and move to the transaction path, where the
     // repair commits with the write (`fix_up_stale_write`).
     drive(PauseWrites::AfterIndexRead, false).await;
-    // Conditional writes take a transaction regardless.
+    // Other conditional writes take a transaction regardless.
     drive(PauseWrites::AfterIndexRead, true).await;
 }

@@ -25,6 +25,16 @@ pub struct PostgresStorageConfig {
         deserialize_with = "extenddb_storage::config::string_coerce::opt_u32"
     )]
     pub catalog_pool_size: Option<u32>,
+    /// Write a `PutItem` whose condition only says that the item must not
+    /// exist (`attribute_not_exists` on a key attribute) as one autocommit
+    /// `INSERT ... ON CONFLICT DO NOTHING`, when it has nothing else to do in
+    /// a transaction. `false` keeps such puts on the transaction path. The
+    /// answers are the same either way.
+    #[serde(
+        default = "default_create_only_puts",
+        deserialize_with = "extenddb_storage::config::string_coerce::bool"
+    )]
+    pub create_only_puts: bool,
 }
 
 impl Default for PostgresStorageConfig {
@@ -33,6 +43,7 @@ impl Default for PostgresStorageConfig {
             connection_string: default_connection_string(),
             pool_size: default_pool_size(),
             catalog_pool_size: None,
+            create_only_puts: default_create_only_puts(),
         }
     }
 }
@@ -43,6 +54,10 @@ fn default_connection_string() -> String {
 
 fn default_pool_size() -> u32 {
     20
+}
+
+fn default_create_only_puts() -> bool {
+    true
 }
 
 /// Parsed components of a `PostgreSQL` connection string.
@@ -171,6 +186,24 @@ catalog_pool_size = 10"#,
         .expect("native numeric fields must deserialize");
         assert_eq!(cfg.pool_size, 25);
         assert_eq!(cfg.catalog_pool_size, Some(10));
+    }
+
+    /// `create_only_puts` is on when omitted, and an environment override
+    /// (`EXTENDDB__STORAGE__POSTGRES__CREATE_ONLY_PUTS=false`) arrives as a
+    /// string.
+    #[test]
+    fn create_only_puts_defaults_on_and_accepts_both_forms() {
+        let conn = r#"connection_string = "postgresql://u:p@localhost:5432/db""#;
+        for (extra, expected) in [
+            ("", true),
+            ("create_only_puts = false", false),
+            ("create_only_puts = \"false\"", false),
+            ("create_only_puts = \"true\"", true),
+        ] {
+            let cfg: PostgresStorageConfig =
+                toml::from_str(&format!("{conn}\n{extra}")).expect("the config must deserialize");
+            assert_eq!(cfg.create_only_puts, expected, "{extra:?}");
+        }
     }
 }
 

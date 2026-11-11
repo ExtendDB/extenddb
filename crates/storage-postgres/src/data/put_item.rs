@@ -3,11 +3,13 @@
 
 //! `put_item` and `get_item` implementations for the `PostgreSQL` backend.
 
-use extenddb_core::expression::{Expr, ExpressionMaps};
+use extenddb_core::expression::{Expr, ExpressionMaps, requires_absent_item};
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::StreamCapture;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info};
+use extenddb_storage::util::{
+    SortKeyValue, composite_pk_to_text, parse_sk, pk_to_text, sk_column, sk_info,
+};
 
 use super::gsi_build::fix_up_stale_write;
 use super::index::{enqueue_async_indexes, fetch_write_path_indexes, sync_indexes};
@@ -86,16 +88,22 @@ impl PostgresEngine {
             self.index_propagation_delay().await
         };
 
-        // When there's a condition, return_old, indexes, or stream capture, we need a transaction
-        // A write that is already slow takes the transaction path even with no
-        // index to maintain, so that a repair for a GSI created meanwhile commits
-        // with the write (`gsi_build::fix_up_stale_write`) instead of after it.
-        let needs_tx = condition.is_some()
-            || return_old
-            || !indexes.is_empty()
-            || !vector_metas.is_empty()
-            || stream.is_some()
-            || stamp.elapsed() > super::gsi_build::GRACE_WRITE;
+        // A write takes a transaction when it has a condition, an old item to
+        // return, an index or a stream to maintain, or is already slow: a repair
+        // for a GSI created meanwhile then commits with the write
+        // (`gsi_build::fix_up_stale_write`) instead of after it. A create-only
+        // put with nothing else to do is the exception: the key alone decides its
+        // condition (`requires_absent_item`), so one autocommit insert does
+        // (`insert_absent`).
+        let no_tx_work = !return_old
+            && indexes.is_empty()
+            && vector_metas.is_empty()
+            && stream.is_none()
+            && stamp.elapsed() <= super::gsi_build::GRACE_WRITE;
+        let create_only = self.create_only_puts
+            && no_tx_work
+            && condition.is_some_and(|c| requires_absent_item(c, &key_info.key_schema, maps));
+        let needs_tx = !no_tx_work || (condition.is_some() && !create_only);
 
         if let Some((sk_name, sk_type)) =
             sk_info(&key_info.key_schema, &key_info.attribute_definitions)
@@ -258,6 +266,11 @@ impl PostgresEngine {
                 } else {
                     Ok(None)
                 }
+            } else if create_only {
+                self.insert_absent(&ddb_table, &pk_text, Some((sk_col, &sk)), &item_json)
+                    .await?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
+                Ok(None)
             } else {
                 let upsert_sql = format!(
                     "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
@@ -436,6 +449,11 @@ impl PostgresEngine {
                 } else {
                     Ok(None)
                 }
+            } else if create_only {
+                self.insert_absent(&ddb_table, &pk_text, None, &item_json)
+                    .await?;
+                self.fix_up_autocommit(stamp, key_info, &item).await;
+                Ok(None)
             } else {
                 let upsert_sql = format!(
                     "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
@@ -498,6 +516,72 @@ impl PostgresEngine {
 /// create race to a winner that is deleted again before the re-read. Same
 /// bound as `UpdateItem`.
 const MAX_CREATE_RACE_ATTEMPTS: u32 = 5;
+
+impl PostgresEngine {
+    /// A create-only put without a transaction: one `INSERT ... ON CONFLICT DO
+    /// NOTHING` of the item, keyed on `pk` and, on a table with a sort key, on
+    /// `sk` (its column and value). A row inserted means the item did not
+    /// exist. No row means the item exists, so the condition fails, and a read
+    /// fetches the item that blocked the insert, which the transaction path also
+    /// reports. If a delete committed between the two statements, the read finds
+    /// no item and the insert is tried again, up to `MAX_CREATE_RACE_ATTEMPTS`
+    /// inserts.
+    async fn insert_absent(
+        &self,
+        ddb_table: &str,
+        pk: &str,
+        sk: Option<(&str, &SortKeyValue)>,
+        item_json: &serde_json::Value,
+    ) -> Result<(), StorageError> {
+        let (insert_sql, select_sql) = match sk {
+            Some((sk_col, _)) => (
+                format!(
+                    "INSERT INTO {ddb_table} (pk, {sk_col}, item_data) VALUES ($1, $2, $3) \
+                     ON CONFLICT (pk, {sk_col}) DO NOTHING"
+                ),
+                format!("SELECT item_data FROM {ddb_table} WHERE pk = $1 AND {sk_col} = $2"),
+            ),
+            None => (
+                format!(
+                    "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2) \
+                     ON CONFLICT (pk) DO NOTHING"
+                ),
+                format!("SELECT item_data FROM {ddb_table} WHERE pk = $1"),
+            ),
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            super::gsi_build::pause_before_autocommit_statement().await;
+            let inserted = match sk {
+                Some((_, sk)) => bind_sk_execute!(&insert_sql, pk, sk, item_json, &self.data_pool)?,
+                None => sqlx::query(&insert_sql)
+                    .bind(pk)
+                    .bind(item_json)
+                    .execute(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            };
+            if inserted.rows_affected() == 1 {
+                return Ok(());
+            }
+            let existing: Option<(serde_json::Value,)> = match sk {
+                Some((_, sk)) => bind_sk_fetch_optional!(&select_sql, pk, sk, &self.data_pool)?,
+                None => sqlx::query_as(&select_sql)
+                    .bind(pk)
+                    .fetch_optional(&self.data_pool)
+                    .await
+                    .map_err(|e| StorageError::Internal(e.to_string()))?,
+            };
+            if let Some((v,)) = existing {
+                return Err(StorageError::ConditionFailed(Some(json_to_item(v)?)));
+            }
+            attempt += 1;
+            if attempt >= MAX_CREATE_RACE_ATTEMPTS {
+                return Err(create_race_exhausted(attempt));
+            }
+        }
+    }
+}
 
 /// The error after `MAX_CREATE_RACE_ATTEMPTS` lost create races. Like the one
 /// `UpdateItem` returns, it is an internal error (HTTP 500).
