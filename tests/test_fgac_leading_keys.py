@@ -377,17 +377,15 @@ class TestLeadingKeys:
             c.scan(TableName=table)
         assert _denied(e)
 
-    # -- A second clause on the partition key binds nothing ----------------
+    # -- A second clause on the partition key ------------------------------
 
     def test_unreadable_partition_equality_does_not_bind_another_clause(self, table):
-        # An equality on the partition key and a second clause on it name the
-        # partition key twice, so the duplicate check leaves
-        # dynamodb:LeadingKeys absent and the fenced value in the second
-        # clause (`:v`) is never bound. A principal allowed everything gets
-        # the one-condition-per-key error. A policy that needs a LeadingKeys
-        # value denies the request, whether the equality's value can be read
-        # (`:u = {"S": "bob"}`) or not (`:u = {"N": "bob"}`, refused either
-        # way).
+        # An equality on the partition key decides dynamodb:LeadingKeys, and
+        # the fenced value in the second clause (`:v`) is never bound in its
+        # place. A principal allowed everything gets the one-condition-per-key
+        # error. A policy fenced to `:v`'s value denies the request, whether
+        # the equality's value can be read (`:u = {"S": "bob"}`, bound) or not
+        # (`:u = {"N": "bob"}`, absent, and refused either way).
         kces = ("pk = :u AND pk > :v", "pk > :v AND pk = :u")
         readable = {":u": {"S": OTHER}, ":v": {"S": OWN}}
         unreadable = {":u": {"N": OTHER}, ":v": {"S": OWN}}
@@ -420,6 +418,24 @@ class TestLeadingKeys:
                             ExpressionAttributeValues=unreadable)
                 assert e.value.response["Error"]["Code"] in (
                     "AccessDeniedException", "ValidationException"), (form, kce)
+
+    def test_duplicate_sort_key_condition_binds_the_partition_equality(self, table):
+        # A second condition on the sort key leaves dynamodb:LeadingKeys bound
+        # to the partition equality's value, so a principal fenced to that
+        # value reaches the engine and gets the one-condition-per-key error.
+        # With the key absent, the same principal would get
+        # AccessDeniedException. Which value the service binds for a key
+        # condition with two conditions on one key attribute is not measured.
+        c = self._user_client([("lk", self._leading_keys_policy(
+            "ForAnyValue", [OWN], table))])
+        with pytest.raises(ClientError) as e:
+            c.query(TableName=table,
+                    KeyConditionExpression="pk = :own AND sk = :b AND sk = :c",
+                    ExpressionAttributeValues={":own": {"S": OWN}, ":b": {"S": "x"},
+                                               ":c": {"S": "y"}})
+        err = e.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == ONE_PER_KEY
 
     def test_non_equality_partition_with_sort_clause_is_refused(self, table):
         # The fix binds the partition operand of these shapes; the engine still

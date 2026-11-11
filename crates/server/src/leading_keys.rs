@@ -63,7 +63,7 @@
 use std::collections::HashMap;
 
 use extenddb_core::expression::{
-    Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition_with_maps,
+    Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition,
     tokenize_with_limit,
 };
 use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo};
@@ -268,11 +268,8 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
 
     if let Some(kce) = input.get("KeyConditionExpression").and_then(Value::as_str) {
         let tokens = tokenize_with_limit(kce, max_tokens).ok()?;
-        // The clauses that name the partition attribute. A key condition with
-        // a second condition on one key attribute, written with plain names
-        // or through a `#name` reference, is refused here with the check the
-        // engine runs, so it leaves the key absent whatever its operators.
-        let pk_clauses: Vec<_> = key_condition_clause_operands(&tokens, &names, &values)
+        // The clauses that name the partition attribute, as written.
+        let pk_clauses: Vec<_> = key_condition_clause_operands(&tokens)
             .ok()?
             .into_iter()
             .filter(|clause| resolve_attr_name(&clause.path, &names).as_deref() == Some(pk_attr))
@@ -281,17 +278,21 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
         // engine reads it. When the engine's classification refuses the
         // condition (a missing HASH attribute on a multi-attribute key schema,
         // for one) or the value cannot be read here (an `N` that is not a
-        // number, a placeholder with no value), the key stays absent.
+        // number, a placeholder with no value), the key stays absent and no
+        // other clause's operand is bound in its place: the equality, not the
+        // other clause, names the partition.
         if pk_clauses.iter().any(|clause| clause.equality) {
             return equality_pk_value(&tokens, key_schema, pk_attr, &names, &values);
         }
-        // The one clause on the partition key uses an operator the engine
-        // rejects, such as `pk > :v`. The service binds LeadingKeys to that
-        // operand and evaluates the policy before it rejects the shape, so a
-        // principal fenced away from the value gets AccessDeniedException
+        // Exactly one clause names the partition key, under an operator the
+        // engine rejects, such as `pk > :v`. The service binds LeadingKeys to
+        // that operand and evaluates the policy before it rejects the shape,
+        // so a principal fenced away from the value gets AccessDeniedException
         // while one fenced to it gets the shape's ValidationException
-        // (measured 2026-10-21 for `pk > :v`). A condition that does not parse
-        // and one that names no partition clause leave the key absent.
+        // (measured 2026-10-21 for `pk > :v`). A condition that does not
+        // parse, one that names no partition clause, and one with two
+        // non-equality partition clauses (which value the service binds for
+        // that shape is not measured) leave the key absent.
         let [clause] = pk_clauses.as_slice() else {
             return None;
         };
@@ -347,7 +348,7 @@ fn equality_pk_value(
     names: &HashMap<String, String>,
     values: &HashMap<String, Value>,
 ) -> Option<String> {
-    let mut kc = parse_key_condition_with_maps(tokens, names, values).ok()?;
+    let mut kc = parse_key_condition(tokens).ok()?;
     // Assign every clause to its key attribute with the engine's own
     // classification: by name on a multi-attribute key schema, where the
     // first HASH attribute is the one LeadingKeys names, and by

@@ -389,9 +389,10 @@ impl KeyCondition {
     /// authorization when it finds the partition key value for
     /// `dynamodb:LeadingKeys`, so both read the same clause as the partition
     /// key. On a multi-attribute key schema `pk_path` then names the first
-    /// HASH attribute. Both parse with [`parse_key_condition_with_maps`],
-    /// which refuses a second condition on one key attribute before this runs,
-    /// so a duplicate is reported ahead of `value_check`.
+    /// HASH attribute. The engine parses with
+    /// [`parse_key_condition_with_maps`], which refuses a second condition on
+    /// one key attribute before this runs, so a duplicate is reported ahead of
+    /// `value_check`.
     ///
     /// # Errors
     ///
@@ -597,10 +598,12 @@ impl SortKeyCondition {
 /// Supports multi-part keys: up to 8 AND-ed clauses (4 HASH + 4 RANGE).
 /// Rejects OR, NOT, and unsupported functions.
 ///
-/// This does not look for a second condition on one key attribute, which
-/// needs the request's `ExpressionAttributeNames` and
-/// `ExpressionAttributeValues`. A request's key condition is parsed with
-/// [`parse_key_condition_with_maps`].
+/// This does not refuse a second condition on one key attribute, which needs
+/// the request's `ExpressionAttributeNames` and `ExpressionAttributeValues`.
+/// The engine parses a request's key condition with
+/// [`parse_key_condition_with_maps`]. Authorization parses with this when it
+/// finds the partition key value for `dynamodb:LeadingKeys`, which keeps the
+/// value it bound for such a condition before the engine refused it.
 ///
 /// # Errors
 ///
@@ -620,8 +623,7 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
 /// through `#name` references. When there is such a duplicate, an undefined
 /// `#name` and then an undefined `:value` are reported ahead of it, as the
 /// service reports them. The engine reads a `Query` key condition through
-/// this, and authorization runs the same check through
-/// [`key_condition_clause_operands`].
+/// this.
 ///
 /// # Errors
 ///
@@ -656,24 +658,19 @@ fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoD
 /// it cannot read. A `BETWEEN` clause carries two operands and is left out,
 /// since it names no single value for the attribute.
 ///
-/// `names` and `values` are the request's `ExpressionAttributeNames` and
-/// `ExpressionAttributeValues`, as [`parse_key_condition_with_maps`] takes
-/// them.
+/// Like [`parse_key_condition`], this does not refuse a second condition on
+/// one key attribute, so authorization binds `dynamodb:LeadingKeys` for such a
+/// condition as it did before the engine refused it. Which value the service
+/// binds for it is not measured.
 ///
 /// # Errors
 ///
-/// Returns `ValidationException` for the same errors
-/// [`parse_key_condition_with_maps`] returns before it classifies clauses,
-/// including a second condition on one key attribute, so a key condition the
-/// engine refuses for that names no operand here.
-pub fn key_condition_clause_operands<V>(
+/// Returns `ValidationException` for the same syntax errors and unsupported
+/// constructs [`parse_key_condition`] rejects before it classifies clauses.
+pub fn key_condition_clause_operands(
     tokens: &[Token],
-    names: &std::collections::HashMap<String, String>,
-    values: &std::collections::HashMap<String, V>,
 ) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
-    let clauses = parse_clauses(tokens)?;
-    reject_duplicate_key_attrs(&clauses, names, values)?;
-    Ok(clauses
+    Ok(parse_clauses(tokens)?
         .into_iter()
         .filter_map(|clause| match clause {
             RawClause::Eq(path, value) => Some(KeyClauseOperand {
@@ -1483,14 +1480,17 @@ mod tests {
                 "pk < :v AND sk > :s",
                 &[("pk", "v", false), ("sk", "s", false)],
             ),
+            (
+                "pk = :u AND pk > :v",
+                &[("pk", "u", true), ("pk", "v", false)],
+            ),
             // BETWEEN names two operands, so it contributes none.
             ("pk BETWEEN :lo AND :hi", &[]),
             ("pk = :v AND sk BETWEEN :lo AND :hi", &[("pk", "v", true)]),
         ];
         for (expr, want) in cases {
             let tokens = tokenize(expr).unwrap();
-            let got =
-                key_condition_clause_operands(&tokens, &HashMap::new(), &values_of(expr)).unwrap();
+            let got = key_condition_clause_operands(&tokens).unwrap();
             let got: Vec<(String, String, bool)> = got
                 .into_iter()
                 .map(|clause| {
@@ -1529,7 +1529,7 @@ mod tests {
                 continue;
             };
             assert!(
-                key_condition_clause_operands(&tokens, &HashMap::new(), &no_values()).is_err(),
+                key_condition_clause_operands(&tokens).is_err(),
                 "expr {expr} should be rejected"
             );
         }
@@ -2079,30 +2079,6 @@ mod tests {
         match result {
             Err(DynamoDbError::ValidationException(msg)) => assert_eq!(msg, want, "expr {expr}"),
             other => panic!("expr {expr}: got {other:?}"),
-        }
-    }
-
-    /// A second condition on a key attribute, written with plain names or
-    /// through a `#name` reference, is refused before the clauses are handed
-    /// to authorization, so the LeadingKeys path reads no partition operand
-    /// from such a request.
-    #[test]
-    fn clause_operands_reject_duplicate_key_attribute() {
-        let names = names_of(&[("p", "pk"), ("s", "sk")]);
-        for expr in [
-            "pk = :a AND pk = :b",
-            "#p = :a AND pk = :b",
-            "pk = :u AND pk > :v",
-            "#p = :u AND pk > :v",
-            "pk > :v AND sk = :s AND sk = :t",
-            "pk > :v AND #s = :s AND sk = :t",
-        ] {
-            let tokens = tokenize(expr).unwrap();
-            assert_refused(
-                key_condition_clause_operands(&tokens, &names, &values_of(expr)),
-                ONE_CONDITION_PER_KEY_ERR,
-                expr,
-            );
         }
     }
 
