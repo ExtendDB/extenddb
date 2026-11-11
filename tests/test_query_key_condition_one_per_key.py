@@ -46,11 +46,10 @@ NESTED = (
 REDUNDANT_PARENS = (
     "Invalid KeyConditionExpression: The expression has redundant parentheses;"
 )
-UNDEFINED_NAME = (
-    "An expression attribute name used in the document path is not defined; "
-    "attribute name: #u"
+UNDEFINED_NAME_EXACT = (
+    "Invalid KeyConditionExpression: An expression attribute name used in the "
+    "document path is not defined; attribute name: #u"
 )
-UNDEFINED_NAME_EXACT = "Invalid KeyConditionExpression: " + UNDEFINED_NAME
 UNDEFINED_VALUE_A = (
     "Invalid KeyConditionExpression: An expression attribute value used in "
     "expression is not defined; attribute value: :a"
@@ -265,7 +264,7 @@ class TestOneConditionPerKey:
             )
         )
         assert code == "ValidationException"
-        assert UNDEFINED_NAME in msg
+        assert msg == UNDEFINED_NAME_EXACT
 
 
 class TestDuplicateCheckOrder:
