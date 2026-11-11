@@ -794,9 +794,9 @@ Keys imported earlier keep working while import is disabled.
 
 ### `Management API: encrypt session secret failed: <error>`
 
-**Cause:** AES-256-GCM encryption of the temporary session secret key failed. This could indicate a corrupted or invalid encryption key in the settings table.
+**Cause:** AES-256-GCM encryption of the temporary session secret key failed. The server checks the encryption key at startup and encrypts with the copy it loaded then, so the key in the `settings` table is not the cause.
 
-**Fix:** Verify the `encryption_key` value in the `settings` table is a valid base64-encoded 32-byte key. If corrupted, re-run `extenddb init` to regenerate.
+**Fix:** Open an issue with the error that follows the message in the server log.
 
 ### `Management API: store assume-role session failed: <error>`
 
