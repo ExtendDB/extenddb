@@ -9,7 +9,7 @@
 
 use super::context::ConditionContext;
 use super::document::{Condition, ConditionOperator, base_operator};
-use super::variables::{ConditionValue, arn_value_lacks_fields};
+use super::variables::ConditionValue;
 
 /// Evaluate a single condition against a context.
 ///
@@ -196,9 +196,14 @@ pub enum ConditionMatch {
     /// A condition is not satisfied; the statement does not apply.
     NoMatch,
     /// A condition depends on a key the service populates but this context
-    /// cannot resolve, or has an `Arn*` value that contains `${` and cannot
-    /// have the six fields of an ARN, which IAM refuses in a document of any
-    /// `Version`. The statement fails closed.
+    /// cannot resolve, or has an `Arn*` value that
+    /// [`super::arn_value::fails_closed_at_evaluation`] reports: one that
+    /// contains `${` and cannot have the six fields of an ARN, which IAM
+    /// refuses in a document of any `Version`, one whose first field holds no
+    /// `${` and does not match `arn`, or one whose evaluation by IAM was not
+    /// measured: a short pattern, or, in a `2012-10-17` document, a value
+    /// whose expansion has two to five fields, or six fields and a first
+    /// field that holds `${`. The statement fails closed.
     Unresolvable,
 }
 
@@ -214,12 +219,20 @@ pub enum ConditionMatch {
 /// fails closed here although it matches nothing whatever the other key
 /// holds; a `Resource` pattern of that shape does not. Where the value is not
 /// expanded it is compared as written and reads no key. It also returns
-/// `Unresolvable`, whatever `version_2012` says, when a value of an `Arn*`
-/// operator, with or without a set qualifier or `IfExists`, contains `${` and
-/// has fewer than five `:` written outside its `${...}` references, such as
-/// `${aws:ResourceTag/owner}`. Otherwise returns `Match` or `NoMatch` from
-/// the ordinary evaluation, so cases 1 and 2 are unchanged. `version_2012` is
-/// as in [`evaluate_condition_with`].
+/// `Unresolvable` when a value of an `Arn*` operator, with or without a set
+/// qualifier or `IfExists`, is one that
+/// [`super::arn_value::fails_closed_at_evaluation`] reports. Whatever
+/// `version_2012` says, that is a value that contains `${` and has fewer than
+/// five `:` written outside its `${...}` references, such as
+/// `${aws:ResourceTag/owner}`, one whose first field holds no `${` and does
+/// not match `arn`, such as `""`, and a short pattern with a wildcard in its
+/// first field, such as `*:aws:iam:*`. When the value is expanded, it is also
+/// a value whose expansion has two to five fields, such as
+/// `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, and a value whose first
+/// field holds `${` and whose expansion has six fields, such as
+/// `${x}:aws:iam::123456789012:user/alice`. Otherwise returns `Match` or
+/// `NoMatch` from the ordinary evaluation, so cases 1 and 2 are unchanged.
+/// `version_2012` is as in [`evaluate_condition_with`].
 pub fn evaluate_condition_match(
     condition: &Condition,
     version_2012: bool,
@@ -231,18 +244,34 @@ pub fn evaluate_condition_match(
     {
         return ConditionMatch::Unresolvable;
     }
-    // The IAM policy simulator refuses a policy with such an ARN value
-    // (`InvalidInput`) and IAM Access Analyzer reports `MISSING_ARN_FIELD`, so
-    // IAM gives no decision to match. Failing closed makes a `Deny` apply and
-    // keeps an `Allow` from granting. IAM checks the value's fields whatever
-    // the document's `Version`, so the rule does not read `version_2012`.
+    // IAM gives no decision to match for these values: the IAM policy
+    // simulator refuses a value with a variable and too few fields
+    // (`InvalidInput`, and IAM Access Analyzer reports `MISSING_ARN_FIELD`),
+    // IAM's identity policy write check refuses a value whose first field is
+    // not `arn` (a role trust policy write accepts one of six fields, and how
+    // IAM evaluates it there was not measured), and the short wildcard
+    // pattern was not measured. A first field that holds `${` is left to the
+    // matcher where the value is compared as written: that first field is
+    // text with `${`, which no ARN holds. It is also left to the matcher
+    // where the references hold every `:` once expanded, which gives the
+    // simulator's answer for `${x, '}:::::'}`. How IAM evaluates an
+    // expanded value of two to five fields, or of six fields whose first
+    // field holds a variable, was not measured either. Failing closed makes a
+    // `Deny` apply and keeps an `Allow` from granting. IAM checks the value's
+    // fields whatever the document's `Version`, so the other rules do not
+    // read `version_2012`. Only an expanded value has an expansion, so these
+    // two rules read whether the value is expanded.
+    let expanded = expands_variables(&condition.operator, version_2012);
     if matches!(
         base_operator(&condition.operator),
         ConditionOperator::ArnEquals
             | ConditionOperator::ArnNotEquals
             | ConditionOperator::ArnLike
             | ConditionOperator::ArnNotLike
-    ) && condition.values.iter().any(|v| arn_value_lacks_fields(v))
+    ) && condition
+        .values
+        .iter()
+        .any(|v| super::arn_value::fails_closed_at_evaluation(v, expanded))
     {
         return ConditionMatch::Unresolvable;
     }
@@ -552,16 +581,19 @@ fn compare_single(op: &ConditionOperator, context_value: &str, value: &Condition
         }
         ConditionOperator::Bool => bool_matches(context_value, policy_value),
         // IAM evaluates ArnEquals exactly as ArnLike and ArnNotEquals exactly
-        // as ArnNotLike: `*` and `?` match in every ARN field, matching is
-        // case sensitive, and both sides need the same number of fields,
-        // except that a bare `*` pattern matches any six-field value
-        // (`arn_match` returns before it compares fields; derived, since the
-        // simulator refuses `*` against an ARN). The rows measured with
-        // simulate-custom-policy are in the description of PR #471. The
-        // context value is an ARN here (checked above). The pattern is the
-        // expanded value with the wildcards the policy wrote, so a `*` or `?`
-        // that came from a variable value, a default or an escape is matched
-        // literally (`ConditionValue::arn_matches`).
+        // as ArnNotLike: `*` and `?` match in every ARN field and matching is
+        // case sensitive (simulate-custom-policy, rows in the description of
+        // PR #471). The field rules are those of
+        // `arn_value::arn_condition_match_tokens`, measured on a live role
+        // session on 2026-10-30 (issue #665): a six-field pattern compares
+        // every field, a pattern of two to five fields starting `arn`
+        // compares only the fields it has, and a one-field pattern (bare `*`
+        // included) matches nothing, so the negative operators hold for it.
+        // The context value is an ARN here (checked above). The pattern is
+        // the expanded value with the wildcards and field separators the
+        // policy wrote, so a `*`, `?` or `:` that came from a variable value,
+        // a default or an escape is matched literally
+        // (`ConditionValue::arn_matches`).
         ConditionOperator::ArnEquals | ConditionOperator::ArnLike => {
             value.arn_matches(context_value)
         }

@@ -20,9 +20,14 @@ use super::auth::authenticate_admin;
 use super::crypto::{
     encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
 };
+use extenddb_auth::policy::arn_value::{
+    fail_closed_trust_arn_value, invalid_trust_arn_value, trust_arn_value_message,
+};
 use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
-use extenddb_auth::policy::document::parse_conditions;
+use extenddb_auth::policy::document::{
+    Condition, PolicyDocument, PolicyParseError, parse_conditions,
+};
 
 #[derive(Deserialize)]
 pub struct AssumeRoleRequest {
@@ -122,6 +127,11 @@ pub async fn assume_role(
         )
             .into_response();
     }
+    if let Some(ref sp) = request.session_policy
+        && let Err(msg) = check_session_policy(sp)
+    {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
 
     // Load the role and its trust policy.
     let trust_policy = match state
@@ -138,6 +148,7 @@ pub async fn assume_role(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    warn_on_stored_trust_arn_value(&trust_policy, &role_name, &account_id);
 
     // Session tags passed on the call require sts:TagSession in the trust
     // policy, so the STS action set the decision checks depends on their
@@ -204,6 +215,69 @@ pub async fn assume_role(
         caller_arn,
     )
     .await
+}
+
+/// Refuse a session policy that does not load, or that holds an Arn condition
+/// value the identity write check refuses
+/// (`PolicyDocument::from_json_for_session_policy`), answering
+/// `MalformedPolicyDocument`, the error the STS API reference lists for a
+/// malformed policy document.
+///
+/// Before this check AssumeRole issued credentials for both. A session policy
+/// that does not load, such as one with a malformed CIDR, made every request
+/// with those credentials fail. A session policy with such an Arn value
+/// worked, and AssumeRole now refuses it for parity with the identity write
+/// check. The `Version` and `Sid` checks of a policy write do not apply, so a
+/// session policy that AssumeRole accepted for those keeps getting
+/// credentials. What STS answers for these session policies was not measured;
+/// the text after the code is ExtendDB's own.
+fn check_session_policy(session_policy: &Value) -> Result<(), String> {
+    PolicyDocument::from_json_for_session_policy(&session_policy.to_string())
+        .map(|_| ())
+        .map_err(|e| format!("MalformedPolicyDocument: {}", e.0))
+}
+
+/// A stored trust policy can hold an Arn condition value that fails its
+/// statement closed at evaluation: one stored before the trust write check,
+/// which that check now rejects, or a value the check accepts that
+/// `arn_value::fails_closed_at_evaluation` reports under the policy's
+/// `Version`. Such a value is a six-field value whose first field holds no
+/// `${` and does not match `arn`, a value with `${` and fewer than five `:`
+/// written outside its references, or, in a `2012-10-17` trust policy, a
+/// value whose expansion has two to five fields, or six fields and a first
+/// field that holds `${`. Log the role so an operator can find the policy and
+/// rewrite it. The value is read as the evaluator reads it
+/// ([`stored_trust_arn_value`]).
+fn warn_on_stored_trust_arn_value(trust_policy: &Value, role_name: &str, account_id: &str) {
+    if let Some((key, value)) = stored_trust_arn_value(trust_policy) {
+        tracing::warn!(
+            "trust policy of role {role_name} in account {account_id} holds Arn condition \
+             value {value:?} on {key}, so its statement fails closed until the policy is \
+             rewritten"
+        );
+    }
+}
+
+/// The first Arn condition value in a stored trust policy that fails its
+/// statement closed at evaluation (`arn_value::fail_closed_trust_arn_value`),
+/// with its key, read statement by statement as [`evaluate_conditions`] reads
+/// it ([`trust_conditions`]) under the policy's `Version`
+/// ([`trust_policy_is_version_2012`]), or `None`.
+fn stored_trust_arn_value(trust_policy: &Value) -> Option<(String, String)> {
+    let version_2012 = trust_policy_is_version_2012(trust_policy);
+    statements_vec(trust_policy)?.iter().find_map(|stmt| {
+        let conds = trust_conditions(&stmt["Condition"]).ok()?;
+        fail_closed_trust_arn_value(&conds, version_2012).map(|(k, v)| (k.to_owned(), v.to_owned()))
+    })
+}
+
+/// A trust policy statement's `Condition` block as the trust evaluator reads
+/// it: each number or boolean as its JSON text
+/// ([`normalize_condition_scalars`]), then `parse_conditions`. The write check,
+/// the evaluator and its guard, and the AssumeRole warning all read Arn
+/// condition values through this.
+fn trust_conditions(condition: &Value) -> Result<Vec<Condition>, PolicyParseError> {
+    parse_conditions(&normalize_condition_scalars(condition))
 }
 
 /// Generate ASIA* credentials, encrypt, store session, and return the response.
@@ -540,8 +614,11 @@ fn evaluate_conditions(
     context: &AssumeRoleContext,
     version_2012: bool,
 ) -> ConditionOutcome {
-    let normalized = normalize_condition_scalars(&stmt["Condition"]);
-    match parse_conditions(&normalized) {
+    match trust_conditions(&stmt["Condition"]) {
+        // An Arn condition value the trust write check rejects (fewer than six
+        // fields) can only be a value stored before that check. It fails
+        // closed like an unparseable block.
+        Ok(conds) if invalid_trust_arn_value(&conds).is_some() => ConditionOutcome::Unparseable,
         Ok(conds) => match evaluate_statement_conditions(&conds, version_2012, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
@@ -749,9 +826,12 @@ const STS_TRUST_ACTIONS: [&str; 3] = ["sts:assumerole", "sts:tagsession", "sts:s
 /// `NotPrincipal`; a missing `Principal`; a bare string principal (including
 /// `"*"`); an `AWS` principal ARN containing a wildcard; a missing
 /// `Action`/`NotAction`; an action outside the STS trust set; a
-/// `Resource`/`NotResource` field; and a `Condition` with an unknown operator
-/// or invalid structure. Accepts a missing `Version`, a single-object
-/// `Statement`, numeric condition values and unknown condition keys.
+/// `Resource`/`NotResource` field; a `Condition` with an unknown operator
+/// or invalid structure; and an Arn condition value that does not split into
+/// six ARN fields, a number or boolean read as its text. Accepts a missing
+/// `Version`, a single-object
+/// `Statement`, numeric condition values under other operators and unknown
+/// condition keys.
 pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> {
     let Some(statements) = statements_vec(trust_policy) else {
         return Err("Trust policy must contain a Statement object or array".to_owned());
@@ -774,6 +854,25 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     trust_variable_order::validate_trust_sids(&statements)?;
     for stmt in &statements {
         validate_trust_statement(stmt)?;
+    }
+    // Measured on live IAM CreateRole and UpdateAssumeRolePolicy: an Arn
+    // condition value that does not split into six ARN fields is rejected with
+    // MalformedPolicyDocument and a message naming the value. A number or
+    // boolean is read as its text and rejected the same way. Each operator
+    // entry is read on its own, because this check accepts operators the
+    // evaluator does not parse, and IAM checks the Arn values beside them.
+    for stmt in &statements {
+        let Some(block) = stmt.get("Condition").and_then(Value::as_object) else {
+            continue;
+        };
+        for (op, keys) in block {
+            let entry = Value::Object(serde_json::Map::from_iter([(op.clone(), keys.clone())]));
+            if let Ok(conds) = trust_conditions(&entry)
+                && let Some((key, value)) = invalid_trust_arn_value(&conds)
+            {
+                return Err(trust_arn_value_message(key, value));
+            }
+        }
     }
     Ok(())
 }
@@ -1037,6 +1136,9 @@ async fn fetch_caller_created_at(
 mod trust_variable_order;
 
 #[cfg(test)]
+mod arn_trust_tests;
+
+#[cfg(test)]
 mod trust_version_tests;
 
 #[cfg(test)]
@@ -1077,7 +1179,7 @@ mod tests {
         }
     }
 
-    fn ctx() -> AssumeRoleContext {
+    pub(super) fn ctx() -> AssumeRoleContext {
         mk_ctx(HashMap::new(), None, HashMap::new())
     }
 
