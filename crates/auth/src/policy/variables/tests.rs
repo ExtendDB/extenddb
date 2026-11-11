@@ -664,3 +664,31 @@ fn arn_value_lacks_fields_counts_only_colons_written_outside_references() {
     assert!(!arn_value_lacks_fields("${x, '}:::::'}"));
     assert!(arn_value_lacks_fields("${x, ':::::}"));
 }
+
+#[test]
+fn expanded_arn_value_is_short_counts_the_colons_the_evaluator_reads() {
+    // A quoted `}` does not end the reference, so the quoted `:` is part of
+    // the default: four written `:` and five fields.
+    assert!(expanded_arn_value_is_short(
+        "arn:aws:iam::${aws:PrincipalAccount, '}:'}"
+    ));
+    assert!(expanded_arn_value_is_short("*:${x, '}::::'}"));
+    // A reference whose text starts with `}` runs to the next `}`.
+    assert!(expanded_arn_value_is_short("arn:aws:iam::${}:}"));
+    // The references hold every `:`: one field, which matches nothing.
+    assert!(!expanded_arn_value_is_short("${x, '}:::::'}"));
+    // Five written `:`: six fields.
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::123456789012:user/${aws:username, '}:'}"
+    ));
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::${aws:PrincipalAccount}:user/alice"
+    ));
+    // A value with a reference the write refuses is read with each `${`
+    // ending at the next `}`, which counts every `:` after the `}`.
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::${a b, '}:'}:user/x"
+    ));
+    // No variable: the value is compared as written.
+    assert!(!expanded_arn_value_is_short("arn:aws:iam"));
+}
