@@ -415,110 +415,36 @@ mod tests {
         );
     }
 
-    /// A key condition request and the message it answers: the expression,
-    /// its `#`-prefixed names, its `:`-prefixed values (`None` for no
-    /// `ExpressionAttributeValues`) and the expected message.
-    type KceCase = (
-        &'static str,
-        Vec<(&'static str, &'static str)>,
-        Option<Vec<(&'static str, AttributeValue)>>,
-        &'static str,
-    );
-
-    /// Parse `expr` as `Query` does, with `#`-prefixed `names` and
-    /// `:`-prefixed `values` as a request carries them.
-    fn parse_kce(
-        expr: &str,
-        names: &[(&str, &str)],
-        values: Option<&[(&str, AttributeValue)]>,
-    ) -> Result<KeyCondition, DynamoDbError> {
-        let names: HashMap<String, String> = names
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        let values: Option<HashMap<String, AttributeValue>> = values.map(|vs| {
-            vs.iter()
-                .map(|(k, v)| ((*k).to_owned(), v.clone()))
-                .collect()
-        });
-        let maps = build_expression_maps(Some(&names), values.as_ref());
-        parse_key_condition_expr(expr, &maps, &LimitsConfig::default())
-    }
-
-    /// The order of the one-condition-per-key check through the engine's
-    /// entry point, on the requests measured 2026-10-31 (table `pk` S HASH,
-    /// `sk` S RANGE). The key value type check and the unused-value check
-    /// run after this parse.
+    /// `parse_key_condition_expr` reads the request's `ExpressionAttributeNames`
+    /// and `ExpressionAttributeValues`, keyed with `#` and `:` as a request
+    /// carries them: a duplicate written through `#p` and an undefined `#u`
+    /// each answer the service's message. The core tests cover the other
+    /// rows.
     #[test]
-    fn key_condition_duplicate_check_order_matches_the_service() {
-        const ONE_PER_KEY: &str = "Invalid KeyConditionExpression: KeyConditionExpressions \
-                                   must only contain one condition per key";
-        const UNDEFINED_U: &str = "Invalid KeyConditionExpression: An expression attribute \
-                                   name used in the document path is not defined; attribute \
-                                   name: #u";
-        const UNDEFINED_A: &str = "Invalid KeyConditionExpression: An expression attribute \
-                                   value used in expression is not defined; attribute value: :a";
-        let s = |v: &str| AttributeValue::S(v.to_owned());
-        let n = AttributeValue::N("1".to_owned());
-        let abc = [(":a", s("alice")), (":b", s("bob")), (":c", s("carol"))];
-        let cases: Vec<KceCase> = vec![
+    fn key_condition_parse_reads_the_request_maps() {
+        let names: HashMap<String, String> = [("#p".to_owned(), "pk".to_owned())].into();
+        let values: HashMap<String, AttributeValue> = [":a", ":b", ":c"]
+            .into_iter()
+            .map(|k| (k.to_owned(), AttributeValue::S("v".to_owned())))
+            .collect();
+        let maps = build_expression_maps(Some(&names), Some(&values));
+        for (expr, want) in [
             (
-                "pk = :a AND pk = :b",
-                vec![],
-                Some(abc[..2].to_vec()),
-                ONE_PER_KEY,
-            ),
-            (
-                "#p = :a AND pk = :n",
-                vec![("#p", "pk")],
-                Some(vec![(":a", s("alice")), (":n", n.clone())]),
-                ONE_PER_KEY,
-            ),
-            (
-                "pk = :a AND #s = :b AND sk = :n",
-                vec![("#s", "sk")],
-                Some(vec![
-                    (":a", s("alice")),
-                    (":b", s("bob")),
-                    (":n", n.clone()),
-                ]),
-                ONE_PER_KEY,
-            ),
-            (
-                "#u = :a AND sk = :b AND sk = :c",
-                vec![],
-                Some(abc.to_vec()),
-                UNDEFINED_U,
+                "#p = :a AND pk = :b",
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain \
+                 one condition per key",
             ),
             (
                 "pk = :a AND pk = :b AND #u = :c",
-                vec![],
-                Some(abc.to_vec()),
-                UNDEFINED_U,
+                "Invalid KeyConditionExpression: An expression attribute name used in the \
+                 document path is not defined; attribute name: #u",
             ),
-            ("pk = :a AND pk = :b", vec![], None, UNDEFINED_A),
-            (
-                "pk = :a AND pk = :b",
-                vec![],
-                Some(vec![(":a", s("alice")), (":b", s("bob")), (":z", s("zed"))]),
-                ONE_PER_KEY,
-            ),
-            (
-                "#u = :a AND #u > :b",
-                vec![],
-                Some(abc[..2].to_vec()),
-                UNDEFINED_U,
-            ),
-        ];
-        for (expr, names, values, want) in cases {
-            let got = parse_kce(expr, &names, values.as_deref());
+        ] {
+            let got = parse_key_condition_expr(expr, &maps, &LimitsConfig::default());
             assert!(
                 matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
                 "expr {expr}: got {got:?}"
             );
         }
-        // Without a duplicate the parse leaves the value to the later checks.
-        let got = parse_kce("pk = :n", &[], Some(&[(":n", n)]));
-        assert!(got.is_ok(), "pk = :n: got {got:?}");
     }
 }
