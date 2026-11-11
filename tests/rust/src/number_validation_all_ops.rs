@@ -552,12 +552,7 @@ async fn transact_write_items_reports_a_long_client_request_token_first() {
         .client_request_token("t".repeat(37))
         .send()
         .await;
-    let err = refused(result);
-    assert!(
-        err.starts_with("ValidationException:")
-            && err.contains("at 'clientRequestToken' failed to satisfy constraint"),
-        "expected the token's constraint message, got: {err}"
-    );
+    crate::number_validation_order::assert_token_refused(&refused(result));
 }
 
 #[tokio::test]
