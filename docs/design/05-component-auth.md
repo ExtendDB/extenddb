@@ -501,7 +501,7 @@ pub enum ConditionOperator {
 }
 ```
 
-> **Deferred: Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"` grants access to tables matching the caller's own team tag. extenddb v1 does not support policy variables; all Resource and Condition values are treated as literal strings (with wildcard matching where applicable). This means ABAC policies that use variables to generalize across principals must be written as separate per-principal policies. Policy variable support is tracked as REQ-ABAC-006.
+> **Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`, which grants access to tables matching the caller's own team tag. extenddb expands `${key}` and `${key, 'default'}` in the `Resource` and `NotResource` patterns and the condition values of a `2012-10-17` document, in condition values only for the string and ARN operators (`policy/variables.rs`). In a `Resource` or `NotResource` pattern, text that comes from a value or a default is matched literally, so a value cannot add a wildcard, and a variable whose key the request does not carry, with no default, makes the pattern match nothing. With a default, the default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none` when the request has no `team` tag (measured with the IAM policy simulator, issue #533). The full rules are in the security model manual (`docs/manuals/10-security-model.md`). Policy variable support is tracked as REQ-ABAC-006.
 
 **JSON deserialization:**
 
@@ -1353,7 +1353,7 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 
 3. **Service control policies (SCPs) are not evaluated.** SCPs are an Organizations-level feature. extenddb does not query Organizations APIs.
 
-4. **Policy variable substitution is not supported.** Consistent with REQ-ABAC-006 deferral. Fetched policies containing `${aws:PrincipalTag/key}` will treat the variable syntax as a literal string.
+4. **Policy variables follow the identity-policy rules.** Fetched policies are evaluated by the same engine, so `${aws:PrincipalTag/key}` in a `Resource`, `NotResource` or condition value expands from the request under the same rules (REQ-ABAC-006).
 
 5. **Cross-account access is not evaluated.** extenddb assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
 
@@ -1587,18 +1587,19 @@ impl AuthLayer {
 
 ## 10. Secret Key Encryption
 
-```rust
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+The implementation is `crates/storage/src/secret_cipher.rs`, on AWS-LC through
+aws-lc-rs ([ADR-0026](../adr/0026-credential-crypto-on-aws-lc.md)). `aad` is the
+access key id.
 
-pub fn encrypt_secret(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    // Generate random 12-byte nonce
-    // Encrypt with AES-256-GCM
+```rust
+pub fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
+    // Seal with AES-256-GCM under a fresh random 12-byte nonce
     // Return: nonce || ciphertext || tag
 }
 
-pub fn decrypt_secret(ciphertext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AuthError> {
-    // Extract nonce (first 12 bytes)
-    // Decrypt with AES-256-GCM
+pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<String, String> {
+    // Split off the nonce (first 12 bytes)
+    // Open with the same aad; any mismatch fails
     // Return plaintext
 }
 ```

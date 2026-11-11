@@ -3,7 +3,7 @@
 
 //! Policy and permissions-boundary operations for `CassandraCatalogStore`.
 
-use extenddb_storage::management_store::{OpError, OpResult};
+use extenddb_storage::management_store::{OpError, OpResult, StoredDocument};
 
 use crate::catalog_store::CassandraCatalogStore;
 
@@ -131,6 +131,43 @@ impl CassandraCatalogStore {
         Ok(policies)
     }
 
+    /// A principal's policies for the resource-tag migration, each document
+    /// decoded on its own: one that does not decode comes back as its decode
+    /// error, and the others are still read.
+    pub(crate) async fn list_policy_documents_impl(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<Vec<(String, StoredDocument)>> {
+        let catalog_keyspace = self.catalog_keyspace();
+        let query = format!(
+            "SELECT policy_name, policy_document FROM {catalog_keyspace}.iam_policies \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
+        );
+        let rows = crate::cassandra_util::query_rows(
+            self.session(),
+            &query,
+            cdrs_tokio::query_values!(account_id, principal_type, principal_name),
+            "list_policy_documents",
+        )
+        .await?;
+        let mut policies = crate::cassandra_util::map_rows(
+            rows,
+            |row| {
+                use crate::cassandra_util::get_column;
+                let doc_str: String = get_column(row, "policy_document", "list_policy_documents")?;
+                Ok::<_, OpError>((
+                    get_column::<String, _>(row, "policy_name", "list_policy_documents")?,
+                    serde_json::from_str(&doc_str).map_err(|e| e.to_string()),
+                ))
+            },
+            "list_policy_documents",
+        )?;
+        policies.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(policies)
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     pub(crate) async fn set_boundary_impl(
@@ -196,6 +233,36 @@ impl CassandraCatalogStore {
         })?;
 
         Ok(Some(doc))
+    }
+
+    /// A principal's permissions boundary for the resource-tag migration:
+    /// the decoded document, or its decode error.
+    pub(crate) async fn boundary_document_impl(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> OpResult<Option<StoredDocument>> {
+        let catalog_keyspace = self.catalog_keyspace();
+        let query = format!(
+            "SELECT policy_document FROM {catalog_keyspace}.iam_permissions_boundaries \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
+        );
+        let row = crate::cassandra_util::query_optional(
+            self.session(),
+            &query,
+            cdrs_tokio::query_values!(account_id, principal_type, principal_name),
+            "boundary_document",
+        )
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let doc_str: String =
+            crate::cassandra_util::get_column(&row, "policy_document", "boundary_document")?;
+        Ok(Some(
+            serde_json::from_str(&doc_str).map_err(|e| e.to_string()),
+        ))
     }
 
     pub(crate) async fn delete_boundary_impl(

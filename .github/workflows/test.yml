@@ -29,11 +29,11 @@ jobs:
       matrix:
         toolchain: [stable, "1.88.0"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Only pushes to main save, so other runs restore main's cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -44,7 +44,7 @@ jobs:
       # pinned in requirements-moto.txt, which also keys the pip cache. The
       # suite fails rather than skips when EXTENDDB_TEST_S3_REQUIRED is set
       # and the endpoint is unreachable.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -105,13 +105,36 @@ jobs:
         if: failure()
         run: cat moto.log || true
 
+  # crates.io accepts only what `cargo package` can write. Each dependency
+  # needs a version, and the dev-dependency cycle between extenddb-engine and
+  # extenddb-storage-sqlite must stay out of the published manifests.
+  # --no-verify writes the packages without compiling them, in seconds, and
+  # runs no build script. devtools/check-crate-packages then checks the pins,
+  # the LICENSE and NOTICE files, the metadata and crates.io's size limits.
+  # Compiling each package from its tarball takes minutes. That build belongs
+  # to the crates.io release workflow (follow-up work), before the upload, and
+  # not to each PR.
+  package:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo package --workspace --no-verify --locked
+      - run: devtools/check-crate-packages
+
   test:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 15
-    needs: run-tests
+    needs: [run-tests, package]
     if: always()
     steps:
       - run: |
-          if [ "${{ needs.run-tests.result }}" != "success" ]; then
+          if [ "${{ needs.run-tests.result }}" != "success" ] \
+              || [ "${{ needs.package.result }}" != "success" ]; then
             exit 1
           fi

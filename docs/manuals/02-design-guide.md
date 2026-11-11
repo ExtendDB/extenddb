@@ -11,9 +11,9 @@ examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
 - **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Data** (the `extenddb` PostgreSQL database for the default catalog `extenddb_catalog`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
-On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
+On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`, and its name under `data_database_name`. This allows the catalog and data databases to live on different PostgreSQL instances.
 
 ### Catalog Tables
 
@@ -40,6 +40,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
+| `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
 
 ### Data Tables
 
@@ -106,7 +107,7 @@ extenddb uses SigV4 signature verification with a local IAM credential store. Th
 Full SigV4 signature verification:
 
 1. Extract `Authorization` header components (credential, signed headers, signature)
-2. Look up access key in the credential store (database-backed, credential lookup per request; encryption key cached at startup)
+2. Look up access key in the credential store (cached in memory, database on a miss; encryption key cached at startup)
 3. Reconstruct the canonical request and string-to-sign
 4. Derive the signing key: `HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256("AWS4" + secret, date), region), service), "aws4_request")`
 5. Compare computed signature with the provided signature (constant-time comparison)
@@ -128,13 +129,15 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `encryption_keys` table. Each access key record stores the encrypted secret and a unique nonce.
 
-Credential lookups (access key → encrypted secret) read directly from the database on every request — there is no in-process cache for credentials. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
+Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
 
 ## DynamoDB Streams Internals
 
 ### Record Capture
 
 Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same PostgreSQL transaction as the data write.
+
+On PostgreSQL the record waits in `stream_pending`, with no sequence number, until the write commits. GetRecords and a `LATEST` shard iterator first number one batch of the committed records of the shard they read, in the order the writes stored them: 1,000 records, or fewer once the records hold 1 MiB of JSON text. Every 250 ms a background worker numbers up to 10,000 committed records of each shard that has some, and skips a shard that another transaction numbers, so the records of a shard that nobody reads are numbered too. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past, and that consumer would never receive the record. A read returns the records whose writes committed before it started, except in three cases: more records of the shard wait for their numbers than one batch takes, another transaction numbers the shard for longer than one second, or the read's numbering fails, which the server logs as a warning. The records left waiting get higher numbers than any the read returned, from a later read or the worker, and a later read returns them. In the same three cases a `LATEST` iterator can return records whose writes committed before it was taken. The order needs `stream_seq` and `stream_pending_id_seq` to keep a cache of one value per session, which migration 7 sets; a larger cache lets a record take a number below one a consumer has read.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 
@@ -181,7 +184,7 @@ Item size includes attribute names and values, matching DynamoDB's size calculat
 
 ## Caching Design
 
-extenddb caches a small set of operational settings in memory to avoid per-request database queries on hot paths. Catalog state (table metadata, auth policies, tags, GSI definitions) is never cached.
+extenddb caches a small set of operational settings in memory to avoid per-request database queries on hot paths; this section covers those settings and the risks of caching catalog state. Credentials, policies, boundaries, tags and table key definitions are cached separately by the auth/authz caches (see Credential and Policy Caching in the Security Model, and `docs/design/12-auth-authz-cache.md`).
 
 ### What Is Cached
 
@@ -194,18 +197,18 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 
 All cached values are operational tuning knobs where a briefly-stale value does not affect correctness.
 
-### What Is NOT Cached (and Why)
+### Risks of Caching Catalog State
 
-Catalog state is never cached because correctness requires every request to see the current state:
+The settings cache above holds no catalog state. The auth/authz caches hold some (credentials, IAM policies, boundaries, tags, and table key definitions), and a stale copy can be wrong in the ways listed below. On the server that makes a change, they drop the affected entries before the call returns. For a change made elsewhere, the TTL (`auth.cache.ttl_seconds`) bounds how long a stale entry can be used (see `docs/design/12-auth-authz-cache.md`).
 
-- **Table metadata** (key schema, attribute definitions, status, billing mode): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
+- **Table metadata** (table ID, key schema, attribute definitions, indexes, stream specification): A stale cache could serve the wrong key schema after a table is deleted and recreated with the same name but different schema. The new table has a different `table_id`, different key schema, and different indexes — stale cache serves wrong schema, writes corrupt data, reads return garbage.
 - **IAM policies and credentials**: A revoked Deny policy still cached as absent creates a security gap. A deleted access key still cached as valid allows unauthorized access.
 - **Tags**: Tag-based authorization (`aws:ResourceTag/*`) requires current tag values.
 - **GSI definitions**: Stale GSI metadata could route writes to wrong index tables.
 
 ### The Table-Name-Reuse Problem
 
-The fundamental reason catalog state cannot be cached safely:
+The main risk in caching catalog state:
 
 1. Client calls `DeleteTable("Orders")`
 2. Client immediately calls `CreateTable("Orders")` with a different key schema
@@ -214,15 +217,15 @@ The fundamental reason catalog state cannot be cached safely:
 5. Writes use wrong column layout → data corruption
 6. Reads return items with wrong attribute interpretation → garbage
 
-No safe TTL exists because delete-recreate can happen within milliseconds. Cross-instance invalidation (e.g., PostgreSQL LISTEN/NOTIFY) would be a prerequisite for any future catalog caching.
+On the server that runs the table operation, `CreateTable`, `UpdateTable`, `DeleteTable`, `RestoreTableFromBackup` and `ImportTable` drop the table's cached key and index definitions before the call returns, and a cache refresh that started before the change discards its result (the epoch counter in `crates/cache/src/swr.rs`). Across servers no TTL is safe, because a delete and recreate can happen within milliseconds: after a table is recreated through one server, another server keeps the old `table_id` for up to `ttl_seconds`. Cross-instance invalidation (for example PostgreSQL LISTEN/NOTIFY, Appendix B of `docs/design/12-auth-authz-cache.md`) is a prerequisite for running several servers on one catalog.
 
 ### Multi-Instance Considerations
 
-On SQLite, `extenddb serve` enforces one instance per database file with an exclusive lock on `<database>.lock`. On PostgreSQL and MongoDB nothing enforces it, and running several instances against one catalog is not supported: the credential and policy caches are per instance with no cross-instance invalidation, and every instance runs every background worker (see the deployment guide). Any in-process cache of catalog state would likewise be invisible to other instances. PostgreSQL's own buffer pool provides memory-resident access to hot rows, making application-level caching unnecessary for most workloads.
+On SQLite, `extenddb serve` enforces one instance per database file with an exclusive lock on `<database>.lock`. On PostgreSQL and MongoDB nothing enforces it, and running several instances against one catalog is not supported: the credential and policy caches are per instance with no cross-instance invalidation, and every instance runs every background worker (see the deployment guide).
 
 ### Future Considerations
 
-Caching of operational settings is currently unconditional. If issues arise (e.g., a setting change must take effect immediately for safety reasons), a runtime toggle (`extenddb settings set caching_enabled false`) should be added. Catalog caching remains prohibited without a cross-instance invalidation design and explicit human approval.
+Caching of operational settings is currently unconditional. If issues arise (e.g., a setting change must take effect immediately for safety reasons), a runtime toggle (`extenddb settings set caching_enabled false`) should be added. Running several servers on one catalog needs the cross-instance invalidation in Appendix B of `docs/design/12-auth-authz-cache.md` first.
 
 ---
 
