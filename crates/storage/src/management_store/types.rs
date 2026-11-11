@@ -123,7 +123,8 @@ pub struct AdminEntry {
 pub struct MetricsRow {
     pub bucket: time::OffsetDateTime,
     /// The account the row was recorded for; `None` for a metric of the
-    /// whole deployment. Stored as the empty string.
+    /// whole deployment, stored as the empty string on SQLite, PostgreSQL
+    /// and Cassandra and as a document without the field on MongoDB.
     pub account_id: Option<String>,
     pub metric: String,
     pub table_name: Option<String>,

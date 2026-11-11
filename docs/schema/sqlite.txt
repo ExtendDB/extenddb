@@ -1,4 +1,3 @@
-index idx_account_metrics_bucket on account_metrics: CREATE INDEX idx_account_metrics_bucket ON account_metrics (bucket)
 index idx_backup_index_account_table on backup_index: CREATE INDEX idx_backup_index_account_table ON backup_index (account_id, table_name)
 index idx_backup_index_backup_id on backup_index: CREATE UNIQUE INDEX idx_backup_index_backup_id ON backup_index (backup_id)
 index idx_backup_index_store_status on backup_index: CREATE INDEX idx_backup_index_store_status ON backup_index (store_kind, store_root, store_id, status)

@@ -83,6 +83,15 @@ pub async fn run(store: &dyn MetricsStore, expect: Expectations) {
                 5.0,
             ),
             row(Some(&first), None, "UserErrors", 2.0),
+            // Rows that only the table filter or only the metric filter
+            // leaves out of the narrow reads below.
+            row(
+                Some(&second),
+                Some("Other"),
+                "ConsumedWriteCapacityUnits",
+                4.0,
+            ),
+            row(Some(&second), Some("Orders"), "UserErrors", 6.0),
             row(None, None, "WorkerCycleLatency", 7.0),
         ])
         .await
@@ -127,6 +136,8 @@ pub async fn run(store: &dyn MetricsStore, expect: Expectations) {
         seen(&first, Some("Orders"), "ConsumedWriteCapacityUnits", 1.0),
         seen(&second, Some("Orders"), "ConsumedWriteCapacityUnits", 5.0),
         seen(&first, None, "UserErrors", 2.0),
+        seen(&second, Some("Other"), "ConsumedWriteCapacityUnits", 4.0),
+        seen(&second, Some("Orders"), "UserErrors", 6.0),
     ];
     let rows_of_deployment: Vec<&Seen> = all.iter().filter(|s| s.0.is_none()).collect();
     assert_eq!(
@@ -170,6 +181,44 @@ pub async fn run(store: &dyn MetricsStore, expect: Expectations) {
             "ConsumedWriteCapacityUnits",
             5.0
         )]
+    );
+
+    // The table filter alone, and the metric filter alone.
+    let sorted = |mut v: Vec<Seen>| {
+        v.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        v
+    };
+    let by_table = ours(
+        read(MetricsFilter {
+            table_name: Some("Orders".to_owned()),
+            ..MetricsFilter::default()
+        })
+        .await,
+    );
+    assert_eq!(
+        by_table,
+        sorted(vec![
+            seen(&first, Some("Orders"), "ConsumedWriteCapacityUnits", 1.0),
+            seen(&second, Some("Orders"), "ConsumedWriteCapacityUnits", 5.0),
+            seen(&second, Some("Orders"), "UserErrors", 6.0),
+        ]),
+        "the table filter"
+    );
+    let by_metric = ours(
+        read(MetricsFilter {
+            metric: Some("ConsumedWriteCapacityUnits".to_owned()),
+            ..MetricsFilter::default()
+        })
+        .await,
+    );
+    assert_eq!(
+        by_metric,
+        sorted(vec![
+            seen(&first, Some("Orders"), "ConsumedWriteCapacityUnits", 1.0),
+            seen(&second, Some("Orders"), "ConsumedWriteCapacityUnits", 5.0),
+            seen(&second, Some("Other"), "ConsumedWriteCapacityUnits", 4.0),
+        ]),
+        "the metric filter"
     );
 
     // An account with no rows reads nothing, and empty filters read as none.

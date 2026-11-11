@@ -260,7 +260,6 @@ index iam_user_tags_pkey: CREATE UNIQUE INDEX iam_user_tags_pkey ON public.iam_u
 index iam_users_pkey: CREATE UNIQUE INDEX iam_users_pkey ON public.iam_users USING btree (account_id, user_name)
 index iam_users_user_arn_key: CREATE UNIQUE INDEX iam_users_user_arn_key ON public.iam_users USING btree (user_arn)
 index idempotency_tokens_pkey: CREATE UNIQUE INDEX idempotency_tokens_pkey ON public.idempotency_tokens USING btree (token)
-index idx_account_metrics_bucket: CREATE INDEX idx_account_metrics_bucket ON public.account_metrics USING btree (bucket)
 index idx_backup_index_account_table: CREATE INDEX idx_backup_index_account_table ON public.backup_index USING btree (account_id, table_name)
 index idx_backup_index_backup_id: CREATE UNIQUE INDEX idx_backup_index_backup_id ON public.backup_index USING btree (backup_id)
 index idx_backup_index_store_status: CREATE INDEX idx_backup_index_store_status ON public.backup_index USING btree (store_kind, store_root, store_id, status)
