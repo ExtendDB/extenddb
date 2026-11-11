@@ -438,6 +438,41 @@ class TestDuplicateAheadOfRequestChecks:
         assert code == "ValidationException"
         assert msg == ONE_PER_KEY
 
+    @pytest.mark.parametrize(
+        ("kwargs", "non_expression"),
+        [
+            ({"ConditionalOperator": "AND"}, "ConditionalOperator"),
+            (
+                {
+                    "KeyConditions": {
+                        "pk": {"ComparisonOperator": "EQ", "AttributeValueList": [A]}
+                    }
+                },
+                "KeyConditions",
+            ),
+        ],
+        ids=["conditional-operator", "key-conditions"],
+    )
+    def test_parameter_mixing_reported_ahead_of_duplicate(
+        self, dynamodb_client, range_table, kwargs, non_expression
+    ):
+        """Measured 2026-11-11T11:23Z: a non-expression parameter beside the
+        expression answers the mixing error, not the duplicate."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND pk = :b",
+                ExpressionAttributeValues={":a": A, ":b": B},
+                **kwargs,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == (
+            "Can not use both expression and non-expression parameters in the same "
+            f"request: Non-expression parameters: {{{non_expression}}} Expression "
+            "parameters: {KeyConditionExpression}"
+        )
+
 
 def _undefined(reference: str) -> str:
     """The service's message for an undefined `#name` or `:value`."""
