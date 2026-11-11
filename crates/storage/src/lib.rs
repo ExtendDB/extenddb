@@ -17,6 +17,9 @@ pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
 pub mod hooks;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod iam_leftovers_conformance;
 pub mod management_store;
 pub mod management_store_factory;
 #[doc(hidden)]
