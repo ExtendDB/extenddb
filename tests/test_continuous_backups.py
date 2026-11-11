@@ -28,6 +28,8 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
+from conftest import PITR_REFUSAL
+
 pytestmark = pytest.mark.skipif(
     not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip(),
     reason="pins ExtendDB's documented divergence: point-in-time recovery is unsupported",
@@ -72,9 +74,8 @@ def _table_not_found(name: str) -> tuple[str, str]:
     return "TableNotFoundException", f"Table not found: {name}"
 
 
-PITR_UNSUPPORTED = "Point-in-time recovery is not supported by this storage backend"
-RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_UNSUPPORTED)
-ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_UNSUPPORTED)
+RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
+ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
 
 
 def test_describe_continuous_backups_reports_recovery_disabled(
@@ -127,7 +128,7 @@ def test_disable_point_in_time_recovery_reports_disabled(
     }
 
 
-def test_a_missing_table_is_table_not_found_on_both_continuous_backups_operations(
+def test_a_missing_table_on_the_continuous_backups_operations(
     dynamodb_client,
 ):
     """TableNotFoundException with the service's text on a describe and a
@@ -225,12 +226,12 @@ def test_the_recovery_flag_as_the_string_false_disables(
     }
 
 
-def test_every_restore_is_refused_before_any_check(
+def test_every_restore_gets_the_refusal(
     dynamodb_client, dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
 ):
     """Every RestoreTableToPointInTime gets the same refusal: an existing
     source, a missing one, an index ARN, a source named twice or not at all,
-    no target, bad names and bad time members. Nothing is checked first."""
+    no target, bad names and bad time members."""
     create_and_cleanup_table()
     table_arn = dynamodb_client.describe_table(TableName=unique_table_name)["Table"][
         "TableArn"
@@ -263,29 +264,3 @@ def test_every_restore_is_refused_before_any_check(
     restore = dynamodb_client_no_validation.restore_table_to_point_in_time
     for params in shapes:
         _assert_error(restore, *RESTORE_REFUSED, **params)
-
-
-def test_the_recovery_flag_strings_are_read_as_the_service_reads_them(
-    dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
-):
-    """The service reads the flag's string ignoring case: true, t, yes, y and
-    1 enable, and false, f, no, n and 0 disable (measured on DynamoDB,
-    2026-11-10, two samples each). Every enable spelling is refused before
-    the table is read; every disable spelling answers 200."""
-    create_and_cleanup_table()
-    update = dynamodb_client_no_validation.update_continuous_backups
-    for flag in ("TRUE", "True", "t", "yes", "Y", "1"):
-        _assert_error(
-            update,
-            *ENABLE_REFUSED,
-            TableName=_missing_name(),
-            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": flag},
-        )
-    for flag in ("FALSE", "False", "f", "no", "N", "0"):
-        resp = update(
-            TableName=unique_table_name,
-            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": flag},
-        )
-        assert resp["ContinuousBackupsDescription"]["PointInTimeRecoveryDescription"] == {
-            "PointInTimeRecoveryStatus": "DISABLED"
-        }, flag

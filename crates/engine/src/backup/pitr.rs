@@ -218,11 +218,9 @@ async fn require_table_exists(
 /// `PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled`, which the
 /// model requires: a request without the specification, or with one that
 /// does not hold the flag, is refused with the service's text for the
-/// missing member. A JSON string is read as the service reads it, ignoring
-/// case: `true`, `t`, `yes`, `y` and `1` are true, and `false`, `f`, `no`,
-/// `n` and `0` are false (measured, two samples each: each enable spelling
-/// enabled recovery and each disable spelling answered 200). Any other value
-/// that is not a boolean is refused as a missing flag.
+/// missing member. The JSON strings `"true"` and `"false"` are taken as the
+/// booleans (the service answers 200 for `"false"`, measured); any other
+/// value that is not a boolean is refused as a missing flag.
 fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
     let spec = body
         .get("PointInTimeRecoverySpecification")
@@ -230,16 +228,12 @@ fn point_in_time_recovery_enabled(body: &Value) -> Result<bool, DynamoDbError> {
         .ok_or_else(|| member_null("pointInTimeRecoverySpecification"))?;
     match spec.get("PointInTimeRecoveryEnabled") {
         Some(Value::Bool(flag)) => Ok(*flag),
-        Some(Value::String(s)) if is_one_of(s, &["true", "t", "yes", "y", "1"]) => Ok(true),
-        Some(Value::String(s)) if is_one_of(s, &["false", "f", "no", "n", "0"]) => Ok(false),
+        Some(Value::String(s)) if s == "true" => Ok(true),
+        Some(Value::String(s)) if s == "false" => Ok(false),
         _ => Err(member_null(
             "pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled",
         )),
     }
-}
-
-fn is_one_of(s: &str, spellings: &[&str]) -> bool {
-    spellings.iter().any(|w| s.eq_ignore_ascii_case(w))
 }
 
 /// The restore's source table name, from `SourceTableName`, checked against

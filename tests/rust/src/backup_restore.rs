@@ -21,6 +21,10 @@ use aws_sdk_dynamodb::types::{
 use aws_sdk_dynamodb::Client;
 use std::time::{Duration, Instant};
 
+/// The refusal of every restore and every enable: point-in-time recovery is
+/// not in this release.
+const PITR_REFUSED: &str = "Point-in-time recovery is not supported by this storage backend";
+
 /// Where the server under test writes its backups, from
 /// `EXTENDDB_TEST_BACKUP_STORE`: `filesystem` or `s3` (a configured
 /// `[backup.store]`, under which a backup is in the store and the restore
@@ -398,11 +402,27 @@ async fn enable_point_in_time_recovery_is_refused() {
         .unwrap_err();
     assert_eq!(
         (err_code(&err), err_msg(&err).as_str()),
-        (
-            Some("ContinuousBackupsUnavailableException"),
-            "Point-in-time recovery is not supported by this storage backend"
-        ),
+        (Some("ContinuousBackupsUnavailableException"), PITR_REFUSED),
         "unexpected error: {err:?}"
+    );
+
+    // A missing table gets the same refusal: no table is read.
+    let err = c
+        .update_continuous_backups()
+        .table_name(format!("PITRMissing_{}", ts()))
+        .point_in_time_recovery_specification(
+            PointInTimeRecoverySpecification::builder()
+                .point_in_time_recovery_enabled(true)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (Some("ContinuousBackupsUnavailableException"), PITR_REFUSED),
+        "missing table: {err:?}"
     );
 
     // The refusal must not have changed anything.
@@ -481,16 +501,35 @@ async fn restore_table_to_point_in_time_is_refused() {
         (err_code(&err), err_msg(&err).as_str()),
         (
             Some("PointInTimeRecoveryUnavailableException"),
-            "Point-in-time recovery is not supported by this storage backend"
+            PITR_REFUSED
         ),
         "unexpected error: {err:?}"
+    );
+
+    // A missing source gets the same refusal: no table is read.
+    let missing = format!("PITRMissing_{}", ts());
+    let err = c
+        .restore_table_to_point_in_time()
+        .source_table_name(&missing)
+        .target_table_name(format!("{missing}_restored"))
+        .use_latest_restorable_time(true)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err_code(&err), err_msg(&err).as_str()),
+        (
+            Some("PointInTimeRecoveryUnavailableException"),
+            PITR_REFUSED
+        ),
+        "missing source: {err:?}"
     );
 
     c.delete_table().table_name(&table).send().await.ok();
 }
 
-/// A describe and a disable look the table up; an enable and a restore are
-/// refused before any table is read.
+/// A describe and a disable look the table up. An enable and a restore are
+/// refused before any table is read (the two refusal tests above).
 #[tokio::test]
 async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_found() {
     let c = client();
@@ -525,37 +564,4 @@ async fn point_in_time_recovery_operations_report_a_missing_table_as_table_not_f
         .await
         .unwrap_err();
     check("disable", err_code(&err), err_msg(&err));
-
-    let refused = "Point-in-time recovery is not supported by this storage backend";
-    let err = c
-        .update_continuous_backups()
-        .table_name(&missing)
-        .point_in_time_recovery_specification(
-            PointInTimeRecoverySpecification::builder()
-                .point_in_time_recovery_enabled(true)
-                .build()
-                .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap_err();
-    assert_eq!(
-        (err_code(&err), err_msg(&err).as_str()),
-        (Some("ContinuousBackupsUnavailableException"), refused),
-        "enable"
-    );
-
-    let err = c
-        .restore_table_to_point_in_time()
-        .source_table_name(&missing)
-        .target_table_name(format!("{missing}_restored"))
-        .use_latest_restorable_time(true)
-        .send()
-        .await
-        .unwrap_err();
-    assert_eq!(
-        (err_code(&err), err_msg(&err).as_str()),
-        (Some("PointInTimeRecoveryUnavailableException"), refused),
-        "restore"
-    );
 }

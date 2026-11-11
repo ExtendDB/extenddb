@@ -30,9 +30,8 @@ import pytest
 from botocore.exceptions import ClientError
 
 from helpers import (
-    assert_point_in_time_recovery_refused,
+    PITR_REFUSAL,
     assert_validation,
-    on_the_service,
     unique_name,
     wait_for_active,
     wait_for_deleted,
@@ -287,7 +286,7 @@ class TestAccountSegmentInArnFields:
         [BAD_ACCOUNTS[0], FOREIGN, *BAD_ACCOUNTS[1:]],
         ids=["nul", "foreign", "letter", "eleven", "thirteen"],
     )
-    def test_export_and_point_in_time_restore(self, raw_client, caller, account):
+    def test_export_and_point_in_time_restore(self, raw_client, caller, account, is_extenddb):
         arn = _table_arn(caller, account)
         _assert_denied(
             _raises(lambda: raw_client.export_table_to_point_in_time(TableArn=arn, S3Bucket="bucket1"))
@@ -297,11 +296,11 @@ class TestAccountSegmentInArnFields:
                 SourceTableArn=arn, TargetTableName="t830target"
             )
         )
-        if on_the_service():
-            assert_validation(exc, OWNER_ONLY)
-        else:
+        if is_extenddb:
             # Every restore is refused before the account is looked at.
-            assert_point_in_time_recovery_refused(exc, "PointInTimeRecoveryUnavailableException")
+            assert_validation(exc, PITR_REFUSAL, code="PointInTimeRecoveryUnavailableException")
+        else:
+            assert_validation(exc, OWNER_ONLY)
 
     @pytest.mark.parametrize("account", BAD_ACCOUNTS, ids=BAD_IDS)
     def test_tag_stream_and_backup_arn_fields(self, raw_client, raw_streams_client, caller, account):

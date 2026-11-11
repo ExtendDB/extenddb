@@ -122,7 +122,15 @@ Flushing a cache does not revoke anything by itself: it only makes the server re
 
 ### Policy Evaluation — 5-Phase IAM Algorithm
 
-When `auth.provider = "builtin"`, every DynamoDB API request is authorized against IAM policies. The evaluation follows the same algorithm as real AWS IAM:
+When `auth.provider = "builtin"`, every authenticated DynamoDB API request is authorized against IAM policies, except these, which get an answer without an IAM decision:
+
+- `DescribeEndpoints`, which needs a signed request and no permission.
+- `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables point-in-time recovery, which are refused because point-in-time recovery is not supported.
+- A request that the service also answers before its IAM decision: a table name, index name or ARN outside the model's constraints, an ARN of the wrong kind or in another account, a stream ARN in another partition or region, a batch or transaction with no items or too many, and a shard iterator the server did not issue (see [Differences from DynamoDB](../differences-from-dynamodb.md)).
+- A PartiQL request that is refused before any of its statements is authorized: a member outside its constraints, or a statement that does not parse or breaks a rule of its form. The server authorizes a PartiQL request per statement.
+- A request the server cannot authorize because of a fault, such as a failed key lookup, which gets a server error.
+
+In dev mode no request gets an IAM decision. The evaluation follows the same algorithm as real AWS IAM:
 
 1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). If any Deny statement matches the action, resource, and conditions → **DENY**.
 2. **Permissions Boundary** — if a permissions boundary is set on the user or role, it must contain an Allow statement matching the action, resource, and conditions. If not → **DENY**.

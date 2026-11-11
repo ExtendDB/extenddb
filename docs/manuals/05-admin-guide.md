@@ -759,8 +759,8 @@ upgrading:
   DynamoDB returns for an iterator it did not issue. Shard iterators expire after
   15 minutes.
 - **Restores.** A restore writes items into its target table, so
-  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
-  and read actions on the target table in addition to the restore action. A
+  RestoreTableFromBackup requires the item write and read actions on the
+  target table in addition to the restore action. A
   principal that could previously restore with only the restore permission now
   also needs those actions on the target table name. From v0.1.15,
   RestoreTableToPointInTime is refused before authorization, for every

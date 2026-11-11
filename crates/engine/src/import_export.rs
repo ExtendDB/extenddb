@@ -414,7 +414,8 @@ async fn wait_for_table_active(
 ///
 /// `RestoreTableToPointInTime` reads its `SourceTableArn` through this too,
 /// with no check before authorization: an index ARN there is refused here
-/// with the same message (measured on DynamoDB).
+/// with the same message (measured on DynamoDB). The server refuses every
+/// `RestoreTableToPointInTime` before its handler runs.
 pub(crate) fn extract_table_name_from_arn(arn: &str) -> Result<String, DynamoDbError> {
     match extenddb_core::arn::parse(arn) {
         Some(extenddb_core::arn::TableResource {

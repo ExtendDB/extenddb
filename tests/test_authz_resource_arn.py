@@ -33,10 +33,11 @@ from typing import Any
 
 import boto3
 import pytest
+import requests
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import PITR_REFUSAL, wait_for_active
 from management_helpers import ManagementClient
 from test_backup_restore_fidelity import _delete_backup_when_available
 
@@ -639,8 +640,7 @@ class TestExplicitDenyOnResourceArn:
                         **source)
                 err = exc.value.response["Error"]
                 assert (err["Code"], err["Message"]) == (
-                    "PointInTimeRecoveryUnavailableException",
-                    "Point-in-time recovery is not supported by this storage backend",
+                    "PointInTimeRecoveryUnavailableException", PITR_REFUSAL
                 ), (policy, source, err)
 
     def test_an_enable_is_refused_before_authorization(self, table):
@@ -655,15 +655,14 @@ class TestExplicitDenyOnResourceArn:
         for policy in policies:
             ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
             d = _client(self.endpoint, ak, sk, self.region, validate=False)
-            for flag in (True, "TRUE", "yes", "1"):
+            for flag in (True, "true"):
                 with pytest.raises(ClientError) as exc:
                     d.update_continuous_backups(
                         TableName=table["name"],
                         PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": flag})
                 err = exc.value.response["Error"]
                 assert (err["Code"], err["Message"]) == (
-                    "ContinuousBackupsUnavailableException",
-                    "Point-in-time recovery is not supported by this storage backend",
+                    "ContinuousBackupsUnavailableException", PITR_REFUSAL
                 ), (policy, flag, err)
 
     def test_the_refusal_comes_after_authentication(self, table):
@@ -687,6 +686,21 @@ class TestExplicitDenyOnResourceArn:
                 with pytest.raises(ClientError) as exc:
                     call()
                 assert exc.value.response["Error"]["Code"] == code, exc.value.response["Error"]
+        for target, body in (
+            ("RestoreTableToPointInTime", {
+                "SourceTableName": table["name"], "TargetTableName": table["name"] + "-pitr",
+                "UseLatestRestorableTime": True}),
+            ("UpdateContinuousBackups", {
+                "TableName": table["name"],
+                "PointInTimeRecoverySpecification": {"PointInTimeRecoveryEnabled": True}}),
+        ):
+            resp = requests.post(
+                self.endpoint,
+                headers={"Content-Type": "application/x-amz-json-1.0",
+                         "X-Amz-Target": f"DynamoDB_20120810.{target}"},
+                json=body, timeout=30, verify=not self.endpoint.startswith("https://"))
+            assert resp.status_code == 400, resp.text
+            assert resp.json()["__type"].endswith("MissingAuthenticationToken"), resp.text
 
     def test_export_deny_table_blocks(self, table):
         d = self._ddb(_allow_all_deny("ExportTableToPointInTime", table["table_arn"]))

@@ -43,7 +43,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import PITR_REFUSAL, wait_for_active
 from management_helpers import ManagementClient
 
 ALLOW_ALL = {
@@ -56,10 +56,8 @@ NO_POLICY = {
 }
 # Point-in-time recovery is not in this release: every restore is refused
 # before authorization, so before the account is looked at.
-PITR_REFUSED = (
-    "PointInTimeRecoveryUnavailableException",
-    "Point-in-time recovery is not supported by this storage backend",
-)
+PITR_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
+ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
 OWNER_ONLY = (
     "ValidationException",
     "This action is only supported by accounts that match the resource owner\u2019s account.",
@@ -183,7 +181,9 @@ def _requests(t: str, table: dict) -> list[tuple[str, str, str, str, Any]]:
     the same denial and "The caller is not authorized ..."; "owner" answers
     the owner-only ValidationException and "Access is denied"; "pitr" answers
     the point-in-time recovery refusal for both, which ExtendDB gives before
-    authorization (the service answers the owner-only ValidationException).
+    authorization (the service answers the owner-only ValidationException);
+    "enable" is an UpdateContinuousBackups enable, which ExtendDB refuses the
+    same way.
     """
     stream = f"{t}/stream/{table['stream_label']}"
     backup = f"{t}/backup/{table['backup_id']}"
@@ -257,6 +257,14 @@ def _requests(t: str, table: dict) -> list[tuple[str, str, str, str, Any]]:
         ("RestoreTableToPointInTime", "pitr", "", "",
          lambda c: c["dynamodb"].restore_table_to_point_in_time(
              SourceTableArn=t, TargetTableName=f"p{uuid.uuid4().hex[:8]}")),
+        ("UpdateContinuousBackups disable", "owner", "", "",
+         lambda c: c["dynamodb"].update_continuous_backups(
+             TableName=t,
+             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False})),
+        ("UpdateContinuousBackups enable", "enable", "", "",
+         lambda c: c["dynamodb"].update_continuous_backups(
+             TableName=t,
+             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})),
     ]
 
 
@@ -271,6 +279,8 @@ def test_other_account_answer_depends_on_operation_and_account(env, table, polic
             where = (label, "known" if known else "unknown", code, msg)
             if family == "pitr":
                 assert (code, msg) == PITR_REFUSED, where
+            elif family == "enable":
+                assert (code, msg) == ENABLE_REFUSED, where
             elif family == "owner" and known:
                 assert (code, msg) == OWNER_ONLY, where
             elif known:

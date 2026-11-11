@@ -17,6 +17,10 @@
 //! | `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup`, `ListBackups`, `DescribeBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime` | ValidationException [`OWNER_ONLY`] | "Access is denied" |
 //! | `RestoreTableToPointInTime` | ValidationException [`OWNER_ONLY`] | the same |
 //!
+//! The server refuses every `RestoreTableToPointInTime`, and an
+//! `UpdateContinuousBackups` that enables point-in-time recovery, before this
+//! code runs.
+//!
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
@@ -114,6 +118,8 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
             .map(extenddb_core::backup_format::trim_backup_arn)
             .and_then(|v| other(v, v.to_owned())),
         "ExportTableToPointInTime" => named("TableArn"),
+        // The server refuses every RestoreTableToPointInTime before this
+        // code runs.
         "RestoreTableToPointInTime" => named("SourceTableArn"),
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             batch_or_transaction(operation, input, account_id)
@@ -239,7 +245,7 @@ async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, Dyn
 }
 
 /// The principal a denial names, in the form the service writes it.
-fn principal_arn(identity: &AuthIdentity) -> String {
+pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
     match identity {
         AuthIdentity::User {
             account_id,

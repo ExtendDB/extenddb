@@ -107,28 +107,17 @@ def make_raw_client(endpoint_url: str | None, service_name: str = "dynamodb"):
 MEMBER_PATTERN = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
 
 
-def assert_validation(exc, message: str) -> None:
-    """A 400 ValidationException with exactly this message."""
+def assert_validation(exc, message: str, code: str = "ValidationException") -> None:
+    """A 400 with this error code, ValidationException by default, and
+    exactly this message."""
     resp = exc.response
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
-    assert resp["Error"]["Code"] == "ValidationException", resp["Error"]
+    assert resp["Error"]["Code"] == code, resp["Error"]
     assert resp["Error"]["Message"] == message, resp["Error"]["Message"]
 
 
-PITR_UNSUPPORTED = "Point-in-time recovery is not supported by this storage backend"
-
-
-def on_the_service() -> bool:
-    """True when the suite runs against DynamoDB (validation mode)."""
-    return os.environ.get("EXTENDDB_VALIDATION_MODE", "").lower() == "true"
-
-
-def assert_point_in_time_recovery_refused(exc, code: str) -> None:
-    """A 400 with the refusal ExtendDB gives a restore or an enable before any
-    check: point-in-time recovery is not in this release."""
-    resp = exc.response
-    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
-    assert (resp["Error"]["Code"], resp["Error"]["Message"]) == (code, PITR_UNSUPPORTED), resp["Error"]
+# The message of every refused point-in-time recovery request on ExtendDB.
+PITR_REFUSAL = "Point-in-time recovery is not supported by this storage backend"
 
 
 def assert_member_pattern(exc, location: str, value: str) -> None:
