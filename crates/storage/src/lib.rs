@@ -22,6 +22,9 @@ pub mod hooks;
 pub mod iam_leftovers_conformance;
 pub mod management_store;
 pub mod management_store_factory;
+#[doc(hidden)]
+#[cfg(feature = "test-util")]
+pub mod metrics_conformance;
 pub mod migrations;
 pub mod operations;
 pub mod password;

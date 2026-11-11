@@ -325,6 +325,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (7, d.target.catalog.clone()),
             (8, d.target.catalog.clone()),
             (9, d.target.catalog.clone()),
+            (10, d.target.catalog.clone()),
         ]
     );
     let not_applicable: Vec<u32> = report
@@ -354,6 +355,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (7, Outcome::NotApplicable),
             (8, Outcome::NotApplicable),
             (9, Outcome::NotApplicable),
+            (10, Outcome::Applied),
         ]
     );
     assert!(
@@ -375,8 +377,9 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
     let (catalog, data) = definitions(&d).await;
     if std::env::var("EXTENDDB_BLESS_EXPECTED").as_deref() == Ok("1") {
         let dir = env!("CARGO_MANIFEST_DIR");
-        // Migration 1's file keeps the collection migration 5 drops and
-        // leaves out what migration 6 adds, which its own file holds.
+        // Migration 1's file keeps the collections migrations 5 and 10 drop
+        // and leaves out what migrations 6 and 10 add, which their own files
+        // hold.
         let committed: Definitions = serde_json::from_str(CATALOG_EXPECTED).expect("catalog");
         let added: Definitions =
             serde_json::from_str(migrations_support::CATALOG_MIGRATION_6).expect("migration 6");
@@ -395,9 +398,20 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
                 }
             }
         }
-        if let Some(dropped) = committed.get("continuous_backups") {
-            catalog_at_1.insert("continuous_backups".to_owned(), dropped.clone());
+        for name in ["continuous_backups", "metrics"] {
+            if let Some(dropped) = committed.get(name) {
+                catalog_at_1.insert(name.to_owned(), dropped.clone());
+            }
         }
+        let at_10: Definitions =
+            serde_json::from_str::<Definitions>(migrations_support::CATALOG_MIGRATION_10)
+                .expect("migration 10")
+                .keys()
+                .map(|name| {
+                    catalog_at_1.remove(name);
+                    (name.clone(), catalog[name].clone())
+                })
+                .collect();
         let mut at_6 = Definitions::new();
         for (name, collection) in &added {
             let mut found = catalog[name].clone();
@@ -418,6 +432,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
                 "tests/fixtures/0006_backup_catalog_index.expected.json",
                 &at_6,
             ),
+            ("tests/fixtures/0010_account_metrics.expected.json", &at_10),
         ] {
             let text = serde_json::to_string_pretty(defs).expect("json") + "\n";
             std::fs::write(format!("{dir}/{path}"), text).expect("write");
@@ -448,8 +463,8 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
 
     let reconverged = d.reconverge().await.expect("reconverge");
     // Migration 1's steps in the catalog and the data database, and
-    // migrations 5's and 6's in the catalog: 2 is not convergent, and 3, 4,
-    // 7, 8 and 9 do not apply on MongoDB.
+    // migrations 5's, 6's and 10's in the catalog: 2 is not convergent, and
+    // 3, 4, 7, 8 and 9 do not apply on MongoDB.
     let ran: Vec<(u32, String)> = reconverged
         .applied
         .iter()
@@ -462,6 +477,7 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
             (1, d.target.data.clone()),
             (5, d.target.catalog.clone()),
             (6, d.target.catalog.clone()),
+            (10, d.target.catalog.clone()),
         ],
         "{reconverged:?}"
     );
@@ -600,24 +616,24 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
         "notes": "", "applied_at": bson::DateTime::now(), "applied_by": "9.9.9" }
     };
     ledger
-        .insert_one(row(10, "breaking"))
+        .insert_one(row(11, "breaking"))
         .await
         .expect("insert");
     let status = d.status().await;
     assert_eq!(status.label(), "AheadIncompatible");
     assert_eq!(status.exit_code(), exit::AHEAD_INCOMPATIBLE);
     ledger
-        .delete_one(doc! { "_id": 10_i64 })
+        .delete_one(doc! { "_id": 11_i64 })
         .await
         .expect("delete");
     ledger
-        .insert_one(row(10, "additive"))
+        .insert_one(row(11, "additive"))
         .await
         .expect("insert");
     assert_eq!(d.status().await.label(), "AheadCompatible");
     assert!(d.migrate().await.expect("migrate").applied.is_empty());
     ledger
-        .delete_one(doc! { "_id": 10_i64 })
+        .delete_one(doc! { "_id": 11_i64 })
         .await
         .expect("delete");
 
@@ -698,6 +714,6 @@ async fn a_ledger_document_this_binary_cannot_read_stops_the_status() {
         .expect_err("an error");
     migrations.close().await;
     assert!(error.to_string().contains("\"sideways\""), "{error}");
-    assert_eq!(MigrationId::LATEST.number(), 9);
+    assert_eq!(MigrationId::LATEST.number(), 10);
     d.drop_databases().await;
 }

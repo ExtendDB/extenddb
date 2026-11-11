@@ -228,12 +228,18 @@ pub(crate) async fn handle_request(
             } else {
                 extenddb_core::metrics::MetricName::WriteThrottleEvents
             };
-            state
-                .metrics
-                .record(metric, 1.0, metric_table.as_deref(), None, Some(&operation));
+            state.metrics.record(
+                metric,
+                1.0,
+                Some(&ctx.account_id),
+                metric_table.as_deref(),
+                None,
+                Some(&operation),
+            );
             state.metrics.record(
                 extenddb_core::metrics::MetricName::ThrottledRequests,
                 1.0,
+                Some(&ctx.account_id),
                 metric_table.as_deref(),
                 None,
                 Some(&operation),
@@ -302,6 +308,7 @@ pub(crate) async fn handle_request(
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedReadCapacityUnits,
                         m.read_capacity_units,
+                        Some(&ctx.account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
@@ -311,20 +318,27 @@ pub(crate) async fn handle_request(
                     state.metrics.record(
                         extenddb_core::metrics::MetricName::ConsumedWriteCapacityUnits,
                         m.write_capacity_units,
+                        Some(&ctx.account_id),
                         Some(tn),
                         m.index_name.as_deref(),
                         Some(&operation),
                     );
                 }
                 if m.returned_item_count > 0 {
-                    state
-                        .metrics
-                        .record_returned_items(tn, &operation, m.returned_item_count);
+                    state.metrics.record_returned_items(
+                        &ctx.account_id,
+                        tn,
+                        &operation,
+                        m.returned_item_count,
+                    );
                 }
                 if m.returned_bytes > 0 {
-                    state
-                        .metrics
-                        .record_returned_bytes(tn, &operation, m.returned_bytes);
+                    state.metrics.record_returned_bytes(
+                        &ctx.account_id,
+                        tn,
+                        &operation,
+                        m.returned_bytes,
+                    );
                 }
             }
             // Throttle buckets stay keyed by the name the request sent, which
@@ -343,7 +357,13 @@ pub(crate) async fn handle_request(
             success_response(&result.body, &request_id)
         }
         Err(e) => {
-            record_error_metrics(&state.metrics, &e, metric_table.as_deref(), &operation);
+            record_error_metrics(
+                &state.metrics,
+                &e,
+                &ctx.account_id,
+                metric_table.as_deref(),
+                &operation,
+            );
             error_response(&e, &request_id)
         }
     };
@@ -356,12 +376,18 @@ pub(crate) async fn handle_request(
     // `SuccessfulRequestLatency` counts successful requests only, as
     // CloudWatch's does.
     if succeeded {
-        state
-            .metrics
-            .record_latency(metric_table.as_deref(), &operation, total_us);
+        state.metrics.record_latency(
+            &ctx.account_id,
+            metric_table.as_deref(),
+            &operation,
+            total_us,
+        );
     }
-    state.metrics.record_request_count(&operation);
+    state
+        .metrics
+        .record_request_count(&ctx.account_id, &operation);
     state.metrics.record_segments(
+        &ctx.account_id,
         &operation,
         metric_table.as_deref(),
         extenddb_core::metrics::LatencySegments {
