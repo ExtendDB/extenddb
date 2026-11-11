@@ -652,6 +652,29 @@ class TestImportTableNumbers:
         self._assert_failed(desc)
         assert sorted(self._items(dynamodb_client, unique_table_name)) == ["before", "middle"]
 
+    def test_a_row_whose_key_has_the_wrong_type_fails_the_import(
+        self, dynamodb_client, unique_table_name, cleanup_table
+    ):
+        """A file whose only refused row has a number key on a string-key table.
+
+        Every number in the file is valid. The handler marks any import that
+        refused a row FAILED with ItemValidationError, whichever check refused
+        the row. Each such row counts as one error and is skipped, and the
+        rows after it are imported. The service's status for this file was
+        not measured: the measured files above refuse rows for their numbers,
+        and a measured row with a mistyped key and the number 1E126 was logged
+        as the type mismatch.
+        """
+        cleanup_table(unique_table_name)
+        desc = self._import(unique_table_name, [
+            {"pk": {"S": "before"}, "n": {"N": "1"}},
+            {"pk": {"N": "2"}, "n": {"N": "3"}},
+            {"pk": {"S": "after"}, "n": {"N": "4"}},
+        ])
+        assert self._counts(desc) == (3, 2, 1)
+        self._assert_failed(desc)
+        assert sorted(self._items(dynamodb_client, unique_table_name)) == ["after", "before"]
+
     def test_numbers_are_stored_as_the_service_spells_them(
         self, dynamodb_client, unique_table_name, cleanup_table
     ):
