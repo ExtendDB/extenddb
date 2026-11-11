@@ -8,7 +8,8 @@ use crate::types::{BatchWriteItemInput, TransactGetItem, TransactWriteItem};
 
 // Every value below was sent to DynamoDB twice on 2026-10-27 (us-east-1) on
 // the operation path the test names, with the same answer both times, except
-// where a comment says the test pins a choice of these checks.
+// where a comment gives another date or says the test pins a choice of these
+// checks.
 const NUMERIC: &str = "The parameter cannot be converted to a numeric value";
 const OVERFLOW: &str =
     "Number overflow. Attempting to store a number with magnitude larger than supported range";
@@ -22,6 +23,11 @@ fn refused(result: Result<(), DynamoDbError>) -> String {
         other => panic!("expected ValidationException, got {other:?}"),
     }
 }
+
+// The `ImportTable` reader. Its rows were measured on `BatchWriteItem` on
+// 2026-10-27, when that operation read numbers this way; the `ImportTable`
+// rows measured on 2026-11-03, in the `import_row` tests below, follow the
+// same rules.
 
 fn i32_scale(n: &str) -> Result<(), String> {
     validate_number_i32_scale(n)
@@ -121,120 +127,93 @@ fn i32_scale_magnitude_wraps_and_comes_before_the_digit_count() {
     assert_eq!(i32_scale(&ones), Err(DIGITS.to_owned()));
 }
 
-/// A deterministic xorshift generator for the reader comparison below.
-struct Generator(u64);
-
-impl Generator {
-    fn below(&mut self, bound: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % bound
-    }
-
-    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
-        from[usize::try_from(self.below(from.len() as u64)).unwrap()]
-    }
-
-    /// `count` digits, about half of them zeros.
-    fn digits(&mut self, count: usize) -> String {
-        (0..count)
-            .map(|_| self.pick(&['0', '0', '0', '1', '2', '5', '9']))
-            .collect()
-    }
-
-    /// A string shaped like a number, malformed about one time in twenty.
-    fn number_like(&mut self) -> String {
-        let mut s = self.pick(&["", "", "+", "-"]).to_owned();
-        let integer_digits = self.pick(&[0, 1, 2, 3, 38, 39, 45]);
-        s.push_str(&self.digits(integer_digits));
-        if self.below(2) == 0 {
-            s.push('.');
-            let fraction_digits = self.pick(&[0, 1, 2, 5, 39, 45]);
-            s.push_str(&self.digits(fraction_digits));
-        }
-        if self.below(2) == 0 {
-            s.push_str(self.pick(&["e", "E", "E+", "e-", "E-"]));
-            let exponent = match self.below(5) {
-                0 => self.below(300),
-                1 => 120 + self.below(15),
-                2 => 2_147_483_640 + self.below(16),
-                3 => 9_223_372_036_854_775_800 + self.below(9),
-                _ => self.below(10_000_000_000),
-            };
-            s.push_str(&exponent.to_string());
-        }
-        if self.below(20) == 0 {
-            // The string is ASCII so far, so every index is a char boundary.
-            let at = usize::try_from(self.below(s.len() as u64 + 1)).unwrap();
-            let junk = self.pick(&[' ', 'a', '.', '+', 'e', '\u{b2}', '\u{ff15}']);
-            s.insert(at, junk);
-        }
-        s
-    }
+/// One number on four paths: a `PutItem` item value, a `BatchWriteItem` put
+/// item value, a `TransactWriteItems` `Put` item value and a
+/// `TransactGetItems` key value, as the answer each path gives.
+fn four_paths(n: &str) -> [Result<(), String>; 4] {
+    let answer = |result: Result<(), DynamoDbError>| match result {
+        Ok(()) => Ok(()),
+        Err(DynamoDbError::ValidationException(message)) => Err(message),
+        Err(other) => panic!("expected ValidationException, got {other:?}"),
+    };
+    let item = json!({"pk": {"S": "a"}, "n": {"N": n}});
+    let put: PutItemInput =
+        serde_json::from_value(json!({"TableName": "t", "Item": item.clone()})).unwrap();
+    let batch: BatchWriteItemInput = serde_json::from_value(
+        json!({"RequestItems": {"t": [{"PutRequest": {"Item": item.clone()}}]}}),
+    )
+    .unwrap();
+    let transact_put: TransactWriteItem =
+        serde_json::from_value(json!({"Put": {"TableName": "t", "Item": item}})).unwrap();
+    let transact_get: TransactGetItem =
+        serde_json::from_value(json!({"Get": {"TableName": "t", "Key": {"pk": {"N": n}}}}))
+            .unwrap();
+    [
+        answer(put_item_item(&put)),
+        answer(batch_write_item(&batch)),
+        answer(transact_write_item(&transact_put)),
+        answer(transact_get_item(&transact_get)),
+    ]
 }
 
 #[test]
-fn the_two_readers_agree_outside_the_documented_differences() {
-    // `validate_number_i32_scale` and `validate_and_normalize_number` read
-    // one grammar. They must accept the same values and refuse the others
-    // with the same message, except in four cases the docs describe:
-    // 1. a zero whose exponent fits in 32 bits, which the 64-bit reader
-    //    accepts as 0 (#618) and the 32-bit reader range checks;
-    // 2. an exponent, a scale (fraction digits less the exponent) or a
-    //    magnitude (digits less the scale) that does not fit in 32 bits,
-    //    where the 32-bit reader cannot convert the value or wraps its
-    //    magnitude, and both refuse it;
-    // 3. more than 38 digits and a magnitude out of range, where the 32-bit
-    //    reader names the magnitude and the 64-bit reader the digit count;
-    // 4. a zero whose exponent fits in 32 bits and whose scale does not
-    //    (`0.0E-2147483648`), which the 64-bit reader accepts as 0 and the
-    //    32-bit reader cannot convert.
-    // The empty value's text differs too (module doc), and is tested above.
-    let mut generator = Generator(0x9E37_79B9_7F4A_7C15);
-    let mut agreed = 0;
-    for _ in 0..4_000 {
-        let s = generator.number_like();
-        if s.is_empty() {
-            continue;
+fn put_batch_and_transact_paths_read_a_number_alike() {
+    // Measured in us-east-1 on 2026-11-11, each value twice on PutItem,
+    // BatchWriteItem, TransactWriteItems and TransactGetItems with the same
+    // answer on each path. The service puts `1 validation error detected: `
+    // ahead of the PutItem message, and ExtendDB's PutItem item errors carry
+    // no prefix. `1E125` is accepted on each path.
+    let convert = |n: &str| format!("{NUMERIC}: {n}");
+    let forty = "1234567890123456789012345678901234567890";
+    for (n, want) in [
+        ("10E2147483647".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E2147483648".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E2147483647".to_owned(), Err(OVERFLOW.to_owned())),
+        ("1E-2147483648".to_owned(), Err(UNDERFLOW.to_owned())),
+        ("1E-2147483649".to_owned(), Err(UNDERFLOW.to_owned())),
+        ("1E9223372036854775807".to_owned(), Err(OVERFLOW.to_owned())),
+        (
+            "1E9223372036854775808".to_owned(),
+            Err(convert("1E9223372036854775808")),
+        ),
+        (
+            "10E9223372036854775807".to_owned(),
+            Err(OVERFLOW.to_owned()),
+        ),
+        (
+            "1E-9223372036854775808".to_owned(),
+            Err(UNDERFLOW.to_owned()),
+        ),
+        (
+            "1E-9223372036854775809".to_owned(),
+            Err(convert("1E-9223372036854775809")),
+        ),
+        ("1E125".to_owned(), Ok(())),
+        // Zeros and forty digits, also sent to UpdateItem as an
+        // ExpressionAttributeValues value with the same answer. The forty
+        // digits without an exponent were sent to BatchWriteItem alone.
+        ("0E2147483648".to_owned(), Err(OVERFLOW.to_owned())),
+        ("0E-2147483649".to_owned(), Err(UNDERFLOW.to_owned())),
+        (
+            "0E9223372036854775807".to_owned(),
+            Err(UNDERFLOW.to_owned()),
+        ),
+        (format!("{forty}E200"), Err(DIGITS.to_owned())),
+        (format!("{forty}E-200"), Err(DIGITS.to_owned())),
+        (forty.to_owned(), Err(DIGITS.to_owned())),
+    ] {
+        for (path, got) in [
+            "PutItem",
+            "BatchWriteItem",
+            "TransactWriteItems",
+            "TransactGetItems",
+        ]
+        .into_iter()
+        .zip(four_paths(&n))
+        {
+            assert_eq!(got, want, "{n} on {path}");
         }
-        let narrow = i32_scale(&s);
-        let wide = validate_and_normalize_number(&s);
-        let wide_answer = wide.clone().map(drop).map_err(message);
-        if narrow == wide_answer {
-            agreed += 1;
-            continue;
-        }
-        // The exponent as written, when it is a plain signed integer, and the
-        // scale it gives with the fraction digits.
-        let (mantissa, exponent) = s
-            .split_once(['e', 'E'])
-            .map_or((s.as_str(), None), |(m, e)| (m, e.parse::<i64>().ok()));
-        let fraction_digits = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
-        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-        let precision = digits.trim_start_matches('0').len().max(1);
-        let exponent_wide = exponent.is_some_and(|e| i32::try_from(e).is_err());
-        let scale = exponent.map(|e| i128::try_from(fraction_digits).unwrap() - i128::from(e));
-        let scale_wide = scale.is_some_and(|scale| i32::try_from(scale).is_err());
-        let magnitude_wide = scale.is_some_and(|scale| {
-            i32::try_from(i128::try_from(precision).unwrap() - scale).is_err()
-        });
-        let magnitude = |m: &str| m == OVERFLOW || m == UNDERFLOW;
-        let malformed = |m: &str| m.starts_with(NUMERIC);
-        let documented = match (&narrow, &wide) {
-            (Err(m), Ok(zero)) => {
-                zero == "0" && (magnitude(m) || (malformed(m) && !exponent_wide && scale_wide))
-            }
-            (Err(_), Err(_)) if exponent_wide || scale_wide || magnitude_wide => true,
-            (Err(m), Err(_)) => magnitude(m) && wide_answer == Err(DIGITS.to_owned()),
-            (Ok(()), _) => false,
-        };
-        assert!(
-            documented,
-            "{s:?}: 32-bit reader {narrow:?}, 64-bit reader {wide_answer:?}"
-        );
     }
-    assert!(agreed > 2_000, "only {agreed} of the values agreed");
 }
 
 fn get(key: Value) -> GetItemInput {
@@ -252,8 +231,7 @@ fn get_item_key_answers_without_a_prefix() {
         refused(get_item(&get(json!({"a": {"S": "x"}, "b": {"N": "abc"}})))),
         format!("{NUMERIC}: abc")
     );
-    // The 64-bit exponent rules: an overflow where the transaction paths
-    // answer an underflow, and the empty value with its colon.
+    // The 64-bit exponent rules, and the empty value with its colon.
     assert_eq!(
         refused(get_item(&get(json!({"pk": {"N": "10E2147483647"}})))),
         OVERFLOW
@@ -359,18 +337,15 @@ fn put_item_values_carry_the_prefix_and_follow_the_item() {
 }
 
 #[test]
-fn transact_get_item_uses_the_32_bit_rules() {
+fn transact_get_item_reads_a_64_bit_exponent() {
+    // Measured 2026-11-11: `10E2147483647` and `1E2147483648` are a `Number
+    // overflow`. The empty value answers the message without the colon
+    // (2026-10-27).
     let item = |n: &str| -> TransactGetItem {
         serde_json::from_value(json!({"Get": {"TableName": "t", "Key": {"pk": {"N": n}}}})).unwrap()
     };
-    assert_eq!(
-        refused(transact_get_item(&item("10E2147483647"))),
-        UNDERFLOW
-    );
-    assert_eq!(
-        refused(transact_get_item(&item("1E2147483648"))),
-        format!("{NUMERIC}: 1E2147483648")
-    );
+    assert_eq!(refused(transact_get_item(&item("10E2147483647"))), OVERFLOW);
+    assert_eq!(refused(transact_get_item(&item("1E2147483648"))), OVERFLOW);
     assert_eq!(refused(transact_get_item(&item(""))), NUMERIC);
     transact_get_item(&item("5")).unwrap();
 }
@@ -394,8 +369,9 @@ fn batch_write_item_checks_put_items_and_delete_keys() {
             OVERFLOW.to_owned(),
         ),
         (
+            // Measured 2026-11-11.
             json!({"PutRequest": {"Item": {"pk": {"S": "a"}, "n": {"N": "10E2147483647"}}}}),
-            UNDERFLOW.to_owned(),
+            OVERFLOW.to_owned(),
         ),
         (
             json!({"DeleteRequest": {"Key": {"pk": {"N": "1E126"}}}}),
@@ -450,11 +426,12 @@ fn transact_write_item_checks_values_then_key_or_item() {
         "ExpressionAttributeValues": {":v": {"L": [{"N": "1E126"}]}},
     }}));
     assert_eq!(refused(transact_write_item(&put)), wrapped(OVERFLOW, ":v"));
+    // Measured 2026-11-11: `1E2147483647` is a `Number overflow`.
     let delete = transact(json!({"Delete": {
         "TableName": "t",
         "Key": {"pk": {"N": "1E2147483647"}},
     }}));
-    assert_eq!(refused(transact_write_item(&delete)), UNDERFLOW);
+    assert_eq!(refused(transact_write_item(&delete)), OVERFLOW);
 }
 
 #[test]

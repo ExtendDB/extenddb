@@ -529,6 +529,49 @@ async fn a_number_over_the_range_is_refused_in_get_and_delete_keys() {
 }
 
 #[tokio::test]
+async fn put_batch_and_transact_paths_read_a_64_bit_exponent() {
+    // Measured 2026-11-11, each value twice on each path: `10E2147483647` and
+    // `1E2147483648` are a `Number overflow` on PutItem, BatchWriteItem,
+    // TransactWriteItems and TransactGetItems. DynamoDB puts the prefix on
+    // the PutItem message and ExtendDB does not, so PutItem is matched on
+    // the message body.
+    let t = tables().await;
+    for value in ["10E2147483647", "1E2147483648"] {
+        let mut item = string_key("x618");
+        item.insert("amount".to_string(), n_raw(value));
+        let put = client()
+            .put_item()
+            .table_name(&t.simple_key_string)
+            .set_item(Some(item.clone()))
+            .send()
+            .await;
+        let err = refused(put);
+        assert!(
+            err.starts_with("ValidationException:") && err.ends_with(OVERFLOW),
+            "PutItem {value}: {err}"
+        );
+
+        let err = batch_write(&t.simple_key_string, vec![put_request(item.clone())]).await;
+        assert_refused(&err.unwrap_err(), OVERFLOW);
+
+        let err = transact_write(vec![txn_put(put_of(&t.simple_key_string, item))]).await;
+        assert_refused(&err.unwrap_err(), OVERFLOW);
+
+        let get = Get::builder()
+            .table_name(&t.comp_key_number_string)
+            .set_key(Some(number_key(value)))
+            .build()
+            .expect("get");
+        let result = client()
+            .transact_get_items()
+            .transact_items(TransactGetItem::builder().get(get).build())
+            .send()
+            .await;
+        assert_refused(&refused(result), OVERFLOW);
+    }
+}
+
+#[tokio::test]
 async fn a_zero_inside_the_range_is_stored_as_zero_on_batch_and_transact_writes() {
     // Measured 2026-10-27: `0.0E126` and `-0E-130` are stored as 0.
     let t = tables().await;

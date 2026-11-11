@@ -5,19 +5,20 @@
 //! `PutItem` item check and the `UpdateItem` value checks do not cover, with
 //! the text each operation answers.
 //!
-//! Measured 2026-10-27 (us-east-1, every request twice, the same answer both
-//! times), the service reads a number one of two ways:
+//! Every operation here reads a number as [`validate_and_normalize_number`]
+//! does, with a 64-bit exponent. Measured in us-east-1, every request twice
+//! with the same answer both times: `GetItem`, `BatchGetItem`, `UpdateItem`
+//! and `DeleteItem` on 2026-10-27, and `PutItem`, `BatchWriteItem`,
+//! `TransactWriteItems` and `TransactGetItems` on 2026-11-11, where
+//! `10E2147483647` and `1E2147483648` are a `Number overflow` on all four
+//! paths. The operations differ in the text for an empty value (measured
+//! 2026-10-27): `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and
+//! `DeleteItem` answer `The parameter cannot be converted to a numeric value: `
+//! with nothing after the colon, and `BatchWriteItem`, `TransactGetItems` and
+//! `TransactWriteItems` answer the message without the colon.
 //!
-//! - `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem` read
-//!   it as [`validate_and_normalize_number`] does, with a 64-bit exponent. An
-//!   empty value answers `The parameter cannot be converted to a numeric
-//!   value: ` with nothing after the colon.
-//! - `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems` read it with
-//!   a 32-bit exponent and scale; see [`validate_number_i32_scale`]. An empty
-//!   value answers the message without the colon.
-//!
-//! `ImportTable` reads the numbers of a row the second way (measured
-//! 2026-11-03; see [`import_row`]).
+//! `ImportTable` reads the numbers of a row with a 32-bit exponent and scale
+//! (measured 2026-11-03; see [`import_row`] and [`validate_number_i32_scale`]).
 //!
 //! `PutItem`, `UpdateItem` and `DeleteItem` start the message with
 //! `1 validation error detected: `, and the other operations do not.
@@ -50,13 +51,15 @@ const NUMERIC_VALUE: &str = "The parameter cannot be converted to a numeric valu
 /// The prefix `PutItem`, `UpdateItem` and `DeleteItem` put on the message.
 const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
 
-/// How an operation reads a number.
+/// The text an operation gives for an empty number (measured 2026-10-27).
 #[derive(Clone, Copy)]
-enum Rules {
-    /// `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem`.
-    I64Exponent,
-    /// `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
-    I32Scale,
+enum EmptyText {
+    /// `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem`:
+    /// the message and a colon with nothing after it.
+    WithColon,
+    /// `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`: the
+    /// message without the colon.
+    WithoutColon,
 }
 
 /// Refuse a `GetItem` key holding a number the service cannot read.
@@ -65,7 +68,7 @@ enum Rules {
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn get_item(input: &GetItemInput) -> Result<(), DynamoDbError> {
-    item_numbers(Rules::I64Exponent, &input.key).map_err(bare)
+    item_numbers(EmptyText::WithColon, &input.key).map_err(bare)
 }
 
 /// Refuse one `BatchGetItem` table's keys when one holds a number the service
@@ -76,7 +79,7 @@ pub fn get_item(input: &GetItemInput) -> Result<(), DynamoDbError> {
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn batch_get_keys(keys: &[Item]) -> Result<(), DynamoDbError> {
     keys.iter()
-        .try_for_each(|key| item_numbers(Rules::I64Exponent, key))
+        .try_for_each(|key| item_numbers(EmptyText::WithColon, key))
         .map_err(bare)
 }
 
@@ -86,7 +89,7 @@ pub fn batch_get_keys(keys: &[Item]) -> Result<(), DynamoDbError> {
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn delete_item_key(input: &DeleteItemInput) -> Result<(), DynamoDbError> {
-    item_numbers(Rules::I64Exponent, &input.key).map_err(single_write)
+    item_numbers(EmptyText::WithColon, &input.key).map_err(single_write)
 }
 
 /// Refuse `DeleteItem` `ExpressionAttributeValues` holding a value nested too
@@ -106,7 +109,7 @@ pub fn delete_item_values(input: &DeleteItemInput) -> Result<(), DynamoDbError> 
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn update_item_key(input: &UpdateItemInput) -> Result<(), DynamoDbError> {
-    item_numbers(Rules::I64Exponent, &input.key).map_err(single_write)
+    item_numbers(EmptyText::WithColon, &input.key).map_err(single_write)
 }
 
 /// Refuse `PutItem` `ExpressionAttributeValues` holding a value nested too
@@ -148,7 +151,7 @@ pub fn put_item_item(input: &PutItemInput) -> Result<(), DynamoDbError> {
 ///
 /// Returns `DynamoDbError::ValidationException` with the service's text.
 pub fn transact_get_item(item: &TransactGetItem) -> Result<(), DynamoDbError> {
-    item_numbers(Rules::I32Scale, &item.get.key).map_err(bare)
+    item_numbers(EmptyText::WithoutColon, &item.get.key).map_err(bare)
 }
 
 /// Refuse a `BatchWriteItem` request when a put item or a delete key holds a
@@ -173,10 +176,10 @@ pub fn batch_write_item(input: &BatchWriteItemInput) -> Result<(), DynamoDbError
         for request in &input.request_items[table_name] {
             if let Some(put) = &request.put_request {
                 crate::validation::validate_item_nesting_depth(&put.item)?;
-                item_numbers(Rules::I32Scale, &put.item).map_err(bare)?;
+                item_numbers(EmptyText::WithoutColon, &put.item).map_err(bare)?;
             }
             if let Some(delete) = &request.delete_request {
-                item_numbers(Rules::I32Scale, &delete.key).map_err(bare)?;
+                item_numbers(EmptyText::WithoutColon, &delete.key).map_err(bare)?;
             }
         }
     }
@@ -209,12 +212,12 @@ pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError
     } else {
         return Ok(());
     };
-    value_numbers(Rules::I32Scale, values).map_err(|(message, key)| {
+    value_numbers(EmptyText::WithoutColon, values).map_err(|(message, key)| {
         DynamoDbError::ValidationException(format!(
             "ExpressionAttributeValues contains invalid value: {message} for key {key}"
         ))
     })?;
-    item_numbers(Rules::I32Scale, key_or_item).map_err(bare)
+    item_numbers(EmptyText::WithoutColon, key_or_item).map_err(bare)
 }
 
 /// Why `ImportTable` refuses a row holding a number the service cannot read.
@@ -235,7 +238,7 @@ pub enum ImportRowFault {
 /// Measured 2026-11-03 (us-east-1), one import from S3 per value, each file a
 /// row with a valid number, the row under test, and another valid row:
 ///
-/// - The service reads a row's numbers as `BatchWriteItem` does, with a
+/// - The service read a row's numbers as `BatchWriteItem` then did, with a
 ///   32-bit exponent and scale; see [`validate_number_i32_scale`]. `abc`,
 ///   ` 5`, an empty value, `12e`, `1E2147483648` and `1E-2147483648` are not
 ///   numbers, and `1E2147483647` is a `Number underflow`.
@@ -312,19 +315,19 @@ fn values_nesting_then_numbers(
         return Ok(());
     };
     crate::validation::validate_attribute_values_nesting_depth(values.values()).map_err(message)?;
-    value_numbers(Rules::I64Exponent, Some(values)).map_err(|(message, _)| message)
+    value_numbers(EmptyText::WithColon, Some(values)).map_err(|(message, _)| message)
 }
 
 /// The first number in `item` the service cannot read, as its message.
-fn item_numbers(rules: Rules, item: &Item) -> Result<(), String> {
+fn item_numbers(empty: EmptyText, item: &Item) -> Result<(), String> {
     item.values()
-        .try_for_each(|value| attribute_numbers(rules, value))
+        .try_for_each(|value| attribute_numbers(empty, value))
 }
 
 /// The first number in `values` the service cannot read, as its message and
 /// placeholder. Placeholders are visited in name order.
 fn value_numbers(
-    rules: Rules,
+    empty: EmptyText,
     values: Option<&HashMap<String, AttributeValue>>,
 ) -> Result<(), (String, &str)> {
     let Some(values) = values else {
@@ -333,36 +336,40 @@ fn value_numbers(
     let mut keys: Vec<&String> = values.keys().collect();
     keys.sort();
     for key in keys {
-        attribute_numbers(rules, &values[key]).map_err(|message| (message, key.as_str()))?;
+        attribute_numbers(empty, &values[key]).map_err(|message| (message, key.as_str()))?;
     }
     Ok(())
 }
 
 /// The first number inside `value` (an `N`, an `NS` member, or a value nested
 /// in an `L` or `M`) the service cannot read, as its message.
-fn attribute_numbers(rules: Rules, value: &AttributeValue) -> Result<(), String> {
+fn attribute_numbers(empty: EmptyText, value: &AttributeValue) -> Result<(), String> {
     match value {
-        AttributeValue::N(n) => number_text(rules, n),
-        AttributeValue::NS(set) => set.iter().try_for_each(|n| number_text(rules, n)),
-        AttributeValue::L(list) => list.iter().try_for_each(|v| attribute_numbers(rules, v)),
-        AttributeValue::M(map) => map.values().try_for_each(|v| attribute_numbers(rules, v)),
+        AttributeValue::N(n) => number_text(empty, n),
+        AttributeValue::NS(set) => set.iter().try_for_each(|n| number_text(empty, n)),
+        AttributeValue::L(list) => list.iter().try_for_each(|v| attribute_numbers(empty, v)),
+        AttributeValue::M(map) => map.values().try_for_each(|v| attribute_numbers(empty, v)),
         _ => Ok(()),
     }
 }
 
-/// One number's text under `rules`, as the message the service gives when it
-/// cannot read it.
-fn number_text(rules: Rules, n: &str) -> Result<(), String> {
-    match rules {
-        Rules::I64Exponent if n.is_empty() => Err(format!("{NUMERIC_VALUE}: ")),
-        Rules::I64Exponent => validate_and_normalize_number(n).map(drop).map_err(message),
-        Rules::I32Scale => validate_number_i32_scale(n),
+/// One number's text, as the message the service gives when it cannot read
+/// it, with the operation's text for an empty value.
+fn number_text(empty: EmptyText, n: &str) -> Result<(), String> {
+    match empty {
+        EmptyText::WithColon if n.is_empty() => Err(format!("{NUMERIC_VALUE}: ")),
+        // `validate_and_normalize_number` answers an empty value without the
+        // colon.
+        _ => validate_and_normalize_number(n).map(drop).map_err(message),
     }
 }
 
-/// Check `s` as the service reads a number on `BatchWriteItem`,
-/// `TransactGetItems` and `TransactWriteItems`, and return the message for the
-/// first rule it breaks (measured 2026-10-27, us-east-1, every value twice):
+/// Check `s` as the service reads a number in an `ImportTable` row, and
+/// return the message for the first rule it breaks. These rules were measured
+/// on `BatchWriteItem` on 2026-10-27 (us-east-1, every value twice), which
+/// read numbers this way then, and the `ImportTable` rows measured on
+/// 2026-11-03 follow them (see [`import_row`]). On 2026-11-11 `BatchWriteItem`
+/// read numbers as `PutItem` does; `ImportTable` was not measured again.
 ///
 /// 1. `s` is an optional sign, digits with at most one point and at least one
 ///    digit, and an optional exponent: `e` or `E`, an optional sign and
