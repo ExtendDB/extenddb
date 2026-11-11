@@ -14,8 +14,10 @@
 //! except where a test gives another date.
 //! `PutItem`, `UpdateItem` and `DeleteItem` start the message with
 //! "1 validation error detected: " and the other operations do not.
-//! `TransactWriteItems` reports a value in `ExpressionAttributeValues` as
-//! "ExpressionAttributeValues contains invalid value: <message> for key :v".
+//! `TransactWriteItems` answers a value in `ExpressionAttributeValues` with
+//! the number message alone (measured 2026-11-11; on 2026-10-27 the service
+//! wrapped it as "ExpressionAttributeValues contains invalid value: <message>
+//! for key :v").
 //! More tests of the order of these checks against other faults in the same
 //! request are in `number_validation_order`, which shares the helpers below.
 
@@ -41,11 +43,6 @@ const OVER_RANGE: &str = "1E126";
 /// The prefix `PutItem`, `UpdateItem` and `DeleteItem` put on a message.
 const PREFIX: &str = "1 validation error detected: ";
 const CONDITION: &str = "attribute_not_exists(amount) OR amount = :v";
-
-/// What `TransactWriteItems` answers for a value in `ExpressionAttributeValues`.
-fn in_values(message: &str) -> String {
-    format!("ExpressionAttributeValues contains invalid value: {message} for key :v")
-}
 
 pub(crate) fn n_raw(value: &str) -> AttributeValue {
     AttributeValue::N(value.to_string())
@@ -348,6 +345,8 @@ async fn delete_item_rejects_a_condition_value_out_of_range() {
 
 #[tokio::test]
 async fn transact_write_items_rejects_a_condition_check_value_out_of_range() {
+    // The four TransactWriteItems value tests: measured 2026-11-11 with
+    // `1E126`, the number message with no prefix and no wrapper.
     let t = tables().await;
     let check = ConditionCheck::builder()
         .table_name(&t.simple_key_string)
@@ -357,7 +356,7 @@ async fn transact_write_items_rejects_a_condition_check_value_out_of_range() {
         .build()
         .expect("check");
     let err = transact_write(vec![txn_check(check)]).await;
-    assert_refused(&err.unwrap_err(), &in_values(OVERFLOW));
+    assert_refused(&err.unwrap_err(), OVERFLOW);
 }
 
 #[tokio::test]
@@ -371,7 +370,7 @@ async fn transact_write_items_rejects_a_put_condition_value_out_of_range() {
         .build()
         .expect("put");
     let err = transact_write(vec![txn_put(put)]).await;
-    assert_refused(&err.unwrap_err(), &in_values(OVERFLOW));
+    assert_refused(&err.unwrap_err(), OVERFLOW);
 }
 
 #[tokio::test]
@@ -385,7 +384,7 @@ async fn transact_write_items_rejects_an_update_value_out_of_range() {
         .build()
         .expect("update");
     let err = transact_write(vec![txn_update(update)]).await;
-    assert_refused(&err.unwrap_err(), &in_values(OVERFLOW));
+    assert_refused(&err.unwrap_err(), OVERFLOW);
 }
 
 #[tokio::test]
@@ -399,7 +398,7 @@ async fn transact_write_items_rejects_a_delete_condition_value_out_of_range() {
         .build()
         .expect("delete");
     let err = transact_write(vec![txn_delete(delete)]).await;
-    assert_refused(&err.unwrap_err(), &in_values(OVERFLOW));
+    assert_refused(&err.unwrap_err(), OVERFLOW);
 }
 
 // ---- legacy Expected ----

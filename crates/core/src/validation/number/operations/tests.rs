@@ -396,13 +396,13 @@ fn transact(action: Value) -> TransactWriteItem {
     serde_json::from_value(action).unwrap()
 }
 
-fn wrapped(message: &str, key: &str) -> String {
-    format!("ExpressionAttributeValues contains invalid value: {message} for key {key}")
-}
-
 #[test]
 fn transact_write_item_checks_values_then_key_or_item() {
-    // Values come before the key: the service names the value.
+    // Values come before the key: the service names the value (measured
+    // 2026-10-27). A value answers the number message alone, with no prefix
+    // and no wrapper, a value inside an `L` included, and an empty `N` with
+    // the colon (measured 2026-11-11 on Update, Put, Delete and
+    // ConditionCheck values; the empty `N` and the `L` on an Update value).
     let update = transact(json!({"Update": {
         "TableName": "t",
         "Key": {"pk": {"N": "abc"}},
@@ -411,7 +411,7 @@ fn transact_write_item_checks_values_then_key_or_item() {
     }}));
     assert_eq!(
         refused(transact_write_item(&update)),
-        wrapped(&format!("{NUMERIC}: xyz"), ":v")
+        format!("{NUMERIC}: xyz")
     );
     let check = transact(json!({"ConditionCheck": {
         "TableName": "t",
@@ -419,20 +419,78 @@ fn transact_write_item_checks_values_then_key_or_item() {
         "ConditionExpression": "n = :v",
         "ExpressionAttributeValues": {":v": {"N": ""}},
     }}));
-    assert_eq!(refused(transact_write_item(&check)), wrapped(NUMERIC, ":v"));
+    assert_eq!(refused(transact_write_item(&check)), format!("{NUMERIC}: "));
     let put = transact(json!({"Put": {
         "TableName": "t",
         "Item": {"pk": {"S": "a"}, "n": {"N": "xyz"}},
         "ConditionExpression": "n = :v",
         "ExpressionAttributeValues": {":v": {"L": [{"N": "1E126"}]}},
     }}));
-    assert_eq!(refused(transact_write_item(&put)), wrapped(OVERFLOW, ":v"));
+    assert_eq!(refused(transact_write_item(&put)), OVERFLOW);
     // Measured 2026-11-11: `1E2147483647` is a `Number overflow`.
     let delete = transact(json!({"Delete": {
         "TableName": "t",
         "Key": {"pk": {"N": "1E2147483647"}},
     }}));
     assert_eq!(refused(transact_write_item(&delete)), OVERFLOW);
+}
+
+#[test]
+fn transact_update_values_answer_the_inner_number_message() {
+    // Measured 2026-11-11 with `SET n = :v`, each value twice: no prefix, no
+    // wrapper, and the colon for an empty `N`.
+    for (value, want) in [
+        (json!({"N": "1E126"}), OVERFLOW.to_owned()),
+        (json!({"N": "abc"}), format!("{NUMERIC}: abc")),
+        (json!({"N": ""}), format!("{NUMERIC}: ")),
+        (json!({"M": {"x": {"N": "abc"}}}), format!("{NUMERIC}: abc")),
+        (json!({"L": [{"N": "1E126"}]}), OVERFLOW.to_owned()),
+        (json!({"NS": ["1", "abc"]}), format!("{NUMERIC}: abc")),
+    ] {
+        let update = transact(json!({"Update": {
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": value.clone()},
+        }}));
+        assert_eq!(refused(transact_write_item(&update)), want, "{value}");
+    }
+}
+
+#[test]
+fn update_item_values_carry_the_prefix_and_no_wrapper() {
+    // Measured 2026-11-11 with `SET n = :v`, each value twice.
+    for (value, want) in [
+        (json!({"N": "abc"}), format!("{NUMERIC}: abc")),
+        (json!({"N": "12e"}), format!("{NUMERIC}: 12e")),
+        (json!({"N": ""}), format!("{NUMERIC}: ")),
+        (json!({"N": "1E2147483648"}), OVERFLOW.to_owned()),
+        (json!({"N": "1E126"}), OVERFLOW.to_owned()),
+        (json!({"M": {"x": {"N": "abc"}}}), format!("{NUMERIC}: abc")),
+        (json!({"L": [{"N": "1E126"}]}), OVERFLOW.to_owned()),
+        (json!({"NS": ["1", "abc"]}), format!("{NUMERIC}: abc")),
+    ] {
+        let input: UpdateItemInput = serde_json::from_value(json!({
+            "TableName": "t",
+            "Key": {"pk": {"S": "a"}},
+            "UpdateExpression": "SET n = :v",
+            "ExpressionAttributeValues": {":v": value.clone()},
+        }))
+        .unwrap();
+        assert_eq!(
+            refused(update_item_values(&input)),
+            format!("1 validation error detected: {want}"),
+            "{value}"
+        );
+    }
+    let input: UpdateItemInput = serde_json::from_value(json!({
+        "TableName": "t",
+        "Key": {"pk": {"S": "a"}},
+        "UpdateExpression": "SET n = :v",
+        "ExpressionAttributeValues": {":v": {"N": "1E125"}},
+    }))
+    .unwrap();
+    update_item_values(&input).unwrap();
 }
 
 #[test]
@@ -449,7 +507,7 @@ fn transact_put_and_delete_values_are_checked_only_with_a_condition() {
         body["ConditionExpression"] = json!("");
         assert_eq!(
             refused(transact_write_item(&transact(json!({action: body})))),
-            wrapped(&format!("{NUMERIC}: abc"), ":v"),
+            format!("{NUMERIC}: abc"),
             "{action}"
         );
     }

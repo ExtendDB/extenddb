@@ -11,22 +11,28 @@
 //! and `DeleteItem` on 2026-10-27, and `PutItem`, `BatchWriteItem`,
 //! `TransactWriteItems` and `TransactGetItems` on 2026-11-11, where
 //! `10E2147483647` and `1E2147483648` are a `Number overflow` on all four
-//! paths. The operations differ in the text for an empty value (measured
-//! 2026-10-27): `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and
+//! paths. The operations differ in the text for an empty value: keys and
+//! items of `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and
 //! `DeleteItem` answer `The parameter cannot be converted to a numeric value: `
-//! with nothing after the colon, and `BatchWriteItem`, `TransactGetItems` and
-//! `TransactWriteItems` answer the message without the colon.
+//! with nothing after the colon, and keys and items of `BatchWriteItem`,
+//! `TransactGetItems` and `TransactWriteItems` answer the message without the
+//! colon (measured 2026-10-27). An empty value in `ExpressionAttributeValues`
+//! answers with the colon on `UpdateItem` and `TransactWriteItems` (measured
+//! 2026-11-11).
 //!
 //! `ImportTable` reads the numbers of a row with a 32-bit exponent and scale
-//! (measured 2026-11-03; see [`import_row`] and [`validate_number_i32_scale`]).
+//! (measured 2026-11-03 and 2026-11-11; see [`import_row`] and
+//! [`validate_number_i32_scale`]).
 //!
 //! `PutItem`, `UpdateItem` and `DeleteItem` start the message with
-//! `1 validation error detected: `, and the other operations do not.
-//! `TransactWriteItems` reports a value in `ExpressionAttributeValues` as
-//! `ExpressionAttributeValues contains invalid value: <message> for key
-//! <placeholder>`. It checks those values for every `Update` and
-//! `ConditionCheck`, and for a `Put` or `Delete` only when the action has a
-//! `ConditionExpression`, empty or not.
+//! `1 validation error detected: `, and the other operations do not. A
+//! number in `ExpressionAttributeValues`, or inside an `M`, `L` or `NS` value
+//! there, answers the number message in the same form on each operation, with
+//! no wrapper (measured 2026-11-11; on 2026-10-27 `TransactWriteItems`
+//! answered `ExpressionAttributeValues contains invalid value: <message> for
+//! key <placeholder>`). `TransactWriteItems` checks those values for every
+//! `Update` and `ConditionCheck`, and for a `Put` or `Delete` only when the
+//! action has a `ConditionExpression`, empty or not.
 //!
 //! When several placeholders in `ExpressionAttributeValues` are malformed, the
 //! service named a different one on two sends of the same request, so these
@@ -47,14 +53,16 @@ use crate::types::{
 /// The prefix `PutItem`, `UpdateItem` and `DeleteItem` put on the message.
 const SINGLE_WRITE_PREFIX: &str = "1 validation error detected: ";
 
-/// The text an operation gives for an empty number (measured 2026-10-27).
+/// The text an operation gives for an empty number.
 #[derive(Clone, Copy)]
 enum EmptyText {
-    /// `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem`:
-    /// the message and a colon with nothing after it.
+    /// The message and a colon with nothing after it: keys and items of
+    /// `GetItem`, `BatchGetItem`, `PutItem`, `UpdateItem` and `DeleteItem`
+    /// (measured 2026-10-27), and `ExpressionAttributeValues` (measured on
+    /// `UpdateItem` and on a `TransactWriteItems` `Update` on 2026-11-11).
     WithColon,
-    /// `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`: the
-    /// message without the colon.
+    /// The message without the colon: keys and items of `BatchWriteItem`,
+    /// `TransactGetItems` and `TransactWriteItems` (measured 2026-10-27).
     WithoutColon,
 }
 
@@ -219,7 +227,10 @@ pub fn batch_write_item(input: &BatchWriteItemInput) -> Result<(), DynamoDbError
 }
 
 /// Refuse one `TransactWriteItems` action holding a number the service cannot
-/// read: its `ExpressionAttributeValues` first, then its key or item.
+/// read: its `ExpressionAttributeValues` first, then its key or item. Both
+/// answer the number message with no prefix and no wrapper (measured
+/// 2026-11-11 on `Update`, `Put`, `Delete` and `ConditionCheck` values and on
+/// a `Delete` key).
 ///
 /// # Errors
 ///
@@ -244,32 +255,31 @@ pub fn transact_write_item(item: &TransactWriteItem) -> Result<(), DynamoDbError
     } else {
         return Ok(());
     };
-    expression_attribute_value_numbers(values)?;
+    value_numbers(EmptyText::WithColon, values).map_err(bare)?;
     item_numbers(EmptyText::WithoutColon, key_or_item).map_err(bare)
 }
 
-/// Refuse `ExpressionAttributeValues` holding a number the service cannot
-/// read, as `ExpressionAttributeValues contains invalid value: <message> for
-/// key <placeholder>`. Placeholders are visited in name order, and an empty
-/// value answers the message without the colon.
+/// Refuse `UpdateItem` `ExpressionAttributeValues` holding a number the
+/// service cannot read, with the prefix and the number message. Placeholders
+/// are visited in name order.
 ///
-/// `TransactWriteItems` gives this text (measured 2026-10-27), and the
-/// `UpdateItem` check in `validate_update_item` uses it too. On 2026-11-11 the
-/// service answered an `UpdateItem` value out of range, such as
-/// `0E2147483648`, with the prefix `1 validation error detected: ` and no
-/// wrapper.
+/// Measured 2026-11-11 (us-east-1, each request twice) with `SET n = :v`:
+/// `abc` and `12e` answer `1 validation error detected: The parameter cannot
+/// be converted to a numeric value: abc` (`12e` likewise), an empty `N` the
+/// same message with nothing after the colon, and `1E126` and
+/// `1E2147483648` the prefix and `Number overflow`. A number inside an `M`,
+/// `L` or `NS` value answers the inner number's message in the same form. No
+/// answer names the placeholder.
 ///
 /// # Errors
 ///
-/// Returns `DynamoDbError::ValidationException` with that text.
-pub(crate) fn expression_attribute_value_numbers(
-    values: Option<&HashMap<String, AttributeValue>>,
-) -> Result<(), DynamoDbError> {
-    value_numbers(EmptyText::WithoutColon, values).map_err(|(message, key)| {
-        DynamoDbError::ValidationException(format!(
-            "ExpressionAttributeValues contains invalid value: {message} for key {key}"
-        ))
-    })
+/// Returns `DynamoDbError::ValidationException` with the service's text.
+pub fn update_item_values(input: &UpdateItemInput) -> Result<(), DynamoDbError> {
+    value_numbers(
+        EmptyText::WithColon,
+        input.expression_attribute_values.as_ref(),
+    )
+    .map_err(single_write)
 }
 
 /// Why `ImportTable` refuses a row holding a number the service cannot read.
@@ -361,7 +371,7 @@ fn values_nesting_then_numbers(
         return Ok(());
     };
     crate::validation::validate_attribute_values_nesting_depth(values.values()).map_err(message)?;
-    value_numbers(EmptyText::WithColon, Some(values)).map_err(|(message, _)| message)
+    value_numbers(EmptyText::WithColon, Some(values))
 }
 
 /// The first number in `item` the service cannot read, as its message.
@@ -370,21 +380,19 @@ fn item_numbers(empty: EmptyText, item: &Item) -> Result<(), String> {
         .try_for_each(|value| attribute_numbers(empty, value))
 }
 
-/// The first number in `values` the service cannot read, as its message and
-/// placeholder. Placeholders are visited in name order.
+/// The first number in `values` the service cannot read, as its message.
+/// Placeholders are visited in name order.
 fn value_numbers(
     empty: EmptyText,
     values: Option<&HashMap<String, AttributeValue>>,
-) -> Result<(), (String, &str)> {
+) -> Result<(), String> {
     let Some(values) = values else {
         return Ok(());
     };
     let mut keys: Vec<&String> = values.keys().collect();
     keys.sort();
-    for key in keys {
-        attribute_numbers(empty, &values[key]).map_err(|message| (message, key.as_str()))?;
-    }
-    Ok(())
+    keys.into_iter()
+        .try_for_each(|key| attribute_numbers(empty, &values[key]))
 }
 
 /// The first number inside `value` (an `N`, an `NS` member, or a value nested
