@@ -21,7 +21,14 @@ async fn the_metrics_store_keeps_two_accounts_apart() {
     let d = Deployment::new(&uri, "metrics").await;
     d.create().await;
     let store = MongoCatalogStore::on_database_for_tests(d.client.clone(), d.catalog());
-    extenddb_storage::metrics_conformance::run(&store).await;
+    extenddb_storage::metrics_conformance::run(
+        &store,
+        extenddb_storage::metrics_conformance::Expectations {
+            accumulates: true,
+            prunes: true,
+        },
+    )
+    .await;
     d.drop_databases().await;
 }
 

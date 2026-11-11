@@ -383,16 +383,15 @@ async fn migration_10_replaces_metrics_with_an_empty_account_metrics() {
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 0);
 
-    let insert = |account: &str| {
-        format!(
-            "INSERT INTO account_metrics (bucket, account_id, metric, table_name, operation, \
-             sum, count, min, max) \
-             VALUES ('2026-11-11T00:00:00Z', '{account}', 'UserErrors', 'Orders', 'PutItem', \
-             1, 1, 1, 1)"
-        )
-    };
-    exec(&db, &insert("111111111111")).await;
-    exec(&db, &insert("222222222222")).await;
+    // Two rows that differ only in their account.
+    exec(
+        &db,
+        "INSERT INTO account_metrics (bucket, account_id, metric, table_name, operation, \
+         sum, count, min, max) VALUES \
+         ('2026-11-11T00:00:00Z', '111111111111', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1), \
+         ('2026-11-11T00:00:00Z', '222222222222', 'UserErrors', 'Orders', 'PutItem', 1, 1, 1, 1)",
+    )
+    .await;
     assert_eq!(count(&db, "SELECT COUNT(*) FROM account_metrics").await, 2);
 
     // The body again, as --reconverge runs it: the rows stay.
@@ -409,7 +408,14 @@ async fn the_metrics_store_keeps_two_accounts_apart() {
     run(&db).await.expect("migrate");
     let pool = plain_pool(&db).await;
     let store = crate::SqliteCatalogStore::new(pool.clone());
-    extenddb_storage::metrics_conformance::run(&store).await;
+    extenddb_storage::metrics_conformance::run(
+        &store,
+        extenddb_storage::metrics_conformance::Expectations {
+            accumulates: true,
+            prunes: true,
+        },
+    )
+    .await;
     pool.close().await;
 }
 

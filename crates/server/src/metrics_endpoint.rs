@@ -82,10 +82,12 @@ pub(crate) async fn render_metrics(
                     .window
                     .unwrap_or(extenddb_core::metrics::TimeWindow::Last5Minutes);
                 let seg_metrics = state.metrics.clone();
-                response.segments =
-                    tokio::task::spawn_blocking(move || seg_metrics.query_segments(window))
-                        .await
-                        .unwrap_or_default();
+                let account = params.account_id.clone();
+                response.segments = tokio::task::spawn_blocking(move || {
+                    seg_metrics.query_segments(window, account.as_deref())
+                })
+                .await
+                .unwrap_or_default();
                 return (
                     StatusCode::OK,
                     axum::Json(serde_json::to_value(response).unwrap_or_default()),
@@ -106,6 +108,7 @@ pub(crate) async fn render_metrics(
         .window
         .unwrap_or(extenddb_core::metrics::TimeWindow::Last5Minutes);
     let metrics_for_segments = state.metrics.clone();
+    let account = params.account_id.clone();
     let snapshots = match tokio::task::spawn_blocking(move || metrics.query(&params)).await {
         Ok(s) => s,
         Err(e) => {
@@ -113,9 +116,11 @@ pub(crate) async fn render_metrics(
             Vec::new()
         }
     };
-    let segments = tokio::task::spawn_blocking(move || metrics_for_segments.query_segments(window))
-        .await
-        .unwrap_or_default();
+    let segments = tokio::task::spawn_blocking(move || {
+        metrics_for_segments.query_segments(window, account.as_deref())
+    })
+    .await
+    .unwrap_or_default();
     let response = MetricsResponse {
         metrics: snapshots,
         buckets: Vec::new(),
@@ -229,9 +234,9 @@ fn aggregate_rows(
     let mut bucket_map: HashMap<(DimKey, i64), (f64, u64, f64, f64)> = HashMap::new();
 
     for row in rows {
-        // CloudWatch-style dimensions: metrics are keyed per account, per
-        // table and per index. The endpoint is authenticated (admin Basic
-        // auth), so per-table dimensions are only returned to an authorized
+        // CloudWatch-style dimensions per table and per index, and ExtendDB's
+        // own account dimension. The endpoint is authenticated (admin Basic
+        // auth), so these dimensions are only returned to an authorized
         // caller.
         let key = (
             row.metric.clone(),

@@ -213,7 +213,7 @@ Defined in `crates/storage/src/management_store/mod.rs`. Historical metrics pers
 | `query_metrics` | Query rows by time range, filtered by `MetricsFilter`: account, table name and metric |
 | `prune_metrics` | Delete rows older than the retention period |
 
-Two accounts' rows for a table of the same name must stay two rows: the account is part of each row's key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
+Two accounts' rows for a table of the same name must never be read back as one: a store that adds rows of one key together keeps the account in the key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
 
 ### RateLimitStore
 

@@ -19,6 +19,15 @@ mod tests {
         }
         let engine = setup_engine().await;
         let store = create_catalog_store(&engine, &test_config());
-        extenddb_storage::metrics_conformance::run(&store).await;
+        extenddb_storage::metrics_conformance::run(
+            &store,
+            // Cassandra writes a row of the same key over the previous one,
+            // and its TTL, not prune_metrics, expires the rows.
+            extenddb_storage::metrics_conformance::Expectations {
+                accumulates: false,
+                prunes: false,
+            },
+        )
+        .await;
     }
 }

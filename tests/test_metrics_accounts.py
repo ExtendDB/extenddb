@@ -6,16 +6,19 @@
 The metrics used to have no account dimension, so two accounts that each
 had a table of the same name wrote to one row, and the counts an admin read
 for that name were the two tables' added together. Each metric of a request
-now carries the account the request was made for, as an ``AccountId``
-dimension, and ``/metrics`` takes an ``account_id`` filter.
+and each TTL metric of a table now carries the account it was recorded for,
+as an ``AccountId`` dimension, and ``/metrics`` takes an ``account_id``
+filter, which also applies to the latency segments.
 
 The test creates two accounts, each with a user that may call every
-DynamoDB action, and a table of the same name in each. It writes one item
-to the first account's table and three to the second's, waits until the
-flush has persisted both accounts' ``ConsumedWriteCapacityUnits`` rows, then
-reads until two reads in a row are the same (see ``flushed``): the two
-accounts' rows are two rows with their own sums, and the account filter
-returns one account's rows only.
+DynamoDB action, and a table of the same name with TTL in each. Each
+account sends one PutItem (one write capacity unit for the first account,
+three for the second, so a sum of the two is visible), a GetItem, a Query,
+a DeleteItem whose condition fails, and a GetItem on a table that does not
+exist; the second account also sends a Scan. Each table holds one expired
+item for the TTL sweep. The fixture waits until the flush has persisted
+every row the tests read, with the PutItem sums at their final values,
+then reads until two reads in a row are the same (see ``flushed``).
 
 Prerequisites:
   - extenddb running on EXTENDDB_TEST_ENDPOINT
@@ -34,23 +37,26 @@ import boto3
 import pytest
 import requests
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 
 from conftest import wait_for_active, wait_for_deleted
 from management_helpers import ManagementClient
 
-# The flush worker persists a data point once it is older than the worker's
-# 60-second interval, at the next tick, so a point can take up to two
-# intervals to reach the metrics table.
-FLUSH_DEADLINE_SECONDS = 180
+# A TTL sweep runs once a minute, a new TTL attribute can take one more
+# sweep to be ready, and the flush persists a data point at most two
+# minutes after it was recorded.
+FLUSH_DEADLINE_SECONDS = 420
 POLL_SECONDS = 5
 # After the awaited rows, the fixture reads the metrics every SETTLE_SECONDS
-# until two reads in a row are the same: one flush writes its rows one by
-# one, and a read can land partway through it.
+# until two reads in a row are the same, for at most SETTLE_DEADLINE_SECONDS:
+# one flush writes its rows one by one, and a read can land partway through.
 SETTLE_SECONDS = 5
+SETTLE_DEADLINE_SECONDS = 180
 
-# Items each account writes to its table; a PutItem of a small item on an
-# on-demand table consumes one write capacity unit.
-WRITES = (1, 3)
+# The write capacity each account's one PutItem consumes: a small item is
+# one unit, an item of about 2.5 KB three.
+WRITE_UNITS = (1.0, 3.0)
+PADDING = (0, 2500)
 
 pytestmark = pytest.mark.slow
 
@@ -78,7 +84,7 @@ def _admin_metrics(env: tuple[str, str, str], **params: str) -> dict[str, Any]:
     endpoint, admin_user, admin_pass = env
     resp = requests.get(
         f"{endpoint}/metrics",
-        params=params,
+        params={"window": "LastHour", **params},
         auth=(admin_user, admin_pass),
         timeout=10,
         verify=False,
@@ -94,18 +100,32 @@ def _dimension(metric: dict[str, Any], key: str) -> str | None:
     return None
 
 
-def _write_capacity(data: dict[str, Any], table: str) -> dict[str | None, float]:
-    """The PutItem write capacity under ``table``, summed per AccountId."""
+def _per_account(
+    data: dict[str, Any],
+    metric: str,
+    operation: str | None,
+    table: str | None,
+    field: str = "sum",
+) -> dict[str | None, float]:
+    """``field`` of the rows of ``metric``, summed per AccountId.
+
+    Only rows whose Operation is ``operation`` and whose TableName is
+    ``table`` count; None asks for a row without that dimension.
+    """
     sums: dict[str | None, float] = {}
     for m in data["metrics"]:
         if (
-            m["metric"] == "ConsumedWriteCapacityUnits"
-            and _dimension(m, "Operation") == "PutItem"
+            m["metric"] == metric
+            and _dimension(m, "Operation") == operation
             and _dimension(m, "TableName") == table
         ):
             account = _dimension(m, "AccountId")
-            sums[account] = sums.get(account, 0.0) + m["sum"]
+            sums[account] = sums.get(account, 0.0) + m[field]
     return sums
+
+
+def _ours(sums: dict[str | None, float], ids: list[str]) -> dict[str | None, float]:
+    return {account: value for account, value in sums.items() if account in ids}
 
 
 def _canonical(data: dict[str, Any]) -> list[str]:
@@ -145,13 +165,54 @@ def _account(mgmt: ManagementClient, endpoint: str, label: str):
     return account_id, boto3.client(**kwargs), user
 
 
+def _send_requests(client, table: str, padding: int, scan: bool) -> None:
+    """The requests whose metrics the tests read, as one account."""
+    # The expired item goes in by BatchWriteItem, whose metrics carry no
+    # table name, so it adds nothing to the PutItem rows.
+    client.batch_write_item(
+        RequestItems={
+            table: [
+                {
+                    "PutRequest": {
+                        "Item": {
+                            "pk": {"S": "expired"},
+                            "expires": {"N": str(int(time.time()) - 600)},
+                        }
+                    }
+                }
+            ]
+        }
+    )
+    client.put_item(
+        TableName=table, Item={"pk": {"S": "1"}, "pad": {"S": "x" * padding or "x"}}
+    )
+    client.get_item(TableName=table, Key={"pk": {"S": "1"}})
+    client.query(
+        TableName=table,
+        KeyConditionExpression="pk = :pk",
+        ExpressionAttributeValues={":pk": {"S": "1"}},
+    )
+    if scan:
+        client.scan(TableName=table)
+    with pytest.raises(ClientError) as failed:
+        client.delete_item(
+            TableName=table,
+            Key={"pk": {"S": "absent"}},
+            ConditionExpression="attribute_exists(pk)",
+        )
+    assert failed.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    with pytest.raises(ClientError) as missing:
+        client.get_item(TableName=f"{table}-missing", Key={"pk": {"S": "1"}})
+    assert missing.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 @pytest.fixture(scope="module")
 def flushed():
-    """Both accounts' writes, persisted by the flush.
+    """Both accounts' requests, persisted by the flush.
 
     Yields the admin environment, the table name, the two account ids in
-    the order of WRITES, and the metrics an admin reads once both accounts'
-    rows are in them.
+    the order of WRITE_UNITS, and the metrics an admin reads once every row
+    the tests read is in them.
     """
     env = _require_env()
     mgmt = ManagementClient(*env)
@@ -162,36 +223,55 @@ def flushed():
             accounts.append(_account(mgmt, env[0], label))
         for _, client, _ in accounts:
             client.create_table(TableName=table, **KEY)
-        for (_, client, _), writes in zip(accounts, WRITES):
+        for _, client, _ in accounts:
             wait_for_active(client, table)
-            for i in range(writes):
-                client.put_item(TableName=table, Item={"pk": {"S": str(i)}})
+            client.update_time_to_live(
+                TableName=table,
+                TimeToLiveSpecification={"Enabled": True, "AttributeName": "expires"},
+            )
+        for i, ((_, client, _), padding) in enumerate(zip(accounts, PADDING)):
+            _send_requests(client, table, padding, scan=i == 1)
 
         ids = [account_id for account_id, _, _ in accounts]
+        every = set(ids)
 
-        def both_flushed(data: dict[str, Any]) -> bool:
-            return set(ids) <= set(_write_capacity(data, table))
+        def all_flushed(data: dict[str, Any]) -> bool:
+            writes = _ours(
+                _per_account(data, "ConsumedWriteCapacityUnits", "PutItem", table), ids
+            )
+            present = [
+                _per_account(data, "ConsumedReadCapacityUnits", "GetItem", table),
+                _per_account(data, "ReturnedItemCount", "Query", table),
+                _per_account(data, "ConditionalCheckFailedRequests", "DeleteItem", table),
+                _per_account(data, "UserErrors", "GetItem", None),
+                _per_account(data, "TimeToLiveDeletedItemCount", None, table),
+            ]
+            return writes == dict(zip(ids, WRITE_UNITS)) and all(
+                every <= set(p) for p in present
+            )
 
         deadline = time.monotonic() + FLUSH_DEADLINE_SECONDS
         while True:
-            data = _admin_metrics(env, window="LastHour")
-            if both_flushed(data) or time.monotonic() > deadline:
+            data = _admin_metrics(env)
+            if all_flushed(data) or time.monotonic() > deadline:
                 break
             time.sleep(POLL_SECONDS)
-        assert both_flushed(data), (
-            f"within {FLUSH_DEADLINE_SECONDS}s the metrics lacked a PutItem "
-            f"write capacity row under {table} for each account: "
-            f"{_write_capacity(data, table)}"
+        assert all_flushed(data), (
+            f"within {FLUSH_DEADLINE_SECONDS}s the metrics lacked a row the "
+            f"tests read for one of the two accounts under {table}; PutItem "
+            f"write capacity per account: "
+            f"{_per_account(data, 'ConsumedWriteCapacityUnits', 'PutItem', table)}"
         )
         # The server lists the rows in no fixed order, so compare them sorted.
+        settle = time.monotonic() + SETTLE_DEADLINE_SECONDS
         while True:
             time.sleep(SETTLE_SECONDS)
-            again = _admin_metrics(env, window="LastHour")
+            again = _admin_metrics(env)
             if _canonical(again) == _canonical(data):
                 break
-            assert time.monotonic() < deadline, (
-                f"the metrics were still changing {FLUSH_DEADLINE_SECONDS}s "
-                f"after the test's requests"
+            assert time.monotonic() < settle, (
+                f"the metrics were still changing {SETTLE_DEADLINE_SECONDS}s "
+                f"after the awaited rows arrived"
             )
             data = again
         yield env, table, ids, data
@@ -203,19 +283,60 @@ def flushed():
             except client.exceptions.ResourceNotFoundException:
                 pass
             finally:
-                mgmt.delete_user(account_id, user)
-                mgmt.delete_account(account_id)
+                resp = mgmt.delete_user(account_id, user)
+                assert resp.status_code in (200, 204), resp.text
+                resp = mgmt.delete_account(account_id)
+                assert resp.status_code in (200, 204), resp.text
 
 
 def test_two_accounts_with_the_same_table_name_get_separate_rows(flushed):
     _, table, ids, data = flushed
-    sums = _write_capacity(data, table)
-    assert sums == {ids[0]: float(WRITES[0]), ids[1]: float(WRITES[1])}, sums
+    writes = _per_account(data, "ConsumedWriteCapacityUnits", "PutItem", table)
+    assert _ours(writes, ids) == dict(zip(ids, WRITE_UNITS)), writes
+
+
+@pytest.mark.parametrize(
+    "metric, operation, on_table",
+    [
+        ("ConsumedReadCapacityUnits", "GetItem", True),
+        ("ReturnedItemCount", "Query", True),
+        ("ReturnedBytes", "Query", True),
+        ("ConditionalCheckFailedRequests", "DeleteItem", True),
+        ("UserErrors", "GetItem", False),
+        ("RequestCount", "PutItem", False),
+    ],
+)
+def test_each_request_metric_names_its_account(flushed, metric, operation, on_table):
+    _, table, ids, data = flushed
+    rows = _per_account(data, metric, operation, table if on_table else None, "count")
+    assert set(ids) <= set(rows), f"{metric} {operation}: {rows}"
+
+
+def test_latency_counts_each_accounts_requests_apart(flushed):
+    _, table, ids, data = flushed
+    counts = _per_account(data, "SuccessfulRequestLatency", "PutItem", table, "count")
+    assert _ours(counts, ids) == {ids[0]: 1, ids[1]: 1}, counts
+
+
+def test_ttl_deletions_name_their_account(flushed):
+    _, table, ids, data = flushed
+    deleted = _per_account(data, "TimeToLiveDeletedItemCount", None, table)
+    assert _ours(deleted, ids) == {ids[0]: 1.0, ids[1]: 1.0}, deleted
 
 
 def test_the_account_filter_returns_that_accounts_rows_only(flushed):
     env, table, ids, _ = flushed
-    data = _admin_metrics(env, window="LastHour", account_id=ids[1])
+    data = _admin_metrics(env, account_id=ids[1])
     accounts = {_dimension(m, "AccountId") for m in data["metrics"]}
     assert accounts == {ids[1]}, accounts
-    assert _write_capacity(data, table) == {ids[1]: float(WRITES[1])}
+    writes = _per_account(data, "ConsumedWriteCapacityUnits", "PutItem", table)
+    assert writes == {ids[1]: WRITE_UNITS[1]}, writes
+
+
+def test_the_account_filter_applies_to_the_latency_segments(flushed):
+    env, _, ids, _ = flushed
+    # Only the second account sent a Scan.
+    first = {s["operation"] for s in _admin_metrics(env, account_id=ids[0])["segments"]}
+    second = {s["operation"] for s in _admin_metrics(env, account_id=ids[1])["segments"]}
+    assert "PutItem" in first and "Scan" not in first, first
+    assert {"PutItem", "Scan"} <= second, second

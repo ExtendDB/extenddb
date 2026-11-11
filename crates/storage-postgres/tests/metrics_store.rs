@@ -22,7 +22,14 @@ async fn the_metrics_store_keeps_two_accounts_apart() {
     s.migrate_through(MigrationId::LATEST).await;
     let catalog = s.catalog().await;
     let store = PostgresCatalogStore::new(catalog.clone());
-    extenddb_storage::metrics_conformance::run(&store).await;
+    extenddb_storage::metrics_conformance::run(
+        &store,
+        extenddb_storage::metrics_conformance::Expectations {
+            accumulates: true,
+            prunes: true,
+        },
+    )
+    .await;
     catalog.close().await;
 }
 

@@ -305,7 +305,8 @@ GET /metrics → 200 OK (application/json)
 ```
 
 This is **not** Prometheus exposition format. The response is a custom JSON
-schema that uses DynamoDB CloudWatch-style metric names and dimensions.
+schema that uses DynamoDB CloudWatch-style metric names and dimensions, and
+ExtendDB's own `AccountId` dimension.
 
 **Query parameters** (`MetricsQuery` in `crates/core/src/metrics/types.rs`):
 
@@ -360,17 +361,19 @@ DynamoDB CloudWatch-aligned:
 - `TimeToLiveDeletedItemCount`, `TtlDeletionStaleness`
 
 ExtendDB-internal:
-- `RequestCount` (HTTP request count, dimension: `Operation`)
+- `RequestCount` (HTTP request count, dimensions: `AccountId`, `Operation`)
 - `StorageQueryCount`, `StorageQueryLatency` (dimensions: source, category)
 - `PoolActiveConnections`, `PoolIdleConnections`, `PoolAcquireLatency`
 - `WorkerLastSuccess`, `WorkerCycleLatency`, `WorkerErrorCount`
 
 **Dimensions** (from the `Dimension` enum):
 
-- `AccountId(String)`: the account of the request or table the metric
-  belongs to; absent on a metric of the whole deployment (pool, worker,
-  storage query and backup job metrics). Each stored row is keyed by it, so
-  two accounts' tables of the same name have their own rows.
+- `AccountId(String)`, ExtendDB's own: the account of the request or table
+  the metric belongs to; absent on a metric of the whole deployment (pool,
+  worker, storage query and backup job metrics). Each stored row records it
+  (on SQLite, PostgreSQL and Cassandra as part of the key), so two accounts'
+  tables of the same name have their own rows. The `account_id` filter also
+  applies to `segments`.
 - `TableName(String)`
 - `GlobalSecondaryIndexName(String)`
 - `Operation(String)`

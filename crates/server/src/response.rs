@@ -151,10 +151,17 @@ mod tests {
         let user_errors = dimensions_of(&collector, MetricName::UserErrors);
         assert_eq!(user_errors.len(), 1, "{user_errors:?}");
         assert!(!has_table(&user_errors[0]), "{user_errors:?}");
-        // The error still names the account the request was made for.
+        // The error still names the account the request was made for, and
+        // so does the conflict.
         assert!(
             user_errors[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
             "{user_errors:?}"
+        );
+        let conflicts = dimensions_of(&collector, MetricName::TransactionConflict);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(
+            conflicts[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{conflicts:?}"
         );
     }
 
@@ -203,6 +210,10 @@ mod tests {
                 dims[0]
                     .iter()
                     .any(|d| matches!(d, Dimension::TableName(t) if t == "Orders")),
+                "{metric:?}: {dims:?}"
+            );
+            assert!(
+                dims[0].contains(&Dimension::AccountId(ACCOUNT.to_owned())),
                 "{metric:?}: {dims:?}"
             );
         }

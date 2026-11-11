@@ -179,7 +179,7 @@ async fn admin_gets_every_accounts_rows_from_the_data_feed() {
         );
         assert!(
             accounts.contains(&account),
-            "admin feed lacks the account of {table}: {accounts:?}"
+            "admin feed lacks the account of {table}"
         );
     }
     let indexes: Vec<&str> = body["metrics"]
@@ -218,6 +218,9 @@ async fn admin_gets_the_metrics_page() {
     assert!(body.contains("<h1>Metrics</h1>"), "{body}");
     assert!(body.contains("/console/metrics-data"), "{body}");
     assert!(!body.contains("accountFilter"), "{body}");
+    // The raw metrics table names each row's account.
+    assert!(body.contains("<th>Metric</th><th>Account</th><th>Table</th>"));
+    assert!(body.contains("d.AccountId"));
 }
 
 #[test]

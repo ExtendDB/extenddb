@@ -186,7 +186,7 @@ fn record_and_query_segments() {
         },
     );
 
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 1);
     let s = &segs[0];
     assert_eq!(s.operation, "GetItem");
@@ -218,7 +218,7 @@ fn prune_removes_old_segments() {
 
     // All data is recent, prune should keep it.
     c.prune();
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].count, 1);
 }
@@ -255,7 +255,7 @@ fn segments_multiple_operations() {
         },
     );
 
-    let segs = c.query_segments(TimeWindow::AllTime);
+    let segs = c.query_segments(TimeWindow::AllTime, None);
     assert_eq!(segs.len(), 2);
     // Both operations should have count=1.
     for s in &segs {
@@ -376,4 +376,149 @@ fn restore_job_recorders_land_under_the_outcome_and_render_their_names() {
         "RestoreBytesDownloaded"
     );
     assert_eq!(QuerySource::RestoreJob.to_string(), "RestoreJob");
+}
+
+/// Every recorder of a request's or a table's metric keys its point by the
+/// account it is given, so the account filter finds it and reports it as the
+/// `AccountId` dimension.
+#[test]
+fn every_scoped_recorder_keeps_its_account() {
+    type Recorder = fn(&MetricsCollector, &str);
+    let recorders: [(&str, MetricName, Recorder); 14] = [
+        ("latency", MetricName::SuccessfulRequestLatency, |c, a| {
+            c.record_latency(a, Some("T"), "GetItem", 1.0);
+        }),
+        (
+            "read capacity",
+            MetricName::ConsumedReadCapacityUnits,
+            |c, a| {
+                c.record_read_capacity(a, "T", "GetItem", 1.0);
+            },
+        ),
+        (
+            "write capacity",
+            MetricName::ConsumedWriteCapacityUnits,
+            |c, a| {
+                c.record_write_capacity(a, "T", "PutItem", 1.0);
+            },
+        ),
+        ("user error", MetricName::UserErrors, |c, a| {
+            c.record_user_error(a, None, "PutItem");
+        }),
+        ("system error", MetricName::SystemErrors, |c, a| {
+            c.record_system_error(a, Some("T"), "PutItem");
+        }),
+        (
+            "condition",
+            MetricName::ConditionalCheckFailedRequests,
+            |c, a| {
+                c.record_conditional_check_failure(a, Some("T"), "PutItem");
+            },
+        ),
+        ("conflict", MetricName::TransactionConflict, |c, a| {
+            c.record_transaction_conflict(a, "TransactWriteItems");
+        }),
+        ("returned items", MetricName::ReturnedItemCount, |c, a| {
+            c.record_returned_items(a, "T", "Query", 2);
+        }),
+        ("returned bytes", MetricName::ReturnedBytes, |c, a| {
+            c.record_returned_bytes(a, "T", "Query", 20);
+        }),
+        (
+            "ttl deletion",
+            MetricName::TimeToLiveDeletedItemCount,
+            |c, a| {
+                c.record_ttl_deletion(a, "T");
+            },
+        ),
+        (
+            "ttl audit",
+            MetricName::TtlAuditRepairedEntryCount,
+            |c, a| {
+                c.record_ttl_audit_repair(a, "T");
+            },
+        ),
+        (
+            "ttl row error",
+            MetricName::TtlSweepRowErrorCount,
+            |c, a| {
+                c.record_ttl_sweep_row_error(a, "T");
+            },
+        ),
+        ("ttl staleness", MetricName::TtlDeletionStaleness, |c, a| {
+            c.record_ttl_staleness(a, "T", 3.0);
+        }),
+        ("request count", MetricName::RequestCount, |c, a| {
+            c.record_request_count(a, "GetItem");
+        }),
+    ];
+    for (label, metric, record) in recorders {
+        let c = MetricsCollector::new();
+        record(&c, ACCOUNT);
+        record(&c, "222222222222");
+        let mine = c.query(&MetricsQuery {
+            account_id: Some(ACCOUNT.to_owned()),
+            metric: Some(metric),
+            window: Some(TimeWindow::AllTime),
+            ..Default::default()
+        });
+        assert_eq!(mine.len(), 1, "{label}: {mine:?}");
+        assert!(
+            mine[0]
+                .dimensions
+                .contains(&Dimension::AccountId(ACCOUNT.to_owned())),
+            "{label}: {:?}",
+            mine[0].dimensions
+        );
+        assert_eq!(mine[0].count, 1, "{label}");
+    }
+}
+
+/// The latency segments of one account leave out the other account's
+/// requests; without an account, or with an empty one, they hold both.
+#[test]
+fn segments_are_filtered_by_account() {
+    use crate::metrics::types::LatencySegments;
+
+    let c = MetricsCollector::new();
+    let point = LatencySegments {
+        dispatch_us: 10.0,
+        total_us: 10.0,
+        ..LatencySegments::default()
+    };
+    c.record_segments(ACCOUNT, "GetItem", Some("T"), point.clone());
+    c.record_segments("222222222222", "Scan", Some("T"), point.clone());
+    c.record_segments("222222222222", "GetItem", Some("T"), point);
+
+    let ops = |account: Option<&str>| {
+        let mut ops: Vec<(String, u64)> = c
+            .query_segments(TimeWindow::AllTime, account)
+            .into_iter()
+            .map(|s| (s.operation, s.count))
+            .collect();
+        ops.sort();
+        ops
+    };
+    assert_eq!(ops(Some(ACCOUNT)), [("GetItem".to_owned(), 1)]);
+    assert_eq!(
+        ops(Some("222222222222")),
+        [("GetItem".to_owned(), 1), ("Scan".to_owned(), 1)]
+    );
+    let all = [("GetItem".to_owned(), 2), ("Scan".to_owned(), 1)];
+    assert_eq!(ops(None), all);
+    assert_eq!(ops(Some("")), all);
+}
+
+/// An empty account filter is no filter, as in the stores.
+#[test]
+fn an_empty_account_filter_is_no_filter() {
+    let c = MetricsCollector::new();
+    c.record_user_error(ACCOUNT, None, "PutItem");
+    c.record_pool_acquire_latency(1.0);
+    let all = c.query(&MetricsQuery {
+        account_id: Some(String::new()),
+        window: Some(TimeWindow::AllTime),
+        ..Default::default()
+    });
+    assert_eq!(all.len(), 2, "{all:?}");
 }
