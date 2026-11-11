@@ -23,7 +23,13 @@ and Select checks was measured 2026-11-11T09:43Z in us-east-1 on a table with
 the same key schema and a KEYS_ONLY global secondary index on g (S), two
 sends each: a FilterExpression fault is reported ahead of the duplicate, and
 the duplicate ahead of a missing table, an unknown index, ConsistentRead on
-the index, an invalid Select and Select ALL_ATTRIBUTES on the index.
+the index, an invalid Select and Select ALL_ATTRIBUTES on the index. In the
+same run the first undefined reference in the order the expression is written
+was reported, a #name or a :value, with or without a duplicate; `<>` and
+`contains` beside a duplicate answered the duplicate; and a number in
+begins_with answered its operand type error ahead of it. On 2026-11-10 an
+undefined reference was reported ahead of an unused name or value, on a table
+keyed on pk (S) alone.
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -431,3 +437,78 @@ class TestDuplicateAheadOfRequestChecks:
         code, msg = _error(lambda: dynamodb_client.query(**request))
         assert code == "ValidationException"
         assert msg == ONE_PER_KEY
+
+
+def _undefined(reference: str) -> str:
+    """The service's message for an undefined `#name` or `:value`."""
+    if reference.startswith("#"):
+        return (
+            "Invalid KeyConditionExpression: An expression attribute name used in "
+            f"the document path is not defined; attribute name: {reference}"
+        )
+    return (
+        "Invalid KeyConditionExpression: An expression attribute value used in "
+        f"expression is not defined; attribute value: {reference}"
+    )
+
+
+class TestReferenceAndOperatorOrder:
+    """Which undefined reference is reported, and the operators beside a
+    duplicate (2026-11-10 and 2026-11-11)."""
+
+    @pytest.mark.parametrize(
+        ("expr", "names", "values", "undefined"),
+        [
+            ("pk = :q AND #u = :c", None, None, ":q"),
+            ("sk = :b AND pk = :a", None, None, ":b"),
+            ("pk = :a AND sk = :missing", None, {":a": A, ":extra": B}, ":missing"),
+            ("pk = :a AND pk = :b AND #u = :c", None, None, ":a"),
+            ("pk = :q AND pk = :b AND #u = :c", None, {":b": B, ":c": C}, ":q"),
+            ("#u = :a AND #u = :b", None, None, "#u"),
+            ("pk = :b AND pk = :a", None, None, ":b"),
+            # Measured 2026-11-10 on a table keyed on pk (S) alone; each
+            # request also carries an unused name or value.
+            ("pk = :v", None, {":w": A}, ":v"),
+            ("#k = :v", None, {":v": A, ":w": B}, "#k"),
+            ("#k = :v", {"#j": "pk"}, {":v": A}, "#k"),
+            ("pk = :v", {"#j": "pk"}, {":w": A}, ":v"),
+            ("#k = :v", None, {":w": A}, "#k"),
+        ],
+    )
+    def test_first_undefined_reference_in_text_order_is_reported(
+        self, dynamodb_client, range_table, expr, names, values, undefined
+    ):
+        kwargs = {"TableName": range_table, "KeyConditionExpression": expr}
+        if names is not None:
+            kwargs["ExpressionAttributeNames"] = names
+        if values is not None:
+            kwargs["ExpressionAttributeValues"] = values
+        code, msg = _error(lambda: dynamodb_client.query(**kwargs))
+        assert code == "ValidationException"
+        assert msg == _undefined(undefined)
+
+    @pytest.mark.parametrize(
+        ("expr", "values", "want"),
+        [
+            ("pk = :a AND pk <> :b", {":a": A, ":b": B}, ONE_PER_KEY),
+            ("pk = :a AND contains(pk, :b)", {":a": A, ":b": B}, ONE_PER_KEY),
+            (
+                "pk = :a AND begins_with(sk, :n) AND sk = :b",
+                {":a": A, ":b": B, ":n": N1},
+                "Invalid KeyConditionExpression: Incorrect operand type for operator "
+                "or function; operator or function: begins_with, operand type: N",
+            ),
+        ],
+    )
+    def test_operators_beside_a_duplicate(
+        self, dynamodb_client, range_table, expr, values, want
+    ):
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression=expr,
+                ExpressionAttributeValues=values,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == want
