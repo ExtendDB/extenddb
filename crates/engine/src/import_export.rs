@@ -229,8 +229,9 @@ pub async fn handle_import_table(
     let end_time = epoch_seconds();
 
     // An import that refused any row is FAILED with `ItemValidationError`,
-    // and the rows it accepted stay in the table (measured 2026-11-03). The
-    // service's message sends the reader to its error log in CloudWatch;
+    // and the rows it accepted stay in the table (measured 2026-11-03 with
+    // number rows, and 2026-11-11 with a row whose key has the wrong type).
+    // The service's message sends the reader to its error log in CloudWatch;
     // ExtendDB writes each refused row to the server log instead.
     let (import_status, failure_code, failure_message) = if error_count > 0 {
         (

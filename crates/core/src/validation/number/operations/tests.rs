@@ -696,6 +696,7 @@ fn import_row_stops_at_a_value_that_is_not_a_number() {
         json!({"pk": {"S": "a"}, "n": {"N": ""}}),
         json!({"pk": {"S": "a"}, "n": {"N": " 5"}}),
         json!({"pk": {"S": "a"}, "n": {"N": "12e"}}),
+        // These three were measured again on 2026-11-11, one file each.
         json!({"pk": {"S": "a"}, "n": {"N": "1E2147483648"}}),
         json!({"pk": {"S": "a"}, "n": {"N": "1E9223372036854775808"}}),
         json!({"pk": {"S": "a"}, "n": {"N": "1E-2147483648"}}),
@@ -739,8 +740,13 @@ fn import_row_refuses_a_number_out_of_range() {
             NumberFault::Underflow,
         ),
         // The magnitude passes the 32-bit maximum and wraps to a negative.
+        // Measured again on 2026-11-11, with `10E2147483647` as well.
         (
             json!({"pk": {"S": "a"}, "n": {"N": "1E2147483647"}}),
+            NumberFault::Underflow,
+        ),
+        (
+            json!({"pk": {"S": "a"}, "n": {"N": "10E2147483647"}}),
             NumberFault::Underflow,
         ),
         (

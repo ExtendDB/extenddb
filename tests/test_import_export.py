@@ -506,12 +506,15 @@ class TestCrossTenantIsolation:
 # ImportTable rows holding numbers the service cannot store
 #
 # Measured against DynamoDB ImportTable from S3 on 2026-11-03 (us-east-1), one
-# import per file. Unless a test says otherwise, each file held a row with a
-# valid number, the row under test, and another valid row. A row holding a
-# value that is not a number ends the import of the file there; a row holding
-# a number out of range is skipped and the rows after it are imported. Either
-# way the row counts as one error, and an import with any error is FAILED with
-# ItemValidationError, keeping the rows it imported.
+# import per file, and again on 2026-11-11 for the rows marked so. Unless a
+# test says otherwise, each file held a row with a valid number, the row under
+# test, and another valid row. A row holding a value that is not a number
+# ends the import of the file there; a row holding a number out of range is
+# skipped and the rows after it are imported. Either way the row counts as one
+# error, and an import with any error is FAILED with ItemValidationError,
+# keeping the rows it imported. ImportTable reads a number's exponent and
+# scale as 32-bit integers: on 2026-11-11 it still did, when BatchWriteItem
+# already read a 64-bit exponent.
 # ---------------------------------------------------------------------------
 
 OUT_OF_RANGE = [
@@ -519,7 +522,9 @@ OUT_OF_RANGE = [
     pytest.param({"n": {"N": "1E-131"}}, id="underflow"),
     pytest.param({"n": {"N": "1" * 39}}, id="39-digits"),
     pytest.param({"n": {"N": "1E999999999"}}, id="large-exponent"),
+    # Number underflow: the 32-bit magnitude wraps. Both measured 2026-11-11.
     pytest.param({"n": {"N": "1E2147483647"}}, id="magnitude-wraps"),
+    pytest.param({"n": {"N": "10E2147483647"}}, id="magnitude-wraps-two-digits"),
     pytest.param({"s": {"NS": ["1", "1E126"]}}, id="number-set"),
     pytest.param({"m": {"M": {"x": {"N": "1E126"}}}}, id="in-a-map"),
     pytest.param({"l": {"L": [{"N": "1E-131"}]}}, id="in-a-list"),
@@ -530,8 +535,11 @@ NOT_A_NUMBER = [
     pytest.param({"n": {"N": ""}}, id="empty"),
     pytest.param({"n": {"N": " 5"}}, id="leading-space"),
     pytest.param({"n": {"N": "12e"}}, id="no-exponent-digits"),
+    # Not numbers to a 32-bit reader. Measured again on 2026-11-11, with the
+    # exponent past the 64-bit range as well.
     pytest.param({"n": {"N": "1E2147483648"}}, id="exponent-over-32-bits"),
     pytest.param({"n": {"N": "1E-2147483648"}}, id="scale-over-32-bits"),
+    pytest.param({"n": {"N": "1E9223372036854775808"}}, id="exponent-over-64-bits"),
     pytest.param({"s": {"NS": ["1", "abc"]}}, id="number-set"),
     pytest.param({"a": {"N": "1E126"}, "b": {"N": "abc"}}, id="after-a-number-out-of-range"),
     # The service imports this row with `5`. ExtendDB does not read a Unicode
@@ -657,13 +665,13 @@ class TestImportTableNumbers:
     ):
         """A file whose only refused row has a number key on a string-key table.
 
-        Every number in the file is valid. The handler marks any import that
-        refused a row FAILED with ItemValidationError, whichever check refused
-        the row. Each such row counts as one error and is skipped, and the
-        rows after it are imported. The service's status for this file was
-        not measured: the measured files above refuse rows for their numbers,
-        and a measured row with a mistyped key and the number 1E126 was logged
-        as the type mismatch.
+        Measured on 2026-11-11 (us-east-1) with the rows a-k, pk 2 (N) and
+        c-k, every number valid: the import is FAILED with
+        ItemValidationError, ProcessedItemCount 3, ImportedItemCount 2 and
+        ErrorCount 1, and a-k and c-k are in the table. The service logged
+        the row as "One or more parameter values were invalid: Type mismatch
+        for key pk expected: S actual: N". The handler gives this status for
+        any refused row, whichever check refused it.
         """
         cleanup_table(unique_table_name)
         desc = self._import(unique_table_name, [

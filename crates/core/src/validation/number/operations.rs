@@ -297,12 +297,18 @@ pub enum ImportRowFault {
 /// Refuse an `ImportTable` row holding a number the service cannot read.
 ///
 /// Measured 2026-11-03 (us-east-1), one import from S3 per value, each file a
-/// row with a valid number, the row under test, and another valid row:
+/// row with a valid number, the row under test, and another valid row, and
+/// measured again on 2026-11-11 for the exponents at the 32-bit and 64-bit
+/// limits:
 ///
-/// - The service read a row's numbers as `BatchWriteItem` then did, with a
-///   32-bit exponent and scale; see [`validate_number_i32_scale`]. `abc`,
-///   ` 5`, an empty value, `12e`, `1E2147483648` and `1E-2147483648` are not
-///   numbers, and `1E2147483647` is a `Number underflow`.
+/// - The service reads a row's numbers with a 32-bit exponent and scale; see
+///   [`validate_number_i32_scale`]. `BatchWriteItem` read them that way too
+///   until November, and on 2026-11-11 read them as `PutItem` does while
+///   `ImportTable` still read 32 bits. `abc`, ` 5`, an empty value, `12e`,
+///   `1E2147483648`, `1E-2147483648` and `1E9223372036854775808` are not
+///   numbers, and `1E2147483647` and `10E2147483647` are a `Number
+///   underflow` (the last three of the not-a-number values and both
+///   underflows measured on 2026-11-11, one file each).
 /// - A row holding a value that is not a number stops the import of the
 ///   file: the row and the rows after it are not imported, and the row is
 ///   the last one counted as processed. This holds whatever else the row
@@ -424,7 +430,9 @@ fn number_text(empty: EmptyText, n: &str) -> Result<(), String> {
 /// on `BatchWriteItem` on 2026-10-27 (us-east-1, every value twice), which
 /// read numbers this way then, and the `ImportTable` rows measured on
 /// 2026-11-03 follow them (see [`import_row`]). On 2026-11-11 `BatchWriteItem`
-/// read numbers as `PutItem` does; `ImportTable` was not measured again.
+/// read numbers as `PutItem` does, and `ImportTable` still read them this way:
+/// `1E2147483648`, `1E-2147483648` and `1E9223372036854775808` were not
+/// numbers, and `1E2147483647` and `10E2147483647` a `Number underflow`.
 ///
 /// 1. `s` is an optional sign, digits with at most one point and at least one
 ///    digit, and an optional exponent: `e` or `E`, an optional sign and
