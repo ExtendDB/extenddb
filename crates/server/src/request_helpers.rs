@@ -537,6 +537,7 @@ pub(crate) async fn authorize_request(
 mod tests {
     use super::*;
     use extenddb_core::types::TableKeyInfo;
+    use serde_json::json;
 
     fn sample_key_info() -> TableKeyInfo {
         TableKeyInfo {
