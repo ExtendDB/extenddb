@@ -65,17 +65,17 @@ See `docs/local-postgres-setup.md` for full setup instructions.
 
 **Fix:** Check the PostgreSQL logs (`~/pgdata/server.log`). Ensure the `extenddb` user has CREATE TABLE permissions on the `extenddb` database.
 
-### `Catalog version mismatch: expected X, found Y. Run 'extenddb migrate' to update.`
+### `serve`, `migrate` or `verify` exits 3, 4, 5 or 6 naming the catalog
 
-**Cause:** The catalog database was initialized with a different version of extenddb. The binary expects catalog version X but the database has version Y.
+**Cause:** The catalog's status, read from its migration ledgers, is not one this binary serves: exit 3 means migrations are pending, 4 that the catalog has a breaking migration this binary does not know, 5 that a person must act, and 6 that the migration lock or a running server outlasted `--lock-timeout`. The [status table](manuals/07-upgrade-manual.md#the-catalog-status) of the upgrade manual lists each status with its exit codes.
 
-**Fix:** Run `extenddb migrate` to apply schema migrations and update the catalog version. Back up the database first.
+**Fix:** Run the command the message prints. For pending migrations that is `extenddb migrate --config extenddb.toml --yes`, after the backup the message names.
 
-### `Catalog not initialized. Run 'extenddb init' to set up the catalog.`
+### `the catalog at <location> is not initialized; create it with 'extenddb init'`
 
-**Cause:** The server connected to the database but the catalog tables don't exist. The database hasn't been initialized with `extenddb init`.
+**Cause:** The database holds no catalog: no migration ledger and no `catalog_version` row. `serve`, `migrate` and `verify` exit 1 and change nothing.
 
-**Fix:** Run `extenddb init` to create the catalog schema and data database. See `docs/getting-started.md`.
+**Fix:** Check that the config names the right database. For a new deployment, run `extenddb init` to create the catalog and data databases. See `docs/getting-started.md`.
 
 ### `Database '<name>' already exists. Run 'extenddb destroy --config <config>' first, then re-run 'extenddb init'.`
 
@@ -95,7 +95,7 @@ extenddb serve --port 19443 --config extenddb.toml  # use a different port
 
 ### `another extenddb process is already using <database> (lock held on <database>.lock)`
 
-**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`) take no lock and run alongside a server.
+**Cause:** A SQLite database file has one owner at a time. `extenddb serve` takes an exclusive lock on `<database>.lock` (next to the file SQLite opens, after resolving any `sqlite:` or `file:` form, relative path, or symlink) before it opens the database and holds it until it exits. `init` (through to the admin user being written), `migrate --yes`, and `destroy` take the same lock for as long as they run, because they rewrite or remove the file; `migrate --yes` waits for it for up to `--lock-timeout` seconds (60 by default) and then exits 6. The backend serializes writers inside one process and recovers interrupted work at startup, so a second server, or a migration or destroy under a running server, would corrupt the first one's work. Read-only commands (`settings`, `manage`, `verify`, `status`, and `migrate` without `--yes`) take no lock and run alongside a server.
 
 **Fix:** Stop the other process (`extenddb stop --config <config>` for a server), or point this command at a different database (`--sqlite-path` at `init` time). The lock is released by the operating system when the holder exits, including after a crash, so a leftover `<database>.lock` file is harmless and needs no cleanup.
 
@@ -123,6 +123,26 @@ The error intentionally does not name the specific file to avoid leaking filesys
    chmod 644 ~/.extenddb/tls/cert.pem
    ```
 4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
+
+### TLS private key readable by other users
+
+`WARNING: TLS private key (server.tls.key_path) had permissions <mode>, which let other users read it. …`
+
+**Cause:** `extenddb serve`, or `extenddb init` when it keeps an existing certificate, found the TLS private key readable by group or other users. An older `init` that stopped before it set the key's mode left it that way, as does a key copied in with the default umask. The warning names the setting rather than the file, as the TLS load error above does, and goes to stderr: the terminal that ran the command, or the log stream under `--foreground`.
+
+What the server did depends on the rest of the message:
+
+- **`It is now 0600: group and other access were removed`**: the server could change the key's mode, because it owns the key or runs as root, and narrowed it. If another service read the key through its group, it can no longer read it. If `server.tls.key_path` is a symlink, the file it points to was changed.
+- **`Another user (uid <n>) owns it`**: the key is readable by every user, and the server cannot change it. What its owner should run depends on the key's group, which the message names:
+  - **`this server reads it through its group`**: remove other access with `chmod o-rwx <file>`. The group's access stays, and the server reads the key through it.
+  - **`this server is not in its group`**: the server reads the key through the access every user has, so `chmod o-rwx` alone would leave it unable to load the key. Give the key to the server's group first, then remove other access: `chgrp <server gid> <file>`, then `chmod 640 <file>`.
+
+  A key another user owns that only its owner and group can read is a supported layout and gets no warning.
+- **`it is on a read-only filesystem`**: set the mode where the file is provided. For a Kubernetes Secret volume, use `defaultMode: 0440` with the pod's `fsGroup` set to the server's group (gid 10001 in the official image). Secret volume files are owned by root, so `defaultMode: 0400` without a matching group would leave the key unreadable to a server that does not run as root.
+- **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
+- **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
+
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
 
 ### `Config file <path> has permissions <mode>, which is too open.`
 
@@ -240,9 +260,9 @@ journalctl -t extenddb -f
 
 **Fix:** If permission denied, run `extenddb stop` as the same user that started extenddb. If the process already exited, the stale PID file will be cleaned up on the next `extenddb stop` invocation.
 
-### `extenddb (pid <pid>) did not exit within 10s after SIGTERM`
+### `extenddb (pid <pid>) did not exit within 76s after SIGTERM`
 
-**Cause:** The server received SIGTERM but did not shut down within the 10-second timeout. It may be stuck draining long-running requests or waiting on a database operation.
+**Cause:** The server received SIGTERM but did not shut down within the 76-second timeout, the sum of its shutdown bounds (5 s to drain connections, 30 s for running backup jobs to end, 36 s to stop its background workers and give up its serving registration, 5 s for its runtime). It may be stuck draining long-running requests or waiting on a database operation.
 
 **Fix:** Send SIGKILL to force termination: `kill -9 <pid>`. Check PostgreSQL for long-running queries that may be blocking shutdown.
 
@@ -357,14 +377,72 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Cause:** The background transition poller processes status changes when notified by CreateTable/DeleteTable, or on a 60-second defensive sweep. If the server was stopped while a table was in a transitional state, the transition completes on the next server startup.
 
+A second cause, on PostgreSQL only, is a session holding any lock on one of the table's relations (the base data table, a GSI or LSI data table, or a vector-index data table): a reader (a table snapshot, an in-catalog backup, a Scan or Query, `pg_dump`, any client transaction that read the table), an open write transaction, an index build, or `VACUUM`. DeleteTable then returns `DELETING` instead of dropping the tables in the request: at once for a reader, and after about a second for any other holder, which is how long its drops wait before they give up. The poller then checks the table for holders about once a second without waiting on them, and drops it at the first check that finds none, so the table disappears within about a second of the last holder's release however many tables are waiting this way, also when the server was restarted in between. A table snapshot or an in-catalog backup that ends also wakes the poller, which then checks at once. Until then a CreateTable of the same name is refused with `ResourceInUseException`, and a DeleteTable of the table returns its description with `TableStatus: DELETING`. A table that stays `DELETING` for longer has a long-running holder. To find it, list the table's relations on the catalog database:
+
+```sql
+SELECT '_ddb_' || t.table_id FROM tables t
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>'
+UNION ALL
+SELECT '_ddb_' || i.index_id FROM indexes i JOIN tables t ON t.table_id = i.table_id
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>'
+UNION ALL
+SELECT '_ddb_vec_' || v.index_id FROM vector_indexes v JOIN tables t ON t.table_id = v.table_id
+ WHERE t.account_id = '<account_id>' AND t.table_name = '<table_name>';
+```
+
+and the sessions holding a lock on any of them, on the data database (the same database when no separate data database is configured), with the names from the first query:
+
+```sql
+SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
+  FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+ WHERE l.locktype = 'relation' AND l.granted
+   AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND l.relation IN (SELECT to_regclass(quote_ident(n))
+                        FROM unnest(ARRAY['_ddb_<table_id>', '_ddb_<index_id>']) AS n);
+```
+
 **Fix:** If a table appears stuck:
 1. Check that extenddb is running (`extenddb status`).
-2. Wait for the configured `control_plane_delay_seconds` (default: 5) — the poller is woken immediately when a table enters a transitional state.
-3. If the server was restarted, transitions are recovered automatically at startup.
+2. Wait for the configured `control_plane_delay_seconds` (default: 0.25) — the poller is woken immediately when a table enters a transitional state.
+3. On PostgreSQL, look for a session holding a lock on the table (above); the delete finishes within about a second of its end.
+4. If the server was restarted, transitions are recovered automatically at startup.
+
+### Data tables without a catalog row (PostgreSQL, separate data database)
+
+**Cause:** A table's data relations (`_ddb_%`) are on the data database with no `tables` row naming them. Current releases do not create this state from an interrupted DeleteTable: with a separate data database a synchronous DeleteTable marks the catalog row `DELETING`, commits it, drops the table's data tables on the data database, and removes the row only after that drop has committed. If the data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. A process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the row `DELETING` with its transition due; the control-plane poller (the next startup pass, or a later one) drops the data tables and removes the row once the data database is reachable again, so the relations are not left without a row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run, for an operator who would rather finish the drop by hand than wait for the poller. (On one shared database the row and the drops commit together, so none of this applies.) Relations a release from before this behaviour shipped left without a row are not swept automatically; find and drop them as below.
+
+To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
+
+```sql
+SELECT table_id FROM tables
+UNION ALL SELECT index_id FROM indexes
+UNION ALL SELECT index_id FROM vector_indexes;
+```
+
+On the data database, every data relation and whether the catalog still names it (replace the `VALUES` list with the ids from the first query):
+
+```sql
+SELECT d.tablename
+  FROM pg_tables d
+  LEFT JOIN (VALUES ('<table_id>'), ('<index_id>'), ('<vector_index_id>')) AS live(id)
+    ON d.tablename = '_ddb_' || live.id
+    OR d.tablename = '_ddb_vec_' || live.id
+ WHERE d.tablename LIKE '\_ddb\_%' AND live.id IS NULL;
+```
+
+Each row is a data relation with no catalog row. After confirming the table is gone from the catalog (`DescribeTable` returns `ResourceNotFoundException`), drop the listed relations on the data database:
+
+```sql
+DROP TABLE IF EXISTS "_ddb_<table_id>", "_ddb_<index_id>", "_ddb_vec_<vector_index_id>";
+```
+
+The error log line names the exact relations for one leaked table and gives this `DROP TABLE` verbatim.
+
+**Do not** use `extenddb catalog-check --fix` to clean these up: it expects a different relation-naming scheme and, against the current schema, reports every live data table as orphaned and would drop tables still in use.
 
 ### CreateTable returns CREATING instead of ACTIVE
 
-**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (default: 5 seconds).
+**Cause:** extenddb emulates real DynamoDB's async control plane behavior. Tables start in CREATING state and transition to ACTIVE after a configurable delay (`control_plane_delay_seconds`, default: 0.25 seconds).
 
 **Fix:** This is expected behavior matching real DynamoDB. Poll with DescribeTable until `TableStatus` is `ACTIVE` before performing operations on the table. All test code should use a `wait_for_active()` helper after CreateTable.
 
@@ -555,6 +633,16 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 **Cause:** The `UPDATE iam_users` query to change the password failed. Likely a database connectivity issue.
 
 **Fix:** Check PostgreSQL connectivity and logs.
+
+### `Credential import is disabled (allow_credential_import = false)`
+
+**Cause:** The server refused an access key import (`extenddb manage import-access-key`, or `POST /management/accounts/{id}/users/{name}/access-keys/import`) with HTTP 403 because the `allow_credential_import` runtime setting is not `true`. The message is the same when the catalog has no row for the setting. From v0.1.15 the server refuses the import when the row is missing. A deployment that imported keys before the upgrade without setting it gets this error after the upgrade.
+
+**Fix:** Enable import, then retry. The next import reads the new value, so you do not need to restart the server:
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+Keys imported earlier keep working while import is disabled.
 
 ### `Management API: check allow_credential_import failed: <error>`
 
@@ -762,23 +850,29 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 **Fix:** Check PostgreSQL connectivity. Verify the table's stream shards exist in the `stream_shards` table. If the table was created before streams were enabled, the shards may not have been initialized.
 
-### `Stream capture: failed to write record for <table>: <error>`
-
-**Cause:** A stream record was constructed but could not be persisted to the `stream_records` table. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity and disk space. If the error mentions a unique constraint violation, two writes to the same shard may have occurred in the same microsecond — retry the operation.
-
-### `Stream capture: failed to get sequence number: <error>`
-
-**Cause:** extenddb could not generate a sequence number for a stream record. The data write succeeded — only the stream record is missing.
-
-**Fix:** Check PostgreSQL connectivity.
-
 ### `Stream cleanup worker: <error>`
 
 **Cause:** The background worker that deletes stream records older than 24 hours encountered a database error. Expired records will accumulate until the worker succeeds.
 
 **Fix:** Check PostgreSQL connectivity. The worker retries every hour automatically.
+
+### `Stream record numbering failed: <error>`
+
+**Cause:** The background worker that gives PostgreSQL stream records their sequence numbers encountered a database error. GetRecords numbers one batch of the records of the shard it reads before it reads them, so a consumer that keeps reading a shard still receives its records, unless the same error stops that numbering too (see the next entry). The records of shards that nobody reads stay in the `stream_pending` table, and the retention sweep does not trim them, until the worker succeeds.
+
+**Fix:** Check PostgreSQL connectivity. After a failure the worker tries again a little over a second later.
+
+### `Stream record numbering before a read of shard <shard> failed: <error>`
+
+**Cause:** GetRecords, or GetShardIterator with `LATEST`, could not number the shard's committed stream records before it read the shard, because of a database error. The call went on and answered from the records numbered before. The records left in `stream_pending` get higher sequence numbers from a later read or the background worker, and a later GetRecords call returns them.
+
+**Fix:** Check PostgreSQL connectivity and the error in the message. While the error repeats on every read of the shard and in the worker, consumers of that shard receive no new records.
+
+### GetRecords is slow on PostgreSQL while a long transaction runs
+
+**Cause:** Every stream record passes through the `stream_pending` table, and the numbering step deletes it there. A transaction that stays open on the data database, such as the one a backup of a large table reads from, keeps autovacuum from removing those deleted rows. Until it ends, each GetRecords on a busy shard and each numbering read past them.
+
+**Fix:** Find the long transaction in `pg_stat_activity` (`xact_start`). Once it ends, autovacuum removes the rows; `VACUUM stream_pending` removes them at once.
 
 ## Management Console Errors
 
@@ -790,9 +884,15 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 
 ### Console redirects to login page on every request
 
-**Cause:** The session cookie has expired (sessions last 8 hours) or cookies are blocked by the browser.
+**Cause:** The session cookie has expired (sessions end 8 hours after login, however active they are, and the browser drops the cookie at the same time), the user's password was changed or the user was deleted after the session began, or cookies are blocked by the browser.
 
-**Fix:** Log in again. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+**Fix:** Log in again, with the new password if it was changed. Ensure cookies are enabled for the extenddb server address. If using a reverse proxy, ensure it forwards the `Cookie` and `Set-Cookie` headers.
+
+### Console pages return HTTP 503 "The catalog is unavailable"
+
+**Cause:** The console checks every session against the catalog database, and that read failed. The session is kept.
+
+**Fix:** Check that the catalog database is reachable from the server, then reload the page. After a PostgreSQL restart the first reloads can still answer 503: each pooled catalog connection that the restart closed fails once and is then replaced.
 
 ### Console shows "Encryption key not found" when creating access keys
 
@@ -852,7 +952,7 @@ If the health check fails, start extenddb. If it succeeds, check your `--endpoin
 pool_size = 50  # default is 20
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb';` (the data database's default name).
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 

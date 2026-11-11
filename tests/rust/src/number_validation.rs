@@ -123,3 +123,138 @@ async fn put_item_zero_with_exponent_outside_i32_is_rejected() {
             .unwrap_or_else(|e| panic!("{n} must be accepted: {e}"));
     }
 }
+
+// DynamoDB's answers below were measured with PutItem in us-east-1 on
+// 2026-11-09, each value twice with the same answer both times, except the
+// values marked with another date. The checks match on the full message body,
+// which DynamoDB prefixes with "1 validation error detected: " and ExtendDB
+// does not.
+const OVERFLOW_MESSAGE: &str =
+    "Number overflow. Attempting to store a number with magnitude larger than supported range";
+const UNDERFLOW_MESSAGE: &str =
+    "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+const TOO_MANY_DIGITS_MESSAGE: &str =
+    "Attempting to store more than 38 significant digits in a Number";
+
+#[tokio::test]
+async fn put_item_zero_with_exponent_at_i64_max_is_underflow() {
+    let t = tables().await;
+    for (n, want) in [
+        ("0E9223372036854775807", UNDERFLOW_MESSAGE),
+        // Measured on 2026-10-27.
+        ("0E9223372036854775806", OVERFLOW_MESSAGE),
+        ("0.0E9223372036854775807", OVERFLOW_MESSAGE),
+    ] {
+        let err = put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .expect_err("zero with an exponent at the i64 limit must be rejected");
+        assert!(
+            err.starts_with("ValidationException") && err.contains(want),
+            "{n}: got {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn put_item_magnitude_at_i64_max_is_overflow_before_digit_count() {
+    let t = tables().await;
+    for (n, want) in [
+        (
+            "1234567890123456789012345678901234567890E9223372036854775768",
+            OVERFLOW_MESSAGE,
+        ),
+        (
+            "1234567890123456789012345678901234567890E9223372036854775767",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        // The order of magnitude at i64::MAX + 1 and at i64::MAX + 39.
+        // Measured on 2026-11-10, each value sent twice.
+        (
+            "1234567890123456789012345678901234567890E9223372036854775769",
+            OVERFLOW_MESSAGE,
+        ),
+        (
+            "1234567890123456789012345678901234567890E9223372036854775807",
+            OVERFLOW_MESSAGE,
+        ),
+    ] {
+        let err = put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .expect_err("forty digits with an out-of-range magnitude must be rejected");
+        assert!(
+            err.starts_with("ValidationException") && err.contains(want),
+            "{n}: got {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn put_item_magnitude_below_i64_min_is_underflow_before_digit_count() {
+    let t = tables().await;
+    // More than 38 digits with the exponent of the normalized form `0.d * 10^n`
+    // below i64::MIN are an underflow before the digit count. Each fraction
+    // zero before the digits lowers that exponent by one: under the smallest
+    // exponent, one zero puts forty digits at i64::MIN - 1, two at i64::MIN - 2
+    // and forty at i64::MIN - 40. At i64::MIN, and at i64::MIN + 40 with the
+    // digits before the point, the digit count is reported. The answers are
+    // the same with 39 digits and with a minus sign. Measured on 2026-11-10,
+    // each value sent twice with the same answer both times.
+    let forty_zeros = "0".repeat(40);
+    let forty_below =
+        format!(".{forty_zeros}1234567890123456789012345678901234567891E-9223372036854775808");
+    for (n, want) in [
+        (
+            ".01234567890123456789012345678901234567891E-9223372036854775808",
+            UNDERFLOW_MESSAGE,
+        ),
+        (
+            ".001234567890123456789012345678901234567891E-9223372036854775807",
+            UNDERFLOW_MESSAGE,
+        ),
+        (
+            ".001234567890123456789012345678901234567891E-9223372036854775808",
+            UNDERFLOW_MESSAGE,
+        ),
+        (forty_below.as_str(), UNDERFLOW_MESSAGE),
+        (
+            ".0123456789012345678901234567890123456789E-9223372036854775808",
+            UNDERFLOW_MESSAGE,
+        ),
+        (
+            "-.01234567890123456789012345678901234567891E-9223372036854775808",
+            UNDERFLOW_MESSAGE,
+        ),
+        (
+            ".1234567890123456789012345678901234567891E-9223372036854775808",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        (
+            ".01234567890123456789012345678901234567891E-9223372036854775807",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        (
+            ".001234567890123456789012345678901234567891E-9223372036854775806",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        (
+            "1234567890123456789012345678901234567891E-9223372036854775808",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        (
+            ".123456789012345678901234567890123456789E-9223372036854775808",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+        (
+            "-.1234567890123456789012345678901234567891E-9223372036854775808",
+            TOO_MANY_DIGITS_MESSAGE,
+        ),
+    ] {
+        let err = put_with_raw_number(&t.simple_key_string, n)
+            .await
+            .expect_err("more than 38 digits with an out-of-range magnitude must be rejected");
+        assert!(
+            err.starts_with("ValidationException") && err.contains(want),
+            "{n}: got {err}"
+        );
+    }
+}

@@ -145,14 +145,22 @@ jobs:
             exit 1
           fi
 
-          # 5. The checked-in launcher manifest must not have drifted from it.
-          #    The publish step rewrites the version anyway, so a stale value
-          #    would not break the release; it would quietly mislead anyone
-          #    reading the manifest, which is worse.
-          # Read from origin/main, not the tag tree: packaging is release
-          # tooling and lives on main (same rule as the workflow definition
-          # itself). A tag cut before a manifest bump merged would otherwise
-          # fail here forever.
+          # 5. The launcher manifest must carry the same version, at the
+          #    tagged commit and on origin/main.
+          #    At the tag: every build leg runs the tagged commit's launcher
+          #    suite against the binary it built. The launcher runs only a
+          #    binary of its own release. A tagged manifest at another
+          #    version fails all five legs after this gate passes. The
+          #    release flow cannot fix a tag in place, so refuse the tag
+          #    here, before any build.
+          #    On origin/main: the publish step rewrites the version anyway,
+          #    so a stale value there would not break the release. It would
+          #    mislead anyone who reads the manifest.
+          TAG_PKG_VERSION=$(git show "${SHA}:packaging/npm/package.json" | jq -r .version)
+          if [[ "$VERSION" != "$TAG_PKG_VERSION" ]]; then
+            echo "::error::packaging/npm/package.json at ${RAW_TAG} (${SHA}) says ${TAG_PKG_VERSION}, expected ${VERSION}: the launcher suite on every build leg would refuse the ${VERSION} binary (bump the manifest in the same commit as the workspace version, before the tag)"
+            exit 1
+          fi
           PKG_VERSION=$(git show "origin/main:packaging/npm/package.json" | jq -r .version)
           if [[ "$VERSION" != "$PKG_VERSION" ]]; then
             echo "::error::packaging/npm/package.json on origin/main says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
@@ -163,6 +171,25 @@ jobs:
             echo "version=$VERSION"
             echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged commit for the migration gate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.sha }}
+          persist-credentials: false
+
+      - name: Gate - the release freezes the catalog migrations it ships
+        # The platform packages ship the sqlite,dev-mode build of the tag,
+        # whose dev server applies SQLite migrations to a catalog behind it.
+        # As in release-image.yml: RELEASED_THROUGH must reach the last
+        # migration id. A tag before the migration framework passes.
+        run: |
+          set -euo pipefail
+          if [[ -e crates/storage/src/migrations/registry.rs ]]; then
+            python3 devtools/check-released-through
+          else
+            echo "the tagged commit has no catalog migration registry"
+          fi
 
   build:
     needs: gate

@@ -12,7 +12,9 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::effective_attribute_definitions;
+use extenddb_storage::util::{
+    effective_attribute_definitions, warm_throughput_record_for_create, warm_throughput_record_json,
+};
 
 use crate::CassandraEngine;
 use crate::cassandra_util::query_optional;
@@ -30,7 +32,7 @@ impl CassandraEngine {
             &self.session,
             &format!(
                 "SELECT table_id, table_status, key_schema, attribute_definitions, \
-                 billing_mode, provisioned_throughput \
+                 billing_mode, provisioned_throughput, stream_specification, stream_label \
                  FROM {catalog_ks}.tables WHERE account_id = ? AND table_name = ?"
             ),
             cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
@@ -151,53 +153,48 @@ impl CassandraEngine {
             add_update!("on_demand_throughput", odt_json.as_str());
         }
 
-        // Stream specification: add to batch, then handle shard init separately
-        // (init_stream_shards writes to a different keyspace and does its own batch).
-        let mut needs_shard_init = false;
-        let mut needs_label_restore = false;
-        if let Some(spec) = &input.stream_specification {
-            let spec_json =
-                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            add_update!("stream_specification", spec_json.as_str());
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        // The table's record is written by the table LWT below, conditional on
+        // the record read here; the indexes' by their own LWTs after the
+        // indexes batch (`store_index_warm_throughput`). Both read again and
+        // retry when another UpdateTable wrote the record first.
+        let mut warm_read: Option<String> = None;
+        if let Some(spec) = &input.warm_throughput {
+            let merge = self
+                .merged_table_warm_throughput(account_id, &input.table_name, spec)
+                .await?;
+            add_update!("warm_throughput", merge.merged.as_str());
+            warm_read = merge.read;
+        }
+        for update in input.global_secondary_index_updates.iter().flatten() {
+            if let Some(action) = &update.update
+                && let Some(spec) = &action.warm_throughput
+            {
+                // Refuse a missing index before anything is written.
+                self.merged_index_warm_throughput(&table_id, &action.index_name, spec)
+                    .await?;
+            }
+        }
 
-            if spec.stream_enabled {
-                let account_ks = self.account_keyspace(account_id);
-                let existing = query_optional(
-                    &self.session,
-                    &format!(
-                        "SELECT shard_id FROM {account_ks}.stream_shards \
-                         WHERE table_id = ? LIMIT 1 ALLOW FILTERING"
-                    ),
-                    cdrs_tokio::query_values!(table_id.as_str()),
-                    "update_table stream_shards check",
+        // Stream specification: the catalog columns go in the tables LWT; the
+        // shard changes run after it (`PendingStream`), since the shards are
+        // in a different keyspace.
+        let mut pending_stream = None;
+        if let Some(spec) = &input.stream_specification {
+            let (cols, pending) = self
+                .decide_stream_change_or_close(
+                    &row,
+                    &self.account_keyspace(account_id),
+                    &table_id,
+                    &input.table_name,
+                    spec,
                 )
                 .await?;
-
-                if existing.is_none() {
-                    needs_shard_init = true;
-                } else {
-                    // Re-enabling: check if stream_label needs restoring.
-                    let label_row = query_optional(
-                        &self.session,
-                        &format!(
-                            "SELECT stream_label FROM {catalog_ks}.tables \
-                             WHERE account_id = ? AND table_name = ?"
-                        ),
-                        cdrs_tokio::query_values!(account_id, input.table_name.as_str()),
-                        "update_table stream_label check",
-                    )
-                    .await?;
-                    let has_label = label_row.is_some_and(|r| {
-                        let v: Option<String> = r.get_by_name("stream_label").ok().flatten();
-                        v.is_some()
-                    });
-                    if !has_label {
-                        needs_label_restore = true;
-                        let label = extenddb_storage::util::new_stream_label();
-                        add_update!("stream_label", label.as_str());
-                    }
-                }
+            for (col, val) in cols {
+                table_cols.push((col, Value::from(val.as_str())));
             }
+            pending_stream = Some(pending);
         }
 
         // GSI updates: pre-validate, then add catalog changes to batch.
@@ -272,21 +269,35 @@ impl CassandraEngine {
                         .map_err(|e| StorageError::Internal(e.to_string()))?
                         .unwrap_or_default();
 
+                    let mut index_values = vec![
+                        Value::from(table_id.as_str()),
+                        Value::from(create.index_name.as_str()),
+                        Value::from(index_id.as_str()),
+                        Value::from(idx_ks_json.as_str()),
+                        Value::from(proj_json.as_str()),
+                        Value::from(pt_json.as_str()),
+                    ];
+                    // WarmThroughput named only when sent, as in create_table.
+                    let gsi_warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_secs().await,
+                    );
+                    let (warm_column, warm_placeholder) = match gsi_warm.as_ref() {
+                        Some(record) => {
+                            index_values
+                                .push(Value::from(warm_throughput_record_json(record)?.as_str()));
+                            (", warm_throughput", ", ?")
+                        }
+                        None => ("", ""),
+                    };
                     add_index_op!(
                         format!(
                             "INSERT INTO {catalog_ks}.indexes \
                              (table_id, index_name, index_id, index_type, key_schema, \
-                              projection, index_status, provisioned_throughput) \
-                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)"
+                              projection, index_status, provisioned_throughput{warm_column}) \
+                             VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?{warm_placeholder})"
                         ),
-                        QueryValues::SimpleValues(vec![
-                            Value::from(table_id.as_str()),
-                            Value::from(create.index_name.as_str()),
-                            Value::from(index_id.as_str()),
-                            Value::from(idx_ks_json.as_str()),
-                            Value::from(proj_json.as_str()),
-                            Value::from(pt_json.as_str()),
-                        ])
+                        QueryValues::SimpleValues(index_values)
                     );
                     gsi_creates.push((index_id, create.index_name.clone()));
                     surviving_index_key_schemas.push(create.key_schema.clone());
@@ -414,10 +425,10 @@ impl CassandraEngine {
                 account_id,
                 &input,
                 table_cols,
+                warm_read,
                 indexes_batch,
                 indexes_batch_has_statements,
-                needs_shard_init,
-                needs_label_restore,
+                pending_stream,
                 &table_id,
                 &gsi_creates,
                 &gsi_deletes,
@@ -448,11 +459,11 @@ impl CassandraEngine {
         &self,
         account_id: &str,
         input: &UpdateTableInput,
-        table_cols: Vec<(&'static str, Value)>,
+        mut table_cols: Vec<(&'static str, Value)>,
+        mut warm_read: Option<String>,
         indexes_batch: BatchQueryBuilder,
         indexes_batch_has_statements: bool,
-        needs_shard_init: bool,
-        needs_label_restore: bool,
+        pending_stream: Option<crate::stream_lifecycle::PendingStream>,
         table_id: &str,
         gsi_creates: &[(String, String)],
         gsi_deletes: &[String],
@@ -460,7 +471,6 @@ impl CassandraEngine {
         base_attr_defs: &[AttributeDefinition],
     ) -> Result<TableDescription, StorageError> {
         let account_ks = self.account_keyspace(account_id);
-        let catalog_ks = self.catalog_keyspace();
 
         // Take propagation holds for all new GSIs BEFORE the catalog batch
         // commits. This ensures no worker can apply a queued write to the index
@@ -497,28 +507,109 @@ impl CassandraEngine {
             }
         }
 
-        // Execute tables update as a single LWT UPDATE ... IF EXISTS.
+        // Execute tables update as a single LWT, conditional on the values the
+        // request read (`tables_write_condition`), or IF EXISTS.
         // This avoids mixing plain/LWT writes on the tables row (created with IF NOT EXISTS).
         if !table_cols.is_empty() {
-            let set_clause = table_cols
+            let warm_col = table_cols
                 .iter()
-                .map(|(col, _)| format!("{col} = ?"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let cql = format!(
-                "UPDATE {catalog_ks}.tables SET {set_clause} \
-                 WHERE account_id = ? AND table_name = ? IF EXISTS"
-            );
-            let mut vals: Vec<Value> = table_cols.into_iter().map(|(_, v)| v).collect();
-            vals.push(Value::from(account_id));
-            vals.push(Value::from(input.table_name.as_str()));
-            let result = crate::cassandra_util::query_lwt(
-                &self.session,
-                &cql,
-                QueryValues::SimpleValues(vals),
-            )
-            .await
-            .inspect_err(|_e| {
+                .position(|(col, _)| *col == "warm_throughput");
+            let mut attempts = 0;
+            let applied = loop {
+                let written = self
+                    .write_tables_row(
+                        account_id,
+                        &input.table_name,
+                        &table_cols,
+                        table_id,
+                        warm_col.map(|_| warm_read.as_deref()),
+                        pending_stream
+                            .as_ref()
+                            .map(|p| (p.read_specification.as_deref(), p.read_label.as_deref())),
+                    )
+                    .await
+                    .inspect_err(|_e| {
+                        for held_id in &taken_holds {
+                            let session = self.session_arc();
+                            let account_ks = account_ks.clone();
+                            let held_id = held_id.clone();
+                            let table_id = table_id.to_owned();
+                            tokio::spawn(async move {
+                                let _ = crate::propagation_hold::release_propagation_hold(
+                                    &session,
+                                    &account_ks,
+                                    &table_id,
+                                    &held_id,
+                                )
+                                .await;
+                            });
+                        }
+                    })?;
+                if written {
+                    break Ok(true);
+                }
+                // The write did not apply for one of these reasons:
+                // - The row is gone, or it holds a table created again under
+                //   the same name.
+                // - A stream change committed after this request read the row.
+                // - Another UpdateTable wrote the warm throughput after this
+                //   request read it.
+                // The loop retries only the last case, merged again over what
+                // that request wrote. With a stream change pending, the other
+                // two end the loop, and the code below answers them. Without
+                // one, the merge reads the record by name, so the loop retries
+                // a table created again until MERGE_ATTEMPTS and then answers
+                // Internal. A stream change that finds its table and stream
+                // fields as it read them ran into a warm throughput write.
+                let (Some(col), Some(spec)) = (warm_col, input.warm_throughput.as_ref()) else {
+                    break Ok(false);
+                };
+                if let Some(pending) = &pending_stream {
+                    match self
+                        .stream_condition_fields(account_id, &input.table_name)
+                        .await
+                    {
+                        Ok(Some((id, specification, label)))
+                            if id.as_deref() == Some(table_id)
+                                && specification == pending.read_specification
+                                && label == pending.read_label => {}
+                        Ok(_) => break Ok(false),
+                        Err(e) => break Err(e),
+                    }
+                }
+                attempts += 1;
+                if attempts >= crate::warm_throughput::MERGE_ATTEMPTS {
+                    break Err(StorageError::Internal(
+                        "warm throughput: the record changed on every attempt to merge the \
+                         request"
+                            .to_owned(),
+                    ));
+                }
+                match self
+                    .merged_table_warm_throughput(account_id, &input.table_name, spec)
+                    .await
+                {
+                    Ok(merge) => {
+                        table_cols[col].1 = Value::from(merge.merged.as_str());
+                        warm_read = merge.read;
+                    }
+                    Err(StorageError::TableNotFound(_)) => break Ok(false),
+                    Err(e) => break Err(e),
+                }
+            };
+            // A condition that stays false means the row was deleted between
+            // our earlier SELECT and this UPDATE: treat as TableNotFound. Under
+            // a stream change the condition also fails when another stream
+            // change committed in between; `refuse_overlapping_stream_change`
+            // re-reads the row and answers as that later request would be, or
+            // with TableNotFound when the row is gone or holds another table.
+            // NOTE: the tables LWT commits before the indexes batch below runs.
+            // A failure in the indexes batch leaves the table row updated with
+            // no corresponding index rows; the recovery worker does not cover
+            // this gap (it only scans existing CREATING index rows). This is a
+            // known atomicity gap — conditional batches cannot span tables in
+            // Cassandra. Tracked in ADR-0021.
+            let applied = applied.inspect_err(|_e| {
                 for held_id in &taken_holds {
                     let session = self.session_arc();
                     let account_ks = account_ks.clone();
@@ -535,15 +626,6 @@ impl CassandraEngine {
                     });
                 }
             })?;
-            // IF EXISTS returns false only if the row was deleted between our
-            // earlier SELECT and this UPDATE — treat as TableNotFound.
-            // NOTE: the tables LWT commits before the indexes batch below runs.
-            // A failure in the indexes batch leaves the table row updated with
-            // no corresponding index rows; the recovery worker does not cover
-            // this gap (it only scans existing CREATING index rows). This is a
-            // known atomicity gap — conditional batches cannot span tables in
-            // Cassandra. Tracked in ADR-0021.
-            let applied = crate::cassandra_util::lwt_applied(&result)?;
             if !applied {
                 for held_id in &taken_holds {
                     let session = self.session_arc();
@@ -559,6 +641,15 @@ impl CassandraEngine {
                         )
                         .await;
                     });
+                }
+                if pending_stream.is_some() {
+                    self.refuse_overlapping_stream_change(
+                        account_id,
+                        &input.table_name,
+                        table_id,
+                        input,
+                    )
+                    .await?;
                 }
                 return Err(StorageError::TableNotFound(input.table_name.clone()));
             }
@@ -591,12 +682,23 @@ impl CassandraEngine {
             return Err(e);
         }
 
-        // Post-batch: shard init (has its own internal batch across two keyspaces).
-        if needs_shard_init {
-            self.init_stream_shards(account_id, &input.table_name, &account_ks, table_id)
+        // Post-batch: each GSI Update's WarmThroughput, as its own conditional
+        // write on the index row (see `store_index_warm_throughput`).
+        for update in input.global_secondary_index_updates.iter().flatten() {
+            if let Some(action) = &update.update
+                && let Some(spec) = &action.warm_throughput
+            {
+                self.store_index_warm_throughput(table_id, &action.index_name, spec)
+                    .await?;
+            }
+        }
+
+        // Post-batch: close the stream's shards and create the new stream's.
+        if let Some(pending) = pending_stream {
+            pending
+                .apply(self, account_id, &account_ks, &input.table_name, table_id)
                 .await?;
         }
-        let _ = needs_label_restore; // stream_label is set via add_update! above
 
         // Post-batch: GSI data table DDL and async backfill.
         if let Some(updates) = &input.global_secondary_index_updates {
@@ -666,5 +768,156 @@ impl CassandraEngine {
 
         self.build_table_description(account_id, &input.table_name)
             .await
+    }
+
+    /// One attempt of `update_table`'s write of the `tables` row: `UPDATE ...
+    /// SET` the columns of `set`, conditional on [`tables_write_condition`].
+    /// `true` when the write applied. Public for the direct tests, which run
+    /// it against a row that does not exist.
+    #[doc(hidden)]
+    pub async fn write_tables_row(
+        &self,
+        account_id: &str,
+        table_name: &str,
+        set: &[(&'static str, Value)],
+        table_id: &str,
+        warm_read: Option<Option<&str>>,
+        stream_read: Option<(Option<&str>, Option<&str>)>,
+    ) -> Result<bool, StorageError> {
+        let set_clause = set
+            .iter()
+            .map(|(col, _)| format!("{col} = ?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (condition, condition_values) =
+            tables_write_condition(table_id, warm_read, stream_read);
+        let cql = format!(
+            "UPDATE {}.tables SET {set_clause} \
+             WHERE account_id = ? AND table_name = ? {condition}",
+            self.catalog_keyspace()
+        );
+        let mut vals: Vec<Value> = set.iter().map(|(_, v)| v.clone()).collect();
+        vals.push(Value::from(account_id));
+        vals.push(Value::from(table_name));
+        vals.extend(condition_values);
+        let result =
+            crate::cassandra_util::query_lwt(&self.session, &cql, QueryValues::SimpleValues(vals))
+                .await?;
+        crate::cassandra_util::lwt_applied(&result)
+    }
+}
+
+/// The condition of `update_table`'s write of the `tables` row and the values
+/// it binds, in the order of its parts.
+///
+/// `warm_read` is the warm throughput record the request read, when the write
+/// carries a WarmThroughput. `stream_read` is the stream specification and
+/// label the request read, when a stream change is pending: of two overlapping
+/// stream changes the one whose write finds them changed re-reads the row and
+/// is refused by `stream_change` as a request arriving after the other's commit
+/// would be. With either, the write is also conditional on `table_id`, which a
+/// missing row does not have. A condition that compares a column with null is
+/// met by a missing row, so without it a stream enable on a table created
+/// without a stream (both stream columns null) that runs after a DeleteTable
+/// would write a row holding only the columns it sets. A table created again
+/// under the same name has another `table_id` and fails the condition too.
+/// With neither, the write is conditional on the row existing.
+fn tables_write_condition(
+    table_id: &str,
+    warm_read: Option<Option<&str>>,
+    stream_read: Option<(Option<&str>, Option<&str>)>,
+) -> (String, Vec<Value>) {
+    let mut parts = Vec::new();
+    let mut values = Vec::new();
+    if warm_read.is_some() || stream_read.is_some() {
+        parts.push("table_id = ?");
+        values.push(Value::from(table_id));
+    }
+    if let Some(read) = warm_read {
+        parts.push("warm_throughput = ?");
+        values.push(crate::warm_throughput::condition_value(read));
+    }
+    if let Some((specification, label)) = stream_read {
+        parts.push("stream_specification = ?");
+        values.push(Value::from(specification));
+        parts.push("stream_label = ?");
+        values.push(Value::from(label));
+    }
+    if parts.is_empty() {
+        return ("IF EXISTS".to_owned(), values);
+    }
+    (format!("IF {}", parts.join(" AND ")), values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const WARM: &str = r#"{"ReadUnitsPerSecond":12000,"WriteUnitsPerSecond":4000}"#;
+    const SPEC: &str = r#"{"StreamEnabled":true,"StreamViewType":"KEYS_ONLY"}"#;
+    const LABEL: &str = "2026-11-09T18:00:00.000";
+
+    fn condition(
+        warm_read: Option<Option<&str>>,
+        stream_read: Option<(Option<&str>, Option<&str>)>,
+    ) -> (String, Vec<Value>) {
+        let (text, values) = tables_write_condition(TID, warm_read, stream_read);
+        assert_eq!(text.matches('?').count(), values.len(), "{text}");
+        (text, values)
+    }
+
+    /// The condition of the `tables` write and the values it binds, in order,
+    /// with neither a WarmThroughput nor a stream change, with each alone, and
+    /// with both. Every case with a part is also conditional on `table_id`,
+    /// bound first.
+    #[test]
+    fn the_tables_write_condition_binds_its_values_in_the_order_of_its_parts() {
+        assert_eq!(condition(None, None), ("IF EXISTS".to_owned(), vec![]));
+
+        let warm_only = "IF table_id = ? AND warm_throughput = ?".to_owned();
+        assert_eq!(
+            condition(Some(Some(WARM)), None),
+            (warm_only.clone(), vec![Value::from(TID), Value::from(WARM)])
+        );
+        assert_eq!(
+            condition(Some(None), None),
+            (warm_only, vec![Value::from(TID), Value::Null])
+        );
+
+        // A table created without a stream has both stream columns null, so
+        // its first enable binds two nulls. `table_id` keeps a row that does
+        // not exist from meeting the condition.
+        let stream_only =
+            "IF table_id = ? AND stream_specification = ? AND stream_label = ?".to_owned();
+        assert_eq!(
+            condition(None, Some((None, None))),
+            (
+                stream_only.clone(),
+                vec![Value::from(TID), Value::Null, Value::Null]
+            )
+        );
+        assert_eq!(
+            condition(None, Some((Some(SPEC), Some(LABEL)))),
+            (
+                stream_only,
+                vec![Value::from(TID), Value::from(SPEC), Value::from(LABEL)]
+            )
+        );
+
+        assert_eq!(
+            condition(Some(Some(WARM)), Some((Some(SPEC), None))),
+            (
+                "IF table_id = ? AND warm_throughput = ? AND stream_specification = ? \
+                 AND stream_label = ?"
+                    .to_owned(),
+                vec![
+                    Value::from(TID),
+                    Value::from(WARM),
+                    Value::from(SPEC),
+                    Value::Null
+                ]
+            )
+        );
     }
 }

@@ -94,11 +94,29 @@ pub async fn handle_put_item(
         }
     })?;
 
+    // An attribute name over the size limit is input validation: the service
+    // reports it ahead of the table lookup, so a request naming a missing
+    // table answers with the name refusal. A name that arrives only through
+    // the condition's ExpressionAttributeNames is refused the same way.
+    extenddb_core::validation::validate_attribute_name_sizes(
+        &input.item,
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+    extenddb_core::validation::validate_expression_attribute_name_sizes(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+
     // A number the service cannot read or a value nested too deep in the item
     // is reported ahead of the mixed-parameter check, the expression checks,
     // the table lookup and the key schema checks (measured 2026-10-27).
     // Numbers come first, as before this check; the service's order follows
-    // the request body, which `Item` does not keep.
+    // the request body, which `Item` does not keep. An attribute name over
+    // the size limit comes before both: the service answered either fault for
+    // one item holding both (measured 2026-11-11).
     // The later `validate_put_item` repeats both and cannot fail after this.
     extenddb_core::validation::number::operations::put_item_item(&input)?;
 

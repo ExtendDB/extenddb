@@ -26,6 +26,15 @@ use super::ast::{CompareOp, Expr, PathElement};
 pub struct ExpressionMaps {
     pub names: HashMap<String, String>,
     pub values: HashMap<String, AttributeValue>,
+    /// Set by the engine when the update arrived as legacy `AttributeUpdates`
+    /// and was desugared into an update expression. The service sizes that
+    /// form against the item limit differently from an expression.
+    pub legacy_attribute_updates: bool,
+    /// Set by the engine for an update translated from a PartiQL `UPDATE`.
+    /// The service sizes that statement by its finished item alone, as it
+    /// sizes a transacted Update, and not by the statement as it sizes
+    /// `UpdateItem`.
+    pub finished_item_sizing: bool,
     /// Pre-parsed `BigDecimal` values for numeric placeholders, `None` for a
     /// placeholder whose `N` is not a number the service can store.
     /// Populated eagerly by `new()` and refreshed by `pre_parse_numerics()`.
@@ -50,6 +59,8 @@ impl ExpressionMaps {
         let mut maps = Self {
             names,
             values,
+            legacy_attribute_updates: false,
+            finished_item_sizing: false,
             parsed_numerics: HashMap::new(),
         };
         maps.pre_parse_numerics();

@@ -6,6 +6,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "A DynamoDB-compatible API server that stores data in PostgreSQL, MongoDB, Cassandra or SQLite."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["dynamodb", "database", "nosql", "server", "postgresql"]
+categories = ["database-implementations", "command-line-utilities"]
 
 [[bin]]
 name = "extenddb"
@@ -25,10 +31,12 @@ mongodb-test-hooks = [
     "extenddb-storage-mongodb/test-hooks",
     "extenddb-app/mongodb-test-hooks",
 ]
-# Developer mode: plain HTTP on loopback, open authorization (SigV4 still
-# enforced), seeded dev credential. A build-time profile for local/CI only; it
-# requires a dev backend (`sqlite`/`sqlite-memory`) and fails to build with a
-# production backend like `postgres` (enforced at compile time in `main.rs`).
+# Developer mode: plain HTTP on loopback, open authorization (SigV4
+# authentication still enforced), seeded dev credential. A build-time profile
+# for local development and CI. It compiles only with `sqlite` or
+# `sqlite-memory`. A build of any other backend with it, `postgres` among them,
+# fails (`main.rs` checks this at compile time). A production `sqlite` build
+# leaves it off.
 dev-mode = ["extenddb-app/dev-mode"]
 
 [dependencies]
@@ -40,3 +48,9 @@ extenddb-storage-postgres = { workspace = true, optional = true }
 extenddb-storage-sqlite = { workspace = true, optional = true }
 anyhow = { workspace = true }
 extenddb-config = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+extenddb-storage = { path = "../storage", features = ["test-util"] }

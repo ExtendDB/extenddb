@@ -84,7 +84,15 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         // numbers yet: refusing `0E126` here would make them look it up as a
         // key of its own instead of `0` (#618).
         if i32::try_from(explicit_exp).is_err() {
-            check_zero_magnitude(explicit_exp, frac_part)?;
+            // The exponent of the normalized form `0.d * 10^n` is the point
+            // offset plus one, and DynamoDB computes it in 64 bits, where
+            // i64::MAX + 1 wraps to a negative exponent: `0E9223372036854775807`
+            // is an underflow, while `0E9223372036854775806` and
+            // `0.0E9223372036854775807` are overflows.
+            if normalized_exponent_exceeds_i64(point_offset) {
+                return Err(underflow_err());
+            }
+            check_magnitude(point_offset)?;
         }
         return Ok("0".to_owned());
     }
@@ -97,10 +105,6 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
         return Ok("0".to_owned());
     }
 
-    if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
-        return Err(too_many_digits_err());
-    }
-
     // The exponent for the normalized form:
     // value = all_digits_as_integer * 10^point_offset
     //       = significant_as_integer * 10^point_offset  (leading zeros don't change value)
@@ -109,7 +113,41 @@ pub fn validate_and_normalize_number(s: &str) -> Result<String, DynamoDbError> {
 
     // Magnitude: the number is sig_trimmed * 10^exp, so its order of magnitude
     // is sig_trimmed.len() - 1 + exp
-    check_magnitude(digit_count(sig_trimmed) - 1 + exp)?;
+    let magnitude_exp = digit_count(sig_trimmed) - 1 + exp;
+
+    // DynamoDB reports an overflow before it counts the digits when the
+    // exponent of the normalized form, the magnitude plus one, is above
+    // i64::MAX. Measured with `1234567890123456789012345678901234567890` as
+    // the digits: `E9223372036854775768` (an order of magnitude of i64::MAX),
+    // `E9223372036854775769` (i64::MAX + 1) and `E9223372036854775807`
+    // (i64::MAX + 39) are overflows, and `E9223372036854775767` is too many
+    // digits. The one-digit `1E9223372036854775807` (i64::MAX) and
+    // `10E9223372036854775807` (i64::MAX + 1) are overflows as well.
+    if normalized_exponent_exceeds_i64(magnitude_exp) {
+        return Err(overflow_err());
+    }
+
+    // The small side mirrors it: an underflow is reported before the digits
+    // are counted when the exponent of the normalized form is below i64::MIN.
+    // Measured with the forty digits `1234567890123456789012345678901234567891`
+    // after the point, where each fraction zero before them lowers that
+    // exponent by one: `.0<digits>E-9223372036854775808` and
+    // `.00<digits>E-9223372036854775807` (i64::MIN - 1),
+    // `.00<digits>E-9223372036854775808` (i64::MIN - 2) and the same with
+    // forty zeros (i64::MIN - 40) are underflows, while
+    // `.<digits>E-9223372036854775808`, `.0<digits>E-9223372036854775807` and
+    // `.00<digits>E-9223372036854775806` (i64::MIN) are too many digits, as is
+    // `<digits>E-9223372036854775808` (i64::MIN + 40). The answers are the
+    // same with 39 digits and with a minus sign.
+    if normalized_exponent_is_below_i64(magnitude_exp) {
+        return Err(underflow_err());
+    }
+
+    if sig_trimmed.len() > MAX_SIGNIFICANT_DIGITS {
+        return Err(too_many_digits_err());
+    }
+
+    check_magnitude(magnitude_exp)?;
 
     // The magnitude is in range and `sig_trimmed` has at most 38 digits, so
     // `exp` is between MIN_EXPONENT - 37 and MAX_EXPONENT and fits in an i32.
@@ -133,42 +171,34 @@ fn digit_count(digits: &str) -> i128 {
     i128::try_from(digits.len()).unwrap_or(i128::MAX)
 }
 
+/// Whether the exponent of the normalized form `0.d * 10^n`, which is the
+/// given order of magnitude plus one, is above `i64::MAX`. `DynamoDB` answers
+/// such a nonzero value with an overflow before it counts the digits, and such
+/// a zero with an underflow. Measured with forty digits at orders of magnitude
+/// of `i64::MAX`, `i64::MAX + 1` and `i64::MAX + 39`, with one and two digits
+/// at `i64::MAX` and `i64::MAX + 1`, and with the zero `0E9223372036854775807`.
+fn normalized_exponent_exceeds_i64(magnitude_exp: i128) -> bool {
+    magnitude_exp + 1 > i128::from(i64::MAX)
+}
+
+/// Whether the exponent of the normalized form `0.d * 10^n`, which is the
+/// given order of magnitude plus one, is below `i64::MIN`. `DynamoDB` answers
+/// such a nonzero value with an underflow before it counts the digits.
+/// Measured with forty digits, with 39 digits and with a minus sign at
+/// normalized exponents of `i64::MIN - 1`, `i64::MIN - 2` and `i64::MIN - 40`,
+/// against `i64::MIN` and `i64::MIN + 40`, which get the digit count. A zero
+/// takes the other path in the caller: its exponent is range checked, and a
+/// zero this far down is an underflow there as well.
+fn normalized_exponent_is_below_i64(magnitude_exp: i128) -> bool {
+    magnitude_exp + 1 < i128::from(i64::MIN)
+}
+
 /// Refuse an order of magnitude outside `DynamoDB`'s supported range.
 fn check_magnitude(magnitude_exp: i128) -> Result<(), DynamoDbError> {
     if magnitude_exp > i128::from(MAX_EXPONENT) {
         return Err(overflow_err());
     }
     if magnitude_exp < i128::from(MIN_EXPONENT) {
-        return Err(underflow_err());
-    }
-    Ok(())
-}
-
-/// Range check a zero on its magnitude, its precision (1 for a zero) less its
-/// scale, where the scale is the number of fraction digits less the exponent.
-/// The scale saturates at the 64-bit limits and the magnitude wraps, which
-/// gives the service's answer for every such zero measured on 2026-10-27
-/// (us-east-1, each value twice):
-///
-/// - `0E9223372036854775807` is an underflow: without fraction digits, its
-///   magnitude wraps past the 64-bit maximum. Measured on `GetItem`,
-///   `DeleteItem`, `UpdateItem`, `BatchGetItem`, `PutItem` and the `PutItem`
-///   and `DeleteItem` condition values. `0E9223372036854775806`, one less,
-///   does not wrap and is an overflow (measured on `PutItem`).
-///   `0.0E9223372036854775807`, with one fraction digit, does not wrap and is
-///   an overflow (`GetItem`).
-/// - `0.00E-9223372036854775808` and `0.000E-9223372036854775808` are
-///   underflows, as every zero whose exponent is below the 32-bit range is:
-///   their scale saturates instead of wrapping (`GetItem`).
-fn check_zero_magnitude(explicit_exp: i64, frac_part: &str) -> Result<(), DynamoDbError> {
-    let scale = i64::try_from(frac_part.len())
-        .unwrap_or(i64::MAX)
-        .saturating_sub(explicit_exp);
-    let magnitude = 1_i64.wrapping_sub(scale);
-    if magnitude > MAX_MAGNITUDE {
-        return Err(overflow_err());
-    }
-    if magnitude < MIN_MAGNITUDE {
         return Err(underflow_err());
     }
     Ok(())
@@ -520,27 +550,20 @@ mod tests {
         ] {
             assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
         }
-        // A zero whose exponent does not fit in an i32. DynamoDB refuses each;
-        // the rows with fraction digits and the 64-bit minimum or maximum
-        // exponent were sent to its GetItem, twice each.
-        for n in [
-            "0E2147483648",
-            "0E9223372036854775806",
-            "0.0E9223372036854775807",
-        ] {
+        // A zero whose exponent does not fit in an i32. DynamoDB also refuses a
+        // zero such as `0E126` whose exponent fits; see the comment in
+        // `validate_and_normalize_number` for why those are not checked.
+        for n in ["0E2147483648", "0E9223372036854775806"] {
             assert_refused(n, OVERFLOW);
         }
         for n in [
             "0E-9223372036854775807",
             "0E-9223372036854775808",
-            // The scale saturates at the 64-bit minimum exponent instead of
-            // wrapping, so these are underflows, as on the service.
+            // Fraction digits lower the exponent further below the 64-bit
+            // minimum, and the zero stays an underflow (sent to GetItem on
+            // 2026-10-27, twice each).
             "0.00E-9223372036854775808",
             "0.000E-9223372036854775808",
-            // The magnitude, 1 less the scale, wraps past the 64-bit maximum,
-            // as it does on the service: `0E9223372036854775806` above is an
-            // overflow and this an underflow.
-            "0E9223372036854775807",
         ] {
             assert_refused(n, UNDERFLOW);
         }
@@ -568,6 +591,87 @@ mod tests {
             "0.0E-2147483648",
         ] {
             assert_eq!(validate_and_normalize_number(n).unwrap(), "0", "{n:?}");
+        }
+    }
+
+    // DynamoDB's answers to the values in the next three tests were measured
+    // with PutItem in us-east-1 on 2026-11-09, each value sent twice with the
+    // same answer both times, except the values marked with another date.
+    const TOO_MANY_DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
+
+    #[test]
+    fn zero_with_exponent_at_i64_max_is_an_underflow() {
+        // The exponent of a zero's normalized form is its point offset plus
+        // one, computed in 64 bits: at i64::MAX the sum wraps to a negative
+        // exponent. A fraction digit lowers the point offset before the sum.
+        assert_refused("0E9223372036854775807", UNDERFLOW);
+        // `0E9223372036854775806` was measured on 2026-10-27.
+        for n in ["0E9223372036854775806", "0.0E9223372036854775807"] {
+            assert_refused(n, OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn magnitude_at_i64_max_is_an_overflow_before_the_digit_count() {
+        // Forty digits with the order of magnitude at i64::MAX: the overflow
+        // is reported before the digits are counted. With the exponent one
+        // lower, the digit count is reported.
+        assert_refused(
+            "1234567890123456789012345678901234567890E9223372036854775768",
+            OVERFLOW,
+        );
+        assert_refused(
+            "1234567890123456789012345678901234567890E9223372036854775767",
+            TOO_MANY_DIGITS,
+        );
+        // The same digits with the order of magnitude at i64::MAX + 1 and at
+        // i64::MAX + 39. Measured on 2026-11-10, each value sent twice with
+        // the same answer both times.
+        for n in [
+            "1234567890123456789012345678901234567890E9223372036854775769",
+            "1234567890123456789012345678901234567890E9223372036854775807",
+        ] {
+            assert_refused(n, OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn magnitude_below_i64_min_is_an_underflow_before_the_digit_count() {
+        // More than 38 digits with the exponent of the normalized form
+        // `0.d * 10^n` below i64::MIN: the underflow is reported before the
+        // digits are counted. Each fraction zero before the digits lowers
+        // that exponent by one. Under the smallest exponent, one zero puts
+        // forty digits at i64::MIN - 1, two at i64::MIN - 2 and forty at
+        // i64::MIN - 40; under the next exponent, two zeros reach i64::MIN - 1
+        // as well. The answer is the same with 39 digits and with a minus
+        // sign. Measured on 2026-11-10, each value sent twice with the same
+        // answer both times.
+        let forty_zeros = "0".repeat(40);
+        let forty_below =
+            format!(".{forty_zeros}1234567890123456789012345678901234567891E-9223372036854775808");
+        for n in [
+            ".01234567890123456789012345678901234567891E-9223372036854775808",
+            ".001234567890123456789012345678901234567891E-9223372036854775807",
+            ".001234567890123456789012345678901234567891E-9223372036854775808",
+            forty_below.as_str(),
+            ".0123456789012345678901234567890123456789E-9223372036854775808",
+            "-.01234567890123456789012345678901234567891E-9223372036854775808",
+        ] {
+            assert_refused(n, UNDERFLOW);
+        }
+        // At i64::MIN, reached with no fraction zero under the smallest
+        // exponent, one under the next and two under the one after, and at
+        // i64::MIN + 40, with the digits before the point, the digit count is
+        // reported. The same holds with 39 digits and with a minus sign.
+        for n in [
+            ".1234567890123456789012345678901234567891E-9223372036854775808",
+            ".01234567890123456789012345678901234567891E-9223372036854775807",
+            ".001234567890123456789012345678901234567891E-9223372036854775806",
+            "1234567890123456789012345678901234567891E-9223372036854775808",
+            ".123456789012345678901234567890123456789E-9223372036854775808",
+            "-.1234567890123456789012345678901234567891E-9223372036854775808",
+        ] {
+            assert_refused(n, TOO_MANY_DIGITS);
         }
     }
 }

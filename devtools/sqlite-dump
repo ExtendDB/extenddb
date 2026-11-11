@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Print a SQLite catalog as text two runs can be compared with: every
+schema object with its SQL, then every table's rows in rowid order, one per
+line. The encryption key, stored secrets and password hashes are replaced,
+so the output can go to a log.
+
+    devtools/sqlite-dump <database file>
+"""
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sqlite3
+import sys
+
+
+def schema_dump():
+    """devtools/schema-dump as a module, for its SQLite schema lines."""
+    path = pathlib.Path(__file__).with_name("schema-dump")
+    loader = importlib.machinery.SourceFileLoader("schema_dump", str(path))
+    spec = importlib.util.spec_from_loader("schema_dump", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main(path: str) -> None:
+    for line in schema_dump().sqlite_schema(path):
+        print(line)
+    # Read-write: a read-only connection cannot open a WAL database whose
+    # -shm file does not exist. Nothing here writes.
+    conn = sqlite3.connect(path)
+    for (table,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY name"
+    ).fetchall():
+        quoted = '"' + table.replace('"', '""') + '"'
+        columns = [row[1] for row in conn.execute(f"PRAGMA table_info({quoted})")]
+        for row in conn.execute(f"SELECT * FROM {quoted} ORDER BY rowid"):
+            values = dict(zip(columns, row))
+            if table == "settings" and values.get("key") == "encryption_key":
+                values["value"] = "<redacted>"
+            for secret in ("secret_key_encrypted", "password_hash"):
+                if values.get(secret) is not None:
+                    values[secret] = "<redacted>"
+            print(f"row {table}: {json.dumps(values, sort_keys=True, default=repr)}")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

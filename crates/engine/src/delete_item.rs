@@ -56,6 +56,16 @@ pub async fn handle_delete_item(
     // checks (measured 2026-10-27).
     extenddb_core::validation::number::operations::delete_item_key(&input)?;
 
+    // An attribute name over the size limit that arrives through the
+    // condition's ExpressionAttributeNames is input validation, reported
+    // ahead of the table lookup and the condition.
+    extenddb_core::validation::validate_expression_attribute_name_sizes(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+
     // Validate expressions/`Expected` before the existence check,
     // so a missing table returns ValidationException, not ResourceNotFoundException.
     // Key validation stays after existence (it needs the table's key schema).

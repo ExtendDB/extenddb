@@ -14,8 +14,8 @@ use extenddb_core::types::{
     WriteRequest, extract_key, item_size_bytes,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_batch_item_keys, validate_batch_key_only,
-    validate_item_nesting_depth, validate_item_size, validate_key_sizes,
+    AttributeNameRequestForm, validate_attribute_name_sizes, validate_batch_item_keys,
+    validate_batch_key_only, validate_item_nesting_depth, validate_item_size, validate_key_sizes,
 };
 
 use crate::OperationContext;
@@ -65,10 +65,26 @@ pub async fn handle_batch_write_item(
             }
         }
     }
+    // Attribute names over the size limit are request-shape validation: every
+    // PutRequest item is checked before any table lookup and before the key
+    // checks, so a request naming a missing table, or an item missing its key,
+    // answers with the name refusal.
+    for reqs in input.request_items.values() {
+        for put in reqs.iter().filter_map(|wr| wr.put_request.as_ref()) {
+            validate_attribute_name_sizes(
+                &put.item,
+                &ctx.limits,
+                AttributeNameRequestForm::BatchRequest,
+            )?;
+        }
+    }
+
     // Every number in every request is checked before any table is looked up
     // or written: the service reports a malformed number ahead of a missing
     // table, a key type mismatch, a missing key and a duplicate key, and
     // writes none of a batch whose later put holds one (measured 2026-10-27).
+    // An attribute name over the size limit comes first: for one item holding
+    // both, the service answered either fault (measured 2026-11-11).
     extenddb_core::validation::number::operations::batch_write_item(&input)?;
 
     let empty_maps = ExpressionMaps::default();
@@ -104,7 +120,6 @@ pub async fn handle_batch_write_item(
                 )?;
                 validate_item_nesting_depth(&put.item)?;
                 validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-                validate_attribute_name_sizes(&put.item, &ctx.limits)?;
                 validate_key_sizes(&put.item, &key_info.key_schema, &ctx.limits)?;
                 extenddb_core::validation::validate_vector_write(
                     &put.item,
