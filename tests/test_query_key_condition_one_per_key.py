@@ -18,6 +18,13 @@ same key schema, two samples each: an undefined #name anywhere in the
 expression and an undefined :value are reported ahead of the duplicate, and the
 duplicate is reported ahead of the type check and the unused-value check.
 
+The order against the FilterExpression and the table, index, ConsistentRead
+and Select checks was measured 2026-11-11T09:43Z in us-east-1 on a table with
+the same key schema and a KEYS_ONLY global secondary index on g (S), two
+sends each: a FilterExpression fault is reported ahead of the duplicate, and
+the duplicate ahead of a missing table, an unknown index, ConsistentRead on
+the index, an invalid Select and Select ALL_ATTRIBUTES on the index.
+
 Dual-target against Amazon DynamoDB and extenddb.
 """
 
@@ -55,18 +62,30 @@ C = {"S": "carol"}
 N1 = {"N": "1"}
 
 
+KEYS_ONLY_INDEX = "g-keys"
+
+
 @pytest.fixture(scope="class")
 def range_table(dynamodb_client):
-    """pk (S) HASH, sk (S) RANGE, holding alice/bob and alice/carol."""
+    """pk (S) HASH, sk (S) RANGE, holding alice/bob and alice/carol, with a
+    KEYS_ONLY global secondary index on g (S)."""
     with scoped_table(
         dynamodb_client,
         attribute_definitions=[
             {"AttributeName": "pk", "AttributeType": "S"},
             {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"},
         ],
         key_schema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
             {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": KEYS_ONLY_INDEX,
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "KEYS_ONLY"},
+            }
         ],
     ) as name:
         for sk in ("bob", "carol"):
@@ -314,5 +333,102 @@ class TestDuplicateCheckOrder:
         if names is not None:
             kwargs["ExpressionAttributeNames"] = names
         code, msg = _error(lambda: dynamodb_client.query(**kwargs))
+        assert code == "ValidationException"
+        assert msg == ONE_PER_KEY
+
+
+class TestDuplicateAheadOfRequestChecks:
+    """Where the duplicate is reported against the FilterExpression and the
+    table, index, ConsistentRead and Select checks (2026-11-11)."""
+
+    @pytest.mark.parametrize(
+        ("filter_expr", "values", "want"),
+        [
+            (
+                "#q = :a",
+                {":a": A, ":b": B},
+                "Invalid FilterExpression: An expression attribute name used in "
+                "the document path is not defined; attribute name: #q",
+            ),
+            (
+                "foo = :zz",
+                {":a": A, ":b": B},
+                "Invalid FilterExpression: An expression attribute value used in "
+                "expression is not defined; attribute value: :zz",
+            ),
+            (
+                "begins_with(foo, :n)",
+                {":a": A, ":b": B, ":n": N1},
+                "Invalid FilterExpression: Incorrect operand type for operator or "
+                "function; operator or function: begins_with, operand type: N",
+            ),
+            (
+                "name = :a",
+                {":a": A, ":b": B},
+                "Invalid FilterExpression: Attribute name is a reserved keyword; "
+                "reserved keyword: name",
+            ),
+        ],
+        ids=["undefined-name", "undefined-value", "begins-with-number", "reserved-word"],
+    )
+    def test_filter_fault_reported_ahead_of_duplicate(
+        self, dynamodb_client, range_table, filter_expr, values, want
+    ):
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND pk = :b",
+                FilterExpression=filter_expr,
+                ExpressionAttributeValues=values,
+            )
+        )
+        assert code == "ValidationException"
+        assert msg == want
+
+    def test_filter_syntax_error_reported_ahead_of_duplicate(
+        self, dynamodb_client, range_table
+    ):
+        """The service answers `Invalid FilterExpression: Syntax error; token:
+        "=", near: "= = :a"`; extenddb words its syntax errors differently, so
+        only the expression the error names is compared."""
+        code, msg = _error(
+            lambda: dynamodb_client.query(
+                TableName=range_table,
+                KeyConditionExpression="pk = :a AND pk = :b",
+                FilterExpression="zz = = :a",
+                ExpressionAttributeValues={":a": A, ":b": B},
+            )
+        )
+        assert code == "ValidationException"
+        assert msg.startswith("Invalid FilterExpression: "), msg
+
+    @pytest.mark.parametrize(
+        ("kwargs", "on_index"),
+        [
+            ({"TableName": "extenddb-test-484-no-such-table"}, False),
+            ({"IndexName": "nope"}, False),
+            ({"IndexName": KEYS_ONLY_INDEX, "ConsistentRead": True}, True),
+            ({"Select": "BOGUS"}, False),
+            ({"IndexName": KEYS_ONLY_INDEX, "Select": "ALL_ATTRIBUTES"}, True),
+        ],
+        ids=[
+            "missing-table",
+            "unknown-index",
+            "consistent-read-on-gsi",
+            "invalid-select",
+            "all-attributes-on-keys-only-gsi",
+        ],
+    )
+    def test_duplicate_reported_ahead_of_table_index_and_select_checks(
+        self, dynamodb_client, range_table, kwargs, on_index
+    ):
+        key = "g" if on_index else "pk"
+        request = {
+            "TableName": range_table,
+            "KeyConditionExpression": f"{key} = :a AND {key} = :b",
+            "ExpressionAttributeValues": {":a": A, ":b": B},
+            **kwargs,
+        }
+        code, msg = _error(lambda: dynamodb_client.query(**request))
         assert code == "ValidationException"
         assert msg == ONE_PER_KEY

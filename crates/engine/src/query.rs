@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::PathElement;
-use extenddb_core::expression::{ExpressionKind, ExpressionMaps, Projection};
+use extenddb_core::expression::{
+    ExpressionKind, ExpressionMaps, ONE_CONDITION_PER_KEY_ERR, Projection,
+};
 use extenddb_core::types::{
     IndexType, KeyType, QueryInput, QueryOutput, Select, TableKeyInfo,
     VECTOR_INDEX_QUERY_NOT_SUPPORTED,
@@ -44,7 +46,7 @@ use crate::{DispatchMetrics, DispatchResult};
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_query(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Pre-scanned before typed deserialization, sequentially: Query stops at
@@ -60,7 +62,11 @@ pub async fn handle_query(
             clause: crate::EnumClause::Named("returnConsumedCapacity"),
         }],
     )?;
-    crate::validate_enum_fields(
+    // A second condition on one key attribute is reported ahead of an invalid
+    // Select (measured 2026-11-11: `pk = :a AND pk = :b` with Select `BOGUS`
+    // answers the duplicate), so an invalid Select is left out of the typed
+    // input and its error waits for that check below.
+    let select_check = crate::validate_enum_fields(
         &body,
         &[crate::EnumField {
             json_name: "Select",
@@ -72,8 +78,43 @@ pub async fn handle_query(
             ],
             clause: crate::EnumClause::Named("select"),
         }],
-    )?;
+    );
+    if select_check.is_err()
+        && let Some(fields) = body.as_object_mut()
+    {
+        fields.remove("Select");
+    }
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+
+    // Build expression maps from request (used for expression-based parameters)
+    let maps = build_expression_maps(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+    );
+
+    // The key condition is parsed here because the service reports a second
+    // condition on one key attribute ahead of the Select, table, index and
+    // ConsistentRead checks (measured 2026-11-11: with `pk = :a AND pk = :b`,
+    // Select `BOGUS`, a missing table, IndexName `nope`, ConsistentRead on a
+    // GSI and Select `ALL_ATTRIBUTES` on a KEYS_ONLY GSI each answer the
+    // duplicate). The FilterExpression's own faults come first. Any other
+    // fault of the parse is reported further down.
+    let key_condition_parse = input
+        .key_condition_expression
+        .as_deref()
+        .map(|kce| crate::expression_helpers::parse_key_condition_expr(kce, &maps, &ctx.limits));
+    if let Some(Err(DynamoDbError::ValidationException(msg))) = &key_condition_parse
+        && msg == ONE_CONDITION_PER_KEY_ERR
+    {
+        refuse_filter_faults(
+            input.filter_expression.as_deref(),
+            input.expression_attribute_names.as_ref(),
+            &maps,
+            &ctx.limits,
+        )?;
+        return Err(DynamoDbError::ValidationException(msg.clone()));
+    }
+    select_check?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
@@ -199,12 +240,6 @@ pub async fn handle_query(
     // the expression-parameter-usage checks (matching real DynamoDB).
     reject_empty_key_condition_expression(input.key_condition_expression.as_deref())?;
 
-    // Build expression maps from request (used for expression-based parameters)
-    let maps = build_expression_maps(
-        input.expression_attribute_names.as_ref(),
-        input.expression_attribute_values.as_ref(),
-    );
-
     // Reject EAN/EAV supplied with no expression that references them. Legacy
     // KeyConditions does not count as an expression. Query emits no values suffix.
     let has_kce = input
@@ -234,17 +269,13 @@ pub async fn handle_query(
     )?;
 
     // Parse KeyConditionExpression or desugar legacy KeyConditions
-    let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
-        input.key_condition_expression.as_deref()
-    {
-        // The parse refuses, in this order, the first undefined `#name` or
-        // `:value` in the order the expression is written, a `begins_with`
-        // operand of the wrong type and a second condition on one key
-        // attribute, before the clauses are classified (measured 2026-10-31
-        // and 2026-11-11).
-        let parsed =
-            crate::expression_helpers::parse_key_condition_expr(kce_str, &maps, &ctx.limits)?;
-        (parsed, None)
+    let (mut key_condition, legacy_kc_maps) = if let Some(parsed) = key_condition_parse {
+        // Parsed above. The parse refuses, in this order, the first undefined
+        // `#name` or `:value` in the order the expression is written, a
+        // `begins_with` operand of the wrong type and a second condition on
+        // one key attribute, before the clauses are classified (measured
+        // 2026-10-31 and 2026-11-11).
+        (parsed?, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info
             .key_schema
@@ -701,6 +732,33 @@ fn refuse_begins_with_on_number(
         ));
     }
     Ok(())
+}
+
+/// Refuse a `FilterExpression` fault that the service reports ahead of a
+/// second condition on one key attribute.
+///
+/// Measured 2026-11-11 (us-east-1), with `pk = :a AND pk = :b`: a filter
+/// syntax error, a reserved word, an undefined `#name` or `:value`, and a
+/// number in `begins_with` each answer the filter's own message. This runs
+/// only for a key condition with that duplicate.
+fn refuse_filter_faults(
+    filter: Option<&str>,
+    names: Option<&HashMap<String, String>>,
+    maps: &ExpressionMaps,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let Some(filter) = parse_optional_filter(filter, limits)? else {
+        return Ok(());
+    };
+    validate_name_refs_in_expr(&filter, names, ExpressionKind::Filter)?;
+    let mut placeholders = Vec::new();
+    extenddb_core::expression::collect_value_placeholders(&filter, &mut placeholders);
+    for placeholder in &placeholders {
+        maps.resolve_value_for(placeholder, ExpressionKind::Filter.as_str())?;
+    }
+    extenddb_core::expression::validate_begins_with_operands(&filter, maps)
+        .and_then(|()| extenddb_core::expression::validate_ordering_operand_types(&filter, maps))
+        .map_err(|e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter))
 }
 
 /// Validate that all `#name` references in an expression AST are defined.
