@@ -193,7 +193,14 @@ while (admin === null) {
   if (left() <= 0) throw new Error(`mongod on ${PORT} did not answer within ${SECONDS} s (last: ${last})`);
   try {
     const db = connect(`mongodb://localhost:${PORT}/admin?directConnection=true&serverSelectionTimeoutMS=1000`);
-    if (db.runCommand({ping: 1}).ok === 1) admin = db;
+    const pong = db.runCommand({ping: 1});
+    if (pong.ok === 1) {
+      admin = db;
+    } else {
+      last = JSON.stringify(pong);
+      db.getMongo().close();
+      sleep(100);
+    }
   } catch (e) {
     last = e.message;
     sleep(100);
@@ -209,12 +216,18 @@ if (!admin.runCommand({hello: 1}).setName) {
   }
 }
 // An awaitable hello answers when the topology changes, so this waits for
-// the election instead of sleeping and asking again.
+// the election instead of sleeping and asking again. An error reply has no
+// topologyVersion to wait on, so that path pauses and asks plainly.
 let hello = admin.runCommand({hello: 1});
 while (!hello.isWritablePrimary) {
   if (left() <= 0) throw new Error(`not primary within ${SECONDS} s: ${JSON.stringify(hello)}`);
-  hello = admin.runCommand(
-    {hello: 1, topologyVersion: hello.topologyVersion, maxAwaitTimeMS: Math.min(left(), 10000)});
+  if (hello.ok === 1 && hello.topologyVersion) {
+    hello = admin.runCommand(
+      {hello: 1, topologyVersion: hello.topologyVersion, maxAwaitTimeMS: Math.min(left(), 10000)});
+  } else {
+    sleep(100);
+    hello = admin.runCommand({hello: 1});
+  }
 }
 print("primary");
 """
@@ -229,7 +242,10 @@ def become_primary(container: str, port: int, seconds: int = 120) -> bool:
     try:
         done = docker("exec", container, "mongosh", "--nodb", "--quiet", "--eval", script, timeout=seconds + 30)
         out = done.stdout + done.stderr
-        ok = done.returncode == 0 and out.strip() == "primary"
+        # mongosh may add warnings on either stream; the script's own answer
+        # is the last line it prints.
+        lines = done.stdout.strip().splitlines()
+        ok = done.returncode == 0 and bool(lines) and lines[-1].strip() == "primary"
     except subprocess.TimeoutExpired as e:
         ok, out = False, f"mongosh did not finish within {seconds + 30} s\n{_text(e.stdout)}{_text(e.stderr)}"
     if ok:
