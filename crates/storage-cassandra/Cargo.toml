@@ -50,7 +50,7 @@ extenddb-storage-cassandra = { path = ".", features = ["test-util"] }
 # The move's claim test runs the engine's `--move-store` over this backend and
 # a filesystem store (the engine depends on `extenddb-storage`, not on this
 # crate, so the edge is acyclic).
-extenddb-engine = { workspace = true }
-extenddb-backup-store = { workspace = true }
+extenddb-engine = { path = "../engine" }
+extenddb-backup-store = { path = "../backup-store" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
