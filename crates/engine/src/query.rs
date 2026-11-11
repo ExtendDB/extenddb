@@ -237,10 +237,11 @@ pub async fn handle_query(
     let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
         input.key_condition_expression.as_deref()
     {
-        // The parse refuses a second condition on one key attribute, after
-        // the expression's `#name` and `:value` references are checked and
-        // before the clauses are classified, which is where the service
-        // reports it (measured 2026-10-31).
+        // The parse refuses, in this order, the first undefined `#name` or
+        // `:value` in the order the expression is written, a `begins_with`
+        // operand of the wrong type and a second condition on one key
+        // attribute, before the clauses are classified (measured 2026-10-31
+        // and 2026-11-11).
         let parsed =
             crate::expression_helpers::parse_key_condition_expr(kce_str, &maps, &ctx.limits)?;
         (parsed, None)

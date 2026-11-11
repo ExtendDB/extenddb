@@ -239,7 +239,8 @@ pub fn parse_projection_expr(
 /// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
 ///
 /// `maps` holds the request's `ExpressionAttributeNames` and
-/// `ExpressionAttributeValues`, which the parse reads to refuse a second
+/// `ExpressionAttributeValues`. The parse reads them to refuse an undefined
+/// reference, a `begins_with` operand of the wrong type and a second
 /// condition on one key attribute.
 ///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
@@ -247,7 +248,7 @@ pub fn parse_projection_expr(
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors, and for a second condition on one key attribute.
+/// reserved-word errors, and for the faults above.
 pub fn parse_key_condition_expr(
     expr: &str,
     maps: &ExpressionMaps,
@@ -263,7 +264,7 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition_with_maps(&tokens, &maps.names, &maps.values)
+        parse_key_condition_with_maps(&tokens, maps)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }

@@ -15,10 +15,12 @@
 
 use super::ast::{CompareOp, Expr, PathElement};
 use super::parser_common;
+use super::resolver::{ExpressionMaps, attribute_type_code};
 use super::tokenizer::Token;
 use crate::error::DynamoDbError;
 use crate::types::{
-    KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema, range_key_elements,
+    AttributeValue, KeySchemaElement, KeyType, hash_key_elements, is_multipart_key_schema,
+    range_key_elements,
 };
 
 /// Parsed key condition: partition key value expression(s) and optional sort key condition.
@@ -81,12 +83,10 @@ impl KeyCondition {
         let pk_name = match self.pk_path.first() {
             Some(PathElement::Attribute(name)) => {
                 if let Some(ref_name) = name.strip_prefix('#') {
-                    names.get(ref_name).map(String::as_str).ok_or_else(|| {
-                        DynamoDbError::ValidationException(format!(
-                            "Invalid KeyConditionExpression: An expression attribute name used in \
-                             the document path is not defined; attribute name: #{ref_name}"
-                        ))
-                    })?
+                    names
+                        .get(ref_name)
+                        .map(String::as_str)
+                        .ok_or_else(|| undefined_name_err(ref_name))?
                 } else {
                     name.as_str()
                 }
@@ -469,69 +469,88 @@ impl KeyCondition {
 /// condition on the same key attribute. Measured 2026-10-24 (us-east-1).
 const ONE_CONDITION_PER_KEY_ERR: &str = "Invalid KeyConditionExpression: KeyConditionExpressions must only contain one condition per key";
 
+/// The service's message for a `#name` reference that
+/// `ExpressionAttributeNames` does not define.
+fn undefined_name_err(reference: &str) -> DynamoDbError {
+    validation_err(&format!(
+        "Invalid KeyConditionExpression: An expression attribute name used in the document \
+         path is not defined; attribute name: #{reference}"
+    ))
+}
+
+/// Refuse the first `#name` or `:value` reference that `maps` does not define,
+/// in the order the expression is written, names and values alike.
+///
+/// Measured 2026-11-10 and 2026-11-11 (us-east-1): the service names the
+/// first undefined reference in text order (`pk = :q AND #u = :c` with no
+/// maps answers `:q`; `#u = :a AND #u = :b` answers `#u`), with or without a
+/// second condition on one key attribute, and ahead of an unused name or
+/// value.
+fn check_references(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
+    for token in tokens {
+        match token {
+            Token::NameRef(name) if !maps.names.contains_key(name) => {
+                return Err(undefined_name_err(name));
+            }
+            Token::Placeholder(placeholder) => {
+                maps.resolve_value_for(placeholder, "KeyConditionExpression")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `begins_with` operand that is not a string or a binary value.
+///
+/// Measured 2026-11-11 (us-east-1): `pk = :a AND begins_with(sk, :n) AND
+/// sk = :b` with `:n` a number answers this ahead of the one-condition-per-key
+/// message.
+fn check_begins_with_operands(
+    clauses: &[RawClause],
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    for clause in clauses {
+        if let RawClause::BeginsWith(_, Expr::Placeholder(placeholder)) = clause
+            && let Some(value) = maps.values.get(placeholder)
+            && !matches!(value, AttributeValue::S(_) | AttributeValue::B(_))
+        {
+            return Err(validation_err(&format!(
+                "Invalid KeyConditionExpression: Incorrect operand type for operator or \
+                 function; operator or function: begins_with, operand type: {}",
+                attribute_type_code(value)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a key condition with more than one condition on one key attribute.
 ///
 /// Two clauses name the same attribute when their paths resolve to the same
 /// name through `names`, whether each is written as a plain name or as a
-/// `#name` reference. Two clauses on one `#name` reference name the same
-/// attribute whether or not `names` defines it. DynamoDB allows one condition
-/// per key attribute, on the partition key and on the sort key alike, whatever
-/// the operators are (measured 2026-10-24).
-///
-/// The service resolves every `#name` and `:value` reference before it looks
-/// for a duplicate (measured 2026-10-31), so when a duplicate is found an
-/// undefined `#name` in any clause is reported first, then an undefined
-/// `:value`, each with the service's text. A key condition without a duplicate
-/// passes, and the checks that follow report its undefined references.
-fn reject_duplicate_key_attrs<V>(
+/// `#name` reference. DynamoDB allows one condition per key attribute, on the
+/// partition key and on the sort key alike, whatever the operators are
+/// (measured 2026-10-24, and 2026-11-11 for `<>` and `contains`).
+fn reject_duplicate_key_attrs(
     clauses: &[RawClause],
     names: &std::collections::HashMap<String, String>,
-    values: &std::collections::HashMap<String, V>,
 ) -> Result<(), DynamoDbError> {
     let mut seen: Vec<&str> = Vec::with_capacity(clauses.len());
-    let mut duplicated = false;
     for clause in clauses {
         let Some(PathElement::Attribute(name)) = raw_clause_path(clause).first() else {
             continue;
         };
-        // An undefined reference keeps its `#`, which no plain name carries.
         let attr = match name.strip_prefix('#') {
             Some(reference) => names.get(reference).map_or(name.as_str(), String::as_str),
             None => name.as_str(),
         };
         if seen.contains(&attr) {
-            duplicated = true;
-            break;
+            return Err(validation_err(ONE_CONDITION_PER_KEY_ERR));
         }
         seen.push(attr);
     }
-    if !duplicated {
-        return Ok(());
-    }
-    for clause in clauses {
-        if let Some(PathElement::Attribute(name)) = raw_clause_path(clause).first()
-            && let Some(reference) = name.strip_prefix('#')
-            && !names.contains_key(reference)
-        {
-            return Err(validation_err(&format!(
-                "Invalid KeyConditionExpression: An expression attribute name used in the \
-                 document path is not defined; attribute name: #{reference}"
-            )));
-        }
-    }
-    for clause in clauses {
-        for value in raw_clause_values(clause) {
-            if let Expr::Placeholder(placeholder) = value
-                && !values.contains_key(placeholder)
-            {
-                return Err(validation_err(&format!(
-                    "Invalid KeyConditionExpression: An expression attribute value used in \
-                     expression is not defined; attribute value: :{placeholder}"
-                )));
-            }
-        }
-    }
-    Err(validation_err(ONE_CONDITION_PER_KEY_ERR))
+    Ok(())
 }
 
 /// Resolve a path's top-level attribute name, handling `#name` references.
@@ -542,12 +561,10 @@ fn resolve_path_attr(
     match path.first() {
         Some(PathElement::Attribute(name)) => {
             if let Some(ref_name) = name.strip_prefix('#') {
-                names.get(ref_name).cloned().ok_or_else(|| {
-                    DynamoDbError::ValidationException(format!(
-                        "Invalid KeyConditionExpression: An expression attribute name used in \
-                         the document path is not defined; attribute name: #{ref_name}"
-                    ))
-                })
+                names
+                    .get(ref_name)
+                    .cloned()
+                    .ok_or_else(|| undefined_name_err(ref_name))
             } else {
                 Ok(name.clone())
             }
@@ -612,40 +629,54 @@ pub fn parse_key_condition(tokens: &[Token]) -> Result<KeyCondition, DynamoDbErr
     classify_clauses(parse_clauses(tokens)?)
 }
 
-/// [`parse_key_condition`] with the request's `ExpressionAttributeNames`
-/// (`names`, keyed without the leading `#`) and `ExpressionAttributeValues`
-/// (`values`, keyed without the leading `:`; only which placeholders are
-/// defined is read).
+/// [`parse_key_condition`] with the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`.
 ///
 /// After the parser's own checks, and before any clause is read as the
-/// partition or the sort key condition, this refuses a key condition with more
-/// than one condition on one key attribute, written with plain names or
-/// through `#name` references. When there is such a duplicate, an undefined
-/// `#name` and then an undefined `:value` are reported ahead of it, as the
-/// service reports them. The engine reads a `Query` key condition through
-/// this.
+/// partition or the sort key condition, this refuses, in this order: the first
+/// undefined `#name` or `:value` reference in the order the expression is
+/// written, a `begins_with` operand that is not a string or a binary value,
+/// and a key condition with more than one condition on one key attribute,
+/// written with plain names or through `#name` references. An operator a key
+/// condition does not support (`<>`, `contains`) is refused after these. The
+/// engine reads a `Query` key condition through this.
 ///
 /// # Errors
 ///
-/// As [`parse_key_condition`], plus `ValidationException` for a second
-/// condition on one key attribute.
-pub fn parse_key_condition_with_maps<V>(
+/// As [`parse_key_condition`], plus `ValidationException` for each of the
+/// faults above.
+pub fn parse_key_condition_with_maps(
     tokens: &[Token],
-    names: &std::collections::HashMap<String, String>,
-    values: &std::collections::HashMap<String, V>,
+    maps: &ExpressionMaps,
 ) -> Result<KeyCondition, DynamoDbError> {
     let clauses = parse_clauses(tokens)?;
-    reject_duplicate_key_attrs(&clauses, names, values)?;
+    check_references(tokens, maps)?;
+    check_begins_with_operands(&clauses, maps)?;
+    reject_duplicate_key_attrs(&clauses, &maps.names)?;
     classify_clauses(clauses)
 }
 
 /// Read the parsed clauses as a partition key condition and sort key
-/// conditions.
+/// conditions, after refusing the first clause whose operator a key condition
+/// does not support.
 fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError> {
+    refuse_unsupported_clauses(&clauses)?;
     match clauses.len() {
         1 => classify_single(clauses.remove(0)),
         2 => classify_pair(clauses.remove(0), clauses.remove(0)),
         _ => classify_multi(clauses),
+    }
+}
+
+/// Refuse the first clause whose operator a key condition does not support,
+/// with its message.
+fn refuse_unsupported_clauses(clauses: &[RawClause]) -> Result<(), DynamoDbError> {
+    match clauses.iter().find_map(|clause| match clause {
+        RawClause::Unsupported(_, message) => Some(*message),
+        _ => None,
+    }) {
+        Some(message) => Err(validation_err(message)),
+        None => Ok(()),
     }
 }
 
@@ -670,7 +701,9 @@ fn classify_clauses(mut clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoD
 pub fn key_condition_clause_operands(
     tokens: &[Token],
 ) -> Result<Vec<KeyClauseOperand>, DynamoDbError> {
-    Ok(parse_clauses(tokens)?
+    let clauses = parse_clauses(tokens)?;
+    refuse_unsupported_clauses(&clauses)?;
+    Ok(clauses
         .into_iter()
         .filter_map(|clause| match clause {
             RawClause::Eq(path, value) => Some(KeyClauseOperand {
@@ -685,7 +718,7 @@ pub fn key_condition_clause_operands(
                     equality: false,
                 })
             }
-            RawClause::Between(..) => None,
+            RawClause::Between(..) | RawClause::Unsupported(..) => None,
         })
         .collect())
 }
@@ -756,16 +789,8 @@ fn raw_clause_path(clause: &RawClause) -> &[PathElement] {
         RawClause::Eq(path, _)
         | RawClause::Compare(path, _, _)
         | RawClause::Between(path, _, _)
-        | RawClause::BeginsWith(path, _) => path,
-    }
-}
-
-/// The value operands of a raw clause, in the order they are written.
-fn raw_clause_values(clause: &RawClause) -> Vec<&Expr> {
-    match clause {
-        RawClause::Eq(_, value) | RawClause::Compare(_, _, value) => vec![value],
-        RawClause::Between(_, low, high) => vec![low, high],
-        RawClause::BeginsWith(_, prefix) => vec![prefix],
+        | RawClause::BeginsWith(path, _)
+        | RawClause::Unsupported(path, _) => path,
     }
 }
 
@@ -789,6 +814,11 @@ enum RawClause {
     Compare(Vec<PathElement>, CompareOp, Expr),
     Between(Vec<PathElement>, Expr, Expr),
     BeginsWith(Vec<PathElement>, Expr),
+    /// A clause whose operator a key condition does not support, with the
+    /// message it is refused with. It stays a clause until a second
+    /// condition on its attribute has been looked for, which the service
+    /// reports first.
+    Unsupported(Vec<PathElement>, &'static str),
 }
 
 enum KeyOperand {
@@ -822,7 +852,7 @@ fn classify_pair(a: RawClause, b: RawClause) -> Result<KeyCondition, DynamoDbErr
                 pk_path,
                 pk_value,
                 extra_pk_conditions: Vec::new(),
-                sk_condition: Some(raw_to_sk(sk)),
+                sk_condition: Some(raw_to_sk(sk)?),
                 extra_sk_conditions: Vec::new(),
             })
         }
@@ -852,7 +882,7 @@ fn classify_multi(clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError
                         "Invalid KeyConditionExpression: at most one non-equality condition is allowed",
                     ));
                 }
-                non_eq = Some(raw_to_sk(other));
+                non_eq = Some(raw_to_sk(other)?);
             }
         }
     }
@@ -888,8 +918,10 @@ fn classify_multi(clauses: Vec<RawClause>) -> Result<KeyCondition, DynamoDbError
     })
 }
 
-fn raw_to_sk(clause: RawClause) -> SortKeyCondition {
-    match clause {
+/// The sort key condition a clause becomes. [`classify_clauses`] refuses an
+/// unsupported clause before any clause reaches this.
+fn raw_to_sk(clause: RawClause) -> Result<SortKeyCondition, DynamoDbError> {
+    Ok(match clause {
         RawClause::Eq(path, value) => SortKeyCondition::Compare {
             path,
             op: CompareOp::Eq,
@@ -898,7 +930,8 @@ fn raw_to_sk(clause: RawClause) -> SortKeyCondition {
         RawClause::Compare(path, op, value) => SortKeyCondition::Compare { path, op, value },
         RawClause::Between(path, low, high) => SortKeyCondition::Between { path, low, high },
         RawClause::BeginsWith(path, prefix) => SortKeyCondition::BeginsWith { path, prefix },
-    }
+        RawClause::Unsupported(_, message) => return Err(validation_err(message)),
+    })
 }
 
 fn parse_key_clause(tokens: &[Token], pos: &mut usize) -> Result<RawClause, DynamoDbError> {
@@ -931,19 +964,25 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
         ));
     }
 
-    // begins_with(path, :val)
+    // begins_with(path, :val), and contains(path, :val), which a key condition
+    // refuses once a second condition on its attribute has been looked for.
     if let Token::Ident(name) = &tokens[*pos]
-        && name.eq_ignore_ascii_case("begins_with")
+        && (name.eq_ignore_ascii_case("begins_with") || name.eq_ignore_ascii_case("contains"))
         && *pos + 1 < tokens.len()
         && tokens[*pos + 1] == Token::LParen
     {
+        let begins_with = name.eq_ignore_ascii_case("begins_with");
         *pos += 1; // skip function name
         parser_common::expect_token(tokens, pos, &Token::LParen, "(", "KeyConditionExpression")?;
         let path = parse_key_operand_path(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::Comma, ",", "KeyConditionExpression")?;
         let prefix = parse_key_value(tokens, pos)?;
         parser_common::expect_token(tokens, pos, &Token::RParen, ")", "KeyConditionExpression")?;
-        return Ok(RawClause::BeginsWith(path, prefix));
+        return Ok(if begins_with {
+            RawClause::BeginsWith(path, prefix)
+        } else {
+            RawClause::Unsupported(path, EXPECTED_COMPARISON_OPERATOR)
+        });
     }
 
     // path op :value | :value op path | path BETWEEN :lo AND :hi
@@ -958,19 +997,14 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     let path = match left {
         KeyOperand::Path(path) => path,
         KeyOperand::Value(value) => {
-            let op = try_comparator(&tokens[*pos]).ok_or_else(|| {
-                validation_err("Invalid KeyConditionExpression: expected comparison operator")
-            })?;
-            // DynamoDB rejects <> in KeyConditionExpression — only =, <, <=, >, >=
-            // are valid key condition operators.
-            if op == CompareOp::Ne {
-                return Err(validation_err(
-                    "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE",
-                ));
-            }
+            let op = try_comparator(&tokens[*pos])
+                .ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
             *pos += 1;
 
             let path = parse_key_operand_path(tokens, pos)?;
+            if op == CompareOp::Ne {
+                return Ok(RawClause::Unsupported(path, NE_UNSUPPORTED));
+            }
             // Key conditions are stored path-first, so reverse the operator when
             // the source expression puts the value placeholder on the left.
             let op = reverse_comparator(op);
@@ -993,26 +1027,33 @@ fn parse_key_clause_inner(tokens: &[Token], pos: &mut usize) -> Result<RawClause
     }
 
     // Comparison operator
-    let op = try_comparator(&tokens[*pos]).ok_or_else(|| {
-        validation_err("Invalid KeyConditionExpression: expected comparison operator")
-    })?;
-    // DynamoDB rejects <> in KeyConditionExpression — only =, <, <=, >, >=
-    // are valid key condition operators.
-    if op == CompareOp::Ne {
-        return Err(validation_err(
-            "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE",
-        ));
-    }
+    let op =
+        try_comparator(&tokens[*pos]).ok_or_else(|| validation_err(EXPECTED_COMPARISON_OPERATOR))?;
     *pos += 1;
 
     let value = parse_key_value(tokens, pos)?;
 
-    if op == CompareOp::Eq {
+    if op == CompareOp::Ne {
+        Ok(RawClause::Unsupported(path, NE_UNSUPPORTED))
+    } else if op == CompareOp::Eq {
         Ok(RawClause::Eq(path, value))
     } else {
         Ok(RawClause::Compare(path, op, value))
     }
 }
+
+/// A key condition allows `=`, `<`, `<=`, `>` and `>=`, and refuses `<>` with
+/// this. A second condition on the same attribute is reported first
+/// (measured 2026-11-11: `pk = :a AND pk <> :b` answers the
+/// one-condition-per-key message).
+const NE_UNSUPPORTED: &str = "Invalid KeyConditionExpression: Unsupported operator on KeyCondition: NE";
+
+/// The refusal of a clause with no comparison operator, and of a `contains`
+/// clause. A second condition on the same attribute is reported ahead of
+/// `contains` (measured 2026-11-11: `pk = :a AND contains(pk, :b)` answers
+/// the one-condition-per-key message).
+const EXPECTED_COMPARISON_OPERATOR: &str =
+    "Invalid KeyConditionExpression: expected comparison operator";
 
 fn parse_key_operand(tokens: &[Token], pos: &mut usize) -> Result<KeyOperand, DynamoDbError> {
     if *pos >= tokens.len() {
@@ -2028,9 +2069,6 @@ mod tests {
         assert_eq!(kc.pk_path, vec![PathElement::Attribute("pk".to_owned())]);
     }
 
-    const UNDEFINED_NAME_U: &str = "Invalid KeyConditionExpression: An expression attribute \
-                                    name used in the document path is not defined; attribute \
-                                    name: #u";
     const TYPE_ERR: &str = "One or more parameter values were invalid: Condition parameter \
                             type does not match schema type";
 
@@ -2061,16 +2099,30 @@ mod tests {
             .collect()
     }
 
-    /// Parse `expr` as the engine parses a request's key condition, with every
-    /// placeholder defined.
+    /// Parse `expr` as the engine parses a request's key condition.
+    fn parse_with(
+        expr: &str,
+        names: &HashMap<String, String>,
+        values: &HashMap<String, AttributeValue>,
+    ) -> Result<KeyCondition, DynamoDbError> {
+        let tokens = tokenize(expr).unwrap();
+        parse_key_condition_with_maps(&tokens, &ExpressionMaps::new(names.clone(), values.clone()))
+    }
+
+    /// [`parse_with`] with every placeholder of `expr` defined.
     fn parse_request(
         expr: &str,
         names: &HashMap<String, String>,
     ) -> Result<KeyCondition, DynamoDbError> {
-        let tokens = tokenize(expr).unwrap();
-        parse_key_condition_with_maps(&tokens, names, &values_of(expr))
+        parse_with(expr, names, &values_of(expr))
     }
 
+    fn undefined_value(value: &str) -> String {
+        format!(
+            "Invalid KeyConditionExpression: An expression attribute value used in \
+             expression is not defined; attribute value: :{value}"
+        )
+    }
     fn assert_refused<T: std::fmt::Debug>(
         result: Result<T, DynamoDbError>,
         want: &str,
@@ -2137,67 +2189,59 @@ mod tests {
         assert_refused(parse_request(expr, &names), ONE_CONDITION_PER_KEY_ERR, expr);
     }
 
-    /// With a duplicate present, an undefined `#name` anywhere in the
-    /// expression is reported first. Measured 2026-10-24 for
-    /// `#u = :a AND #u = :b` and 2026-10-31 for the next three; the
-    /// multi-attribute form is not measured.
+    /// The first undefined reference in the order the expression is written is
+    /// reported, a `#name` or a `:value`, with or without a duplicate.
+    /// Measured 2026-10-24 for `#u = :a AND #u = :b`, 2026-10-31 for the
+    /// duplicates with `#u` the only undefined reference, and 2026-11-11 for
+    /// the rest (us-east-1, two sends each). The multi-attribute form is not
+    /// measured.
     #[test]
-    fn undefined_name_reported_ahead_of_duplicate() {
-        for expr in [
-            "#u = :a AND #u = :b",
-            "#u = :a AND #u > :b",
-            "#u = :a AND sk = :b AND sk = :c",
-            "pk = :a AND pk = :b AND #u = :c",
-            "h = :a AND h = :b AND #u = :c",
+    fn first_undefined_reference_in_text_order_is_reported() {
+        let none = HashMap::new();
+        for (expr, values, want) in [
+            // Every placeholder defined, `#u` the only undefined reference.
+            ("#u = :a AND #u = :b", values_of("#u = :a AND #u = :b"), "#u"),
+            ("#u = :a AND #u > :b", values_of("#u = :a AND #u > :b"), "#u"),
+            (
+                "#u = :a AND sk = :b AND sk = :c",
+                values_of("#u = :a AND sk = :b AND sk = :c"),
+                "#u",
+            ),
+            (
+                "pk = :a AND pk = :b AND #u = :c",
+                values_of("pk = :a AND pk = :b AND #u = :c"),
+                "#u",
+            ),
+            (
+                "h = :a AND h = :b AND #u = :c",
+                values_of("h = :a AND h = :b AND #u = :c"),
+                "#u",
+            ),
+            // No maps, or only some values: the first in text order.
+            ("#u = :a AND #u = :b", no_values(), "#u"),
+            ("pk = :q AND #u = :c", no_values(), ":q"),
+            ("sk = :b AND pk = :a", no_values(), ":b"),
+            ("pk = :b AND pk = :a", no_values(), ":b"),
+            ("pk = :a AND pk = :b AND #u = :c", no_values(), ":a"),
+            (
+                "pk = :q AND pk = :b AND #u = :c",
+                values_of(":b :c"),
+                ":q",
+            ),
+            ("pk = :a AND pk = :missing", values_of(":a"), ":missing"),
+            ("#k = :v", no_values(), "#k"),
+            ("pk = :v", no_values(), ":v"),
         ] {
-            assert_refused(parse_request(expr, &HashMap::new()), UNDEFINED_NAME_U, expr);
+            let want = match want.strip_prefix('#') {
+                Some(name) => format!(
+                    "Invalid KeyConditionExpression: An expression attribute name used in the \
+                     document path is not defined; attribute name: #{name}"
+                ),
+                None => undefined_value(&want[1..]),
+            };
+            assert_refused(parse_with(expr, &none, &values), &want, expr);
         }
-        // Without a duplicate the parse passes, and `resolve_pk_sk` reports
-        // the name.
-        let mut kc = parse_request("#u = :a AND sk = :b", &HashMap::new()).unwrap();
-        assert_refused(
-            kc.resolve_pk_sk("pk", &HashMap::new()),
-            UNDEFINED_NAME_U,
-            "#u = :a AND sk = :b",
-        );
     }
-
-    /// With a duplicate present, an undefined `:value` is reported ahead of it
-    /// (measured 2026-10-31: `pk = :a AND pk = :b` without
-    /// `ExpressionAttributeValues` answers the undefined-value message for
-    /// `:a`). Which of an undefined name and an undefined value the service
-    /// reports first is not measured; the name is checked first here.
-    #[test]
-    fn undefined_value_reported_ahead_of_duplicate() {
-        let undefined = |value: &str| {
-            format!(
-                "Invalid KeyConditionExpression: An expression attribute value used in \
-                 expression is not defined; attribute value: :{value}"
-            )
-        };
-        let tokens = tokenize("pk = :a AND pk = :b").unwrap();
-        assert_refused(
-            parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()),
-            &undefined("a"),
-            "pk = :a AND pk = :b",
-        );
-        let tokens = tokenize("pk = :a AND pk = :missing").unwrap();
-        assert_refused(
-            parse_key_condition_with_maps(&tokens, &HashMap::new(), &values_of("pk = :a")),
-            &undefined("missing"),
-            "pk = :a AND pk = :missing",
-        );
-        let tokens = tokenize("pk = :a AND pk = :b AND #u = :c").unwrap();
-        assert_refused(
-            parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()),
-            UNDEFINED_NAME_U,
-            "pk = :a AND pk = :b AND #u = :c",
-        );
-        // Without a duplicate the parse does not read the values.
-        let tokens = tokenize("pk = :a AND sk = :b").unwrap();
-        assert!(parse_key_condition_with_maps(&tokens, &HashMap::new(), &no_values()).is_ok());
-    }
-
     /// The duplicate is reported by the parse, so it comes ahead of the key
     /// value type check that `resolve_key_schema_with` runs and of the engine's
     /// unused-value check, whichever way it is spelled (measured 2026-10-31:
@@ -2224,15 +2268,13 @@ mod tests {
             "pk = :a AND #s = :b AND sk = :n",
             "pk = :a AND pk = :b",
         ] {
-            let tokens = tokenize(expr).unwrap();
             assert_refused(
-                parse_key_condition_with_maps(&tokens, &names, &values),
+                parse_with(expr, &names, &values),
                 ONE_CONDITION_PER_KEY_ERR,
                 expr,
             );
         }
-        let tokens = tokenize("pk = :n").unwrap();
-        let mut kc = parse_key_condition_with_maps(&tokens, &names, &values).unwrap();
+        let mut kc = parse_with("pk = :n", &names, &values).unwrap();
         assert_refused(
             kc.resolve_key_schema_with(&schema, &names, |_, value| match value {
                 Expr::Placeholder(name) if name == "n" => Err(validation_err(TYPE_ERR)),
@@ -2241,6 +2283,36 @@ mod tests {
             TYPE_ERR,
             "pk = :n",
         );
+    }
+
+    /// `<>` and `contains` are refused after the duplicate check, and a
+    /// `begins_with` operand that is not a string or a binary value before it
+    /// (measured 2026-11-11, us-east-1, two sends each). Without a duplicate,
+    /// `<>` and `contains` keep the messages they had.
+    #[test]
+    fn operators_and_operands_around_the_duplicate_check() {
+        const BEGINS_WITH_N: &str = "Invalid KeyConditionExpression: Incorrect operand type \
+                                     for operator or function; operator or function: \
+                                     begins_with, operand type: N";
+        let mut values = values_of(":a :b :c");
+        values.insert("n".to_owned(), AttributeValue::N("1".to_owned()));
+        let none = HashMap::new();
+        for (expr, want) in [
+            ("pk = :a AND pk <> :b", ONE_CONDITION_PER_KEY_ERR),
+            ("pk = :a AND contains(pk, :b)", ONE_CONDITION_PER_KEY_ERR),
+            ("pk = :a AND begins_with(sk, :n) AND sk = :b", BEGINS_WITH_N),
+            ("pk = :a AND sk <> :b", NE_UNSUPPORTED),
+            ("pk = :a AND :b <> sk", NE_UNSUPPORTED),
+            ("pk = :a AND contains(sk, :b)", EXPECTED_COMPARISON_OPERATOR),
+        ] {
+            assert_refused(parse_with(expr, &none, &values), want, expr);
+        }
+        // The map-less parse authorization reads refuses them too.
+        for expr in ["pk = :a AND pk <> :b", "pk = :a AND contains(pk, :b)"] {
+            let tokens = tokenize(expr).unwrap();
+            assert!(parse_key_condition(&tokens).is_err(), "expr {expr}");
+            assert!(key_condition_clause_operands(&tokens).is_err(), "expr {expr}");
+        }
     }
 
     #[test]
