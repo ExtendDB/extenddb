@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "SQLite storage backend of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # Compile the in-memory (`:memory:`) database in as the default storage path,
@@ -41,12 +44,12 @@ libc = { workspace = true }
 libsqlite3-sys = { workspace = true }
 
 [dev-dependencies]
-extenddb-storage = { workspace = true, features = ["test-util"] }
+extenddb-storage = { path = "../storage", features = ["test-util"] }
 # `tests/backup_job_panic.rs` drives the engine's CreateBackup job and
 # reconciler against a `SqliteEngine` (the engine depends on `extenddb-storage`,
 # not on this crate, so the edge is acyclic).
-extenddb-engine = { workspace = true }
-extenddb-backup-store = { workspace = true }
+extenddb-engine = { path = "../engine" }
+extenddb-backup-store = { path = "../backup-store" }
 # The slow-statement test sets sqlx's threshold, a `log` level, and prints
 # every tracing event of a child process.
 log = "0.4"
