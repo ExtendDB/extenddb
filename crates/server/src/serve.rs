@@ -473,11 +473,14 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             } else {
                 "or sign with the configured EXTENDDB_DEV_ACCESS_KEY_ID pair"
             };
+            let switch_note = crate::dev_credentials::ignored_key_switch_note(&ignored, &dev_creds)
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default();
             tracing::warn!(
                 "AWS_ACCESS_KEY_ID is set in the environment but dev mode does not adopt \
-                 it; requests signed with '{ignored}' will get UnrecognizedClientException. \
-                 Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY to seed \
-                 an additional credential, {alternative}."
+                 it; requests signed with '{ignored}' will get UnrecognizedClientException.\
+                 {switch_note} Set EXTENDDB_DEV_ACCESS_KEY_ID and EXTENDDB_DEV_SECRET_ACCESS_KEY \
+                 to seed an additional credential, {alternative}."
             );
         }
     }

@@ -99,19 +99,35 @@ impl std::fmt::Debug for DevCredential {
 /// disable switch holds an unrecognised value, or when the example pair is
 /// disabled without an `EXTENDDB_DEV_*` pair to replace it.
 pub fn resolve() -> anyhow::Result<Vec<DevCredential>> {
-    resolve_with(|name| std::env::var(name).ok())
+    resolve_with(|name| std::env::var_os(name))
 }
 
 /// [`resolve`], reading each variable through `env` (`None` when unset), so
 /// tests can supply the environment.
-fn resolve_with(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Vec<DevCredential>> {
-    let non_empty = |name: &str| env(name).filter(|s| !s.is_empty());
+fn resolve_with(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Vec<DevCredential>> {
+    let non_empty = |name: &str| {
+        env(name)
+            .and_then(|v| v.into_string().ok())
+            .filter(|s| !s.is_empty())
+    };
+    // Read as-is, not through `non_empty`: an empty value is refused rather
+    // than read as unset (see `parse_switch`), and so is a value that is not
+    // UTF-8, which `std::env::var(..).ok()` would also have read as unset,
+    // leaving the example pair active with nothing printed.
+    let switch = match env(ENV_DISABLE_EXAMPLE) {
+        None => None,
+        Some(value) => Some(value.into_string().map_err(|_| {
+            anyhow::anyhow!(
+                "{ENV_DISABLE_EXAMPLE} is not valid UTF-8; set it to 1, true, 0 or false."
+            )
+        })?),
+    };
     resolve_from(
         non_empty(ENV_ACCESS_KEY_ID),
         non_empty(ENV_SECRET_ACCESS_KEY),
-        // Read as-is, not through `non_empty`: an empty value is refused
-        // rather than read as unset (see `parse_switch`).
-        parse_switch(ENV_DISABLE_EXAMPLE, env(ENV_DISABLE_EXAMPLE))?,
+        parse_switch(ENV_DISABLE_EXAMPLE, switch)?,
     )
 }
 
@@ -154,6 +170,13 @@ fn resolve_from(
         });
     }
 
+    // With the switch set, "neither" is refused above, so the half-set
+    // messages must not offer it.
+    let set_both = if disable_example {
+        format!("set both, as {ENV_DISABLE_EXAMPLE} requires.")
+    } else {
+        "set both to seed an additional dev credential, or neither.".to_owned()
+    };
     let (key_id, secret) = match (custom_key_id, custom_secret) {
         (None, None) if disable_example => anyhow::bail!(
             "{ENV_DISABLE_EXAMPLE} is set, which removes the built-in example credential, \
@@ -163,12 +186,10 @@ fn resolve_from(
         (None, None) => return Ok(credentials),
         (Some(k), Some(s)) => (k, s),
         (Some(_), None) => anyhow::bail!(
-            "{ENV_ACCESS_KEY_ID} is set but {ENV_SECRET_ACCESS_KEY} is not; \
-             set both to seed an additional dev credential, or neither."
+            "{ENV_ACCESS_KEY_ID} is set but {ENV_SECRET_ACCESS_KEY} is not; {set_both}"
         ),
         (None, Some(_)) => anyhow::bail!(
-            "{ENV_SECRET_ACCESS_KEY} is set but {ENV_ACCESS_KEY_ID} is not; \
-             set both to seed an additional dev credential, or neither."
+            "{ENV_SECRET_ACCESS_KEY} is set but {ENV_ACCESS_KEY_ID} is not; {set_both}"
         ),
     };
 
@@ -180,6 +201,11 @@ fn resolve_from(
     // This also matches real AWS, which rejects fabricated key ids with
     // UnrecognizedClientException rather than authenticating them.
     if !key_id.starts_with("AKIA") {
+        // With the switch set the example pair is not seeded, so it is no
+        // alternative to point at.
+        if disable_example {
+            anyhow::bail!("{ENV_ACCESS_KEY_ID} must be AKIA-shaped (got '{key_id}').");
+        }
         anyhow::bail!(
             "{ENV_ACCESS_KEY_ID} must be AKIA-shaped (got '{key_id}'). The built-in \
              example pair {EXAMPLE_ACCESS_KEY_ID} is seeded by default; clients migrating \
@@ -215,6 +241,15 @@ fn ignored_aws_env_key_from(
     credentials: &[DevCredential],
 ) -> Option<String> {
     aws_key_id.filter(|id| credentials.iter().all(|c| c.access_key_id != *id))
+}
+
+/// The sentence the ignored-`AWS_ACCESS_KEY_ID` advisories add when that key
+/// is the example key and the switch removed it, so the operator learns why a
+/// key the docs hand out is rejected. `None` in every other case.
+#[must_use]
+pub fn ignored_key_switch_note(ignored: &str, credentials: &[DevCredential]) -> Option<String> {
+    (ignored == EXAMPLE_ACCESS_KEY_ID && !example_pair_active(credentials))
+        .then(|| format!("The example key is not accepted because {ENV_DISABLE_EXAMPLE} is set."))
 }
 
 /// Seed the resolved credentials onto the `dev` user of the default account.
@@ -454,6 +489,34 @@ mod tests {
     }
 
     #[test]
+    fn with_the_switch_set_a_half_set_pair_does_not_offer_neither() {
+        // "Neither" is refused with the switch set, so the message must not
+        // suggest it.
+        for (k, s) in [
+            (Some(TEAM_KEY.into()), None),
+            (None, Some("team-secret".into())),
+        ] {
+            let msg = resolve_from(k, s, true).unwrap_err().to_string();
+            assert!(!msg.contains("neither"), "{msg}");
+            assert!(msg.contains(ENV_DISABLE_EXAMPLE), "{msg}");
+        }
+        let msg = resolve_from(Some(TEAM_KEY.into()), None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("or neither"), "{msg}");
+    }
+
+    #[test]
+    fn with_the_switch_set_a_non_akia_key_does_not_point_at_the_example_pair() {
+        let msg = resolve_from(Some("test".into()), Some("test".into()), true)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("AKIA-shaped"), "{msg}");
+        assert!(!msg.contains("seeded by default"), "{msg}");
+        assert!(!msg.contains(EXAMPLE_ACCESS_KEY_ID), "{msg}");
+    }
+
+    #[test]
     fn disable_switch_accepts_on_and_off_values() {
         for on in ["1", "true", " 1 "] {
             assert!(
@@ -487,8 +550,26 @@ mod tests {
         resolve_with(|name| {
             vars.iter()
                 .find(|(n, _)| *n == name)
-                .map(|(_, v)| (*v).to_owned())
+                .map(|(_, v)| (*v).into())
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_switch_refuses_to_resolve() {
+        use std::os::unix::ffi::OsStringExt;
+        // `std::env::var(..).ok()` reads this as unset, which would leave the
+        // example pair active with nothing printed.
+        let err = resolve_with(|name| match name {
+            ENV_ACCESS_KEY_ID => Some(TEAM_KEY.into()),
+            ENV_SECRET_ACCESS_KEY => Some("team-secret".into()),
+            ENV_DISABLE_EXAMPLE => Some(std::ffi::OsString::from_vec(vec![b'1', 0xff])),
+            _ => None,
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(ENV_DISABLE_EXAMPLE), "{msg}");
+        assert!(msg.contains("UTF-8"), "{msg}");
     }
 
     #[test]
@@ -601,6 +682,26 @@ mod tests {
         assert_eq!(
             ignored_aws_env_key_from(Some(EXAMPLE_ACCESS_KEY_ID.into()), &creds),
             Some(EXAMPLE_ACCESS_KEY_ID.into())
+        );
+    }
+
+    #[test]
+    fn the_switch_note_names_the_switch_only_for_a_removed_example_key() {
+        let (k, s) = team_pair();
+        let disabled = resolve_from(k.clone(), s.clone(), true).unwrap();
+        let note = ignored_key_switch_note(EXAMPLE_ACCESS_KEY_ID, &disabled).unwrap();
+        assert!(note.contains(ENV_DISABLE_EXAMPLE), "{note}");
+        // A foreign key is rejected for another reason.
+        assert_eq!(
+            ignored_key_switch_note("ASIAFOREIGNSESSION01", &disabled),
+            None
+        );
+        // Not reached in practice (the example key is not ignored while the
+        // pair is active), but the note must not claim the switch is set.
+        let active = resolve_from(k, s, false).unwrap();
+        assert_eq!(
+            ignored_key_switch_note(EXAMPLE_ACCESS_KEY_ID, &active),
+            None
         );
     }
 

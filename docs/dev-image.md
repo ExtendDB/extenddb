@@ -63,7 +63,8 @@ command.
 
 Where other people or machines can reach the host (a shared build machine, a
 CI runner with a routable address), remove the public example credential and
-use your own:
+use your own. The switch below is read by images released after 0.1.14;
+releases through 0.1.14 ignore it and always accept the example credential.
 
 ```bash
 docker run -d -p 127.0.0.1:18080:18080 \
@@ -88,6 +89,13 @@ accepting the example pair:
   leave the example pair active.
 - Tools that hardcode the example pair (NoSQL Workbench, the launchers) must
   be pointed at your credential instead.
+
+Pass the switch as `-e EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1`. A bare
+`-e EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL`, without `=1`, passes the host's
+value and leaves the switch unset when the host has not exported it, and a
+misspelled name is never read; both start with the example pair active. Check
+the `Sign requests with:` line the server prints at startup, which lists the
+credentials it seeded: `AKIAIOSFODNN7EXAMPLE` must not be on it.
 
 The switch removes only the example key. Other keys a file-backed database
 holds keep working: an `EXTENDDB_DEV_*` key from an earlier start that you

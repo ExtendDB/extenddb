@@ -491,9 +491,12 @@ fn dev_mode_banner_lines(
         lines.push(String::new());
     }
     if let Some(ignored) = ignored_aws_key {
+        let switch_note = dev_credentials::ignored_key_switch_note(ignored, dev_creds)
+            .map(|note| format!(" {note}"))
+            .unwrap_or_default();
         lines.push(format!(
             "  Note: AWS_ACCESS_KEY_ID is set but not adopted; requests signed with \
-             '{ignored}' will be rejected. Set EXTENDDB_DEV_ACCESS_KEY_ID and \
+             '{ignored}' will be rejected.{switch_note} Set EXTENDDB_DEV_ACCESS_KEY_ID and \
              EXTENDDB_DEV_SECRET_ACCESS_KEY to seed an additional credential."
         ));
     }
@@ -589,6 +592,27 @@ mod tests {
         .join("\n");
         assert!(
             text.contains("'ASIAFOREIGNSESSION01' will be rejected"),
+            "{text}"
+        );
+        assert!(!text.contains("is not accepted because"), "{text}");
+    }
+
+    #[test]
+    fn dev_banner_names_the_switch_when_it_removed_the_ignored_example_key() {
+        let text = dev_mode_banner_lines(
+            ":memory:",
+            "127.0.0.1",
+            18080,
+            &[team()],
+            Some(EXAMPLE_ACCESS_KEY_ID),
+        )
+        .join("\n");
+        assert!(
+            text.contains(&format!("'{EXAMPLE_ACCESS_KEY_ID}' will be rejected")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("because {ENV_DISABLE_EXAMPLE} is set")),
             "{text}"
         );
     }

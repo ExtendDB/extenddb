@@ -1,6 +1,6 @@
 # ExtendDB dev
 
-> **Local development and CI only. Not for shared networks.** This image serves plain HTTP, its authorization is open, and by default it accepts AWS's public example credential, so anyone who can reach its port can read, change and delete every table. Always publish it on loopback, `-p 127.0.0.1:18080:18080`; a bare `-p 18080:18080` publishes it on every network the host is on. Do not keep real data in it. On a shared host or CI runner, also set `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` with your own `EXTENDDB_DEV_ACCESS_KEY_ID` and `EXTENDDB_DEV_SECRET_ACCESS_KEY` ([details](https://github.com/ExtendDB/extenddb/blob/main/docs/dev-image.md#a-shared-host-or-ci-runner)).
+> **Local development and CI only. Not for shared networks.** This image serves plain HTTP, its authorization is open, and by default it accepts AWS's public example credential, so anyone who can reach its port can read, change and delete every table. Always publish it on loopback, `-p 127.0.0.1:18080:18080`; a bare `-p 18080:18080` publishes it on every network the host is on. Do not keep real data in it. On a shared host or CI runner, with an image released after 0.1.14, also set `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` with your own `EXTENDDB_DEV_ACCESS_KEY_ID` and `EXTENDDB_DEV_SECRET_ACCESS_KEY` ([details](https://github.com/ExtendDB/extenddb/blob/main/docs/dev-image.md#a-shared-host-or-ci-runner)). Releases through 0.1.14 ignore that variable and always accept the example credential; whatever the version, check that the credentials the server prints at startup do not include `AKIAIOSFODNN7EXAMPLE`.
 
 ExtendDB dev is a single-container, DynamoDB-compatible endpoint that enables developers to develop and test applications against the DynamoDB API in their own development environment.
 
@@ -54,6 +54,8 @@ cosign verify \
 ```
 
 The routine signer is `release-dev-image.yml`; the break-glass signer `sign-image.yml` can sign any tier, so drop it from the pattern to require the routine dev path.
+
+## Note
 
 ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does not contain any DynamoDB source code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol; behavioral differences from the service are documented in [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
