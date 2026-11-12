@@ -4,8 +4,9 @@
 //! Creation of the configured import and export roots at startup.
 //!
 //! A root that does not exist yet is created owner-only (`0700` on Unix),
-//! with any missing ancestors, because it holds import and export files and
-//! those carry table data. A root that already exists keeps its mode.
+//! because it holds import and export files and those carry table data. Its
+//! missing ancestors are created with the default mode, as `mkdir -p -m 0700`
+//! does, and a directory that already exists keeps its mode.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ mod tests {
     //! under. The same directory creation under umask 0 is covered by the
     //! engine's `tests/private_modes.rs`.
 
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
 
     use super::resolve_roots;
@@ -72,8 +73,29 @@ mod tests {
             & 0o777
     }
 
+    /// The mode a directory created without a mode gets under the inherited
+    /// umask: `0777` less the umask's bits.
+    fn default_dir_mode() -> u32 {
+        let base = scratch();
+        let probe = base.join("probe");
+        std::fs::DirBuilder::new()
+            .mode(0o777)
+            .create(&probe)
+            .unwrap();
+        let mode = mode_of(&probe);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "these tests need a umask that masks no owner bit, not {:03o}",
+            0o777 & !mode
+        );
+        mode
+    }
+
     #[test]
     fn a_missing_root_is_created_owner_only() {
+        let default = default_dir_mode();
         let base = scratch();
         let root = base.join("exports").join("nested");
 
@@ -82,7 +104,11 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(*resolved[0], root.canonicalize().unwrap());
         assert_eq!(mode_of(&root), 0o700);
-        assert_eq!(mode_of(&base.join("exports")), 0o700);
+        assert_eq!(
+            mode_of(&base.join("exports")),
+            default,
+            "a missing ancestor gets the default mode"
+        );
         assert_eq!(mode_of(&base), 0o755, "an existing ancestor keeps its mode");
         std::fs::remove_dir_all(&base).unwrap();
     }

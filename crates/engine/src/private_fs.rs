@@ -4,11 +4,12 @@
 //! Owner-only files and directories for table data on the local filesystem.
 //!
 //! An export file holds a table's items, so it is created `0600`, and the
-//! directories extenddb creates to hold such files are created `0700`. Both
+//! directory extenddb creates to hold such files is created `0700`. Both
 //! modes are set at creation time, so there is no window in which the process
-//! umask decides who can read the data. A directory that already exists keeps
-//! its mode. On targets other than Unix the helpers fall back to the platform
-//! defaults.
+//! umask decides who can read the data. Missing parents of that directory are
+//! created with the default mode, as `mkdir -p -m 0700` does, and a directory
+//! that already exists keeps its mode. On targets other than Unix the helpers
+//! fall back to the platform defaults.
 
 use std::io;
 use std::path::Path;
@@ -21,8 +22,11 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// Create `path` and every missing ancestor, each owner-only on Unix.
+/// Create `path`, owner-only on Unix, and every missing ancestor with the
+/// default mode (`0777` less the umask), as `mkdir -p -m 0700` does.
 ///
+/// Only `path` itself is made owner-only: an ancestor may be a directory
+/// such as `/srv/data` that other users need for siblings created later.
 /// Like `std::fs::create_dir_all`, this succeeds when `path` already exists,
 /// and it never changes the mode of a directory it did not create.
 ///
@@ -31,13 +35,30 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Returns the I/O error from creating any missing directory.
 pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(PRIVATE_DIR_MODE);
     }
-    builder.create(path)
+    // The same steps as `create_dir_all`, with the mode on the last one.
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match builder.create(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) if path.is_dir() => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent)?,
+        None => return Err(io::Error::other("failed to create whole tree")),
+    }
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Options that create a new file, owner-only on Unix, and refuse any path
@@ -122,17 +143,30 @@ mod tests {
     }
 
     #[test]
-    fn create_private_dir_all_creates_owner_only_directories() {
+    fn create_private_dir_all_makes_only_the_last_directory_owner_only() {
+        let default = default_dir_mode();
         let base = scratch("dirs");
         let leaf = base.join("a").join("b").join("c");
 
         create_private_dir_all(&leaf).unwrap();
 
-        for dir in [base.join("a"), base.join("a").join("b"), leaf] {
-            assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
+        for dir in [base.join("a"), base.join("a").join("b")] {
+            assert_eq!(
+                mode_of(&dir),
+                default,
+                "a missing ancestor, {}",
+                dir.display()
+            );
         }
+        assert_eq!(mode_of(&leaf), 0o700);
         assert_eq!(mode_of(&base), 0o755, "the existing parent keeps its mode");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn create_private_dir_all_accepts_an_empty_path_as_create_dir_all_does() {
+        create_private_dir_all(Path::new("")).unwrap();
+        std::fs::create_dir_all("").unwrap();
     }
 
     #[test]

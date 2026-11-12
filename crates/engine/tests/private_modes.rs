@@ -42,17 +42,24 @@ fn owner_only_modes_hold_under_a_umask_of_zero() {
     standard_calls_follow_the_umask();
 }
 
-/// `create_private_dir_all` creates every missing directory 0700 and leaves
-/// the existing parent alone.
+/// `create_private_dir_all` creates the directory asked for 0700 and its
+/// missing ancestors with the default mode, and leaves the existing parent
+/// alone.
 fn missing_directories() {
     let base = scratch("missing");
     let leaf = base.join("a").join("b").join("c");
 
     create_private_dir_all(&leaf).unwrap();
 
-    for dir in [base.join("a"), base.join("a").join("b"), leaf] {
-        assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
+    for dir in [base.join("a"), base.join("a").join("b")] {
+        assert_eq!(
+            mode_of(&dir),
+            0o777,
+            "a missing ancestor, {}",
+            dir.display()
+        );
     }
+    assert_eq!(mode_of(&leaf), 0o700);
     assert_eq!(mode_of(&base), 0o755, "the existing parent keeps its mode");
     std::fs::remove_dir_all(&base).unwrap();
 }
