@@ -41,13 +41,13 @@ pub const CATALOG_MIGRATION_6: &str =
 pub const CATALOG_MIGRATION_10: &str =
     include_str!("../fixtures/0010_account_metrics.expected.json");
 
-/// The name of the index migration 11 creates on `access_keys`.
+/// The name of the index migration 12 creates on `access_keys`.
 pub const ACCESS_KEY_ID_INDEX: &str = "access_key_id_1";
 
 /// The catalog database's definitions after every migration: migration 1's,
 /// without `continuous_backups`, which migration 5 drops, and `metrics`,
 /// which migration 10 drops, with what migrations 6 and 10 add, and with the
-/// index migration 11 creates on `access_keys`.
+/// index migration 12 creates on `access_keys`.
 ///
 /// # Panics
 ///

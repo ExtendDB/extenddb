@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 11, `unique_access_key_ids`, MongoDB: give the catalog's
+//! Migration 12, `unique_access_key_ids`, MongoDB: give the catalog's
 //! `access_keys` collection a unique index on `access_key_id`.
 //!
 //! PostgreSQL, SQLite and Cassandra key `access_keys` by the ID. Migration 1
@@ -52,10 +52,10 @@ use mongodb::options::{CommitQuorum, Hint, IndexOptions};
 use super::MongoStores;
 
 /// This module, whose SHA-256 the checksum test pins.
-pub(crate) const SOURCE: &str = include_str!("m0011_unique_access_key_ids.rs");
+pub(crate) const SOURCE: &str = include_str!("m0012_unique_access_key_ids.rs");
 
 /// Recorded as this migration's checksum. Changes only with a new migration.
-const FINGERPRINT: &str = "0011_unique_access_key_ids/mongodb/1";
+const FINGERPRINT: &str = "0012_unique_access_key_ids/mongodb/1";
 
 /// The catalog collection this migration indexes.
 const COLLECTION: &str = "access_keys";
@@ -66,7 +66,7 @@ const INDEX: &str = "access_key_id_1";
 /// NamespaceNotFound: `listIndexes` on a collection that does not exist.
 const NAMESPACE_NOT_FOUND: i32 = 26;
 
-/// Migration 11's catalog body.
+/// Migration 12's catalog body.
 pub(crate) struct UniqueAccessKeyIds;
 
 /// The documents that hold one value of `access_key_id`, when more than one
@@ -585,7 +585,7 @@ impl CodeBody<MongoStores> for UniqueAccessKeyIds {
             // The ledger records the notes after the body returns; this line
             // names the copies when a run stops before then.
             tracing::warn!(
-                "migration 11 unique_access_key_ids: {total} documents in {}.{COLLECTION} have the \
+                "migration 12 unique_access_key_ids: {total} documents in {}.{COLLECTION} have the \
                  access key ID {id}, and all of them belong to {owner}. {reads} This migration \
                  keeps _id {} and deletes {copies}.",
                 db.name(),

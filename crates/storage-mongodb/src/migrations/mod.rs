@@ -46,7 +46,7 @@ mod m0006_backup_catalog_index;
 mod m0010_account_metrics;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0011_unique_access_key_ids;
+mod m0012_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -188,6 +188,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0010_account_metrics::SOURCE,
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "MongoDB stores the catalog's attribute names as BSON string values, which carry their \
+             length and so can hold U+0000, and every name reads back as it was written",
+        ),
         MigrationId::UniqueAccessKeyIds => Migration::Applies {
             // A unique index is never additive (CONTRIBUTING.md): the
             // previous release does not expect the index to refuse a write.
@@ -197,8 +201,8 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             convergent: true,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
-                &m0011_unique_access_key_ids::UniqueAccessKeyIds,
-                m0011_unique_access_key_ids::SOURCE,
+                &m0012_unique_access_key_ids::UniqueAccessKeyIds,
+                m0012_unique_access_key_ids::SOURCE,
             )],
         },
     }

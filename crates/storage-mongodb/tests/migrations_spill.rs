@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Migration 11's read of `access_keys` when its `$group` state is larger
+//! Migration 12's read of `access_keys` when its `$group` state is larger
 //! than the server's memory limit for `$group`. The test lowers the limits
 //! of the classic and the slot-based engine to 100 KB and sets them back at
 //! the end. They are the server's, so the test is alone in its binary: the
@@ -90,12 +90,12 @@ fn check_not_left_lowered(values: &[Bson]) {
 }
 
 /// 3,000 keys, and a second copy of 20 of them for the same user: migration
-/// 11's `$group` holds more than 100 KB, and its read spills. The migration
+/// 12's `$group` holds more than 100 KB, and its read spills. The migration
 /// applies, and each of the 20 IDs keeps the copy a lookup read.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_11_reads_a_collection_whose_group_spills_to_disk() {
+async fn migration_12_reads_a_collection_whose_group_spills_to_disk() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "spill11").await;
+    let d = Deployment::new(&uri, "spill12").await;
     let saved = limits(&d.client).await;
     check_not_left_lowered(&saved);
     fixture::load(&d, &fixture::read("0.1.14")).await;
@@ -178,7 +178,7 @@ async fn migration_11_reads_a_collection_whose_group_spills_to_disk() {
         .await
         .into_iter()
         .find(|row| row.id == MigrationId::UniqueAccessKeyIds.number())
-        .expect("migration 11's row")
+        .expect("migration 12's row")
         .notes;
     assert_eq!(notes.lines().count(), SHARED as usize, "{notes}");
     d.drop_databases().await;

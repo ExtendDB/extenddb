@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use std::time::Duration;
 
 use crate::PostgresEngine;
+use crate::catalog_json::from_catalog_json;
 use crate::stream_records_sql::{STREAM_RECORDS_AFTER, STREAM_RECORDS_FROM_START};
 
 /// The most pending records one numbering transaction moves.
@@ -545,8 +546,7 @@ impl StreamEngine for PostgresEngine {
                 .stream_table_row(&account_id, &table_name)
                 .await?
                 .ok_or_else(|| extenddb_storage::util::stream_not_found(&stream_arn))?;
-            let key_schema = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let key_schema = from_catalog_json(ks_json)?;
             let shards = self
                 .stream_shard_rows(std::slice::from_ref(&table.table_id))
                 .await?;
