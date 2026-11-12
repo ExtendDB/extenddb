@@ -520,6 +520,7 @@ impl MongoEngine {
 
         let tx_options = self.write_transaction_options();
 
+        let mut last_cause = String::new();
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let new_doc =
                 item_to_document(&item, &key_info.key_schema, &key_info.attribute_definitions)?;
@@ -636,12 +637,14 @@ impl MongoEngine {
             match attempt_res {
                 Ok(return_val) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(return_val),
-                    CommitOutcome::RerunBody => {
+                    CommitOutcome::RerunBody(cause) => {
+                        last_cause = crate::write_conflict::retrying("PutItem", attempt, cause);
                         backoff_sleep(attempt).await;
                         continue;
                     }
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(cause)) => {
+                    last_cause = crate::write_conflict::retrying("PutItem", attempt, cause);
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
@@ -653,11 +656,11 @@ impl MongoEngine {
             }
         }
 
-        // Retry ceiling exhausted. RFC-0003 §4.3 requires
-        // `TransactionConflictException` when a single-item write can't
-        // serialize against concurrent activity — never a bare 500.
-        Err(StorageError::TransactionConflict(
-            "PutItem: too many concurrent write conflicts, giving up".to_owned(),
+        // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "PutItem",
+            TRANSIENT_RETRY_ATTEMPTS,
+            &last_cause,
         ))
     }
 
@@ -730,6 +733,7 @@ impl MongoEngine {
 
         let tx_options = self.write_transaction_options();
 
+        let mut last_cause = String::new();
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             // Capture before the transaction's first database operation so a
             // concurrent catalog mutation cannot be hidden by the snapshot.
@@ -811,12 +815,14 @@ impl MongoEngine {
             match attempt_res {
                 Ok(return_val) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(return_val),
-                    CommitOutcome::RerunBody => {
+                    CommitOutcome::RerunBody(cause) => {
+                        last_cause = crate::write_conflict::retrying("DeleteItem", attempt, cause);
                         backoff_sleep(attempt).await;
                         continue;
                     }
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(cause)) => {
+                    last_cause = crate::write_conflict::retrying("DeleteItem", attempt, cause);
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
@@ -828,8 +834,10 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::TransactionConflict(
-            "DeleteItem: too many concurrent write conflicts, giving up".to_owned(),
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "DeleteItem",
+            TRANSIENT_RETRY_ATTEMPTS,
+            &last_cause,
         ))
     }
 
@@ -982,6 +990,7 @@ impl MongoEngine {
 
         let tx_options = self.write_transaction_options();
 
+        let mut last_cause = String::new();
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             // Capture before the transaction's first database operation. A
             // later UpdateTable must invalidate this observation rather than
@@ -1155,13 +1164,21 @@ impl MongoEngine {
                         .await?
                     {
                         CommitOutcome::Committed => return Ok((old, new)),
-                        CommitOutcome::RerunBody => {
+                        CommitOutcome::RerunBody(cause) => {
+                            last_cause =
+                                crate::write_conflict::retrying("UpdateItem", attempt, cause);
                             backoff_sleep(attempt).await;
                             continue;
                         }
                     }
                 }
                 Ok(AttemptOk::Stale) => {
+                    last_cause = crate::write_conflict::retrying(
+                        "UpdateItem",
+                        attempt,
+                        "the item's version changed between the read and the versioned replace"
+                            .to_owned(),
+                    );
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
@@ -1170,7 +1187,8 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     return Ok((None, None));
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(cause)) => {
+                    last_cause = crate::write_conflict::retrying("UpdateItem", attempt, cause);
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
@@ -1182,8 +1200,13 @@ impl MongoEngine {
             }
         }
 
-        Err(StorageError::TransactionConflict(
-            "UpdateItem: too many concurrent write conflicts, giving up".to_owned(),
+        // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
+        // The same answer as PutItem and DeleteItem, which lose their budget to
+        // the same contention on the same item.
+        Err(crate::write_conflict::retry_budget_exhausted(
+            "UpdateItem",
+            TRANSIENT_RETRY_ATTEMPTS,
+            &last_cause,
         ))
     }
 
@@ -2036,14 +2059,14 @@ impl MongoEngine {
             .find(doc! { "_id.table_id": &key_info.table_id })
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
 
         let mut found_any = false;
         while let Some(idx_doc) = cursor
             .next(session)
             .await
             .transpose()
-            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .map_err(crate::write_conflict::transaction_error)?
         {
             found_any = true;
             let index_id = match idx_doc.get_str("index_id") {
@@ -2091,7 +2114,7 @@ impl MongoEngine {
                     .delete_one(old_filter)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(crate::write_conflict::transaction_error)?;
             }
 
             if let Some(new) = new_item
@@ -2119,7 +2142,7 @@ impl MongoEngine {
                     .with_options(opts)
                     .session(&mut *session)
                     .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .map_err(crate::write_conflict::transaction_error)?;
             }
         }
 
@@ -2247,7 +2270,7 @@ impl MongoEngine {
             })
             .session(&mut *session)
             .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+            .map_err(crate::write_conflict::transaction_error)?;
 
         Ok(())
     }
@@ -2340,7 +2363,8 @@ impl MongoEngine {
         enum AttemptOutcome {
             Committed,
             CanceledReasons(Vec<CancellationReason>),
-            Retry,
+            /// Carries the error text of the conflict that ended the attempt.
+            Retry(String),
         }
 
         // Rehydrate the `IdempotencyKey` per attempt from owned strings.
@@ -2355,6 +2379,7 @@ impl MongoEngine {
             )
         });
 
+        let mut last_cause = String::new();
         for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
                 account_id: a.as_str(),
@@ -2389,7 +2414,7 @@ impl MongoEngine {
                     {
                         Ok(v) => v,
                         Err(e) if is_transient_write_conflict(&e) => {
-                            return Ok(AttemptOutcome::Retry);
+                            return Ok(AttemptOutcome::Retry(e.to_string()));
                         }
                         Err(e) => return Err(StorageError::Internal(e.to_string())),
                     };
@@ -2459,7 +2484,9 @@ impl MongoEngine {
                             // real dup — retry so the next attempt
                             // inserts fresh.
                             if winner.is_none() {
-                                return Ok(AttemptOutcome::Retry);
+                                return Ok(AttemptOutcome::Retry(
+                                    "the idempotency token expired during the attempt".to_owned(),
+                                ));
                             }
                             return Err(
                                 match winner.as_ref().and_then(|d| d.get_str("fingerprint").ok()) {
@@ -2471,7 +2498,7 @@ impl MongoEngine {
                             );
                         }
                         if is_transient_write_conflict(&e) {
-                            return Ok(AttemptOutcome::Retry);
+                            return Ok(AttemptOutcome::Retry(e.to_string()));
                         }
                         return Err(StorageError::Internal(e.to_string()));
                     }
@@ -2490,8 +2517,8 @@ impl MongoEngine {
                             any_failed = true;
                             reasons.push(r);
                         }
-                        Err(TransactOpError::Transient) => {
-                            return Ok(AttemptOutcome::Retry);
+                        Err(TransactOpError::Transient(cause)) => {
+                            return Ok(AttemptOutcome::Retry(cause));
                         }
                         Err(TransactOpError::Storage(e)) => return Err(e),
                     }
@@ -2508,7 +2535,12 @@ impl MongoEngine {
                 Ok(AttemptOutcome::Committed) => {
                     match self.commit_write_transaction(&mut session, None).await? {
                         CommitOutcome::Committed => return Ok(()),
-                        CommitOutcome::RerunBody => {
+                        CommitOutcome::RerunBody(cause) => {
+                            last_cause = crate::write_conflict::retrying(
+                                "TransactWriteItems",
+                                attempt,
+                                cause,
+                            );
                             backoff_sleep(attempt).await;
                             continue;
                         }
@@ -2525,7 +2557,9 @@ impl MongoEngine {
                         Err(message) => StorageError::Validation(message),
                     });
                 }
-                Ok(AttemptOutcome::Retry) => {
+                Ok(AttemptOutcome::Retry(cause)) => {
+                    last_cause =
+                        crate::write_conflict::retrying("TransactWriteItems", attempt, cause);
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                     continue;
@@ -2543,6 +2577,11 @@ impl MongoEngine {
         // instead of a bare HTTP 500. The engine maps StorageError::
         // TransactionCanceled to TransactionCanceledException; the
         // reason codes are echoed back in the message.
+        tracing::warn!(
+            attempts = TRANSIENT_RETRY_ATTEMPTS,
+            error = %last_cause,
+            "TransactWriteItems: could not commit; answering TransactionCanceled"
+        );
         let reasons = ops
             .iter()
             .map(|_| CancellationReason {
@@ -2686,7 +2725,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     self.write_stream_inline_in_session(
                         key_info,
@@ -2696,7 +2735,7 @@ impl MongoEngine {
                         &mut *session,
                     )
                     .await
-                    .map_err(TransactOpError::Storage)?;
+                    .map_err(TransactOpError::from)?;
                 }
 
                 Ok(())
@@ -2772,7 +2811,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     // DDB semantics: a delete on a non-existent key is a
                     // no-op, and no stream record is emitted. Guard on
@@ -2786,7 +2825,7 @@ impl MongoEngine {
                             &mut *session,
                         )
                         .await
-                        .map_err(TransactOpError::Storage)?;
+                        .map_err(TransactOpError::from)?;
                     }
                 }
 
@@ -2952,7 +2991,7 @@ impl MongoEngine {
                     &mut *session,
                 )
                 .await
-                .map_err(TransactOpError::Storage)?;
+                .map_err(TransactOpError::from)?;
                 if let Some(capture) = stream {
                     let old_for_stream = if is_creating {
                         None
@@ -2967,7 +3006,7 @@ impl MongoEngine {
                         &mut *session,
                     )
                     .await
-                    .map_err(TransactOpError::Storage)?;
+                    .map_err(TransactOpError::from)?;
                 }
 
                 Ok(())
@@ -3497,13 +3536,13 @@ impl MongoEngine {
             match attempt_result {
                 Ok(true) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(()),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
                 Ok(false) => {
                     let _ = session.abort_transaction().await;
                     return Ok(());
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
@@ -3625,7 +3664,9 @@ impl MongoEngine {
                 Ok(()) => return Ok(CommitOutcome::Committed),
                 Err(e) => match classify_commit_error(&e) {
                     CommitErrorClass::RetryCommit => backoff_sleep(attempt).await,
-                    CommitErrorClass::RerunBody => return Ok(CommitOutcome::RerunBody),
+                    CommitErrorClass::RerunBody => {
+                        return Ok(CommitOutcome::RerunBody(e.to_string()));
+                    }
                     CommitErrorClass::Fatal => {
                         return Err(StorageError::Internal(e.to_string()));
                     }
@@ -3749,14 +3790,16 @@ enum NativeUpdate {
 /// body use `?` for control flow while distinguishing "retry this
 /// whole transaction" from "return this error to the caller."
 pub(crate) enum TxErr {
-    Transient,
+    /// MongoDB aborted the transaction as a transient conflict. Carries the
+    /// driver's error text, which the exhaustion message reports.
+    Transient(String),
     Fatal(StorageError),
 }
 
 impl From<mongodb::error::Error> for TxErr {
     fn from(e: mongodb::error::Error) -> Self {
         if is_transient_write_conflict(&e) {
-            TxErr::Transient
+            TxErr::Transient(e.to_string())
         } else {
             TxErr::Fatal(StorageError::Internal(e.to_string()))
         }
@@ -3764,8 +3807,14 @@ impl From<mongodb::error::Error> for TxErr {
 }
 
 impl From<StorageError> for TxErr {
+    /// A `Transient` error from a helper that ran inside the transaction
+    /// (`write_conflict::transaction_error`) re-runs the body like a
+    /// conflict on the data collection; everything else ends the operation.
     fn from(e: StorageError) -> Self {
-        TxErr::Fatal(e)
+        match e {
+            StorageError::Transient(cause) => TxErr::Transient(cause),
+            e => TxErr::Fatal(e),
+        }
     }
 }
 
@@ -3833,8 +3882,8 @@ pub(crate) enum CommitOutcome {
     /// The transaction committed. Return the attempt's success value.
     Committed,
     /// The transaction aborted without committing. The caller may re-run
-    /// its body in the next loop iteration.
-    RerunBody,
+    /// its body in the next loop iteration. Carries the driver's error text.
+    RerunBody(String),
 }
 
 /// Detect a duplicate-key error (E11000, code 11000). Used at
@@ -3859,7 +3908,7 @@ pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
 /// route to a labeled error, which the test hook and the classifier unit
 /// tests both need.
 #[cfg(any(test, feature = "test-hooks"))]
-fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mongodb::error::Error {
+pub(crate) fn synthetic_error_with_labels(message: &str, labels: &[&str]) -> mongodb::error::Error {
     let wc: mongodb::error::WriteConcernError = bson::from_document(doc! {
         "code": 64,
         "codeName": "WriteConcernTimeout",
@@ -3886,14 +3935,14 @@ enum TransactOpError {
     Storage(StorageError),
     /// MongoDB aborted the transaction as a transient conflict —
     /// the whole transact_write_items txn should be retried from
-    /// the top.
-    Transient,
+    /// the top. Carries the driver's error text.
+    Transient(String),
 }
 
 impl From<mongodb::error::Error> for TransactOpError {
     fn from(e: mongodb::error::Error) -> Self {
         if is_transient_write_conflict(&e) {
-            TransactOpError::Transient
+            TransactOpError::Transient(e.to_string())
         } else {
             TransactOpError::Storage(StorageError::Internal(e.to_string()))
         }
@@ -3901,8 +3950,13 @@ impl From<mongodb::error::Error> for TransactOpError {
 }
 
 impl From<StorageError> for TransactOpError {
+    /// Same rule as `TxErr`: a `Transient` error raised by a helper inside
+    /// the transaction re-runs the whole transaction.
     fn from(e: StorageError) -> Self {
-        TransactOpError::Storage(e)
+        match e {
+            StorageError::Transient(cause) => TransactOpError::Transient(cause),
+            e => TransactOpError::Storage(e),
+        }
     }
 }
 
@@ -4338,6 +4392,35 @@ mod tests {
             CommitErrorClass::RerunBody
         ));
         assert!(is_transient_write_conflict(&e));
+    }
+
+    /// The text of the error that ended an attempt reaches the loop that
+    /// reports the exhausted budget, whichever way the error arrives.
+    #[test]
+    fn a_retried_attempt_keeps_the_driver_text() {
+        let e = synthetic_error_with_labels(
+            "snapshot unavailable",
+            &[mongodb::error::TRANSIENT_TRANSACTION_ERROR],
+        );
+        let text = e.to_string();
+        assert!(text.contains("snapshot unavailable"), "{text}");
+        match TxErr::from(e.clone()) {
+            TxErr::Transient(cause) => assert_eq!(cause, text),
+            TxErr::Fatal(other) => panic!("want Transient, got {other:?}"),
+        }
+        match TransactOpError::from(e) {
+            TransactOpError::Transient(cause) => assert_eq!(cause, text),
+            _ => panic!("want Transient"),
+        }
+        let helper = StorageError::Transient("counter conflict".to_owned());
+        match TxErr::from(helper.clone()) {
+            TxErr::Transient(cause) => assert_eq!(cause, "counter conflict"),
+            TxErr::Fatal(other) => panic!("want Transient, got {other:?}"),
+        }
+        match TransactOpError::from(helper) {
+            TransactOpError::Transient(cause) => assert_eq!(cause, "counter conflict"),
+            _ => panic!("want Transient"),
+        }
     }
 
     #[test]

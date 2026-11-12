@@ -227,6 +227,25 @@ fn key_filter(key: &BackupKey) -> Document {
     doc! { "account_id": &key.account_id, "backup_id": &key.backup_id }
 }
 
+/// `insert_backup_row`'s upsert of `row`, unowned, as a filter and a
+/// pipeline update: an existing row never matches the filter (every row
+/// carries a generation, this one 0), so the upsert's insert hits a unique
+/// index, (`account_id`, `backup_id`) or `backup_id`, and nothing is
+/// written. The legacy reader's `replace_with_index_row` sends it in its
+/// session transaction.
+pub(crate) fn unowned_insert(row: &BackupRow) -> Result<(Document, Vec<Document>), StorageError> {
+    let mut filter = key_filter(&row.key());
+    filter.insert("owner_generation", doc! { "$exists": false });
+    let mut set = row_fields(row, row.status)?;
+    if let Some(reason) = &row.failure_reason {
+        set.insert("failure_reason", reason);
+    }
+    set.insert("owner_generation", generation_field(UNOWNED_GENERATION));
+    set.insert("heartbeat_at", "$$NOW");
+    set.insert("completed_at", "$$NOW");
+    Ok((filter, vec![doc! { "$set": literal_set(set) }]))
+}
+
 /// `set` as the `$set` stage of a pipeline update: `$$NOW` stays the server's
 /// clock and every other value is wrapped in `$literal`, so a string, or a
 /// key inside the source table object, is never read as a field path.
@@ -673,9 +692,9 @@ impl MongoEngine {
             match body {
                 Ok(outcome) => match self.commit_write_transaction(&mut session, None).await? {
                     CommitOutcome::Committed => return Ok(outcome),
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
@@ -768,7 +787,7 @@ impl MongoEngine {
                     .await
                 {
                     Ok(desc) => Ok(Ok(desc)),
-                    Err(StorageError::Transient(_)) => Err(TxErr::Transient),
+                    Err(StorageError::Transient(cause)) => Err(TxErr::Transient(cause)),
                     Err(e) => {
                         // A creation that failed after its insert committed
                         // (a collection or index could not be created) left a
@@ -817,7 +836,7 @@ impl MongoEngine {
                     let _ = session.abort_transaction().await;
                     return Err(refusal);
                 }
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
@@ -902,23 +921,10 @@ impl BackupCatalog for MongoEngine {
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
         Box::pin(async move {
-            // The claim's upsert, unowned: an existing row never matches the
-            // filter (every row carries a generation, this one 0), so the
-            // upsert's insert hits a unique index, (`account_id`,
-            // `backup_id`) or `backup_id`, and nothing is written.
-            let mut filter = key_filter(&row.key());
-            filter.insert("owner_generation", doc! { "$exists": false });
-            let mut set = row_fields(row, row.status)?;
-            if let Some(reason) = &row.failure_reason {
-                set.insert("failure_reason", reason);
-            }
-            set.insert("owner_generation", generation_field(UNOWNED_GENERATION));
-            set.insert("heartbeat_at", "$$NOW");
-            set.insert("completed_at", "$$NOW");
-            let set = literal_set(set);
+            let (filter, update) = unowned_insert(row)?;
             match self
                 .backup_index()
-                .update_one(filter, vec![doc! { "$set": set }])
+                .update_one(filter, update)
                 .upsert(true)
                 .await
             {
@@ -1037,6 +1043,20 @@ impl BackupCatalog for MongoEngine {
                     "table_name": arn.table_name(),
                     "backup_arn": arn.to_arn_string(),
                 })
+                .await
+                .map_err(internal)?;
+            doc.as_ref().map(row_from_doc).transpose()
+        })
+    }
+
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        Box::pin(async move {
+            let doc = self
+                .backup_index()
+                .find_one(doc! { "backup_id": backup_id })
                 .await
                 .map_err(internal)?;
             doc.as_ref().map(row_from_doc).transpose()

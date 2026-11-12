@@ -13,6 +13,7 @@
 mod accumulator;
 mod collector;
 mod collector_query;
+mod collector_record;
 mod types;
 
 pub use collector::MetricsCollector;

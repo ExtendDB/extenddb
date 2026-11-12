@@ -491,6 +491,7 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         target_bytes: env.settings.data_file_target_bytes,
         key_prefix: &env.key_prefix,
         bucket: &env.bucket,
+        written: None,
     };
     let tracker = key_order.as_ref().map(KeyRangeTracker::new);
     let mut item_count = 0;
@@ -559,7 +560,9 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         Err(stop) => {
             let (reason, outcome) = match stop {
                 Stop::Cancelled => (SHUTDOWN.to_owned(), BackupJobOutcome::Cancelled),
-                Stop::Fail(reason) => (reason, BackupJobOutcome::Failed),
+                Stop::Fail(reason) | Stop::Refused(reason) | Stop::Occupied(reason) => {
+                    (reason, BackupJobOutcome::Failed)
+                }
                 Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) => unreachable!("matched above"),
             };
             match failure::fail_row(
@@ -665,7 +668,11 @@ async fn write_documents(
 
 /// One document's put under the backup prefix, after the pre-put check;
 /// returns the bytes the store reported.
-pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> Result<u64, Stop> {
+pub(crate) async fn put_document<W: writer::ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<u64, Stop> {
     if p.shutdown.is_cancelled() {
         return Err(Stop::Cancelled);
     }
@@ -680,15 +687,9 @@ pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> 
         biased;
         () = p.shutdown.cancelled() => Err(Stop::Cancelled),
         () = p.heartbeat.lost().cancelled() => Err(Stop::ClaimLost(p.heartbeat.reason())),
-        result = p.store.put(&key, byte_stream_from(bytes.to_vec())) => match result {
-            Ok(meta) => Ok(meta.size),
-            Err(e) => {
-                if let Some(metrics) = p.metrics {
-                    metrics.record_backup_store_error("put");
-                }
-                Err(Stop::Fail(format!("writing {name}: {e}")))
-            }
-        },
+        result = p.put_object(&key, name, byte_stream_from(bytes.to_vec())) => {
+            result.map(|meta| meta.size)
+        }
     }
 }
 
