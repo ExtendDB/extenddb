@@ -82,7 +82,7 @@ Under the `catalog` source the catalog has no key ring.
 
 ### 3. A key id on each stored secret
 
-Migration 11 adds a nullable integer column, `key_id`, to `access_keys` and `iam_sessions` on SQLite, PostgreSQL and Cassandra. On MongoDB a document takes a `key_id` field with no schema change, because the catalog collections have no validator (`crates/storage-mongodb/src/migrations/mod.rs:175-178`).
+Migration 12 adds a nullable integer column, `key_id`, to `access_keys` and `iam_sessions` on SQLite, PostgreSQL and Cassandra. Migration 11 is the attribute name escape of #833 (`crates/storage/src/migrations/registry.rs:108` on main at ce3a51a4b). On MongoDB a document takes a `key_id` field with no schema change, because the catalog collections have no validator (`crates/storage-mongodb/src/migrations/mod.rs:175-178`).
 
 - A null `key_id` means the catalog key. Every row written before the upgrade has a null `key_id`, so no existing row changes.
 - Under the `catalog` source, writers keep `key_id` null. Under the `file` source, writers store the id of the active DEK.
@@ -92,13 +92,13 @@ Migration 11 adds a nullable integer column, `key_id`, to `access_keys` and `iam
 
 With the column, a reader finds the key of a row without trial decryption. A prefix in the stored bytes cannot do that. The current bytes start with a random nonce, so no prefix tells an old row from a new one.
 
-Migration 11 changes the schema only, so it needs no key. That holds on a new catalog too, where `init` writes the catalog key after the migrations (`crates/app/src/cmd_init.rs:357`, `:368`). It follows migration 9, which adds a nullable column in the same way:
+Migration 12 changes the schema only, so it needs no key. That holds on a new catalog too, where `init` writes the catalog key after the migrations (`crates/app/src/cmd_init.rs:357`, `:368`). It follows migration 9, which adds a nullable column in the same way:
 
 - SQLite: a code body that adds the column only when it is missing (`crates/storage-sqlite/src/migrations/m0009_warm_throughput.rs`).
 - PostgreSQL and Cassandra: file bodies (`crates/storage-postgres/migrations/0009_warm_throughput.sql`, `crates/storage-cassandra/migrations/catalog/0009_warm_throughput.cql`).
 - MongoDB: no step.
 
-Migration 11 is convergent. It is `Kind::Breaking`, because declaring a migration additive needs the old-binary job, which does not exist yet (`CONTRIBUTING.md:288-299`).
+Migration 12 is convergent. It is `Kind::Breaking`, because declaring a migration additive needs the old-binary job, which does not exist yet (`CONTRIBUTING.md:288-299`).
 
 ### 4. Startup
 
@@ -176,8 +176,8 @@ In 1.0, running more than one server on a catalog is unsupported, and only SQLit
 
 ### 7. Upgrade and rollback
 
-- `extenddb migrate --yes` applies migration 11. The deployment keeps the `catalog` source and today's protection until the operator moves it.
-- A 1.x binary without migration 11 refuses the migrated catalog with exit 4, because migration 11 is breaking (`CONTRIBUTING.md:283-286`).
+- `extenddb migrate --yes` applies migration 12. The deployment keeps the `catalog` source and today's protection until the operator moves it.
+- A 1.x binary without migration 12 refuses the migrated catalog with exit 4, because migration 12 is breaking (`CONTRIBUTING.md:283-286`).
 - Releases before 1.0 refuse a 1.0 catalog or leave a trace in it (`docs/adr/0023-catalog-migrations.md:370-384`). If one starts anyway under the `catalog` source, it reads and writes as before, because a null `key_id` means the catalog key. After a move, it finds no `encryption_key` row and refuses to start.
 - A SQLite dev image from before 1.0 may write a new `encryption_key` row at startup. A server with this change then refuses to start until `rotate --yes` runs again.
 - A rollback restores the pre-upgrade backup of every store that the backend uses (`docs/adr/0023-catalog-migrations.md:366-369`). Every catalog write since the upgrade is lost, and the restored catalog holds the catalog key again.
@@ -221,7 +221,7 @@ Line numbers are on main at 870962647.
 - #972 covers the false statements that this change does not touch: `docs/troubleshooting.md:149` and the text that says the config file may contain the key, and `docs/design/05-component-auth.md:37` and `:1036-1039`.
 - Code comments: `crates/storage/src/secret_cipher.rs:7-9`, `crates/storage/src/lib.rs:781-783`, `crates/storage-postgres/src/catalog_store.rs:24-25`, `crates/storage-cassandra/src/catalog_store.rs:46-47` and `crates/storage-cassandra/src/bootstrapper.rs:552`.
 - New text:
-  - migration 11 beside `docs/manuals/07-upgrade-manual.md:7-11`, and the rollback step beside `:79`
+  - migration 12 beside `docs/manuals/07-upgrade-manual.md:7-11`, and the rollback step beside `:79`
   - the KEK file in the air-gapped transfer list (`docs/manuals/11-deployment-guide.md:150-154`) and in the Kubernetes mount (`:146`)
   - the container steps (`docker/README.md:124-143`)
   - the configuration and command reference in the admin guide
@@ -232,7 +232,7 @@ Line numbers are on main at 870962647.
 
 Three pull requests, each with its own docs, ship in one release:
 
-1. Migration 11, the shared startup function and the one shared key, for the `catalog` source only. The pull request also deletes the fallback reads and adds the new factory argument. The released-upgrade tests and `docs/schema/<backend>.txt` change with the migration (`CONTRIBUTING.md:329-341`). No request or response changes. Crates: `storage`, `storage-sqlite`, `storage-postgres`, `storage-mongodb`, `storage-cassandra`, `server` and `app`.
+1. Migration 12, the shared startup function and the one shared key, for the `catalog` source only. The pull request also deletes the fallback reads and adds the new factory argument. The released-upgrade tests and `docs/schema/<backend>.txt` change with the migration (`CONTRIBUTING.md:329-341`). No request or response changes. Crates: `storage`, `storage-sqlite`, `storage-postgres`, `storage-mongodb`, `storage-cassandra`, `server` and `app`.
 2. The `file` source, its file rule and the KEK id. The bootstrap rule of section 4, the startup refusals, and `extenddb encryption-key rotate` on SQLite and PostgreSQL. Crates: `config`, `storage`, `storage-sqlite`, `storage-postgres` and `app`.
 3. `rotate` on MongoDB and Cassandra, and the consistency argument of the Cassandra helpers. Crates: `storage-mongodb` and `storage-cassandra`.
 
@@ -258,7 +258,7 @@ Size: each pull request reports its production and test line counts. For compari
 - On Cassandra a rotation needs every replica of the catalog keyspace up.
 - The operator keeps the KEK readable only by the server's user, and backs it up apart from the catalog. A lost KEK loses every stored secret.
 - SQLite, PostgreSQL and Cassandra never delete expired sessions (#971). The pass therefore reads every session row to find the ones that have not expired.
-- Migration 11 is breaking, so its rollback is a restore.
+- Migration 12 is breaking, so its rollback is a restore.
 - The move does not protect the secrets that older catalog copies hold (section 5).
 
 ## Alternatives
@@ -274,7 +274,7 @@ Size: each pull request reports its production and test line counts. For compari
 
 ## Unresolved questions
 
-- Which release carries migration 11 and the three pull requests? `RELEASED_THROUGH` is 0, and the 1.0 release pull request raises it to 10 (`crates/storage/src/migrations/registry.rs:108-111`).
+- Which release carries migration 12 and the three pull requests? On main at ce3a51a4b, `RELEASED_THROUGH` is 0, and the 1.0 release pull request raises it to 11 (`crates/storage/src/migrations/registry.rs:112-115`).
 - Is the downtime of an offline rotation acceptable for the largest deployment that reviewers expect? On Cassandra each row is a lightweight transaction, and its rate was not measured.
 - Should a follow-up encrypt the PostgreSQL connection string, with its password, under the DEK?
 
