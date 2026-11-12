@@ -167,6 +167,15 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0009_warm_throughput.sql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
@@ -196,6 +205,7 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::StreamPending
         | MigrationId::RestoreProgress
         | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics
         | MigrationId::UniqueAccessKeyIds => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }

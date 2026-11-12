@@ -15,6 +15,7 @@ use super::catalog_store::CassandraCatalogStore;
 
 mod access_keys;
 mod accounts;
+mod dependents;
 mod groups;
 mod policies;
 mod roles;

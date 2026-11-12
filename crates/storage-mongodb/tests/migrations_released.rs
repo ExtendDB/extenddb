@@ -163,7 +163,7 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 11, "{state}");
+        assert_eq!(pending.len(), 12, "{state}");
         let report = d.migrate().await.expect("migrate");
         assert_eq!(
             (report.from, report.to),
@@ -182,10 +182,9 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
         for (name, want) in &expected_catalog {
             assert_eq!(catalog.get(name), Some(want), "{state}: {name}");
         }
-        assert!(
-            !catalog.contains_key("continuous_backups"),
-            "{state}: continuous_backups"
-        );
+        for dropped in ["continuous_backups", "metrics"] {
+            assert!(!catalog.contains_key(dropped), "{state}: {dropped}");
+        }
         for (name, want) in &expected_data {
             assert_eq!(data.get(name), Some(want), "{state}: {name}");
         }
@@ -618,7 +617,7 @@ async fn access_key_indexes(d: &Deployment) -> Vec<String> {
         .unwrap()
 }
 
-/// Migration 10's body on the oldest released catalog, after the fixture's
+/// Migration 11's body on the oldest released catalog, after the fixture's
 /// user imported its access key ID twice more and the user `ci` imported
 /// the example pair three times: a release before 1.0 stored a document for
 /// each import. Each ID keeps the copy a credential lookup read before the
@@ -627,12 +626,12 @@ async fn access_key_indexes(d: &Deployment) -> Vec<String> {
 /// index then refuses another copy. The committed golden file pins the keys
 /// and the notes.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_keeps_the_copy_each_lookup_read_as_the_golden_file_records() {
+async fn migration_11_keeps_the_copy_each_lookup_read_as_the_golden_file_records() {
     use futures::TryStreamExt;
     use mongodb::error::{ErrorKind, WriteFailure};
 
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "golden10").await;
+    let d = Deployment::new(&uri, "golden11").await;
     fixture::load(&d, &fixture::read("0.1.12")).await;
     let (fixture_doc, fixture_id, account, created) = fixture_key(&d).await;
     let keys = d.catalog().collection::<Document>("access_keys");
@@ -741,19 +740,19 @@ async fn migration_10_keeps_the_copy_each_lookup_read_as_the_golden_file_records
         .await
         .iter()
         .find(|row| row.id == MigrationId::UniqueAccessKeyIds.number())
-        .expect("migration 10's row")
+        .expect("migration 11's row")
         .notes
         .lines()
         .map(str::to_owned)
         .collect();
     golden(
-        "0010_unique_access_key_ids",
+        "0011_unique_access_key_ids",
         &serde_json::json!({ "access_keys": stored, "notes": notes }),
     );
     d.drop_databases().await;
 }
 
-/// Migration 10's `detect` refuses, before any migration writes, an ID that
+/// Migration 11's `detect` refuses, before any migration writes, an ID that
 /// another user of the account holds, an ID that users of one name in two
 /// accounts hold, two documents without an ID, and a document whose ID is
 /// an array: the status reads NeedsAttention, `migrate --yes` exits 5 and
@@ -762,9 +761,9 @@ async fn migration_10_keeps_the_copy_each_lookup_read_as_the_golden_file_records
 /// the documents the refusal names are deleted, `migrate --yes` applies
 /// every migration.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_refuses_copies_it_cannot_resolve_and_writes_nothing() {
+async fn migration_11_refuses_copies_it_cannot_resolve_and_writes_nothing() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "refuse10").await;
+    let d = Deployment::new(&uri, "refuse11").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let (owner, fixture_id, account, created) = fixture_key(&d).await;
     let keys = d.catalog().collection::<Document>("access_keys");
@@ -797,7 +796,7 @@ async fn migration_10_refuses_copies_it_cannot_resolve_and_writes_nothing() {
     let settings = Deployment::documents(&d.catalog(), "settings").await;
 
     let CatalogStatus::NeedsAttention { items } = d.status().await else {
-        panic!("migration 10 is not refused");
+        panic!("migration 11 is not refused");
     };
     assert_eq!(items.len(), 4, "{items:?}");
     let error = d.migrate().await.expect_err("refused");
@@ -916,13 +915,13 @@ async fn migration_10_refuses_copies_it_cannot_resolve_and_writes_nothing() {
 /// `detect` otherwise stops first: copies written after the runner read the
 /// collection. It returns NeedsAttention and writes nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_run_refuses_copies_written_after_detect() {
+async fn migration_11_run_refuses_copies_written_after_detect() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "run10").await;
+    let d = Deployment::new(&uri, "run11").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
-    d.migrate_through(MigrationId::WarmThroughput)
+    d.migrate_through(MigrationId::AccountMetrics)
         .await
-        .expect("migrations 1 to 9");
+        .expect("migrations 1 to 10");
     let (_, fixture_id, account, created) = fixture_key(&d).await;
     d.catalog()
         .collection::<Document>("access_keys")
@@ -957,12 +956,12 @@ async fn migration_10_run_refuses_copies_written_after_detect() {
             .await
             .iter()
             .all(|row| row.id != MigrationId::UniqueAccessKeyIds.number()),
-        "migration 10 is not recorded"
+        "migration 11 is not recorded"
     );
     d.drop_databases().await;
 }
 
-/// Migration 10's body `run`, called directly under the lock; the items it
+/// Migration 11's body `run`, called directly under the lock; the items it
 /// refuses the migration for.
 async fn run_body(d: &Deployment) -> Vec<String> {
     use extenddb_storage::migrations::{Body, MigrationError};
@@ -980,7 +979,7 @@ async fn run_body(d: &Deployment) -> Vec<String> {
         .expect("open");
     let entry = migration(MigrationId::UniqueAccessKeyIds);
     let Body::Code { body, .. } = &entry.bodies()[0].body else {
-        panic!("migration 10 is a code body");
+        panic!("migration 11 is a code body");
     };
     let result = body.run(migrations.stores()).await;
     migrations.close().await;
@@ -1005,10 +1004,10 @@ fn oid(n: u8) -> ObjectId {
     ObjectId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n])
 }
 
-/// What the runner writes before each of migration 10's refusals.
-const REFUSED: &str = "migration 10 unique_access_key_ids: ";
+/// What the runner writes before each of migration 11's refusals.
+const REFUSED: &str = "migration 11 unique_access_key_ids: ";
 
-/// How migration 10's refusals name a document of `user` in `account`,
+/// How migration 11's refusals name a document of `user` in `account`,
 /// created at `created_ms`.
 fn described(id: &Bson, account: &str, user: &str, created_ms: i64) -> String {
     let created = bson::DateTime::from_millis(created_ms)
@@ -1017,7 +1016,7 @@ fn described(id: &Bson, account: &str, user: &str, created_ms: i64) -> String {
     format!("_id {id} (account {account}, user {user}, created {created})")
 }
 
-/// The sentence that ends each of migration 10's refusals in `catalog`.
+/// The sentence that ends each of migration 11's refusals in `catalog`.
 fn delete_sentence(catalog: &str) -> String {
     format!(
         "To delete a document, run this command in mongosh: \
@@ -1025,7 +1024,7 @@ fn delete_sentence(catalog: &str) -> String {
     )
 }
 
-/// Migration 10's refusal, as the runner writes it, of document `n` of the
+/// Migration 11's refusal, as the runner writes it, of document `n` of the
 /// user `listed` in `account`, created at `created_ms`, whose access key
 /// ID is the array [`ARRAY_KEY_IDS`].
 fn array_refusal(catalog: &str, account: &str, n: u8, created_ms: i64) -> String {
@@ -1061,31 +1060,31 @@ async fn unique_index(d: &Deployment) -> Option<bool> {
         .map(|o| o.unique == Some(true))
 }
 
-/// The items for which the status refuses migration 10.
+/// The items for which the status refuses migration 11.
 async fn status_items(d: &Deployment) -> Vec<String> {
     match d.status().await {
         CatalogStatus::NeedsAttention { items } => items,
-        status => panic!("migration 10 is not refused: {status}"),
+        status => panic!("migration 11 is not refused: {status}"),
     }
 }
 
-/// A catalog at migration 9 holds an ID of two users and an array ID. It
+/// A catalog at migration 10 holds an ID of two users and an array ID. It
 /// also holds a document without an ID and one whose ID is the number 42.
 /// Beside a non-unique `access_key_id_1`, the status refuses the ID of two
 /// users and the array. With the second user's copy deleted and that index
 /// replaced by the unique index built by hand, the status refuses the array
-/// alone. After the array is deleted, `migrate --yes` applies 10 and keeps
+/// alone. After the array is deleted, `migrate --yes` applies 11 and keeps
 /// the document without an ID and the one with the number 42. Then
 /// `--reconverge` refuses an array ID written later, and it refuses neither
 /// of those two documents.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_refuses_array_ids_beside_its_own_index() {
+async fn migration_11_refuses_array_ids_beside_its_own_index() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "arrays10").await;
+    let d = Deployment::new(&uri, "arrays11").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
-    d.migrate_through(MigrationId::WarmThroughput)
+    d.migrate_through(MigrationId::AccountMetrics)
         .await
-        .expect("migrations 1 to 9");
+        .expect("migrations 1 to 10");
     let (_, fixture_id, account, created) = fixture_key(&d).await;
     let keys = d.catalog().collection::<Document>("access_keys");
     let mut without_id = stored_key(21, "", &account, "broken", created);
@@ -1175,9 +1174,9 @@ async fn migration_10_refuses_array_ids_beside_its_own_index() {
 /// order. The body keeps the copy the lookup's own query returns and
 /// deletes the others, and the operator's index stays.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_keeps_the_copy_a_lookup_reads_through_an_operator_index() {
+async fn migration_11_keeps_the_copy_a_lookup_reads_through_an_operator_index() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "operator10").await;
+    let d = Deployment::new(&uri, "operator11").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let (first, fixture_id, account, created) = fixture_key(&d).await;
     let keys = d.catalog().collection::<Document>("access_keys");
@@ -1215,7 +1214,7 @@ async fn migration_10_keeps_the_copy_a_lookup_reads_through_an_operator_index() 
         .await
         .into_iter()
         .find(|row| row.id == MigrationId::UniqueAccessKeyIds.number())
-        .expect("migration 10's row")
+        .expect("migration 11's row")
         .notes;
     assert_eq!(
         notes,
@@ -1243,9 +1242,9 @@ async fn migration_10_keeps_the_copy_a_lookup_reads_through_an_operator_index() 
 /// the index, its newest copy. The body keeps, for each ID, the copy its
 /// own lookup reads.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_keeps_the_copy_each_lookup_reads_beside_a_partial_index() {
+async fn migration_11_keeps_the_copy_each_lookup_reads_beside_a_partial_index() {
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "partial10").await;
+    let d = Deployment::new(&uri, "partial11").await;
     fixture::load(&d, &fixture::read("0.1.14")).await;
     let (_, _, account, created) = fixture_key(&d).await;
     let keys = d.catalog().collection::<Document>("access_keys");
@@ -1302,7 +1301,7 @@ async fn migration_10_keeps_the_copy_each_lookup_reads_beside_a_partial_index() 
 /// and there the test stops after it loads the fixture, before it writes
 /// the second copy.
 #[tokio::test(flavor = "multi_thread")]
-async fn migration_10_keeps_the_copy_a_lookup_reads_under_query_settings() {
+async fn migration_11_keeps_the_copy_a_lookup_reads_under_query_settings() {
     use futures::FutureExt;
 
     /// CommandNotFound.
@@ -1313,7 +1312,7 @@ async fn migration_10_keeps_the_copy_a_lookup_reads_under_query_settings() {
     }
 
     let Some(uri) = server() else { return };
-    let d = Deployment::new(&uri, "settings10").await;
+    let d = Deployment::new(&uri, "settings11").await;
     let catalog = d.target.catalog.clone();
     let admin = d.client.database("admin");
     fixture::load(&d, &fixture::read("0.1.14")).await;
@@ -1369,7 +1368,7 @@ async fn migration_10_keeps_the_copy_a_lookup_reads_under_query_settings() {
             .await
             .into_iter()
             .find(|row| row.id == MigrationId::UniqueAccessKeyIds.number())
-            .expect("migration 10's row")
+            .expect("migration 11's row")
             .notes;
         assert_eq!(
             notes,

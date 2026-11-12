@@ -43,7 +43,10 @@ mod m0005_drop_continuous_backups;
 mod m0006_backup_catalog_index;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
-mod m0010_unique_access_key_ids;
+mod m0010_account_metrics;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0011_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -176,6 +179,15 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             "the catalog collections have no validator, so a table or index document carries \
              a warm_throughput field without a schema change",
         ),
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0010_account_metrics::AccountMetrics,
+                m0010_account_metrics::SOURCE,
+            )],
+        },
         MigrationId::UniqueAccessKeyIds => Migration::Applies {
             // A unique index is never additive (CONTRIBUTING.md): the
             // previous release does not expect the index to refuse a write.
@@ -185,8 +197,8 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             convergent: true,
             bodies: vec![StoreBody::code(
                 StoreKind::Catalog,
-                &m0010_unique_access_key_ids::UniqueAccessKeyIds,
-                m0010_unique_access_key_ids::SOURCE,
+                &m0011_unique_access_key_ids::UniqueAccessKeyIds,
+                m0011_unique_access_key_ids::SOURCE,
             )],
         },
     }
