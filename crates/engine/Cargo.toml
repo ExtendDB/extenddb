@@ -49,6 +49,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # A storage engine for the tests that need an `OperationContext`.
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
 
-# The file-mode tests set a permissive umask.
+# `tests/private_modes.rs` sets umask 0.
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }

@@ -52,9 +52,16 @@ pub(crate) fn private_new_file_options() -> tokio::fs::OpenOptions {
 
 #[cfg(all(test, unix))]
 mod tests {
+    //! These tests run under the umask the test binary inherited and never
+    //! change it: the umask is process-wide, and the other tests in this
+    //! binary create files in parallel. The modes they assert hold under any
+    //! umask that masks no owner bit, which covers the umasks the server runs
+    //! under (022, 002, 027 as a daemon, 077). `tests/private_modes.rs` runs
+    //! the same cases under umask 0, as the only test in its binary.
+
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::Arc;
 
     use extenddb_core::error::DynamoDbError;
 
@@ -62,54 +69,20 @@ mod tests {
     use crate::import_export::create_export_file;
     use crate::import_export_io::ensure_account_dirs;
 
-    /// Serializes the tests that change the process-wide umask. While one of
-    /// them runs, every other test in this binary creates files under the umask
-    /// it set, so a test that checks the mode of a file it creates must hold
-    /// this lock and set its own umask. The lock and the `Umask` guard are
-    /// private to this module; make them `pub(crate)` to use them elsewhere.
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Sets the process umask for the lifetime of the value, then restores it.
-    struct Umask {
-        _guard: MutexGuard<'static, ()>,
-        previous: libc::mode_t,
-    }
-
-    impl Umask {
-        fn set(mask: libc::mode_t) -> Self {
-            let guard = UMASK_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // SAFETY: umask(2) has no preconditions and cannot fail; the lock
-            // keeps the tests in this module from interleaving their changes.
-            let previous = unsafe { libc::umask(mask) };
-            Self {
-                _guard: guard,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for Umask {
-        fn drop(&mut self) {
-            // SAFETY: see `set`.
-            unsafe {
-                libc::umask(self.previous);
-            }
-        }
-    }
-
-    /// A fresh `0755` directory under the temp dir, whatever the umask.
+    /// A fresh `0755` directory under the temp dir.
     fn scratch(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "extenddb-private-fs-{name}-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o755);
-        builder.create(&base).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o755);
         base
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -118,6 +91,26 @@ mod tests {
             .permissions()
             .mode()
             & 0o777
+    }
+
+    /// The mode a directory created without a mode gets under the inherited
+    /// umask: `0777` less the umask's bits.
+    fn default_dir_mode() -> u32 {
+        let base = scratch("probe");
+        let probe = base.join("probe");
+        std::fs::DirBuilder::new()
+            .mode(0o777)
+            .create(&probe)
+            .unwrap();
+        let mode = mode_of(&probe);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "these tests need a umask that masks no owner bit, not {:03o}",
+            0o777 & !mode
+        );
+        mode
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -130,7 +123,6 @@ mod tests {
 
     #[test]
     fn create_private_dir_all_creates_owner_only_directories() {
-        let _umask = Umask::set(0);
         let base = scratch("dirs");
         let leaf = base.join("a").join("b").join("c");
 
@@ -145,17 +137,21 @@ mod tests {
 
     #[test]
     fn create_private_dir_all_leaves_an_existing_directory_alone() {
-        let _umask = Umask::set(0);
         let base = scratch("existing");
         let shared = base.join("shared");
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o775);
-        builder.create(&shared).unwrap();
-        assert_eq!(mode_of(&shared), 0o775);
+        std::fs::create_dir(&shared).unwrap();
+        set_mode(&shared, 0o775);
+
+        create_private_dir_all(&shared).unwrap();
+        assert_eq!(
+            mode_of(&shared),
+            0o775,
+            "an existing directory keeps its mode"
+        );
 
         let child = shared.join("child");
         create_private_dir_all(&child).unwrap();
-        assert_eq!(mode_of(&shared), 0o775);
+        assert_eq!(mode_of(&shared), 0o775, "an existing parent keeps its mode");
         assert_eq!(mode_of(&child), 0o700);
 
         create_private_dir_all(&child).unwrap();
@@ -165,7 +161,6 @@ mod tests {
 
     #[test]
     fn export_file_is_created_owner_only() {
-        let _umask = Umask::set(0);
         let base = scratch("file");
         let path = base.join("export.json");
 
@@ -200,7 +195,6 @@ mod tests {
 
     #[test]
     fn account_export_directory_is_created_owner_only() {
-        let _umask = Umask::set(0);
         let base = scratch("account");
 
         ensure_account_dirs(&[Arc::new(base.clone())], "111122223333").unwrap();
@@ -210,11 +204,18 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    /// Control: the standard calls these helpers replace follow the umask, so
-    /// the tests above run under a permissive one.
+    /// Control: the standard calls these helpers replace give other modes
+    /// under the inherited umask, so the tests above tell the two apart.
+    /// Under a umask that gives the standard calls `0700` or `0600` too, such
+    /// as 077, there is nothing to tell apart and the test returns early.
     #[test]
     fn standard_library_defaults_follow_the_umask() {
-        let _umask = Umask::set(0);
+        let dir_mode = default_dir_mode();
+        let file_mode = dir_mode & 0o666;
+        if dir_mode == 0o700 || file_mode == 0o600 {
+            eprintln!("skipped: the inherited umask gives the standard calls owner-only modes");
+            return;
+        }
         let base = scratch("control");
         let dir = base.join("plain");
         let file = base.join("plain.json");
@@ -229,8 +230,8 @@ mod tests {
                 .unwrap();
         });
 
-        assert_eq!(mode_of(&dir), 0o777);
-        assert_eq!(mode_of(&file), 0o666);
+        assert_eq!(mode_of(&dir), dir_mode);
+        assert_eq!(mode_of(&file), file_mode);
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

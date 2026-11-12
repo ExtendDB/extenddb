@@ -36,60 +36,32 @@ pub(crate) fn resolve_roots(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    //! These tests run under the umask the test binary inherited and never
+    //! change it: the umask is process-wide, and the other tests in this
+    //! binary create files in parallel. The modes they assert hold under any
+    //! umask that masks no owner bit, which covers the umasks the server runs
+    //! under. The same directory creation under umask 0 is covered by the
+    //! engine's `tests/private_modes.rs`.
+
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard};
 
     use super::resolve_roots;
 
-    /// Serializes the tests that change the process-wide umask. While one of
-    /// them runs, every other test in this binary creates files under the umask
-    /// it set, so a test that checks the mode of a file it creates must hold
-    /// this lock and set its own umask. The lock and the `Umask` guard are
-    /// private to this module; make them `pub(crate)` to use them elsewhere.
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Sets the process umask for the lifetime of the value, then restores it.
-    struct Umask {
-        _guard: MutexGuard<'static, ()>,
-        previous: libc::mode_t,
-    }
-
-    impl Umask {
-        fn set(mask: libc::mode_t) -> Self {
-            let guard = UMASK_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // SAFETY: umask(2) has no preconditions and cannot fail; the lock
-            // keeps the tests in this module from interleaving their changes.
-            let previous = unsafe { libc::umask(mask) };
-            Self {
-                _guard: guard,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for Umask {
-        fn drop(&mut self) {
-            // SAFETY: see `set`.
-            unsafe {
-                libc::umask(self.previous);
-            }
-        }
-    }
-
-    /// A fresh `0755` directory under the temp dir, whatever the umask.
+    /// A fresh `0755` directory under the temp dir.
     fn scratch() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "extenddb-roots-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o755);
-        builder.create(&base).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o755);
         base
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -102,7 +74,6 @@ mod tests {
 
     #[test]
     fn a_missing_root_is_created_owner_only() {
-        let _umask = Umask::set(0);
         let base = scratch();
         let root = base.join("exports").join("nested");
 
@@ -118,12 +89,10 @@ mod tests {
 
     #[test]
     fn an_existing_root_keeps_its_mode() {
-        let _umask = Umask::set(0);
         let base = scratch();
         let root = base.join("shared");
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o775);
-        builder.create(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        set_mode(&root, 0o775);
 
         resolve_roots(&[root.display().to_string()], "import").unwrap();
 
