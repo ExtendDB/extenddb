@@ -15,6 +15,17 @@
 //! from that id so the `backup_arn` (which contains slashes and colons) never
 //! appears in a collection name.
 //!
+//! `extenddb backup migrate-legacy` reads a backup through `items`, a cursor
+//! over that collection with a frozen copy of the decode, and ends with
+//! `replace_with_index_row`: one session transaction that takes the lock
+//! below, inserts the catalog index document and writes DELETING marked
+//! `migrated_to_store`, then the delete's drop and DELETED. DeleteBackup
+//! reads a marked DELETING document as not found instead of finishing it,
+//! since its backup lives on in the store; `finish_replacement`, which
+//! `backup migrate-legacy` calls for every DELETING document it lists,
+//! finishes the drop whatever the catalog index row holds. `holder_status`
+//! and `list_deleted` leave marked documents out.
+//!
 //! # The restore job record, DeleteBackup and the claim
 //!
 //! A restore registers through the job record on its target's `tables`
@@ -90,26 +101,32 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use extenddb_core::types::{
-    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput, Item,
     KeySchemaElement, LsiInput, Projection, ProvisionedThroughput, SourceTableDetails,
     StreamSpecification, TableDescription, TimeToLiveDescription, TimeToLiveStatus,
 };
 use extenddb_storage::backup_catalog::{
-    AbandonedLegacyBackup, BackupCatalog, JOB_HEARTBEAT_INTERVAL, JobStatus, RestoreKind,
-    RestoreTargetKey, StoreIdentity, new_generation,
+    AbandonedLegacyBackup, BackupCatalog, BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL,
+    JobStatus, LegacyBackupItems, LegacyBackupKey, Replaced, RestoreKind, RestoreTargetKey,
+    StoreIdentity, new_generation,
 };
-use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTableDefinition};
+use extenddb_storage::backup_definition::{
+    BACKUP_DEFINITION_VERSION, BackupTableDefinition, LegacyVectorState,
+};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::snapshot::paging;
 use extenddb_storage::{BackupRestoreSource, JobPermit, LegacyBackupReader, RestoreRequest, util};
 
 use crate::MongoEngine;
 use crate::backup_catalog::{
     LOCK_SEQ, RESTORE_JOB, RESTORE_JOB_COMPLETED_AT, RESTORE_JOB_FAILURE_REASON,
     RESTORE_JOB_GENERATION, RESTORE_JOB_HEARTBEAT, RESTORE_JOB_STATUS, backup_in_use,
-    generation_field,
+    generation_field, unowned_insert,
 };
 use crate::data::data_collection_name;
-use crate::data_engine::{CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, TxErr, backoff_sleep};
+use crate::data_engine::{
+    CommitOutcome, TRANSIENT_RETRY_ATTEMPTS, TxErr, backoff_sleep, is_duplicate_key,
+};
 
 /// The definition version stored on a backup document written by this build.
 /// Backup documents written before it carry the same fields without the
@@ -162,6 +179,11 @@ pub(crate) struct BackupLiveness {
     /// [`HeartbeatFault::INJECTED`] the loop's answer.
     #[cfg(test)]
     pub(crate) heartbeat_fault: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// Test only: when set, a `replace_with_index_row` whose transaction
+    /// committed is told its commit failed (an outcome lost after the
+    /// commit's retries ran out).
+    #[cfg(test)]
+    pub(crate) replacement_commit_unknown: bool,
 }
 
 /// Test only: the two ways a backup drop can end after the server ran it.
@@ -205,6 +227,8 @@ impl Default for BackupLiveness {
             local_clock_behind: Duration::ZERO,
             #[cfg(test)]
             heartbeat_fault: None,
+            #[cfg(test)]
+            replacement_commit_unknown: false,
         }
     }
 }
@@ -461,9 +485,16 @@ enum LockMiss {
 
 fn lock_miss(doc: Option<&Document>) -> LockMiss {
     match doc.and_then(|d| d.get_str("backup_status").ok()) {
-        Some("DELETING") => LockMiss::Deleting,
+        Some("DELETING") if !is_migrated(doc) => LockMiss::Deleting,
         _ => LockMiss::NotFound,
     }
+}
+
+/// Whether `doc` is a backup document `replace_with_index_row` moved to
+/// DELETING ([`MIGRATED_TO_STORE`]).
+fn is_migrated(doc: Option<&Document>) -> bool {
+    doc.and_then(|d| d.get_bool(MIGRATED_TO_STORE).ok())
+        .unwrap_or(false)
 }
 
 impl MongoEngine {
@@ -1085,7 +1116,8 @@ impl MongoEngine {
     /// the backup document (`$inc lock_seq` while AVAILABLE), re-check for a
     /// CREATING target, write DELETING. `Ok(Some(doc))` is the document as it
     /// was, now DELETING; `Ok(None)` means a concurrent DeleteBackup has
-    /// written DELETING already and this one resumes its drop.
+    /// written DELETING already: this one resumes its drop and answers not
+    /// found.
     async fn start_legacy_delete(
         &self,
         account_id: &str,
@@ -1682,13 +1714,27 @@ impl LegacyBackupReader for MongoEngine {
                         "Backup not found: {backup_arn}"
                     )));
                 }
-                // A DeleteBackup that stopped after writing DELETING: resume
-                // its drop and its DELETED write.
+                // A replacement by its store copy (`replace_with_index_row`)
+                // that stopped before its drop: the backup lives on in the
+                // store, and that call, not this one, finishes the drop.
+                Some(Ok("DELETING")) if is_migrated(current.as_ref()) => {
+                    return Err(StorageError::Validation(format!(
+                        "Backup not found: {backup_arn}"
+                    )));
+                }
+                // Another DeleteBackup wrote DELETING (one running, or one
+                // that stopped after the write): its drop and its DELETED
+                // write are resumed, which is idempotent, and this one
+                // answers not found. Only the DeleteBackup that wrote
+                // DELETING answers DELETED, as on PostgreSQL and SQLite,
+                // whatever the timing.
                 Some(Ok("DELETING")) => {
                     let doc = current.expect("a status was read from a document");
-                    return self
-                        .finish_legacy_delete(&account_id, &backup_arn, &doc)
-                        .await;
+                    self.finish_legacy_delete(&account_id, &backup_arn, &doc)
+                        .await?;
+                    return Err(StorageError::Validation(format!(
+                        "Backup not found: {backup_arn}"
+                    )));
                 }
                 Some(_) => current.expect("a status was read from a document"),
             };
@@ -1706,9 +1752,15 @@ impl LegacyBackupReader for MongoEngine {
             // The decision under the lock: AVAILABLE and no CREATING target,
             // then DELETING, in one transaction a restore's registration
             // conflicts with.
-            let backup_doc = match self.start_legacy_delete(&account_id, &backup_arn).await? {
-                Some(doc) => doc,
-                None => current,
+            let Some(backup_doc) = self.start_legacy_delete(&account_id, &backup_arn).await? else {
+                // A concurrent DeleteBackup wrote DELETING between the read
+                // above and the lock: as for a DELETING read above, its drop
+                // is resumed and this one answers not found.
+                self.finish_legacy_delete(&account_id, &backup_arn, &current)
+                    .await?;
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
             };
             self.finish_legacy_delete(&account_id, &backup_arn, &backup_doc)
                 .await
@@ -1842,6 +1894,454 @@ impl LegacyBackupReader for MongoEngine {
     ) -> BoxFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys(doc! { "backup_status": { "$ne": "DELETED" } }))
+    }
+
+    /// A replacement leaves its DELETED document marked `migrated_to_store`;
+    /// the others are DeleteBackup's.
+    fn list_deleted(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys(doc! {
+            "backup_status": "DELETED",
+            MIGRATED_TO_STORE: { "$ne": true },
+        }))
+    }
+
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        Box::pin(async move {
+            let found = self
+                .catalog_db
+                .collection::<Document>("backups")
+                .find_one(doc! { "_id": backup_arn, "account_id": account_id })
+                .await
+                .map_err(internal)?;
+            match found {
+                Some(doc) if !is_migrated(Some(&doc)) => legacy_key(&doc).map(|k| Some(k.status)),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// The DELETED backup document without the [`MIGRATED_TO_STORE`]
+    /// marker goes (the DeleteBackup dropped its item collection); a
+    /// document in any other status, or a replacement's, is left.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let removed = self
+                .catalog_db
+                .collection::<Document>("backups")
+                .delete_one(doc! {
+                    "_id": backup_arn,
+                    "account_id": account_id,
+                    "backup_status": "DELETED",
+                    MIGRATED_TO_STORE: { "$ne": true },
+                })
+                .await
+                .map_err(internal)?;
+            Ok(removed.deleted_count == 1)
+        })
+    }
+
+    /// A backup document DELETING with [`MIGRATED_TO_STORE`]: its
+    /// replacement committed and stopped before the drop. The frozen
+    /// delete's second half (`finish_legacy_delete`) drops the collection
+    /// and writes DELETED, whatever the catalog index row now holds; the
+    /// marker is what proves the store copy was the replacement's.
+    fn finish_replacement<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let found = self
+                .catalog_db
+                .collection::<Document>("backups")
+                .find_one(doc! {
+                    "_id": backup_arn,
+                    "account_id": account_id,
+                    "backup_status": "DELETING",
+                    MIGRATED_TO_STORE: true,
+                })
+                .await
+                .map_err(internal)?;
+            let Some(doc) = found else {
+                return Ok(false);
+            };
+            self.finish_legacy_delete(account_id, backup_arn, &doc)
+                .await?;
+            Ok(true)
+        })
+    }
+
+    /// The AVAILABLE backup document (its source as `restore_source` reads
+    /// it), then a cursor over its `_backup_<backup_id>` collection in
+    /// batches of [`paging::DEFAULT_FETCH_BATCH`] documents, each decoded as
+    /// the data path decoded `item_data` when the backup was taken
+    /// ([`legacy_item_from_document`]). The collection is immutable while the
+    /// backup is AVAILABLE, so no snapshot is held; a DeleteBackup's drop
+    /// ends the cursor with an error.
+    fn items(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        let account_id = account_id.to_owned();
+        let backup_arn = backup_arn.to_owned();
+        Box::pin(async move {
+            let doc = self
+                .catalog_db
+                .collection::<Document>("backups")
+                .find_one(doc! {
+                    "_id": &backup_arn,
+                    "account_id": &account_id,
+                    "backup_status": "AVAILABLE",
+                })
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| {
+                    StorageError::Validation(format!("Backup not found: {backup_arn}"))
+                })?;
+            let source = restore_source_from_doc(&doc, &self.region, &account_id, &backup_arn)?;
+            let Ok(collection_id) = doc.get_str("backup_id") else {
+                return Err(StorageError::Unsupported(format!(
+                    "backup {backup_arn} was taken before backups copied their items into a \
+                     collection of their own, so it has no item collection to read"
+                )));
+            };
+            let cursor = self
+                .data_db
+                .collection::<Document>(&backup_collection_name(collection_id))
+                .find(doc! {})
+                .batch_size(u32::try_from(paging::DEFAULT_FETCH_BATCH).unwrap_or(u32::MAX))
+                .await
+                .map_err(internal)?;
+            let items = futures::stream::unfold(Some(cursor), |cursor| async move {
+                let mut cursor = cursor?;
+                match cursor.try_next().await {
+                    Ok(Some(doc)) => {
+                        let item = legacy_item_from_document(&doc);
+                        let next = item.is_ok().then_some(cursor);
+                        Some((item, next))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(internal(e)), None)),
+                }
+            });
+            Ok(LegacyBackupItems {
+                backup_name: doc.get_str("backup_name").unwrap_or_default().to_owned(),
+                source,
+                vector_state: LegacyVectorState::Unsupported,
+                items: Box::pin(items),
+            })
+        })
+    }
+
+    /// One session transaction on the catalog database: the backup
+    /// document's lock (`$inc lock_seq` while AVAILABLE, the lock DeleteBackup
+    /// and a restore's registration take), the in-use rule, the index
+    /// document (`insert_backup_row`'s upsert) and DELETING with
+    /// [`MIGRATED_TO_STORE`] set. After the commit, the frozen delete's
+    /// second half drops the item collection and writes DELETED
+    /// (`finish_legacy_delete`). A stop between the two leaves DELETING with
+    /// the index document committed, which `list_all` lists and a later call
+    /// (as `AlreadyReplaced`) or `finish_replacement` finishes; DeleteBackup
+    /// of the legacy ARN reads such a document as not found rather than
+    /// finish it. A commit whose outcome is lost is settled by reading the
+    /// marked document and the index document back.
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Replaced, StorageError>> {
+        Box::pin(async move {
+            let (outcome, finish) = self.start_replacement(row).await?;
+            if let Some(backup_doc) = finish {
+                self.finish_legacy_delete(&row.account_id, &row.backup_arn, &backup_doc)
+                    .await?;
+            }
+            Ok(outcome)
+        })
+    }
+}
+
+/// Set (`true`) on a legacy backup document that `replace_with_index_row`
+/// moved to DELETING: its backup lives on in the store under the same ARN, so
+/// the frozen DeleteBackup must not finish the deletion and answer DELETED.
+const MIGRATED_TO_STORE: &str = "migrated_to_store";
+
+/// A frozen copy of the data path's decode of a stored document
+/// (`crate::data::document_to_item`) as it was when the in-catalog `$out`
+/// copies were taken, so the data path can change without changing what a
+/// legacy backup reads as.
+fn legacy_item_from_document(doc: &Document) -> Result<Item, StorageError> {
+    let item_data = doc
+        .get("item_data")
+        .ok_or_else(|| StorageError::Internal("Document missing item_data field".to_string()))?;
+    let json_value: serde_json::Value = bson::from_bson(item_data.clone())
+        .map_err(|e| StorageError::Internal(format!("BSON to JSON conversion error: {e}")))?;
+    serde_json::from_value(json_value)
+        .map_err(|e| StorageError::Internal(format!("JSON to Item conversion error: {e}")))
+}
+
+/// A backup document as a [`LegacyBackupKey`]; a document without its
+/// `_id`, `account_id` or `backup_status`, or with a status no release
+/// writes, is an error.
+fn legacy_key(doc: &Document) -> Result<LegacyBackupKey, StorageError> {
+    let field = |name: &str| {
+        doc.get_str(name).map(str::to_owned).map_err(|e| {
+            StorageError::Internal(format!(
+                "backup document {:?} has no {name}: {e}",
+                doc.get("_id")
+            ))
+        })
+    };
+    Ok(LegacyBackupKey {
+        account_id: field("account_id")?,
+        backup_arn: field("_id")?,
+        status: BackupStatus::parse(&field("backup_status")?)?,
+    })
+}
+
+impl MongoEngine {
+    /// The backup documents `filter` keeps, of every account, by creation
+    /// time and then ARN.
+    async fn legacy_keys(&self, filter: Document) -> Result<Vec<LegacyBackupKey>, StorageError> {
+        let mut cursor = self
+            .catalog_db
+            .collection::<Document>("backups")
+            .find(filter)
+            .sort(doc! { "created_at": 1, "_id": 1 })
+            .await
+            .map_err(internal)?;
+        let mut keys = Vec::new();
+        while let Some(doc) = cursor.try_next().await.map_err(internal)? {
+            keys.push(legacy_key(&doc)?);
+        }
+        Ok(keys)
+    }
+
+    /// Whether the replacement of `row` committed: its backup document
+    /// DELETING (or DELETED) with [`MIGRATED_TO_STORE`] and the index
+    /// document of `row`'s account, ARN and store in.
+    async fn replacement_landed(&self, row: &BackupRow) -> Result<bool, StorageError> {
+        let marked = self
+            .catalog_db
+            .collection::<Document>("backups")
+            .find_one(doc! {
+                "_id": &row.backup_arn,
+                "account_id": &row.account_id,
+                MIGRATED_TO_STORE: true,
+            })
+            .await
+            .map_err(internal)?
+            .is_some();
+        if !marked {
+            return Ok(false);
+        }
+        Ok(self
+            .backup_index()
+            .find_one(doc! {
+                "backup_id": &row.backup_id,
+                "account_id": &row.account_id,
+                "backup_arn": &row.backup_arn,
+                "store_kind": row.store.store_kind.as_str(),
+                "store_root": &row.store.store_root,
+                "store_id": &row.store.store_id,
+            })
+            .await
+            .map_err(internal)?
+            .is_some())
+    }
+
+    /// The transaction of `replace_with_index_row`: what it decided, and the
+    /// backup document (as it was) whose collection is still to drop.
+    async fn start_replacement(
+        &self,
+        row: &BackupRow,
+    ) -> Result<(Replaced, Option<Document>), StorageError> {
+        let backups = self.catalog_db.collection::<Document>("backups");
+        let index = self.backup_index();
+        let mut session = self.client.start_session().await.map_err(internal)?;
+        let tx_options = self.write_transaction_options();
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+            session
+                .start_transaction()
+                .with_options(tx_options.clone())
+                .await
+                .map_err(internal)?;
+            let body: Result<Result<(Replaced, Option<Document>), StorageError>, TxErr> = async {
+                let held = index
+                    .find_one(doc! { "backup_id": &row.backup_id })
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                let same = held.as_ref().is_some_and(|held| {
+                    held.get_str("account_id").ok() == Some(row.account_id.as_str())
+                        && held.get_str("backup_arn").ok() == Some(row.backup_arn.as_str())
+                        && held.get_str("store_kind").ok() == Some(row.store.store_kind.as_str())
+                        && held.get_str("store_root").ok() == Some(row.store.store_root.as_str())
+                        && held.get_str("store_id").ok() == Some(row.store.store_id.as_str())
+                });
+                let elsewhere = |held: &Document| {
+                    StorageError::AlreadyExists(format!(
+                        "backup id {} has a row under {} in the {} store at {:?} ({})",
+                        row.backup_id,
+                        held.get_str("backup_arn").unwrap_or("?"),
+                        held.get_str("store_kind").unwrap_or("?"),
+                        held.get_str("store_root").unwrap_or("?"),
+                        held.get_str("store_id").unwrap_or("?"),
+                    ))
+                };
+                let locked = backups
+                    .find_one_and_update(
+                        doc! {
+                            "_id": &row.backup_arn,
+                            "account_id": &row.account_id,
+                            "backup_status": "AVAILABLE",
+                        },
+                        doc! { "$inc": { LOCK_SEQ: 1_i64 } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                let Some(backup_doc) = locked else {
+                    // Another row of the id is answered as such whatever
+                    // the in-catalog backup's status, as on the AVAILABLE
+                    // path: the caller keeps the copy, which may be that
+                    // row's prefix.
+                    if let Some(held) = held.as_ref().filter(|_| !same) {
+                        return Ok(Err(elsewhere(held)));
+                    }
+                    let current = backups
+                        .find_one(doc! { "_id": &row.backup_arn, "account_id": &row.account_id })
+                        .session(&mut session)
+                        .await
+                        .map_err(TxErr::from)?;
+                    let status = current
+                        .as_ref()
+                        .and_then(|d| d.get_str("backup_status").ok().map(str::to_owned));
+                    return Ok(Ok(match (same, status.as_deref()) {
+                        // An earlier call committed and stopped before the
+                        // drop: finish it.
+                        (true, Some("DELETING")) => (Replaced::AlreadyReplaced, current),
+                        (true, _) => (Replaced::AlreadyReplaced, None),
+                        (false, Some(status)) => (
+                            Replaced::NotAvailable(format!("the in-catalog backup is {status}")),
+                            None,
+                        ),
+                        (false, None) => (
+                            Replaced::NotAvailable(format!("Backup not found: {}", row.backup_arn)),
+                            None,
+                        ),
+                    }));
+                };
+                if let Some(target) = self
+                    .creating_restore_target(&row.account_id, &row.backup_arn, Some(&mut session))
+                    .await
+                    .map_err(TxErr::from)?
+                {
+                    return Ok(Ok((Replaced::InUse(target), None)));
+                }
+                let outcome = match held {
+                    None => {
+                        let (filter, update) = unowned_insert(row)?;
+                        index
+                            .update_one(filter, update)
+                            .upsert(true)
+                            .session(&mut session)
+                            .await
+                            .map_err(|e| {
+                                // A row inserted since the read above: run the
+                                // body again, which reads it.
+                                if is_duplicate_key(&e) {
+                                    TxErr::Transient(e.to_string())
+                                } else {
+                                    TxErr::from(e)
+                                }
+                            })?;
+                        Replaced::Replaced
+                    }
+                    Some(_) if same => Replaced::AlreadyReplaced,
+                    Some(held) => return Ok(Err(elsewhere(&held))),
+                };
+                backups
+                    .update_one(
+                        doc! {
+                            "_id": &row.backup_arn,
+                            "account_id": &row.account_id,
+                            "backup_status": "AVAILABLE",
+                        },
+                        doc! { "$set": { "backup_status": "DELETING", MIGRATED_TO_STORE: true } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(TxErr::from)?;
+                Ok(Ok((outcome, Some(backup_doc))))
+            }
+            .await;
+            match body {
+                Ok(Ok(decided)) => {
+                    if decided.1.is_none() {
+                        // Nothing was written: no commit to wait for.
+                        let _ = session.abort_transaction().await;
+                        return Ok(decided);
+                    }
+                    let committed = self.commit_write_transaction(&mut session, None).await;
+                    #[cfg(test)]
+                    let committed = match committed {
+                        Ok(CommitOutcome::Committed)
+                            if self.backup_liveness.replacement_commit_unknown =>
+                        {
+                            Err(StorageError::Internal(
+                                "test hook: the commit applied and its outcome was lost".to_owned(),
+                            ))
+                        }
+                        other => other,
+                    };
+                    match committed {
+                        Ok(CommitOutcome::Committed) => return Ok(decided),
+                        Ok(CommitOutcome::RerunBody(_)) => backoff_sleep(attempt).await,
+                        // The outcome is unknown (the retries of the commit
+                        // ran out): what this call would have written,
+                        // read back, settles it, so a replacement that
+                        // landed is this call's and answers as decided.
+                        Err(e) => {
+                            return if self.replacement_landed(row).await.unwrap_or(false) {
+                                Ok(decided)
+                            } else {
+                                Err(e)
+                            };
+                        }
+                    }
+                }
+                Ok(Err(refusal)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(refusal);
+                }
+                Err(TxErr::Transient(_)) => {
+                    let _ = session.abort_transaction().await;
+                    backoff_sleep(attempt).await;
+                }
+                Err(TxErr::Fatal(e)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(e);
+                }
+            }
+        }
+        Err(StorageError::Internal(format!(
+            "the replacement of {} did not commit after {TRANSIENT_RETRY_ATTEMPTS} conflicting \
+             attempts",
+            row.backup_arn
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -1926,13 +2426,14 @@ mod tests {
 #[cfg(test)]
 mod definition_tests {
     use super::{
-        LockMiss, RestoreRecord, RestoreRegistration, backup_definition_from_doc,
-        description_from_doc, gone_statuses, lock_miss, restore_source_from_doc,
-        restoring_target_filter,
+        LockMiss, MIGRATED_TO_STORE, RestoreRecord, RestoreRegistration,
+        backup_definition_from_doc, description_from_doc, gone_statuses, legacy_key, lock_miss,
+        restore_source_from_doc, restoring_target_filter,
     };
     use extenddb_core::types::{
         OnDemandThroughput, ProvisionedThroughput, StreamViewType, TimeToLiveStatus,
     };
+    use extenddb_storage::backup_catalog::{BackupStatus, LegacyBackupKey};
     use extenddb_storage::error::StorageError;
     use mongodb::bson::{self, doc};
 
@@ -2152,6 +2653,38 @@ mod definition_tests {
         assert_eq!(lock_miss(Some(&d)), LockMiss::NotFound);
         d.insert("backup_status", "DELETING");
         assert_eq!(lock_miss(Some(&d)), LockMiss::Deleting);
+        // A replacement's DELETING document: its backup lives on in the
+        // store, so a DeleteBackup that missed the lock answers not found.
+        d.insert(MIGRATED_TO_STORE, true);
+        assert_eq!(lock_miss(Some(&d)), LockMiss::NotFound);
+    }
+
+    /// A backup document lists as its key only with its `_id`, its account
+    /// and a status a release writes; anything else is an error, not a key
+    /// made up of defaults.
+    #[test]
+    fn a_backup_document_lists_as_its_key_or_an_error() {
+        let full = doc! { "_id": ARN, "account_id": "123456789012", "backup_status": "DELETED" };
+        assert_eq!(
+            legacy_key(&full).expect("key"),
+            LegacyBackupKey {
+                account_id: "123456789012".to_owned(),
+                backup_arn: ARN.to_owned(),
+                status: BackupStatus::Deleted,
+            }
+        );
+        for missing in ["_id", "account_id", "backup_status"] {
+            let mut d = full.clone();
+            d.remove(missing);
+            let err = legacy_key(&d).err();
+            assert!(
+                matches!(&err, Some(StorageError::Internal(m)) if m.contains(missing)),
+                "{missing}: {err:?}"
+            );
+        }
+        let mut d = full.clone();
+        d.insert("backup_status", "GONE");
+        assert!(legacy_key(&d).is_err());
     }
 
     #[test]
