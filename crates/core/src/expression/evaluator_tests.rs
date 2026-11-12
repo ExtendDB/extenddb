@@ -229,9 +229,9 @@ fn between_out_of_range() {
 
 /// Bounds of different types or with the lower above the upper are refused
 /// whatever the item holds. A legacy `Expected` condition reaches the
-/// evaluator without the semantic walk, so this is its only bounds check
-/// (measured 2026-11-12: PutItem with `Expected` `n BETWEEN [5, 1]` answers
-/// ValidationException on a missing and on an existing item).
+/// evaluator without the semantic walk, so this is its only bounds check.
+/// Measured 2026-11-12: PutItem with `Expected` `n BETWEEN [5, 1]` answers
+/// ValidationException on a missing and on an existing item.
 #[test]
 fn between_bounds_at_fault_are_refused_for_every_item() {
     let bounds = |lo: AttributeValue, hi: AttributeValue| {

@@ -332,10 +332,10 @@ pub fn validate_unused_attributes(
 /// prefix of the other, across all four sections, after `#name` resolution:
 /// `SET a = :v, a = :w`, `SET m = :v, m.x = :w`, `SET a.b = :v REMOVE a`, and
 /// `SET #l[1] = :v, #l[1].x = :w` with `#l` bound to `lst` all fail. Siblings
-/// (`m.x` and `m.y`) are fine. The first path in expression order that
-/// overlaps an earlier one is named after that earlier path, rendered as the
-/// service renders it: `[lst, [1]]` (`SET a = :v, b = :v, b.y = :v, a.x = :v`
-/// names `[b]` and `[b, y]`, measured 2026-11-12).
+/// (`m.x` and `m.y`) are fine. The message names the first path in expression
+/// order that overlaps an earlier one, after that earlier path. It renders the
+/// paths as the service renders them: `[lst, [1]]`. Measured 2026-11-12:
+/// `SET a = :v, b = :v, b.y = :v, a.x = :v` names `[b]` and `[b, y]`.
 ///
 /// # Errors
 ///

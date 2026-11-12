@@ -383,12 +383,12 @@ pub fn parse_projection_expr(
 /// does not define and a document path of more than 32 elements.
 ///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon
-/// `DynamoDB`. The references and the path lengths are checked once the whole
-/// expression parses, in one pass in the order they stand in the text, names
-/// and values alike (measured 2026-10-27: `pk = :q AND #n = :v` names `:q`,
-/// `#b = :p AND #a > :q` names `#b`; see
+/// `DynamoDB`. Once the whole expression parses, the references and the path
+/// lengths are checked in one pass in text order, names and values alike.
+/// Measured 2026-10-27: `pk = :q AND #n = :v` names `:q`, and
+/// `#b = :p AND #a > :q` names `#b`. See
 /// `extenddb_core::expression::parse_key_condition_with_maps` for the
-/// lengths). The check runs before the key schema is consulted, so an
+/// lengths. The check runs before the key schema is consulted, so an
 /// undefined `#n` is reported as such rather than as a key schema mismatch
 /// (measured 2026-10-14).
 ///

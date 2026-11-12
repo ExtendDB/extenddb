@@ -130,11 +130,12 @@ pub(crate) enum ResolvedElement {
 
 /// Resolve `#name` references in parsed paths, rejecting index-start paths.
 ///
-/// The service checks the paths one after another in text order: a path's
-/// names, then its length, then, when `overlap` names the expression kind,
-/// whether it overlaps an earlier path (one is a prefix of the other). So
-/// `#k, #k, <33 elements>` answers the overlap, and `#m, <33 elements>` and
-/// `#k, <33 elements>, #k` the length (measured 2026-11-12, us-east-1).
+/// The service checks the paths one after another in text order. It checks a
+/// path's names, then its length. When `overlap` names the expression kind,
+/// it then checks whether the path overlaps an earlier path (one is a prefix
+/// of the other). So `#k, #k, <33 elements>` answers the overlap. Both
+/// `#m, <33 elements>` and `#k, <33 elements>, #k` answer the length
+/// (measured 2026-11-12, us-east-1).
 pub(crate) fn resolve_paths(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
@@ -166,7 +167,7 @@ pub(crate) fn resolve_paths(
         if let Some(msg) = super::path_length::too_many_levels(path) {
             return Err(DynamoDbError::ValidationException(msg));
         }
-        // Siblings are fine; the message names the earlier path first.
+        // Siblings are fine. The message names the earlier path first.
         if let Some(kind) = overlap
             && let Some(earlier) = resolved
                 .iter()

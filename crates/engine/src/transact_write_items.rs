@@ -483,11 +483,12 @@ fn parse_write_expressions(
     };
 
     // A Put's Item nesting comes before every check of the item's expressions
-    // and before the item's size: an Item attribute 33 maps deep answers the
-    // nesting error beside a condition with a syntax error, an undefined name
-    // or value, an unused value, a reserved word, a path of 33 elements or
-    // BETWEEN bounds out of order, and beside an item over the size limit
-    // (measured 2026-11-12).
+    // and before the item's size (measured 2026-11-12). An Item attribute 33
+    // maps deep answers the nesting error beside a condition fault. The
+    // faults measured are a syntax error, an undefined name or value, an
+    // unused value and a reserved word. They also include a path of 33
+    // elements and BETWEEN bounds out of order. The Item also answers the
+    // nesting error beside an item over the size limit.
     if let Some(put) = &twi.put {
         validate_item_nesting_depth(&put.item)?;
     }
@@ -500,15 +501,16 @@ fn parse_write_expressions(
     validate_value_map_nesting(values)?;
 
     // Inside a transaction the service checks an Update item's
-    // ConditionExpression before its UpdateExpression, as UpdateItem does:
-    // a condition with an undefined name or BETWEEN bounds out of order beats
-    // an UpdateExpression syntax error, undefined name or value, overlap,
-    // reserved word, operand type and path length (measured 2026-11-12, each
-    // request twice; on 2026-10-14 the service answered the UpdateExpression
-    // first). Then come the unused names and values; then, for a Put, the
-    // item's size (measured: an oversize Put with an unused value reports the
-    // value, and an oversize item reports its size ahead of the next item's
-    // defects).
+    // ConditionExpression before its UpdateExpression, as UpdateItem does
+    // (measured 2026-11-12, each request twice). A condition with an
+    // undefined name or BETWEEN bounds out of order beats an UpdateExpression
+    // fault. The faults measured are a syntax error, an undefined name or
+    // value and an overlap. They also include a reserved word, an operand
+    // type and the path length. On 2026-10-14 the service answered the
+    // UpdateExpression first. The unused names and values come next. Then,
+    // for a Put, comes the item's size. Measured: an oversize Put with an
+    // unused value reports the value. An oversize item reports its size
+    // ahead of the next item's defects.
     let maps = build_expression_maps(names, values);
     let condition = match condition_expression {
         // A ConditionCheck's expression is required, so an empty string is

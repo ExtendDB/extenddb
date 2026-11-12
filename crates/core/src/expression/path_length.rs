@@ -11,8 +11,8 @@
 //! `#name` in an earlier path or inside the long path is reported instead
 //! (measured 2026-10-26 and 2026-11-12, us-east-1). The semantic walk, the
 //! projection resolution and the key condition's reference pass run the check
-//! right after each path's names; the key condition's pass also checks each
-//! `:value` in text order, and runs before the nested-attribute refusal.
+//! right after each path's names. The key condition's pass also checks each
+//! `:value` in text order, and it runs before the nested-attribute refusal.
 
 use super::ast::PathElement;
 

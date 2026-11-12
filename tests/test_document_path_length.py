@@ -335,9 +335,9 @@ def test_between_bounds_are_checked_whatever_the_item(dynamodb_client, table, ke
 def test_legacy_expected_between_bounds_out_of_order_are_refused(dynamodb_client, table, key):
     # The service words this `One or more parameter values were invalid: The
     # BETWEEN condition was provided a range where the lower bound is greater
-    # than the upper bound` (measured 2026-11-12); ExtendDB answers with the
-    # ConditionExpression sentence, so only the class and the operator are
-    # compared.
+    # than the upper bound` (measured 2026-11-12). ExtendDB answers with the
+    # ConditionExpression sentence, so the test compares only the class and
+    # the operator.
     expected = {"n": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "5"}, {"N": "1"}]}}
     missing = {"pk": {"S": "plen"}, "sk": {"S": "between-expected-no-item"}}
     for k in (missing, key):
@@ -360,9 +360,9 @@ def test_projection_names_come_before_the_length(dynamodb_client, table, key):
 OVERLAP_K = ("Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite "
              "one of these paths; path one: [k], path two: [k]")
 
-# (case, projection, message): the service checks the paths one after another,
-# each path's length before its overlap with an earlier path (measured
-# 2026-11-12, each request twice).
+# (case, projection, message): the service checks the paths one after
+# another. It checks each path's length before its overlap with an earlier
+# path (measured 2026-11-12, each request twice).
 PROJECTION_ORDER = [
     ("overlap_before_a_later_length", f"#k, #k, {p(33)}", OVERLAP_K),
     ("length_before_a_later_overlap", f"{p(33)}, #k, #k", too_long("ProjectionExpression", 33)),
@@ -507,9 +507,10 @@ KEY_NAME = f"Invalid KeyConditionExpression: {UNDEFINED_NAME}"
 KEY_VALUE = f"Invalid KeyConditionExpression: {UNDEFINED_VALUE}"
 KEY_LENGTH = too_long("KeyConditionExpression", 33)
 
-# (case, key condition, names, values defined, message): the names, the
-# values and each path's length in one pass in text order, then the
-# nested-attribute refusal (measured 2026-11-12, each request twice).
+# (case, key condition, names, values defined, message): the service checks
+# the names, the values and each path's length in one pass in text order.
+# Then it refuses a nested attribute (measured 2026-11-12, each request
+# twice).
 KEY_CONDITION_ORDER = [
     ("name_inside_the_long_path", "pk = :p AND #zz" + ".#k" * 32 + " = :s", {"#k": "k"}, (":p", ":s"), KEY_NAME),
     ("value_in_an_earlier_clause", f"pk = :nope AND {p(33)} = :s", N, (":s",), KEY_VALUE),

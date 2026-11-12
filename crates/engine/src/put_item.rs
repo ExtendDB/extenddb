@@ -148,12 +148,13 @@ pub async fn handle_put_item(
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
     // The Item's numbers and nesting come before every expression check, with
-    // or without ExpressionAttributeValues: an Item holding `{N: abc}` or an
-    // attribute 33 maps deep answers the number or the nesting error beside a
-    // condition with a syntax error, an undefined name or value, an unused
-    // value, a reserved word, a path of 33 elements or BETWEEN bounds out of
-    // order (measured 2026-11-12). `validate_put_item` checks them again
-    // after the table lookup.
+    // or without ExpressionAttributeValues (measured 2026-11-12). An Item
+    // holding `{N: abc}` or an attribute 33 maps deep answers the number or
+    // the nesting error beside a condition fault. The faults measured are a
+    // syntax error, an undefined name or value, an unused value and a
+    // reserved word. They also include a path of 33 elements and BETWEEN
+    // bounds out of order.
+    // `validate_put_item` checks them again after the table lookup.
     extenddb_core::validation::validate_item_numbers(&input.item)?;
     extenddb_core::validation::validate_item_nesting_depth(&input.item)?;
 
