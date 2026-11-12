@@ -256,6 +256,54 @@ mod suite {
         assert_eq!(list_keys(store, "pre").await, vec!["pre/fixture"]);
     }
 
+    /// `delete_written` removes the object its put answered with, and only
+    /// that one: an object put under the key since (other bytes of the
+    /// same size, so the filesystem store's modification time decides) is left
+    /// whole and answers `false`; its own answer then removes it; a key that
+    /// holds nothing answers `true`; another key under the same prefix is
+    /// untouched throughout.
+    pub async fn delete_written_removes_only_the_object_its_put_wrote(store: &dyn BackupStore) {
+        let key = "written/a/data/000001.json.gz";
+        store
+            .put("written/a/data/000002.json.gz", chunked_body(b"other key"))
+            .await
+            .unwrap();
+        let first = store.put(key, chunked_body(b"first")).await.unwrap();
+        assert!(
+            store.delete_written(&first).await.unwrap(),
+            "its own object"
+        );
+        assert!(store.head(key).await.unwrap().is_none());
+        assert!(
+            store.delete_written(&first).await.unwrap(),
+            "a key that holds nothing"
+        );
+
+        let mine = store.put(key, chunked_body(b"mine")).await.unwrap();
+        // The other writer's object comes later (a filesystem's modification
+        // time ticks at a jiffy or coarser).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let theirs = store.put(key, chunked_body(b"them")).await.unwrap();
+        assert!(
+            !store.delete_written(&mine).await.unwrap(),
+            "another writer's object under the key is not this put's"
+        );
+        assert_eq!(
+            read_all(store.get(key).await.unwrap()).await,
+            b"them".to_vec()
+        );
+        assert_eq!(
+            list_keys(store, "written").await.len(),
+            2,
+            "nothing else moved"
+        );
+        assert!(store.delete_written(&theirs).await.unwrap());
+        assert_eq!(
+            list_keys(store, "written").await,
+            vec!["written/a/data/000002.json.gz"]
+        );
+    }
+
     pub async fn delete_prefix_removes_and_counts(store: &dyn BackupStore) {
         for key in ["del/a/1", "del/a/2", "del/b/3", "keep/4"] {
             store.put(key, chunked_body(vec![9])).await.unwrap();
@@ -696,6 +744,15 @@ mod filesystem {
     async fn delete_prefix_removes_and_counts() {
         let (_dir, store) = fs_store().await;
         suite::delete_prefix_removes_and_counts(&store).await;
+    }
+
+    /// The shared cell, then: the hidden name the rename uses is gone on
+    /// both paths (removed, or linked back and removed).
+    #[tokio::test]
+    async fn delete_written_removes_only_the_object_its_put_wrote() {
+        let (dir, store) = fs_store().await;
+        suite::delete_written_removes_only_the_object_its_put_wrote(&store).await;
+        assert!(temporaries_under(dir.path()).is_empty());
     }
 
     #[tokio::test]
@@ -2878,6 +2935,13 @@ mod s3 {
         suite::concurrent_put_if_absent_leaves_the_first_body(&store).await;
     }
 
+    /// The shared cell over `DeleteObject` with `If-Match`.
+    #[tokio::test]
+    async fn delete_written_removes_only_the_object_its_put_wrote() {
+        let Some(store) = store().await else { return };
+        suite::delete_written_removes_only_the_object_its_put_wrote(&store).await;
+    }
+
     #[tokio::test]
     async fn delete_prefix_removes_and_counts() {
         let Some(store) = store().await else { return };
@@ -3523,10 +3587,61 @@ mod s3 {
         );
     }
 
+    /// The 409 `ConditionalRequestConflict` loop of `delete_written`, from
+    /// the same script: a `DeleteObject` with `If-Match` answered 409 twice
+    /// is re-sent and the third answer (204) deletes; one answered 409 and
+    /// then 412 leaves the object (another one is under the key).
+    #[tokio::test]
+    async fn a_conditional_delete_conflict_is_retried_from_a_reply_script() {
+        const NAME: &str = "s3::a_conditional_delete_conflict_is_retried_from_a_reply_script";
+        if !is_child(NAME) {
+            run_with_test_credentials(NAME);
+            return;
+        }
+        let server = ScriptedS3::start().await;
+        let config = test_config(server.endpoint(), "scripted".to_owned(), String::new());
+        let store = S3Store::open(&config).await.expect("S3Store::open");
+        let written = |key: &str| ObjectMeta {
+            key: key.to_owned(),
+            size: 4,
+            last_modified: None,
+            etag: Some("etag-1".to_owned()),
+        };
+
+        server.conflicts_before_success(2);
+        assert!(
+            store
+                .delete_written(&written("k/deleted"))
+                .await
+                .expect("the third answer deletes"),
+            "deleted"
+        );
+        assert_eq!(
+            server.requests("DELETE /scripted/k/deleted?x-id=DeleteObject"),
+            3,
+            "one send and two re-sends"
+        );
+
+        server.conflicts_then_present(1);
+        assert!(
+            !store
+                .delete_written(&written("k/replaced"))
+                .await
+                .expect("412 is an answer, not an error"),
+            "another object under the key is left"
+        );
+        assert_eq!(
+            server.requests("DELETE /scripted/k/replaced?x-id=DeleteObject"),
+            2,
+            "the delete was re-sent once"
+        );
+    }
+
     /// An HTTP/1.1 server that plays S3 from a script: every request's
-    /// method, path and query are recorded; a `PutObject` or
-    /// `CompleteMultipartUpload` is answered 409 `ConditionalRequestConflict`
-    /// a scripted number of times, then 200, or 412 `PreconditionFailed`;
+    /// method, path and query are recorded; a `PutObject`,
+    /// `CompleteMultipartUpload` or `DeleteObject` is answered 409
+    /// `ConditionalRequestConflict` a scripted number of times, then 200 (204
+    /// for the delete), or 412 `PreconditionFailed`;
     /// `CreateMultipartUpload`, `UploadPart` and `AbortMultipartUpload` are
     /// answered as S3 answers them.
     struct ScriptedS3 {
@@ -3722,6 +3837,12 @@ mod s3 {
                      <ETag>\"etag-1\"</ETag></CompleteMultipartUploadResult>"
                         .to_owned(),
                 ),
+                "DELETE" if target.contains("x-id=DeleteObject") => {
+                    match conditional(state, String::new()) {
+                        (200, body) => (204, body),
+                        other => other,
+                    }
+                }
                 "DELETE" => (204, String::new()),
                 _ => (
                     404,

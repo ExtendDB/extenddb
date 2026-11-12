@@ -21,8 +21,11 @@
 //! The maintenance claim is the same mechanism on the `backup_maintenance`
 //! row: an advisory lock (`backup_maintenance` in the same key space) on a
 //! dedicated connection is the proof of a live holder, so a second command
-//! finds it taken and a holder whose session ended has released it; the row
-//! carries the holder, the generation and the heartbeat.
+//! finds it taken; a holder whose session ended has released it, and its
+//! claim is taken over once the row's heartbeat is older than the stale
+//! window (the holder's process may outlive its session until its next
+//! beat finds the loss); the row carries the holder, the generation and
+//! the heartbeat.
 //! `check_maintenance_claim` reports the claim held while a session holds
 //! the lock (a transaction-scoped shared try-lock in one autocommit
 //! statement fails while the exclusive lock is held, and holds nothing past
@@ -44,7 +47,7 @@
 //! whose key schema, attribute definitions and indexes carry attribute
 //! names. It is stored through the escape of `catalog_json`, as the other
 //! catalog documents that carry names are: `claim_backup`, `set_status` and
-//! `insert_backup_row` write it through `escape_json`, and every read
+//! `insert_unowned_row` write it through `escape_json`, and every read
 //! reverses the escape in `row_from_tuple`.
 
 use std::time::Duration;
@@ -92,6 +95,82 @@ pub(crate) async fn creating_restore_target<'e, E: PgExecutor<'e>>(
 /// text, [`extenddb_storage::backup_catalog::backup_in_use`].
 pub(crate) fn backup_in_use(table: &str, backup_arn: &str) -> StorageError {
     extenddb_storage::backup_catalog::backup_in_use(table, backup_arn)
+}
+
+/// `insert_backup_row`'s statement, on `executor`: `row` unowned, if no row
+/// with its key or its backup id exists. `Ok(false)`, writing nothing,
+/// otherwise. The legacy reader's `replace_with_index_row` runs it inside
+/// its transaction.
+pub(crate) async fn insert_unowned_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &BackupRow,
+) -> Result<bool, StorageError> {
+    // No conflict target: the primary key (`account_id`, `backup_id`) and
+    // the unique `backup_id` both make it a no-op. No advisory lock: a job
+    // that holds the id's lock and has not inserted its row yet finds this
+    // one and is refused, as it is by any row with the key.
+    let inserted = sqlx::query(
+        "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
+         backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
+         created_at, completed_at, failure_reason, source_table_details_json, \
+         owner_generation, heartbeat_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
+         $13, $14, $15, now()) ON CONFLICT DO NOTHING",
+    )
+    .bind(&row.backup_id)
+    .bind(&row.account_id)
+    .bind(&row.table_name)
+    .bind(&row.backup_arn)
+    .bind(&row.backup_name)
+    .bind(row.status.as_str())
+    .bind(row.store.store_kind.as_str())
+    .bind(&row.store.store_root)
+    .bind(&row.store.store_id)
+    .bind(row.size_bytes)
+    .bind(row.item_count)
+    .bind(row.created_at)
+    .bind(&row.failure_reason)
+    .bind(escape_json(row.source_table_details_json.clone()))
+    .bind(generation_column(UNOWNED_GENERATION))
+    .execute(executor)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// The account, ARN and store of the `backup_index` row holding
+/// `backup_id`, if one does, on `executor`.
+pub(crate) async fn index_row_holding<'e, E: PgExecutor<'e>>(
+    executor: E,
+    backup_id: &str,
+) -> Result<Option<(String, String, StoreIdentity)>, StorageError> {
+    let found: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT account_id, backup_arn, store_kind, store_root, store_id FROM backup_index \
+         WHERE backup_id = $1",
+    )
+    .bind(backup_id)
+    .fetch_optional(executor)
+    .await
+    .map_err(db_err)?;
+    found
+        .map(|(account_id, backup_arn, kind, store_root, store_id)| {
+            let store_kind = StoreKind::parse(&kind).ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "backup {backup_arn} carries an unknown store kind {kind:?}"
+                ))
+            })?;
+            Ok((
+                account_id,
+                backup_arn,
+                StoreIdentity {
+                    store_kind,
+                    store_root,
+                    store_id,
+                },
+            ))
+        })
+        .transpose()
 }
 
 fn db_err(e: sqlx::Error) -> StorageError {
@@ -554,41 +633,7 @@ impl BackupCatalog for PostgresEngine {
         &'a self,
         row: &'a BackupRow,
     ) -> BoxFuture<'a, Result<bool, StorageError>> {
-        Box::pin(async move {
-            // No conflict target: the primary key (`account_id`,
-            // `backup_id`) and the unique `backup_id` both make it a no-op.
-            // No advisory lock: a job that holds the id's lock and has not
-            // inserted its row yet finds this one and is refused, as it is by
-            // any row with the key.
-            let inserted = sqlx::query(
-                "INSERT INTO backup_index (backup_id, account_id, table_name, backup_arn, \
-                 backup_name, status, store_kind, store_root, store_id, size_bytes, item_count, \
-                 created_at, completed_at, failure_reason, source_table_details_json, \
-                 owner_generation, heartbeat_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), now(), \
-                 $13, $14, $15, now()) ON CONFLICT DO NOTHING",
-            )
-            .bind(&row.backup_id)
-            .bind(&row.account_id)
-            .bind(&row.table_name)
-            .bind(&row.backup_arn)
-            .bind(&row.backup_name)
-            .bind(row.status.as_str())
-            .bind(row.store.store_kind.as_str())
-            .bind(&row.store.store_root)
-            .bind(&row.store.store_id)
-            .bind(row.size_bytes)
-            .bind(row.item_count)
-            .bind(row.created_at)
-            .bind(&row.failure_reason)
-            .bind(escape_json(row.source_table_details_json.clone()))
-            .bind(generation_column(UNOWNED_GENERATION))
-            .execute(&self.pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-            Ok(inserted == 1)
-        })
+        Box::pin(insert_unowned_row(&self.pool, row))
     }
 
     fn list_backup_rows<'a>(
@@ -692,6 +737,22 @@ impl BackupCatalog for PostgresEngine {
             .bind(arn.backup_id())
             .bind(arn.table_name())
             .bind(arn.to_arn_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            row.map(row_from_tuple).transpose()
+        })
+    }
+
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        Box::pin(async move {
+            let row: Option<RowTuple> = sqlx::query_as(&format!(
+                "SELECT {ROW_COLUMNS} FROM backup_index WHERE backup_id = $1"
+            ))
+            .bind(backup_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;
@@ -1255,11 +1316,26 @@ impl BackupCatalog for PostgresEngine {
                 )));
             };
             // With the lock held, a row whose heartbeat is still young is a
-            // holder whose lock session ended within the stale window: dead
-            // by this backend's rule (4(e)), so the row is taken over
-            // whatever its age. `stale_after` is the other backends' rule and
-            // the one `check_maintenance_claim` applies on every backend.
-            let _ = stale_after;
+            // holder whose lock session ended within the stale window: its
+            // process may still be running (a connection reset, the session
+            // terminated) until its next beat finds the loss, so the take
+            // waits for the window, as the other backends' does. A released
+            // claim leaves no row.
+            let young: Option<String> = sqlx::query_scalar(
+                "SELECT holder FROM backup_maintenance \
+                 WHERE heartbeat_at >= now() - make_interval(secs => $1)",
+            )
+            .bind(stale_after.as_secs_f64())
+            .fetch_optional(session.connection())
+            .await
+            .map_err(db_err)?;
+            if let Some(current) = young {
+                session.close().await;
+                return Err(StorageError::AlreadyExists(format!(
+                    "the backup maintenance claim is held by {current} (its catalog session \
+                     ended, and its heartbeat is younger than the stale window)"
+                )));
+            }
             let generation = session.generation();
             sqlx::query(
                 "INSERT INTO backup_maintenance (singleton, holder, owner_generation) \
