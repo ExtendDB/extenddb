@@ -38,6 +38,9 @@ mod m0001_baseline;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0005_drop_continuous_backups;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0006_backup_catalog_index;
 mod postcheck;
 
 use std::time::Duration;
@@ -59,7 +62,7 @@ pub use locks::{MigrationLock, Timing};
 #[cfg(feature = "test-util")]
 pub use postcheck::{Collection, Definitions, Index, describe_store};
 pub use registrar::ServerRegistration;
-pub use registrations::ServingRegistration;
+pub use registrations::{SERVE_COMMAND, ServingRegistration};
 
 /// The catalog database every MongoDB deployment uses.
 pub const CATALOG_DATABASE: &str = "extenddb_catalog";
@@ -137,6 +140,35 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0005_drop_continuous_backups::SOURCE,
             )],
         },
+        // Breaking: a binary without it neither reads the index nor writes
+        // the job record on the restore registrations it creates, so a
+        // restore it ran would be owned by nobody; and the index's unique
+        // indexes are what refuse a second claim of one backup. Convergent:
+        // the collections and indexes are created only when absent, the
+        // backfill touches only a registration without a job record, which
+        // no registration this release writes is (each is inserted with its
+        // record), and the catalog id is written only when absent; so a
+        // second run over data written since changes nothing but a
+        // registration a release before it wrote, which is the repair
+        // `--reconverge` is for.
+        MigrationId::BackupCatalogIndex => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0006_backup_catalog_index::BackupCatalogIndex,
+                m0006_backup_catalog_index::SOURCE,
+            )],
+        },
+        MigrationId::StreamPending => Migration::NotApplicable(
+            "a MongoDB write draws its stream sequence number from its shard's counter inside its \
+             transaction, so the records of a shard commit in number order",
+        ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
     }
 }
 
@@ -266,6 +298,50 @@ pub async fn migrate_holding(
     result
 }
 
+/// Take the migration lock on `target`, apply every pending migration
+/// through `id`, and release the lock: for the crate's live tests, which
+/// build catalogs in databases of their own.
+///
+/// # Errors
+///
+/// As [`Runner::migrate_through`], or the lock could not be taken.
+#[cfg(test)]
+pub(crate) async fn migrate_through_for_tests(
+    target: &MongoTarget,
+    id: MigrationId,
+) -> Result<RunReport, MigrationError> {
+    let (held, target) = lock(target, true, Duration::from_secs(10), Timing::PRODUCTION).await?;
+    let result = async {
+        let migrations = MongoMigrations::open(&target, Some(&held)).await?;
+        let result = Runner::new(&migrations, "test").migrate_through(id).await;
+        migrations.close().await;
+        result
+    }
+    .await;
+    held.release().await;
+    result
+}
+
+/// Run migration 6's catalog body on `target`'s catalog alone, with no lock
+/// and no ledger row, as a migrator stopped before it wrote the row leaves
+/// it: for the live tests of the body's backfill.
+///
+/// # Errors
+///
+/// As the body.
+#[cfg(test)]
+pub(crate) async fn run_backup_catalog_index(
+    target: &MongoTarget,
+) -> Result<extenddb_storage::migrations::Done, MigrationError> {
+    use extenddb_storage::migrations::{CodeBody, MigrationBackend};
+    let migrations = MongoMigrations::open(target, None).await?;
+    let done = m0006_backup_catalog_index::BackupCatalogIndex
+        .run(migrations.stores())
+        .await;
+    migrations.close().await;
+    done
+}
+
 /// Register as the catalog's server and read its status, before anything
 /// opens the engine: a server that refuses has written nothing but its
 /// registration, which it deletes. The registration is written before the
@@ -281,7 +357,24 @@ pub async fn register_and_check(
     release: &str,
     timing: Timing,
 ) -> Result<ServerRegistration, MigrationError> {
-    let registration = ServingRegistration::register(target, release, timing).await?;
+    register_and_check_as(target, release, SERVE_COMMAND, timing).await
+}
+
+/// [`register_and_check`] for the process `command` names: `extenddb serve`
+/// ([`SERVE_COMMAND`]) or a command that opens the catalog as a server does
+/// (`extenddb backup list`), whose registration carries its name
+/// ([`ServingRegistration::register_as`]).
+///
+/// # Errors
+///
+/// As [`register_and_check`].
+pub async fn register_and_check_as(
+    target: &MongoTarget,
+    release: &str,
+    command: &'static str,
+    timing: Timing,
+) -> Result<ServerRegistration, MigrationError> {
+    let registration = ServingRegistration::register_as(target, release, command, timing).await?;
     let status = match catalog_status(target).await {
         Ok(status) => status,
         Err(e) => {
@@ -305,6 +398,7 @@ pub async fn register_and_check(
     Ok(ServerRegistration::new(
         target,
         release,
+        command,
         timing,
         status,
         registration,

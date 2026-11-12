@@ -364,4 +364,48 @@ mod tests {
             "GSI-name dimension must be retained, got {dims:?}"
         );
     }
+
+    /// The backup job's metric names round-trip through the store's string
+    /// column: a row written under each name renders as that name and not
+    /// as the fallback `SystemErrors`, with its outcome or store-call
+    /// dimension kept.
+    #[test]
+    fn backup_job_metric_names_render_from_the_store() {
+        use extenddb_core::metrics::MetricName;
+        let names = [
+            MetricName::BackupJobs,
+            MetricName::BackupJobDuration,
+            MetricName::BackupBytesUploaded,
+            MetricName::BackupSnapshotAge,
+            MetricName::BackupStoreErrors,
+            MetricName::RestoreJobs,
+            MetricName::RestoreJobDuration,
+            MetricName::RestoreBytesDownloaded,
+        ];
+        let rows: Vec<MetricsRow> = names
+            .iter()
+            .map(|name| MetricsRow {
+                bucket: time::OffsetDateTime::UNIX_EPOCH,
+                metric: name.to_string(),
+                table_name: None,
+                index_name: None,
+                operation: Some("succeeded".to_owned()),
+                sum: 1.0,
+                count: 1,
+                min: 1.0,
+                max: 1.0,
+            })
+            .collect();
+        let (snapshots, _buckets) = aggregate_rows(&rows, 60, TimeWindow::Last5Minutes);
+        let mut rendered: Vec<MetricName> = snapshots.iter().map(|s| s.metric).collect();
+        rendered.sort_by_key(|m| m.to_string());
+        let mut expected = names.to_vec();
+        expected.sort_by_key(|m| m.to_string());
+        assert_eq!(rendered, expected);
+        assert!(snapshots.iter().all(|s| {
+            s.dimensions
+                .iter()
+                .any(|d| matches!(d, Dimension::Operation(o) if o == "succeeded"))
+        }));
+    }
 }

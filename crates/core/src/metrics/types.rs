@@ -55,6 +55,76 @@ pub enum MetricName {
     WorkerCycleLatency,
     /// P120e: Worker error count.
     WorkerErrorCount,
+    /// Store-backed backup jobs ended, one per job; the operation dimension
+    /// carries the outcome ([`BackupJobOutcome`]: `succeeded`, `failed` or
+    /// `cancelled`). `/metrics` emits it under this name as JSON, as it does
+    /// every metric (the endpoint is not Prometheus exposition format); a
+    /// converter would give it a name like `backup_jobs_total{outcome}`, and
+    /// nothing in the server renders that.
+    BackupJobs,
+    /// Duration of a store-backed backup job in microseconds, from the
+    /// snapshot's open to the end of its last catalog or store call (the
+    /// AVAILABLE write, or the FAILED write and the prefix's deletion);
+    /// recorded for every outcome, with the outcome as the operation
+    /// dimension.
+    BackupJobDuration,
+    /// Bytes a backup job that ended AVAILABLE wrote to the store: every
+    /// data file and document as the store reported it stored; a failed
+    /// job's uploaded and then deleted bytes are not counted.
+    BackupBytesUploaded,
+    /// Seconds between a running backup job's snapshot instant and now
+    /// (gauge), recorded at each confirmed heartbeat.
+    BackupSnapshotAge,
+    /// Store operations a backup or restore job or the backup reconciler
+    /// saw fail; the operation dimension names the store call (`put` by a
+    /// backup job's uploads, `delete_prefix` by its failure path and the
+    /// reconciler's deleting duties, `get` by a restore's reads of the
+    /// manifest and its sidecar, in the request and in a resume, by a
+    /// restore job's downloads and by the reconciler's manifest probe, and
+    /// `list` by the reconciler's manifest probe and deleting duties).
+    BackupStoreErrors,
+    /// Store-backed restore jobs ended, one per job; the operation dimension
+    /// carries the outcome ([`BackupJobOutcome`]: `succeeded` for a DONE
+    /// record, `failed` for a FAILED one or a job that stopped without a
+    /// status write of its own, `cancelled` for one the shutdown stopped,
+    /// whose record stays RUNNING for a resume). Named as `BackupJobs` is
+    /// (the `/metrics` name; a converter's would be
+    /// `restore_jobs_total{outcome}`).
+    RestoreJobs,
+    /// Duration of a store-backed restore job in microseconds, from its
+    /// registration to the end of its last catalog or store call, with the
+    /// outcome as the operation dimension.
+    RestoreJobDuration,
+    /// Bytes of each data-file download attempt of a restore job as they
+    /// arrived, verified or not, so an attempt the job retried counts its
+    /// bytes too; the manifest and sidecar reads, and a filesystem store's
+    /// second read of each file for the load, are not counted.
+    RestoreBytesDownloaded,
+}
+
+/// How a store-backed backup or restore job ended, the operation dimension
+/// of [`MetricName::BackupJobs`], [`MetricName::BackupJobDuration`],
+/// [`MetricName::RestoreJobs`] and [`MetricName::RestoreJobDuration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackupJobOutcome {
+    /// The manifest was written and the row is AVAILABLE.
+    Succeeded,
+    /// The row is FAILED, or the job stopped without a status write of its
+    /// own (its claim lost).
+    Failed,
+    /// The server's shutdown stopped the job; a backup row is FAILED with
+    /// reason `shutdown`, a restore record stays RUNNING for a resume.
+    Cancelled,
+}
+
+impl std::fmt::Display for BackupJobOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        })
+    }
 }
 
 impl std::fmt::Display for MetricName {
@@ -86,6 +156,14 @@ impl std::fmt::Display for MetricName {
             Self::WorkerLastSuccess => f.write_str("WorkerLastSuccess"),
             Self::WorkerCycleLatency => f.write_str("WorkerCycleLatency"),
             Self::WorkerErrorCount => f.write_str("WorkerErrorCount"),
+            Self::BackupJobs => f.write_str("BackupJobs"),
+            Self::BackupJobDuration => f.write_str("BackupJobDuration"),
+            Self::BackupBytesUploaded => f.write_str("BackupBytesUploaded"),
+            Self::BackupSnapshotAge => f.write_str("BackupSnapshotAge"),
+            Self::BackupStoreErrors => f.write_str("BackupStoreErrors"),
+            Self::RestoreJobs => f.write_str("RestoreJobs"),
+            Self::RestoreJobDuration => f.write_str("RestoreJobDuration"),
+            Self::RestoreBytesDownloaded => f.write_str("RestoreBytesDownloaded"),
         }
     }
 }
@@ -129,6 +207,14 @@ pub enum QuerySource {
     ControlPlane,
     /// Background: login attempt cleanup.
     LoginAttemptCleanup,
+    /// Background: the backup reconciler.
+    BackupReconciler,
+    /// A store-backed backup job (the worker metrics are recorded once per
+    /// job, at its end).
+    BackupJob,
+    /// A store-backed restore job (the worker metrics are recorded once per
+    /// job, at its end; a job the shutdown stopped records none).
+    RestoreJob,
     /// Management CLI commands.
     Management,
 }
@@ -149,6 +235,9 @@ impl std::fmt::Display for QuerySource {
             Self::TableSizeRefresh => f.write_str("TableSizeRefresh"),
             Self::ControlPlane => f.write_str("ControlPlane"),
             Self::LoginAttemptCleanup => f.write_str("LoginAttemptCleanup"),
+            Self::BackupReconciler => f.write_str("BackupReconciler"),
+            Self::BackupJob => f.write_str("BackupJob"),
+            Self::RestoreJob => f.write_str("RestoreJob"),
             Self::Management => f.write_str("Management"),
         }
     }

@@ -106,21 +106,30 @@ jobs:
         env:
           EXTENDDB_TEST_CASSANDRA: required
       - name: TTL integration tests
-        continue-on-error: true  # TTL integration tests are known-flaky under CI load; tracked in #338
         run: cargo test -p extenddb-storage-cassandra --test ttl_integration -- --test-threads=1
         env:
           EXTENDDB_TEST_CASSANDRA: required
       - name: Direct storage-trait integration tests
-        # Ported from the plug-in repo's tests/rust suite. Parallel-safe:
-        # each test provisions its own account and keyspace; the shared
-        # control-plane setting test restores what it mutates.
-        run: cargo test -p extenddb-storage-cassandra --test direct_integration
+        # Ported from the plug-in repo's tests/rust suite. Each test
+        # provisions its own account and keyspace, and a GSI backfill
+        # recovery worker a test starts scans only that keyspace. The GSI
+        # propagation workers that some index tests start read the queue of
+        # every keyspace. The shared control-plane setting test restores what
+        # it mutates. The test-hooks feature compiles the tests that pause an
+        # operation or shorten a heartbeat (crates/storage-cassandra/src/test_hooks.rs).
+        # It runs after a failed TTL step too, so a run reports both suites.
+        if: ${{ !cancelled() }}
+        run: cargo test -p extenddb-storage-cassandra --features test-hooks --test direct_integration
         env:
           EXTENDDB_TEST_CASSANDRA: required
 
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 45
+    # With the PartiQL wire tests the job took up to 42 min 10 s on #411's CI,
+    # near the old 45-minute bound; on main it took 30 to 40 min. A run with a
+    # cold build cache should take about 44 min; 60 leaves room for a slow
+    # runner.
+    timeout-minutes: 60
     services:
       cassandra:
         image: cassandra:4.1
@@ -171,6 +180,10 @@ jobs:
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
       - name: Run Cassandra pytest suite
+        env:
+          # run-cassandra-tests initializes the server without [backup.store],
+          # and Cassandra takes the in-catalog create with one.
+          EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
 
   cassandra-rust:
@@ -226,6 +239,10 @@ jobs:
       - name: Build release (cassandra backend)
         run: cargo build --release --no-default-features --features cassandra
       - name: Run Cassandra rust integration suite
+        env:
+          # run-cassandra-tests initializes the server without [backup.store]:
+          # the Rust backup tests restore the in-catalog create's backups.
+          EXTENDDB_TEST_BACKUP_STORE: none
         run: devtools/run-cassandra-tests -- --rust-integration
 
   cassandra-production-build:

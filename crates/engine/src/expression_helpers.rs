@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_sections,
-    tokenize_for, tokenize_with_limit, validate_condition_semantics, validate_no_reserved_words,
-    validate_update_semantics,
+    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
+    parse_update_sections, tokenize_for, tokenize_with_limit, validate_condition_semantics,
+    validate_no_reserved_words, validate_update_semantics,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -113,13 +113,41 @@ pub fn single_item_write_prefix(err: DynamoDbError) -> DynamoDbError {
     match err {
         DynamoDbError::ValidationException(msg)
             if !msg.starts_with("1 validation error detected")
-                && (msg.starts_with("Invalid ConditionExpression:")
-                    || msg.starts_with("Invalid UpdateExpression:")
-                    || msg.starts_with("Value provided in ExpressionAttribute")
-                    || msg.starts_with("ExpressionAttributeNames can only be specified")
-                    || msg.starts_with("ExpressionAttributeValues can only be specified")) =>
+                && SINGLE_ITEM_WRITE_WRAPPED
+                    .iter()
+                    .any(|start| msg.starts_with(start)) =>
         {
             DynamoDbError::ValidationException(format!("1 validation error detected: {msg}"))
+        }
+        other => other,
+    }
+}
+
+/// The starts of the messages [`single_item_write_prefix`] wraps.
+const SINGLE_ITEM_WRITE_WRAPPED: [&str; 5] = [
+    "Invalid ConditionExpression:",
+    "Invalid UpdateExpression:",
+    "Value provided in ExpressionAttribute",
+    "ExpressionAttributeNames can only be specified",
+    "ExpressionAttributeValues can only be specified",
+];
+
+/// Undo [`single_item_write_prefix`] on a message it wrapped, and leave every
+/// other message as it is. A PartiQL statement runs through the single-item
+/// write handlers and reports these messages without the wrapper (see
+/// `partiql::bare_expression_error`).
+pub fn strip_single_item_write_prefix(err: DynamoDbError) -> DynamoDbError {
+    match err {
+        DynamoDbError::ValidationException(msg) => {
+            let bare = msg
+                .strip_prefix("1 validation error detected: ")
+                .filter(|rest| {
+                    SINGLE_ITEM_WRITE_WRAPPED
+                        .iter()
+                        .any(|start| rest.starts_with(start))
+                })
+                .map(str::to_owned);
+            DynamoDbError::ValidationException(bare.unwrap_or(msg))
         }
         other => other,
     }
@@ -144,6 +172,38 @@ pub fn parse_condition_expr_with(
     tokenize_expression(expr, limits)
         .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
+}
+
+/// Tokenize, reserved-word check, and parse an `UpdateExpression`, with the
+/// grammar checks and the repeated-section rule only.
+///
+/// The handlers use [`parse_update_expr_checked`]. This serves the PartiQL
+/// write translation, which reads the actions for its key and index checks
+/// before the statement runs as `UpdateItem`, so the semantic refusals come
+/// from the handler, in its order.
+///
+/// Errors carry the `UpdateExpression` prefix, matching Amazon DynamoDB.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` for syntax or reserved-word errors.
+pub fn parse_update_expr(
+    update_expr: &str,
+    limits: &LimitsConfig,
+) -> Result<Vec<UpdateAction>, DynamoDbError> {
+    check_expression_size(update_expr, ExpressionKind::Update, limits)?;
+    tokenize_for(
+        update_expr,
+        limits.max_expression_tokens,
+        ExpressionKind::Update,
+    )
+    .and_then(|update_tokens| {
+        if limits.enforce_reserved_keywords {
+            validate_no_reserved_words(&update_tokens)?;
+        }
+        parse_update_from(&update_tokens, update_expr)
+    })
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::Update))
 }
 
 /// Size-check, tokenize, parse, and semantically validate an
