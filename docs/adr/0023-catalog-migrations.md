@@ -365,8 +365,8 @@ that each backend implements, as follows.
   to run.
 - Rollback after additive migrations runs the previous 1.x binary. Rollback
   after a breaking migration restores the backup taken before the upgrade.
-  All five v1.0 migrations are breaking, so rolling back from 1.0 is a
-  restore.
+  Each v1.0 migration is breaking on every backend it applies to, so
+  rolling back from 1.0 is a restore.
 - Releases before 1.0 refuse a 1.0 catalog or leave a trace in it. PostgreSQL
   `serve` refuses the integer version row, and v0.1.14 `serve` on every
   backend refuses a catalog without the `resource_tag_migration` row, which

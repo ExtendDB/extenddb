@@ -147,6 +147,11 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
                 "0010_account_metrics.sql"
             )],
         },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "SQLite stores the documents that carry attribute names as JSON text in TEXT columns, \
+             where U+0000 is the six-character escape \\u0000, so every name reads back as it was \
+             written",
+        ),
     }
 }
 

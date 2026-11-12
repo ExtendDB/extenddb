@@ -1409,6 +1409,14 @@ impl BackupStore for BoundedCalls<'_> {
         self.run(move |store| Box::pin(async move { store.delete_prefix(&prefix).await }))
     }
 
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let written = written.clone();
+        self.run(move |store| Box::pin(async move { store.delete_written(&written).await }))
+    }
+
     fn validate(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         self.run(|store| Box::pin(async move { store.validate().await }))
     }

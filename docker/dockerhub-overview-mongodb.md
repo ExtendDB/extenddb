@@ -44,7 +44,7 @@ Start the server using the generated configuration:
 
 ```console
 docker run --rm --name extenddb-mongodb \
-  -p 18443:18443 \
+  -p 127.0.0.1:18443:18443 \
   -v "$PWD/extenddb-data:/var/lib/extenddb" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \

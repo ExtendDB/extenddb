@@ -326,6 +326,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (8, d.target.catalog.clone()),
             (9, d.target.catalog.clone()),
             (10, d.target.catalog.clone()),
+            (11, d.target.catalog.clone()),
         ]
     );
     let not_applicable: Vec<u32> = report
@@ -334,7 +335,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
         .filter(|s| s.outcome == Outcome::NotApplicable)
         .map(|s| s.id)
         .collect();
-    assert_eq!(not_applicable, [3, 4, 7, 8, 9], "{report:?}");
+    assert_eq!(not_applicable, [3, 4, 7, 8, 9, 11], "{report:?}");
     assert_eq!(
         d.status().await,
         CatalogStatus::Current {
@@ -356,6 +357,7 @@ async fn a_fresh_store_gets_every_migration_and_the_expected_definitions() {
             (8, Outcome::NotApplicable),
             (9, Outcome::NotApplicable),
             (10, Outcome::Applied),
+            (11, Outcome::NotApplicable),
         ]
     );
     assert!(
@@ -464,7 +466,7 @@ async fn a_second_run_applies_nothing_and_reconverge_keeps_the_rows() {
     let reconverged = d.reconverge().await.expect("reconverge");
     // Migration 1's steps in the catalog and the data database, and
     // migrations 5's, 6's and 10's in the catalog: 2 is not convergent, and
-    // 3, 4, 7, 8 and 9 do not apply on MongoDB.
+    // 3, 4, 7, 8, 9 and 11 do not apply on MongoDB.
     let ran: Vec<(u32, String)> = reconverged
         .applied
         .iter()
@@ -616,24 +618,24 @@ async fn a_changed_checksum_a_newer_catalog_and_an_older_release_are_reported() 
         "notes": "", "applied_at": bson::DateTime::now(), "applied_by": "9.9.9" }
     };
     ledger
-        .insert_one(row(11, "breaking"))
+        .insert_one(row(12, "breaking"))
         .await
         .expect("insert");
     let status = d.status().await;
     assert_eq!(status.label(), "AheadIncompatible");
     assert_eq!(status.exit_code(), exit::AHEAD_INCOMPATIBLE);
     ledger
-        .delete_one(doc! { "_id": 11_i64 })
+        .delete_one(doc! { "_id": 12_i64 })
         .await
         .expect("delete");
     ledger
-        .insert_one(row(11, "additive"))
+        .insert_one(row(12, "additive"))
         .await
         .expect("insert");
     assert_eq!(d.status().await.label(), "AheadCompatible");
     assert!(d.migrate().await.expect("migrate").applied.is_empty());
     ledger
-        .delete_one(doc! { "_id": 11_i64 })
+        .delete_one(doc! { "_id": 12_i64 })
         .await
         .expect("delete");
 
@@ -714,6 +716,6 @@ async fn a_ledger_document_this_binary_cannot_read_stops_the_status() {
         .expect_err("an error");
     migrations.close().await;
     assert!(error.to_string().contains("\"sideways\""), "{error}");
-    assert_eq!(MigrationId::LATEST.number(), 10);
+    assert_eq!(MigrationId::LATEST.number(), 11);
     d.drop_databases().await;
 }

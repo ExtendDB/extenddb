@@ -31,6 +31,7 @@ mod table_engine;
 mod ttl_worker;
 mod warm_throughput;
 mod worker_store;
+mod write_conflict;
 
 pub use bootstrapper::MongoBootstrapper;
 pub use catalog_store::MongoCatalogStore;

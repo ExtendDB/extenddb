@@ -40,9 +40,21 @@
 //! number rule over every member); an item within the default is validated
 //! on the feeder's own task.
 //!
-//! Before every `put` the uploader checks the heartbeat
-//! ([`HeartbeatHandle::confirms_the_claim`]) and starts none otherwise; a
-//! lost claim or the shutdown token ends the pipeline at its next await.
+//! Before every `put` the uploader checks the claim the writer runs under
+//! ([`ClaimWatch::confirms_the_claim`]: the job's heartbeat,
+//! [`HeartbeatHandle`], or for `backup migrate-legacy` the maintenance
+//! claim's) and starts none otherwise; a lost claim or the shutdown token
+//! ends the pipeline at its next await. A backup job's prefix is its own
+//! (its ARN is new), and it writes with `put`. `backup migrate-legacy`
+//! copies under an ARN another run may have written under too, so its
+//! pipeline records what it writes ([`Pipeline::written`]) and writes each
+//! object with `put_if_absent`: an object already under a key stops the
+//! pipeline with that object left ([`Stop::Occupied`]: another run's, or
+//! this run's own put, which the SDK retries after a lost answer and S3
+//! then answers 412), so a run never replaces an object it did not write;
+//! after a put that failed, the key is read back with `head` and the
+//! object found is recorded with the store's metadata, a key the head
+//! cannot read being left to the next run ([`Pipeline::put_object`]).
 //! When the uploader fails on its own (a put refused, an encoder error) it
 //! cancels a token the feeder selects on, so the feeder stops reading at
 //! once rather than at the stream's next item and the FAILED write does not
@@ -62,7 +74,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Bytes, BytesMut};
-use extenddb_backup_store::{BackupStore, ByteStream};
+use extenddb_backup_store::{BackupStore, ByteStream, ObjectMeta};
 use extenddb_core::backup_format::{
     DataFileChecksums, DataFileEncoder, DataFileEntry, FormatError, KeyRange, KeyRangeTracker,
     MAX_LINE_BYTES, data_file_key, encode_item_line_len_bounded,
@@ -102,6 +114,14 @@ pub(crate) const REFUSAL_LOG_CAP: u64 = 1000;
 pub(crate) enum Stop {
     /// The row is this job's and the failure path runs with this reason.
     Fail(String),
+    /// The validator refused items ([`refusal_reason`]'s text): a failure
+    /// of the backup's own content, which the failure path treats as
+    /// [`Stop::Fail`].
+    Refused(String),
+    /// An object was already under a key the pipeline writes with
+    /// `put_if_absent` ([`Pipeline::written`]): another writer's, left as
+    /// it is.
+    Occupied(String),
     /// The shutdown token fired: the failure path runs with reason
     /// `shutdown`.
     Cancelled,
@@ -129,8 +149,34 @@ pub(crate) struct DataFiles {
     pub bytes_uploaded: u64,
 }
 
+/// The claim the pipeline writes under, as the uploader and the feeder read
+/// it: the backup job's heartbeat ([`HeartbeatHandle`]), or the maintenance
+/// claim `backup migrate-legacy` holds.
+pub(crate) trait ClaimWatch: Send + Sync {
+    /// The pre-put check: `true` while the claim is confirmed held.
+    fn confirms_the_claim(&self) -> bool;
+    /// Cancelled once the claim is known to be lost.
+    fn lost(&self) -> &CancellationToken;
+    /// Why the claim is lost, once it is.
+    fn reason(&self) -> String;
+}
+
+impl ClaimWatch for HeartbeatHandle {
+    fn confirms_the_claim(&self) -> bool {
+        HeartbeatHandle::confirms_the_claim(self)
+    }
+
+    fn lost(&self) -> &CancellationToken {
+        HeartbeatHandle::lost(self)
+    }
+
+    fn reason(&self) -> String {
+        HeartbeatHandle::reason(self)
+    }
+}
+
 /// What the uploader needs from the job.
-pub(crate) struct Pipeline<'a> {
+pub(crate) struct Pipeline<'a, W: ?Sized = HeartbeatHandle> {
     pub store: &'a dyn BackupStore,
     /// The store as the runtime holds it: its health and identity, read
     /// before every put.
@@ -141,7 +187,8 @@ pub(crate) struct Pipeline<'a> {
     pub prefix: &'a str,
     /// The ARN, for the log lines.
     pub arn: &'a str,
-    pub heartbeat: &'a HeartbeatHandle,
+    /// The claim every put is checked against.
+    pub heartbeat: &'a W,
     pub shutdown: &'a CancellationToken,
     pub metrics: Option<&'a MetricsCollector>,
     /// `data_file_target_bytes`.
@@ -150,9 +197,85 @@ pub(crate) struct Pipeline<'a> {
     /// (`BackupDocuments::build`).
     pub key_prefix: &'a str,
     pub bucket: &'a str,
+    /// `None` for a backup job, which writes with `put`. `Some` for a
+    /// writer whose prefix another run may also write under: every object
+    /// is written with `put_if_absent`, and each one this pipeline stored
+    /// is recorded here, in order, for a deletion that reaches only those
+    /// ([`BackupStore::delete_written`]); after a put that failed, the
+    /// object `head` finds under the key, with the metadata it reports.
+    pub written: Option<&'a std::sync::Mutex<Vec<ObjectMeta>>>,
 }
 
-impl Pipeline<'_> {
+impl<W: ?Sized> Pipeline<'_, W> {
+    /// One object's put under the prefix (module doc): `put` for a backup
+    /// job; `put_if_absent` where the pipeline records what it writes, an
+    /// object already under `key` stopping it with [`Stop::Occupied`]. A put
+    /// that fails may still have stored its object (the trait's contract),
+    /// so where the pipeline records its writes the key is read back with
+    /// `head`, and the object found there is recorded with the metadata the
+    /// store reports (a deletion conditioned on a size or an `ETag` the
+    /// put never answered would otherwise never match it); a key the head
+    /// cannot read is recorded as nothing and left to the next run, since
+    /// a deletion without a condition could reach another run's object.
+    pub(crate) async fn put_object(
+        &self,
+        key: &str,
+        name: &str,
+        body: ByteStream,
+    ) -> Result<ObjectMeta, Stop> {
+        let stored = match self.written {
+            None => self.store.put(key, body).await.map(Some),
+            Some(_) => self.store.put_if_absent(key, body).await,
+        };
+        let record = |meta: ObjectMeta| {
+            if let Some(written) = self.written {
+                written
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(meta);
+            }
+        };
+        match stored {
+            Ok(Some(meta)) => {
+                record(ObjectMeta {
+                    key: key.to_owned(),
+                    ..meta.clone()
+                });
+                Ok(meta)
+            }
+            Ok(None) => Err(Stop::Occupied(format!(
+                "{name} is already under {} (another run's object, or this run's own put \
+                 retried after its answer was lost), and the object is left as it is",
+                self.prefix
+            ))),
+            Err(e) => {
+                if let Some(metrics) = self.metrics {
+                    metrics.record_backup_store_error("put");
+                }
+                let mut reason = format!("writing {name}: {e}");
+                if self.written.is_some() {
+                    match self.store.head(key).await {
+                        Ok(Some(found)) => record(ObjectMeta {
+                            key: key.to_owned(),
+                            ..found
+                        }),
+                        Ok(None) => {}
+                        Err(head) => {
+                            if let Some(metrics) = self.metrics {
+                                metrics.record_backup_store_error("head");
+                            }
+                            reason = format!(
+                                "{reason}; whether the put stored its object could not be read \
+                                 ({head}), so whatever is under {key} is left to the next run"
+                            );
+                        }
+                    }
+                }
+                Err(Stop::Fail(reason))
+            }
+        }
+    }
+
     /// The check before every put: the store is healthy as the runtime holds
     /// it (the reconciler's check sets it) and its identity is the one the
     /// row records. A store marked unhealthy mid-job, or whose identity file
@@ -483,8 +606,8 @@ fn close(
 }
 
 /// The pipeline (module doc). `tracker` is `Some` for a key-ordered backup.
-pub(crate) async fn write_data_files(
-    p: &Pipeline<'_>,
+pub(crate) async fn write_data_files<W: ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
     items: BoxStream<'static, Result<Item, StorageError>>,
     key: RestorableKeySchema,
     limits: RestorableLimits,
@@ -584,12 +707,7 @@ pub(crate) async fn write_data_files(
             biased;
             () = p.shutdown.cancelled() => Err(Stop::Cancelled),
             () = p.heartbeat.lost().cancelled() => Err(Stop::ClaimLost(p.heartbeat.reason())),
-            result = p.store.put(&key, body) => result.map_err(|e| {
-                if let Some(metrics) = p.metrics {
-                    metrics.record_backup_store_error("put");
-                }
-                Stop::Fail(format!("writing {name}: {e}"))
-            }),
+            result = p.put_object(&key, &name, body) => result,
         };
         let meta = match put {
             Ok(meta) => meta,
@@ -665,13 +783,17 @@ pub(crate) async fn write_data_files(
         Ok(end) => end,
         Err(e) => return Err(Stop::Fail(format!("the snapshot reader task failed: {e}"))),
     };
-    if let Err(why @ (Stop::Cancelled | Stop::ClaimLost(_) | Stop::StoreUnhealthy(_))) = uploaded {
+    if let Err(
+        why @ (Stop::Cancelled | Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) | Stop::Occupied(_)),
+    ) = uploaded
+    {
         return Err(why);
     }
     match end.interrupted {
         Some(Stop::Cancelled) => return Err(Stop::Cancelled),
         Some(Stop::ClaimLost(_)) => return Err(Stop::ClaimLost(p.heartbeat.reason())),
-        Some(Stop::Fail(_) | Stop::StoreUnhealthy(_)) | None => {}
+        Some(Stop::Fail(_) | Stop::Refused(_) | Stop::StoreUnhealthy(_) | Stop::Occupied(_))
+        | None => {}
     }
     match (end.refusals, end.stream_error) {
         // A stream that fails after a refusal (the pass that checks the rest
@@ -679,14 +801,14 @@ pub(crate) async fn write_data_files(
         // over the items read before the failure, so `backup list --failed`
         // still names the first refused item.
         (Some((count, first)), Some(e)) => {
-            return Err(Stop::Fail(format!(
+            return Err(Stop::Refused(format!(
                 "{}; the snapshot then failed: {e}",
                 refusal_reason(count, &first)
             )));
         }
         (None, Some(e)) => return Err(Stop::Fail(format!("reading the snapshot: {e}"))),
         (Some((count, first)), None) => {
-            return Err(Stop::Fail(refusal_reason(count, &first)));
+            return Err(Stop::Refused(refusal_reason(count, &first)));
         }
         (None, None) => {}
     }

@@ -1284,6 +1284,12 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
             unused()
         }
+        fn row_holding_backup_id<'a>(
+            &'a self,
+            _backup_id: &'a str,
+        ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+            unused()
+        }
         fn start_backup_delete<'a>(
             &'a self,
             _key: &'a BackupKey,
