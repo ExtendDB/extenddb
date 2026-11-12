@@ -44,3 +44,14 @@ gh attestation verify oci://docker.io/extenddb/extenddb-postgres@sha256:<linux/a
   --predicate-type https://cyclonedx.org/bom \
   --format json --jq '.[0].verificationResult.statement.predicate' > sbom-amd64.cdx.json
 ```
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

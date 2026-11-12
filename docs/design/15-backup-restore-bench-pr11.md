@@ -451,3 +451,14 @@ points under one arena (130 MiB per running restore for 100k items of
 2.5 KB strings, 184 to 208 MiB for items of 128 numbers, 301 to 316 MiB for
 20,000 items of 1,536 numbers), times `max_concurrent_jobs`, more for larger
 items, and treat the default-arena figures as unbounded by this record.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

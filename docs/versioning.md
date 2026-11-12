@@ -64,3 +64,14 @@ Support covers the stable and beta backends. An experimental backend gets fixes 
 3. A major release removes the item, no earlier than 6 months after the release that announced it.
 
 The same steps apply when a release removes a stable or beta backend, or moves it to a lower tier. A security issue can need a faster change, and its release notes then give the reason.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

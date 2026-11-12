@@ -164,3 +164,14 @@ Deliberately out of scope for this change, in rough priority order:
 * **TTL alongside asynchronously propagated GSIs**, per the table above.
 * **Version fence hardening.** The fence now uses the `version` column; remaining follow-up is retiring the `item_data` fallback once no unversioned rows can exist (requires a fleet-wide rewrite pass or an explicit migration), after which the canonical-JSON coupling disappears entirely.
 * **Recovery-path test coverage.** The transitions this change introduced — draining a retired generation, retiring a drained bucket registration, an expired worker claim — are reasoned about but not yet covered by tests.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

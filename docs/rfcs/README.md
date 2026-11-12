@@ -55,4 +55,13 @@ you whether an RFC, an ADR, or neither is needed.
 | [0002](0002-backend-plugin-policy.md) | Backend Plugin Policy | Draft | |
 | [0003](0003-backend-acceptance-criteria.md) | Backend Acceptance Criteria | Draft | |
 
+---
 
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

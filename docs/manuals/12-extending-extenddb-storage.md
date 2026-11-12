@@ -433,3 +433,14 @@ The PostgreSQL implementation makes backend-specific choices. These are implemen
 | `CredentialStore` | `auth/src/lib.rs`                     | `DbCredentialStore` | SigV4 credential lookup |
 
 All PostgreSQL-specific code lives in `crates/storage-postgres/`. The `server` crate has no direct database dependencies. Backends register at compile time via the `inventory` crate and are selected by name at startup.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.

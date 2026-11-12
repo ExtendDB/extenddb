@@ -113,11 +113,11 @@ The same images and their signatures are mirrored by digest to
 
 ## Note
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-implementation that speaks the DynamoDB wire protocol; behavioral differences
-from the service are documented in
+ExtendDB is an open source project maintained by AWS. It is not Amazon
+DynamoDB and does not contain any DynamoDB source code. "DynamoDB" is a
+trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that
+speaks the DynamoDB wire protocol; behavioral differences from the service are
+documented in
 [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
 More at [extenddb.org](https://extenddb.org) and

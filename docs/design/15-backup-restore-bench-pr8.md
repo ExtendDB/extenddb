@@ -479,3 +479,14 @@ client bounds these rates; the server's own share of the loss may be larger
 under a faster client. The deployment guide's service unit carries the line
 commented out, with the condition (a host that backs up tables of large
 items) and this cost beside it.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc.
