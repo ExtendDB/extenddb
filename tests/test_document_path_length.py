@@ -215,6 +215,8 @@ def test_update_item_reports_an_earlier_fault_first(dynamodb_client, table, key,
 NESTING = "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
 BETWEEN = ("The BETWEEN operator requires upper bound to be greater than or equal to lower bound; "
            "lower bound operand: AttributeValue: {N:5}, upper bound operand: AttributeValue: {N:1}")
+BETWEEN_TYPES = ("The BETWEEN operator requires same data type for lower and upper bounds; "
+                 "lower bound operand: AttributeValue: {N:1}, upper bound operand: AttributeValue: {S:a}")
 
 
 def deep_value() -> dict:
@@ -308,20 +310,40 @@ def test_transact_write_items_put_checks_the_item_nesting_before_the_condition(
         "ValidationException", message)
 
 
-def test_between_bounds_are_checked_whatever_the_item(dynamodb_client, table, key):
-    bounds = {":hi": {"N": "5"}, ":lo": {"N": "1"}, ":s": {"S": "s"}}
+@pytest.mark.parametrize(("lower", "upper", "message"), [
+    ({"N": "5"}, {"N": "1"}, BETWEEN),
+    ({"N": "1"}, {"S": "a"}, BETWEEN_TYPES),
+], ids=["lower_above_upper", "different_types"])
+def test_between_bounds_are_checked_whatever_the_item(dynamodb_client, table, key, lower, upper, message):
+    bounds = {":a": lower, ":b": upper, ":s": {"S": "s"}}
     missing = {"pk": {"S": "plen"}, "sk": {"S": "between-no-item"}}
-    for k, cond in ((missing, "#x BETWEEN :hi AND :lo"), (key, "attribute_exists(#n) AND #x BETWEEN :hi AND :lo")):
+    for k, cond in ((missing, "#x BETWEEN :a AND :b"), (key, "#x BETWEEN :a AND :b"),
+                    (key, "attribute_exists(#n) AND #x BETWEEN :a AND :b")):
         names = {"#x": "x", "#n": "nope"} if "#n" in cond else {"#x": "x"}
         assert _single_item_error(lambda: _update(dynamodb_client, table, k, "SET #x = :s", names=names,
                                                   values=bounds, ConditionExpression=cond)) == (
-            "ValidationException", f"Invalid ConditionExpression: {BETWEEN}"), cond
+            "ValidationException", f"Invalid ConditionExpression: {message}"), cond
     assert "Item" not in dynamodb_client.get_item(TableName=table, Key=missing, ConsistentRead=True)
-    assert _error(lambda: dynamodb_client.query(
-        TableName=table, KeyConditionExpression="pk = :p", FilterExpression="#x BETWEEN :hi AND :lo",
-        ExpressionAttributeNames={"#x": "x"},
-        ExpressionAttributeValues={":p": {"S": "plen-empty"}, ":hi": bounds[":hi"], ":lo": bounds[":lo"]},
-    )) == ("ValidationException", f"Invalid FilterExpression: {BETWEEN}")
+    for partition in ("plen-empty", "plen"):
+        assert _error(lambda: dynamodb_client.query(
+            TableName=table, KeyConditionExpression="pk = :p", FilterExpression="#x BETWEEN :a AND :b",
+            ExpressionAttributeNames={"#x": "x"},
+            ExpressionAttributeValues={":p": {"S": partition}, ":a": lower, ":b": upper},
+        )) == ("ValidationException", f"Invalid FilterExpression: {message}"), partition
+
+
+def test_legacy_expected_between_bounds_out_of_order_are_refused(dynamodb_client, table, key):
+    # The service words this `One or more parameter values were invalid: The
+    # BETWEEN condition was provided a range where the lower bound is greater
+    # than the upper bound` (measured 2026-11-12); ExtendDB answers with the
+    # ConditionExpression sentence, so only the class and the operator are
+    # compared.
+    expected = {"n": {"ComparisonOperator": "BETWEEN", "AttributeValueList": [{"N": "5"}, {"N": "1"}]}}
+    missing = {"pk": {"S": "plen"}, "sk": {"S": "between-expected-no-item"}}
+    for k in (missing, key):
+        code, message = _single_item_error(lambda: dynamodb_client.put_item(
+            TableName=table, Item={**k, "n": {"N": "3"}}, Expected=expected))
+        assert (code, "BETWEEN" in message) == ("ValidationException", True), message
 
 
 def test_projection_names_come_before_the_length(dynamodb_client, table, key):

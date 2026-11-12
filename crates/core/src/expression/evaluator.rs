@@ -111,7 +111,8 @@ fn resolve_to_value<'a>(
 /// The service's sentence when both BETWEEN bounds are placeholders and they
 /// differ in type or the lower is above the upper, without the `Invalid
 /// <Kind>: ` label. The service checks this at request time, whatever the
-/// item (measured 2026-10-26).
+/// item (measured 2026-10-26). The evaluator calls this for every item, so
+/// the sentence is built only when the bounds are at fault.
 pub(crate) fn between_bounds_fault(
     low: &Expr,
     high: &Expr,
@@ -123,25 +124,24 @@ pub(crate) fn between_bounds_fault(
     let (Some(l), Some(h)) = (maps.values.get(l_name), maps.values.get(h_name)) else {
         return None;
     };
-    let bounds = format!(
-        "lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
-        format_attribute_value(l),
-        format_attribute_value(h)
-    );
-    if attribute_type_code(l) != attribute_type_code(h) {
-        return Some(format!(
-            "The BETWEEN operator requires same data type for lower and upper bounds; {bounds}"
-        ));
-    }
-    let (lpn, hpn) = (
+    let requirement = if attribute_type_code(l) != attribute_type_code(h) {
+        "same data type for lower and upper bounds"
+    } else if compare_values(
+        l,
+        h,
+        CompareOp::Gt,
         placeholder_numeric(low, maps),
         placeholder_numeric(high, maps),
-    );
-    compare_values(l, h, CompareOp::Gt, lpn, hpn).then(|| {
-        format!(
-            "The BETWEEN operator requires upper bound to be greater than or equal to lower bound; {bounds}"
-        )
-    })
+    ) {
+        "upper bound to be greater than or equal to lower bound"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "The BETWEEN operator requires {requirement}; lower bound operand: AttributeValue: {{{}}}, upper bound operand: AttributeValue: {{{}}}",
+        format_attribute_value(l),
+        format_attribute_value(h)
+    ))
 }
 
 /// Look up a pre-parsed `BigDecimal` for a placeholder expression.
