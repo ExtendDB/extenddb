@@ -14,8 +14,8 @@
 //!
 //! [`parse`] requires the literal `arn:` prefix and five colon-separated fields.
 //! The partition, service, region, and account are captured but not constrained
-//! to any value: a caller that pins them to its deployment does so itself, and a
-//! caller that ignores them (authorization canonicalizes every supplied ARN to
+//! to any value: a caller that pins them to its deployment does so itself
+//! ([`ArnFields::in_deployment`]), and a caller that ignores them (authorization canonicalizes every supplied ARN to
 //! its own deployment) reads only the table and sub-resource.
 
 /// A table sub-resource: a secondary index, a stream, or a backup.
@@ -47,6 +47,18 @@ pub struct TableResource {
     pub account: String,
     pub table: String,
     pub sub: Option<SubResource>,
+}
+
+impl ArnFields<'_> {
+    /// True when the partition is `aws`, the service `dynamodb` and the region
+    /// `region`, each compared exactly. Every ARN the server issues carries
+    /// these three values. The server's `StreamArn` scope check and the engine's
+    /// tag `ResourceArn` check both refuse an ARN for which this is false; the
+    /// account and resource are not compared.
+    #[must_use]
+    pub fn in_deployment(&self, region: &str) -> bool {
+        self.partition == "aws" && self.service == "dynamodb" && self.region == region
+    }
 }
 
 /// Split a string into the five ARN fields after the `arn:` prefix.
@@ -146,6 +158,34 @@ mod tests {
         assert_eq!(f.region, "us-east-1");
         assert_eq!(f.account, "1");
         assert_eq!(f.resource, "table/T");
+    }
+
+    #[test]
+    fn in_deployment_compares_partition_service_and_region_exactly() {
+        let arn = "arn:aws:dynamodb:us-east-1:1:table/T/stream/2026-10-20T16:17:40.188";
+        assert!(fields(arn).unwrap().in_deployment("us-east-1"));
+        // The account and the resource are not compared.
+        assert!(
+            fields("arn:aws:dynamodb:us-east-1:2:table/U")
+                .unwrap()
+                .in_deployment("us-east-1")
+        );
+        for other in [
+            arn.replace("arn:aws:", "arn:aws-cn:"),
+            arn.replace("arn:aws:", "arn:aws-us-gov:"),
+            arn.replace("arn:aws:", "arn::"),
+            arn.replace(":dynamodb:", ":DynamoDB:"),
+            arn.replace(":dynamodb:", ":DYNAMODB:"),
+            arn.replace(":dynamodb:", ":s3:"),
+            arn.replace("us-east-1", "us-west-2"),
+            arn.replace("us-east-1", "US-EAST-1"),
+            arn.replace("us-east-1", ""),
+        ] {
+            assert!(
+                !fields(&other).unwrap().in_deployment("us-east-1"),
+                "{other}"
+            );
+        }
     }
 
     #[test]

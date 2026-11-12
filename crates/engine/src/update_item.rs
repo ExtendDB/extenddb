@@ -37,6 +37,17 @@ pub async fn handle_update_item(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
+    handle_update_item_with(body, ctx, false).await
+}
+
+/// [`handle_update_item`], sizing the update by its finished item alone when
+/// `finished_item_sizing` is set, as the service sizes a PartiQL `UPDATE`
+/// (see `validate_update_item_size`).
+pub(crate) async fn handle_update_item_with(
+    body: Value,
+    ctx: &OperationContext,
+    finished_item_sizing: bool,
+) -> Result<DispatchResult, DynamoDbError> {
     // Sequential rather than aggregated, deliberately: UpdateItem stops at the
     // FIRST invalid enum and reports one error, where PutItem and DeleteItem
     // aggregate all of theirs. Measured 2026-08-24 (us-east-1): ReturnValues
@@ -61,6 +72,19 @@ pub async fn handle_update_item(
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
+
+    // An attribute name over the size limit is input validation: it is
+    // reported ahead of the table lookup, the expressions, the condition and
+    // the index-key checks, whichever map the name arrives through.
+    extenddb_core::validation::validate_expression_attribute_name_sizes(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+        &ctx.limits,
+        extenddb_core::validation::AttributeNameRequestForm::SingleItem,
+    )?;
+    if let Some(updates) = &input.attribute_updates {
+        extenddb_core::validation::validate_attribute_updates_name_sizes(updates, &ctx.limits)?;
+    }
 
     // Validate Update/Condition expressions (and AttributeUpdates
     // desugaring) before the existence check; key, item-content nesting, and
@@ -160,7 +184,7 @@ pub async fn handle_update_item(
     // references, functions, and operand types) before it looks at the
     // UpdateExpression: a request with a defect in each reports the
     // condition's (measured 2026-10-14). `resolve_condition` runs that pass.
-    let (condition, maps) = resolve_condition(
+    let (condition, mut maps) = resolve_condition(
         input.condition_expression.as_deref(),
         effective_expr_names.as_ref(),
         effective_expr_values.as_ref(),
@@ -169,6 +193,10 @@ pub async fn handle_update_item(
         &ctx.limits,
     )
     .map_err(single_item_write_prefix)?;
+    // The storage layer sizes a desugared legacy update against the item limit
+    // the way the service sizes `AttributeUpdates`, not an expression.
+    maps.legacy_attribute_updates = input.attribute_updates.is_some();
+    maps.finished_item_sizing = finished_item_sizing;
 
     // No UpdateExpression and no AttributeUpdates: no-op upsert.
     // Some("") still errors via parse_update_expr_checked. The checked parse
@@ -226,6 +254,30 @@ pub async fn handle_update_item(
 
     // Validate that no update action targets a key attribute (REQ-DATA-003)
     validate_no_key_updates(&actions, &key_info, &maps)?;
+
+    // A literal operand assigned to a secondary-index key must carry the key's
+    // declared type. DynamoDB checks this on the statement itself, ahead of
+    // the condition and ahead of applying any action, so it is reported even
+    // when the condition would fail or another action could not be applied.
+    // A value computed from the existing item is checked by the storage layer
+    // on the written item instead.
+    {
+        let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = key_info
+            .global_secondary_indexes
+            .iter()
+            .chain(key_info.local_secondary_indexes.iter())
+            .map(|idx| extenddb_core::validation::IndexKeyRef {
+                index_name: &idx.index_name,
+                key_schema: &idx.key_schema,
+            })
+            .collect();
+        extenddb_core::validation::validate_index_key_literal_operands(
+            &actions,
+            &idx_refs,
+            &key_info.attribute_definitions,
+            &maps,
+        )?;
+    }
 
     let return_old = matches!(
         input.return_values,

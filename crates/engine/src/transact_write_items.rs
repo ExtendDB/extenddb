@@ -22,11 +22,13 @@ use crate::transact_write_helpers::{
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_item_nesting_depth, validate_item_size,
+    AttributeNameRequestForm, validate_attribute_name_sizes,
+    validate_expression_attribute_name_sizes, validate_item_nesting_depth, validate_item_size,
 };
 
 /// Handle a `TransactWriteItems` request.
@@ -78,10 +80,12 @@ pub async fn handle_transact_write_items(
 
     // Validation runs in the order the service applies it, each phase over
     // every item before the next phase starts:
-    //   1. per item, in order, with no table needed: the nesting of the item's
-    //      ExpressionAttributeValues, expression grammar, the semantic walk,
-    //      unused names and values, then for a Put the attribute name size,
-    //      the item size and the item nesting (top-level ValidationException),
+    //   1. per item, in order, with no table needed: the attribute name sizes
+    //      of the item's expression maps and, for a Put, of its item, the
+    //      nesting of the item's ExpressionAttributeValues, expression
+    //      grammar, the semantic walk, unused names and values, then for a
+    //      Put the item size and the item nesting (top-level
+    //      ValidationException),
     //   2. table lookup (ResourceNotFoundException),
     //   3. the 4 MB request total (top-level ValidationException),
     //   4. the key pass, per item in order: a key that does not fit the schema
@@ -372,6 +376,52 @@ fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -
     assigned
 }
 
+/// Check the attribute names one `TransactWriteItems` member carries: the
+/// member's expression maps (any member type), then a `Put` member's item
+/// names and map keys. An over-limit name fails the whole request with a
+/// top-level ValidationException and no cancellation reasons.
+///
+/// Order, measured on the service (2026-10-21) with over-limit names in two
+/// places at once: a `Put` with a long `#n` and a long key in `:c` reports
+/// `:c` (values before names, as the `Update` member does), and a `Put` with a
+/// long item name and a long `#n` reports `#n` (expression maps before the
+/// item). A standalone `PutItem` with a long item name and a long `#n`
+/// reports the item, so that handler keeps the opposite order.
+fn validate_member_attribute_name_sizes(
+    twi: &TransactWriteItem,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let form = AttributeNameRequestForm::TransactionMember;
+    let (names, values) = if let Some(put) = &twi.put {
+        (
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(del) = &twi.delete {
+        (
+            del.expression_attribute_names.as_ref(),
+            del.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(upd) = &twi.update {
+        (
+            upd.expression_attribute_names.as_ref(),
+            upd.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(cc) = &twi.condition_check {
+        (
+            cc.expression_attribute_names.as_ref(),
+            cc.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    validate_expression_attribute_name_sizes(names, values, limits, form)?;
+    if let Some(put) = &twi.put {
+        validate_attribute_name_sizes(&put.item, limits, form)?;
+    }
+    Ok(())
+}
+
 /// A `TransactWriteItem`'s expressions, parsed and checked without touching
 /// storage: grammar, operand types, every `#name` and `:value` reference
 /// defined, and no unused names or values.
@@ -388,9 +438,15 @@ struct ParsedExpressions {
 /// expression on item three is reported ahead of a missing table on item one.
 fn parse_write_expressions(
     twi: &TransactWriteItem,
-    limits: &extenddb_core::limits::LimitsConfig,
+    limits: &LimitsConfig,
 ) -> Result<ParsedExpressions, DynamoDbError> {
     use extenddb_core::expression::ExpressionKind;
+
+    // Attribute names over the size limit are request-shape validation of the
+    // member: a request whose first member names a missing table answers with
+    // a later member's name refusal, and a member's own name refusal comes
+    // ahead of every other check on that member.
+    validate_member_attribute_name_sizes(twi, limits)?;
 
     let (names, values, condition_expression, update_expression) = if let Some(put) = &twi.put {
         (
@@ -428,19 +484,20 @@ fn parse_write_expressions(
     };
 
     // The nesting of every ExpressionAttributeValues value, used or not, is
-    // the first thing the service checks about an item (measured: it beats
-    // the same item's syntax error, undefined reference and unused value, and
-    // a later item's expression errors, and yields to an earlier item's).
+    // the first thing the service checks about an item's expressions
+    // (measured: it beats the same item's syntax error, undefined reference
+    // and unused value, and a later item's expression errors, and yields to
+    // an earlier item's).
     validate_value_map_nesting(values)?;
 
     // Inside a transaction the service checks an Update item's
     // UpdateExpression (syntax, the ordered semantic walk, overlapping paths)
     // before its ConditionExpression, the reverse of UpdateItem; then the
-    // unused names and values; then, for a Put, the attribute name size, the
-    // item's size and the item's nesting (measured: an oversize Put with an
-    // unused value reports the value, an oversize item one reports its size
-    // ahead of the next item's defects, and one item with all three defects
-    // reports the name first and the nesting last).
+    // unused names and values; then, for a Put, the item's size and the
+    // item's nesting (measured: an oversize Put with an unused value reports
+    // the value, an oversize item one reports its size ahead of the next
+    // item's defects, and one item with a long attribute name, an oversize
+    // item and a deep item reports the name first and the nesting last).
     let maps = build_expression_maps(names, values);
     let actions = match update_expression {
         Some(expr) => Some(crate::expression_helpers::parse_update_expr_checked(
@@ -479,7 +536,6 @@ fn parse_write_expressions(
         )?;
     }
     if let Some(put) = &twi.put {
-        validate_attribute_name_sizes(&put.item, limits)?;
         validate_item_size(&put.item, limits.max_item_size_bytes)?;
         validate_item_nesting_depth(&put.item)?;
     }

@@ -34,6 +34,25 @@ To learn how to configure ExtendDB dev, see [the `extenddb-dev` image](https://g
 
 For a durable, TLS-terminated deployment, use [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres).
 
+## Verification
+
+Every published image is signed with Sigstore cosign, with a Rekor transparency-log entry. Releases through 0.1.14 use a committed release key, [`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem):
+
+```console
+cosign verify --key extenddb-signing.pub.pem docker.io/extenddb/extenddb-dev:X.Y.Z
+```
+
+From the first release after the keyless migration (named in the release notes), signatures are keyless, bound to the workflow that signed the image:
+
+```console
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  docker.io/extenddb/extenddb-dev:X.Y.Z
+```
+
+The routine signer is `release-dev-image.yml`; the break-glass signer `sign-image.yml` can sign any tier, so drop it from the pattern to require the routine dev path.
+
 ## Note
 
 This image is built for local development and CI. It serves plain HTTP and its authorization is open, so whoever holds the credential can do anything. Publish it to loopback only, as the command above does, and do not keep real data in it.
