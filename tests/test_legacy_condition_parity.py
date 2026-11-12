@@ -135,6 +135,22 @@ def multi_table(dynamodb_client):
     dynamodb_client.delete_table(TableName=name)
 
 
+@pytest.fixture(scope="module")
+def bb_table(dynamodb_client):
+    """pk B, sk B, one item."""
+    name = f"legacy_parity_b_{uuid.uuid4().hex[:8]}"
+    dynamodb_client.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "B"}, {"AttributeName": "sk", "AttributeType": "B"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    wait_for_active(dynamodb_client, name)
+    dynamodb_client.put_item(TableName=name, Item={"pk": {"B": b"\x01"}, "sk": {"B": b"\x02"}})
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+
+
 class TestLegacyNumberValues:
     """A legacy N value that is not a number is refused with the number
     message, ahead of the operator checks on the same entry and ahead of the
@@ -356,6 +372,8 @@ RANGE_R1_FOR_R2 = "RANGE key attributes r1 must have equality conditions specifi
 MIDX = {"IndexName": "midx"}
 KEYS_ONLY_ALL = {"IndexName": "kidx", "Select": "ALL_ATTRIBUTES"}
 SK_NE = {"pk": _cond("EQ", [_s("p1")]), "sk": _cond("NE", [_s("a")])}
+B_01 = {"B": b"\x01"}
+EMPTY_B = "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: {}"
 
 # Query requests measured on 2026-11-12 against tables of these fixtures'
 # shapes, two sends each: (id, fixture, request, the answers the service
@@ -403,6 +421,14 @@ MEASURED_ORDER = [
     ("non_indexable_before_the_index_lookup", "ss_table", {"KeyConditions": SK_NE, "IndexName": "nope"}, [NOT_INDEXABLE]),
     ("non_indexable_before_consistent_read", "ss_table", {"KeyConditions": {"gpk": _eq(_s("g")), "gsk": _cond("NE", [_s("a")])}, "IndexName": "kidx", "ConsistentRead": True}, [NOT_INDEXABLE]),
     ("non_indexable_before_select", "ss_table", {"KeyConditions": SK_NE, "Select": "SPECIFIC_ATTRIBUTES"}, [NOT_INDEXABLE]),
+    # B keys: the schema type check and the binary wording of the empty key
+    # check.
+    ("binary_hash_string_value", "bb_table", {"KeyConditions": {"pk": _eq(_s("x"))}}, [SCHEMA_TYPE]),
+    ("binary_range_string_value", "bb_table", {"KeyConditions": {"pk": _eq(B_01), "sk": _eq(_s("x"))}}, [SCHEMA_TYPE]),
+    ("binary_empty_hash", "bb_table", {"KeyConditions": {"pk": _eq({"B": b""})}}, [EMPTY_B.format("pk")]),
+    ("binary_empty_range", "bb_table", {"KeyConditions": {"pk": _eq(B_01), "sk": _eq({"B": b""})}}, [EMPTY_B.format("sk")]),
+    ("binary_empty_range_begins_with", "bb_table", {"KeyConditions": {"pk": _eq(B_01), "sk": _cond("BEGINS_WITH", [{"B": b""}])}}, [EMPTY_B.format("sk")]),
+    ("binary_empty_between_bound", "bb_table", {"KeyConditions": {"pk": _eq(B_01), "sk": _cond("BETWEEN", [{"B": b""}, {"B": b"\x05"}])}}, [EMPTY_B.format("sk")]),
 ]
 
 
@@ -423,6 +449,10 @@ class TestMeasuredCheckOrder:
     def test_multi_attribute_index_reads_the_item(self, dynamodb_client, multi_table):
         # Measured 2026-11-12: Count 1.
         assert dynamodb_client.query(TableName=multi_table, **MIDX, KeyConditions={"h1": _eq(_s("a")), "h2": _eq(_s("b"))})["Count"] == 1
+
+    def test_binary_key_reads_the_item(self, dynamodb_client, bb_table):
+        # Measured 2026-11-12: Count 1.
+        assert dynamodb_client.query(TableName=bb_table, KeyConditions={"pk": _eq(B_01)})["Count"] == 1
 
 
 class TestBatchGetAbsentKeyCapacity:

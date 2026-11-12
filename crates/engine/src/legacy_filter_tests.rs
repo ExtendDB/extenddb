@@ -458,6 +458,22 @@ fn key_conditions_refuse_a_value_of_the_wrong_schema_type() {
         )
         .is_none()
     );
+    // B keys: a B value passes and an S value is refused (measured
+    // 2026-11-12 on a B/B table).
+    let bb = schema(&[
+        ("pk", KeyType::Hash, ScalarAttributeType::B),
+        ("sk", KeyType::Range, ScalarAttributeType::B),
+    ]);
+    let pk_b = || ("pk", cond("EQ", vec![AttributeValue::B(vec![1])]));
+    assert_eq!(
+        key_error(&kc(vec![("pk", cond("EQ", vec![s("x")]))]), &bb),
+        refusal(SCHEMA_TYPE)
+    );
+    assert_eq!(
+        key_error(&kc(vec![pk_b(), ("sk", cond("EQ", vec![s("x")]))]), &bb),
+        refusal(SCHEMA_TYPE)
+    );
+    assert!(key_error(&kc(vec![pk_b()]), &bb).is_none());
 }
 
 #[test]
@@ -533,6 +549,40 @@ fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
         assert_eq!(empty(&conditions, &multi), empty_key(name));
     }
     assert_eq!(empty(&kc(vec![pk_s(), ("foo", eq(""))]), &ss.0), None);
+    // An empty B on a B key names the binary kind (measured 2026-11-12).
+    let (bb, _) = schema(&[
+        ("pk", KeyType::Hash, ScalarAttributeType::B),
+        ("sk", KeyType::Range, ScalarAttributeType::B),
+    ]);
+    let empty_binary = |name: &str| {
+        Some(format!(
+            "One or more parameter values are not valid. The AttributeValue for a key attribute cannot contain an empty binary value. Key: {name}"
+        ))
+    };
+    let pk_b = || ("pk", cond("EQ", vec![AttributeValue::B(vec![1])]));
+    assert_eq!(
+        empty(
+            &kc(vec![(
+                "pk",
+                cond("EQ", vec![AttributeValue::B(Vec::new())])
+            )]),
+            &bb
+        ),
+        empty_binary("pk")
+    );
+    for sk in [
+        cond("EQ", vec![AttributeValue::B(Vec::new())]),
+        cond("BEGINS_WITH", vec![AttributeValue::B(Vec::new())]),
+        cond(
+            "BETWEEN",
+            vec![AttributeValue::B(Vec::new()), AttributeValue::B(vec![5])],
+        ),
+    ] {
+        assert_eq!(
+            empty(&kc(vec![pk_b(), ("sk", sk)]), &bb),
+            empty_binary("sk")
+        );
+    }
     // The key schema checks come first: these report their own error with an
     // empty key value present.
     assert_eq!(
