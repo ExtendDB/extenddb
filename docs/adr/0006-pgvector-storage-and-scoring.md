@@ -110,6 +110,8 @@ operators, which costs a per-row unpack of every candidate and gives up any inde
 on the column. That trade is worse than the documented asymmetry for an input
 class no real embedding produces.
 
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

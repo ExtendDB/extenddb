@@ -205,6 +205,8 @@ the ledger's image.
   the worker path is exercised by the crate's direct integration tests, which
   hold the worker guard.
 
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

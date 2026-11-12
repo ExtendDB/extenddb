@@ -917,6 +917,8 @@ neither path is refused, "Either FilePath or S3Prefix must be provided"). It rea
 DynamoDB export directly, with `ImportTable` or a restore, is planned (#748) and not in this release; `backup
 sync` adopts only prefixes with an ExtendDB manifest.
 
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
