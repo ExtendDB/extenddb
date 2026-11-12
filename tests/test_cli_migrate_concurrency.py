@@ -20,8 +20,6 @@ the backend-agnostic pytest suite.
 
 from __future__ import annotations
 
-import os
-import select
 import signal
 import subprocess
 import time
@@ -31,6 +29,7 @@ from lifecycle_helpers import (
     PG_ADMIN_CONN,
     _init_args,
     _pg_args,
+    _read_until,
     _run_extenddb,
 )
 
@@ -61,31 +60,6 @@ def _migrate_cmd(cli_env):
 def _decode(data):
     """Decode captured subprocess output for assertions and diagnostics."""
     return data.decode("utf-8", errors="replace")
-
-
-def _read_until(proc, expected, timeout=15.0):
-    """Read raw stdout until expected appears, without waiting for process exit."""
-    assert proc.stdout is not None
-    expected_bytes = expected.encode()
-    output = bytearray()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        ready, _, _ = select.select([proc.stdout], [], [], min(0.1, remaining))
-        if not ready:
-            if proc.poll() is not None:
-                output.extend(os.read(proc.stdout.fileno(), 4096))
-                break
-            continue
-        chunk = os.read(proc.stdout.fileno(), 4096)
-        if not chunk:
-            break
-        output.extend(chunk)
-        if expected_bytes in output:
-            return _decode(output)
-    raise AssertionError(
-        f"timed out waiting for {expected!r}; output so far: {_decode(output)!r}"
-    )
 
 
 def _lose_migration_1_in_the_data_database(data_db):

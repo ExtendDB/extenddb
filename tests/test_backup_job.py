@@ -3620,13 +3620,16 @@ def test_a_create_backup_during_the_moves_wait_is_refused(deployment, tmp_path):
 def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
     """Beside servers (PostgreSQL): server A stays on the old root, server B
     runs on a new root holding a copy of the old tree and 2,000 junk
-    prefixes (so the move's sync lists for a while). A CreateBackup on A
-    passes its claim reads and is held in its CREATING insert by a trigger;
-    `--move-store <old root>` then moves the old row, and the trigger lets
-    the insert go once the move prints that it syncs the configured store.
-    The job's row lands under the old root during that sync: the closing
-    report names it under "Rows that landed under the old root during the
-    move" and the command exits 1, naming the remedy."""
+    prefixes. A CreateBackup on A passes its claim reads and is held in its
+    CREATING insert by a trigger; `--move-store <old root>` then moves the
+    old row, and the trigger lets the insert go once the move prints that it
+    syncs the configured store. The move writes to a pipe that the test stops
+    reading at that line: the sync's report of the junk prefixes fills it, so
+    the move cannot read the other stores' rows until the job's row has
+    committed and the test reads again. The job's row lands under the old
+    root during that sync: the closing report names it under "Rows that
+    landed under the old root during the move" and the command exits 1,
+    naming the remedy."""
     d = deployment
     if d.backend == "sqlite":
         pytest.skip("on SQLite the serve lock keeps every server stopped during the move")
@@ -3704,33 +3707,32 @@ def test_a_row_that_lands_during_the_moves_sync_exits_1(deployment, tmp_path):
         ) == 0:
             assert time.monotonic() < deadline, "the CreateBackup's insert is not held"
             time.sleep(0.1)
-        out_path = str(tmp_path / "move.out")
-        with open(out_path, "wb") as out:
-            moving = subprocess.Popen(
-                [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--move-store", old],
-                cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            )
+        moving = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--move-store", old],
+            cwd=d.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
         released = False
         try:
-            deadline = time.monotonic() + 120
-            while moving.poll() is None:
-                assert time.monotonic() < deadline, open(out_path).read()[-4000:]
-                if not released and "syncing it." in open(out_path).read():
-                    _catalog(d, "INSERT INTO landed_release VALUES (1)", ())
-                    released = True
-                time.sleep(0.02)
-            rc = moving.wait(timeout=60)
+            text = lh._read_until(moving, "syncing it.", timeout=120)
+            _catalog(d, "INSERT INTO landed_release VALUES (1)", ())
+            released = True
+            creating.join(timeout=60)
+            late = result.get("arn")
+            assert late is not None, result
+            # CreateBackup answers once its row is committed.
+            assert _catalog(
+                d, "SELECT 1 FROM backup_index WHERE backup_arn = ? AND store_root = ?", (late, old)
+            ) == 1, "the job's row is not under the old root"
+            early = moving.poll()
+            text += moving.communicate(timeout=120)[0].decode(errors="replace")
+            assert early is None, "the move did not wait on its output pipe: " + text[-4000:]
+            rc = moving.returncode
         finally:
             if moving.poll() is None:
                 moving.kill()
-                moving.wait(timeout=10)
+                moving.communicate(timeout=10)
             if not released:
                 _catalog(d, "INSERT INTO landed_release VALUES (1)", ())
-        creating.join(timeout=60)
-        text = open(out_path).read()
-        late = result.get("arn")
-        assert late is not None, result
-        assert released, "the move's sync line was printed before it ended"
         assert f"Moved (each row now names the configured store):\n  {moved}" in text, text[-4000:]
         assert "--- Rows that landed under the old root during the move:\n  " + late in text, text[-4000:]
         assert rc == 1, text[-4000:]

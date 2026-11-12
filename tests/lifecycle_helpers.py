@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
@@ -273,3 +274,27 @@ def _wait_for_server(port, timeout=15):
     return False
 
 
+def _read_until(proc, expected, timeout=15.0):
+    """Read raw stdout until expected appears, without waiting for process exit."""
+    assert proc.stdout is not None
+    expected_bytes = expected.encode()
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        ready, _, _ = select.select([proc.stdout], [], [], min(0.1, remaining))
+        if not ready:
+            if proc.poll() is not None:
+                output.extend(os.read(proc.stdout.fileno(), 4096))
+                break
+            continue
+        chunk = os.read(proc.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        output.extend(chunk)
+        if expected_bytes in output:
+            return output.decode("utf-8", errors="replace")
+    raise AssertionError(
+        f"timed out waiting for {expected!r}; output so far: "
+        f"{output.decode('utf-8', errors='replace')!r}"
+    )
