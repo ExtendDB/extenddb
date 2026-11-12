@@ -43,7 +43,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import PITR_REFUSAL, wait_for_active
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED, wait_for_active
 from management_helpers import ManagementClient
 
 ALLOW_ALL = {
@@ -54,10 +54,6 @@ NO_POLICY = {
     "Version": "2012-10-17",
     "Statement": [{"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}],
 }
-# Point-in-time recovery is not in this release: every restore is refused
-# before authorization, so before the account is looked at.
-PITR_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
-ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
 OWNER_ONLY = (
     "ValidationException",
     "This action is only supported by accounts that match the resource owner\u2019s account.",
@@ -278,7 +274,7 @@ def test_other_account_answer_depends_on_operation_and_account(env, table, polic
             code, msg = _error(lambda: call(clients))
             where = (label, "known" if known else "unknown", code, msg)
             if family == "pitr":
-                assert (code, msg) == PITR_REFUSED, where
+                assert (code, msg) == RESTORE_REFUSED, where
             elif family == "enable":
                 assert (code, msg) == ENABLE_REFUSED, where
             elif family == "owner" and known:

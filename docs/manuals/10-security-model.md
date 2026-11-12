@@ -135,7 +135,7 @@ When `auth.provider = "builtin"`, every authenticated DynamoDB API request is au
 
 - `DescribeEndpoints`, which needs a signed request and no permission.
 - `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables point-in-time recovery, which are refused because point-in-time recovery is not supported.
-- A request that the service also answers before its IAM decision: a table name, index name or ARN outside the model's constraints, an ARN of the wrong kind or in another account, a stream ARN in another partition or region, a batch or transaction with no items or too many, and a shard iterator the server did not issue (see [Differences from DynamoDB](../differences-from-dynamodb.md)).
+- A request that the service also answers before its IAM decision: a table name, index name or ARN outside the model's constraints, an ARN of the wrong kind or in another account, a stream ARN in another partition or region, a batch or transaction with no items or too many, and a shard iterator the server did not issue (see [Differences from DynamoDB](../differences-from-dynamodb.md)). A name or ARN that breaks only a length bound, an empty one included, is authorized first, except a `ListStreams` `TableName` of 1, 2 or more than 255 characters, which is refused first.
 - A PartiQL request that is refused before any of its statements is authorized: a member outside its constraints, or a statement that does not parse or breaks a rule of its form. The server authorizes a PartiQL request per statement.
 - A request the server cannot authorize because of a fault, such as a failed key lookup, which gets a server error.
 

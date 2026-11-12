@@ -28,7 +28,7 @@ import uuid
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import PITR_REFUSAL
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip(),
@@ -72,10 +72,6 @@ def _assert_error(call, code: str, message: str, **params) -> None:
 
 def _table_not_found(name: str) -> tuple[str, str]:
     return "TableNotFoundException", f"Table not found: {name}"
-
-
-RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
-ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
 
 
 def test_describe_continuous_backups_reports_recovery_disabled(
