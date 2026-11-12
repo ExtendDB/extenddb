@@ -154,7 +154,6 @@ pub async fn handle_put_item(
     // syntax error, an undefined name or value, an unused value and a
     // reserved word. They also include a path of 33 elements and BETWEEN
     // bounds out of order.
-    // `validate_put_item` checks them again after the table lookup.
     extenddb_core::validation::validate_item_numbers(&input.item)?;
     extenddb_core::validation::validate_item_nesting_depth(&input.item)?;
 
@@ -163,9 +162,9 @@ pub async fn handle_put_item(
     // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
     // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
     // alike, while 31 levels is accepted. TransactWriteItems checks its values
-    // separately, in `validate_value_map_nesting`. It comes after an invalid
-    // number in the Item and before the ConditionExpression and the table
-    // lookup (measured 2026-10-26).
+    // separately, in `validate_value_map_nesting`. This check comes after the
+    // Item's numbers and nesting and before the ConditionExpression and the
+    // table lookup (measured 2026-10-26).
     if let Some(values) = &input.expression_attribute_values {
         extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
