@@ -4,8 +4,8 @@
 # Resolver 3 prefers dependency versions whose rust-version fits ours. The
 # published crates use it too. (With resolver 2, cargo writes
 # `resolver = "2"` into each of them.) Without `--locked`, `cargo install`
-# then resolves for Rust 1.88 and does not fail on a dependency that needs a
-# newer Rust.
+# then resolves for our rust-version and does not fail on a dependency that
+# needs a newer Rust.
 resolver = "3"
 members = [
     "crates/core",

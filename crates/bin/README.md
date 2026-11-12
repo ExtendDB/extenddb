@@ -10,7 +10,7 @@ This crate builds the `extenddb` binary.
 
 ## Install
 
-You need Rust 1.88 or later and a C compiler. Each build contains one storage backend, which a Cargo feature selects:
+You need Rust 1.91.1 or later and a C compiler. Each build contains one storage backend, which a Cargo feature selects:
 
 | Backend | Command |
 |---|---|
