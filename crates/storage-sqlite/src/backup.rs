@@ -35,6 +35,16 @@
 //! where main answered BackupNotFound; the service's BackupInUse for a
 //! CREATING backup is the catalog-index row's rule, not this reader's.
 //!
+//! `extenddb backup migrate-legacy` reads a backup through `items`, keyset
+//! batches on `backup_items.id` as the restore's copy reads them, and ends
+//! with `replace_with_index_row`: one write transaction under the engine
+//! write lock that inserts the catalog index row and deletes the `backups`
+//! row with its items and definition, so a DELETED `backups` row is always
+//! a DeleteBackup's (`holder_status` and `list_deleted` read them). A
+//! backup with no definition (taken before catalog 0.0.4) is opened with an
+//! unknown vector state, since this backend recorded vector indexes only in
+//! the definition.
+//!
 //! A restore's heartbeat runs every
 //! [`JOB_HEARTBEAT_INTERVAL`](extenddb_storage::backup_catalog::JOB_HEARTBEAT_INTERVAL),
 //! the one constant every backend's heartbeat loop reads and the stale floor
@@ -60,12 +70,13 @@ use extenddb_core::types::{
     TableDescription, TimeToLiveDescription, TimeToLiveStatus,
 };
 use extenddb_storage::backup_catalog::{
-    AbandonedLegacyBackup, JOB_HEARTBEAT_INTERVAL, JobBound, JobClaim, JobStatus, StatusFields,
+    AbandonedLegacyBackup, BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL, JobBound, JobClaim,
+    JobStatus, LegacyBackupItems, LegacyBackupKey, Replaced, StatusFields, StoreIdentity,
     WriteOutcome, limit_exceeded_message, new_generation,
 };
 use extenddb_storage::backup_definition::{
     BACKUP_DEFINITION_VERSION, BackupTableDefinition, COPY_BATCH_BYTES, COPY_BATCH_ITEMS,
-    throughput_from_catalog,
+    LegacyVectorState, throughput_from_catalog,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{composite_pk_to_text, parse_sk, sk_column_n};
@@ -1225,6 +1236,24 @@ impl LegacyBackupReader for SqliteEngine {
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(db_err)?;
+            // The status again, under the write lock: a concurrent
+            // DeleteBackup that took the lock first has left the backup
+            // DELETED (or removed a dead CREATING row), and this one answers
+            // not found, as a DeleteBackup after it does; only the delete
+            // that changes the row answers DELETED.
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = ? AND account_id = ?",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if status.as_deref() != Some(desc.backup_details.backup_status.as_str()) {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
             // Refuse while a restore from this backup is still running, as the
             // service does. Under the write lock, which the restore also takes
             // to record itself, so the check cannot miss one.
@@ -1523,6 +1552,293 @@ impl LegacyBackupReader for SqliteEngine {
             tx.commit().await.map_err(db_err)?;
             Ok(removed)
         })
+    }
+
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys("backup_status <> 'DELETED'"))
+    }
+
+    /// A replacement deletes the `backups` row, so every DELETED row is a
+    /// DeleteBackup's.
+    fn list_deleted(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys("backup_status = 'DELETED'"))
+    }
+
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        Box::pin(async move {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = ? AND account_id = ?",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+            status.as_deref().map(BackupStatus::parse).transpose()
+        })
+    }
+
+    /// The DELETED `backups` row goes, under the engine write lock (the
+    /// DeleteBackup removed its items and definition); a row in any other
+    /// status is left.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.write_lock.lock().await;
+            let removed = sqlx::query(
+                "DELETE FROM backups WHERE backup_arn = ? AND account_id = ? \
+                 AND backup_status = 'DELETED'",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(removed == 1)
+        })
+    }
+
+    /// The source as `restore_source` reads it, then the items in keyset
+    /// batches on `backup_items.id`, as the restore's copy reads them
+    /// (`copy_backup_items`): each batch in its own read transaction that
+    /// first re-checks AVAILABLE, at most [`COPY_BATCH_ITEMS`] rows or
+    /// [`COPY_BATCH_BYTES`] of item text (one row over the budget is still
+    /// read whole). No transaction is held between batches.
+    fn items(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        let account_id = account_id.to_owned();
+        let backup_arn = backup_arn.to_owned();
+        Box::pin(async move {
+            let source = self.restore_source(&account_id, &backup_arn).await?;
+            let backup_name: String = sqlx::query_scalar(
+                "SELECT backup_name FROM backups WHERE backup_arn = ? AND account_id = ? \
+                 AND backup_status = 'AVAILABLE'",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| StorageError::Validation(format!("Backup not found: {backup_arn}")))?;
+            // A backup taken before catalog 0.0.4 has no definition, and this
+            // backend recorded vector indexes nowhere else.
+            let vector_state = if source.definition.is_some() {
+                LegacyVectorState::NoneRecorded
+            } else {
+                LegacyVectorState::Unknown
+            };
+            let cursor = LegacyItemsCursor {
+                pool: self.pool.clone(),
+                backup_arn,
+                last_id: 0,
+                batch: std::collections::VecDeque::new(),
+                done: false,
+            };
+            Ok(LegacyBackupItems {
+                backup_name,
+                source,
+                vector_state,
+                items: Box::pin(futures::stream::unfold(cursor, LegacyItemsCursor::next)),
+            })
+        })
+    }
+
+    /// One `BEGIN IMMEDIATE` transaction under the engine write lock, the
+    /// lock DeleteBackup and a restore's registration take: the status, the
+    /// in-use rule, `insert_backup_row`'s insert, then the items, the
+    /// definition and the `backups` row deleted.
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Replaced, StorageError>> {
+        Box::pin(async move {
+            let _writer = self.write_lock.lock().await;
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = ? AND account_id = ?",
+            )
+            .bind(&row.backup_arn)
+            .bind(&row.account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let same = |held: &Option<(String, String, StoreIdentity)>| {
+                held.as_ref().is_some_and(|(account_id, arn, store)| {
+                    *account_id == row.account_id && *arn == row.backup_arn && *store == row.store
+                })
+            };
+            let held_elsewhere = |arn: &str, store: &StoreIdentity| {
+                StorageError::AlreadyExists(format!(
+                    "backup id {} has a row under {arn} in the {} store at {:?} ({})",
+                    row.backup_id, store.store_kind, store.store_root, store.store_id
+                ))
+            };
+            if status.as_deref() != Some("AVAILABLE") {
+                let held =
+                    crate::backup_catalog::index_row_holding(&mut tx, &row.backup_id).await?;
+                tx.rollback().await.map_err(db_err)?;
+                // Another row of the id is answered as such whatever the
+                // in-catalog backup's status, as on the AVAILABLE path: the
+                // caller keeps the copy, which may be that row's prefix.
+                return match held {
+                    _ if same(&held) => Ok(Replaced::AlreadyReplaced),
+                    Some((_, arn, store)) => Err(held_elsewhere(&arn, &store)),
+                    None => Ok(Replaced::NotAvailable(match status {
+                        Some(status) => format!("the in-catalog backup is {status}"),
+                        None => format!("Backup not found: {}", row.backup_arn),
+                    })),
+                };
+            }
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, &row.backup_arn).await?
+            {
+                tx.rollback().await.map_err(db_err)?;
+                return Ok(Replaced::InUse(table));
+            }
+            let outcome = if crate::backup_catalog::insert_unowned_row(&mut tx, row).await? {
+                Replaced::Replaced
+            } else {
+                let held =
+                    crate::backup_catalog::index_row_holding(&mut tx, &row.backup_id).await?;
+                if !same(&held) {
+                    tx.rollback().await.map_err(db_err)?;
+                    return Err(match held {
+                        Some((_, arn, store)) => held_elsewhere(&arn, &store),
+                        None => StorageError::Internal(format!(
+                            "the insert of backup {} met a conflict and no row",
+                            row.backup_arn
+                        )),
+                    });
+                }
+                Replaced::AlreadyReplaced
+            };
+            for table in ["backup_items", "backup_definitions"] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE backup_arn = ?"))
+                    .bind(&row.backup_arn)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            // The row itself goes, not to DELETED: a DELETED `backups` row
+            // is then always a DeleteBackup's, whose prefix `backup sync`
+            // never adopts.
+            sqlx::query("DELETE FROM backups WHERE backup_arn = ? AND account_id = ?")
+                .bind(&row.backup_arn)
+                .bind(&row.account_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(outcome)
+        })
+    }
+}
+
+impl SqliteEngine {
+    /// The `backups` rows `filter` keeps, of every account, by creation
+    /// time and then ARN.
+    async fn legacy_keys(&self, filter: &str) -> Result<Vec<LegacyBackupKey>, StorageError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+            "SELECT account_id, backup_arn, backup_status FROM backups WHERE {filter} \
+             ORDER BY created_at, backup_arn"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(account_id, backup_arn, status)| {
+                Ok(LegacyBackupKey {
+                    account_id,
+                    backup_arn,
+                    status: BackupStatus::parse(&status)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Where `items`' stream is: the last `backup_items.id` read and the batch
+/// not yet handed out.
+struct LegacyItemsCursor {
+    pool: sqlx::SqlitePool,
+    backup_arn: String,
+    last_id: i64,
+    batch: std::collections::VecDeque<String>,
+    done: bool,
+}
+
+impl LegacyItemsCursor {
+    async fn next(mut self) -> Option<(Result<Item, StorageError>, Self)> {
+        if self.done {
+            return None;
+        }
+        if self.batch.is_empty() {
+            match self.read_batch().await {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => {
+                    self.done = true;
+                    return Some((Err(e), self));
+                }
+            }
+        }
+        let item_json = self.batch.pop_front()?;
+        let item = parse_json::<Item>(&item_json, "backup item");
+        if item.is_err() {
+            self.done = true;
+        }
+        Some((item, self))
+    }
+
+    /// The next batch after `last_id`, in its own read transaction that
+    /// re-checks the backup is AVAILABLE; `Ok(false)` past the last row.
+    async fn read_batch(&mut self) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let available: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = ? \
+             AND backup_status = 'AVAILABLE')",
+        )
+        .bind(&self.backup_arn)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if !available {
+            return Err(StorageError::Validation(format!(
+                "Backup not found: {}",
+                self.backup_arn
+            )));
+        }
+        let batch = next_batch(
+            &mut tx,
+            "backup_items",
+            "id",
+            Some(("backup_arn = ?", self.backup_arn.as_str())),
+            self.last_id,
+        )
+        .await?;
+        tx.commit().await.map_err(db_err)?;
+        let Some(&(tail, _)) = batch.last() else {
+            self.done = true;
+            return Ok(false);
+        };
+        self.last_id = tail;
+        self.batch = batch.into_iter().map(|(_, item_json)| item_json).collect();
+        Ok(true)
     }
 }
 
@@ -4751,6 +5067,11 @@ mod restore_tests {
                 DeleteStart::InUse("del_target".to_owned())
             );
             assert_eq!(
+                engine.forget_available_backup_row(&key).await.unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::InUse("del_target".to_owned()),
+                "the outright removal keeps the in-use rule"
+            );
+            assert_eq!(
                 engine
                     .read_backup_row(&arn_of(&row))
                     .await
@@ -4776,8 +5097,60 @@ mod restore_tests {
                 DeleteStart::Status(BackupStatus::Deleting),
                 "a retry finds the row DELETING"
             );
+            assert_eq!(
+                engine.forget_available_backup_row(&key).await.unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::Status(BackupStatus::Deleting),
+                "only an AVAILABLE row is removed outright"
+            );
+            // An AVAILABLE row goes outright, read and listed nowhere, with no
+            // tombstone; a second removal finds no row.
+            let mut adopted = self::row(ACCOUNT, "Music", "adopted");
+            adopted.status = BackupStatus::Available;
+            assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+            assert_eq!(
+                engine
+                    .forget_available_backup_row(&adopted.key())
+                    .await
+                    .unwrap(),
+                extenddb_storage::backup_catalog::ForgetRow::Removed
+            );
             assert!(
-                !engine.remove_backup_row(&key).await.unwrap(),
+                engine
+                    .read_backup_row(&arn_of(&adopted))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            for status in [None, Some(BackupStatus::Available)] {
+                let listed: Vec<BackupRow> = engine
+                    .list_backup_rows(status, &adopted.store)
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(
+                    !listed.iter().any(|r| r.backup_arn == adopted.backup_arn),
+                    "{status:?}"
+                );
+            }
+            let by_account: Vec<BackupRow> = engine
+                .list_account_backup_rows(&adopted.account_id, None, &TimeBounds::default())
+                .try_collect()
+                .await
+                .unwrap();
+            assert!(
+                !by_account
+                    .iter()
+                    .any(|r| r.backup_arn == adopted.backup_arn)
+            );
+            assert!(matches!(
+                engine.forget_available_backup_row(&adopted.key()).await,
+                Err(StorageError::Validation(m)) if m.contains("Backup not found")
+            ));
+            assert!(
+                !engine
+                    .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
+                    .await
+                    .unwrap(),
                 "DELETING is not a tombstone"
             );
             assert!(engine.set_backup_deleted(&key).await.unwrap());
@@ -4789,8 +5162,82 @@ mod restore_tests {
                 .unwrap();
             assert_eq!(stored.status, BackupStatus::Deleted);
             assert!(stored.completed_at.is_some());
-            assert!(engine.remove_backup_row(&key).await.unwrap());
-            assert!(!engine.remove_backup_row(&key).await.unwrap());
+            // A row another writer moved to another store after the caller read it
+            // is left by a removal that names the store read.
+            let moved_to = StoreIdentity {
+                store_kind: row.store.store_kind,
+                store_root: format!("{}-moved", row.store.store_root),
+                store_id: "moved-1".to_owned(),
+            };
+            assert_eq!(
+                engine
+                    .rewrite_store(
+                        row.store.store_kind,
+                        &row.store.store_root,
+                        std::slice::from_ref(&key),
+                        &moved_to
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !engine
+                    .remove_backup_row(&key, row.store.store_kind, &row.store.store_root)
+                    .await
+                    .unwrap(),
+                "a row moved to another store is left"
+            );
+            assert_eq!(
+                engine
+                    .read_backup_row(&arn_of(&row))
+                    .await
+                    .unwrap()
+                    .map(|r| (r.status, r.store)),
+                Some((BackupStatus::Deleted, moved_to.clone()))
+            );
+            // The same root under the other kind is another store: a removal that
+            // names the kind it read leaves the row.
+            let other_kind = StoreIdentity {
+                store_kind: if moved_to.store_kind == StoreKind::S3 {
+                    StoreKind::Filesystem
+                } else {
+                    StoreKind::S3
+                },
+                ..moved_to.clone()
+            };
+            assert_eq!(
+                engine
+                    .rewrite_store(
+                        moved_to.store_kind,
+                        &moved_to.store_root,
+                        std::slice::from_ref(&key),
+                        &other_kind
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !engine
+                    .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+                    .await
+                    .unwrap(),
+                "a row moved to the other kind is left"
+            );
+            let moved_to = other_kind;
+            assert!(
+                engine
+                    .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !engine
+                    .remove_backup_row(&key, moved_to.store_kind, &moved_to.store_root)
+                    .await
+                    .unwrap()
+            );
             assert!(
                 engine
                     .read_backup_row(&arn_of(&row))
@@ -5204,6 +5651,565 @@ mod restore_tests {
                     .expect("ids")
                     .is_empty()
             );
+        }
+
+        /// A row of `row(ACCOUNT, table, name)` with `status`, under the
+        /// store of `kind`, `root` and `id`.
+        fn row_at(
+            table: &str,
+            name: &str,
+            status: BackupStatus,
+            (kind, root, id): (StoreKind, &str, &str),
+        ) -> BackupRow {
+            let mut row = row(ACCOUNT, table, name);
+            row.status = status;
+            row.store = StoreIdentity {
+                store_kind: kind,
+                store_root: root.to_owned(),
+                store_id: id.to_owned(),
+            };
+            row.size_bytes = 10;
+            row.item_count = 2;
+            row
+        }
+
+        /// The ARNs of `rows` in the listings' (`created_at`, `backup_arn`)
+        /// order.
+        fn in_listing_order(rows: &[&BackupRow]) -> Vec<String> {
+            let mut rows = rows.to_vec();
+            rows.sort_by(|a, b| {
+                a.created_at
+                    .total_cmp(&b.created_at)
+                    .then_with(|| a.backup_arn.cmp(&b.backup_arn))
+            });
+            rows.into_iter().map(|r| r.backup_arn.clone()).collect()
+        }
+
+        /// `list_backup_rows_by_root`: every row of the kind and root,
+        /// whatever its id, of every status or of one, whole and in the
+        /// listings' order; nothing of a root that differs by one byte (a
+        /// trailing `/`, one character fewer), of an S3 root that differs by
+        /// its `?endpoint=` suffix, or of the other kind at the same label.
+        #[tokio::test]
+        async fn list_backup_rows_by_root_returns_every_id_and_status_of_the_root_and_nothing_else()
+        {
+            let engine = engine().await;
+            let root = "/srv/backups-old";
+            let at = |id| (StoreKind::Filesystem, root, id);
+            let mut of_root = Vec::new();
+            for (i, status) in [
+                BackupStatus::Available,
+                BackupStatus::Deleting,
+                BackupStatus::Deleted,
+                BackupStatus::Failed,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = if i % 2 == 0 { "store-1" } else { "store-2" };
+                of_root.push(row_at("Music", &format!("r{i}"), status, at(id)));
+            }
+            // Inserted newest first: the order asserted is the listing's.
+            for row in of_root.iter().rev() {
+                assert!(engine.insert_backup_row(row).await.expect("insert"));
+            }
+            let creating = row_at("Music", "job", BackupStatus::Creating, at("store-1"));
+            let _claim = engine.claim_backup(&creating).await.expect("claim");
+            let slash = format!("{root}/");
+            let s3 = "s3://bucket/prefix";
+            let s3_endpoint = "s3://bucket/prefix?endpoint=http://127.0.0.1:9200";
+            let others = [
+                row_at(
+                    "Music",
+                    "slash",
+                    BackupStatus::Available,
+                    (StoreKind::Filesystem, &slash, "store-1"),
+                ),
+                row_at(
+                    "Music",
+                    "shorter",
+                    BackupStatus::Available,
+                    (StoreKind::Filesystem, "/srv/backups-ol", "store-1"),
+                ),
+                row_at(
+                    "Music",
+                    "kind",
+                    BackupStatus::Available,
+                    (StoreKind::S3, root, "store-1"),
+                ),
+                row_at(
+                    "Music",
+                    "s3",
+                    BackupStatus::Available,
+                    (StoreKind::S3, s3, "store-3"),
+                ),
+                row_at(
+                    "Music",
+                    "endpoint",
+                    BackupStatus::Available,
+                    (StoreKind::S3, s3_endpoint, "store-3"),
+                ),
+            ];
+            for row in &others {
+                assert!(engine.insert_backup_row(row).await.expect("insert"));
+            }
+            let listed = |kind: StoreKind, root: String, status: Option<BackupStatus>| {
+                let engine = &engine;
+                async move {
+                    let rows: Vec<BackupRow> = engine
+                        .list_backup_rows_by_root(kind, &root, status)
+                        .try_collect()
+                        .await
+                        .expect("listing");
+                    rows
+                }
+            };
+            let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+                rows.into_iter().map(|r| r.backup_arn).collect()
+            };
+            let mut all: Vec<&BackupRow> = of_root.iter().collect();
+            all.push(&creating);
+            let whole = listed(StoreKind::Filesystem, root.to_owned(), None).await;
+            assert_eq!(arns(whole.clone()), in_listing_order(&all));
+            for row in &whole {
+                assert_eq!(
+                    Some(row),
+                    engine
+                        .read_backup_row(&arn_of(row))
+                        .await
+                        .expect("read")
+                        .as_ref(),
+                    "the listing returns rows whole"
+                );
+            }
+            for status in BackupStatus::ALL {
+                let of_status: Vec<&BackupRow> =
+                    all.iter().copied().filter(|r| r.status == status).collect();
+                assert_eq!(
+                    arns(listed(StoreKind::Filesystem, root.to_owned(), Some(status)).await),
+                    in_listing_order(&of_status),
+                    "{status}"
+                );
+            }
+            for (kind, label, row) in [
+                (StoreKind::Filesystem, slash.as_str(), &others[0]),
+                (StoreKind::Filesystem, "/srv/backups-ol", &others[1]),
+                (StoreKind::S3, root, &others[2]),
+                (StoreKind::S3, s3, &others[3]),
+                (StoreKind::S3, s3_endpoint, &others[4]),
+            ] {
+                assert_eq!(
+                    arns(listed(kind, label.to_owned(), None).await),
+                    std::slice::from_ref(&row.backup_arn),
+                    "{kind} {label}"
+                );
+            }
+            assert!(
+                listed(StoreKind::Filesystem, "/srv/backups".to_owned(), None)
+                    .await
+                    .is_empty()
+            );
+        }
+
+        /// `rewrite_store`: of the keys given, the rows still of the old kind
+        /// and root and not CREATING get the new store, with every other
+        /// column left, and are counted; a CREATING row, a row of another
+        /// root, a row of the other kind at the same label and a key with no
+        /// row are left and not counted; a second call counts 0; a row
+        /// another writer moved to a third root before the call is left
+        /// there.
+        #[tokio::test]
+        async fn rewrite_store_moves_only_the_old_roots_rows_that_are_not_creating() {
+            let engine = engine().await;
+            let old = (StoreKind::Filesystem, "/srv/backups-old", "old-1");
+            let to = StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/backups-new".to_owned(),
+                store_id: "new-1".to_owned(),
+            };
+            let mut movable = Vec::new();
+            for (i, status) in [
+                BackupStatus::Available,
+                BackupStatus::Deleting,
+                BackupStatus::Deleted,
+                BackupStatus::Failed,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                movable.push(row_at("Music", &format!("m{i}"), status, old));
+            }
+            let moved_away = row_at("Music", "away", BackupStatus::Available, old);
+            let other_root = row_at(
+                "Music",
+                "other-root",
+                BackupStatus::Available,
+                (StoreKind::Filesystem, "/srv/backups-other", "old-1"),
+            );
+            let other_kind = row_at(
+                "Music",
+                "other-kind",
+                BackupStatus::Available,
+                (StoreKind::S3, "/srv/backups-old", "old-1"),
+            );
+            for row in movable
+                .iter()
+                .chain([&moved_away, &other_root, &other_kind])
+            {
+                assert!(engine.insert_backup_row(row).await.expect("insert"));
+            }
+            let creating = row_at("Music", "job", BackupStatus::Creating, old);
+            let claim = engine.claim_backup(&creating).await.expect("claim");
+            let stored = |row: &BackupRow| {
+                let engine = &engine;
+                let arn = arn_of(row);
+                async move {
+                    engine
+                        .read_backup_row(&arn)
+                        .await
+                        .expect("read")
+                        .expect("the row exists")
+                }
+            };
+            let mut before = Vec::new();
+            for row in &movable {
+                before.push(stored(row).await);
+            }
+            // Another writer moves one row to a third root first.
+            let third = StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/backups-third".to_owned(),
+                store_id: "third-1".to_owned(),
+            };
+            assert_eq!(
+                engine
+                    .rewrite_store(old.0, old.1, &[moved_away.key()], &third)
+                    .await
+                    .expect("rewrite"),
+                1
+            );
+            let mut ghost = row_at("Music", "ghost", BackupStatus::Available, old).key();
+            ghost.backup_id = extenddb_storage::util::new_backup_id();
+            let keys: Vec<extenddb_storage::backup_catalog::BackupKey> = movable
+                .iter()
+                .chain([&creating, &moved_away, &other_root, &other_kind])
+                .map(BackupRow::key)
+                .chain([ghost])
+                .collect();
+            assert_eq!(
+                engine
+                    .rewrite_store(old.0, old.1, &keys, &to)
+                    .await
+                    .expect("rewrite"),
+                4,
+                "the four rows of the old root that are not CREATING"
+            );
+            for (row, before) in movable.iter().zip(&before) {
+                assert_eq!(
+                    stored(row).await,
+                    BackupRow {
+                        store: to.clone(),
+                        ..before.clone()
+                    },
+                    "only the store changed"
+                );
+            }
+            let creating_now = stored(&creating).await;
+            assert_eq!(
+                (creating_now.status, creating_now.store.store_root.as_str()),
+                (BackupStatus::Creating, old.1)
+            );
+            assert_eq!(creating_now.owner_generation, claim.generation());
+            assert_eq!(stored(&moved_away).await.store, third);
+            assert_eq!(stored(&other_root).await.store, other_root.store);
+            assert_eq!(stored(&other_kind).await.store, other_kind.store);
+            assert_eq!(
+                engine
+                    .rewrite_store(old.0, old.1, &keys, &to)
+                    .await
+                    .expect("rewrite"),
+                0,
+                "a second call finds nothing left to move"
+            );
+            let listed: Vec<BackupRow> = engine
+                .list_backup_rows(None, &to)
+                .try_collect()
+                .await
+                .expect("listing");
+            let movable_refs: Vec<&BackupRow> = movable.iter().collect();
+            assert_eq!(
+                listed.into_iter().map(|r| r.backup_arn).collect::<Vec<_>>(),
+                in_listing_order(&movable_refs)
+            );
+            assert_eq!(
+                engine.read_store_ids(old.0, old.1).await.expect("ids"),
+                ["old-1"],
+                "the CREATING row keeps the old root"
+            );
+            assert_eq!(
+                engine
+                    .rewrite_store(old.0, old.1, &[], &to)
+                    .await
+                    .expect("rewrite"),
+                0
+            );
+        }
+
+        /// `rewrite_store` moves every key or none: a statement that fails
+        /// on a later key (a trigger here raises on the last one) rolls back
+        /// the keys already rewritten in the same call; once the trigger is
+        /// gone the same call moves them all.
+        #[tokio::test]
+        async fn a_rewrite_that_fails_on_a_later_key_moves_no_row() {
+            let engine = engine().await;
+            let old = (StoreKind::Filesystem, "/srv/backups-old", "old-1");
+            let to = StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/srv/backups-new".to_owned(),
+                store_id: "new-1".to_owned(),
+            };
+            let rows: Vec<BackupRow> = ["a", "b", "c"]
+                .into_iter()
+                .map(|name| row_at("Music", name, BackupStatus::Available, old))
+                .collect();
+            for row in &rows {
+                assert!(engine.insert_backup_row(row).await.expect("insert"));
+            }
+            sqlx::query(&format!(
+                "CREATE TRIGGER refuse_the_last_key BEFORE UPDATE OF store_root ON backup_index \
+                 WHEN OLD.backup_id = '{}' BEGIN SELECT RAISE(ABORT, 'refused'); END",
+                rows[2].backup_id
+            ))
+            .execute(&engine.pool)
+            .await
+            .expect("create the trigger");
+            let keys: Vec<_> = rows.iter().map(BackupRow::key).collect();
+            let refused = engine
+                .rewrite_store(old.0, old.1, &keys, &to)
+                .await
+                .expect_err("the last key's statement fails");
+            assert!(refused.to_string().contains("refused"), "{refused}");
+            let roots = || async {
+                let mut roots = Vec::new();
+                for row in &rows {
+                    roots.push(
+                        engine
+                            .read_backup_row(&arn_of(row))
+                            .await
+                            .expect("read")
+                            .expect("the row exists")
+                            .store
+                            .store_root,
+                    );
+                }
+                roots
+            };
+            assert_eq!(roots().await, [old.1; 3], "no row moved");
+            sqlx::query("DROP TRIGGER refuse_the_last_key")
+                .execute(&engine.pool)
+                .await
+                .expect("drop the trigger");
+            assert_eq!(
+                engine
+                    .rewrite_store(old.0, old.1, &keys, &to)
+                    .await
+                    .expect("rewrite"),
+                3
+            );
+            assert_eq!(roots().await, [to.store_root.as_str(); 3]);
+        }
+
+        /// `summarize_store_roots`: one count per kind, root, id and status
+        /// with a row, in the one order; two ids of one root, two statuses of
+        /// one id, two roots and the two kinds are each counted apart.
+        #[tokio::test]
+        async fn summarize_store_roots_counts_the_rows_of_each_store_and_status() {
+            use extenddb_storage::backup_catalog::StoreRootCount;
+            let engine = engine().await;
+            assert!(
+                engine
+                    .summarize_store_roots()
+                    .await
+                    .expect("summary")
+                    .is_empty()
+            );
+            let a1 = (StoreKind::Filesystem, "/srv/a", "id-1");
+            let a2 = (StoreKind::Filesystem, "/srv/a", "id-2");
+            let b1 = (StoreKind::Filesystem, "/srv/b", "id-1");
+            let s3 = (StoreKind::S3, "s3://bucket/a", "id-1");
+            let rows = [
+                row_at("Music", "1", BackupStatus::Available, a1),
+                row_at("Music", "2", BackupStatus::Available, a1),
+                row_at("Music", "3", BackupStatus::Failed, a1),
+                row_at("Music", "4", BackupStatus::Available, a2),
+                row_at("Music", "5", BackupStatus::Deleting, b1),
+                row_at("Music", "7", BackupStatus::Available, b1),
+                row_at("Music", "6", BackupStatus::Available, s3),
+            ];
+            for row in &rows {
+                assert!(engine.insert_backup_row(row).await.expect("insert"));
+            }
+            let creating = row_at("Music", "job", BackupStatus::Creating, b1);
+            let _claim = engine.claim_backup(&creating).await.expect("claim");
+            let line = |(kind, root, id): (StoreKind, &str, &str), status, rows| StoreRootCount {
+                store: StoreIdentity {
+                    store_kind: kind,
+                    store_root: root.to_owned(),
+                    store_id: id.to_owned(),
+                },
+                status,
+                rows,
+            };
+            assert_eq!(
+                engine.summarize_store_roots().await.expect("summary"),
+                [
+                    line(a1, BackupStatus::Available, 2),
+                    line(a1, BackupStatus::Failed, 1),
+                    line(a2, BackupStatus::Available, 1),
+                    line(b1, BackupStatus::Creating, 1),
+                    line(b1, BackupStatus::Available, 1),
+                    line(b1, BackupStatus::Deleting, 1),
+                    line(s3, BackupStatus::Available, 1),
+                ]
+            );
+        }
+
+        /// `insert_backup_row`: the row lands as given, unowned, with
+        /// `completed_at` and `heartbeat_at` on the database's clock; a
+        /// second insert, an insert over a CREATING row a claim holds, and an
+        /// insert of the id under another account (the unique `backup_id`)
+        /// answer `false` and change nothing; a claim over the inserted row
+        /// is refused; the row is read and listed like a created one.
+        #[tokio::test]
+        async fn insert_backup_row_inserts_an_unowned_row_only_when_absent() {
+            let engine = engine().await;
+            let mut adopted = row(ACCOUNT, "Music", "adopted");
+            adopted.status = BackupStatus::Available;
+            adopted.size_bytes = 1234;
+            adopted.item_count = 5;
+            // Ignored: the insert sets these three itself.
+            adopted.owner_generation = 99;
+            adopted.completed_at = None;
+            adopted.heartbeat_at = 0.0;
+            // A year before the id's instant: the two clock columns must be
+            // the database's clock at the insert, not the row's `created_at`.
+            adopted.created_at -= 365.0 * 86_400.0;
+            assert!(engine.insert_backup_row(&adopted).await.expect("insert"));
+            let stored = engine
+                .read_backup_row(&arn_of(&adopted))
+                .await
+                .expect("read")
+                .expect("the row exists");
+            assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+            let completed_at = stored.completed_at.expect("completed_at is set");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_secs_f64();
+            for at in [completed_at, stored.heartbeat_at] {
+                assert!(
+                    (at - now).abs() < 60.0,
+                    "{at} is not the insert's instant {now}"
+                );
+            }
+            assert!(
+                (stored.created_at - adopted.created_at).abs() < 1e-3,
+                "{} is the row's created_at {}",
+                stored.created_at,
+                adopted.created_at
+            );
+            assert_eq!(
+                BackupRow {
+                    owner_generation: 99,
+                    completed_at: None,
+                    heartbeat_at: 0.0,
+                    created_at: adopted.created_at,
+                    ..stored.clone()
+                },
+                adopted,
+                "every other column is the row as given"
+            );
+
+            // A second insert of the key, with other values, writes nothing.
+            let mut again = adopted.clone();
+            again.backup_name = "again".to_owned();
+            again.size_bytes = 1;
+            again.status = BackupStatus::Failed;
+            assert!(!engine.insert_backup_row(&again).await.expect("insert"));
+            // The id under another account: the unique `backup_id`.
+            let mut elsewhere = adopted.clone();
+            elsewhere.account_id = OTHER_ACCOUNT.to_owned();
+            elsewhere.backup_arn = extenddb_storage::util::backup_arn(
+                REGION,
+                OTHER_ACCOUNT,
+                "Music",
+                &adopted.backup_id,
+            );
+            assert!(!engine.insert_backup_row(&elsewhere).await.expect("insert"));
+            assert!(
+                engine
+                    .read_backup_row(&arn_of(&elsewhere))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                engine.read_backup_row(&arn_of(&adopted)).await.unwrap(),
+                Some(stored.clone()),
+                "the refused inserts changed nothing"
+            );
+            let claimed = engine.claim_backup(&adopted).await.err();
+            assert!(
+                matches!(claimed, Some(StorageError::AlreadyExists(_))),
+                "{claimed:?}"
+            );
+
+            // Over a CREATING row a live claim holds.
+            let creating = row(ACCOUNT, "Music", "job");
+            let claim = engine.claim_backup(&creating).await.expect("claim");
+            let mut over = creating.clone();
+            over.status = BackupStatus::Available;
+            assert!(!engine.insert_backup_row(&over).await.expect("insert"));
+            let job_row = engine
+                .read_backup_row(&arn_of(&creating))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job_row.status, BackupStatus::Creating);
+            assert_eq!(job_row.owner_generation, claim.generation());
+
+            // Read and listed like a created row.
+            let arns = |rows: Vec<BackupRow>| -> Vec<String> {
+                rows.into_iter().map(|r| r.backup_arn).collect()
+            };
+            let available: Vec<BackupRow> = engine
+                .list_backup_rows(Some(BackupStatus::Available), &store())
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(available, std::slice::from_ref(&stored));
+            let creating_rows: Vec<BackupRow> = engine
+                .list_backup_rows(Some(BackupStatus::Creating), &store())
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                arns(creating_rows),
+                std::slice::from_ref(&creating.backup_arn)
+            );
+            for table in [None, Some("Music")] {
+                let listed: Vec<BackupRow> = engine
+                    .list_account_backup_rows(ACCOUNT, table, &TimeBounds::default())
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(
+                    listed.contains(&stored),
+                    "{table:?}: {:?}",
+                    arns(listed.clone())
+                );
+            }
+            drop(claim);
         }
 
         /// `remove_dead_creating_backup_row`: a CREATING row whose heartbeat
@@ -5723,6 +6729,79 @@ mod restore_tests {
             assert!(!check().await.expect("check"));
         }
 
+        /// The maintenance claim's beat queues behind the engine write lock,
+        /// and its bound starts once the beat holds it: a writer of this
+        /// process holding the lock three bounds long delays the beat, which
+        /// then confirms the claim; the claim says its beat parks before its
+        /// bound. A beat on a claim taken over answers `Lost` within the
+        /// bound.
+        #[tokio::test]
+        async fn the_maintenance_claims_beat_is_bounded_from_the_write_lock() {
+            let engine = engine().await;
+            let stale = Duration::from_secs(300);
+            let claim = engine
+                .maintenance_claim("purge on host-a", stale)
+                .await
+                .expect("claim");
+            assert!(claim.heartbeat_parks_before_its_bound());
+            let bound = Duration::from_millis(200);
+            let writer = engine.write_lock.lock().await;
+            let started = std::time::Instant::now();
+            let (beat, ()) = tokio::join!(claim.heartbeat_within(bound), async move {
+                tokio::time::sleep(3 * bound).await;
+                drop(writer);
+            });
+            assert!(
+                matches!(beat, Some(Ok(Heartbeat::Confirmed))),
+                "the beat parked on the lock confirms once it holds it: {beat:?}"
+            );
+            assert!(started.elapsed() >= 3 * bound, "{:?}", started.elapsed());
+
+            sqlx::query("UPDATE backup_maintenance SET owner_generation = owner_generation + 1")
+                .execute(&engine.pool)
+                .await
+                .expect("take over");
+            assert!(
+                matches!(
+                    claim.heartbeat_within(bound).await,
+                    Some(Ok(Heartbeat::Lost))
+                ),
+                "a claim taken over is lost"
+            );
+        }
+
+        /// The maintenance claim's beat waits for this process's write lock
+        /// outside its bound and says so: with a writer holding the lock for
+        /// three bounds (a replacement of a large in-catalog backup), the
+        /// beat parks, then confirms once the lock is free, and the claim
+        /// reports that its beat parks before its bound (so `HeldClaim`
+        /// counts that beat in flight).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_maintenance_beat_parks_on_the_write_lock_before_its_bound() {
+            let engine = engine().await;
+            let claim = engine
+                .maintenance_claim("migrate-legacy on host-a", Duration::from_secs(300))
+                .await
+                .expect("claim");
+            assert!(claim.heartbeat_parks_before_its_bound());
+            let bound = Duration::from_millis(200);
+            let held = engine.write_lock.lock().await;
+            let started = std::time::Instant::now();
+            let (outcome, ()) = tokio::join!(claim.heartbeat_within(bound), async move {
+                tokio::time::sleep(3 * bound).await;
+                drop(held);
+            });
+            assert!(
+                started.elapsed() >= 3 * bound,
+                "the beat waited for the lock"
+            );
+            assert!(
+                matches!(outcome, Some(Ok(Heartbeat::Confirmed))),
+                "the bound starts once the beat holds the lock"
+            );
+            claim.release().await.expect("release");
+        }
+
         /// An engine that holds the serve lock (a command that opened the
         /// file as `serve` does: `backup purge --confirm`) takes over a
         /// maintenance claim whose heartbeat is young: under the lock the
@@ -5864,6 +6943,572 @@ mod restore_tests {
                     .is_none()
             );
             drop(failed_claim);
+        }
+    }
+
+    mod legacy_migration {
+        //! The legacy reader's half of `extenddb backup migrate-legacy`: the
+        //! item stream, `list_all` and the replacement by an index row.
+
+        use extenddb_core::backup_format::BackupArn;
+        use extenddb_storage::BackupCatalog;
+        use extenddb_storage::backup_catalog::{
+            BackupRow, BackupStatus, LegacyBackupKey, Replaced, StoreIdentity, StoreKind,
+            UNOWNED_GENERATION,
+        };
+        use extenddb_storage::backup_definition::{LegacyVectorState, source_table_from_legacy};
+        use futures::StreamExt;
+
+        use super::*;
+
+        const REGION: &str = "us-east-1";
+        const OTHER_ACCOUNT: &str = "111111111111";
+
+        fn store() -> StoreIdentity {
+            StoreIdentity {
+                store_kind: StoreKind::Filesystem,
+                store_root: "/var/lib/extenddb/backups".to_owned(),
+                store_id: "store-1".to_owned(),
+            }
+        }
+
+        /// A legacy backup named `bkp` of a new table `name` holding `items`
+        /// 1 KB items and then `large` items of 3 MiB, so the stream crosses
+        /// both the row and the byte bound of a batch.
+        async fn legacy_backup(
+            engine: &SqliteEngine,
+            name: &str,
+            items: i64,
+            large: i64,
+        ) -> String {
+            let key_info = plain_table(engine, name).await;
+            fill_table(engine, &key_info, items).await;
+            let table = crate::data::data_table_name(&key_info.table_id);
+            let payload = "y".repeat(3 * 1024 * 1024);
+            for i in 0..large {
+                let item = json!({"pk": {"S": format!("large{i}")}, "payload": {"S": payload}});
+                sqlx::query(&format!(
+                    "INSERT INTO {table} (pk, item_data) VALUES (?, ?)"
+                ))
+                .bind(format!("large{i}"))
+                .bind(item.to_string())
+                .execute(&engine.pool)
+                .await
+                .expect("a large item");
+            }
+            engine
+                .create(ACCOUNT, name, "bkp", JobPermit::detached())
+                .await
+                .expect("backup")
+                .backup_arn
+        }
+
+        /// The stored items of `backup_arn`, in `id` order, parsed.
+        async fn stored_items(engine: &SqliteEngine, backup_arn: &str) -> Vec<Item> {
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT item_data FROM backup_items WHERE backup_arn = ? ORDER BY id",
+            )
+            .bind(backup_arn)
+            .fetch_all(&engine.pool)
+            .await
+            .expect("stored items");
+            rows.iter()
+                .map(|r| serde_json::from_str(r).expect("item"))
+                .collect()
+        }
+
+        async fn counts(engine: &SqliteEngine, backup_arn: &str) -> (i64, i64, Option<String>) {
+            let items: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM backup_items WHERE backup_arn = ?")
+                    .bind(backup_arn)
+                    .fetch_one(&engine.pool)
+                    .await
+                    .expect("items");
+            let definitions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM backup_definitions WHERE backup_arn = ?")
+                    .bind(backup_arn)
+                    .fetch_one(&engine.pool)
+                    .await
+                    .expect("definitions");
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT backup_status FROM backups WHERE backup_arn = ?")
+                    .bind(backup_arn)
+                    .fetch_optional(&engine.pool)
+                    .await
+                    .expect("status");
+            (items, definitions, status)
+        }
+
+        /// The index row of the store copy of `backup_arn`, built as the
+        /// migration builds it.
+        async fn migrated_row(engine: &SqliteEngine, backup_arn: &str) -> BackupRow {
+            let source = engine
+                .restore_source(ACCOUNT, backup_arn)
+                .await
+                .expect("source");
+            let table =
+                source_table_from_legacy(&source, LegacyVectorState::NoneRecorded, REGION, ACCOUNT)
+                    .expect("source table");
+            let arn = BackupArn::parse(backup_arn).expect("arn");
+            BackupRow {
+                backup_id: arn.backup_id().to_owned(),
+                account_id: ACCOUNT.to_owned(),
+                table_name: source.source_table_name.clone(),
+                backup_arn: backup_arn.to_owned(),
+                backup_name: "bkp".to_owned(),
+                status: BackupStatus::Available,
+                store: store(),
+                size_bytes: 4321,
+                item_count: source.item_count,
+                created_at: source.backup_creation_date_time,
+                completed_at: None,
+                failure_reason: None,
+                source_table_details_json: serde_json::to_value(&table).expect("json"),
+                owner_generation: 77,
+                heartbeat_at: 0.0,
+            }
+        }
+
+        #[tokio::test]
+        async fn items_stream_every_stored_item_in_id_order_across_batch_bounds() {
+            let engine = engine().await;
+            let arn = legacy_backup(&engine, "src", 1201, 3).await;
+            let opened = engine.items(ACCOUNT, &arn).await.expect("items");
+            assert_eq!(opened.backup_name, "bkp");
+            assert_eq!(
+                opened.source,
+                engine.restore_source(ACCOUNT, &arn).await.expect("source")
+            );
+            assert_eq!(opened.vector_state, LegacyVectorState::NoneRecorded);
+            let streamed: Vec<Item> = opened
+                .items
+                .map(|item| item.expect("an item"))
+                .collect()
+                .await;
+            let stored = stored_items(&engine, &arn).await;
+            assert_eq!(stored.len(), 1204, "the backup holds every item");
+            assert_eq!(streamed.len(), 1204);
+            assert_eq!(streamed, stored, "every item, once, in id order");
+
+            // A backup taken before catalog 0.0.4 has no definition, and its
+            // vector state is not known.
+            sqlx::query("DELETE FROM backup_definitions WHERE backup_arn = ?")
+                .bind(&arn)
+                .execute(&engine.pool)
+                .await
+                .expect("drop the definition");
+            let opened = engine.items(ACCOUNT, &arn).await.expect("items");
+            assert!(opened.source.definition.is_none());
+            assert_eq!(opened.vector_state, LegacyVectorState::Unknown);
+        }
+
+        /// Two DeleteBackups of one in-catalog backup that both read it
+        /// AVAILABLE before either takes the write lock: the one that
+        /// deletes it answers DELETED and the other `Backup not found`, as
+        /// a DeleteBackup after the pair does (the status is read again
+        /// under the lock).
+        #[tokio::test]
+        async fn the_later_of_two_concurrent_deletes_answers_not_found() {
+            let engine = engine().await;
+            let arn = legacy_backup(&engine, "src", 3, 0).await;
+            let gate = engine.write_lock.lock().await;
+            let (first, second, ()) = tokio::join!(
+                engine.delete(ACCOUNT, &arn),
+                engine.delete(ACCOUNT, &arn),
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    drop(gate);
+                },
+            );
+            let answers = [first, second];
+            let deleted = answers
+                .iter()
+                .filter(|a| matches!(a, Ok(d) if d.backup_details.backup_status == "DELETED"))
+                .count();
+            let not_found = answers
+                .iter()
+                .filter(|a| {
+                    matches!(a, Err(StorageError::Validation(m)) if m.starts_with("Backup not found"))
+                })
+                .count();
+            assert_eq!((deleted, not_found), (1, 1), "{answers:?}");
+            assert_eq!(
+                counts(&engine, &arn).await,
+                (0, 0, Some("DELETED".to_owned()))
+            );
+            let after = engine.delete(ACCOUNT, &arn).await;
+            assert!(
+                matches!(&after, Err(StorageError::Validation(m)) if m.starts_with("Backup not found")),
+                "{after:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn items_refuse_what_is_not_available_and_stop_at_a_delete() {
+            let engine = engine().await;
+            let arn = legacy_backup(&engine, "src", 1201, 0).await;
+            for (account, backup_arn) in
+                [(OTHER_ACCOUNT, arn.clone()), (ACCOUNT, flip_last_hex(&arn))]
+            {
+                let err = engine.items(account, &backup_arn).await.err();
+                assert!(
+                    matches!(&err, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+                    "{err:?}"
+                );
+            }
+            let mut items = engine.items(ACCOUNT, &arn).await.expect("items").items;
+            assert!(items.next().await.expect("one").is_ok());
+            engine.delete(ACCOUNT, &arn).await.expect("delete");
+            let mut read = 1;
+            let mut ended_with = None;
+            while let Some(item) = items.next().await {
+                match item {
+                    Ok(_) => read += 1,
+                    Err(e) => {
+                        ended_with = Some(e);
+                        break;
+                    }
+                }
+            }
+            assert!(
+                matches!(&ended_with, Some(StorageError::Validation(m)) if m.contains("Backup not found")),
+                "{ended_with:?}"
+            );
+            assert_eq!(read, 500, "the batch read before the delete, and no more");
+            assert!(items.next().await.is_none(), "nothing follows the error");
+            let err = engine.items(ACCOUNT, &arn).await.err();
+            assert!(matches!(err, Some(StorageError::Validation(_))), "{err:?}");
+        }
+
+        #[tokio::test]
+        async fn list_all_lists_every_account_and_leaves_deleted_backups_out() {
+            let engine = engine().await;
+            let mut arns = Vec::new();
+            for name in ["a", "b", "c", "d"] {
+                arns.push(legacy_backup(&engine, name, 2, 0).await);
+            }
+            // Another account's backup, a CREATING one and a deleted one.
+            sqlx::query("UPDATE backups SET account_id = ? WHERE backup_arn = ?")
+                .bind(OTHER_ACCOUNT)
+                .bind(&arns[1])
+                .execute(&engine.pool)
+                .await
+                .expect("move");
+            sqlx::query("UPDATE backups SET backup_status = 'CREATING' WHERE backup_arn = ?")
+                .bind(&arns[2])
+                .execute(&engine.pool)
+                .await
+                .expect("creating");
+            engine.delete(ACCOUNT, &arns[3]).await.expect("delete");
+            assert_eq!(
+                engine.list_all().await.expect("list"),
+                vec![
+                    LegacyBackupKey {
+                        account_id: ACCOUNT.to_owned(),
+                        backup_arn: arns[0].clone(),
+                        status: BackupStatus::Available,
+                    },
+                    LegacyBackupKey {
+                        account_id: OTHER_ACCOUNT.to_owned(),
+                        backup_arn: arns[1].clone(),
+                        status: BackupStatus::Available,
+                    },
+                    LegacyBackupKey {
+                        account_id: ACCOUNT.to_owned(),
+                        backup_arn: arns[2].clone(),
+                        status: BackupStatus::Creating,
+                    },
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replacement_inserts_the_unowned_row_and_removes_the_backup_in_one_step() {
+            let engine = engine().await;
+            let arn = legacy_backup(&engine, "src", 7, 0).await;
+            let row = migrated_row(&engine, &arn).await;
+            assert_eq!(
+                counts(&engine, &arn).await,
+                (7, 1, Some("AVAILABLE".to_owned()))
+            );
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::Replaced
+            );
+            let stored = engine
+                .read_backup_row(&BackupArn::parse(&arn).unwrap())
+                .await
+                .expect("read")
+                .expect("the index row");
+            assert_eq!(stored.owner_generation, UNOWNED_GENERATION);
+            assert!(stored.completed_at.is_some());
+            // The source table is compared parsed: a float read back from the
+            // catalog's JSON may differ from the one written in its last bit.
+            let mut stored = stored;
+            let read_table = stored.source_table().expect("source table");
+            let row_table = row.source_table().expect("source table");
+            assert!(
+                (read_table.table_creation_date_time - row_table.table_creation_date_time).abs()
+                    < 1e-3
+            );
+            assert_eq!(
+                extenddb_core::backup_format::SourceTableSchema {
+                    table_creation_date_time: row_table.table_creation_date_time,
+                    ..read_table
+                },
+                row_table
+            );
+            stored.source_table_details_json = row.source_table_details_json.clone();
+            assert_eq!(
+                BackupRow {
+                    owner_generation: row.owner_generation,
+                    completed_at: None,
+                    heartbeat_at: 0.0,
+                    created_at: row.created_at,
+                    ..stored
+                },
+                row
+            );
+            // No in-catalog backup is left: the `backups` row is gone with its
+            // items and definition, so no DELETED row reads as a delete's.
+            assert_eq!(counts(&engine, &arn).await, (0, 0, None));
+            assert_eq!(
+                engine.holder_status(ACCOUNT, &arn).await.expect("holder"),
+                None
+            );
+            assert!(engine.list_deleted().await.expect("deleted").is_empty());
+            assert!(engine.describe(ACCOUNT, &arn).await.is_err());
+            assert!(engine.list(ACCOUNT, None).await.expect("list").is_empty());
+            assert!(engine.list_all().await.expect("list").is_empty());
+            // Again: the row is there, nothing is left to remove.
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::AlreadyReplaced
+            );
+        }
+
+        /// `holder_status` answers for an in-catalog backup in any status,
+        /// DELETED included, and for none the replacement replaced;
+        /// `list_deleted` lists the backups a DeleteBackup left DELETED, of
+        /// every account, and not a replaced one, which leaves no row.
+        #[tokio::test]
+        async fn holder_status_and_list_deleted_tell_a_delete_from_a_replacement() {
+            let engine = engine().await;
+            let deleted = legacy_backup(&engine, "gone", 2, 0).await;
+            let replaced = legacy_backup(&engine, "moved", 2, 0).await;
+            let kept = legacy_backup(&engine, "kept", 1, 0).await;
+            assert_eq!(
+                engine
+                    .holder_status(ACCOUNT, &deleted)
+                    .await
+                    .expect("holder"),
+                Some(BackupStatus::Available)
+            );
+            engine.delete(ACCOUNT, &deleted).await.expect("delete");
+            let row = migrated_row(&engine, &replaced).await;
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::Replaced
+            );
+            assert_eq!(
+                engine
+                    .holder_status(ACCOUNT, &deleted)
+                    .await
+                    .expect("holder"),
+                Some(BackupStatus::Deleted)
+            );
+            assert_eq!(
+                engine
+                    .holder_status(ACCOUNT, &replaced)
+                    .await
+                    .expect("holder"),
+                None
+            );
+            assert_eq!(
+                engine.holder_status(ACCOUNT, &kept).await.expect("holder"),
+                Some(BackupStatus::Available)
+            );
+            assert_eq!(
+                engine
+                    .holder_status(OTHER_ACCOUNT, &deleted)
+                    .await
+                    .expect("holder"),
+                None
+            );
+            assert_eq!(
+                engine.list_deleted().await.expect("deleted"),
+                vec![LegacyBackupKey {
+                    account_id: ACCOUNT.to_owned(),
+                    backup_arn: deleted.clone(),
+                    status: BackupStatus::Deleted,
+                }]
+            );
+            let listed: Vec<String> = engine
+                .list_all()
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|k| k.backup_arn)
+                .collect();
+            assert_eq!(listed, std::slice::from_ref(&kept));
+            // The row the replacement wrote is found by its id alone,
+            // whatever its ARN and its account: the id is unique in the
+            // index (`idx_backup_index_backup_id`), so an insert of the id
+            // under another account conflicts on it too (the insert's cell).
+            let by_id = engine
+                .row_holding_backup_id(&row.backup_id)
+                .await
+                .expect("by id");
+            assert_eq!(by_id.map(|r| r.backup_arn), Some(replaced.clone()));
+            assert_eq!(
+                engine
+                    .row_holding_backup_id("01791976430099-11110099")
+                    .await
+                    .expect("by id"),
+                None
+            );
+            // The removal of a DeleteBackup's record: only a DELETED one of
+            // the account, once.
+            for (account, arn) in [
+                (ACCOUNT, &kept),
+                (OTHER_ACCOUNT, &deleted),
+                (ACCOUNT, &replaced),
+            ] {
+                assert!(
+                    !engine.remove_deleted(account, arn).await.expect("remove"),
+                    "{account} {arn}"
+                );
+            }
+            assert!(
+                engine
+                    .remove_deleted(ACCOUNT, &deleted)
+                    .await
+                    .expect("remove")
+            );
+            assert!(
+                !engine
+                    .remove_deleted(ACCOUNT, &deleted)
+                    .await
+                    .expect("remove")
+            );
+            assert!(engine.list_deleted().await.expect("deleted").is_empty());
+            assert_eq!(
+                engine
+                    .holder_status(ACCOUNT, &deleted)
+                    .await
+                    .expect("holder"),
+                None
+            );
+            assert_eq!(
+                engine.holder_status(ACCOUNT, &kept).await.expect("holder"),
+                Some(BackupStatus::Available)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replacement_over_an_adopted_copy_finishes_and_one_of_another_store_refuses() {
+            let engine = engine().await;
+            // `backup sync` adopted the copy before the replacement ran.
+            let adopted = legacy_backup(&engine, "src", 3, 0).await;
+            let row = migrated_row(&engine, &adopted).await;
+            assert!(engine.insert_backup_row(&row).await.expect("insert"));
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::AlreadyReplaced
+            );
+            assert_eq!(counts(&engine, &adopted).await, (0, 0, None));
+
+            // A row of the id in another store: refused, nothing removed.
+            let other = legacy_backup(&engine, "other", 3, 0).await;
+            let row = migrated_row(&engine, &other).await;
+            let mut elsewhere = row.clone();
+            elsewhere.store.store_root = "/srv/elsewhere".to_owned();
+            assert!(engine.insert_backup_row(&elsewhere).await.expect("insert"));
+            let err = engine.replace_with_index_row(&row).await.err();
+            assert!(
+                matches!(&err, Some(StorageError::AlreadyExists(m)) if m.contains("/srv/elsewhere")),
+                "{err:?}"
+            );
+            assert_eq!(
+                counts(&engine, &other).await,
+                (3, 1, Some("AVAILABLE".to_owned()))
+            );
+            assert_eq!(
+                engine
+                    .read_backup_row(&BackupArn::parse(&other).unwrap())
+                    .await
+                    .expect("read")
+                    .expect("row")
+                    .store,
+                elsewhere.store
+            );
+            // Deleted since: the other store's row is still answered as
+            // such, not as a backup that is no longer AVAILABLE.
+            engine.delete(ACCOUNT, &other).await.expect("delete");
+            let err = engine.replace_with_index_row(&row).await.err();
+            assert!(
+                matches!(&err, Some(StorageError::AlreadyExists(m)) if m.contains("/srv/elsewhere")),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_replacement_refuses_an_in_use_or_unavailable_backup_and_writes_nothing() {
+            let engine = engine().await;
+            let arn = legacy_backup(&engine, "src", 4, 0).await;
+            let row = migrated_row(&engine, &arn).await;
+            // A restore target of the backup still CREATING.
+            restore(&engine, "dst", &arn).await.expect("restore");
+            sqlx::query("UPDATE tables SET table_status = 'CREATING' WHERE table_name = 'dst'")
+                .execute(&engine.pool)
+                .await
+                .expect("creating");
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::InUse("dst".to_owned())
+            );
+            assert_eq!(
+                counts(&engine, &arn).await,
+                (4, 1, Some("AVAILABLE".to_owned()))
+            );
+            let key = BackupArn::parse(&arn).unwrap();
+            assert!(engine.read_backup_row(&key).await.expect("read").is_none());
+            sqlx::query("UPDATE tables SET table_status = 'ACTIVE' WHERE table_name = 'dst'")
+                .execute(&engine.pool)
+                .await
+                .expect("active");
+
+            // Not AVAILABLE: CREATING, then deleted, then missing.
+            sqlx::query("UPDATE backups SET backup_status = 'CREATING' WHERE backup_arn = ?")
+                .bind(&arn)
+                .execute(&engine.pool)
+                .await
+                .expect("creating");
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::NotAvailable("the in-catalog backup is CREATING".to_owned())
+            );
+            sqlx::query("UPDATE backups SET backup_status = 'AVAILABLE' WHERE backup_arn = ?")
+                .bind(&arn)
+                .execute(&engine.pool)
+                .await
+                .expect("available");
+            engine.delete(ACCOUNT, &arn).await.expect("delete");
+            assert_eq!(
+                engine.replace_with_index_row(&row).await.expect("replace"),
+                Replaced::NotAvailable("the in-catalog backup is DELETED".to_owned())
+            );
+            let mut missing = row.clone();
+            missing.backup_arn = flip_last_hex(&arn);
+            missing.backup_id = BackupArn::parse(&missing.backup_arn)
+                .unwrap()
+                .backup_id()
+                .to_owned();
+            assert!(matches!(
+                engine.replace_with_index_row(&missing).await.expect("replace"),
+                Replaced::NotAvailable(m) if m.contains("Backup not found")
+            ));
+            assert!(engine.read_backup_row(&key).await.expect("read").is_none());
         }
     }
 

@@ -177,7 +177,7 @@ Defined in `crates/storage/src/management_store/mod.rs`. Covers all IAM CRUD ope
 | `get_account_summary` | Account summary (user/group/role/policy counts) |
 
 Key design decisions:
-- Account deletion must cascade to all users, groups, roles, policies, and access keys atomically.
+- Deleting an account, user, group or role must remove everything it owns, and creating one must remove what an older delete left under its name or id (see [CASCADE Semantics](#cascade-semantics)).
 - Access key secrets are encrypted (AES-256-GCM) before storage.
 - Sessions have expiration enforcement.
 
@@ -209,8 +209,11 @@ Defined in `crates/storage/src/management_store/mod.rs`. Historical metrics pers
 
 | Method | Purpose |
 |--------|---------|
-| `record_metrics` | Insert a metrics snapshot |
-| `query_metrics` | Query metrics by time range, operation, and table filters |
+| `insert_metrics` | Insert a batch of one-minute rows, each with the account it was recorded for (none for a metric of the whole deployment) |
+| `query_metrics` | Query rows by time range, filtered by `MetricsFilter`: account, table name and metric |
+| `prune_metrics` | Delete rows older than the retention period |
+
+Two accounts' rows for a table of the same name must never be read back as one: a store that adds rows of one key together keeps the account in the key. `extenddb_storage::metrics_conformance::run` (feature `test-util`) checks a store against a migrated catalog.
 
 ### RateLimitStore
 
@@ -288,8 +291,8 @@ The `storage-postgres` crate provides the default implementation:
 ### Database Architecture
 
 extenddb uses a dual-database architecture:
-- **Catalog database** (`extenddb`) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
-- **Data database** (`extenddb_data`) — DynamoDB items and index rows
+- **Catalog database** (`extenddb_catalog` by default) — table metadata, IAM data, settings, metrics, stream records, tags, idempotency tokens, login attempts
+- **Data database** (`extenddb` by default, the catalog's name without `_catalog`) — DynamoDB items and index rows
 
 ### Migrations
 
@@ -392,7 +395,36 @@ Stream sequence numbers must be monotonically increasing within a shard. Your ba
 
 ### CASCADE Semantics
 
-Account deletion must cascade to all child resources (users, groups, roles, policies, access keys, sessions) atomically. Your backend must provide equivalent cascade logic.
+IAM records name their principal and account by value, and a record left
+behind belongs to the next principal or account created with that name or id:
+an inline policy or boundary grants it permissions, an access key or role
+session signs in as it, and a membership puts it in a group. So:
+
+- Deleting a user, group or role must also delete everything it owns: a
+  user's access keys, group memberships, tags, inline policies, boundary and
+  failed logins; a group's inline policies and memberships; a role's inline
+  policies, boundary, tags and sessions. On PostgreSQL and SQLite the foreign
+  keys cover all of it except inline policies and boundaries, which name their
+  principal by `(principal_type, principal_name)`, and failed logins, which the
+  `RateLimitStore` records under the sign-in name `account_id/user_name`. Those
+  are deleted in the same transaction as the principal. A user left with the
+  failures of a deleted one is refused with 429 on its first correct password.
+- Account deletion must cascade to all child resources (users, groups, roles,
+  policies, boundaries, access keys, memberships, tags, sessions), and delete
+  the failed logins recorded under any sign-in name `account_id/...`.
+- Creating a user, group or role must delete what is stored under its name
+  before it exists (rows an older release's delete left behind), and only
+  after its own insert succeeded, so that a create refused as a duplicate
+  touches nothing. Creating an account does the same for its id.
+- A backend without foreign keys deletes what a principal or account owns
+  before the principal or account itself, so that a failure leaves less, never
+  a credential without its owner. The MongoDB and Cassandra backends also treat
+  a user, access key, session or role of an account that no longer exists as
+  unknown when signing in or assuming a role.
+
+`extenddb_storage::iam_leftovers_conformance::run` (feature `test-util`)
+checks these properties against a real database; each backend's test suite
+runs it.
 
 ## PostgreSQL-isms in the Default Backend
 

@@ -35,6 +35,9 @@ mod m0003_sort_key_definitions;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0011_attribute_name_escape;
 mod postcheck;
 mod registrar;
 mod rows;
@@ -167,6 +170,37 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0009_warm_throughput.sql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::Applies {
+            // A binary without the decoder reads an escaped name as another
+            // name, and one without the encoder writes a U+0001 raw, which
+            // this release reads as another name.
+            kind: Kind::Breaking,
+            // An escaped U+0001 and a raw U+0001 U+0002 are the same bytes,
+            // so running the rewrite again would change the names written
+            // since it ran.
+            convergent: false,
+            bodies: vec![
+                StoreBody::code(
+                    StoreKind::Catalog,
+                    &m0011_attribute_name_escape::CatalogDocuments,
+                    m0011_attribute_name_escape::SOURCE,
+                ),
+                StoreBody::code(
+                    StoreKind::Data,
+                    &m0011_attribute_name_escape::QueuedContexts,
+                    m0011_attribute_name_escape::SOURCE,
+                ),
+            ],
+        },
     }
 }
 
@@ -192,7 +226,9 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::BackupCatalogIndex
         | MigrationId::StreamPending
         | MigrationId::RestoreProgress
-        | MigrationId::WarmThroughput => RunsIn::Transaction,
+        | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics
+        | MigrationId::AttributeNameEscape => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

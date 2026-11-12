@@ -26,7 +26,7 @@ use extenddb_storage::CatalogStore;
 use extenddb_storage::authorization_store::{AuthorizationStore, SessionData as RoleSession};
 use extenddb_storage::management_store::{
     AccessKeyCreated, AccountDetail, AdminEntry, AdminStore, GroupDetail, GroupListEntry,
-    ManagementStore, MetricsRow, MetricsStore, OpError, OpResult, PasswordHashStore,
+    ManagementStore, MetricsFilter, MetricsRow, MetricsStore, OpError, OpResult, PasswordHashStore,
     RateLimitStore, RoleDetail, RoleListEntry, SettingsStore, UserDetail, UserListEntry,
 };
 use futures::future::BoxFuture;
@@ -161,9 +161,7 @@ impl SettingsStore for CountingStore {
 impl MetricsStore for CountingStore {
     counted_calls! {
         insert_metrics(&[MetricsRow]) -> ();
-        query_metrics(
-            OffsetDateTime, OffsetDateTime, Option<&str>, Option<&str>
-        ) -> Vec<MetricsRow>;
+        query_metrics(OffsetDateTime, OffsetDateTime, &MetricsFilter) -> Vec<MetricsRow>;
         prune_metrics(Duration) -> ();
     }
 }
@@ -188,7 +186,7 @@ impl RateLimitStore for CountingStore {
 impl AuthorizationStore for CountingStore {
     counted_calls! {
         fetch_user_policies(&str, &str) -> Vec<String>;
-        fetch_user_group_policies(&str, &str) -> Vec<String>;
+        fetch_user_group_policies(&str, &str) -> Vec<(String, String)>;
         fetch_user_boundary(&str, &str) -> Option<String>;
         fetch_role_policies(&str, &str) -> Vec<String>;
         fetch_role_boundary(&str, &str) -> Option<String>;

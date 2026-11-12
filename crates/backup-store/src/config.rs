@@ -22,7 +22,7 @@
 //! bucket = "my-extenddb-backups"        # required when kind = "s3"; must not be empty
 //! prefix = "extenddb/"                  # optional; at most 512 bytes
 //! region = "us-east-1"                  # optional; SDK chain otherwise
-//! endpoint = "http://127.0.0.1:9000"    # optional; moto, Garage, LocalStack, or any S3-compatible endpoint
+//! endpoint = "http://127.0.0.1:9000"    # optional; moto, Garage, or any S3-compatible endpoint
 //! allow_insecure_endpoint = false       # an http:// endpoint must be loopback unless true
 //! force_path_style = true               # false when absent; an http:// endpoint needs true
 //! upload_part_size_bytes = 8388608      # 5 MiB to 5 GiB (S3's part size limits)

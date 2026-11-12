@@ -9,9 +9,10 @@
 use std::time::SystemTime;
 
 use crate::harness::{
-    Authorization, INVALID_TOKEN, Key, MISSING_DATE, OTHER_TOKEN, Refusal, SCOPE_DATE_MISMATCH,
-    SIGNATURE_MISMATCH, Shape, Signed, Tally, WRONG_SERVICE, Wire, amz_date, check_accepted,
-    check_accepted_as, check_refused, check_refused_by_the_time_check, shift, sign,
+    Authorization, INVALID_TOKEN, Key, MISSING_DATE, Message, OTHER_TOKEN, Refusal,
+    SCOPE_DATE_MISMATCH, SESSION_TOKEN, SIGNATURE_MISMATCH, Shape, Signed, Tally, WRONG_REGION,
+    WRONG_SERVICE, WRONG_TOKEN, Wire, amz_date, check_accepted, check_accepted_as, check_refused,
+    check_refused_by_the_time_check, shift, sign,
 };
 
 /// Seconds the server allows between `X-Amz-Date` and its clock.
@@ -28,9 +29,9 @@ pub struct Mutant {
     pub label: String,
     pub wire: Wire,
     pub expected: Refusal,
-    /// The start of the refusal message, which names the check that must
+    /// The refusal message, or its start, which names the check that must
     /// refuse the request.
-    pub message: &'static str,
+    pub message: Message,
 }
 
 fn changed(wire: &Wire, change: impl FnOnce(&mut Wire)) -> Wire {
@@ -89,7 +90,7 @@ fn header_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
                 label: format!("{name}: a character appended"),
                 wire: changed(wire, |wire| wire.replace(&name, format!("{value}x"))),
                 expected: Refusal::Signature,
-                message: SIGNATURE_MISMATCH,
+                message: Message::Prefix(SIGNATURE_MISMATCH),
             });
             out.push(Mutant {
                 category,
@@ -98,20 +99,24 @@ fn header_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
                     wire.replace(&name, first_character_replaced(&value));
                 }),
                 expected: Refusal::Signature,
-                message: SIGNATURE_MISMATCH,
+                message: Message::Prefix(SIGNATURE_MISMATCH),
             });
         }
         let (category, expected, message) = match name.as_str() {
-            "x-amz-date" => ("signed header dropped", Refusal::Incomplete, MISSING_DATE),
+            "x-amz-date" => (
+                "signed header dropped",
+                Refusal::Incomplete,
+                Message::Prefix(MISSING_DATE),
+            ),
             "x-amz-security-token" => (
                 "session token removed after signing",
                 Refusal::Signature,
-                SIGNATURE_MISMATCH,
+                Message::Prefix(SIGNATURE_MISMATCH),
             ),
             _ => (
                 "signed header dropped",
                 Refusal::Signature,
-                SIGNATURE_MISMATCH,
+                Message::Prefix(SIGNATURE_MISMATCH),
             ),
         };
         out.push(Mutant {
@@ -140,7 +145,7 @@ fn signed_headers_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
             label: format!("{extra} listed in SignedHeaders"),
             wire: changed(wire, |wire| wire.set_authorization(&listed)),
             expected: Refusal::Signature,
-            message: SIGNATURE_MISMATCH,
+            message: Message::Prefix(SIGNATURE_MISMATCH),
         });
     }
 }
@@ -162,7 +167,7 @@ pub fn body_mutants(signed: &Signed) -> Vec<Mutant> {
             label: "a byte added to the empty body".to_owned(),
             wire: changed(wire, |wire| wire.body.push(b'{')),
             expected: Refusal::Signature,
-            message: SIGNATURE_MISMATCH,
+            message: Message::Prefix(SIGNATURE_MISMATCH),
         }];
     }
     let mut positions = vec![0, length / 2, length - 1];
@@ -174,7 +179,7 @@ pub fn body_mutants(signed: &Signed) -> Vec<Mutant> {
             label: format!("body byte {position} of {length} changed"),
             wire: changed(wire, |wire| wire.body[position] ^= 0x01),
             expected: Refusal::Signature,
-            message: SIGNATURE_MISMATCH,
+            message: Message::Prefix(SIGNATURE_MISMATCH),
         })
         .collect()
 }
@@ -188,9 +193,9 @@ fn date_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
         // the credential scope, and the scope date check refuses the request
         // before the signature is compared.
         let message = if date[..8] == scope_date {
-            SIGNATURE_MISMATCH
+            Message::Prefix(SIGNATURE_MISMATCH)
         } else {
-            SCOPE_DATE_MISMATCH
+            Message::Prefix(SCOPE_DATE_MISMATCH)
         };
         out.push(Mutant {
             category: "x-amz-date moved one second",
@@ -205,12 +210,12 @@ fn date_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
 }
 
 /// `signed` with its `Authorization` value changed by `change`, refused with
-/// `InvalidSignatureException` and a message starting with `message`.
+/// `InvalidSignatureException` and a message `message` matches.
 fn authorization_mutant(
     signed: &Signed,
     category: &'static str,
     label: String,
-    message: &'static str,
+    message: Message,
     change: impl FnOnce(&mut Authorization),
 ) -> Mutant {
     let mut parts = signed.wire.authorization();
@@ -226,10 +231,11 @@ fn authorization_mutant(
 
 /// The credential scope's date, region or service changed.
 ///
-/// The server checks the scope's service and date before it compares the
-/// signature. It has no check of its own for the region, so a changed region
-/// is refused by the signature. `aws-sigv4` takes the scope date and
-/// `X-Amz-Date` from one time, so a changed scope date also breaks the
+/// The server checks the scope's region and service, then its date, before
+/// it compares the signature, so each changed part is refused by its own
+/// check. `signed` verified, so its scope names the server's region, and the
+/// region it is changed to is another one. `aws-sigv4` takes the scope date
+/// and `X-Amz-Date` from one time, so a changed scope date also breaks the
 /// signature, and the scope date check refuses it first.
 fn scope_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
     for days in [-1, 1] {
@@ -238,7 +244,7 @@ fn scope_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
             signed,
             "credential scope date changed, refused by the scope date check",
             format!("scope date {date}"),
-            SCOPE_DATE_MISMATCH,
+            Message::Prefix(SCOPE_DATE_MISMATCH),
             |parts| parts.date = date,
         ));
     }
@@ -247,11 +253,13 @@ fn scope_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
     } else {
         "us-west-2"
     };
+    // The scope's service is still right, so the answer is the region
+    // complaint alone.
     out.push(authorization_mutant(
         signed,
-        "credential scope region changed, refused by the signature",
+        "credential scope region changed, refused by the region check",
         format!("scope region {region}"),
-        SIGNATURE_MISMATCH,
+        Message::Exact(WRONG_REGION),
         |parts| region.clone_into(&mut parts.region),
     ));
     for service in ["s3", "streams.dynamodb", "DynamoDB"] {
@@ -259,7 +267,7 @@ fn scope_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
             signed,
             "credential scope service changed",
             format!("scope service {service}"),
-            WRONG_SERVICE,
+            Message::Prefix(WRONG_SERVICE),
             |parts| service.clone_into(&mut parts.service),
         ));
     }
@@ -295,13 +303,21 @@ fn signature_mutants(signed: &Signed, out: &mut Vec<Mutant>) {
             signed,
             category,
             format!("signature {changed_signature}"),
-            SIGNATURE_MISMATCH,
+            Message::Prefix(SIGNATURE_MISMATCH),
             |parts| parts.signature = changed_signature,
         ));
     }
 }
 
-/// `shape` signed with credentials the store does not hold for its key.
+/// `shape` signed with credentials the store does not hold for its key: the
+/// other key's secret; for the session key, another token or no token; for
+/// the long-term key, which has no token, the session key's token.
+///
+/// A token the request signs and sends leaves the signature intact, so the
+/// server refuses it after the signature is compared, with `WRONG_TOKEN`. A
+/// session key sent without its token is refused with `INVALID_TOKEN`. The
+/// two messages differ only in their trailing period, so each is compared
+/// whole.
 pub fn resigned(shape: &Shape) -> Vec<Mutant> {
     let mut variants = Vec::new();
     let mut other_secret = shape.clone();
@@ -311,27 +327,40 @@ pub fn resigned(shape: &Shape) -> Vec<Mutant> {
         "signed with another secret",
         other_secret,
         Refusal::Signature,
-        SIGNATURE_MISMATCH,
+        Message::Prefix(SIGNATURE_MISMATCH),
     ));
-    if shape.key == Key::Session {
-        let mut other_token = shape.clone();
-        other_token.signing_token = Some(OTHER_TOKEN.to_owned());
-        variants.push((
-            "session token changed before signing",
-            "signed and sent with another token",
-            other_token,
-            Refusal::Client,
-            INVALID_TOKEN,
-        ));
-        let mut no_token = shape.clone();
-        no_token.signing_token = None;
-        variants.push((
-            "session token removed before signing",
-            "signed and sent without the token",
-            no_token,
-            Refusal::Client,
-            INVALID_TOKEN,
-        ));
+    match shape.key {
+        Key::Session => {
+            let mut other_token = shape.clone();
+            other_token.signing_token = Some(OTHER_TOKEN.to_owned());
+            variants.push((
+                "session token changed before signing",
+                "signed and sent with another token",
+                other_token,
+                Refusal::Client,
+                Message::Exact(WRONG_TOKEN),
+            ));
+            let mut no_token = shape.clone();
+            no_token.signing_token = None;
+            variants.push((
+                "session token removed before signing",
+                "signed and sent without the token",
+                no_token,
+                Refusal::Client,
+                Message::Exact(INVALID_TOKEN),
+            ));
+        }
+        Key::LongTerm => {
+            let mut with_token = shape.clone();
+            with_token.signing_token = Some(SESSION_TOKEN.to_owned());
+            variants.push((
+                "session token sent with the long-term key",
+                "signed and sent with a token",
+                with_token,
+                Refusal::Client,
+                Message::Exact(WRONG_TOKEN),
+            ));
+        }
     }
     variants
         .into_iter()
