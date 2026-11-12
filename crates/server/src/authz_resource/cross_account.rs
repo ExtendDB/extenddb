@@ -149,7 +149,15 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
 /// each is authorized for: `Mixed` when they are in more than one account
 /// (a bare name is in the caller's), else the first in another account.
 fn batch_or_transaction(operation: &str, input: &Value, account_id: &str) -> Option<OtherAccount> {
-    let targets = crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())?;
+    // Only each target's table and action are read here. The limits govern
+    // how the expressions are read for Attributes, which this check ignores,
+    // so the defaults serve.
+    let targets = crate::leading_keys::batch_transact_targets(
+        operation,
+        input,
+        &HashMap::new(),
+        &extenddb_core::limits::LimitsConfig::default(),
+    )?;
     let mut accounts = BTreeSet::new();
     let mut first = None;
     for target in targets {

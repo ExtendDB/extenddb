@@ -377,7 +377,9 @@ impl PostgresEngine {
         })
     }
 
-    /// The table's stream columns and its key schema, by name.
+    /// The table's stream columns and its key schema, by name. The key
+    /// schema is in its stored form, which `catalog_json::from_catalog_json`
+    /// decodes.
     pub(crate) async fn stream_table_row(
         &self,
         account_id: &str,

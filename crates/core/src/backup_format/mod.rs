@@ -94,5 +94,5 @@ pub use layout::{
 pub use manifest::{
     BackupGsi, BackupLsi, CURRENT_FORMAT_VERSION, DataFileEntry, DataFileReader, ExtenddbManifest,
     ItemOrder, KeyRange, KeyRangeCheck, KeyRangeTracker, SnapshotDescriptor, SourceTableSchema,
-    check_format_version, verify_manifest_checksum,
+    check_format_version, is_valid_backup_name, verify_manifest_checksum,
 };
