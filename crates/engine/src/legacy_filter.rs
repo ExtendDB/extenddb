@@ -40,10 +40,10 @@ use extenddb_core::validation::{validate_attribute_number, validate_no_empty_key
 ///    first absent key, and refuses three conditions on a two-key schema with
 ///    its own message; neither is changed here).
 ///
-/// The request-time checks ([`validate_key_conditions`]) ran before the table
-/// lookup, so a non-indexable operator never reaches this function. An empty
-/// key value is reported later, after the Select checks
-/// ([`reject_empty_key_values`]).
+/// The Query handler runs [`validate_key_conditions`] before the table
+/// lookup, so every entry has passed the value checks and the non-indexable
+/// refusal when this runs. An empty key value is reported later, after the
+/// Select checks ([`reject_empty_key_values`]).
 ///
 /// # Errors
 ///
@@ -77,8 +77,6 @@ pub fn desugar_key_conditions(
         .iter()
         .find(|ks| ks.key_type == KeyType::Range)
         .map(|ks| ks.attribute_name.as_str());
-
-    validate_key_conditions(conditions)?;
 
     let hash_cond = conditions.get(hash_attr).ok_or_else(|| {
         DynamoDbError::ValidationException(format!(

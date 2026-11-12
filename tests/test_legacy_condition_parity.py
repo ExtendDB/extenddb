@@ -355,6 +355,7 @@ ALL_PROJECTED = "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be us
 RANGE_R1_FOR_R2 = "RANGE key attributes r1 must have equality conditions specified in the query because a condition is present on key attribute r2"
 MIDX = {"IndexName": "midx"}
 KEYS_ONLY_ALL = {"IndexName": "kidx", "Select": "ALL_ATTRIBUTES"}
+SK_NE = {"pk": _cond("EQ", [_s("p1")]), "sk": _cond("NE", [_s("a")])}
 
 # Query requests measured on 2026-11-12 against tables of these fixtures'
 # shapes, two sends each: (id, fixture, request, the answers the service
@@ -396,7 +397,19 @@ MEASURED_ORDER = [
     ("keys_only_projection_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditionExpression": "gpk = :v", "ExpressionAttributeValues": {":v": _s("g")}, "ProjectionExpression": "x"}, ["1 validation error detected: Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES"]),
     ("keys_only_no_key_condition_first", "ss_table", {**KEYS_ONLY_ALL}, ["Either the KeyConditions or KeyConditionExpression parameter must be specified in the request."]),
     ("keys_only_select_all_attributes", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g"))}}, [INVALID_PARAMS + "Select type ALL_ATTRIBUTES is not supported for global secondary index kidx because its projection type is not ALL"]),
+    # A non-indexable operator is refused before the table and index lookups,
+    # the ConsistentRead check and the Select checks.
+    ("non_indexable_on_a_missing_table", "absent_table", {"KeyConditions": SK_NE}, [NOT_INDEXABLE]),
+    ("non_indexable_before_the_index_lookup", "ss_table", {"KeyConditions": SK_NE, "IndexName": "nope"}, [NOT_INDEXABLE]),
+    ("non_indexable_before_consistent_read", "ss_table", {"KeyConditions": {"gpk": _eq(_s("g")), "gsk": _cond("NE", [_s("a")])}, "IndexName": "kidx", "ConsistentRead": True}, [NOT_INDEXABLE]),
+    ("non_indexable_before_select", "ss_table", {"KeyConditions": SK_NE, "Select": "SPECIFIC_ATTRIBUTES"}, [NOT_INDEXABLE]),
 ]
+
+
+@pytest.fixture()
+def absent_table():
+    """The name of a table that does not exist."""
+    return f"absent_{uuid.uuid4().hex[:8]}"
 
 
 class TestMeasuredCheckOrder:

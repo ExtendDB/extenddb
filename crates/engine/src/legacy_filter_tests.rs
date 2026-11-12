@@ -353,16 +353,16 @@ fn key_conditions_refuse_non_indexable_operators_on_any_key_at_request_time() {
         matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == type_refusal("CONTAINS", "L")),
         "{err:?}"
     );
-    // Non-indexable is reported ahead of a schema type mismatch on the other key.
-    assert_eq!(
-        key_error(
-            &kc(vec![
-                ("pk", cond("EQ", vec![n("1")])),
-                ("sk", cond("NE", vec![s("a")]))
-            ]),
-            &ss_schema()
-        ),
-        refusal(NOT_INDEXABLE)
+    // The handler runs this before the table lookup, so non-indexable is
+    // reported ahead of a schema type mismatch on the other key.
+    let err = validate_key_conditions(&kc(vec![
+        ("pk", cond("EQ", vec![n("1")])),
+        ("sk", cond("NE", vec![s("a")])),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == refusal(NOT_INDEXABLE)),
+        "{err:?}"
     );
     assert!(validate_key_conditions(&kc(vec![("pk", cond("EQ", vec![s("p")]))])).is_ok());
 }
@@ -569,15 +569,18 @@ fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
         ),
         Some("Query condition missed key schema element: pk".to_owned())
     );
-    // An inverted range is a request-time error and wins over the empty bound.
-    assert_eq!(
-        key_error(
-            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s("a"), s("")]))]),
-            &ss
-        ),
-        refusal(
+    // An inverted range is a request-time error, reported before the empty
+    // bound is looked at.
+    let err = validate_key_conditions(&kc(vec![
+        pk_s(),
+        ("sk", cond("BETWEEN", vec![s("a"), s("")])),
+    ]))
+    .unwrap_err();
+    assert!(
+        matches!(&err, DynamoDbError::ValidationException(m) if Some(m.clone()) == refusal(
             "The BETWEEN condition was provided a range where the lower bound is greater than the upper bound"
-        )
+        )),
+        "{err:?}"
     );
     // An empty B on an S key is a schema type mismatch.
     assert_eq!(
