@@ -288,6 +288,8 @@ sudo systemctl enable extenddb
 sudo systemctl start extenddb
 ```
 
+With this unit only the `extenddb` user and root can read export files: the server creates them with mode 0600, and the import and export roots and account directories it creates with mode 0700, whatever the daemon's umask (027, which gave the `extenddb` group read access before v0.1.15; see [Behavior Changes by Release](07-upgrade-manual.md#behavior-changes-by-release)). To give a group access to a root, for example to put import files into it, create the root before the first start with that group and the mode you want, since an existing directory keeps its mode; export files in it are still created 0600.
+
 ## Multi-Instance Considerations
 
 Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:

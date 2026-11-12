@@ -25,7 +25,7 @@ This document describes the security architecture of extenddb, including the thr
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
 - **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
 
 ## Authentication
@@ -364,6 +364,10 @@ Import/export file paths are validated:
 - Binds to `127.0.0.1` (localhost only) by default
 - Auth provider defaults to `builtin` (SigV4 + IAM policies). The server refuses to start with `auth.provider = "none"`.
 - TLS is mandatory. `extenddb init` generates a self-signed certificate; production deployments should use CA-signed certificates.
+
+### Import and Export Files
+
+On Unix, an export file is created with mode 0600, and the directories the server creates to hold import and export files are created with mode 0700: a configured import or export root that does not exist at startup, and the account directory that the first export of an account creates under each export root. The modes are set when the file or directory is created, whatever the server's umask, so only the server's user and root can list the account directories it creates or read an export. Missing parent directories of a root are created with the default mode, as `mkdir -p -m 0700` does. A directory that already exists keeps its mode: a root the operator creates with group access keeps that access, and the export files in it are still 0600. Import files keep the modes they were written with. Releases before v0.1.15 created these directories and files with the umask's modes (0755 and 0644 under umask 022, 0750 and 0640 for a daemon, whose umask is 027), and an upgrade does not change the modes of those that exist; the upgrade manual's [Behavior Changes by Release](07-upgrade-manual.md#behavior-changes-by-release) gives the command that tightens them.
 
 ### Backup and Recovery
 
