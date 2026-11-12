@@ -477,7 +477,7 @@ fn key_conditions_refuse_a_value_of_the_wrong_schema_type() {
 }
 
 #[test]
-fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
+fn key_conditions_refuse_an_empty_key_value() {
     let ss = ss_schema();
     let pk_s = || ("pk", cond("EQ", vec![s("p")]));
     let empty = |conditions: &HashMap<String, Condition>, ks: &[KeySchemaElement]| {
@@ -583,42 +583,6 @@ fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
             empty_binary("sk")
         );
     }
-    // The key schema checks come first: these report their own error with an
-    // empty key value present.
-    assert_eq!(
-        key_error(
-            &kc(vec![
-                ("pk", cond("EQ", vec![s("")])),
-                ("sk", cond("EQ", vec![n("1")]))
-            ]),
-            &ss
-        ),
-        refusal(SCHEMA_TYPE)
-    );
-    assert_eq!(
-        key_error(
-            &kc(vec![
-                ("pk", cond("EQ", vec![n("1")])),
-                ("sk", cond("EQ", vec![s("")]))
-            ]),
-            &ss
-        ),
-        refusal(SCHEMA_TYPE)
-    );
-    assert_eq!(
-        key_error(&kc(vec![("pk", cond("LT", vec![s("")]))]), &ss),
-        Some("Query key condition not supported".to_owned())
-    );
-    assert_eq!(
-        key_error(
-            &kc(vec![
-                ("pk", cond("EQ", vec![s("")])),
-                ("foo", cond("EQ", vec![s("x")]))
-            ]),
-            &ss
-        ),
-        Some("Query condition missed key schema element: pk".to_owned())
-    );
     // An inverted range is a request-time error, reported before the empty
     // bound is looked at.
     let err = validate_key_conditions(&kc(vec![

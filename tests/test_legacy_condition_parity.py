@@ -417,7 +417,7 @@ MEASURED_ORDER = [
     ("keys_only_select_all_attributes", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g"))}}, [INVALID_PARAMS + "Select type ALL_ATTRIBUTES is not supported for global secondary index kidx because its projection type is not ALL"]),
     # A non-indexable operator is refused before the table and index lookups,
     # the ConsistentRead check and the Select checks.
-    ("non_indexable_on_a_missing_table", "absent_table", {"KeyConditions": SK_NE}, [NOT_INDEXABLE]),
+    ("non_indexable_on_a_missing_table", "missing_table", {"KeyConditions": SK_NE}, [NOT_INDEXABLE]),
     ("non_indexable_before_the_index_lookup", "ss_table", {"KeyConditions": SK_NE, "IndexName": "nope"}, [NOT_INDEXABLE]),
     ("non_indexable_before_consistent_read", "ss_table", {"KeyConditions": {"gpk": _eq(_s("g")), "gsk": _cond("NE", [_s("a")])}, "IndexName": "kidx", "ConsistentRead": True}, [NOT_INDEXABLE]),
     ("non_indexable_before_select", "ss_table", {"KeyConditions": SK_NE, "Select": "SPECIFIC_ATTRIBUTES"}, [NOT_INDEXABLE]),
@@ -433,7 +433,7 @@ MEASURED_ORDER = [
 
 
 @pytest.fixture()
-def absent_table():
+def missing_table():
     """The name of a table that does not exist."""
     return f"absent_{uuid.uuid4().hex[:8]}"
 
