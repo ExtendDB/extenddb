@@ -341,6 +341,41 @@ def test_transact_write_items_update(dynamodb_client, table, key):
     }}])) == ("ValidationException", too_long("UpdateExpression", 33))
 
 
+# (case, update expression, names, values): one UpdateExpression defect each,
+# beside a condition with an undefined name. The service answers the
+# condition first, in a transaction as in UpdateItem (measured 2026-11-12,
+# each request twice).
+TRANSACTION_UPDATE_DEFECTS = [
+    ("length", f"SET {p(33)} = :s", N, S),
+    ("syntax", "SET a = = :s", None, S),
+    ("undefined_name", "SET #nope = :s", None, S),
+    ("undefined_value", "SET a = :nope", None, None),
+    ("overlap", "SET a = :s, a.b = :s", None, S),
+    ("reserved_word", "SET name = :s", None, S),
+]
+
+
+@pytest.mark.parametrize(("case", "expr", "names", "values"), TRANSACTION_UPDATE_DEFECTS,
+                         ids=[c[0] for c in TRANSACTION_UPDATE_DEFECTS])
+def test_transact_write_items_update_checks_the_condition_first(dynamodb_client, table, key, case, expr, names,
+                                                                values):
+    update = {"TableName": table, "Key": key, "UpdateExpression": expr, "ConditionExpression": "attribute_exists(#zz)"}
+    if names:
+        update["ExpressionAttributeNames"] = names
+    if values:
+        update["ExpressionAttributeValues"] = values
+    assert _error(lambda: dynamodb_client.transact_write_items(TransactItems=[{"Update": update}])) == (
+        "ValidationException", f"Invalid ConditionExpression: {UNDEFINED_NAME}")
+
+
+def test_transact_write_items_update_checks_the_between_bounds_first(dynamodb_client, table, key):
+    assert _error(lambda: dynamodb_client.transact_write_items(TransactItems=[{"Update": {
+        "TableName": table, "Key": key, "UpdateExpression": f"SET {p(33)} = :s",
+        "ConditionExpression": "#x BETWEEN :hi AND :lo", "ExpressionAttributeNames": X,
+        "ExpressionAttributeValues": {**S, ":hi": {"N": "5"}, ":lo": {"N": "1"}},
+    }}])) == ("ValidationException", f"Invalid ConditionExpression: {BETWEEN}")
+
+
 def test_transact_write_items_condition_check(dynamodb_client, table, key):
     assert _error(lambda: dynamodb_client.transact_write_items(TransactItems=[{"ConditionCheck": {
         "TableName": table, "Key": key, "ConditionExpression": f"attribute_exists({p(33)})",

@@ -21,8 +21,9 @@ UpdateExpression:
     `SET a = :v SET b = :q` reports `:q` and `SET a = :v SET b = :v ADD n :s`
     reports the repeated `SET`.
   - Every unused name or value is listed in one set.
-  - UpdateItem checks the ConditionExpression before the UpdateExpression;
-    inside TransactWriteItems the UpdateExpression comes first.
+  - UpdateItem checks the ConditionExpression before the UpdateExpression,
+    and so does TransactWriteItems (re-measured 2026-11-12; on 2026-10-14
+    the transaction answered the UpdateExpression first).
 
 ConditionExpression and FilterExpression:
   - the six condition functions are matched as written; `if_not_exists` and
@@ -74,7 +75,6 @@ NOT_IN_CONDITION = "The function is not allowed in a condition expression; funct
 OPERAND_COUNT = "Incorrect number of operands for operator or function; operator or function: {}, number of operands: {}"
 NEEDS_PATH = "Operator or function requires a document path; operator or function: {}"
 SECTION_ONCE = 'The "{}" section can only be used once in an update expression;'
-OVERLAP_A_AB = "Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
 EVAL_TYPE = "An operand in the update expression has an incorrect data type"
 KEY_SCHEMA = "The provided key element does not match the schema"
 EMPTY_ARGS_SYNTAX = 'Syntax error; token: ")", near: "()"'
@@ -407,16 +407,17 @@ class TestUpdateWalkOrder:
                 P + C + UNDEF_NAME.format("#b"))
         _expect_prefix(_update(dynamodb_client, table, "SET #a = :v", {":v": N}, condition="attribute_exists("), P + C)
 
-    def test_transaction_checks_the_update_first(self, dynamodb_client, table):
+    def test_transaction_checks_the_condition_first(self, dynamodb_client, table):
         _expect(_transact_update(dynamodb_client, table, "SET #a = :v", {":v": N}, condition="attribute_exists(#b)"),
-                U + UNDEF_NAME.format("#a"))
-        _expect(_transact_update(dynamodb_client, table, "SET #a = :v", {":v": N}, condition="attribute_exists("),
-                U + UNDEF_NAME.format("#a"))
+                C + UNDEF_NAME.format("#b"))
+        _expect_prefix(_transact_update(dynamodb_client, table, "SET #a = :v", {":v": N}, condition="attribute_exists("),
+                       C)
         _expect(_transact_update(dynamodb_client, table, "SET a = :v, a.b = :v", {":v": N}, condition="attribute_exists(#b)"),
-                U + OVERLAP_A_AB)
+                C + UNDEF_NAME.format("#b"))
         _expect(_transact_update(dynamodb_client, table, "ADD n :s", {":s": S}, condition="attribute_exists(#b)"),
-                U + ADD_DELETE_TYPE.format("ADD", "STRING"))
-        _expect_prefix(_transact_update(dynamodb_client, table, "SET a = ", condition="attribute_exists(#b)"), U)
+                C + UNDEF_NAME.format("#b"))
+        _expect(_transact_update(dynamodb_client, table, "SET a = ", condition="attribute_exists(#b)"),
+                C + UNDEF_NAME.format("#b"))
 
 
 class TestUnusedKeysAreListedTogether:

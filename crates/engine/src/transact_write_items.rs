@@ -491,20 +491,18 @@ fn parse_write_expressions(
     validate_value_map_nesting(values)?;
 
     // Inside a transaction the service checks an Update item's
-    // UpdateExpression (syntax, the ordered semantic walk, overlapping paths)
-    // before its ConditionExpression, the reverse of UpdateItem; then the
-    // unused names and values; then, for a Put, the item's size and the
-    // item's nesting (measured: an oversize Put with an unused value reports
-    // the value, an oversize item one reports its size ahead of the next
-    // item's defects, and one item with a long attribute name, an oversize
-    // item and a deep item reports the name first and the nesting last).
+    // ConditionExpression before its UpdateExpression, as UpdateItem does:
+    // a condition with an undefined name or BETWEEN bounds out of order beats
+    // an UpdateExpression syntax error, undefined name or value, overlap,
+    // reserved word, operand type and path length (measured 2026-11-12, each
+    // request twice; on 2026-10-14 the service answered the UpdateExpression
+    // first). Then come the unused names and values; then, for a Put, the
+    // item's size and the item's nesting (measured: an oversize Put with an
+    // unused value reports the value, an oversize item one reports its size
+    // ahead of the next item's defects, and one item with a long attribute
+    // name, an oversize item and a deep item reports the name first and the
+    // nesting last).
     let maps = build_expression_maps(names, values);
-    let actions = match update_expression {
-        Some(expr) => Some(crate::expression_helpers::parse_update_expr_checked(
-            expr, &maps, limits,
-        )?),
-        None => None,
-    };
     let condition = match condition_expression {
         // A ConditionCheck's expression is required, so an empty string is
         // parsed and refused as empty (measured 2026-10-27: `Invalid
@@ -520,6 +518,12 @@ fn parse_write_expressions(
             )?)
         }
         _ => None,
+    };
+    let actions = match update_expression {
+        Some(expr) => Some(crate::expression_helpers::parse_update_expr_checked(
+            expr, &maps, limits,
+        )?),
+        None => None,
     };
     // Transactions accept names/values with no expression (unlike single-item
     // APIs); only check for unused refs when some expression is present.
