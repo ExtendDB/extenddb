@@ -97,17 +97,28 @@ mod tests {
     }
 
     #[test]
-    fn a_projection_path_is_checked_after_its_names() {
+    fn a_projection_path_is_checked_after_its_names_and_before_its_overlap() {
         let compile = |text: &str| {
             let paths =
                 crate::expression::parse_projection(&crate::expression::tokenize(text).unwrap())
                     .unwrap();
             crate::expression::Projection::compile(&paths, &maps(), true).map(|_| ())
         };
-        assert_eq!(
-            message(compile(&path_text("#m", 33))),
-            format!("Invalid ProjectionExpression: {LEVELS_33}")
-        );
+        let long = path_text("#m", 33);
+        let length = format!("Invalid ProjectionExpression: {LEVELS_33}");
+        let overlap = "Invalid ProjectionExpression: Two document paths overlap with each other; \
+                       must remove or rewrite one of these paths; path one: [k], path two: [k]";
+        // Measured 2026-11-12 (us-east-1), each request twice.
+        for (text, want) in [
+            (long.clone(), length.as_str()),
+            (format!("k, k, {long}"), overlap),
+            (format!("{long}, k, k"), length.as_str()),
+            (format!("k, {long}, k"), length.as_str()),
+            (format!("#m, {long}"), length.as_str()),
+            (format!("{}, k, k", path_text("#m", 32)), overlap),
+        ] {
+            assert_eq!(message(compile(&text)), want, "{text}");
+        }
         assert!(message(compile(&path_text("#zz", 33))).contains("attribute name: #zz"));
         assert!(compile(&path_text("#m", 32)).is_ok());
     }

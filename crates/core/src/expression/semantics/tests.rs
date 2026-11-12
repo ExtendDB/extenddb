@@ -251,6 +251,13 @@ fn overlap_after_the_walk() {
             "{U}Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]"
         )
     );
+    // The first path that overlaps an earlier one (measured 2026-11-12).
+    assert_eq!(
+        update_err("SET a = :v, b = :v, b.y = :v, a.x = :v", &m),
+        format!(
+            "{U}Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [b], path two: [b, y]"
+        )
+    );
 }
 
 #[test]

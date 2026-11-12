@@ -297,6 +297,43 @@ def test_projection_names_come_before_the_length(dynamodb_client, table, key):
     ])) == ("ValidationException", f"Invalid ProjectionExpression: {UNDEFINED_NAME}")
 
 
+OVERLAP_K = ("Invalid ProjectionExpression: Two document paths overlap with each other; must remove or rewrite "
+             "one of these paths; path one: [k], path two: [k]")
+
+# (case, projection, message): the service checks the paths one after another,
+# each path's length before its overlap with an earlier path (measured
+# 2026-11-12, each request twice).
+PROJECTION_ORDER = [
+    ("overlap_before_a_later_length", f"#k, #k, {p(33)}", OVERLAP_K),
+    ("length_before_a_later_overlap", f"{p(33)}, #k, #k", too_long("ProjectionExpression", 33)),
+    ("length_between_overlapping_paths", f"#k, {p(33)}, #k", too_long("ProjectionExpression", 33)),
+    ("length_before_its_own_overlap", f"#m, {p(33)}", too_long("ProjectionExpression", 33)),
+    ("overlap_after_a_path_at_the_limit", f"{p(32)}, #k, #k", OVERLAP_K),
+]
+
+
+@pytest.mark.parametrize(("case", "projection", "message"), PROJECTION_ORDER, ids=[c[0] for c in PROJECTION_ORDER])
+def test_projection_paths_are_checked_one_after_another(dynamodb_client, table, key, case, projection, message):
+    assert _error(lambda: dynamodb_client.get_item(
+        TableName=table, Key=key, ProjectionExpression=projection, ExpressionAttributeNames=N,
+    )) == ("ValidationException", message)
+
+
+def test_projection_overlap_before_a_later_length_on_every_read(dynamodb_client, table, key):
+    projection = f"#k, #k, {p(33)}"
+    reads = {
+        "scan": lambda: dynamodb_client.scan(
+            TableName=table, Limit=1, ProjectionExpression=projection, ExpressionAttributeNames=N),
+        "query": lambda: _query(dynamodb_client, table, ProjectionExpression=projection),
+        "batch_get_item": lambda: dynamodb_client.batch_get_item(RequestItems={table: {
+            "Keys": [key], "ProjectionExpression": projection, "ExpressionAttributeNames": N}}),
+        "transact_get_items": lambda: dynamodb_client.transact_get_items(TransactItems=[{"Get": {
+            "TableName": table, "Key": key, "ProjectionExpression": projection, "ExpressionAttributeNames": N}}]),
+    }
+    for operation, read in reads.items():
+        assert _error(read) == ("ValidationException", OVERLAP_K), operation
+
+
 def test_transact_write_items_update(dynamodb_client, table, key):
     assert _error(lambda: dynamodb_client.transact_write_items(TransactItems=[{"Update": {
         "TableName": table, "Key": key, "UpdateExpression": f"SET {p(33)} = :s",

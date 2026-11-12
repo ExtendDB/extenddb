@@ -70,10 +70,8 @@ impl Projection {
         maps: &ExpressionMaps,
         reject_overlap: bool,
     ) -> Result<Self, DynamoDbError> {
-        let resolved = resolve_paths(paths, maps).map_err(prefix_projection_error)?;
-        if reject_overlap {
-            check_overlap(&resolved)?;
-        }
+        let overlap = reject_overlap.then_some(super::ExpressionKind::Projection);
+        let resolved = resolve_paths(paths, maps, overlap).map_err(prefix_projection_error)?;
         Ok(Self {
             root: build_trie(resolved),
         })
@@ -131,11 +129,18 @@ pub(crate) enum ResolvedElement {
 }
 
 /// Resolve `#name` references in parsed paths, rejecting index-start paths.
+///
+/// The service checks the paths one after another in text order: a path's
+/// names, then its length, then, when `overlap` names the expression kind,
+/// whether it overlaps an earlier path (one is a prefix of the other). So
+/// `#k, #k, <33 elements>` answers the overlap, and `#m, <33 elements>` and
+/// `#k, <33 elements>, #k` the length (measured 2026-11-12, us-east-1).
 pub(crate) fn resolve_paths(
     paths: &[Vec<PathElement>],
     maps: &ExpressionMaps,
+    overlap: Option<super::ExpressionKind>,
 ) -> Result<Vec<Vec<ResolvedElement>>, DynamoDbError> {
-    let mut resolved = Vec::with_capacity(paths.len());
+    let mut resolved: Vec<Vec<ResolvedElement>> = Vec::with_capacity(paths.len());
     for path in paths {
         if path.is_empty() {
             continue;
@@ -158,40 +163,25 @@ pub(crate) fn resolve_paths(
                 }
             }
         }
-        // The length after the path's names, as the service checks it.
         if let Some(msg) = super::path_length::too_many_levels(path) {
             return Err(DynamoDbError::ValidationException(msg));
+        }
+        // Siblings are fine; the message names the earlier path first.
+        if let Some(kind) = overlap
+            && let Some(earlier) = resolved
+                .iter()
+                .find(|e| is_prefix(e, &elems) || is_prefix(&elems, e))
+        {
+            return Err(DynamoDbError::ValidationException(format!(
+                "Invalid {kind}: Two document paths overlap with each other; \
+                 must remove or rewrite one of these paths; path one: {}, path two: {}",
+                render_path(earlier),
+                render_path(&elems),
+            )));
         }
         resolved.push(elems);
     }
     Ok(resolved)
-}
-
-/// Reject paths where one is a prefix of another (DynamoDB's overlap rule),
-/// reporting the first offending pair in expression order. Siblings are fine.
-fn check_overlap(resolved: &[Vec<ResolvedElement>]) -> Result<(), DynamoDbError> {
-    check_overlap_for(resolved, super::ExpressionKind::Projection)
-}
-
-/// The overlap rule for any expression kind that names document paths; the
-/// message carries the kind's `Invalid <Kind>:` prefix.
-pub(crate) fn check_overlap_for(
-    resolved: &[Vec<ResolvedElement>],
-    kind: super::ExpressionKind,
-) -> Result<(), DynamoDbError> {
-    for i in 0..resolved.len() {
-        for j in (i + 1)..resolved.len() {
-            if is_prefix(&resolved[i], &resolved[j]) || is_prefix(&resolved[j], &resolved[i]) {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid {kind}: Two document paths overlap with each other; \
-                     must remove or rewrite one of these paths; path one: {}, path two: {}",
-                    render_path(&resolved[i]),
-                    render_path(&resolved[j]),
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Return true when `a` is a prefix of `b` (equal paths included).
@@ -639,6 +629,12 @@ mod tests {
             overlap_msg("x, a.b, a"),
             "Invalid ProjectionExpression: Two document paths overlap with each other; \
              must remove or rewrite one of these paths; path one: [a, b], path two: [a]"
+        );
+        // The first path that overlaps an earlier one (measured 2026-11-12).
+        assert_eq!(
+            overlap_msg("a, b, b.y, a.x"),
+            "Invalid ProjectionExpression: Two document paths overlap with each other; \
+             must remove or rewrite one of these paths; path one: [b], path two: [b, y]"
         );
     }
 

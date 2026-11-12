@@ -332,8 +332,10 @@ pub fn validate_unused_attributes(
 /// prefix of the other, across all four sections, after `#name` resolution:
 /// `SET a = :v, a = :w`, `SET m = :v, m.x = :w`, `SET a.b = :v REMOVE a`, and
 /// `SET #l[1] = :v, #l[1].x = :w` with `#l` bound to `lst` all fail. Siblings
-/// (`m.x` and `m.y`) are fine. The first offending pair in expression order is
-/// named, rendered as the service renders it: `[lst, [1]]`.
+/// (`m.x` and `m.y`) are fine. The first path in expression order that
+/// overlaps an earlier one is named after that earlier path, rendered as the
+/// service renders it: `[lst, [1]]` (`SET a = :v, b = :v, b.y = :v, a.x = :v`
+/// names `[b]` and `[b, y]`, measured 2026-11-12).
 ///
 /// # Errors
 ///
@@ -353,8 +355,7 @@ pub fn validate_update_paths_disjoint(
             | UpdateAction::Delete { path, .. } => path.clone(),
         })
         .collect();
-    let resolved = super::projection::resolve_paths(&paths, maps)?;
-    super::projection::check_overlap_for(&resolved, super::ExpressionKind::Update)
+    super::projection::resolve_paths(&paths, maps, Some(super::ExpressionKind::Update)).map(|_| ())
 }
 
 fn collect_expr_refs(
