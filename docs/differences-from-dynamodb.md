@@ -113,7 +113,7 @@ from a request sent to that service or backend.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Which entry of a legacy `ScanFilter`, `QueryFilter` or `KeyConditions` map is named when two or more entries are invalid | One of the invalid entries, with its own message. Measured 2026-10-23 and 2026-10-24 on 44 two- and three-entry maps: the entry named changed with the attribute names, with the order the entries were sent, and between two runs of the same request, so it is not a function of the request | The invalid entry that sorts first by attribute name, on every backend. One invalid entry is always named with the service's message; only the choice between several differs |
+| Which entry of a legacy `ScanFilter`, `QueryFilter` or `KeyConditions` map is named when two or more entries are invalid | One of the invalid entries, with its own message. Measured 2026-10-23 and 2026-10-24 on 44 two- and three-entry maps: the entry named changed with the attribute names, with the order the entries were sent, and between two runs of the same request, so it is not a function of the request. Measured 2026-11-12 for an empty value on both keys: 32 sends of one request named `pk` 12 times and `sk` 20 times | The invalid entry that sorts first by attribute name, on every backend; for empty key values, the first key in key schema order. One invalid entry is always named with the service's message; only the choice between several differs |
 
 ## Backup and Restore
 
