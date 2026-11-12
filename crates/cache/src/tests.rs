@@ -668,7 +668,7 @@ async fn panicking_refresh_does_not_leak_inflight_flag() {
     let cache = SwrCache::new(
         loader,
         SwrCacheConfig {
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
             ..fast_config()
         },
     );
