@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    parse_update_sections, tokenize_for, tokenize_with_limit, validate_condition_semantics,
-    validate_no_reserved_words, validate_update_semantics,
+    parse_condition_with_depth_limit, parse_key_condition_with_maps, parse_projection,
+    parse_update_from, parse_update_sections, tokenize_for, tokenize_with_limit,
+    validate_condition_semantics, validate_no_reserved_words, validate_update_semantics,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -380,27 +380,29 @@ pub fn parse_projection_expr(
 
 /// Size-check, tokenize, reserved-word check, and parse a
 /// `KeyConditionExpression`, then reject a `#name` or `:value` the request
-/// does not define.
+/// does not define and a document path of more than 32 elements.
 ///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon
-/// `DynamoDB`. The references are checked once the whole expression parses,
-/// in the order they stand in the text, names and values alike (measured
-/// 2026-10-27: `pk = :q AND #n = :v` names `:q`, `#b = :p AND #a > :q` names
-/// `#b`). The check runs before the key schema is consulted, so an undefined
-/// `#n` is reported as such rather than as a key schema mismatch (measured
-/// 2026-10-14).
+/// `DynamoDB`. Once the whole expression parses, the references and the path
+/// lengths are checked in one pass in text order, names and values alike.
+/// Measured 2026-10-27: `pk = :q AND #n = :v` names `:q`, and
+/// `#b = :p AND #a > :q` names `#b`. See
+/// `extenddb_core::expression::parse_key_condition_with_maps` for the
+/// lengths. The check runs before the key schema is consulted, so an
+/// undefined `#n` is reported as such rather than as a key schema mismatch
+/// (measured 2026-10-14).
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax,
-/// reserved-word, or undefined-reference errors.
+/// reserved-word, undefined-reference or path-length errors.
 pub fn parse_key_condition_expr(
     expr: &str,
     maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
-    let (tokens, parsed) = tokenize_for(
+    tokenize_for(
         expr,
         limits.max_expression_tokens,
         ExpressionKind::KeyCondition,
@@ -409,33 +411,9 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        let parsed = parse_key_condition(&tokens)?;
-        Ok((tokens, parsed))
+        parse_key_condition_with_maps(&tokens, maps)
     })
-    .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))?;
-    check_key_condition_refs(&tokens, maps)?;
-    Ok(parsed)
-}
-
-/// The first `#name` or `:value` token, in text order, that `maps` does not
-/// define.
-fn check_key_condition_refs(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
-    for token in tokens {
-        match token {
-            Token::NameRef(name) if !maps.names.contains_key(name) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #{name}"
-                )));
-            }
-            Token::Placeholder(value) if !maps.values.contains_key(value) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :{value}"
-                )));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+    .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
 
 /// Prefix an expression error with the expression type, matching `DynamoDB`'s format.

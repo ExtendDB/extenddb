@@ -147,6 +147,28 @@ pub async fn handle_put_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
+    // The Item's numbers and nesting come before every expression check, with
+    // or without ExpressionAttributeValues (measured 2026-11-12). An Item
+    // holding `{N: abc}` or an attribute 33 maps deep answers the number or
+    // the nesting error beside a condition fault. The faults measured are a
+    // syntax error, an undefined name or value, an unused value and a
+    // reserved word. They also include a path of 33 elements and BETWEEN
+    // bounds out of order.
+    extenddb_core::validation::validate_item_numbers(&input.item)?;
+    extenddb_core::validation::validate_item_nesting_depth(&input.item)?;
+
+    // The nesting-depth limit applies to every ExpressionAttributeValue on the
+    // single-item write paths, condition-only placeholders included: measured
+    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
+    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
+    // alike, while 31 levels is accepted. TransactWriteItems checks its values
+    // separately, in `validate_value_map_nesting`. This check comes after the
+    // Item's numbers and nesting and before the ConditionExpression and the
+    // table lookup (measured 2026-10-26).
+    if let Some(values) = &input.expression_attribute_values {
+        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
+    }
+
     // Validate expressions/`Expected` before the existence check,
     // so a malformed request to a missing table returns ValidationException,
     // not ResourceNotFoundException. Key/item-content checks stay after.
@@ -192,17 +214,6 @@ pub async fn handle_put_item(
         &key_info.key_schema,
         &key_info.attribute_definitions,
     )?;
-
-    // The nesting-depth limit applies to every ExpressionAttributeValue on the
-    // single-item write paths, condition-only placeholders included: measured
-    // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
-    // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
-    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
-    // NOT get this check: the same 32-level condition-only value is accepted
-    // inside a transaction on every sub-op shape (also measured).
-    if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
-    }
 
     extenddb_core::validation::validate_vector_write(
         &input.item,

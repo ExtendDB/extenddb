@@ -76,4 +76,5 @@ mod tests;
 mod update_rules;
 
 pub use condition_rules::validate_condition_semantics;
+pub(in crate::expression) use refs::{check_path_refs, check_value_defined};
 pub use update_rules::validate_update_semantics;

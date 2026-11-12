@@ -227,6 +227,44 @@ fn between_out_of_range() {
     assert!(!eval("age BETWEEN :lo AND :hi", &item, HashMap::new(), values).unwrap());
 }
 
+/// Bounds of different types or with the lower above the upper are refused
+/// whatever the item holds. A legacy `Expected` condition reaches the
+/// evaluator without the semantic walk, so this is its only bounds check.
+/// Measured 2026-11-12: PutItem with `Expected` `n BETWEEN [5, 1]` answers
+/// ValidationException on a missing and on an existing item.
+#[test]
+fn between_bounds_at_fault_are_refused_for_every_item() {
+    let bounds = |lo: AttributeValue, hi: AttributeValue| {
+        HashMap::from([("lo".to_owned(), lo), ("hi".to_owned(), hi)])
+    };
+    for (values, want) in [
+        (
+            bounds(AttributeValue::N("5".into()), AttributeValue::N("1".into())),
+            "Invalid ConditionExpression: The BETWEEN operator requires upper bound to be \
+             greater than or equal to lower bound; lower bound operand: AttributeValue: {N:5}, \
+             upper bound operand: AttributeValue: {N:1}",
+        ),
+        (
+            bounds(AttributeValue::N("1".into()), AttributeValue::S("a".into())),
+            "Invalid ConditionExpression: The BETWEEN operator requires same data type for \
+             lower and upper bounds; lower bound operand: AttributeValue: {N:1}, upper bound \
+             operand: AttributeValue: {S:a}",
+        ),
+    ] {
+        for item in [simple_item(), BTreeMap::new()] {
+            match eval(
+                "age BETWEEN :lo AND :hi",
+                &item,
+                HashMap::new(),
+                values.clone(),
+            ) {
+                Err(DynamoDbError::ValidationException(msg)) => assert_eq!(msg, want),
+                other => panic!("{want}: {other:?}"),
+            }
+        }
+    }
+}
+
 #[test]
 fn in_expression_match() {
     let item = simple_item();

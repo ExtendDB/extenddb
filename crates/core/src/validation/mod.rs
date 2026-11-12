@@ -1092,8 +1092,6 @@ pub fn validate_put_item(
     // The attribute-name size check is not here: the service reports it
     // ahead of the table lookup, so the handler runs it before this.
     validate_item_keys(&input.item, key_schema, attr_defs)?;
-    validate_item_numbers(&input.item)?;
-    validate_item_nesting_depth(&input.item)?;
 
     let size = item_size_bytes(&input.item);
     if size > limits.max_item_size_bytes {
