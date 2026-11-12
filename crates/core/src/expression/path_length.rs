@@ -83,17 +83,52 @@ mod tests {
     const LEVELS_33: &str = "The document path has too many nesting levels; nesting levels: 33";
 
     #[test]
-    fn a_key_condition_path_is_checked_before_the_nested_refusal() {
-        let parse = |n: usize| {
-            let expr = format!("pk = :v AND {} = :v", path_text("m", n));
-            crate::expression::parse_key_condition(&crate::expression::tokenize(&expr).unwrap())
-                .map(|_| ())
-        };
-        assert_eq!(
-            message(parse(33)),
-            format!("Invalid KeyConditionExpression: {LEVELS_33}")
+    fn a_key_condition_checks_names_values_and_lengths_in_text_order() {
+        let maps = crate::expression::ExpressionMaps::new(
+            std::collections::HashMap::from([("m".to_owned(), "m".to_owned())]),
+            ["p", "s"]
+                .into_iter()
+                .map(|k| {
+                    (
+                        k.to_owned(),
+                        crate::types::AttributeValue::S("v".to_owned()),
+                    )
+                })
+                .collect(),
         );
-        assert!(message(parse(32)).contains("cannot have conditions on nested attributes"));
+        let parse = |expr: &str| {
+            let tokens = crate::expression::tokenize(expr).unwrap();
+            crate::expression::parse_key_condition_with_maps(&tokens, &maps).map(|_| ())
+        };
+        let (long, at_limit) = (path_text("#m", 33), path_text("#m", 32));
+        let length = format!("Invalid KeyConditionExpression: {LEVELS_33}");
+        let name = "Invalid KeyConditionExpression: An expression attribute name used in the \
+                    document path is not defined; attribute name: #zz";
+        let value = "Invalid KeyConditionExpression: An expression attribute value used in \
+                     expression is not defined; attribute value: :nope";
+        let nested = "Invalid KeyConditionExpression: KeyConditionExpressions cannot have \
+                      conditions on nested attributes";
+        // Measured 2026-11-12 (us-east-1), each request twice.
+        for (expr, want) in [
+            (format!("pk = :p AND {long} = :s"), length.as_str()),
+            (format!("pk = :p AND {} = :s", path_text("#zz", 33)), name),
+            (format!("pk = :nope AND {long} = :s"), value),
+            (format!("{long} = :s AND pk = :nope"), length.as_str()),
+            (format!("#zz = :p AND {long} = :s"), name),
+            (format!("{long} = :s AND #zz = :p"), length.as_str()),
+            (format!("pk = :p AND {long} = :nope"), length.as_str()),
+            (
+                format!("pk = :p AND begins_with({long}, :nope)"),
+                length.as_str(),
+            ),
+            (format!("pk = :p AND {at_limit}.#zz = :s"), name),
+            (format!("pk = :p AND {at_limit} = :s"), nested),
+            (format!("#zz = :p AND {at_limit} = :s"), name),
+            (format!("{at_limit} = :s AND pk = :nope"), value),
+            ("pk < :nope".to_owned(), value),
+        ] {
+            assert_eq!(message(parse(&expr)), want, "{expr}");
+        }
     }
 
     #[test]

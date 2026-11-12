@@ -481,6 +481,36 @@ def test_query_key_condition(dynamodb_client, table, key):
         "Invalid KeyConditionExpression: KeyConditionExpressions cannot have conditions on nested attributes")
 
 
+KEY_NAME = f"Invalid KeyConditionExpression: {UNDEFINED_NAME}"
+KEY_VALUE = f"Invalid KeyConditionExpression: {UNDEFINED_VALUE}"
+KEY_LENGTH = too_long("KeyConditionExpression", 33)
+
+# (case, key condition, names, values defined, message): the names, the
+# values and each path's length in one pass in text order, then the
+# nested-attribute refusal (measured 2026-11-12, each request twice).
+KEY_CONDITION_ORDER = [
+    ("name_inside_the_long_path", "pk = :p AND #zz" + ".#k" * 32 + " = :s", {"#k": "k"}, (":p", ":s"), KEY_NAME),
+    ("value_in_an_earlier_clause", f"pk = :nope AND {p(33)} = :s", N, (":s",), KEY_VALUE),
+    ("length_before_a_later_value", f"{p(33)} = :s AND pk = :nope", N, (":s",), KEY_LENGTH),
+    ("name_in_an_earlier_clause", f"#zz = :p AND {p(33)} = :s", N, (":p", ":s"), KEY_NAME),
+    ("length_before_a_later_name", f"{p(33)} = :s AND #zz = :p", N, (":p", ":s"), KEY_LENGTH),
+    ("length_before_its_value", f"pk = :p AND {p(33)} = :nope", N, (":p",), KEY_LENGTH),
+    ("name_at_the_end_of_the_long_path", f"pk = :p AND {p(32)}.#zz = :s", N, (":p", ":s"), KEY_NAME),
+    ("name_before_the_nested_refusal", f"#zz = :p AND {p(32)} = :s", N, (":p", ":s"), KEY_NAME),
+    ("value_before_the_nested_refusal", f"{p(32)} = :s AND pk = :nope", N, (":s",), KEY_VALUE),
+]
+
+
+@pytest.mark.parametrize(("case", "condition", "names", "values", "message"), KEY_CONDITION_ORDER,
+                         ids=[c[0] for c in KEY_CONDITION_ORDER])
+def test_key_condition_checks_names_values_and_lengths_in_text_order(dynamodb_client, table, case, condition,
+                                                                     names, values, message):
+    assert _error(lambda: dynamodb_client.query(
+        TableName=table, KeyConditionExpression=condition, ExpressionAttributeNames=names,
+        ExpressionAttributeValues={v: {"S": "plen"} for v in values},
+    )) == ("ValidationException", message)
+
+
 def test_query_filter_is_checked_before_the_projection(dynamodb_client, table, key):
     assert _error(lambda: _query(dynamodb_client, table,
                                  FilterExpression=f"attribute_exists(#zz) OR attribute_exists({p(33)})")) == (
