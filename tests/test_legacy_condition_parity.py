@@ -56,7 +56,7 @@ def _validation_error(call):
 
 @pytest.fixture(scope="module")
 def ss_table(dynamodb_client):
-    """pk S, sk S, with a GSI on gpk S / gsk S and two items under pk p1."""
+    """pk S, sk S, with GSIs on gpk S / gsk S (gsi1 ALL, kidx KEYS_ONLY) and two items under pk p1."""
     name = f"legacy_parity_{uuid.uuid4().hex[:8]}"
     dynamodb_client.create_table(
         TableName=name,
@@ -72,7 +72,12 @@ def ss_table(dynamodb_client):
                 "IndexName": "gsi1",
                 "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}, {"AttributeName": "gsk", "KeyType": "RANGE"}],
                 "Projection": {"ProjectionType": "ALL"},
-            }
+            },
+            {
+                "IndexName": "kidx",
+                "KeySchema": [{"AttributeName": "gpk", "KeyType": "HASH"}, {"AttributeName": "gsk", "KeyType": "RANGE"}],
+                "Projection": {"ProjectionType": "KEYS_ONLY"},
+            },
         ],
         BillingMode="PAY_PER_REQUEST",
     )
@@ -349,6 +354,7 @@ SPECIFIC = "1 validation error detected: Must specify the AttributesToGet or Pro
 ALL_PROJECTED = "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
 RANGE_R1_FOR_R2 = "RANGE key attributes r1 must have equality conditions specified in the query because a condition is present on key attribute r2"
 MIDX = {"IndexName": "midx"}
+KEYS_ONLY_ALL = {"IndexName": "kidx", "Select": "ALL_ATTRIBUTES"}
 
 # Query requests measured on 2026-11-12 against tables of these fixtures'
 # shapes, two sends each: (id, fixture, request, the answers the service
@@ -376,6 +382,20 @@ MEASURED_ORDER = [
     ("select_before_empty_hash", "ss_table", {"KeyConditions": {"pk": _eq(_s(""))}, "Select": "SPECIFIC_ATTRIBUTES"}, [SPECIFIC]),
     ("select_before_empty_range", "ss_table", {"KeyConditions": {"pk": _eq(_s("p1")), "sk": _eq(_s(""))}, "Select": "SPECIFIC_ATTRIBUTES"}, [SPECIFIC]),
     ("all_projected_before_empty_hash", "ss_table", {"KeyConditions": {"pk": _eq(_s(""))}, "Select": "ALL_PROJECTED_ATTRIBUTES"}, [ALL_PROJECTED]),
+    # Select ALL_ATTRIBUTES on a KEYS_ONLY GSI is reported after the key
+    # condition, Select, empty key, QueryFilter key and start key checks.
+    ("keys_only_query_filter_on_key_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g"))}, "QueryFilter": {"gpk": _eq(_s("g"))}}, [FILTER_ON_KEY.format("gpk")]),
+    ("keys_only_query_filter_on_key_before_start_key", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g"))}, "QueryFilter": {"gpk": _eq(_s("g"))}, "ExclusiveStartKey": {"zz": _s("x")}}, [FILTER_ON_KEY.format("gpk")]),
+    ("keys_only_empty_hash_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s(""))}}, [EMPTY_KEY.format("gpk")]),
+    ("keys_only_empty_range_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g")), "gsk": _eq(_s(""))}}, [EMPTY_KEY.format("gsk")]),
+    ("keys_only_schema_type_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_n("1"))}}, [SCHEMA_TYPE]),
+    ("keys_only_missing_hash_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gsk": _eq(_s("a"))}}, ["Query condition missed key schema element: gpk"]),
+    ("keys_only_hash_operator_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _cond("LT", [_s("g")])}}, [NOT_SUPPORTED]),
+    ("keys_only_expression_type_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditionExpression": "gpk = :v", "ExpressionAttributeValues": {":v": _n("1")}}, [SCHEMA_TYPE]),
+    ("keys_only_expression_missing_hash_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditionExpression": "gsk = :v", "ExpressionAttributeValues": {":v": _s("a")}}, ["Query condition missed key schema element: gpk"]),
+    ("keys_only_projection_first", "ss_table", {**KEYS_ONLY_ALL, "KeyConditionExpression": "gpk = :v", "ExpressionAttributeValues": {":v": _s("g")}, "ProjectionExpression": "x"}, ["1 validation error detected: Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES"]),
+    ("keys_only_no_key_condition_first", "ss_table", {**KEYS_ONLY_ALL}, ["Either the KeyConditions or KeyConditionExpression parameter must be specified in the request."]),
+    ("keys_only_select_all_attributes", "ss_table", {**KEYS_ONLY_ALL, "KeyConditions": {"gpk": _eq(_s("g"))}}, [INVALID_PARAMS + "Select type ALL_ATTRIBUTES is not supported for global secondary index kidx because its projection type is not ALL"]),
 ]
 
 

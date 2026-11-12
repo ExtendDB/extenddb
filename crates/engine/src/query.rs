@@ -331,12 +331,6 @@ pub async fn handle_query(
         ));
     }
 
-    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
-    // With an ExclusiveStartKey this runs after the start key checks below.
-    if input.exclusive_start_key.is_none() {
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
-    }
-
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
     let query_key_info = if let Some(ref idx) = index_info {
@@ -529,8 +523,13 @@ pub async fn handle_query(
                 forward: input.scan_index_forward,
             },
         )?;
-        validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
+
+    // Select=ALL_ATTRIBUTES requires an ALL-projection GSI (shared with Scan).
+    // The service reports it after every check above: the key condition,
+    // Select, empty key value, QueryFilter key and ExclusiveStartKey checks
+    // (measured 2026-10-23 and 2026-11-12).
+    validate_query_select_index_support(input.select, index_info.as_ref())?;
 
     // Determine which key schema to use for LastEvaluatedKey extraction.
     // For index queries, the LEK includes both the index key and the base table key,

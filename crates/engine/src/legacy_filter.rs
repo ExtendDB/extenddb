@@ -235,8 +235,9 @@ pub fn reject_empty_key_values(
 /// keys pass on a GSI query and index keys pass on a table query). The
 /// service reports it after the table and index lookup, the key schema and
 /// empty key value checks and the Select checks, and before the key value
-/// size check and the `ExclusiveStartKey` check, so the caller runs it after
-/// the Select checks.
+/// size check, the `ExclusiveStartKey` check and `Select=ALL_ATTRIBUTES` on a
+/// GSI whose projection is not `ALL` (measured 2026-11-12), so the caller runs
+/// it after the empty key value check.
 ///
 /// # Errors
 ///
