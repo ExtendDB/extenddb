@@ -17,8 +17,8 @@
 //! difference these tests leave alone.
 
 use aws_sdk_dynamodb::types::{
-    ConditionCheck, ExpectedAttributeValue, Get, KeysAndAttributes, Put, TransactGetItem,
-    TransactWriteItem,
+    AttributeValue, ConditionCheck, ExpectedAttributeValue, Get, KeysAndAttributes, Put,
+    TransactGetItem, TransactWriteItem, Update,
 };
 
 use crate::number_validation_all_ops::{
@@ -220,6 +220,82 @@ async fn transact_write_items_reports_an_earlier_key_number_ahead_of_a_later_con
         .expect("check");
     let err = transact_write(vec![txn_delete(first), txn_check(second)]).await;
     assert_refused_with(&err.unwrap_err(), NUMERIC);
+}
+
+/// A `TransactWriteItems` Put of `item` into `table`, with an optional
+/// condition and the given `ExpressionAttributeValues`.
+fn put_action(
+    table: &str,
+    item: Key,
+    condition: Option<&str>,
+    values: &[(&str, AttributeValue)],
+) -> TransactWriteItem {
+    let mut put = Put::builder()
+        .table_name(table)
+        .set_item(Some(item))
+        .set_condition_expression(condition.map(str::to_string));
+    for (name, value) in values {
+        put = put.expression_attribute_values(*name, value.clone());
+    }
+    TransactWriteItem::builder()
+        .put(put.build().expect("put"))
+        .build()
+}
+
+/// A `TransactWriteItems` Update of a `simple_key_string` item with the
+/// given expression and `ExpressionAttributeValues`.
+fn update_action(
+    table: &str,
+    expression: &str,
+    values: &[(&str, AttributeValue)],
+) -> TransactWriteItem {
+    let mut update = Update::builder()
+        .table_name(table)
+        .set_key(Some(string_key("o618")))
+        .update_expression(expression);
+    for (name, value) in values {
+        update = update.expression_attribute_values(*name, value.clone());
+    }
+    TransactWriteItem::builder()
+        .update(update.build().expect("update"))
+        .build()
+}
+
+#[tokio::test]
+async fn transact_write_items_reports_an_actions_number_ahead_of_its_other_faults() {
+    // One action holding `abc` and one other fault: a missing table, a
+    // condition syntax error, an unused value, an empty key, an item over
+    // 400 KB, an update syntax error or an update of the key. The number on
+    // each, 6 of 6 sends (2026-11-12).
+    let t = tables().await;
+    let table = t.simple_key_string.as_str();
+    let mut empty_key = item_with_a_malformed_number("o618");
+    empty_key.insert(HASH_KEY_S.to_string(), s(""));
+    let mut large = item_with_a_malformed_number("o618");
+    large.insert("big".to_string(), s(&"x".repeat(410_000)));
+    let abc = n_raw("abc");
+    let actions = [
+        put_action(&missing_table(), item_with_a_malformed_number("o618"), None, &[]),
+        put_action(table, item_with_a_malformed_number("o618"), Some("attribute_exists("), &[]),
+        put_action(
+            table,
+            item_with_a_malformed_number("o618"),
+            Some("attribute_not_exists(n)"),
+            &[(":u", s("x"))],
+        ),
+        put_action(table, empty_key, None, &[]),
+        put_action(table, large, None, &[]),
+        update_action(table, "SET n = = :w", &[(":w", abc.clone())]),
+        update_action(
+            table,
+            &format!("SET {HASH_KEY_S} = :v, n = :w"),
+            &[(":v", s("y")), (":w", abc)],
+        ),
+    ];
+    for action in actions {
+        let err = transact_write(vec![action]).await;
+        assert_refused_with(&err.unwrap_err(), NUMERIC);
+    }
 }
 
 // ---- an attribute name over the size limit (measured 2026-11-11) ----

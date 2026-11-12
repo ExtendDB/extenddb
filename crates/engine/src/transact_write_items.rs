@@ -100,14 +100,19 @@ pub async fn handle_transact_write_items(
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
-        let op = prepare_write_op(twi, ctx).await?;
-        // A number the service cannot read is checked after this action is
-        // prepared and before the next one is. Where the action also holds
-        // another fault, that fault is answered, as before this check; the
-        // service answers the number there (12 rows measured 2026-10-27). An
-        // earlier action's condition syntax error or unused value is answered
-        // ahead of a later action's number, as on the service.
+        // Each action's numbers are checked before the action is prepared, so
+        // a Put item is not sized while it holds a number the service cannot
+        // read: sizing one builds a string as long as the exponent and ends
+        // the process. Within an action the service answers the number ahead
+        // of a missing table, a condition or update syntax error, an unused
+        // value, an empty key, a key update and an item over the size limit
+        // (6 of 6 sends each, measured 2026-11-12); beside a value nested too
+        // deep it answered either (2 and 4 of 6). Across actions an earlier
+        // action's fault still comes first: the service agrees for a condition
+        // syntax error and an unused value, and answers the later number for a
+        // missing table (6 of 6), as the base does too.
         extenddb_core::validation::number::operations::transact_write_item(twi)?;
+        let op = prepare_write_op(twi, ctx).await?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
             return Err(DynamoDbError::ValidationException(

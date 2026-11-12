@@ -313,6 +313,23 @@ async fn transact_write_items_rejects_a_malformed_number_sort_key() {
     assert_refused(&err.unwrap_err(), NUMERIC);
 }
 
+#[tokio::test]
+async fn transact_write_items_refuses_a_put_number_with_a_64_bit_exponent() {
+    // Measured 2026-11-12, 6 of 6 sends each, with no prefix. The item is not
+    // sized before its numbers are checked: sizing it builds a string as long
+    // as the exponent.
+    let t = tables().await;
+    for (value, message) in [
+        ("1E9223372036854775807", OVERFLOW),
+        ("1E-9223372036854775808", crate::number_validation::UNDERFLOW_MESSAGE),
+    ] {
+        let mut item = string_key("t618");
+        item.insert("amount".to_string(), n_raw(value));
+        let err = transact_write(vec![txn_put(put_of(&t.simple_key_string, item))]).await;
+        assert_refused(&err.unwrap_err(), message);
+    }
+}
+
 // ---- ExpressionAttributeValues ----
 
 #[tokio::test]
