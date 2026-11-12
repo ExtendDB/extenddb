@@ -934,9 +934,9 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
     mismatch" or, when the flipped byte sits in the gzip trailer so the
     decoder's own CRC fires first, "data file <key>: data file decode error:
     corrupt gzip stream does not have a matching checksum" instead. A
-    CREATING target answers no read whatever the job did, so the GetItem
-    probe below only confirms the target never became readable. The backup
-    itself stays AVAILABLE."""
+    CREATING target answers no read whatever the job did, and
+    `_restore_fails` checks that the target stays CREATING until it is
+    removed. The backup itself stays AVAILABLE."""
     d = deployment
     _restore_cell(d)
     _add_backup_settings(d, RESTORE_BACKUP_SETTINGS)
@@ -949,33 +949,10 @@ def test_a_tampered_data_file_fails_the_restore_before_any_item(deployment, tmp_
             last = f.read(1)
             f.seek(-1, os.SEEK_END)
             f.write(bytes([last[0] ^ 0xFF]))
-        target = f"{name}-r"
-        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=arn)["TableDescription"]
-        assert resp["TableStatus"] == "CREATING", resp
-        assert resp["RestoreSummary"]["SourceBackupArn"] == arn, resp
-        readable = []
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            try:
-                got = ddb.get_item(TableName=target, Key={"pk": {"S": "p0000"}, "sk": {"N": "0"}}, ConsistentRead=True)
-                if "Item" in got:
-                    readable.append(got["Item"])
-            except ClientError:
-                pass
-            try:
-                ddb.describe_table(TableName=target)
-            except ClientError as e:
-                assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
-                break
-            time.sleep(0.2)
-        else:
-            raise AssertionError(f"{target} was not removed within 120 s")
-        assert readable == [], f"an item of the failed restore was readable: {readable[:1]}"
-        log = server.log_text()
-        failed = [line for line in log.splitlines() if "FAILED (data file data/000002.json.gz does not match the manifest" in line]
-        assert len(failed) == 1, log[-4000:]
-        assert "the target was removed" in failed[0], failed[0]
-        assert ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]["BackupStatus"] == "AVAILABLE"
+        _restore_fails(
+            server, ddb, f"{name}-r", arn,
+            "FAILED (data file data/000002.json.gz does not match the manifest",
+        )
     finally:
         server.stop()
 
