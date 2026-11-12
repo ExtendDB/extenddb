@@ -38,15 +38,12 @@ use extenddb_core::validation::{validate_attribute_number, validate_no_empty_key
 /// 2. a condition on an attribute outside the key schema answers `Query
 ///    condition missed key schema element: <hash>` (the service names the
 ///    first absent key, and refuses three conditions on a two-key schema with
-///    its own message; neither is changed here);
-/// 3. an empty `S` or `B` key value, hash key first, answers `One or more
-///    parameter values are not valid. The AttributeValue for a key attribute
-///    cannot contain an empty string value. Key: <name>` (measured for every
-///    range operator and both `BETWEEN` bounds; the binary wording is the
-///    shared key check's and was not measured on this path).
+///    its own message; neither is changed here).
 ///
 /// The request-time checks ([`validate_key_conditions`]) ran before the table
-/// lookup, so a non-indexable operator never reaches this function.
+/// lookup, so a non-indexable operator never reaches this function. An empty
+/// key value is reported later, after the Select checks
+/// ([`reject_empty_key_values`]).
 ///
 /// # Errors
 ///
@@ -105,15 +102,6 @@ pub fn desugar_key_conditions(
             return Err(DynamoDbError::ValidationException(format!(
                 "Query condition missed key schema element: {hash_attr}"
             )));
-        }
-    }
-
-    for value in &hash_cond.attribute_value_list {
-        validate_no_empty_key_value(hash_attr, value)?;
-    }
-    if let Some((name, cond)) = range_cond {
-        for value in &cond.attribute_value_list {
-            validate_no_empty_key_value(name, value)?;
         }
     }
 
@@ -208,6 +196,34 @@ pub fn validate_key_conditions(
         return Err(DynamoDbError::ValidationException(format!(
             "{INVALID_PARAMS}Attempted conditional constraint is not an indexable operation"
         )));
+    }
+    Ok(())
+}
+
+/// Refuse an empty `S` or `B` value on a key of the queried table or index:
+/// `One or more parameter values are not valid. The AttributeValue for a key
+/// attribute cannot contain an empty string value. Key: <name>` (`binary` for
+/// `B`). Measured 2026-10-24 for every range operator and both `BETWEEN`
+/// bounds, and 2026-11-12 on a GSI with HASH `h1`, `h2` and RANGE `r1`, `r2`
+/// and on a B/B table. The service reports it after the key schema checks and
+/// the Select checks, and before a `QueryFilter` on a key, on every key
+/// schema. When several keys hold an empty value the service names any one of
+/// them (the same request named `pk` or `sk` from one send to the next); this
+/// names the first in key schema order.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` naming the key attribute.
+pub fn reject_empty_key_values(
+    conditions: &HashMap<String, Condition>,
+    key_schema: &[KeySchemaElement],
+) -> Result<(), DynamoDbError> {
+    for ks in key_schema {
+        if let Some(cond) = conditions.get(&ks.attribute_name) {
+            for value in &cond.attribute_value_list {
+                validate_no_empty_key_value(&ks.attribute_name, value)?;
+            }
+        }
     }
     Ok(())
 }

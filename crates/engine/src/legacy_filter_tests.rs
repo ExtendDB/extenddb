@@ -464,42 +464,77 @@ fn key_conditions_refuse_a_value_of_the_wrong_schema_type() {
 fn key_conditions_refuse_an_empty_string_after_the_schema_checks() {
     let ss = ss_schema();
     let pk_s = || ("pk", cond("EQ", vec![s("p")]));
+    let empty = |conditions: &HashMap<String, Condition>, ks: &[KeySchemaElement]| {
+        match reject_empty_key_values(conditions, ks) {
+            Ok(()) => None,
+            Err(DynamoDbError::ValidationException(m)) => Some(m),
+            Err(other) => panic!("unexpected error {other:?}"),
+        }
+    };
     assert_eq!(
-        key_error(&kc(vec![("pk", cond("EQ", vec![s("")]))]), &ss),
+        empty(&kc(vec![("pk", cond("EQ", vec![s("")]))]), &ss.0),
         empty_key("pk")
     );
     for op in ["EQ", "LE", "LT", "GE", "GT", "BEGINS_WITH"] {
         assert_eq!(
-            key_error(&kc(vec![pk_s(), ("sk", cond(op, vec![s("")]))]), &ss),
+            empty(&kc(vec![pk_s(), ("sk", cond(op, vec![s("")]))]), &ss.0),
             empty_key("sk"),
             "{op}"
         );
     }
+    for bounds in [vec![s(""), s("a")], vec![s(""), s("")]] {
+        assert_eq!(
+            empty(&kc(vec![pk_s(), ("sk", cond("BETWEEN", bounds))]), &ss.0),
+            empty_key("sk")
+        );
+    }
+    // Both keys empty: the service names either one (measured 2026-11-12);
+    // this names the first in key schema order.
     assert_eq!(
-        key_error(
-            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s(""), s("a")]))]),
-            &ss
-        ),
-        empty_key("sk")
-    );
-    assert_eq!(
-        key_error(
-            &kc(vec![pk_s(), ("sk", cond("BETWEEN", vec![s(""), s("")]))]),
-            &ss
-        ),
-        empty_key("sk")
-    );
-    // Hash key named first; schema type, operator and non-key checks come first.
-    assert_eq!(
-        key_error(
+        empty(
             &kc(vec![
                 ("pk", cond("EQ", vec![s("")])),
                 ("sk", cond("EQ", vec![s("")]))
             ]),
-            &ss
+            &ss.0
         ),
         empty_key("pk")
     );
+    // Every HASH and RANGE attribute of a multi-attribute key schema
+    // (measured 2026-11-12), and no attribute outside the key schema.
+    let (multi, _) = schema(&[
+        ("h1", KeyType::Hash, ScalarAttributeType::S),
+        ("h2", KeyType::Hash, ScalarAttributeType::S),
+        ("r1", KeyType::Range, ScalarAttributeType::S),
+        ("r2", KeyType::Range, ScalarAttributeType::S),
+    ]);
+    let eq = |v: &str| cond("EQ", vec![s(v)]);
+    for (name, conditions) in [
+        ("h1", kc(vec![("h1", eq("")), ("h2", eq("b"))])),
+        ("h2", kc(vec![("h1", eq("a")), ("h2", eq(""))])),
+        (
+            "r1",
+            kc(vec![
+                ("h1", eq("a")),
+                ("h2", eq("b")),
+                ("r1", cond("BEGINS_WITH", vec![s("")])),
+            ]),
+        ),
+        (
+            "r2",
+            kc(vec![
+                ("h1", eq("a")),
+                ("h2", eq("b")),
+                ("r1", eq("c")),
+                ("r2", eq("")),
+            ]),
+        ),
+    ] {
+        assert_eq!(empty(&conditions, &multi), empty_key(name));
+    }
+    assert_eq!(empty(&kc(vec![pk_s(), ("foo", eq(""))]), &ss.0), None);
+    // The key schema checks come first: these report their own error with an
+    // empty key value present.
     assert_eq!(
         key_error(
             &kc(vec![

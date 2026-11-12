@@ -101,6 +101,35 @@ def sn_table(dynamodb_client):
     dynamodb_client.delete_table(TableName=name)
 
 
+@pytest.fixture(scope="module")
+def multi_table(dynamodb_client):
+    """PK S, with a GSI midx on HASH h1, h2 and RANGE r1, r2 (all S) and one item."""
+    name = f"legacy_parity_m_{uuid.uuid4().hex[:8]}"
+    dynamodb_client.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": a, "AttributeType": "S"} for a in ("PK", "h1", "h2", "r1", "r2")],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "midx",
+                "KeySchema": [
+                    {"AttributeName": "h1", "KeyType": "HASH"},
+                    {"AttributeName": "h2", "KeyType": "HASH"},
+                    {"AttributeName": "r1", "KeyType": "RANGE"},
+                    {"AttributeName": "r2", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    wait_for_active(dynamodb_client, name)
+    dynamodb_client.put_item(TableName=name, Item={"PK": _s("i1"), "h1": _s("a"), "h2": _s("b"), "r1": _s("c"), "r2": _s("d")})
+    wait_for_gsi_items(lambda: dynamodb_client.query(TableName=name, IndexName="midx", KeyConditions={"h1": _cond("EQ", [_s("a")]), "h2": _cond("EQ", [_s("b")])})["Items"], 1)
+    yield name
+    dynamodb_client.delete_table(TableName=name)
+
+
 class TestLegacyNumberValues:
     """A legacy N value that is not a number is refused with the number
     message, ahead of the operator checks on the same entry and ahead of the
@@ -247,7 +276,9 @@ class TestKeyConditionsSchemaChecks:
     def test_empty_string_on_the_hash_key_and_between_bounds(self, dynamodb_client, ss_table):
         client = dynamodb_client
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("")])})) == EMPTY_KEY.format("pk")
-        assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("")]), "sk": _cond("EQ", [_s("")])})) == EMPTY_KEY.format("pk")
+        # Both keys empty: the service named pk in some sends of one request
+        # and sk in others (measured 2026-11-12, in both map orders).
+        assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("")]), "sk": _cond("EQ", [_s("")])})) in (EMPTY_KEY.format("pk"), EMPTY_KEY.format("sk"))
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("p1")]), "sk": _cond("BETWEEN", [_s(""), _s("a")])})) == EMPTY_KEY.format("sk")
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("p1")]), "sk": _cond("BETWEEN", [_s(""), _s("")])})) == EMPTY_KEY.format("sk")
         assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("p1")]), "sk": _cond("BETWEEN", [_s("a"), _s("")])})) == LEGACY_RANGE
@@ -308,6 +339,57 @@ class TestQueryFilterOnKeyAttribute:
 
     def test_scan_filter_on_a_key_passes(self, dynamodb_client, ss_table):
         assert dynamodb_client.scan(TableName=ss_table, ScanFilter={"pk": _cond("EQ", [_s("p1")])})["Count"] == 2
+
+
+def _eq(value):
+    return _cond("EQ", [value])
+
+
+SPECIFIC = "1 validation error detected: Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
+ALL_PROJECTED = "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+RANGE_R1_FOR_R2 = "RANGE key attributes r1 must have equality conditions specified in the query because a condition is present on key attribute r2"
+MIDX = {"IndexName": "midx"}
+
+# Query requests measured on 2026-11-12 against tables of these fixtures'
+# shapes, two sends each: (id, fixture, request, the answers the service
+# gave). Two answers: the service named one key in some sends and the other
+# key in the rest.
+MEASURED_ORDER = [
+    # A GSI with HASH h1, h2 and RANGE r1, r2: an empty key value is refused
+    # after the key schema rules and the Select check, and before a
+    # QueryFilter on a key.
+    ("multi_empty_h1", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("")), "h2": _eq(_s("b"))}}, [EMPTY_KEY.format("h1")]),
+    ("multi_empty_h2", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s(""))}}, [EMPTY_KEY.format("h2")]),
+    ("multi_empty_r1", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r1": _eq(_s(""))}}, [EMPTY_KEY.format("r1")]),
+    ("multi_empty_r1_begins_with", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r1": _cond("BEGINS_WITH", [_s("")])}}, [EMPTY_KEY.format("r1")]),
+    ("multi_empty_r1_between", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r1": _cond("BETWEEN", [_s(""), _s("z")])}}, [EMPTY_KEY.format("r1")]),
+    ("multi_empty_r2", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r1": _eq(_s("c")), "r2": _eq(_s(""))}}, [EMPTY_KEY.format("r2")]),
+    ("multi_empty_h1_and_h2", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("")), "h2": _eq(_s(""))}}, [EMPTY_KEY.format("h1"), EMPTY_KEY.format("h2")]),
+    ("multi_empty_before_query_filter_on_key", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("")), "h2": _eq(_s("b"))}, "QueryFilter": {"h1": _eq(_s("x"))}}, [EMPTY_KEY.format("h1")]),
+    ("multi_missing_hash_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s(""))}}, ["HASH key attributes h2 must have equality conditions specified in the query"]),
+    ("multi_range_rule_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r2": _eq(_s(""))}}, [RANGE_R1_FOR_R2]),
+    ("multi_two_non_equalities_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("a")), "h2": _eq(_s("b")), "r1": _cond("GT", [_s("")]), "r2": _cond("GT", [_s("x")])}}, [RANGE_R1_FOR_R2]),
+    ("multi_non_key_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("")), "h2": _eq(_s("b")), "zz": _eq(_s("x"))}}, ["Query condition missed key schema element: r1"]),
+    ("multi_schema_type_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_n("1")), "h2": _eq(_s(""))}}, [SCHEMA_TYPE]),
+    ("multi_select_first", "multi_table", {**MIDX, "KeyConditions": {"h1": _eq(_s("")), "h2": _eq(_s("b"))}, "Select": "SPECIFIC_ATTRIBUTES"}, [SPECIFIC]),
+    # The Select checks are reported before an empty key value.
+    ("select_before_empty_hash", "ss_table", {"KeyConditions": {"pk": _eq(_s(""))}, "Select": "SPECIFIC_ATTRIBUTES"}, [SPECIFIC]),
+    ("select_before_empty_range", "ss_table", {"KeyConditions": {"pk": _eq(_s("p1")), "sk": _eq(_s(""))}, "Select": "SPECIFIC_ATTRIBUTES"}, [SPECIFIC]),
+    ("all_projected_before_empty_hash", "ss_table", {"KeyConditions": {"pk": _eq(_s(""))}, "Select": "ALL_PROJECTED_ATTRIBUTES"}, [ALL_PROJECTED]),
+]
+
+
+class TestMeasuredCheckOrder:
+    """Which Query check the service reports when a request fails several."""
+
+    @pytest.mark.parametrize(("fixture", "args", "answers"), [pytest.param(*row[1:], id=row[0]) for row in MEASURED_ORDER])
+    def test_reported_check(self, request, dynamodb_client_no_validation, fixture, args, answers):
+        table = request.getfixturevalue(fixture)
+        assert _validation_error(lambda: dynamodb_client_no_validation.query(TableName=table, **args)) in answers
+
+    def test_multi_attribute_index_reads_the_item(self, dynamodb_client, multi_table):
+        # Measured 2026-11-12: Count 1.
+        assert dynamodb_client.query(TableName=multi_table, **MIDX, KeyConditions={"h1": _eq(_s("a")), "h2": _eq(_s("b"))})["Count"] == 1
 
 
 class TestBatchGetAbsentKeyCapacity:

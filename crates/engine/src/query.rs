@@ -24,7 +24,8 @@ use crate::index_helpers::{
     validate_query_select_index_support,
 };
 use crate::legacy_filter::{
-    desugar_filter, desugar_key_conditions, reject_query_filter_on_key, validate_key_conditions,
+    desugar_filter, desugar_key_conditions, reject_empty_key_values, reject_query_filter_on_key,
+    validate_key_conditions,
 };
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
@@ -475,10 +476,14 @@ pub async fn handle_query(
         extenddb_core::validation::IS_QUERY,
     )?;
 
-    // A legacy QueryFilter may not name a key of the queried table or index.
-    // The service reports this after the key schema and Select checks above,
-    // and before the key value size check and the ExclusiveStartKey check
-    // (measured 2026-10-24).
+    // An empty legacy KeyConditions key value, then a legacy QueryFilter on a
+    // key of the queried table or index. The service reports both after the
+    // key schema and Select checks above, on every key schema, and before the
+    // key value size check and the ExclusiveStartKey check (measured
+    // 2026-10-24 and 2026-11-12).
+    if let Some(kc) = input.key_conditions.as_ref() {
+        reject_empty_key_values(kc, &query_key_info.key_schema)?;
+    }
     if let Some(qf) = input.query_filter.as_ref().filter(|qf| !qf.is_empty()) {
         reject_query_filter_on_key(qf, &query_key_info.key_schema)?;
     }
