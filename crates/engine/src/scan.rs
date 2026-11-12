@@ -377,7 +377,8 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select

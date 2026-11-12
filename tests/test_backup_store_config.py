@@ -28,7 +28,13 @@ deployment and reads `/health`, the server's log and the API's answers:
   `extenddb-store.json` in it, and a relative root resolved against the
   shell's directory in daemon mode;
 - `extenddb backup list` and `backup purge --confirm` on an empty store, and
-  `backup purge` refused while a server holds the SQLite serve lock (exit 6);
+  `backup purge` refused while a server holds the SQLite serve lock (exit 6),
+  as are `backup sync`'s row-changing options and `backup migrate-legacy`;
+- an in-memory SQLite server restarted onto the root it used: the second
+  start adopts the root the first start's catalog owned and syncs before it
+  listens, so the first start's backup is described and restored; every
+  `backup` command refuses the in-memory database; a root whose file names
+  a durable catalog stays unhealthy;
 - on PostgreSQL, the backup commands ending with the exit code `serve` gives
   for a catalog the factory refuses: 6 while a migration holds the serving
   key, 3 on a catalog behind the binary.
@@ -512,8 +518,8 @@ class TestSqlite:
         default of that build) on the SQLite build: with `[backup.store.filesystem]
         path` set the store is configured and healthy, its identity file is
         written, and a backup created there is written to the store (CREATING,
-        then AVAILABLE with its manifest under the root; its restore is
-        refused naming the store until the restore job lands); without
+        then AVAILABLE with its manifest under the root) and restores from it
+        with its item; without
         `[backup.store]` there is no default root (no database file to put it
         beside), no component, and CreateBackup writes a legacy backup with the
         warning naming `[backup.store]`."""
@@ -543,10 +549,15 @@ class TestSqlite:
             _wait_backup_available(ddb, arn)
             prefix = os.path.join(root, "123456789012", "Music", arn.rsplit("/", 1)[1])
             assert os.path.isfile(os.path.join(prefix, "extenddb-manifest.json")), os.listdir(root)
-            with pytest.raises(ClientError) as refused:
-                ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
-            assert refused.value.response["Error"]["Code"] == "ValidationException", refused.value.response
-            assert "is in a backup store" in refused.value.response["Error"]["Message"], refused.value.response
+            restored = ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
+            assert restored["TableDescription"]["TableStatus"] == "CREATING", restored
+            deadline = time.monotonic() + 60
+            while ddb.describe_table(TableName="Restored")["Table"]["TableStatus"] != "ACTIVE":
+                assert time.monotonic() < deadline, "the restore did not finish"
+                time.sleep(0.1)
+            item = ddb.get_item(TableName="Restored", Key={"pk": {"S": "a"}})["Item"]
+            assert item == {"pk": {"S": "a"}, "v": {"N": "1"}}, item
+            assert "restore of " + arn in server.log_text(), "the restore ran as a store-backed job"
             assert "configure [backup.store]" not in server.log_text(), server.log_text()
         finally:
             server.stop()
@@ -563,6 +574,97 @@ class TestSqlite:
             details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
             assert details["BackupStatus"] in ("CREATING", "AVAILABLE"), details
             assert "configure [backup.store] to write backups to a backup store" in server.log_text(), server.log_text()
+        finally:
+            server.stop()
+
+    def test_an_in_memory_server_restarted_onto_its_root_serves_the_previous_starts_backups(
+        self, sqlite_deployment, tmp_path
+    ):
+        """`sqlite-memory`'s shape with a filesystem store, restarted: the
+        catalog (and its `catalog_id`) is new at every start, so the first
+        start writes `extenddb-store.json` with `ephemeral_catalog: true`,
+        and the second adopts the root that file names (a new `catalog_id`,
+        the store id and the marker kept) and runs the startup sync before
+        it listens, so DescribeBackup, ListBackups and a restore of the first
+        start's backup answer from the first request. Between the two starts
+        every `extenddb backup` command refuses the in-memory database before
+        it opens a catalog, and the file is unchanged. A file whose marker is
+        false (a durable catalog's root) is left alone: the in-memory server
+        reports the store owned by another catalog."""
+        d = sqlite_deployment
+        env = os.environ.copy()
+        env["EXTENDDB__STORAGE__SQLITE__PATH"] = ":memory:"
+        env["EXTENDDB_ADMIN_PASSWORD"] = ADMIN_PASSWORD
+        root = tmp_path / "memory-root"
+        root.mkdir(mode=0o700)
+        identity = root / "extenddb-store.json"
+        _append(d.config, f'[backup]\nreconcile_interval_secs = 1\n[backup.store]\nkind = "filesystem"\n\n[backup.store.filesystem]\npath = "{root}"\n')
+        healthy = lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy"  # noqa: E731
+
+        server = _Server(d.config, str(tmp_path / "serve-1.log"), env=env)
+        try:
+            _wait_health(d.port, healthy, server=server)
+            first = json.loads(identity.read_text())
+            assert first["ephemeral_catalog"] is True, first
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            _create_table(ddb, "Music")
+            for k in ("a", "b"):
+                ddb.put_item(TableName="Music", Item={"pk": {"S": k}, "v": {"N": "1"}})
+            arn = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn)
+        finally:
+            server.stop()
+
+        for args in (
+            ("backup", "list"),
+            ("backup", "sync"),
+            ("backup", "sync", "--adopt-store"),
+            ("backup", "purge", "--confirm"),
+            ("backup", "remove-target", "--account", "123456789012", "Music"),
+        ):
+            res = d.run(*args, env=env)
+            out = res.stdout + res.stderr
+            assert res.returncode == 1, (args, out)
+            assert "the SQLite database is in memory ([storage.sqlite] path names no file)" in out, (args, out)
+        assert json.loads(identity.read_text()) == first, "a refused command changed the identity file"
+
+        server = _Server(d.config, str(tmp_path / "serve-2.log"), env=env)
+        try:
+            _wait_health(d.port, healthy, server=server)
+            second = json.loads(identity.read_text())
+            assert second["catalog_id"] != first["catalog_id"], (first, second)
+            assert second["store_id"] == first["store_id"] and second["created_at_ms"] == first["created_at_ms"], (first, second)
+            assert second["ephemeral_catalog"] is True, second
+            lines = server.log_text().splitlines()
+            synced = [i for i, line in enumerate(lines) if "startup sync of the in-memory catalog: 1 backup(s) adopted" in line]
+            listening = [i for i, line in enumerate(lines) if "extenddb listening on" in line]
+            assert len(synced) == 1 and listening and synced[0] < listening[0], "\n".join(lines[-40:])
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert details["BackupStatus"] == "AVAILABLE" and details["BackupName"] == "nightly", details
+            assert arn in [s["BackupArn"] for s in ddb.list_backups()["BackupSummaries"]]
+            restored = ddb.restore_table_from_backup(TargetTableName="Restored", BackupArn=arn)
+            assert restored["TableDescription"]["TableStatus"] == "CREATING", restored
+            deadline = time.monotonic() + 60
+            while ddb.describe_table(TableName="Restored")["Table"]["TableStatus"] != "ACTIVE":
+                assert time.monotonic() < deadline, "the restore did not finish"
+                time.sleep(0.1)
+            assert ddb.scan(TableName="Restored", Select="COUNT")["Count"] == 2
+        finally:
+            server.stop()
+
+        durable = dict(second, ephemeral_catalog=False)
+        identity.write_text(json.dumps(durable, indent=2) + "\n")
+        os.chmod(identity, 0o600)
+        before = identity.read_bytes()
+        server = _Server(d.config, str(tmp_path / "serve-3.log"), env=env)
+        try:
+            health = _wait_health(d.port, lambda h: "backup_store" in h.get("components", {}), server=server)
+            assert health["components"]["backup_store"] == {
+                "status": "unhealthy", "kind": "filesystem", "reason": "owned by another catalog",
+            }, health
+            assert identity.read_bytes() == before, "an in-memory server rewrote a durable catalog's file"
+            assert "startup sync of the in-memory catalog" not in server.log_text(), server.log_text()[-3000:]
         finally:
             server.stop()
 
@@ -959,7 +1061,8 @@ class TestSqlite:
         root's identity file names the old catalog. The server starts with the
         store unconfigured and a warning naming the file (not degraded, not a
         startup error), CreateBackup takes the in-catalog path with its
-        deprecation warning, and `destroy`'s output said to remove the file."""
+        deprecation warning, and `destroy`'s output named `backup sync
+        --adopt-store`."""
         d = sqlite_deployment
         server = _Server(d.config, str(tmp_path / "serve.log"))
         try:
@@ -971,7 +1074,7 @@ class TestSqlite:
             old_catalog = json.load(f)["catalog_id"]
         res = d.run("destroy", "--yes")
         assert res.returncode == 0, res.stdout + res.stderr
-        assert "needs that file removed" in res.stdout, res.stdout
+        assert "backup sync --adopt-store" in res.stdout, res.stdout
         assert os.path.isfile(identity)
         env = os.environ.copy()
         env["EXTENDDB_ADMIN_PASSWORD"] = ADMIN_PASSWORD
@@ -993,6 +1096,68 @@ class TestSqlite:
             details = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]
             assert details["BackupStatus"] in ("CREATING", "AVAILABLE")
             assert "configure [backup.store] to write backups to a backup store" in server.log_text()
+        finally:
+            server.stop()
+
+    def test_adopt_store_takes_the_default_root_a_re_created_catalog_finds(self, sqlite_deployment, tmp_path):
+        """A store-backed backup on the default root, then `destroy` and
+        `init --overwrite`: the identity file names the old catalog. For
+        `backup sync` that root is configured and unhealthy (owned by another
+        catalog), not left unconfigured as the server leaves it: plain sync
+        exits 1 naming `--adopt-store`, and `--adopt-store` makes the new
+        catalog the owner, keeps the store id and adopts the backup, which
+        the restarted server describes and lists."""
+        d = sqlite_deployment
+        _append(d.config, "[backup]\nreconcile_interval_secs = 1\n")
+        healthy = lambda h: h.get("components", {}).get("backup_store", {}).get("status") == "healthy"  # noqa: E731
+        server = _Server(d.config, str(tmp_path / "serve.log"))
+        try:
+            _wait_health(d.port, healthy, server=server)
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            _create_table(ddb, "Music")
+            ddb.put_item(TableName="Music", Item={"pk": {"S": "a"}})
+            arn = ddb.create_backup(TableName="Music", BackupName="nightly")["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, arn)
+        finally:
+            server.stop()
+        identity = os.path.join(d.dir, "backups", "extenddb-store.json")
+        with open(identity) as f:
+            before = json.load(f)
+        res = d.run("destroy", "--yes")
+        assert res.returncode == 0, res.stdout + res.stderr
+        env = os.environ.copy()
+        env["EXTENDDB_ADMIN_PASSWORD"] = ADMIN_PASSWORD
+        subprocess.run(
+            [EXTENDDB_BINARY, "init", "--backend", "sqlite", "--config", d.config, "--overwrite"],
+            cwd=d.dir, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60, check=True, env=env,
+        )
+        lh._patch_config_port(d.config, d.port)
+        _append(d.config, "[backup]\nreconcile_interval_secs = 1\n")
+
+        res = d.run("backup", "sync")
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert "owned by another catalog" in out and "--adopt-store" in out, out
+        assert "The default root beside a SQLite database file is shared" in out, out
+        assert "there are no store-backed backups" not in out, out
+        res = d.run("backup", "sync", "--adopt-store")
+        out = res.stdout + res.stderr
+        assert res.returncode == 0, out
+        assert "Adopted the root" in out and "1 backup(s) adopted" in out, out
+        with open(identity) as f:
+            after = json.load(f)
+        assert after["store_id"] == before["store_id"], (before, after)
+        assert after["created_at_ms"] == before["created_at_ms"], (before, after)
+        assert after["catalog_id"] != before["catalog_id"], (before, after)
+
+        server = _Server(d.config, str(tmp_path / "serve2.log"))
+        try:
+            _wait_health(d.port, healthy, server=server)
+            ddb = _client(d.port, _provision(d.port, d.cert, ADMIN_PASSWORD))
+            details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert details["BackupStatus"] == "AVAILABLE", details
+            listed = [b["BackupArn"] for b in ddb.list_backups()["BackupSummaries"]]
+            assert listed == [arn], listed
         finally:
             server.stop()
 
@@ -1373,6 +1538,22 @@ class TestSqlite:
         finally:
             server.stop()
 
+    def test_remove_target_creates_neither_the_default_root_nor_its_identity_file(self, sqlite_deployment):
+        # `backup remove-target` needs no store: on a fresh deployment it
+        # refuses a table no restore record names and leaves the default root
+        # as it found it, missing, then present and empty.
+        d = sqlite_deployment
+        root = os.path.join(d.dir, "backups")
+        res = d.run("backup", "remove-target", "--account", "000000000000", "nosuch")
+        assert res.returncode == 1, res.stdout + res.stderr
+        assert "nosuch (account 000000000000) is not a restore target" in res.stderr, res.stderr
+        assert not os.path.exists(root), "remove-target created the default root"
+        os.mkdir(root, 0o700)
+        res = d.run("backup", "remove-target", "--account", "000000000000", "nosuch")
+        assert res.returncode == 1, res.stdout + res.stderr
+        assert "is not a restore target" in res.stderr, res.stderr
+        assert os.listdir(root) == [], "remove-target wrote into the default root"
+
     def test_backup_list_and_purge_on_an_empty_store_and_the_serve_lock(self, sqlite_deployment, tmp_path):
         d = sqlite_deployment
         # Create the default root with a server once, then stop it.
@@ -1416,6 +1597,18 @@ class TestSqlite:
             # it: exit 6, the code `migrate` uses for a locked catalog.
             assert res.returncode == 6, res.stdout + res.stderr
             assert "another extenddb process" in (res.stdout + res.stderr), res.stdout + res.stderr
+            # So is every option of `backup sync` that moves or removes rows,
+            # with or without a store to read, and `backup migrate-legacy`.
+            for args in (
+                ("sync", "--move-store", "/srv/elsewhere"),
+                ("sync", "--forget-store", "/srv/elsewhere"),
+                ("sync", "--forget-backup", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+                ("migrate-legacy", "--all"),
+                ("migrate-legacy", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+            ):
+                res = d.run("backup", *args)
+                assert res.returncode == 6, (args, res.stdout + res.stderr)
+                assert "another extenddb process" in (res.stdout + res.stderr), (args, res.stdout + res.stderr)
             assert server.proc.poll() is None, "the server kept running"
         finally:
             server.stop()
@@ -1552,7 +1745,13 @@ class TestPostgres:
             with conn.cursor() as cur:
                 cur.execute("SET application_name = 'holds the serving key'")
                 cur.execute("SELECT pg_advisory_lock(%s, 2)", (0x00454442,))
-            for args in (("backup", "list"), ("backup", "purge"), ("backup", "purge", "--confirm")):
+            for args in (
+                ("backup", "list"),
+                ("backup", "purge"),
+                ("backup", "purge", "--confirm"),
+                ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+                ("backup", "sync"),
+            ):
                 res = command(*args)
                 out = res.stdout + res.stderr
                 assert res.returncode == 6, f"{args}: {out}"
@@ -1565,7 +1764,12 @@ class TestPostgres:
 
         res = command("migrate", "--forget", "6", *lh._pg_args())
         assert res.returncode == 0, res.stdout + res.stderr
-        for args in (("backup", "list"), ("backup", "purge", "--confirm")):
+        for args in (
+            ("backup", "list"),
+            ("backup", "purge", "--confirm"),
+            ("backup", "remove-target", "--account", "000000000000", "nosuch"),
+            ("backup", "sync"),
+        ):
             res = command(*args)
             out = res.stdout + res.stderr
             assert res.returncode == 3, f"{args}: {out}"

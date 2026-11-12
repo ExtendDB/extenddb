@@ -35,6 +35,9 @@ mod m0003_sort_key_definitions;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0004_index_table_base_key;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0011_attribute_name_escape;
 mod postcheck;
 mod registrar;
 mod rows;
@@ -145,6 +148,59 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 "0007_stream_pending.sql"
             )],
         },
+        MigrationId::RestoreProgress => Migration::Applies {
+            // A new table is additive by CONTRIBUTING's step 4, but declaring
+            // `Kind::Additive` needs the old-binary job, which does not exist
+            // yet (the paragraph after step 4; `refuse_additive` in
+            // `crates/bin` pins it).
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0008_restore_progress.sql"
+            )],
+        },
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0009_warm_throughput.sql"
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations",
+                "0010_account_metrics.sql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::Applies {
+            // A binary without the decoder reads an escaped name as another
+            // name, and one without the encoder writes a U+0001 raw, which
+            // this release reads as another name.
+            kind: Kind::Breaking,
+            // An escaped U+0001 and a raw U+0001 U+0002 are the same bytes,
+            // so running the rewrite again would change the names written
+            // since it ran.
+            convergent: false,
+            bodies: vec![
+                StoreBody::code(
+                    StoreKind::Catalog,
+                    &m0011_attribute_name_escape::CatalogDocuments,
+                    m0011_attribute_name_escape::SOURCE,
+                ),
+                StoreBody::code(
+                    StoreKind::Data,
+                    &m0011_attribute_name_escape::QueuedContexts,
+                    m0011_attribute_name_escape::SOURCE,
+                ),
+            ],
+        },
     }
 }
 
@@ -168,7 +224,11 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::SortKeyDefinitions
         | MigrationId::DropContinuousBackups
         | MigrationId::BackupCatalogIndex
-        | MigrationId::StreamPending => RunsIn::Transaction,
+        | MigrationId::StreamPending
+        | MigrationId::RestoreProgress
+        | MigrationId::WarmThroughput
+        | MigrationId::AccountMetrics
+        | MigrationId::AttributeNameEscape => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

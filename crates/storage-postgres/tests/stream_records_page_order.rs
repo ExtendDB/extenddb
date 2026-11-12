@@ -23,7 +23,6 @@ use sqlx::postgres::PgPoolOptions;
 
 const ACCOUNT: &str = "111111111111";
 const REGION: &str = "us-east-1";
-const LABEL: &str = "2026-01-01T00:00:00.000";
 
 /// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
 /// set to any value but `0`, a job that must reach a server fails here
@@ -159,12 +158,12 @@ async fn a_page_is_in_sequence_order_when_the_records_were_written_in_reverse() 
         .await
         .expect("create a stream-enabled table");
     let table_id = desc.table_id.clone();
-    sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_id = $2")
-        .bind(LABEL)
-        .bind(&table_id)
-        .execute(&db)
-        .await
-        .expect("pin the stream label");
+    // The stream's label is carried in its shard ids, so the ARN takes the
+    // label the table was created with rather than pinning one.
+    let label = desc
+        .latest_stream_label
+        .clone()
+        .expect("a stream-enabled table has a label");
     let shard: String = sqlx::query_scalar(
         "SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY shard_id LIMIT 1",
     )
@@ -193,7 +192,7 @@ async fn a_page_is_in_sequence_order_when_the_records_were_written_in_reverse() 
         .await
         .expect("analyze the records");
 
-    let arn = stream_arn(REGION, ACCOUNT, "t", LABEL);
+    let arn = stream_arn(REGION, ACCOUNT, "t", &label);
     let want =
         |from: u64| -> Vec<String> { (from..from + 3).map(|n| format!("{n:021}")).collect() };
 

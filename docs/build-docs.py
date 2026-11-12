@@ -89,6 +89,8 @@ DOCUMENTS = [
      "docs/local-postgres-setup.md"),
     (18, "event-ticketing-demo", "Event Ticketing Platform Demo", "getting-started",
      "docs/manuals/13-event-ticketing-demo.md"),
+    (19, "backup-and-restore", "Backup and Restore", "usage",
+     "docs/manuals/14-backup-and-restore.md"),
 ]
 
 

@@ -1,5 +1,6 @@
 # catalog keyspace
 table access_keys
+table account_metrics
 table accounts
 table admin_users
 table backup_index_by_status
@@ -21,7 +22,6 @@ table iam_users
 table idempotency_tokens_by_account
 table indexes
 table login_attempts
-table metrics
 table schema_history
 table settings
 table tables
@@ -32,6 +32,16 @@ column access_keys.created_at: timestamp regular
 column access_keys.is_active: boolean regular
 column access_keys.secret_key_encrypted: blob regular
 column access_keys.user_name: text regular
+column account_metrics.bucket: timestamp partition_key 0
+column account_metrics.account_id: text partition_key 1
+column account_metrics.metric: text partition_key 2
+column account_metrics.table_name: text partition_key 3
+column account_metrics.index_name: text partition_key 4
+column account_metrics.operation: text partition_key 5
+column account_metrics.count: bigint regular
+column account_metrics.max: double regular
+column account_metrics.min: double regular
+column account_metrics.sum: double regular
 column accounts.account_id: text partition_key 0
 column accounts.account_name: text regular
 column accounts.created_at: timestamp regular
@@ -166,19 +176,11 @@ column indexes.key_schema: text regular
 column indexes.projection: text regular
 column indexes.propagation_delay_ms: int regular
 column indexes.provisioned_throughput: text regular
+column indexes.warm_throughput: text regular
 column login_attempts.principal: text partition_key 0
 column login_attempts.attempted_at: timestamp clustering 0 desc
 column login_attempts.source_ip: text regular
 column login_attempts.success: boolean regular
-column metrics.bucket: timestamp partition_key 0
-column metrics.metric: text partition_key 1
-column metrics.table_name: text partition_key 2
-column metrics.index_name: text partition_key 3
-column metrics.operation: text partition_key 4
-column metrics.count: bigint regular
-column metrics.max: double regular
-column metrics.min: double regular
-column metrics.sum: double regular
 column schema_history.version: int partition_key 0
 column schema_history.applied_at: timestamp regular
 column schema_history.description: text regular
@@ -226,6 +228,7 @@ column tables.ttl_cleanup_generation: uuid regular
 column tables.ttl_generation: uuid regular
 column tables.ttl_index_ready: boolean regular
 column tables.ttl_sweep_owner: uuid regular
+column tables.warm_throughput: text regular
 column tags.resource_arn: text partition_key 0
 column tags.tag_key: text clustering 0 asc
 column tags.tag_value: text regular

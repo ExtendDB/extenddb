@@ -21,11 +21,13 @@ pub struct InitArgs {
     #[arg(long)]
     backend: Option<String>,
 
-    /// Data database name (default: extenddb)
+    /// Data database name (default: the catalog's name without its
+    /// `_catalog` suffix). PostgreSQL backend only.
     #[arg(long)]
     data_db: Option<String>,
 
-    /// Catalog database name (default: <data-db>_catalog)
+    /// Catalog database name (default: extenddb_catalog, or the config
+    /// file's). PostgreSQL backend only.
     #[arg(long)]
     catalog_db: Option<String>,
 

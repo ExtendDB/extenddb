@@ -1,6 +1,6 @@
 # Technical Debt Tracker
 
-Last updated: 2026-09-16
+Last updated: 2026-11-09
 
 ## Categories
 
@@ -55,7 +55,7 @@ Last updated: 2026-09-16
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
 | S-1 | Multi-instance safety: no lease table prevents multiple extenddb instances sharing one PostgreSQL database | — | High | P25 review |
-| S-2 | `--password` flag visible in process listings (`ps aux`) | `bin/cmd_manage.rs` | Low | P12b |
+| S-2 | `--password` flag visible in process listings (`ps aux`) and shell history. `extenddb manage` prints a warning on stderr when the flag is used. With the flag omitted, it reads `EXTENDDB_PASSWORD`. The subcommand flags `--admin-password`, `--new-password`, `--user-password` and `--secret-access-key` have the same exposure, no environment variable and no warning (#916) | `crates/app/src/cmd_manage.rs` | Low | P12b |
 | S-3 | Release tarballs not GPG-signed — blocked on key ownership, public key distribution, CI secrets management | `devtools/build-release` | Medium | P28 |
 
 ## Testing
@@ -72,13 +72,13 @@ Last updated: 2026-09-16
 
 | # | Item | Location | Priority | Origin |
 |---|------|----------|----------|--------|
-| A-1 | ~~Catalog/data database separation not implemented (REQ-CAT-001/002)~~ Implemented at the location this row cites: the runtime reads the data connection string from the catalog and opens a second pool, and the item, GSI-queue, and vector-index paths run on it. Residual: the pool selection falls back to the catalog pool when the setting is absent, so a hand-written configuration can run both roles on one database without a warning, which makes the separation enforced by `extenddb init` rather than by the code path | `storage-postgres/src/lib.rs:238-256` (the second pool and its fallback) | ~~High~~ Low | P40 |
+| A-1 | ~~Catalog/data database separation not implemented (REQ-CAT-001/002)~~ Implemented at the location this row cites: the runtime reads the data connection string from the catalog and opens a second pool, and the item, GSI-queue, and vector-index paths run on it. Residual: the pool selection falls back to the catalog pool when the setting is absent, so a hand-written configuration can run both roles on one database without a warning, which makes the separation enforced by `extenddb init` rather than by the code path | `PostgresEngine::new` in `storage-postgres/src/lib.rs` (the second pool and its fallback) | ~~High~~ Low | P40 |
 
 ### A-1: Catalog/Data Database Separation
 
-**Design requirement:** Two databases — catalog (`extenddb`) for metadata, data (`extenddb_data`) for user items (REQ-CAT-001, REQ-CAT-002).
+**Design requirement:** Two databases — a catalog for metadata and a data database for user items (REQ-CAT-001, REQ-CAT-002); on PostgreSQL `init` names them `extenddb_catalog` and `extenddb` by default.
 
-**Current state:** Implemented on PostgreSQL. `extenddb init` creates both databases, records the data connection string in the catalog `settings` table (`storage/src/bootstrapper.rs:139`, called at `app/src/cmd_init.rs:334`), and initialises the data schema. The runtime reads that setting and opens a second pool (`storage-postgres/src/lib.rs:238-256`). Table creation, the GSI queue, the item-write paths, vector index data, and the backup and stream engines all take that pool (`create_table.rs:311`, `gsi_queue.rs`, `data/put_item.rs`, `data/vector_index.rs`, `backup_engine.rs`, `stream_engine.rs`), and `create_table.rs:300` commits catalog metadata before creating data tables. `extenddb destroy` drops both databases (`storage-postgres/src/bootstrapper.rs:725` and `:734`). SQLite co-locates catalog and data by design, which its worker module states (`storage-sqlite/src/workers.rs:11`).
+**Current state:** Implemented on PostgreSQL. `extenddb init` creates both databases, records the data connection string in the catalog `settings` table (`PostgresBootstrapper::record_data_connection` in `storage-postgres/src/bootstrapper.rs`, a `Bootstrapper` method of `storage/src/bootstrapper.rs`, called from `app/src/cmd_init.rs`), and initialises the data schema. The runtime reads that setting and opens a second pool (`PostgresEngine::new` in `storage-postgres/src/lib.rs`). Table creation, the GSI queue, the item-write paths, vector index data, and the backup and stream engines all take that pool (`create_table.rs`, `gsi_queue.rs`, `data/put_item.rs`, `data/vector_index.rs`, `backup_engine.rs`, `stream_engine.rs`), and `create_table_impl_inner` (`create_table.rs`) commits catalog metadata before creating data tables. `extenddb destroy` drops both databases (`PostgresBootstrapper::drop_databases` in `storage-postgres/src/bootstrapper.rs`). SQLite co-locates catalog and data by design, which its worker module states (`storage-sqlite/src/workers.rs:11`).
 
 **Residual, which is a note rather than an architectural gap:** the pool selection ends in `_ => pool.clone()`, so a catalog with no `data_database_connection_string` runs both roles on one database and nothing says so. The separation is enforced by `init` rather than by the code path. That is also what the connection formula in `docs/getting-started.md` assumes: it says the collapsed shape is the only one where the two `pool_size` pools become one, and that `extenddb init` does not produce it. Fix, if wanted: warn or refuse when the setting is absent, instead of collapsing silently.
 

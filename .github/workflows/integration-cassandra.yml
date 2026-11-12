@@ -123,9 +123,48 @@ jobs:
         env:
           EXTENDDB_TEST_CASSANDRA: required
 
+  # One release build shared by the jobs that test it; see integration.yml.
+  build-cassandra:
+    runs-on: extenddb_ubuntu-2404_4-core
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build release (cassandra backend)
+        run: cargo build --release --no-default-features --features cassandra
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: extenddb-cassandra
+          path: target/release/extenddb
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
+
   cassandra-pytest:
     runs-on: extenddb_ubuntu-2404_4-core
-    timeout-minutes: 45
+    # With the PartiQL wire tests the job took up to 42 min 10 s on #411's CI,
+    # near the old 45-minute bound; on main it took 30 to 40 min. A run with a
+    # cold build cache should take about 44 min; 60 leaves room for a slow
+    # runner.
+    timeout-minutes: 60
+    needs: build-cassandra
+    # Five shards by test file, each with its own Cassandra node;
+    # cassandra-integration checks that together they collected every test
+    # of the whole suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    env:
+      EXTENDDB_TEST_SHARD: ${{ matrix.shard }}/5
     services:
       cassandra:
         image: cassandra:4.1
@@ -143,14 +182,6 @@ jobs:
           --health-start-period 60s
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          cache-on-failure: true
-          # Only pushes to main save, so other runs restore main's cache.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -173,18 +204,36 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
+      - name: Install Terraform (pinned version, checksum asserted)
+        run: echo "TERRAFORM=$(tests/terraform/install-terraform.sh "$RUNNER_TEMP/terraform")" >> "$GITHUB_ENV"
       - name: Run Cassandra pytest suite
         env:
           # run-cassandra-tests initializes the server without [backup.store],
           # and Cassandra takes the in-catalog create with one.
           EXTENDDB_TEST_BACKUP_STORE: none
-        run: devtools/run-cassandra-tests -- --pytest --comprehensive --parallel
+        run: devtools/run-cassandra-tests -- --pytest --comprehensive --terraform --parallel
+
+      # cassandra-integration checks these lists.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: shards-cassandra-pytest-${{ matrix.shard }}
+          path: discussions/shards/
+          if-no-files-found: warn
+          retention-days: 1
+          # A re-run of a failed job uploads the same name again.
+          overwrite: true
 
   cassandra-rust:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
+    needs: build-cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -232,8 +281,13 @@ jobs:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Run Cassandra rust integration suite
         env:
           # run-cassandra-tests initializes the server without [backup.store]:
@@ -262,6 +316,11 @@ jobs:
   cassandra-catalog-checks:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 60
+    needs: build-cassandra
+    env:
+      # The cargo features of the v0.1.14 build, read by its cache key
+      # and its build command.
+      V0114_FEATURES: cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -278,11 +337,29 @@ jobs:
           --health-retries 20
           --health-start-period 60s
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      # A tag does not change, so the v0.1.14 binary is cached by the tag,
+      # the cargo features and the runner's OS and architecture. Every run
+      # restores it, and only a push to main saves it, as for the Rust
+      # caches, so no pull request run writes the entry. On a hit the job
+      # skips that build and the Rust toolchain and cache steps, which only
+      # that build uses.
+      - name: Restore the v0.1.14 release (cassandra backend)
+        id: cache-v0-1-14
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
+          key: extenddb-v0.1.14-no-default-features-${{ env.V0114_FEATURES }}-${{ runner.os }}-${{ runner.arch }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Configure Cassandra authentication
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -300,13 +377,18 @@ jobs:
             sleep 2
           done
           echo "Cassandra did not become ready" >&2; exit 1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      # After the cache restore, so a cached target/ cannot replace it.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
 
       # A fresh install's schema against the committed file. On a difference
       # the job fails with the diff and uploads the regenerated file to commit.
@@ -339,14 +421,24 @@ jobs:
           ${{ job.services.cassandra.id }} 127.0.0.1:9042 18454
 
       # No released image carries the Cassandra backend, so the job builds
-      # the last 0.1.x release from its tag.
+      # the last 0.1.x release from its tag, on a cache miss only.
       - name: Build the v0.1.14 release (cassandra backend)
+        if: steps.cache-v0-1-14.outputs.cache-hit != 'true'
         run: |
           git fetch --depth 1 origin tag v0.1.14
           git worktree add "$RUNNER_TEMP/extenddb-v0.1.14" v0.1.14
-          cargo build --release --no-default-features --features cassandra \
+          cargo build --release --no-default-features --features "$V0114_FEATURES" \
             --manifest-path "$RUNNER_TEMP/extenddb-v0.1.14/Cargo.toml" \
             --target-dir "$RUNNER_TEMP/target-v0.1.14"
+
+      - name: Save the v0.1.14 release (cassandra backend)
+        if: >-
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          steps.cache-v0-1-14.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/target-v0.1.14/release/extenddb
+          key: extenddb-v0.1.14-no-default-features-${{ env.V0114_FEATURES }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Check the last 0.1.x release against migrated catalogs
         run: >-
@@ -361,11 +453,15 @@ jobs:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
+          # Only pushes to main save, so other runs restore main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Start a two-node cluster
         run: |
           docker network create cassandra-two-nodes
@@ -415,6 +511,7 @@ jobs:
   cassandra-authorizer:
     runs-on: extenddb_ubuntu-2404_4-core
     timeout-minutes: 45
+    needs: build-cassandra
     services:
       cassandra:
         image: cassandra:4.1
@@ -431,11 +528,7 @@ jobs:
           --health-retries 20
           --health-start-period 60s
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Configure Cassandra authentication and CassandraAuthorizer
         run: |
           docker exec ${{ job.services.cassandra.id }} sed -i \
@@ -454,13 +547,17 @@ jobs:
             sleep 2
           done
           echo "Cassandra did not become ready" >&2; exit 1
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Build release (cassandra backend)
-        run: cargo build --release --no-default-features --features cassandra
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: extenddb-cassandra
+          path: target/release
+      # Artifacts do not keep file modes.
+      - run: chmod +x target/release/extenddb
       - name: Check init, migrate, serve and CreateAccount under CassandraAuthorizer
         run: >-
           devtools/check-cassandra-authorizer ./target/release/extenddb
@@ -489,3 +586,12 @@ jobs:
              [ "${{ needs.cassandra-authorizer.result }}" != "success" ]; then
             exit 1
           fi
+      # Fails unless the shards together collected every test of the whole
+      # suite exactly once, so a bad split cannot pass.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: shards-cassandra-pytest-*
+          path: shards/cassandra-pytest
+      - name: Check the shards ran every test
+        run: python3 devtools/test-shards check shards/cassandra-pytest

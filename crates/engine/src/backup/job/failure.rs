@@ -5,15 +5,17 @@
 //! path.
 //!
 //! Every status write goes through [`write_status`]: the backend writes
-//! conditioned on the claim's generation and on the row being CREATING, and
-//! this module gives the three outcomes one meaning. `Matched` is the
-//! write. `NotMatched` means the row is no longer this claim's (gone,
-//! another generation, or not CREATING) and the caller makes no further
-//! store or table access of any kind. `Unknown` (the connection failed
-//! after the statement was sent) is followed by a re-read of the row, not
-//! treated as a failure: a row that shows the write landed is `Matched`; a
-//! row still CREATING under this generation did not take the write, which
-//! is sent once more, at most; anything else is `NotMatched`. Each unknown
+//! conditioned on the claim's generation and on the record being in the
+//! status the job holds it in (`from`: CREATING for a backup row, RUNNING
+//! for a restore record), and this module gives the three outcomes one
+//! meaning. `Matched` is the write. `NotMatched` means the record is no
+//! longer this claim's (gone, another generation, or not in `from`) and the
+//! caller makes no further store or table access of any kind. `Unknown`
+//! (the connection failed after the statement was sent) is followed by a
+//! re-read of the record, not treated as a failure: a record that shows the
+//! write landed is `Matched`; one still in `from` under this generation did
+//! not take the write, which is sent once more, at most; anything else is
+//! `NotMatched`. Each unknown
 //! outcome has its re-read, the second write's included, so a second
 //! unknown outcome whose write landed is `Matched` (the row is in the
 //! target status under this generation) and one whose write was lost is
@@ -28,13 +30,19 @@
 //! job stops, the session's end frees the advisory lock, and the row is the
 //! reconciler's (AVAILABLE from a complete manifest, FAILED otherwise).
 //!
-//! The failure path ([`fail_row`]) is the FAILED write followed, only when
-//! it matched, by `delete_prefix` of the backup's prefix; the holder of the
-//! claim owns the prefix, so a job whose FAILED write did not match never
-//! deletes. A deletion that fails leaves the prefix to the reconciler,
-//! which deletes a FAILED row's prefix once its heartbeat is stale.
+//! The backup job's failure path ([`fail_row`]) is the FAILED write
+//! followed, only when it matched, by the deletion fence and then
+//! `delete_prefix` of the backup's prefix; the holder of the claim owns the
+//! prefix, so a job whose FAILED write did not match never deletes, and a
+//! root another catalog adopted while the job ran is left as it is (the
+//! fence marks the store unhealthy). A deletion that fails leaves the
+//! prefix to the reconciler, which deletes a FAILED row's prefix once its
+//! heartbeat is stale. The restore job's failure path, FAILED then the
+//! target's removal under the same gate, is `super::super::restore::fail_restore`.
 
 use extenddb_backup_store::BackupStore;
+
+use super::super::StoreFence;
 use extenddb_core::metrics::MetricsCollector;
 use extenddb_storage::JobClaim;
 use extenddb_storage::backup_catalog::{JobStatus, StatusFields, WriteOutcome};
@@ -51,23 +59,24 @@ pub(crate) enum Written {
     Error(String),
 }
 
-/// Move the row from CREATING to `to` through `claim` (module doc).
+/// Move the record from `from` to `to` through `claim` (module doc).
 pub(crate) async fn write_status(
     claim: &dyn JobClaim,
+    from: JobStatus,
     to: JobStatus,
     fields: &StatusFields,
 ) -> Written {
     for attempt in 0..2 {
-        let outcome = match claim.set_status(JobStatus::Creating, to, fields).await {
+        let outcome = match claim.set_status(from, to, fields).await {
             Ok(outcome) => outcome,
             Err(e) => return Written::Error(format!("the {to} write failed: {e}")),
         };
         match outcome {
             WriteOutcome::Matched => return Written::Matched,
             WriteOutcome::NotMatched => {
-                return Written::NotMatched(
-                    "the row is no longer CREATING under this claim's generation".to_owned(),
-                );
+                return Written::NotMatched(format!(
+                    "the record is no longer {from} under this claim's generation"
+                ));
             }
             WriteOutcome::Unknown => {}
         }
@@ -89,14 +98,14 @@ pub(crate) async fn write_status(
         if row.status == to {
             return Written::Matched;
         }
-        if row.status != JobStatus::Creating || attempt == 1 {
+        if row.status != from || attempt == 1 {
             return Written::NotMatched(format!(
-                "the row is {} after a {to} write whose outcome was unknown",
+                "the record is {} after a {to} write whose outcome was unknown",
                 row.status
             ));
         }
         tracing::warn!(
-            "the {to} write's outcome was unknown and the row is still CREATING under this \
+            "the {to} write's outcome was unknown and the record is still {from} under this \
              claim; writing once more"
         );
     }
@@ -110,16 +119,21 @@ pub(crate) enum FailurePath {
     Deleted,
     /// FAILED written; the deletion failed and is the reconciler's.
     DeleteFailed(String),
+    /// FAILED written; the deletion fence refused, and nothing was
+    /// deleted.
+    Fenced(String),
     /// FAILED not written by this claim (the row is another's, or the claim
     /// connection failed): no store access was made.
     NoStoreAccess(String),
 }
 
-/// The failure path (module doc): FAILED with `reason`, then the deletion
-/// of `prefix` when the write matched.
+/// The failure path (module doc): FAILED with `reason`, then, when the
+/// write matched, the fence for `catalog_id` and the deletion of `prefix`.
 pub(crate) async fn fail_row(
     claim: &dyn JobClaim,
     store: &dyn BackupStore,
+    fence: &StoreFence,
+    catalog_id: &str,
     prefix: &str,
     reason: &str,
     metrics: Option<&MetricsCollector>,
@@ -129,9 +143,12 @@ pub(crate) async fn fail_row(
         completed: true,
         ..StatusFields::default()
     };
-    match write_status(claim, JobStatus::Failed, &fields).await {
+    match write_status(claim, JobStatus::Creating, JobStatus::Failed, &fields).await {
         Written::Matched => {}
         Written::NotMatched(why) | Written::Error(why) => return FailurePath::NoStoreAccess(why),
+    }
+    if let Err(problem) = fence.check(catalog_id).await {
+        return FailurePath::Fenced(problem.to_string());
     }
     match store.delete_prefix(prefix).await {
         Ok(_) => FailurePath::Deleted,

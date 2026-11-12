@@ -11,9 +11,9 @@ examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
 - **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Data** (the `extenddb` PostgreSQL database for the default catalog `extenddb_catalog`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
-On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
+On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`, and its name under `data_database_name`. This allows the catalog and data databases to live on different PostgreSQL instances.
 
 ### Catalog Tables
 
@@ -23,7 +23,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `tables` | DynamoDB table metadata. Composite PK: `(account_id, table_name)`. Stores key schema, attribute definitions, billing mode, stream spec, status, ARN, and TTL config. |
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
-| `settings` | Key-value store for catalog version, data DB URL, and runtime settings. |
+| `settings` | Key-value store for catalog version, data DB URL, the AES-256-GCM key that encrypts access key secrets (`encryption_key`), and runtime settings. |
 | `schema_history` | Migration tracking. Records which SQL files have been applied. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
@@ -37,7 +37,6 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `iam_user_tags` | Tags on IAM users. |
 | `iam_role_tags` | Tags on IAM roles. |
 | `permissions_boundaries` | Permissions boundaries for users and roles. |
-| `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
 | `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
@@ -127,9 +126,9 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 ### Credential Storage
 
-Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `encryption_keys` table. Each access key record stores the encrypted secret and a unique nonce.
+Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`. Each access key record stores the encrypted secret and a unique nonce.
 
-Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
+Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The server reads the encryption key that decrypts secrets once, at startup. extenddb never changes the key. A change made by hand in the `settings` table takes effect at the next restart. See Credential Storage in the Security Model, and Caching Design below.
 
 ## DynamoDB Streams Internals
 
@@ -191,7 +190,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
 | `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
-| `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
+| `encryption_key` | `Arc<str>` loaded at startup | Never: read at startup, so a change made by hand takes a restart | Decryption key for access key secrets. extenddb generates it once and never changes it |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
 

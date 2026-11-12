@@ -274,7 +274,7 @@ def main() -> None:
 #
 #   kill-points.py restore <sqlite|postgres|mongodb|cassandra> <point> \
 #       --bin <hooks binary> [--items N] [--work DIR] [--second-reach] \
-#       [--remove-target] [--vector] [--source-bin <sqlite build>]
+#       [--vector] [--source-bin <sqlite build>]
 #
 # `pg_terminate_backend` is not a pause point of its own: the server is
 # paused at `restore_after_file_commit`, the session holding the claim's
@@ -292,22 +292,27 @@ def main() -> None:
 # format and no backup taken on a Cassandra server restores through the
 # store-backed job. A Cassandra kill point therefore takes its backup on a
 # SQLite source server (`--source-bin`, a SQLite build), copies the prefix
-# under the Cassandra target's root and seeds the target's `backup_index`
-# row as `devtools/backup-restore-matrix` does (and as `backup sync
-# --adopt-store` will), then restores on the paused Cassandra server. The
-# matrix script is imported for `copy_prefix`, `prefix_of` and `seed_row`.
+# under the Cassandra target's root and adopts it with `extenddb backup
+# sync` beside the target's server, as `devtools/backup-restore-matrix`
+# does (the sync takes the maintenance claim and releases it before it
+# exits, so the restore request that follows is not refused), then restores
+# on the paused Cassandra server. The matrix script is imported for
+# `copy_prefix` and `prefix_of`.
 #
 # `--second-reach` kills at the point's second reach instead of its first:
 # the first pause is released (the release file written, then removed once
 # the job logs its release), and the server is SIGKILLed when the job
 # reaches the point again. For `restore_mongodb_after_insert_many` and
 # `restore_cassandra_before_progress` that puts the kill after an earlier
-# file's or batch's progress is recorded, so the resume runs the
-# re-application path (MongoDB: the one unrecorded file re-applied with
-# E11000 suppressed; Cassandra: at most one batch re-applied by the upsert)
-# and the outcome asserted is ACTIVE with the exact count, where the
-# first-reach kill (no progress recorded, items written) asserts
-# `target_not_empty`.
+# batch's progress is recorded, so the resume continues from that progress
+# (MongoDB: each batch commits with its progress, nothing is re-applied;
+# Cassandra: at most one batch re-applied by the upsert). The first-reach
+# kill of `restore_cassandra_before_progress` leaves the first batch's items
+# with no progress recorded; the resume finds the count at or below the
+# backup's total and re-applies the first file with upserts (the engine's
+# `target_not_empty` rule fails only a count above the total). Every kill
+# point's outcome is therefore ACTIVE with the exact count, except the
+# tampered-file point, whose target is removed.
 #
 # The services are local (PostgreSQL 55432, MongoDB 27117, Cassandra 9042).
 # Every server is stopped by the PID this script started, never by a
@@ -809,7 +814,7 @@ def _tamper_a_data_file(dep: Deployment, arn: str) -> str:
 
 def _matrix_module():
     """`devtools/backup-restore-matrix` imported as a module, for the prefix
-    copy and the `backup_index` seed a Cassandra target needs."""
+    copy a Cassandra target needs."""
     import importlib.machinery
     import importlib.util
 
@@ -828,81 +833,34 @@ def _matrix_module():
 
 
 def _adopt_backup(source: Deployment, target: Deployment, arn: str) -> None:
-    """Copy the source's backup prefix under the target's root and seed the
-    target's `backup_index` row, the matrix's stand-in for `backup sync
-    --adopt-store`."""
-    import json
-    import types
-
+    """Copy the source's backup prefix under the target's root and adopt it
+    with `extenddb backup sync` beside the target's server, as the matrix's
+    `adopt_backup` does: the sync must exit 0 and name the one backup
+    adopted. Its output is kept in `sync.log`."""
     mx = _matrix_module()
     src_prefix = mx.prefix_of(source.root, arn)
     dst_prefix = mx.prefix_of(target.root, arn)
     mx.copy_prefix(src_prefix, dst_prefix, target.root)
-    with open(os.path.join(dst_prefix, "extenddb-manifest.json")) as f:
-        manifest = json.load(f)
-
-    def store_id() -> str:
-        with open(os.path.join(target.root, "extenddb-store.json")) as f:
-            return json.load(f)["store_id"]
-
-    adapter = types.SimpleNamespace(backend=target.backend, root=target.root, work=target.work,
-                                    tag=target.tag, store_id=store_id)
-    mx.seed_row(adapter, arn, manifest, manifest["backup_size_bytes"], manifest["source_table"]["item_count"])
-    _say(f"backup {arn} adopted by the {target.backend} target (prefix copied, backup_index row seeded)")
-
-
-def _remove_target(dep: Deployment, ddb, target: str, arn: str) -> None:
-    """The operator's remedy for a `target_not_empty` target: `extenddb backup
-    remove-target --account <id> <table>` run beside the live server (MongoDB
-    and Cassandra take the maintenance claim; SQLite would need the server
-    stopped), its output asserted, then the target gone (`DescribeTable`
-    ResourceNotFound) and `DeleteBackup` of the backup allowed."""
-    from botocore.exceptions import ClientError
-
-    # DeleteTable's refusal shows the stuck state the command is for.
-    try:
-        ddb.delete_table(TableName=target)
-        raise AssertionError("DeleteTable of the target_not_empty target was accepted")
-    except ClientError as e:
-        assert e.response["Error"]["Code"] == "ResourceInUseException", e.response["Error"]
-    with_ = [dep.bin, "backup", "remove-target", "--account", ACCOUNT, target, "--config", dep.config]
-    r = subprocess.run(with_, cwd=dep.work, capture_output=True, text=True, timeout=300)
-    with open(os.path.join(dep.work, "remove-target.out"), "w") as f:
-        f.write(r.stdout + r.stderr)
-    assert r.returncode == 0, f"remove-target exited {r.returncode}: {r.stdout}{r.stderr}"
-    for needle in REMOVE_TARGET_LINES(target):
-        assert needle in r.stdout, f"remove-target output lacks {needle!r}:\n{r.stdout}{r.stderr}"
-    try:
-        ddb.describe_table(TableName=target)
-        raise AssertionError("the target is still described after remove-target")
-    except ClientError as e:
-        assert e.response["Error"]["Code"] == "ResourceNotFoundException", e.response["Error"]
-    ddb.delete_backup(BackupArn=arn)
-    _say(f"{dep.backend}: remove-target removed {target}; DescribeTable ResourceNotFound, DeleteBackup allowed"
-         f" ({' | '.join(l for l in r.stdout.splitlines() if l.strip())[:300]})")
-
-
-def REMOVE_TARGET_LINES(target: str) -> list[str]:
-    """The lines `backup remove-target` prints for a removed FAILED target."""
-    return [
-        "=== extenddb backup remove-target ===",
-        'Taking the maintenance claim as "extenddb backup remove-target on ',
-        f"removed the restore target {target} (account {ACCOUNT}, table id ",
-        "was FAILED (target_not_empty)",
-        "The maintenance claim is released.",
-    ]
+    r = subprocess.run(
+        [target.bin, "backup", "sync", "--config", target.config],
+        cwd=target.work, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600,
+    )
+    with open(os.path.join(target.work, "sync.log"), "a") as log:
+        log.write(f"$ extenddb backup sync: exit {r.returncode}\n{r.stdout}{r.stderr}\n")
+    if r.returncode != 0 or f"  {arn}" not in r.stdout.splitlines() or "1 backup(s) adopted" not in r.stdout:
+        raise SystemExit(f"backup sync on the {target.backend} target did not adopt {arn} "
+                         f"(exit {r.returncode}): {(r.stdout + r.stderr)[-3000:]}")
+    _say(f"backup {arn} adopted by the {target.backend} target (prefix copied, backup sync)")
 
 
 def _run_restore_point(backend: str, point: str, binary: str, items: int, work: str,
                        second_reach: bool = False, source_bin: str | None = None,
-                       remove_target: bool = False, vector: bool = False) -> int:
+                       vector: bool = False) -> int:
     """One restore kill point on one backend. Returns 0 on pass, 1 on a
     failed assertion, 2 on setup error. With `second_reach` the SIGKILL is
     taken at the point's second reach (module comment). On Cassandra the
     backup is taken on a SQLite source (`source_bin`) and adopted by the
-    target (module comment). With `remove_target` a first-reach run of the
-    two no-progress points goes on to `extenddb backup remove-target` and
-    asserts the target gone and the backup deletable. With `vector` the
+    target (module comment). With `vector` the
     source table carries a vector index and the tamper cell on PostgreSQL
     asserts the removed target's data table and vector relation gone."""
     import boto3  # noqa: F401
@@ -1101,24 +1059,14 @@ def _run_restore_point(backend: str, point: str, binary: str, items: int, work: 
         # removes the target, so give it more than one window.
         deadline = time.monotonic() + 240
 
-        # These two points pause before the first file's/batch's progress is
-        # recorded, so the kill leaves inserted items with no recorded
-        # progress. On resume the engine correctly applies the no-progress
-        # safety rule (4(e)/5.3 step 7): a non-empty target with no progress
-        # is FAILED `target_not_empty` and left for the operator, never blindly
-        # re-applied. (The "re-apply the one unrecorded file/batch with
-        # suppression" path needs an EARLIER recorded file, which a one-shot
-        # pause on the first reach cannot set up; `--second-reach` runs it.)
-        if point in ("restore_mongodb_after_insert_many", "restore_cassandra_before_progress") and not second_reach:
-            line = _log_has(dep, "target_not_empty", timeout=120)
-            assert line, f"{point}: the resume did not apply the target_not_empty rule"
-            st = ddb.describe_table(TableName=target)["Table"]["TableStatus"]
-            assert st == "CREATING", f"{point}: target is {st}, expected it left CREATING for the operator"
-            _say(f"{backend}/{point}: resume found no progress and a non-empty target -> "
-                 f"FAILED target_not_empty, target left for the operator ({line.strip()[-90:]})")
-            if remove_target:
-                _remove_target(dep, ddb, target, arn)
-            return 0
+        # `restore_cassandra_before_progress` at its first reach pauses
+        # before the first batch's progress is recorded, so the kill leaves
+        # the batch's items with no recorded progress. The resume counts the
+        # target, finds no more items than the backup's total, and re-applies
+        # the first file with upserts (the engine fails `target_not_empty`
+        # only above the total), so the outcome below is ACTIVE with the exact
+        # count, as for every other point. (MongoDB commits each batch with
+        # its progress, so its first reach leaves nothing unrecorded.)
 
         want_gone = point == "restore_between_failed_and_removal"
         while True:
@@ -1181,8 +1129,6 @@ def _restore_main(argv) -> None:
     p.add_argument("--second-reach", action="store_true",
                    help="SIGKILL at the point's second reach (after an earlier progress record)")
     p.add_argument("--source-bin", help="a SQLite build that takes the backup a Cassandra target restores")
-    p.add_argument("--remove-target", action="store_true",
-                   help="after a first-reach target_not_empty outcome, run `extenddb backup remove-target` and assert the target gone")
     p.add_argument("--vector", action="store_true",
                    help="give the source table a vector index; restore_between_failed_and_removal on postgres then asserts the removed target's vector relation gone")
     a = p.parse_args(argv)
@@ -1192,7 +1138,7 @@ def _restore_main(argv) -> None:
         raise SystemExit(f"{a.point} does not apply to {a.backend}")
     sys.exit(_run_restore_point(a.backend, a.point, os.path.abspath(a.bin), a.items, os.path.abspath(a.work),
                                 second_reach=a.second_reach, source_bin=a.source_bin,
-                                remove_target=a.remove_target, vector=a.vector))
+                                vector=a.vector))
 
 
 # Dispatch `kill-points.py restore ...` to the restore orchestrator, every
