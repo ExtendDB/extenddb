@@ -270,6 +270,44 @@ def test_an_invalid_number_in_the_item_comes_before_a_value_nested_too_deep(dyna
     )) == ("ValidationException", BAD_NUMBER)
 
 
+REVERSED = {":hi": {"N": "5"}, ":lo": {"N": "1"}}
+
+# (case, Item attributes, condition, names, values, message): the Item's
+# numbers and nesting come before the condition, with or without
+# ExpressionAttributeValues (measured 2026-11-12, each request twice).
+ITEM_BEFORE_CONDITION = [
+    ("number_before_the_length", {"n": {"N": "abc"}}, f"attribute_exists({p(33)})", N, None, BAD_NUMBER),
+    ("nesting_before_the_length", {"d": nmap(33)}, f"attribute_exists({p(33)})", N, None, NESTING),
+    ("nesting_before_the_between_bounds", {"d": nmap(33)}, "a BETWEEN :hi AND :lo", None, REVERSED, NESTING),
+]
+
+
+def _put_body(table, key, attrs, condition, names, values):
+    body = {"TableName": table, "Item": {**key, **attrs}, "ConditionExpression": condition}
+    if names:
+        body["ExpressionAttributeNames"] = names
+    if values:
+        body["ExpressionAttributeValues"] = values
+    return body
+
+
+@pytest.mark.parametrize(("case", "attrs", "condition", "names", "values", "message"), ITEM_BEFORE_CONDITION,
+                         ids=[c[0] for c in ITEM_BEFORE_CONDITION])
+def test_put_item_checks_the_item_before_the_condition(dynamodb_client, table, key, case, attrs, condition, names,
+                                                       values, message):
+    body = _put_body(table, key, attrs, condition, names, values)
+    assert _single_item_error(lambda: dynamodb_client.put_item(**body)) == ("ValidationException", message)
+
+
+@pytest.mark.parametrize(("case", "attrs", "condition", "names", "values", "message"), ITEM_BEFORE_CONDITION[1:],
+                         ids=[c[0] for c in ITEM_BEFORE_CONDITION[1:]])
+def test_transact_write_items_put_checks_the_item_nesting_before_the_condition(
+        dynamodb_client, table, key, case, attrs, condition, names, values, message):
+    body = _put_body(table, key, attrs, condition, names, values)
+    assert _error(lambda: dynamodb_client.transact_write_items(TransactItems=[{"Put": body}])) == (
+        "ValidationException", message)
+
+
 def test_between_bounds_are_checked_whatever_the_item(dynamodb_client, table, key):
     bounds = {":hi": {"N": "5"}, ":lo": {"N": "1"}, ":s": {"S": "s"}}
     missing = {"pk": {"S": "plen"}, "sk": {"S": "between-no-item"}}

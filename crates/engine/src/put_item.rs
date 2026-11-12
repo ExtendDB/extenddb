@@ -147,18 +147,25 @@ pub async fn handle_put_item(
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
 
+    // The Item's numbers and nesting come before every expression check, with
+    // or without ExpressionAttributeValues: an Item holding `{N: abc}` or an
+    // attribute 33 maps deep answers the number or the nesting error beside a
+    // condition with a syntax error, an undefined name or value, an unused
+    // value, a reserved word, a path of 33 elements or BETWEEN bounds out of
+    // order (measured 2026-11-12). `validate_put_item` checks them again
+    // after the table lookup.
+    extenddb_core::validation::validate_item_numbers(&input.item)?;
+    extenddb_core::validation::validate_item_nesting_depth(&input.item)?;
+
     // The nesting-depth limit applies to every ExpressionAttributeValue on the
     // single-item write paths, condition-only placeholders included: measured
     // 2026-08-24 (us-east-1), a 32-level value referenced solely by a
     // ConditionExpression is rejected on PutItem, DeleteItem, and UpdateItem
-    // alike, while 31 levels is accepted. TransactWriteItems deliberately does
-    // NOT get this check: the same 32-level condition-only value is accepted
-    // inside a transaction on every sub-op shape (also measured). It comes
-    // after an invalid number in the Item and before the ConditionExpression
-    // and the table lookup (measured 2026-10-26), so the Item's numbers are
-    // checked here first; `validate_put_item` checks them again later.
+    // alike, while 31 levels is accepted. TransactWriteItems checks its values
+    // separately, in `validate_value_map_nesting`. It comes after an invalid
+    // number in the Item and before the ConditionExpression and the table
+    // lookup (measured 2026-10-26).
     if let Some(values) = &input.expression_attribute_values {
-        extenddb_core::validation::validate_item_numbers(&input.item)?;
         extenddb_core::validation::validate_attribute_values_nesting_depth(values.values())?;
     }
 

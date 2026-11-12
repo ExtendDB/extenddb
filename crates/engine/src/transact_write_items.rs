@@ -81,11 +81,10 @@ pub async fn handle_transact_write_items(
     // Validation runs in the order the service applies it, each phase over
     // every item before the next phase starts:
     //   1. per item, in order, with no table needed: the attribute name sizes
-    //      of the item's expression maps and, for a Put, of its item, the
-    //      nesting of the item's ExpressionAttributeValues, expression
-    //      grammar, the semantic walk, unused names and values, then for a
-    //      Put the item size and the item nesting (top-level
-    //      ValidationException),
+    //      of the item's expression maps and, for a Put, of its item, a Put's
+    //      item nesting, the nesting of the item's ExpressionAttributeValues,
+    //      expression grammar, the semantic walk, unused names and values,
+    //      then for a Put the item size (top-level ValidationException),
     //   2. table lookup (ResourceNotFoundException),
     //   3. the 4 MB request total (top-level ValidationException),
     //   4. the key pass, per item in order: a key that does not fit the schema
@@ -483,6 +482,16 @@ fn parse_write_expressions(
         ));
     };
 
+    // A Put's Item nesting comes before every check of the item's expressions
+    // and before the item's size: an Item attribute 33 maps deep answers the
+    // nesting error beside a condition with a syntax error, an undefined name
+    // or value, an unused value, a reserved word, a path of 33 elements or
+    // BETWEEN bounds out of order, and beside an item over the size limit
+    // (measured 2026-11-12).
+    if let Some(put) = &twi.put {
+        validate_item_nesting_depth(&put.item)?;
+    }
+
     // The nesting of every ExpressionAttributeValues value, used or not, is
     // the first thing the service checks about an item's expressions
     // (measured: it beats the same item's syntax error, undefined reference
@@ -497,11 +506,9 @@ fn parse_write_expressions(
     // reserved word, operand type and path length (measured 2026-11-12, each
     // request twice; on 2026-10-14 the service answered the UpdateExpression
     // first). Then come the unused names and values; then, for a Put, the
-    // item's size and the item's nesting (measured: an oversize Put with an
-    // unused value reports the value, an oversize item one reports its size
-    // ahead of the next item's defects, and one item with a long attribute
-    // name, an oversize item and a deep item reports the name first and the
-    // nesting last).
+    // item's size (measured: an oversize Put with an unused value reports the
+    // value, and an oversize item reports its size ahead of the next item's
+    // defects).
     let maps = build_expression_maps(names, values);
     let condition = match condition_expression {
         // A ConditionCheck's expression is required, so an empty string is
@@ -541,7 +548,6 @@ fn parse_write_expressions(
     }
     if let Some(put) = &twi.put {
         validate_item_size(&put.item, limits.max_item_size_bytes)?;
-        validate_item_nesting_depth(&put.item)?;
     }
     Ok(ParsedExpressions {
         maps,
