@@ -174,14 +174,20 @@ pub(crate) async fn authorize_request(
 
     // A Query's request-time checks (Limit, the expression and non-expression
     // parameter mix, the ReturnConsumedCapacity and Select enums, every number
-    // in ExpressionAttributeValues) run before the IAM decision, for every
-    // principal. The engine makes the same checks at request time; they run
-    // here as well because authorization binds no dynamodb:LeadingKeys value
-    // to a number it cannot parse, and a fence that needs the key present
-    // (ForAnyValue, a Null guard, the plain operators) would otherwise answer
-    // AccessDeniedException where ValidationException is the request's error.
-    // The checks read the raw body, so a field that does not deserialize does
-    // not skip them.
+    // in ExpressionAttributeValues) run before the IAM decision, whatever the
+    // caller's policy. The engine makes the same checks at request time; they
+    // run here as well because authorization binds no dynamodb:LeadingKeys
+    // value to a number it cannot parse, and a fence that needs the key
+    // present (ForAnyValue, a Null guard, the plain operators) would otherwise
+    // answer AccessDeniedException where ValidationException is the request's
+    // error. The checks read the raw body, so a field that does not
+    // deserialize does not skip them.
+    //
+    // They run after the cross-account refusal above, so a Query that names a
+    // table ARN in another account gets AccessDeniedException without them.
+    // The service runs them first for a body it can read (measured
+    // 2026-11-12: with a table ARN in another account, `{"N": "bob"}` answers
+    // the numeric message and a `Limit` of 0 the `Limit` text).
     if operation == "Query" {
         extenddb_engine::query_key_values::validate_query_request_body(input)?;
     }

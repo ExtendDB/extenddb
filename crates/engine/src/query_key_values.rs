@@ -28,13 +28,11 @@
 //! `bob` partition, while authorization binds no `dynamodb:LeadingKeys` value
 //! to a number it cannot parse.
 
-use std::collections::HashMap;
-
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionMaps, KeyCondition, PathElement, SortKeyCondition,
 };
-use extenddb_core::types::{AttributeDefinition, AttributeValue, QueryInput, ScalarAttributeType};
+use extenddb_core::types::{AttributeDefinition, QueryInput};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
@@ -340,8 +338,9 @@ fn number_fault(text: &str) -> Option<Fault<'_>> {
 /// Refuse the first `N` value in `ExpressionAttributeValues` (including `NS`
 /// members and values nested in `L` and `M`) that is not a number, with the
 /// bare numeric message: no `ExpressionAttributeValues contains invalid value`
-/// wrapper, which the service uses on `UpdateItem` and on `Query` only for a
-/// value it cannot read as one type. The placeholders are visited in sorted
+/// wrapper, which the service uses on `UpdateItem`, and on `Query` for a value
+/// it cannot read as one type or beside a `Limit` above 2147483647 (measured
+/// 2026-11-12). The placeholders are visited in sorted
 /// order and each value on its own, so a value of the wrong JSON shape does
 /// not stop the check of another (the service picks among several invalid
 /// values by an order of its own: measured 2026-11-11, `:a` and `:b` with
@@ -377,12 +376,14 @@ fn validate_expression_attribute_value_numbers(
 ///
 /// Every value the condition compares is checked: the partition key value(s),
 /// the sort key value (or both `BETWEEN` bounds, or the `begins_with` prefix)
-/// and the extra equality conditions of a multi-attribute key schema. A path
-/// that does not resolve to an attribute name, a value that is not a
-/// placeholder, and a key attribute with no definition are left to the checks
-/// that already refuse them. When any compared placeholder is undefined the
-/// whole check is skipped: the service reports the undefined placeholder
-/// first, and the storage layer does so here.
+/// and the extra equality conditions of a multi-attribute key schema. Each one
+/// goes through the check the key schema classifier applies to a clause
+/// (`check_key_value_type` in `query.rs`). A path that does not resolve to an
+/// attribute name, a value that is not a placeholder, and a key attribute with
+/// no definition are left to the checks that already refuse them. When any
+/// compared placeholder is undefined the whole check is skipped: the service
+/// reports the undefined placeholder first, and the storage layer does so
+/// here.
 ///
 /// # Errors
 ///
@@ -419,49 +420,9 @@ pub fn validate_key_condition_types(
     }
 
     for (path, value) in pairs {
-        let Some(attr_name) = resolve_attr_name(path, &maps.names) else {
-            continue;
-        };
-        let Some(expected) = attribute_definitions
-            .iter()
-            .find(|ad| ad.attribute_name == attr_name)
-            .map(|ad| ad.attribute_type)
-        else {
-            continue;
-        };
-        let Expr::Placeholder(name) = value else {
-            continue;
-        };
-        let Some(av) = maps.values.get(name) else {
-            continue;
-        };
-        if !type_matches(expected, av) {
-            return Err(DynamoDbError::ValidationException(
-                KEY_CONDITION_TYPE_MISMATCH.to_owned(),
-            ));
-        }
+        crate::query::check_key_value_type(path, value, attribute_definitions, maps)?;
     }
     Ok(())
-}
-
-fn type_matches(expected: ScalarAttributeType, value: &AttributeValue) -> bool {
-    matches!(
-        (expected, value),
-        (ScalarAttributeType::S, AttributeValue::S(_))
-            | (ScalarAttributeType::N, AttributeValue::N(_))
-            | (ScalarAttributeType::B, AttributeValue::B(_))
-    )
-}
-
-/// The top-level attribute name of a key path, through `#name` references.
-fn resolve_attr_name(path: &[PathElement], names: &HashMap<String, String>) -> Option<String> {
-    match path.first()? {
-        PathElement::Attribute(name) => match name.strip_prefix('#') {
-            Some(reference) => names.get(reference).cloned(),
-            None => Some(name.clone()),
-        },
-        PathElement::Index(_) => None,
-    }
 }
 
 #[cfg(test)]

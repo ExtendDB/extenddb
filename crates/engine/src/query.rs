@@ -250,7 +250,11 @@ pub async fn handle_query(
     // Legacy `KeyConditions` are checked by the classifier: against the key
     // schema's definitions on a multi-attribute key schema and against the
     // table's on a single-attribute one. The check below runs only where the
-    // classifier did not check (`!check_types_here`).
+    // classifier did not check (`!check_types_here`). For a legacy value of
+    // the wrong type on a single-attribute key schema, the service reports the
+    // projection, Select, filter, QueryFilter and unused-value checks first
+    // (measured 2026-11-11 and 2026-11-12), so the classifier's check answers
+    // ahead of them there, where the service does not.
     let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
     let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
         .attribute_definitions
@@ -601,7 +605,7 @@ fn resolve_path_attr_name(
 /// `attribute_definitions` is not checked here. On a multi-attribute key
 /// schema the caller passes the queried key schema's definitions only, and the
 /// classifier reports a clause on any other attribute.
-fn check_key_value_type(
+pub(crate) fn check_key_value_type(
     path: &[PathElement],
     expr: &extenddb_core::expression::Expr,
     attribute_definitions: &[extenddb_core::types::AttributeDefinition],
@@ -635,9 +639,7 @@ fn check_key_value_type(
         Ok(())
     } else {
         Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: Condition parameter type does not match \
-             schema type"
-                .to_owned(),
+            crate::query_key_values::KEY_CONDITION_TYPE_MISMATCH.to_owned(),
         ))
     }
 }
