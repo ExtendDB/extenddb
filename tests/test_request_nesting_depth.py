@@ -8,9 +8,12 @@ The JSON deserializer used to refuse any body nested past 128 structural levels
 with a SerializationException, so a request whose attribute nested past that
 never reached the nesting-depth check. Amazon DynamoDB parses such a request and
 answers with the document nesting "Nesting Levels have exceeded supported
-limits..." ValidationException, and only a body nested past about 2000 wrappers
-(roughly 4000 JSON levels) is refused, then with a message-less
-SerializationException. Measured against the service (us-east-1, 2026-11-02).
+limits..." ValidationException. It has no fixed ceiling: a PutItem attribute of
+up to about 1700 single-key wrappers (about 3400 JSON levels) got that
+ValidationException on every send, from about 1800 wrappers the answer varied
+from request to request between it and a message-less SerializationException,
+and 5000 wrappers and deeper got the SerializationException on every send
+(us-east-1, 2026-11-12, 24 sends per depth across four windows).
 
 Dual-target: runs against the service and against ExtendDB on every backend.
 
@@ -31,10 +34,6 @@ from botocore.exceptions import ClientError
 from conftest import scoped_table
 from raw_signed_request import signed_post
 
-# botocore serializes a nested dict recursively, so lift CPython's own limit for
-# the boto3 cases below (the raw-JSON cases do not recurse and do not need it).
-sys.setrecursionlimit(10_000)
-
 NEST = "Nesting Levels have exceeded supported limits"
 NEST_FULL = (
     "Nesting Levels have exceeded supported limits: "
@@ -47,6 +46,16 @@ SERIALIZATION_TYPE = "com.amazon.coral.service#SerializationException"
 def table(dynamodb_client):
     with scoped_table(dynamodb_client) as name:
         yield name
+
+
+@pytest.fixture
+def deep_recursion():
+    """botocore serializes a nested dict recursively; lift CPython's limit for a
+    case that builds a deep Item through boto3, and restore it afterwards."""
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(10_000)
+    yield
+    sys.setrecursionlimit(previous)
 
 
 def _deep(wrappers: int) -> dict:
@@ -93,6 +102,14 @@ def _raw_put(dynamodb_client, table_name: str, pk: str, wrappers: int):
     )
 
 
+def _is_nesting_validation_error(err: dict) -> bool:
+    return err["__type"].endswith("ValidationException") and err["message"] == NEST_FULL
+
+
+def _is_messageless_serialization_error(err: dict) -> bool:
+    return err["__type"] == SERIALIZATION_TYPE and "message" not in err
+
+
 def test_an_attribute_within_the_limit_is_stored(dynamodb_client, table):
     # Positive control: 31 wrappers (leaf at level 32) is within the document
     # limit and is stored, so the parse change did not break the accept path.
@@ -101,7 +118,9 @@ def test_an_attribute_within_the_limit_is_stored(dynamodb_client, table):
     )
 
 
-def test_a_63_level_attribute_is_a_nesting_validation_error(dynamodb_client, table):
+def test_a_63_level_attribute_is_a_nesting_validation_error(
+    dynamodb_client, table, deep_recursion
+):
     # 63 wrappers nests the request just past the 128 structural level parse
     # limit. The server must read it and answer with the nesting
     # ValidationException, not a SerializationException.
@@ -110,7 +129,9 @@ def test_a_63_level_attribute_is_a_nesting_validation_error(dynamodb_client, tab
     assert err["Message"] == NEST_FULL, err
 
 
-def test_an_attribute_far_past_the_parse_limit_still_validates(dynamodb_client, table):
+def test_an_attribute_far_past_the_parse_limit_still_validates(
+    dynamodb_client, table, deep_recursion
+):
     # Well past the old parse limit and within the request depth ceiling: still
     # a nesting ValidationException, never a parse failure.
     err = _put_error(dynamodb_client, table, _deep(120))
@@ -118,27 +139,41 @@ def test_an_attribute_far_past_the_parse_limit_still_validates(dynamodb_client, 
     assert NEST in err["Message"], err
 
 
-@pytest.mark.parametrize("wrappers", [300, 1000, 2000])
-def test_a_deep_body_within_the_ceiling_is_a_nesting_validation_error(
+@pytest.mark.parametrize("wrappers", [300, 1000, 1500])
+def test_a_deep_body_the_service_always_validates_is_a_nesting_error(
     dynamodb_client, table, wrappers
 ):
-    # The service parses a body nested far past the old 128 level parse limit,
-    # up to at least 2000 wrappers, and answers with the document nesting
-    # ValidationException. Built as raw JSON so the client does not recurse.
+    # Up to 1500 wrappers the service answered the document nesting
+    # ValidationException on every send (24 of 24 per depth). Built as raw JSON
+    # so the client does not recurse.
+    resp = _raw_put(dynamodb_client, table, f"deep{wrappers}", wrappers)
+    assert resp.status_code == 400, resp.text
+    assert _is_nesting_validation_error(resp.json()), resp.text
+
+
+@pytest.mark.parametrize("wrappers", [2000, 2598])
+def test_a_body_in_the_varying_band_gets_one_of_the_two_answers(
+    dynamodb_client, table, wrappers
+):
+    # From about 1800 wrappers the service's answer varies per request: the
+    # nesting ValidationException or the message-less SerializationException
+    # (2000 wrappers: 23 and 1 of 24 in one set of windows, the other way round
+    # in others). 2598 wrappers is the deepest body the server's ceiling
+    # admits; it parses it and answers the ValidationException.
     resp = _raw_put(dynamodb_client, table, f"deep{wrappers}", wrappers)
     assert resp.status_code == 400, resp.text
     err = resp.json()
-    assert err["__type"].endswith("ValidationException"), err
-    assert err["message"] == NEST_FULL, err
+    assert _is_nesting_validation_error(err) or _is_messageless_serialization_error(
+        err
+    ), err
 
 
 def test_a_body_far_past_the_ceiling_is_a_messageless_serialization_error(
     dynamodb_client, table
 ):
-    # Far past any depth the service parses. It answers HTTP 400 with the
-    # SerializationException type and no message field at all.
+    # Far past any depth the service parses (5000 wrappers and deeper were
+    # refused on every send). It answers HTTP 400 with the SerializationException
+    # type and no message field at all.
     resp = _raw_put(dynamodb_client, table, "huge", 20_000)
     assert resp.status_code == 400, resp.text
-    err = resp.json()
-    assert err["__type"] == SERIALIZATION_TYPE, err
-    assert "message" not in err, err
+    assert _is_messageless_serialization_error(resp.json()), resp.text
