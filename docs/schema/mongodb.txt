@@ -1,6 +1,9 @@
 collection extenddb_catalog.access_keys type collection options {}
 index extenddb_catalog.access_keys _id_ key {"_id":1} options {}
 index extenddb_catalog.access_keys account_id_1_user_name_1 key {"account_id":1,"user_name":1} options {}
+collection extenddb_catalog.account_metrics type collection options {}
+index extenddb_catalog.account_metrics _id_ key {"_id":1} options {}
+index extenddb_catalog.account_metrics bucket_1 key {"bucket":1} options {}
 collection extenddb_catalog.accounts type collection options {}
 index extenddb_catalog.accounts _id_ key {"_id":1} options {}
 index extenddb_catalog.accounts account_name_1 key {"account_name":1} options {"unique":true}
@@ -44,9 +47,6 @@ index extenddb_catalog.indexes _id_ key {"_id":1} options {}
 collection extenddb_catalog.login_attempts type collection options {}
 index extenddb_catalog.login_attempts _id_ key {"_id":1} options {}
 index extenddb_catalog.login_attempts principal_1_attempted_at_1 key {"principal":1,"attempted_at":1} options {}
-collection extenddb_catalog.metrics type collection options {}
-index extenddb_catalog.metrics _id.bucket_1 key {"_id.bucket":1} options {}
-index extenddb_catalog.metrics _id_ key {"_id":1} options {}
 collection extenddb_catalog.schema_history type collection options {}
 index extenddb_catalog.schema_history _id_ key {"_id":1} options {}
 collection extenddb_catalog.settings type collection options {}
@@ -70,3 +70,4 @@ index extenddb_data.stream_records shard_id_1_sequence_number_1 key {"shard_id":
 collection extenddb_data.stream_shards type collection options {}
 index extenddb_data.stream_shards _id_ key {"_id":1} options {}
 index extenddb_data.stream_shards shard_id_1 key {"shard_id":1} options {"unique":true}
+index extenddb_data.stream_shards table_id_1_shard_id_1 key {"table_id":1,"shard_id":1} options {}

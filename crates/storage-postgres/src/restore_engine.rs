@@ -45,6 +45,7 @@ use futures::stream::BoxStream;
 
 use crate::PostgresEngine;
 use crate::backup_engine::{RestoreTarget, RowInsertError, insert_restore_rows};
+use crate::catalog_json::from_catalog_json;
 use crate::data::data_table_name;
 use crate::data::vector_index::{VectorInsertPlan, fetch_vector_indexes_for_table};
 
@@ -52,7 +53,8 @@ fn db_err(e: sqlx::Error) -> StorageError {
     StorageError::Internal(format!("Database error: {e}"))
 }
 
-/// The key shape of a CREATING restore target, read from its catalog row.
+/// The key shape of a CREATING restore target, read from its catalog row
+/// through the escape of `catalog_json`.
 struct TargetShape {
     key_schema: Vec<KeySchemaElement>,
     attribute_definitions: Vec<AttributeDefinition>,
@@ -84,9 +86,9 @@ impl PostgresEngine {
             ))
         })?;
         Ok(TargetShape {
-            key_schema: serde_json::from_value(key_schema)
+            key_schema: from_catalog_json(key_schema)
                 .map_err(|e| StorageError::Internal(format!("key schema: {e}")))?,
-            attribute_definitions: serde_json::from_value(attribute_definitions)
+            attribute_definitions: from_catalog_json(attribute_definitions)
                 .map_err(|e| StorageError::Internal(format!("attribute definitions: {e}")))?,
         })
     }

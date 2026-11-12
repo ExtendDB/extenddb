@@ -13,10 +13,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use crate::console::ConsoleState;
 use crate::console::html;
 
-use super::account_scope::require_account_session;
+use super::account_scope::require_user_session;
+use super::user_pages::user_breadcrumb;
 use super::{CsrfOnly, identity_label, op_error_message, require_csrf};
-
-use crate::management::CallerIdentity;
 
 /// POST /console/accounts/{id}/users/{name}/access-keys/new
 pub async fn create_access_key(
@@ -25,22 +24,11 @@ pub async fn create_access_key(
     Path((account_id, user_name)): Path<(String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_account_session(&headers, &state, &account_id).await {
+    // Self-service (the session's own user) or admin.
+    let session = match require_user_session(&headers, &state, &account_id, &user_name).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-
-    // Allow self-service (same IAM user) or admin.
-    let allowed = match &session.identity {
-        CallerIdentity::Admin(_) => true,
-        CallerIdentity::IamUser {
-            account_id: a,
-            user_name: u,
-        } => a == &account_id && u == &user_name,
-    };
-    if !allowed {
-        return Redirect::to("/console").into_response();
-    }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
     }
@@ -49,16 +37,12 @@ pub async fn create_access_key(
     let eid = html::escape(&account_id);
     let eun = html::escape(&user_name);
 
-    let crumbs = html::breadcrumb(&[
-        ("Dashboard", Some("/console")),
-        ("Accounts", Some("/console/accounts")),
-        (&account_id, Some(&format!("/console/accounts/{eid}"))),
-        (
-            &user_name,
-            Some(&format!("/console/accounts/{eid}/users/{eun}")),
-        ),
-        ("New Access Key", None),
-    ]);
+    let crumbs = user_breadcrumb(
+        &session.identity,
+        &account_id,
+        &user_name,
+        Some("New Access Key"),
+    );
 
     match state
         .catalog_store
@@ -120,22 +104,11 @@ pub async fn delete_access_key(
     Path((account_id, user_name, key_id)): Path<(String, String, String)>,
     Form(form): Form<CsrfOnly>,
 ) -> Response {
-    let session = match require_account_session(&headers, &state, &account_id).await {
+    // Self-service (the session's own user) or admin.
+    let session = match require_user_session(&headers, &state, &account_id, &user_name).await {
         Ok(s) => s,
         Err(r) => return r,
     };
-
-    // Allow self-service (same IAM user) or admin.
-    let allowed = match &session.identity {
-        CallerIdentity::Admin(_) => true,
-        CallerIdentity::IamUser {
-            account_id: a,
-            user_name: u,
-        } => a == &account_id && u == &user_name,
-    };
-    if !allowed {
-        return Redirect::to("/console").into_response();
-    }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;
     }

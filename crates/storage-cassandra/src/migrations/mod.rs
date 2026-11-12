@@ -159,6 +159,29 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
              (restore_file_index, restore_items_applied, which migration 6 adds); the \
              restore_progress table is PostgreSQL's data database's",
         ),
+        MigrationId::WarmThroughput => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0009_warm_throughput.cql"
+            )],
+        },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0010_account_metrics.cql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
     }
 }
 
