@@ -22,9 +22,10 @@ use extenddb_core::types::{
 };
 use extenddb_storage::backup_catalog::{
     AbandonedLegacyBackup, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat,
-    JobClaim, JobRow, JobStatus, RestoreJobRow, RestoreKind, RestoreRegistrationRow,
-    RestoreTargetKey, StaleClock, StatusEntrySweep, StatusFields, StoreIdentity, StoreKind,
-    StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome, new_generation,
+    JobClaim, JobRow, JobStatus, LegacyBackupItems, LegacyBackupKey, Replaced, RestoreJobRow,
+    RestoreKind, RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusEntrySweep,
+    StatusFields, StoreIdentity, StoreKind, StoreRootCount, TimeBounds, UNOWNED_GENERATION,
+    WriteOutcome, new_generation,
 };
 use extenddb_storage::backup_definition::{BACKUP_DEFINITION_VERSION, BackupTableDefinition};
 use extenddb_storage::error::StorageError;
@@ -38,6 +39,8 @@ use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 
 use super::*;
+
+mod migrate_legacy;
 
 const ACCOUNT: &str = "123456789012";
 const REGION: &str = "us-east-1";
@@ -332,6 +335,12 @@ struct Fake {
     /// ARN, and `read_backup_row` finds a row by its ARN; otherwise by
     /// backup id, as on PostgreSQL, SQLite and MongoDB.
     unique_by_arn: std::sync::atomic::AtomicBool,
+    /// When set, `replace_with_index_row`'s `AlreadyReplaced` finishes a
+    /// DELETING in-catalog backup as MongoDB's does (an earlier call that
+    /// committed and stopped before the drop), besides removing an
+    /// AVAILABLE one; otherwise a DELETING one stays, as on PostgreSQL and
+    /// SQLite.
+    finishes_deleting: std::sync::atomic::AtomicBool,
     /// Rows `rewrite_store` lands just before it decides, by ARN: a
     /// CreateBackup of a server still on the old root whose row lands after
     /// the move's checks, or another writer's change to a row the move
@@ -408,6 +417,70 @@ struct Fake {
     by_root_error_for: Mutex<Option<String>>,
     /// When set, `list_backup_rows_older_than` fails with it (every call).
     older_than_error: Mutex<Option<String>>,
+    /// The in-catalog backups `items` opens, by ARN: their name, vector
+    /// state and items. Their recorded source is `sources`'; a backup with a
+    /// source and no entry here opens with no items.
+    legacy_items: Mutex<HashMap<String, FakeLegacyItems>>,
+    /// What `list_all` answers.
+    legacy_keys: Mutex<Vec<LegacyBackupKey>>,
+    /// When set, `list_all` fails with it (every call).
+    list_all_error: Mutex<Option<String>>,
+    /// When set, the next `items` fails with it before opening anything.
+    items_error: Mutex<Option<StorageError>>,
+    /// When set, the next stream `items` opens yields this many items and
+    /// then fails with the error: a read that ends part way (a MongoDB
+    /// cursor whose collection was dropped, a lost connection).
+    items_fail_after: Mutex<Option<(usize, StorageError)>>,
+    /// Every `items` call, by ARN.
+    items_opened: Mutex<Vec<String>>,
+    /// When set, the streams `items` opens yield each item this long after
+    /// the one before (a slow read).
+    items_delay: Mutex<Option<Duration>>,
+    /// When set, the next `replace_with_index_row` answers this instead of
+    /// deciding; `Replaced` and `AlreadyReplaced` also make the change.
+    replace_answer: Mutex<Option<Replaced>>,
+    /// When set, the next `replace_with_index_row` fails with it, writing
+    /// nothing.
+    replace_error: Mutex<Option<String>>,
+    /// Every row `replace_with_index_row` received, in order.
+    replaces_seen: Mutex<Vec<BackupRow>>,
+    /// In-catalog backups whose replacement committed and stopped before
+    /// its end (MongoDB's DELETING document marked `migrated_to_store`), by
+    /// ARN: `finish_replacement` finishes them.
+    migrated_deleting: Mutex<std::collections::HashSet<String>>,
+    /// Every `finish_replacement` that finished a backup, by ARN.
+    finished_replacements: Mutex<Vec<String>>,
+    /// When set, run (once) at the start of the next legacy `describe`,
+    /// `list`, `delete` or `restore_source`: a replacement committing
+    /// between the engine's read of the catalog index and its read of the
+    /// legacy reader.
+    before_legacy_read: Mutex<Option<SweepHook>>,
+    /// When set, run (once) at the start of the next legacy `restore`, the
+    /// backend's registration: a replacement committing between the
+    /// engine's read of the restore source and the registration.
+    before_legacy_restore: Mutex<Option<SweepHook>>,
+    /// Every `row_holding_backup_id` call, by backup id.
+    id_reads: Mutex<Vec<String>>,
+    /// Every DELETED in-catalog backup `remove_deleted` removed, by ARN.
+    removed_deleted: Mutex<Vec<String>>,
+    /// When set, run (once) at the start of the next
+    /// `replace_with_index_row`: a row written between the migration's
+    /// reads and its replacement.
+    before_replace: Mutex<Option<SweepHook>>,
+    /// When set, `row_holding_backup_id` finds nothing, as Cassandra's
+    /// does (no table of it indexes the backup id).
+    no_id_index: std::sync::atomic::AtomicBool,
+    /// When set, the next `holder_status` fails with it (a catalog read
+    /// that failed), reading nothing.
+    holder_status_error: Mutex<Option<String>>,
+}
+
+/// One in-catalog backup the `Fake`'s `items` opens.
+#[derive(Debug, Clone)]
+struct FakeLegacyItems {
+    backup_name: String,
+    vector_state: extenddb_storage::backup_definition::LegacyVectorState,
+    items: Vec<Item>,
 }
 
 /// One `rewrite_store` call the `Fake` received: the old kind and root, the
@@ -563,6 +636,16 @@ impl JobClaim for FakeRestoreClaim {
         Box::pin(async move {
             found.ok_or_else(|| StorageError::Internal("the record is gone".to_owned()))
         })
+    }
+}
+
+impl Fake {
+    /// Run the `before_legacy_read` hook, once, if one is set.
+    fn legacy_read_starts(&self) {
+        let hook = self.before_legacy_read.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
     }
 }
 
@@ -1000,7 +1083,10 @@ struct MemStore {
     /// reached its deadline (a walk stopped at its next entry).
     deadline_reached: std::sync::atomic::AtomicBool,
     /// Every `delete_prefix_before`'s prefix and deadline, in order.
-    deadlines_seen: Mutex<Vec<(String, tokio::time::Instant)>>,
+    deadlines: Mutex<Vec<(String, tokio::time::Instant)>>,
+    /// Called with the prefix of every `delete_prefix` once it removed what
+    /// it matched, so a test can act between the deletions of a copy.
+    on_delete: Mutex<Option<OnPut>>,
     /// Called with the key of every `put` that stored its object, so a test
     /// can act at a point of the job (after the sidecar's put, before the
     /// claim re-check).
@@ -1058,6 +1144,17 @@ struct MemStore {
     fail_heads_of: Mutex<Option<String>>,
     /// When set, `head` of this key never answers; every other call answers.
     stall_heads_of: Mutex<Option<String>>,
+    /// When set, `delete_prefix_before` removes the prefix's objects one at
+    /// a time, this long before each, recording each key in `deletes` (a
+    /// walk whose removals a test can count against a loss recorded
+    /// mid-walk).
+    delete_one_at_a_time: Mutex<Option<Duration>>,
+    /// When set, a `put_if_absent` of a key ending with this stores its
+    /// object and then fails as a transport error: a put whose answer was
+    /// lost after the store kept the object.
+    store_then_fail_puts_of: Mutex<Option<String>>,
+    /// Every `delete_written`'s object, as the caller recorded it, in order.
+    written_deletes: Mutex<Vec<extenddb_backup_store::ObjectMeta>>,
     /// Every `list`'s prefix, in order.
     lists: Mutex<Vec<String>>,
 }
@@ -1254,26 +1351,80 @@ impl extenddb_backup_store::BackupStore for MemStore {
         Box::pin(async move {
             self.stall().await;
             self.check()?;
+            // A key other than the identity file's is a copy's object
+            // (`backup migrate-legacy` writes with `put_if_absent`): the
+            // knobs and the records of `put` apply to it too.
+            let object = key != STORE_IDENTITY_KEY;
+            let mut body = body;
+            if object
+                && self
+                    .fail_puts_after_first_chunk
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let _first = body.try_next().await?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError(
+                        "connection reset mid-body".to_owned(),
+                    ))),
+                });
+            }
             let bytes = collect_body(body).await?;
+            if object && self.fail_puts.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError("put refused".to_owned()))),
+                });
+            }
             if self
                 .key_taken_by_a_non_object
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 return Ok(None);
             }
-            let mut objects = self.objects.lock().unwrap();
-            if objects.contains_key(key) {
-                return Ok(None);
-            }
-            self.puts.lock().unwrap().push(key.to_owned());
             let size = bytes.len() as u64;
-            objects.insert(key.to_owned(), bytes);
-            if let Some(other) = self.overwrite_after_conditional_put.lock().unwrap().clone() {
-                objects.insert(key.to_owned(), other);
+            {
+                let mut objects = self.objects.lock().unwrap();
+                if objects.contains_key(key) {
+                    return Ok(None);
+                }
+                self.puts.lock().unwrap().push(key.to_owned());
+                objects.insert(key.to_owned(), bytes);
+                if let Some(other) = self.overwrite_after_conditional_put.lock().unwrap().clone() {
+                    objects.insert(key.to_owned(), other);
+                }
             }
+            if object {
+                self.put_sizes.lock().unwrap().push((key.to_owned(), size));
+                if let Some(on_put) = self.on_put.lock().unwrap().as_ref() {
+                    on_put(key);
+                }
+            }
+            if object
+                && self
+                    .store_then_fail_puts_of
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|suffix| key.ends_with(suffix))
+            {
+                return Err(extenddb_backup_store::StoreError::Transport {
+                    source: Box::new(DispatchFailure(ConnectError(
+                        "the answer to the put was lost".to_owned(),
+                    ))),
+                });
+            }
+            let reported = if object
+                && self
+                    .misreport_put_size
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                size + 1
+            } else {
+                size
+            };
             Ok(Some(extenddb_backup_store::ObjectMeta {
                 key: key.to_owned(),
-                size,
+                size: reported,
                 last_modified: None,
                 etag: None,
             }))
@@ -1523,6 +1674,18 @@ impl extenddb_backup_store::BackupStore for MemStore {
         Box::pin(futures::stream::iter(metas))
     }
 
+    /// An unconditional deletion of the key, as the trait's default makes
+    /// when nothing is under `key/` (a copy's keys have nothing under
+    /// them), with the object as the caller recorded it kept in
+    /// `written_deletes`.
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a extenddb_backup_store::ObjectMeta,
+    ) -> BoxedFuture<'a, Result<bool, extenddb_backup_store::StoreError>> {
+        self.written_deletes.lock().unwrap().push(written.clone());
+        Box::pin(async move { self.delete_prefix(&written.key).await.map(|_| true) })
+    }
+
     fn delete_prefix<'a>(
         &'a self,
         prefix: &'a str,
@@ -1562,6 +1725,10 @@ impl extenddb_backup_store::BackupStore for MemStore {
             {
                 objects.insert(format!("{prefix}{late}"), b"late".to_vec());
             }
+            drop(objects);
+            if let Some(on_delete) = self.on_delete.lock().unwrap().as_ref() {
+                on_delete(prefix);
+            }
             Ok(deleted)
         })
     }
@@ -1577,19 +1744,42 @@ impl extenddb_backup_store::BackupStore for MemStore {
         'a,
         Result<extenddb_backup_store::PrefixDeletion, extenddb_backup_store::StoreError>,
     > {
-        self.deadlines_seen
-            .lock()
-            .unwrap()
-            .push((prefix.to_owned(), deadline));
         Box::pin(async move {
+            self.deadlines
+                .lock()
+                .unwrap()
+                .push((prefix.to_owned(), deadline));
             if self
                 .deadline_reached
                 .load(std::sync::atomic::Ordering::Acquire)
                 || tokio::time::Instant::now() >= deadline
             {
+                // A store call answers through I/O, so the walk's loop
+                // yields here as it would on a real store, and a timeout
+                // around a walk that never ends can fire.
+                tokio::task::yield_now().await;
                 return Ok(extenddb_backup_store::PrefixDeletion {
                     deleted: 0,
                     finished: false,
+                });
+            }
+            let one_at_a_time = *self.delete_one_at_a_time.lock().unwrap();
+            if let Some(pause) = one_at_a_time {
+                let keys: Vec<String> = self
+                    .keys()
+                    .into_iter()
+                    .filter(|k| Self::matches(k, prefix))
+                    .collect();
+                let mut deleted = 0;
+                for key in keys {
+                    tokio::time::sleep(pause).await;
+                    self.objects.lock().unwrap().remove(&key);
+                    self.deletes.lock().unwrap().push(key);
+                    deleted += 1;
+                }
+                return Ok(extenddb_backup_store::PrefixDeletion {
+                    deleted,
+                    finished: true,
                 });
             }
             self.delete_prefix(prefix)
@@ -2378,6 +2568,24 @@ impl BackupCatalog for Fake {
             drop(hook);
             run(self);
         }
+        Box::pin(async move { Ok(found) })
+    }
+
+    /// The first row of the id, whatever its account and ARN (the backends'
+    /// unique index).
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        self.id_reads.lock().unwrap().push(backup_id.to_owned());
+        let found = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .find(|r| r.backup_id == backup_id)
+            .cloned()
+            .filter(|_| !self.no_id_index.load(std::sync::atomic::Ordering::Acquire));
         Box::pin(async move { Ok(found) })
     }
 
@@ -3543,6 +3751,7 @@ impl LegacyBackupReader for Fake {
         _account_id: &str,
         backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupDescription, StorageError>> {
+        self.legacy_read_starts();
         let found = self.descriptions.lock().unwrap().get(backup_arn).cloned();
         let backup_arn = backup_arn.to_owned();
         Box::pin(async move {
@@ -3555,6 +3764,7 @@ impl LegacyBackupReader for Fake {
         _account_id: &str,
         table_name: Option<&str>,
     ) -> BoxedFuture<'_, Result<Vec<BackupSummary>, StorageError>> {
+        self.legacy_read_starts();
         self.listed_for
             .lock()
             .unwrap()
@@ -3565,15 +3775,24 @@ impl LegacyBackupReader for Fake {
 
     /// Removes the backup and answers its description as the backends do:
     /// the row's status (not yet `DELETED`), `SourceTableDetails` without
-    /// `ProvisionedThroughput`, no feature details.
+    /// `ProvisionedThroughput`, no feature details. Its `legacy_keys` entry
+    /// stays, DELETED, as the backends' tombstone does.
     fn delete(
         &self,
         _account_id: &str,
         backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupDescription, StorageError>> {
+        self.legacy_read_starts();
         self.deleted.lock().unwrap().push(backup_arn.to_owned());
         let found = self.descriptions.lock().unwrap().remove(backup_arn);
-        self.sources.lock().unwrap().remove(backup_arn);
+        if self.sources.lock().unwrap().remove(backup_arn).is_some() {
+            for key in self.legacy_keys.lock().unwrap().iter_mut() {
+                if key.backup_arn == backup_arn {
+                    key.status = BackupStatus::Deleted;
+                }
+            }
+        }
+        self.legacy_items.lock().unwrap().remove(backup_arn);
         let backup_arn = backup_arn.to_owned();
         Box::pin(async move {
             found.ok_or_else(|| StorageError::Validation(format!("Backup not found: {backup_arn}")))
@@ -3585,6 +3804,7 @@ impl LegacyBackupReader for Fake {
         _account_id: &str,
         backup_arn: &str,
     ) -> BoxedFuture<'_, Result<BackupRestoreSource, StorageError>> {
+        self.legacy_read_starts();
         *self.source_reads.lock().unwrap() += 1;
         let err = self.source_error.lock().unwrap().take();
         let found = self.sources.lock().unwrap().get(backup_arn).cloned();
@@ -3607,6 +3827,10 @@ impl LegacyBackupReader for Fake {
         request: RestoreRequest,
         permit: JobPermit,
     ) -> BoxedFuture<'_, Result<TableDescription, StorageError>> {
+        let hook = self.before_legacy_restore.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
         let err = self.restore_error.lock().unwrap().take();
         let desc = described(&request);
         self.restores.lock().unwrap().push(request);
@@ -3627,6 +3851,300 @@ impl LegacyBackupReader for Fake {
     ) -> BoxedFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
         let found = self.abandoned_backups.lock().unwrap().clone();
         Box::pin(async move { Ok(found) })
+    }
+
+    /// As [`Self::delete`], recorded in `deleted` the same way; the Fake
+    /// has no DELETING state for the reconciler's answer to depend on.
+    fn delete_fenced<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<(), StorageError>> {
+        let deleted = self.delete(account_id, backup_arn);
+        Box::pin(async move { deleted.await.map(|_| ()) })
+    }
+
+    fn list_all(&self) -> BoxedFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        let error = self.list_all_error.lock().unwrap().clone();
+        let keys: Vec<LegacyBackupKey> = self
+            .legacy_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.status != BackupStatus::Deleted)
+            .cloned()
+            .collect();
+        Box::pin(async move {
+            match error {
+                Some(e) => Err(StorageError::Internal(e)),
+                None => Ok(keys),
+            }
+        })
+    }
+
+    /// The `legacy_keys` a DeleteBackup left DELETED (a replacement removes
+    /// its key).
+    fn list_deleted(&self) -> BoxedFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        let error = self.list_all_error.lock().unwrap().clone();
+        let keys: Vec<LegacyBackupKey> = self
+            .legacy_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.status == BackupStatus::Deleted)
+            .cloned()
+            .collect();
+        Box::pin(async move {
+            match error {
+                Some(e) => Err(StorageError::Internal(e)),
+                None => Ok(keys),
+            }
+        })
+    }
+
+    /// The `legacy_keys` entry of the account and ARN, any status; with
+    /// none, the status of a description seeded under the ARN (a test that
+    /// seeds only `descriptions`). A backup in `migrated_deleting` has
+    /// none, as MongoDB answers for a document marked `migrated_to_store`.
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        if let Some(e) = self.holder_status_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(StorageError::Internal(e)) });
+        }
+        if self.migrated_deleting.lock().unwrap().contains(backup_arn) {
+            return Box::pin(async { Ok(None) });
+        }
+        let keyed = self
+            .legacy_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|k| k.account_id == account_id && k.backup_arn == backup_arn)
+            .map(|k| k.status);
+        let described = self
+            .descriptions
+            .lock()
+            .unwrap()
+            .get(backup_arn)
+            .map(|d| d.backup_details.backup_status.clone());
+        Box::pin(async move {
+            match (keyed, described) {
+                (Some(status), _) => Ok(Some(status)),
+                (None, Some(status)) => BackupStatus::parse(&status).map(Some),
+                (None, None) => Ok(None),
+            }
+        })
+    }
+
+    /// Removes the DELETED `legacy_keys` entry of the account and ARN, and
+    /// nothing in another status.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        let mut keys = self.legacy_keys.lock().unwrap();
+        let before = keys.len();
+        keys.retain(|k| {
+            !(k.account_id == account_id
+                && k.backup_arn == backup_arn
+                && k.status == BackupStatus::Deleted)
+        });
+        let removed = keys.len() != before;
+        drop(keys);
+        if removed {
+            self.removed_deleted
+                .lock()
+                .unwrap()
+                .push(backup_arn.to_owned());
+        }
+        Box::pin(async move { Ok(removed) })
+    }
+
+    /// Finishes a backup in `migrated_deleting`: the key and the item
+    /// entry go, as MongoDB's drop and DELETED write leave nothing listed.
+    fn finish_replacement<'a>(
+        &'a self,
+        _account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+        let finished = self.migrated_deleting.lock().unwrap().remove(backup_arn);
+        if finished {
+            self.finished_replacements
+                .lock()
+                .unwrap()
+                .push(backup_arn.to_owned());
+            self.legacy_keys
+                .lock()
+                .unwrap()
+                .retain(|k| k.backup_arn != backup_arn);
+            self.legacy_items.lock().unwrap().remove(backup_arn);
+            self.sources.lock().unwrap().remove(backup_arn);
+        }
+        Box::pin(async move { Ok(finished) })
+    }
+
+    /// The source `restore_source` would answer, with the backup's entry in
+    /// `legacy_items`; a backup with no source is `Backup not found`.
+    fn items(
+        &self,
+        _account_id: &str,
+        backup_arn: &str,
+    ) -> BoxedFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        self.items_opened
+            .lock()
+            .unwrap()
+            .push(backup_arn.to_owned());
+        let error = self.items_error.lock().unwrap().take();
+        let source = self.sources.lock().unwrap().get(backup_arn).cloned();
+        let entry = self.legacy_items.lock().unwrap().get(backup_arn).cloned();
+        let fail_after = self.items_fail_after.lock().unwrap().take();
+        let delay = *self.items_delay.lock().unwrap();
+        let backup_arn = backup_arn.to_owned();
+        Box::pin(async move {
+            if let Some(e) = error {
+                return Err(e);
+            }
+            let source = source.ok_or_else(|| {
+                StorageError::Validation(format!("Backup not found: {backup_arn}"))
+            })?;
+            let entry = entry.unwrap_or(FakeLegacyItems {
+                backup_name: "nightly".to_owned(),
+                vector_state: extenddb_storage::backup_definition::LegacyVectorState::NoneRecorded,
+                items: Vec::new(),
+            });
+            let mut items: Vec<Result<Item, StorageError>> =
+                entry.items.into_iter().map(Ok).collect();
+            if let Some((after, e)) = fail_after {
+                items.truncate(after);
+                items.push(Err(e));
+            }
+            let items = futures::stream::iter(items);
+            Ok(LegacyBackupItems {
+                backup_name: entry.backup_name,
+                source,
+                vector_state: entry.vector_state,
+                items: match delay {
+                    Some(delay) => items
+                        .then(move |item| async move {
+                            tokio::time::sleep(delay).await;
+                            item
+                        })
+                        .boxed(),
+                    None => items.boxed(),
+                },
+            })
+        })
+    }
+
+    /// The backends' replacement, in one step: `InUse` while `in_use` names
+    /// a target of the backup; `AlreadyReplaced` when a row under the ARN
+    /// with the account and store is there (whatever is left of the
+    /// in-catalog backup removed, unless it is DELETED: a DeleteBackup's
+    /// record stays, as on every backend); an `AlreadyExists` error when another row
+    /// holds the backup id (or, with `unique_by_arn`, the ARN under another
+    /// store); `NotAvailable` when the in-catalog backup has no source (not
+    /// AVAILABLE); else the row inserted unowned and the in-catalog backup
+    /// removed (its source, description, items and `list_all` entry).
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxedFuture<'a, Result<Replaced, StorageError>> {
+        let hook = self.before_replace.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
+        self.replaces_seen.lock().unwrap().push(row.clone());
+        let error = self.replace_error.lock().unwrap().take();
+        let preset = self.replace_answer.lock().unwrap().take();
+        let arn = row.backup_arn.clone();
+        // What `AlreadyReplaced` removes: an AVAILABLE in-catalog backup,
+        // and with `finishes_deleting` (MongoDB) a DELETING one. Any other
+        // (CREATING, a DeleteBackup's DELETED record) stays.
+        let finishes_deleting = self
+            .finishes_deleting
+            .load(std::sync::atomic::Ordering::Acquire);
+        let left_available = self.legacy_keys.lock().unwrap().iter().any(|k| {
+            k.backup_arn == arn
+                && (k.status == BackupStatus::Available
+                    || (finishes_deleting && k.status == BackupStatus::Deleting))
+        });
+        let remove_legacy = || {
+            self.sources.lock().unwrap().remove(&arn);
+            self.descriptions.lock().unwrap().remove(&arn);
+            self.legacy_items.lock().unwrap().remove(&arn);
+            self.legacy_keys
+                .lock()
+                .unwrap()
+                .retain(|k| k.backup_arn != arn);
+        };
+        let insert = || {
+            let now = seconds_since_epoch();
+            let mut inserted = row.clone();
+            inserted.owner_generation = UNOWNED_GENERATION;
+            inserted.completed_at = Some(now);
+            inserted.heartbeat_at = now;
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(row.backup_arn.clone(), inserted);
+        };
+        let answer = if let Some(e) = error {
+            Err(StorageError::Internal(e))
+        } else if let Some(preset) = preset {
+            match preset {
+                Replaced::Replaced => {
+                    insert();
+                    remove_legacy();
+                }
+                Replaced::AlreadyReplaced if left_available => remove_legacy(),
+                Replaced::AlreadyReplaced => {}
+                Replaced::NotAvailable(_) | Replaced::InUse(_) | Replaced::NotApplied(_) => {}
+            }
+            Ok(preset)
+        } else {
+            let available = self.sources.lock().unwrap().contains_key(&arn);
+            let in_use = self.in_use.lock().unwrap().get(&arn).cloned();
+            let stored = self.rows.lock().unwrap().get(&arn).cloned();
+            let by_arn = self
+                .unique_by_arn
+                .load(std::sync::atomic::Ordering::Acquire);
+            let other_holds_id =
+                self.rows.lock().unwrap().values().any(|r| {
+                    r.backup_id == row.backup_id && r.backup_arn != row.backup_arn && !by_arn
+                });
+            match (in_use, stored) {
+                (Some(target), _) if available => Ok(Replaced::InUse(target)),
+                (_, Some(stored))
+                    if stored.account_id == row.account_id && stored.store == row.store =>
+                {
+                    if left_available {
+                        remove_legacy();
+                    }
+                    Ok(Replaced::AlreadyReplaced)
+                }
+                (_, Some(stored)) => Err(StorageError::AlreadyExists(format!(
+                    "backup {} has a row in store {}",
+                    stored.backup_arn, stored.store.store_root
+                ))),
+                (_, None) if other_holds_id => Err(StorageError::AlreadyExists(format!(
+                    "backup id {} has a row under another ARN",
+                    row.backup_id
+                ))),
+                (_, None) if !available => {
+                    Ok(Replaced::NotAvailable(format!("Backup not found: {arn}")))
+                }
+                (_, None) => {
+                    insert();
+                    remove_legacy();
+                    Ok(Replaced::Replaced)
+                }
+            }
+        };
+        Box::pin(async move { answer })
     }
 }
 
@@ -7044,10 +7562,14 @@ async fn describe_backup_of_another_accounts_id_is_not_found() {
         matches!(err, DynamoDbError::BackupNotFoundException(_)),
         "{err:?}"
     );
-    // The lookup carried B's account, so B's own rows (none) were read.
+    // The lookup carried B's account, so B's own rows (none) were read:
+    // before the legacy reader and once more after its not-found.
     assert_eq!(
         fake.row_reads.lock().unwrap().as_slice(),
-        [music_arn(OTHER, "01791976431438-73d8d5bc")]
+        [
+            music_arn(OTHER, "01791976431438-73d8d5bc"),
+            music_arn(OTHER, "01791976431438-73d8d5bc")
+        ]
     );
 }
 
@@ -8776,7 +9298,7 @@ fn dead_job(kind: extenddb_storage::backup_catalog::RestoreKind, name: &str) -> 
 /// left alone when this instance has no store configured (it is the job of
 /// the instance that holds the record's store, not this one's to fail);
 /// an abandoned in-catalog CREATING backup is removed through the reader's
-/// delete.
+/// `delete_fenced`.
 #[tokio::test]
 async fn the_reconciler_fails_dead_legacy_restores_and_removes_abandoned_backups() {
     use extenddb_storage::backup_catalog::RestoreKind;
@@ -13145,6 +13667,7 @@ async fn a_stopped_heartbeat_timer_starts_no_put() {
         target_bytes: 64 * 1024 * 1024,
         key_prefix: "",
         bucket: &store().store_root,
+        written: None,
     };
     let table = music_table();
     let key = extenddb_core::validation::RestorableKeySchema::resolve(
@@ -27219,7 +27742,7 @@ async fn a_deletion_the_store_stopped_at_its_deadline_stops_the_duty() {
     );
     let read_sent = read_sent.lock().unwrap().expect("the duty read the claim");
     assert_eq!(
-        *mem.deadlines_seen.lock().unwrap(),
+        *mem.deadlines.lock().unwrap(),
         [(
             prefix_of(&first),
             read_sent + super::reconciler::DUTY_DELETION_BOUND

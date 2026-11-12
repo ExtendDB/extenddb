@@ -114,10 +114,10 @@
 //!   FAILED write, except a record whose reason is `target_not_empty`,
 //!   whose target is the operator's and is logged with the command.
 //! - An in-catalog CREATING backup row whose create is dead (reported by the
-//!   backend's `abandoned_creating_backups`) is removed through the reader's
-//!   `delete`, which takes its items with it, unless the backend removed it
-//!   in the call that reported it (`AbandonedLegacyBackup::removed`), when
-//!   the reconciler only logs it.
+//!   backend's `abandoned_creating_backups`, fenced to DELETING) is removed
+//!   through the reader's `delete_fenced`, which takes its items with it,
+//!   unless the backend removed it in the call that reported it
+//!   (`AbandonedLegacyBackup::removed`), when the reconciler only logs it.
 //! - With a store configured: while the store is unhealthy the reconciler
 //!   acts on no row of the store. While it is healthy, on the rows of the
 //!   configured store:
@@ -331,7 +331,9 @@ pub struct CycleReport {
     /// Spool entries of restores not RUNNING with this host's `spool_host`
     /// removed, by table id.
     pub spool_entries_swept: Vec<String>,
-    /// In-catalog CREATING backup rows removed, by ARN.
+    /// In-catalog backup rows whose owner is dead removed, by ARN: a
+    /// CREATING row (on Cassandra, one the scan fenced to DELETING) and, on
+    /// Cassandra, a stale DELETING row that a stopped DeleteBackup left.
     pub legacy_backups_removed: Vec<String>,
     /// The configured store's health after this cycle's check; `None` with
     /// no store configured.
@@ -735,11 +737,14 @@ where
             report.legacy_backups_removed.push(backup.backup_arn);
             continue;
         }
-        match storage.delete(&backup.account_id, &backup.backup_arn).await {
-            Ok(_) => {
+        match storage
+            .delete_fenced(&backup.account_id, &backup.backup_arn)
+            .await
+        {
+            Ok(()) => {
                 tracing::warn!(
-                    "removed in-catalog backup {} (account {}): its CreateBackup did not finish \
-                     and no process owns it",
+                    "removed in-catalog backup {} (account {}): its CreateBackup or DeleteBackup \
+                     did not finish and no process owns it",
                     backup.backup_arn,
                     backup.account_id
                 );
@@ -1531,6 +1536,38 @@ impl StoreCalls<'_> {
             .map_err(|e| self.failed("get", e))
     }
 
+    /// The ARN the manifest under `prefix` names, read as JSON and not
+    /// verified: `None` with no manifest, `Some(Err(why))` for one that does
+    /// not read or names none.
+    pub(super) async fn manifest_arn(
+        self,
+        prefix: &str,
+    ) -> Result<Option<Result<String, String>>, StoreError> {
+        let bytes = match self
+            .read_object(
+                &format!("{prefix}{EXTENDDB_MANIFEST_FILE}"),
+                MANIFEST_READ_BOUND,
+            )
+            .await?
+        {
+            ReadObject::Bytes(bytes) => bytes,
+            ReadObject::Absent => return Ok(None),
+            ReadObject::Oversize => {
+                return Ok(Some(Err(format!("it is over {MANIFEST_READ_BOUND} bytes"))));
+            }
+        };
+        Ok(Some(
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(value) => value
+                    .get("backup_arn")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "it names no backup_arn".to_owned()),
+                Err(e) => Err(format!("it is not JSON: {e}")),
+            },
+        ))
+    }
+
     /// The prefix's objects, key to size.
     async fn list_sizes(
         self,
@@ -1545,7 +1582,7 @@ impl StoreCalls<'_> {
     }
 
     /// Whether the prefix lists at least one object.
-    async fn prefix_has_objects(self, prefix: &str) -> Result<bool, StoreError> {
+    pub(super) async fn prefix_has_objects(self, prefix: &str) -> Result<bool, StoreError> {
         match self.store.list(prefix).try_next().await {
             Ok(first) => Ok(first.is_some()),
             Err(e) => Err(self.failed("list", e)),
