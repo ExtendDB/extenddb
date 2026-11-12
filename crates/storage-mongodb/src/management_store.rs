@@ -1986,12 +1986,17 @@ impl ManagementStore for MongoCatalogStore {
             })
             .await
             .map_err(|e| {
+                // The unique index on access_key_id (migration 12) refuses a
+                // generated ID that another key holds. PostgreSQL and SQLite
+                // answer the same collision with an internal error.
                 if is_duplicate_key(&e) {
-                    OpError::NotFound("User not found".to_owned())
+                    tracing::error!(
+                        "create_access_key: the generated access key ID {access_key_id} is taken"
+                    );
                 } else {
                     tracing::error!("create_access_key failed: {e}");
-                    OpError::Internal("Database error".to_owned())
                 }
+                OpError::Internal("Database error".to_owned())
             })?;
 
             Ok(AccessKeyCreated {

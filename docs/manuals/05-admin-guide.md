@@ -125,6 +125,8 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `backend` | `postgres` | Storage backend (only `postgres` supported) |
 
+ExtendDB owns the collections, tables and indexes of its catalog and data databases. A change to them, such as an added index, is not supported and can make a later migration fail.
+
 #### [storage.postgres]
 
 | Key | Default | Description |
@@ -1070,7 +1072,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **The catalog has pending migrations, or is ahead of the binary:**
 
-On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 10, and ExtendDB <release> needs migration 11`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 11, and ExtendDB <release> needs migration 12`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 
@@ -1090,7 +1092,7 @@ The IAM policy does not allow the operation. Check attached policies with `list-
 
 **Slow queries:**
 
-Check PostgreSQL query performance with `EXPLAIN ANALYZE`. Ensure indexes exist on key columns.
+Check PostgreSQL query performance with `EXPLAIN ANALYZE`.
 
 **High connection count:**
 
