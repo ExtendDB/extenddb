@@ -298,11 +298,8 @@ impl CassandraEngine {
         use std::sync::atomic::Ordering;
 
         self.index_delay_reads.fetch_add(1, Ordering::Relaxed);
-        // Read at the driver default, ONE, and `settings set` writes at ONE
-        // too. With replication factor above 1, each read can reach a
-        // different replica, so until every replica has a new value,
-        // successive writes can see the old and the new value in any order.
-        // One consistency policy for every statement is #770.
+        // Read at LOCAL_QUORUM, and `settings set` writes at LOCAL_QUORUM
+        // too (#770), so a read sees a new value once its write has returned.
         let query = format!(
             "SELECT key, value FROM {}.settings \
              WHERE key IN ('index_propagation_delay_ms', 'gsi_propagation_delay_ms')",

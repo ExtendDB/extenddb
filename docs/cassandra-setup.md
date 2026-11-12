@@ -295,6 +295,16 @@ Logins read `system_auth` at `QUORUM` for the default superuser, so a
 `system_auth` replication factor above the node count makes those logins fail
 with `Cannot achieve consistency level QUORUM`.
 
+ExtendDB runs each read and write at `LOCAL_QUORUM` or `LOCAL_SERIAL`, so a
+request needs a quorum of its keyspace's replicas in the datacenter to be up.
+While fewer replicas are up, the request fails with HTTP 500
+(`InternalServerError`). A replication factor of 3 keeps serving while one
+replica is down; a replication factor of 2 or 1 stops while any replica is
+down. Use a replication factor of 3 on at least three nodes. For how Cassandra
+counts a quorum, see
+[Tunable Consistency](https://cassandra.apache.org/doc/4.1/cassandra/architecture/dynamo.html#tunable-consistency)
+in the Cassandra documentation.
+
 The `datacenter` must be `datacenter1`:
 `init` hardcodes that name into the keyspace definitions and provides no flag to
 change it, so your cluster's local datacenter has to be named `datacenter1`
@@ -364,8 +374,9 @@ backend is experimental rather than production-ready.
   are known (observed as intermittent integration-test failures) and are being
   worked. Under concurrent load, outcomes may occasionally diverge from
   DynamoDB semantics.
-- **Single-datacenter writes per table.** Reads, writes and lightweight
-  transactions use `LOCAL_QUORUM` / `LOCAL_SERIAL`, which are linearizable only
+- **Single-datacenter writes per table.** Reads and writes use `LOCAL_QUORUM`,
+  so a read sees each write that its datacenter acknowledged before the read
+  started. Lightweight transactions use `LOCAL_SERIAL`, and are linearizable
   within one datacenter. Serve writes for a given table from one Cassandra
   datacenter.
 - **Multi-node ExtendDB needs node-id configuration.** Running more than one

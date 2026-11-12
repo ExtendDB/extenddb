@@ -15,21 +15,154 @@
 
 use std::path::{Path, PathBuf};
 
-/// Calls that bypass the policy, and what to use instead.
-const FORBIDDEN: &[(&str, &str)] = &[
-    (".query(", "PolicySession::run"),
-    (".query_with_values(", "PolicySession::run"),
-    (".query_with_params(", "PolicySession::run"),
-    (".exec(", "PolicySession::run"),
-    (".exec_with_values(", "PolicySession::run"),
-    (".exec_with_params(", "PolicySession::run"),
-    (".batch(", "PolicySession::run_batch"),
-    (".batch_with_params(", "PolicySession::run_batch"),
+/// Driver methods that send a statement or a batch, and what to use instead.
+/// [`forbidden`] matches each one as a method call (`.m(`), a method call
+/// with type arguments (`.m::<`), and a path call (`Session::m(&s, …)`).
+const SEND_METHODS: &[(&str, &str)] = &[
+    ("query", "PolicySession::run"),
+    ("query_with_values", "PolicySession::run"),
+    ("query_with_params", "PolicySession::run"),
+    ("exec", "PolicySession::run"),
+    ("exec_with_values", "PolicySession::run"),
+    ("exec_with_params", "PolicySession::run"),
+    ("batch", "PolicySession::run_batch"),
+    ("batch_with_params", "PolicySession::run_batch"),
+    // `session.paged(n)` returns a pager that sends at the default level.
+    ("paged", "PolicySession::run"),
+    ("query_with_pager_state", "PolicySession::run"),
+    ("query_with_pager_state_params", "PolicySession::run"),
+    ("exec_with_pager_state", "PolicySession::run"),
+];
+
+/// Other text that bypasses the policy, and what to use instead.
+const FORBIDDEN_TEXT: &[(&str, &str)] = &[
     ("StatementParamsBuilder::new(", "cassandra_util::params"),
     ("BatchQueryBuilder::new(", "cassandra_util::batch"),
     ("BatchQueryBuilder::default(", "cassandra_util::batch"),
     ("QueryBatch::new(", "cassandra_util::batch"),
     ("Consistency::", "a Stmt kind"),
+    // A raw request frame on a connection, as `migrations/agreement.rs` sends.
+    ("Envelope::new_req_query(", "PolicySession::run"),
+    ("Envelope::new_req_execute(", "PolicySession::run"),
+    ("Envelope::new_req_batch(", "PolicySession::run_batch"),
+    ("Envelope::new_query(", "PolicySession::run"),
+    ("BodyReqQuery::new(", "PolicySession::run"),
+    ("BodyReqBatch::new(", "PolicySession::run_batch"),
+    // The driver function that sends a frame to the nodes of a query plan.
+    ("send_envelope(", "PolicySession::run"),
+];
+
+/// Text that contains a forbidden pattern but is the policy's own API. The
+/// scan blanks it out before it matches.
+const ALLOWED: &[&str] = &["cassandra_util::batch("];
+
+/// Each forbidden pattern, and what to use instead.
+fn forbidden() -> Vec<(String, &'static str)> {
+    let mut patterns = Vec::new();
+    for (method, instead) in SEND_METHODS {
+        for form in [".{m}(", ".{m}::<", "::{m}(", "::{m}::<"] {
+            patterns.push((form.replace("{m}", method), *instead));
+        }
+    }
+    for (text, instead) in FORBIDDEN_TEXT {
+        patterns.push(((*text).to_owned(), *instead));
+    }
+    patterns
+}
+
+/// Calls that bypass the policy, each with the pattern that must find it.
+/// A pattern removed from [`SEND_METHODS`], [`FORBIDDEN_TEXT`] or the call
+/// forms in [`forbidden`] fails `the_scan_finds_each_known_bypass`.
+const KNOWN_BYPASSES: &[(&str, &str)] = &[
+    (r#"session.query("SELECT a FROM t").await"#, ".query("),
+    (
+        "session.query_with_values(q, values).await",
+        ".query_with_values(",
+    ),
+    (
+        "session.query_with_params(q, params).await",
+        ".query_with_params(",
+    ),
+    ("session.exec(&prepared).await", ".exec("),
+    (
+        "session.exec_with_values(&prepared, values).await",
+        ".exec_with_values(",
+    ),
+    (
+        "session.exec_with_params(&prepared, &params).await",
+        ".exec_with_params(",
+    ),
+    ("session.batch(built).await", ".batch("),
+    (
+        "session.batch_with_params(built, params).await",
+        ".batch_with_params(",
+    ),
+    ("let pager = session.paged(100);", ".paged("),
+    (
+        "pager.query_with_pager_state(q, state)",
+        ".query_with_pager_state(",
+    ),
+    (
+        "pager.query_with_pager_state_params(q, state, params)",
+        ".query_with_pager_state_params(",
+    ),
+    (
+        "pager.exec_with_pager_state(&prepared, state)",
+        ".exec_with_pager_state(",
+    ),
+    ("Session::query(&session, cql).await", "::query("),
+    (
+        "CassandraSession::query_with_values(&session, q, values).await",
+        "::query_with_values(",
+    ),
+    ("Session::batch(&session, built).await", "::batch("),
+    ("session.query::<String>(cql).await", ".query::<"),
+    (
+        "Session::query::<String>(&session, cql).await",
+        "::query::<",
+    ),
+    (
+        "let p = StatementParamsBuilder::new().build();",
+        "StatementParamsBuilder::new(",
+    ),
+    (
+        "let b = BatchQueryBuilder::new();",
+        "BatchQueryBuilder::new(",
+    ),
+    (
+        "let b = BatchQueryBuilder::default();",
+        "BatchQueryBuilder::default(",
+    ),
+    ("let b = QueryBatch::new(r, m);", "QueryBatch::new("),
+    ("let level = Consistency::One;", "Consistency::"),
+    (
+        "let e = Envelope::new_req_query(q, level, None, false, version);",
+        "Envelope::new_req_query(",
+    ),
+    (
+        "let e = Envelope::new_req_execute(id, None, &params, flags, version);",
+        "Envelope::new_req_execute(",
+    ),
+    (
+        "let e = Envelope::new_req_batch(built, flags, version);",
+        "Envelope::new_req_batch(",
+    ),
+    (
+        "let e = Envelope::new_query(body, flags, version);",
+        "Envelope::new_query(",
+    ),
+    (
+        "let body = BodyReqQuery::new(q, Default::default(), None, false, None, None, None, None, None, None);",
+        "BodyReqQuery::new(",
+    ),
+    (
+        "let body = BodyReqBatch::new(queries, kind, level, serial, None, None);",
+        "BodyReqBatch::new(",
+    ),
+    (
+        "send_envelope(plan.into_iter(), &envelope, true, retry).await",
+        "send_envelope(",
+    ),
 ];
 
 /// Source paths, relative to the crate, that set their own levels.
@@ -198,17 +331,22 @@ fn without_test_modules(code: &str) -> String {
 /// Each forbidden call in `source`: its line number, the call, and what to
 /// use instead. A call is skipped when [`MARKER`] is on its line or on the
 /// line above it (where `cargo fmt` keeps a comment).
-fn bypasses(source: &str) -> Vec<(usize, &'static str, &'static str)> {
+fn bypasses(source: &str) -> Vec<(usize, String, &'static str)> {
     let originals: Vec<&str> = source.lines().collect();
     let marked = |index: usize| originals.get(index).is_some_and(|l| l.contains(MARKER));
+    let patterns = forbidden();
     let mut found = Vec::new();
     for (index, line) in code_only(source).lines().enumerate() {
         if marked(index) || index > 0 && marked(index - 1) {
             continue;
         }
-        for (call, instead) in FORBIDDEN {
-            if line.contains(call) {
-                found.push((index + 1, *call, *instead));
+        let mut line = line.to_owned();
+        for allowed in ALLOWED {
+            line = line.replace(allowed, &" ".repeat(allowed.len()));
+        }
+        for (pattern, instead) in &patterns {
+            if line.contains(pattern.as_str()) {
+                found.push((index + 1, pattern.clone(), *instead));
             }
         }
     }
@@ -274,14 +412,37 @@ fn each_exempt_path_exists() {
 
 #[test]
 fn the_scan_finds_each_forbidden_call() {
-    for (call, _) in FORBIDDEN {
+    for (call, _) in forbidden() {
         let source = format!("fn f() {{\n    let x = y{call}a);\n}}\n");
         let found = bypasses(&source);
         assert!(
-            found.iter().any(|(line, c, _)| *line == 2 && c == call),
+            found.iter().any(|(line, c, _)| *line == 2 && *c == call),
             "{call} was not found: {found:?}"
         );
     }
+}
+
+#[test]
+fn the_scan_finds_each_known_bypass() {
+    for (bypass, pattern) in KNOWN_BYPASSES {
+        let source = format!("fn f() {{\n    {bypass}\n}}\n");
+        let found = bypasses(&source);
+        assert!(
+            found.iter().any(|(line, p, _)| *line == 2 && p == pattern),
+            "`{pattern}` did not find `{bypass}`: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn the_scan_allows_the_policy_batch_builder() {
+    let source = "fn f() {\n    let b = crate::cassandra_util::batch();\n    \
+                  let c = cassandra_util::batch().add_query(q, v);\n}\n";
+    assert_eq!(
+        bypasses(source),
+        [],
+        "cassandra_util::batch() is the policy"
+    );
 }
 
 #[test]
@@ -311,7 +472,7 @@ fn h() {
     assert_eq!(
         found
             .iter()
-            .map(|(line, call, _)| (*line, *call))
+            .map(|(line, call, _)| (*line, call.as_str()))
             .collect::<Vec<_>>(),
         [(8, ".query("), (19, ".query_with_values(")],
         "{found:?}"

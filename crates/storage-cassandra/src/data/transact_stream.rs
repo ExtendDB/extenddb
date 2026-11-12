@@ -87,6 +87,7 @@ pub(super) fn secondary_effect_batches(
     let request = &index_batch.request;
     // consistency-policy-ok: the record batch copies the index batch's levels.
     let record_batch = QueryBatch::new(
+        // consistency-policy-ok: the levels below are the index batch's.
         BodyReqBatch::new(
             request.batch_type,
             vec![record],

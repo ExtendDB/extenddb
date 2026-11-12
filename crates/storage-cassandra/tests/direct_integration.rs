@@ -28,6 +28,8 @@ mod backup_engine;
 mod cassandra_engine;
 #[path = "direct/concurrent_account_creation.rs"]
 mod concurrent_account_creation;
+#[path = "direct/consistency_levels.rs"]
+mod consistency_levels;
 #[path = "direct/consistency_shape.rs"]
 mod consistency_shape;
 #[path = "direct/delete_item.rs"]
