@@ -13,22 +13,29 @@
 //! schema, its GSI and LSI keys and its projected names. Each place that
 //! reads the names back returns them byte for byte: `DescribeTable`, the key
 //! info of the data plane, `DescribeStream`, `DescribeBackup`, the restore
-//! source, a restored table, `UpdateTable` and `DeleteTable`.
+//! source, a restored table, the `backup_index` row that `backup
+//! migrate-legacy` writes, `UpdateTable` and `DeleteTable`.
 //!
 //! See `catalog_nul_support` for the database these tests need.
 
 mod catalog_nul_support;
 
 use catalog_nul_support::{
-    ACCOUNT, Options, base_conn, def_names, documents, include, key, names, s_attr, scratch, skip,
-    stored_text, table_documents, wait_active,
+    ACCOUNT, Options, REGION, base_conn, def_names, documents, include, key, names, s_attr,
+    scratch, skip, stored_text, table_documents, wait_active,
 };
+use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::{
     BillingMode, CreateTableInput, DeleteTableInput, DescribeStreamInput, DescribeTableInput,
     GsiInput, KeyType, LsiInput, StreamSpecification, StreamViewType, UpdateTableInput,
 };
+use extenddb_storage::backup_catalog::{
+    BackupRow, BackupStatus, Replaced, StoreIdentity, StoreKind,
+};
+use extenddb_storage::backup_definition::{LegacyVectorState, source_table_from_legacy};
 use extenddb_storage::{
-    JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides, StreamEngine, TableEngine,
+    BackupCatalog, JobPermit, LegacyBackupReader, RestoreRequest, RestoreTableOverrides,
+    StreamEngine, TableEngine,
 };
 
 /// U+0000 in the partition key.
@@ -254,6 +261,57 @@ async fn names_with_u0000_and_u0001_round_trip_through_the_catalog() {
     let rlsi = &restored.local_secondary_indexes.as_deref().expect("LSIs")[0];
     assert_eq!(names(&rlsi.key_schema), [PK, LK]);
     assert_eq!(projected(&rlsi.projection), PROJECTED);
+
+    // `backup migrate-legacy` replaces the in-catalog backup by its
+    // `backup_index` row, whose source table carries the names.
+    let arn = BackupArn::parse(&backup.backup_arn).expect("the backup ARN");
+    let migrated =
+        source_table_from_legacy(&source, LegacyVectorState::NoneRecorded, REGION, ACCOUNT)
+            .expect("the source table of the index row");
+    let row = BackupRow {
+        backup_id: arn.backup_id().to_owned(),
+        account_id: ACCOUNT.to_owned(),
+        table_name: table.to_owned(),
+        backup_arn: backup.backup_arn.clone(),
+        backup_name: "bk367".to_owned(),
+        status: BackupStatus::Available,
+        store: StoreIdentity {
+            store_kind: StoreKind::Filesystem,
+            store_root: "/srv/extenddb-backups".to_owned(),
+            store_id: "store-1".to_owned(),
+        },
+        size_bytes: 0,
+        item_count: source.item_count,
+        created_at: source.backup_creation_date_time,
+        completed_at: None,
+        failure_reason: None,
+        source_table_details_json: serde_json::to_value(&migrated).expect("JSON"),
+        owner_generation: 0,
+        heartbeat_at: 0.0,
+    };
+    assert_eq!(
+        s.engine
+            .replace_with_index_row(&row)
+            .await
+            .expect("the replacement"),
+        Replaced::Replaced
+    );
+    let stored = documents(
+        &s.catalog,
+        "SELECT source_table_details_json::text FROM backup_index WHERE backup_arn = $1",
+        &backup.backup_arn,
+    )
+    .await
+    .join(" ");
+    assert_stored_escaped(&stored, "the backup_index row");
+    let read = s
+        .engine
+        .read_backup_row(&arn)
+        .await
+        .expect("read the backup_index row")
+        .expect("the backup_index row");
+    let schema = read.source_table().expect("the source table");
+    assert_eq!(names(&schema.key_schema), [PK, SK]);
 
     // Deleting the GSI prunes its definitions, compared and rewritten in
     // the stored form; a GSI is then created on the U+0000 attribute again.
