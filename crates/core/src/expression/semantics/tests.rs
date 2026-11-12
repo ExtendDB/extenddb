@@ -440,8 +440,8 @@ fn key_condition_function_names() {
     assert_eq!(key_condition_err("pk = :p AND begins_with(sk, :v)"), "OK");
 }
 
-/// The BETWEEN bounds are checked at request time (measured 2026-10-26,
-/// HBTW-1: refused on a missing key and after a false AND).
+/// The BETWEEN bounds are checked at request time (measured 2026-10-26:
+/// refused on a missing key and after a false AND).
 #[test]
 fn between_bounds_are_checked_in_the_walk() {
     let m = maps(
