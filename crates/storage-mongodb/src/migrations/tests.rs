@@ -39,7 +39,7 @@ fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
 }
 
 #[test]
-fn every_body_is_code_and_three_and_four_do_not_apply() {
+fn every_body_is_code_and_three_four_seven_eight_and_nine_do_not_apply() {
     for id in MigrationId::ALL {
         for body in migration(id).bodies() {
             assert!(matches!(body.body, Body::Code { .. }), "{id}");
@@ -48,6 +48,9 @@ fn every_body_is_code_and_three_and_four_do_not_apply() {
     for id in [
         MigrationId::SortKeyDefinitions,
         MigrationId::IndexTableBaseKey,
+        MigrationId::StreamPending,
+        MigrationId::RestoreProgress,
+        MigrationId::WarmThroughput,
     ] {
         let Migration::NotApplicable(reason) = migration(id) else {
             panic!("{id} applies on MongoDB");
@@ -56,6 +59,13 @@ fn every_body_is_code_and_three_and_four_do_not_apply() {
     }
     assert!(migration(MigrationId::Baseline).convergent());
     assert!(!migration(MigrationId::ResourceTagConditionKeys).convergent());
+    // Migration 10 replaces the metrics collection, and runs again under
+    // --reconverge after migration 1 creates `metrics` again.
+    assert_eq!(
+        migration(MigrationId::AccountMetrics).store_kinds(),
+        [StoreKind::Catalog]
+    );
+    assert!(migration(MigrationId::AccountMetrics).convergent());
 }
 
 /// The lock, the registrations and the ledgers are read and written through

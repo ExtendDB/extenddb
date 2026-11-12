@@ -11,12 +11,12 @@ The storage layer provides a trait-based abstraction for all persistent data ope
 `storage` crate with no database-specific dependencies. Backend implementations live in separate crates (e.g.,
 `storage-postgres`) and are installed once from a thin `main` via `set_backend`, one backend per binary.
 
-The trait-based design allows new storage backends to be added by implementing the storage traits and registering a
-factory function, with no changes needed to the `engine` or `server` crates. The factory pattern enables runtime
-backend selection based on configuration.
+A new storage backend implements the storage traits in its own crate and needs no change to the `engine` crate. A
+backend that cannot pin a table snapshot also needs an entry in `in_catalog_create_only` in
+`crates/server/src/backup_store.rs`, so that its CreateBackup writes the in-catalog format.
 
-**Current status**: PostgreSQL is the only supported backend. The trait architecture and plugin infrastructure provide
-the foundation for future backend implementations.
+**Current status**: four backends implement the storage traits, in `storage-postgres`, `storage-sqlite`, `storage-mongodb`
+and `storage-cassandra`. Each binary is built with one of them.
 
 Backends accepted into the ExtendDB repository must satisfy the [Backend Acceptance Criteria](../rfcs/0003-backend-acceptance-criteria.md)
 (the DynamoDB-behavioral invariants for the storage layer) and the process defined in
@@ -44,7 +44,7 @@ ExtendDB defines **13 traits** across three categories:
 - `AdminStore` — admin user management
 - `SettingsStore` — runtime settings (key-value store)
 - `MetricsStore` — historical metrics persistence and query
-- `RateLimitStore` — login rate limiting and account lockout
+- `RateLimitStore`: login rate limiting per user and source address
 - `AuthorizationStore` — policy lookups for authorization decisions
 
 **Initialization and Lifecycle** (defined in `storage/src/bootstrapper.rs`):
@@ -207,12 +207,14 @@ storage.
 
 ### RateLimitStore
 
-Login rate limiting and account lockout:
+Login rate limiting per user and source address:
 - `count_principal_failures`, `count_ip_failures`, `record_failed_login`,
   `cleanup_old_attempts`
 
-Tracks failed login attempts by principal and source IP to mitigate clients
-sending excessive traffic.
+Records failed login attempts with the principal and the source address, and
+counts them per (principal, source address) pair and per source address, so
+the server can refuse an address that has failed too often for one principal
+or overall without locking the principal out of other addresses.
 
 ### AuthorizationStore
 

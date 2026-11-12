@@ -13,8 +13,10 @@ use std::fmt;
 /// A parsed IAM policy document.
 #[derive(Debug, Clone)]
 pub struct PolicyDocument {
-    /// Policy version string (e.g., "2012-10-17").
-    pub version: String,
+    /// The `Version` string (e.g., "2012-10-17"); `None` when the document has
+    /// no `Version` or its value is not a string. Writes accept only
+    /// `2012-10-17` and `2008-10-17`; a stored document may hold any value.
+    pub version: Option<String>,
     /// The policy statements.
     pub statements: Vec<Statement>,
 }
@@ -141,6 +143,9 @@ impl fmt::Display for PolicyParseError {
 
 impl std::error::Error for PolicyParseError {}
 
+/// The size limit `from_json` applies to every document it parses.
+pub(super) const MAX_POLICY_BYTES: usize = 6_144;
+
 impl PolicyDocument {
     /// Parse a policy document from a JSON string.
     ///
@@ -154,7 +159,7 @@ impl PolicyDocument {
     /// Returns `PolicyParseError` if the JSON is malformed or contains
     /// invalid policy constructs (e.g., both Action and `NotAction`).
     pub fn from_json(json: &str) -> Result<Self, PolicyParseError> {
-        Self::from_json_with_size_limit(json, 6_144)
+        Self::from_json_with_size_limit(json, MAX_POLICY_BYTES)
     }
 
     /// Parse a policy document with an explicit size limit.
@@ -172,7 +177,7 @@ impl PolicyDocument {
             )));
         }
         let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
-        let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
+        let version = raw["Version"].as_str().map(ToOwned::to_owned);
         let statements = parse_statements(&raw["Statement"])?;
         validate_statement_cidrs(&statements)?;
         Ok(Self {
@@ -185,25 +190,62 @@ impl PolicyDocument {
     /// a managed or boundary policy) and apply the checks the service applies
     /// only when a policy is written.
     ///
-    /// Everything `from_json` checks, plus the `Sid` charset. The `Sid` check
-    /// runs at write only: a `Sid` is a statement label that does not affect
-    /// evaluation, so a policy stored before this check existed must keep
-    /// parsing on the request path rather than fail the principal closed.
+    /// Everything `from_json` checks, plus the `Version` value, the `Sid`
+    /// charset, the `${...}` references ([`super::variable_syntax`]) and the
+    /// Arn condition values (`arn_value::validate_statement_arn_values`). All
+    /// four run at write only, so a policy stored before a check existed keeps
+    /// parsing on the request path rather than failing the principal closed:
+    /// a `Sid` is a label that does not affect evaluation, a stored document
+    /// with another `Version` matches its `Resource` patterns as written, as
+    /// it did before, a stored value with such a reference is read as
+    /// before #926, each `${` ending at the next `}`, and a stored Arn value
+    /// evaluates as written unless it is one of the values
+    /// `arn_value::fails_closed_at_evaluation` fails closed.
     ///
     /// # Errors
     ///
-    /// Returns `PolicyParseError` if `from_json` rejects the document or a
-    /// statement `Sid` is outside the service's charset.
+    /// Returns `PolicyParseError` if `from_json` rejects the document, its
+    /// `Version` is not `2012-10-17` or `2008-10-17`, a statement `Sid` is
+    /// outside the service's charset, a pattern or condition value holds a
+    /// `${...}` reference IAM refuses ([`super::variable_syntax`]), or an Arn
+    /// condition value fails the write check.
     pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
+        super::variable_syntax::validate_identity_before_parse(json, MAX_POLICY_BYTES)?;
         let doc = Self::from_json(json)?;
+        super::variables::validate_version(json)?;
+        super::variable_syntax::validate_identity_legacy(&doc)?;
         validate_statement_sids(&doc.statements)?;
+        super::variable_syntax::validate_identity_after_sid(&doc)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
+        Ok(doc)
+    }
+
+    /// Parse the session policy of an AssumeRole call and apply the Arn
+    /// condition value check of a policy write
+    /// (`arn_value::validate_statement_arn_values`).
+    ///
+    /// Everything `from_json` checks, so a session policy that would not load
+    /// on the request path is refused when the session is issued. The
+    /// `Version`, `Sid` and `${...}` reference checks of `from_json_for_write`
+    /// do not run: a session policy with another `Version`, such a `Sid` or
+    /// such a reference loads and evaluates on the request path, and
+    /// AssumeRole accepted one before. What STS answers for these session
+    /// policies was not measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document or an
+    /// Arn condition value fails the write check.
+    pub fn from_json_for_session_policy(json: &str) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json(json)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
         Ok(doc)
     }
 }
 
 /// Unwrap a condition operator to its base, dropping any `ForAllValues:` /
 /// `ForAnyValue:` prefix and `IfExists` suffix.
-fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
+pub(super) fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
     match op {
         ConditionOperator::ForAllValues(inner)
         | ConditionOperator::ForAnyValue(inner)
@@ -503,7 +545,7 @@ mod tests {
             }]
         }"#;
         let doc = PolicyDocument::from_json(json).unwrap();
-        assert_eq!(doc.version, "2012-10-17");
+        assert_eq!(doc.version.as_deref(), Some("2012-10-17"));
         assert_eq!(doc.statements.len(), 1);
         assert_eq!(doc.statements[0].effect, Effect::Allow);
         assert!(matches!(

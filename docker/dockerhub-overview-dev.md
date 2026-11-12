@@ -1,5 +1,7 @@
 # ExtendDB dev
 
+> **Local development and CI only. Not for shared networks.** This image serves plain HTTP, its authorization is open, and by default it accepts AWS's public example credential, so anyone who can reach its port can read, change and delete every table. Always publish it on loopback, `-p 127.0.0.1:18080:18080`; a bare `-p 18080:18080` publishes it on every network the host is on. Do not keep real data in it. On a shared host or CI runner, with an image released after 0.1.14, also set `EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1` with your own `EXTENDDB_DEV_ACCESS_KEY_ID` and `EXTENDDB_DEV_SECRET_ACCESS_KEY` ([details](https://github.com/ExtendDB/extenddb/blob/main/docs/dev-image.md#a-shared-host-or-ci-runner)). Releases through 0.1.14 ignore that variable and always accept the example credential; whatever the version, check that the credentials the server prints at startup do not include `AKIAIOSFODNN7EXAMPLE`.
+
 ExtendDB dev is a single-container, DynamoDB-compatible endpoint that enables developers to develop and test applications against the DynamoDB API in their own development environment.
 
 ## Benefits of using ExtendDB dev
@@ -34,9 +36,26 @@ To learn how to configure ExtendDB dev, see [the `extenddb-dev` image](https://g
 
 For a durable, TLS-terminated deployment, use [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres).
 
-## Note
+## Verification
 
-This image is built for local development and CI. It serves plain HTTP and its authorization is open, so whoever holds the credential can do anything. Publish it to loopback only, as the command above does, and do not keep real data in it.
+Every published image is signed with Sigstore cosign, with a Rekor transparency-log entry. Releases through 0.1.14 use a committed release key, [`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem):
+
+```console
+cosign verify --key extenddb-signing.pub.pem docker.io/extenddb/extenddb-dev:X.Y.Z
+```
+
+From the first release after the keyless migration (named in the release notes), signatures are keyless, bound to the workflow that signed the image:
+
+```console
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-dev-image|sign-image)\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  docker.io/extenddb/extenddb-dev:X.Y.Z
+```
+
+The routine signer is `release-dev-image.yml`; the break-glass signer `sign-image.yml` can sign any tier, so drop it from the pattern to require the routine dev path.
+
+## Note
 
 ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and does not contain any DynamoDB source code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room implementation that speaks the DynamoDB wire protocol; behavioral differences from the service are documented in [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
