@@ -290,15 +290,12 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // join it, holding the process open after the drain until SIGKILL.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        // A deeply nested but valid request body is parsed, converted to typed
-        // AttributeValues, and dropped on a worker thread, each step recursing
-        // to the body's depth. The request parser caps nesting at 5200
-        // structural levels (about 2600 document wrappers; extenddb-server's
-        // request_parse). Measured 2026-11-02 (debug): an 8 MiB stack overflows
-        // past about 1500 wrappers, while 32 MiB handles the ceiling and a 5500
-        // wrapper body besides. Give each worker 32 MiB, well above the 2 MiB
-        // default.
-        .thread_stack_size(32 * 1024 * 1024)
+        // An authenticated request body nested to the parser's ceiling is
+        // parsed, converted to typed AttributeValues and dropped on a worker
+        // thread, each step recursing to the body's depth; the server crate
+        // that sets the ceiling sizes the stack that needs (about twice the
+        // measured need, far above Tokio's 2 MiB default).
+        .thread_stack_size(extenddb_server::REQUEST_WORKER_STACK_SIZE)
         .build()?;
     let result = crate::run_then_shut_down(runtime, extenddb_server::serve(params));
     // `serve` has printed the refusal; end with its code, which `migrate`

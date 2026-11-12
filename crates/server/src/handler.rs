@@ -94,11 +94,21 @@ pub(crate) async fn handle_request(
     }
 
     // --- Pre-auth body validation ---
-    // Real DynamoDB validates request format (empty body, invalid JSON) before
-    // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match crate::request_parse::parse_request_value(&body) {
-        Ok(v) => v,
-        Err(e) => return error_response(&e, &request_id),
+    // The service checks the request's JSON syntax before authentication but
+    // refuses an over deep body only after it (measured 2026-11-12: unsigned,
+    // a 20000 wrapper PutItem is MissingAuthenticationTokenException; signed,
+    // SerializationException). A body within serde_json's default depth is
+    // parsed here, as it always was; a deeper one is only scanned until the
+    // caller is authenticated, so no unauthenticated request makes this
+    // thread recurse past that depth (see request_parse).
+    let depth = crate::request_parse::nesting_depth(&body);
+    let pre_auth_input = if depth <= crate::request_parse::UNAUTHENTICATED_PARSE_DEPTH {
+        match crate::request_parse::parse_request_value(&body, depth) {
+            Ok(v) => Some(v),
+            Err(e) => return error_response(&e, &request_id),
+        }
+    } else {
+        None
     };
 
     // --- Auth segment ---
@@ -109,6 +119,16 @@ pub(crate) async fn handle_request(
     };
     #[allow(clippy::cast_precision_loss)]
     let auth_us = auth_start.elapsed().as_micros() as f64;
+
+    // A body deeper than the pre-auth depth is parsed now, on a thread whose
+    // stack `REQUEST_WORKER_STACK_SIZE` sizes for the ceiling.
+    let input: Value = match pre_auth_input {
+        Some(v) => v,
+        None => match crate::request_parse::parse_request_value(&body, depth) {
+            Ok(v) => v,
+            Err(e) => return error_response(&e, &request_id),
+        },
+    };
 
     let account_id: Arc<str> = match &identity {
         extenddb_auth::AuthIdentity::User { account_id, .. }
