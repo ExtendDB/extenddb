@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Tests for the legacy condition validator; every expected message was
-//! measured against Amazon DynamoDB on 2026-10-23 and 2026-10-24.
+//! measured against Amazon DynamoDB on 2026-10-23, 2026-10-24 and 2026-11-12.
 
 use std::collections::BTreeMap;
 
@@ -271,6 +271,17 @@ fn numbers_are_checked_before_the_operator_checks() {
     };
     assert_eq!(msg("EQ", &[n("abc")]), bad("abc"));
     assert_eq!(msg("EQ", &[n("")]), bad(""));
+    // An empty number keeps the separator inside a set, a list and a map too
+    // (measured 2026-11-12).
+    for nested in [
+        AttributeValue::NS([String::new()].into()),
+        AttributeValue::NS(["1".to_owned(), String::new()].into()),
+        AttributeValue::L(vec![n("")]),
+        AttributeValue::M([("k".to_owned(), n(""))].into()),
+        AttributeValue::L(vec![AttributeValue::M([("k".to_owned(), n(""))].into())]),
+    ] {
+        assert_eq!(msg("EQ", &[nested]), bad(""));
+    }
     assert_eq!(msg("EQ", &[n("12e")]), bad("12e"));
     assert_eq!(msg("BEGINS_WITH", &[n("abc")]), bad("abc"));
     assert_eq!(msg("FOO", &[n("abc")]), bad("abc"));

@@ -3,8 +3,8 @@
 """Legacy QueryFilter, ScanFilter and KeyConditions: the checks that need the
 key schema, the number check on legacy values, and BatchGetItem capacity for
 absent keys. Every expected response was measured against Amazon DynamoDB in
-us-east-1 on 2026-10-24 (issue #477), and the cases marked 2026-10-31 on that
-date.
+us-east-1 on 2026-10-24 (issue #477), and the cases marked 2026-10-31 and
+2026-11-12 on those dates.
 """
 
 from __future__ import annotations
@@ -132,6 +132,15 @@ class TestLegacyNumberValues:
     def test_scan_filter_number_messages(self, dynamodb_client_no_validation, ss_table, raw, message):
         msg = _validation_error(lambda: dynamodb_client_no_validation.scan(TableName=ss_table, ScanFilter={"a": _cond("EQ", [_n(raw)])}))
         assert msg == message
+
+    @pytest.mark.parametrize("value", [{"L": [_n("")]}, {"NS": [""]}, {"M": {"k": _n("")}}, {"NS": ["1", ""]}, {"L": [{"M": {"k": _n("")}}]}])
+    def test_an_empty_nested_number_keeps_the_separator(self, dynamodb_client_no_validation, ss_table, value):
+        # Measured 2026-11-12: the text of a top-level N "", in all three maps.
+        client = dynamodb_client_no_validation
+        cond = {"x": _cond("EQ", [value])}
+        assert _validation_error(lambda: client.scan(TableName=ss_table, ScanFilter=cond)) == NOT_A_NUMBER.format("")
+        assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [_s("p1")])}, QueryFilter=cond)) == NOT_A_NUMBER.format("")
+        assert _validation_error(lambda: client.query(TableName=ss_table, KeyConditions={"pk": _cond("EQ", [value])})) == NOT_A_NUMBER.format("")
 
     def test_query_filter_and_key_conditions_numbers(self, dynamodb_client_no_validation, ss_table, sn_table):
         client = dynamodb_client_no_validation

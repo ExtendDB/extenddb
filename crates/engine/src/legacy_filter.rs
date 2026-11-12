@@ -499,18 +499,23 @@ pub fn desugar_filter(
 
 const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
 
-/// The item-path number check, with one difference in wording. A legacy
-/// condition value `{"N": ""}` answers `The parameter cannot be converted to a
-/// numeric value: `, the separator kept with nothing after it, where the item
-/// path answers the text without the separator. Measured on a ScanFilter `EQ`
-/// condition; every other number error answers the item-path text.
+/// The item-path number check, with one difference in wording. An empty
+/// number in a legacy condition value, `{"N": ""}` or one inside `NS`, `L` or
+/// `M`, answers `The parameter cannot be converted to a numeric value: `, the
+/// separator kept with nothing after it, where the item path answers the text
+/// without the separator. Measured on a top-level value on 2026-10-24, and on
+/// 2026-11-12 inside `NS`, `L`, `M` and an `M` in an `L`, in `ScanFilter`,
+/// `QueryFilter` and `KeyConditions`; every other number error answers the
+/// item-path text. The item-path check gives its separator-less text for an
+/// empty number and for nothing else.
 fn validate_legacy_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
-    if matches!(value, AttributeValue::N(n) if n.is_empty()) {
-        return Err(DynamoDbError::ValidationException(
-            "The parameter cannot be converted to a numeric value: ".to_owned(),
-        ));
-    }
-    validate_attribute_number(value)
+    const EMPTY: &str = "The parameter cannot be converted to a numeric value";
+    validate_attribute_number(value).map_err(|err| match err {
+        DynamoDbError::ValidationException(m) if m == EMPTY => {
+            DynamoDbError::ValidationException(format!("{EMPTY}: "))
+        }
+        other => other,
+    })
 }
 
 /// Validate one legacy condition (`ScanFilter`, `QueryFilter` or
