@@ -671,35 +671,22 @@ fn parse_clauses(
 
 /// Refuse the first `#name` or `:value` reference that `maps` does not define
 /// and the first document path of more than 32 elements, in one pass in the
-/// order the expression is written: each path's names, then its length.
+/// order the expression is written: each path's names, then its length, with
+/// the semantic walk's checks.
 fn check_references(tokens: &[Token], maps: &ExpressionMaps) -> Result<(), DynamoDbError> {
+    use super::semantics::{check_path_refs, check_value_defined};
+    let kind = super::ExpressionKind::KeyCondition;
     let mut pos = 0;
     while pos < tokens.len() {
         match &tokens[pos] {
-            Token::Placeholder(value) if !maps.values.contains_key(value) => {
-                return Err(validation_err(&format!(
-                    "Invalid KeyConditionExpression: An expression attribute value used in expression is not defined; attribute value: :{value}"
-                )));
+            Token::Placeholder(value) => {
+                check_value_defined(value, maps, kind)?;
+                pos += 1;
             }
             // A function name such as `begins_with` is not a path.
             Token::Ident(_) if tokens.get(pos + 1) == Some(&Token::LParen) => pos += 1,
             Token::Ident(_) | Token::NameRef(_) => {
-                let path = parser_common::parse_path(tokens, &mut pos)?;
-                for element in &path {
-                    if let PathElement::Attribute(name) = element
-                        && let Some(reference) = name.strip_prefix('#')
-                        && !maps.names.contains_key(reference)
-                    {
-                        return Err(validation_err(&format!(
-                            "Invalid KeyConditionExpression: An expression attribute name used in the document path is not defined; attribute name: #{reference}"
-                        )));
-                    }
-                }
-                if let Some(msg) = super::path_length::too_many_levels(&path) {
-                    return Err(validation_err(&format!(
-                        "Invalid KeyConditionExpression: {msg}"
-                    )));
-                }
+                check_path_refs(&parser_common::parse_path(tokens, &mut pos)?, maps, kind)?;
             }
             _ => pos += 1,
         }

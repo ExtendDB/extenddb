@@ -11,7 +11,7 @@ use super::super::resolver::ExpressionMaps;
 use super::errors::validation;
 use crate::error::DynamoDbError;
 
-pub(super) fn check_path_refs(
+pub(in crate::expression) fn check_path_refs(
     path: &[PathElement],
     maps: &ExpressionMaps,
     kind: ExpressionKind,
@@ -37,7 +37,7 @@ pub(super) fn check_path_refs(
     }
 }
 
-pub(super) fn check_value_defined(
+pub(in crate::expression) fn check_value_defined(
     name: &str,
     maps: &ExpressionMaps,
     kind: ExpressionKind,
