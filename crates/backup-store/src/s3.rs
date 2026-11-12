@@ -102,7 +102,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 
 use crate::config::S3StoreConfig;
 use crate::key::{key_matches_prefix, normalize_prefix, validate_key, validate_prefix};
-use crate::{BackupStore, ByteStream, ObjectMeta, StoreError};
+use crate::{BackupStore, ByteStream, ObjectMeta, PrefixDeletion, StoreError};
 
 /// The smallest part size S3 accepts for any part except the last.
 pub const MIN_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024;
@@ -925,12 +925,76 @@ impl S3Store {
     }
 
     async fn delete_prefix_impl(&self, prefix: &str) -> Result<u64, StoreError> {
+        self.delete_requests(prefix, None)
+            .await
+            .map(|done| done.deleted)
+    }
+
+    /// `delete_written` (the trait's doc): one `DeleteObject`, with
+    /// `If-Match` on the entity tag the put answered when it gave one. A 412
+    /// leaves the object (another one is under the key); a missing key
+    /// (S3 answers 404 to a conditional delete of one) is gone. A 409
+    /// `ConditionalRequestConflict` (another conditional request on the key
+    /// was in flight) re-sends the conditional delete after a short
+    /// back-off, as the conditional put does, up to [`CONDITIONAL_RETRIES`]
+    /// times, after which the last answer is reported as the error it is.
+    async fn delete_written_impl(&self, written: &ObjectMeta) -> Result<bool, StoreError> {
+        validate_key(&written.key)?;
+        let full_key = self.full_key(&written.key)?;
+        let mut attempt = 0;
+        loop {
+            let mut request = self
+                .client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&full_key);
+            if let Some(etag) = &written.etag {
+                request = request.if_match(format!("\"{etag}\""));
+            }
+            match request.send().await {
+                Ok(_) => return Ok(true),
+                Err(e) => match conditional_outcome(&e) {
+                    Some(Conditional::Present) => return Ok(false),
+                    Some(Conditional::Conflict)
+                        if written.etag.is_some() && attempt < CONDITIONAL_RETRIES =>
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(conditional_backoff(attempt)).await;
+                    }
+                    _ => {
+                        return match map_sdk_error("DeleteObject", e) {
+                            StoreError::NotFound => Ok(true),
+                            other => Err(other),
+                        };
+                    }
+                },
+            }
+        }
+    }
+
+    /// The requests of `delete_prefix` and `delete_prefix_before`: with a
+    /// `deadline`, no request is sent at or after it, and the call returns
+    /// what it deleted with `finished` false.
+    async fn delete_requests(
+        &self,
+        prefix: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PrefixDeletion, StoreError> {
         validate_prefix(prefix)?;
         let match_prefix = normalize_prefix(prefix);
         let request_prefix = format!("{}{match_prefix}", self.prefix);
         let mut deleted: u64 = 0;
         let mut token: Option<String> = None;
+        let out_of_time =
+            || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+        let unfinished = |deleted| PrefixDeletion {
+            deleted,
+            finished: false,
+        };
         loop {
+            if out_of_time() {
+                return Ok(unfinished(deleted));
+            }
             // Raw bucket-side keys, not `list_page`'s filtered view: an
             // object whose key fails the store rule is still under the
             // prefix and still has to go.
@@ -964,6 +1028,9 @@ impl S3Store {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let count = objects.len() as u64;
+                if out_of_time() {
+                    return Ok(unfinished(deleted));
+                }
                 let delete = Delete::builder()
                     .set_objects(Some(objects))
                     .quiet(true)
@@ -1006,9 +1073,16 @@ impl S3Store {
         // does not see them and S3 bills their parts until they are aborted.
         // A process that died mid-put left one; the reconciler's prefix
         // deletion is the one place that sweeps it.
-        self.abort_uploads_under(&request_prefix, match_prefix)
-            .await?;
-        Ok(deleted)
+        if !self
+            .abort_uploads_under(&request_prefix, match_prefix, deadline)
+            .await?
+        {
+            return Ok(unfinished(deleted));
+        }
+        Ok(PrefixDeletion {
+            deleted,
+            finished: true,
+        })
     }
 
     /// Abort every in-progress multipart upload under the normalized store
@@ -1027,14 +1101,22 @@ impl S3Store {
     /// backstop for such uploads, and `validate` reports either missing
     /// grant at startup (it probes both). A token code (`ExpiredToken` and
     /// the others in `is_token_code`) is not a denial and fails the call.
+    /// With a `deadline`, no request is sent at or after it, and the sweep
+    /// answers `false` (not finished); otherwise `true`.
     async fn abort_uploads_under(
         &self,
         request_prefix: &str,
         match_prefix: &str,
-    ) -> Result<(), StoreError> {
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<bool, StoreError> {
+        let out_of_time =
+            || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         let mut key_marker: Option<String> = None;
         let mut id_marker: Option<String> = None;
         loop {
+            if out_of_time() {
+                return Ok(false);
+            }
             let output = match self
                 .client
                 .list_multipart_uploads()
@@ -1056,7 +1138,7 @@ impl S3Store {
                          there stay open until the bucket's AbortIncompleteMultipartUpload \
                          lifecycle rule removes them"
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(e) => return Err(map_sdk_error("ListMultipartUploads", e)),
             };
@@ -1069,6 +1151,9 @@ impl S3Store {
                     .is_some_and(|k| key_matches_prefix(k, match_prefix));
                 if !matches {
                     continue;
+                }
+                if out_of_time() {
+                    return Ok(false);
                 }
                 match self
                     .client
@@ -1110,7 +1195,7 @@ impl S3Store {
                 break;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn validate_impl(&self) -> Result<(), StoreError> {
@@ -1323,6 +1408,21 @@ impl BackupStore for S3Store {
 
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>> {
         self.delete_prefix_impl(prefix).boxed()
+    }
+
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        self.delete_written_impl(written).boxed()
+    }
+
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        self.delete_requests(prefix, Some(deadline)).boxed()
     }
 
     /// Lists one key under the prefix (`ListObjectsV2`, `s3:ListBucket`)

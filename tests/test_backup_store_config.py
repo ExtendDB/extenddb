@@ -28,7 +28,8 @@ deployment and reads `/health`, the server's log and the API's answers:
   `extenddb-store.json` in it, and a relative root resolved against the
   shell's directory in daemon mode;
 - `extenddb backup list` and `backup purge --confirm` on an empty store, and
-  `backup purge` refused while a server holds the SQLite serve lock (exit 6);
+  `backup purge` refused while a server holds the SQLite serve lock (exit 6),
+  as are `backup sync`'s row-changing options and `backup migrate-legacy`;
 - an in-memory SQLite server restarted onto the root it used: the second
   start adopts the root the first start's catalog owned and syncs before it
   listens, so the first start's backup is described and restored; every
@@ -1596,6 +1597,18 @@ class TestSqlite:
             # it: exit 6, the code `migrate` uses for a locked catalog.
             assert res.returncode == 6, res.stdout + res.stderr
             assert "another extenddb process" in (res.stdout + res.stderr), res.stdout + res.stderr
+            # So is every option of `backup sync` that moves or removes rows,
+            # with or without a store to read, and `backup migrate-legacy`.
+            for args in (
+                ("sync", "--move-store", "/srv/elsewhere"),
+                ("sync", "--forget-store", "/srv/elsewhere"),
+                ("sync", "--forget-backup", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+                ("migrate-legacy", "--all"),
+                ("migrate-legacy", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+            ):
+                res = d.run("backup", *args)
+                assert res.returncode == 6, (args, res.stdout + res.stderr)
+                assert "another extenddb process" in (res.stdout + res.stderr), (args, res.stdout + res.stderr)
             assert server.proc.poll() is None, "the server kept running"
         finally:
             server.stop()

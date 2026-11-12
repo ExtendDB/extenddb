@@ -19,9 +19,11 @@
 //! pipeline's item and chunk channels are the job's own), and a client that
 //! disconnects mid-request cannot leave a row whose owner was never
 //! spawned. The maintenance claim is checked by the request before the
-//! permit, as the in-catalog paths check it, so a held claim refuses the
-//! request and inserts no row (a FAILED row written for the refusal was
-//! counted by `backup purge`'s wait as a live job for the stale window).
+//! permit, as the in-catalog paths check it, and again immediately before
+//! `claim_backup`, so a held claim refuses the request and inserts no row
+//! (a FAILED row written for the refusal was counted by `backup purge`'s
+//! wait as a live job for the stale window), and a claim taken while the
+//! open waited (on a lock the table holds, say) refuses it too.
 //! The open and the insert are selected against the shutdown token, so a
 //! server that is stopping neither waits on an open the table's lock holds
 //! nor inserts a row it would fail at once. The `ServiceUnavailable` that
@@ -102,7 +104,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::runtime::{BackupRuntime, ConfiguredStore, JobSettings, Spool, StoreFence};
-use super::{create_backup_storage_err_to_dynamo, storage_err_to_dynamo};
+use super::{create_backup_storage_err_to_dynamo, maintenance_held, storage_err_to_dynamo};
 use failure::{FailurePath, Written};
 use heartbeat::{HeartbeatHandle, HeartbeatMetric};
 use writer::{DataFiles, Pipeline, Stop};
@@ -355,6 +357,21 @@ where
             ))
         }));
     }
+    // The maintenance claim once more, immediately before the insert: the
+    // request's check ran before the open, the TTL read and the fence, any
+    // of which can wait (an open behind the table's lock), and a command
+    // that took the claim since gets no row of this job. A claim taken
+    // between this read and the insert is not seen: the CREATING row lands
+    // under the claim, where the command's wait lists it, the move's re-list
+    // of the old root reports it, or (an insert after that re-list) the
+    // move's closing report of other stores or a later plain sync does.
+    if storage
+        .check_maintenance_claim(env.settings.stale_job_after)
+        .await
+        .map_err(storage_err_to_dynamo)?
+    {
+        return Err(maintenance_held());
+    }
     let claimed_at = Instant::now();
     // The insert too is selected against the token: a server that is
     // stopping inserts no row it would have to fail at once.
@@ -474,6 +491,7 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         target_bytes: env.settings.data_file_target_bytes,
         key_prefix: &env.key_prefix,
         bucket: &env.bucket,
+        written: None,
     };
     let tracker = key_order.as_ref().map(KeyRangeTracker::new);
     let mut item_count = 0;
@@ -542,7 +560,9 @@ pub(crate) async fn run(job: Job) -> BackupJobOutcome {
         Err(stop) => {
             let (reason, outcome) = match stop {
                 Stop::Cancelled => (SHUTDOWN.to_owned(), BackupJobOutcome::Cancelled),
-                Stop::Fail(reason) => (reason, BackupJobOutcome::Failed),
+                Stop::Fail(reason) | Stop::Refused(reason) | Stop::Occupied(reason) => {
+                    (reason, BackupJobOutcome::Failed)
+                }
                 Stop::ClaimLost(_) | Stop::StoreUnhealthy(_) => unreachable!("matched above"),
             };
             match failure::fail_row(
@@ -648,7 +668,11 @@ async fn write_documents(
 
 /// One document's put under the backup prefix, after the pre-put check;
 /// returns the bytes the store reported.
-pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> Result<u64, Stop> {
+pub(crate) async fn put_document<W: writer::ClaimWatch + ?Sized>(
+    p: &Pipeline<'_, W>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<u64, Stop> {
     if p.shutdown.is_cancelled() {
         return Err(Stop::Cancelled);
     }
@@ -663,15 +687,9 @@ pub(crate) async fn put_document(p: &Pipeline<'_>, name: &str, bytes: &[u8]) -> 
         biased;
         () = p.shutdown.cancelled() => Err(Stop::Cancelled),
         () = p.heartbeat.lost().cancelled() => Err(Stop::ClaimLost(p.heartbeat.reason())),
-        result = p.store.put(&key, byte_stream_from(bytes.to_vec())) => match result {
-            Ok(meta) => Ok(meta.size),
-            Err(e) => {
-                if let Some(metrics) = p.metrics {
-                    metrics.record_backup_store_error("put");
-                }
-                Err(Stop::Fail(format!("writing {name}: {e}")))
-            }
-        },
+        result = p.put_object(&key, name, byte_stream_from(bytes.to_vec())) => {
+            result.map(|meta| meta.size)
+        }
     }
 }
 

@@ -26,6 +26,7 @@ mod metrics_endpoint;
 pub mod rate_limit;
 mod registration;
 mod repeated_headers;
+mod request_attributes;
 mod request_helpers;
 mod request_tags;
 mod response;

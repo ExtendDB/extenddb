@@ -25,8 +25,8 @@
 mod types;
 
 pub use types::{
-    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsRow, OpError, OpResult,
-    RoleDetail, SessionPolicyEntry, UserDetail,
+    AccessKeyCreated, AccountDetail, AdminEntry, GroupDetail, MetricsFilter, MetricsRow, OpError,
+    OpResult, RoleDetail, SessionPolicyEntry, UserDetail,
 };
 
 use futures::future::BoxFuture;
@@ -76,12 +76,15 @@ pub trait MetricsStore: Send + Sync {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>>;
 
     /// Query metrics rows within a time range, with optional filters.
+    ///
+    /// A filter that is `None` matches every row; `filter.account_id` set
+    /// returns only the rows recorded for that account, never a row of the
+    /// whole deployment (which has no account).
     fn query_metrics(
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>>;
 
     /// Delete metrics rows older than the retention period.
