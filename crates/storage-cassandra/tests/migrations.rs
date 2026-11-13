@@ -561,6 +561,20 @@ async fn role_rows(session: &CassandraSession, role: &str) -> usize {
         .len()
 }
 
+/// The cluster's node count: the coordinator and its peers.
+async fn node_count(session: &CassandraSession) -> usize {
+    let peers = session
+        .query("SELECT peer FROM system.peers_v2")
+        .await
+        .expect("read system.peers_v2")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    peers + 1
+}
+
 /// The tables of `keyspace`, in name order.
 async fn helpers_tables(session: &CassandraSession, keyspace: &str) -> Vec<String> {
     use cdrs_tokio::types::IntoRustByName;
@@ -1158,9 +1172,8 @@ async fn init_refuses_a_catalog_keyspace_with_another_replication_factor_or_data
         );
     }
 
-    // A catalog that holds a deployment's tables, at RF 3 on this one-node
-    // cluster. The error must not offer DROP KEYSPACE: following it would
-    // remove the catalog.
+    // A catalog that holds a deployment's tables, at RF 3. The error must
+    // not offer DROP KEYSPACE: following it would remove the catalog.
     let (prefix, _drops) = new_prefix("rfdata");
     let catalog = format!("{prefix}_catalog");
     keyspace(&session, &catalog).await;
@@ -1175,6 +1188,7 @@ async fn init_refuses_a_catalog_keyspace_with_another_replication_factor_or_data
         ),
     )
     .await;
+    let unreadable = node_count(&session).await < 2;
     let second = bootstrapper_with(&prefix, &user, &password, 1, "datacenter1").await;
     for (step, result) in [
         ("ensure_app_user", second.ensure_app_user().await),
@@ -1199,12 +1213,19 @@ async fn init_refuses_a_catalog_keyspace_with_another_replication_factor_or_data
             "{step}: {err}"
         );
         assert!(!err.contains("DROP KEYSPACE"), "{step}: {err}");
-        // The status read fails at RF 3 on one node, so an init with the
-        // keyspace's values would stop again: the error does not offer it.
-        assert!(
-            !err.contains("Give init the values") && err.contains("To fix it, stop every"),
-            "{step}: {err}"
-        );
+        // At RF 3, a QUORUM read needs 2 replicas. On one node the status
+        // read fails, and an init with the keyspace's values would stop
+        // again, so the error does not offer it. On 2 or more nodes the
+        // read works, and the error offers it.
+        let offers_same_values = err.contains("Give init the values");
+        if unreadable {
+            assert!(
+                !offers_same_values && err.contains("To fix it, stop every"),
+                "{step}: {err}"
+            );
+        } else {
+            assert!(offers_same_values, "{step}: {err}");
+        }
     }
 }
 
