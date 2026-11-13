@@ -54,8 +54,14 @@ pub use commands::CassandraCatalogMigrations;
 pub(crate) use commands::lease_of;
 pub use connect::Deployment;
 pub(crate) use connect::{
-    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, replication_differs, replication_mismatches,
+    LOCKED_DDL_TIMEOUT, REQUEST_TIMEOUT, alter_steps, cluster_datacenters, replication_differs,
+    tables_of,
 };
+// Public for the integration tests only.
+#[cfg(any(test, feature = "test-util"))]
+pub use connect::{ReplicationChange, replication_mismatches};
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) use connect::{ReplicationChange, replication_mismatches};
 pub(crate) use locks::LeaseHandle;
 pub use locks::{LeaseTimes, MigrationLock};
 pub use registrar::ServerRegistration;

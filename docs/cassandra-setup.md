@@ -190,12 +190,12 @@ Fields:
 - `keyspace_prefix` — prefix for this deployment's keyspaces (default
   `extenddb`).
 - `replication_factor` — keyspace replication factor. `init` creates its own
-  keyspaces with `--replication-factor` (default `1`) and writes the same value
-  here; see [Keyspace replication](#keyspace-replication) for a multi-node
-  cluster.
+  keyspaces with `--replication-factor` (default `1`), or with this file's value
+  for `init --overwrite`, and writes the same value here; see
+  [Keyspace replication](#keyspace-replication) for a multi-node cluster.
 - `datacenter` — the local datacenter name for `NetworkTopologyStrategy`. `init`
-  creates its keyspaces in `--datacenter` (default `datacenter1`) and writes the
-  same value here. It must name a datacenter the cluster has: a node started
+  creates its keyspaces in `--datacenter` (default `datacenter1`), or in this
+  file's value for `init --overwrite`, and writes the same value here. It must name a datacenter the cluster has: a node started
   with another name (for example `CASSANDRA_DC=dc1`) fails keyspace creation
   with `Unrecognized strategy option {datacenter1} ... for keyspace
   extenddb_catalog` until you pass `--datacenter dc1`.
@@ -281,7 +281,22 @@ the catalog keyspace's replication. Cassandra keeps a keyspace's replication
 until an `ALTER KEYSPACE` changes it, so editing the config later changes only
 the account keyspaces created afterwards. At start-up, `serve` logs a warning
 for each of the deployment's keyspaces whose replication differs from the
-config's `replication_factor` and `datacenter`.
+config's `replication_factor` and `datacenter`. Either can be wrong. If the
+keyspace is right, set `replication_factor` and `datacenter` in the config to
+match it. If the config is right, change the keyspace in the order below for
+its change. If the config's `datacenter` is not one of the cluster's, the
+config is wrong: fix it, and do not alter the keyspaces.
+
+The order of `ALTER KEYSPACE` and `nodetool repair` depends on the change. The
+wrong order can lose writes that Cassandra acknowledged. Stop every ExtendDB
+server of the deployment before the first step, and start them again after the
+last.
+
+| Change | Order |
+|---|---|
+| Raise the replication factor, same datacenter | `ALTER KEYSPACE`, then `nodetool repair -full` on each node (steps below) |
+| Lower the replication factor, same datacenter | `nodetool repair -full` on each node, then `ALTER KEYSPACE`, then `nodetool cleanup` on each node |
+| Change the strategy (for example `SimpleStrategy`) or the datacenter | Follow [Changing keyspace replication strategy](https://docs.datastax.com/en/cassandra-oss/3.0/cassandra/operations/opsChangeKSStrategy.html) in the Cassandra documentation. Do not move the replicas with one `ALTER KEYSPACE`. |
 
 Cassandra's own `system_auth` keyspace, which holds the roles ExtendDB logs in
 with, starts at `SimpleStrategy` with replication factor 1 whatever `init` is
@@ -313,7 +328,9 @@ it prints `No nodes available in query plan!`. A second `init` with the same
 `--replication-factor` is refused, because the catalog keyspace already has
 the first one. To recover, lower the catalog keyspace's replication factor with
 `ALTER KEYSPACE` (as above, with a value no larger than the node count), or
-remove the keyspace with `DROP KEYSPACE`. Then run `init` again.
+remove the keyspace with `DROP KEYSPACE`, but only when it holds no data: no
+table, or for the catalog keyspace no table but `settings`. Then run `init`
+again.
 Logins read `system_auth` at `QUORUM` for the default superuser, so a
 `system_auth` replication factor above the node count makes those logins fail
 with `Cannot achieve consistency level QUORUM`.

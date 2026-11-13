@@ -111,6 +111,11 @@ pub(super) fn check_name(
 /// digits, `_`, `-` and `.`. The name is written between single quotes into
 /// every `CREATE KEYSPACE`, so a quote would break the statement. `what`
 /// names where the value came from, for the error.
+///
+/// This checks the name's characters only, not that the cluster has the
+/// datacenter. Cassandra checks that: its `NetworkTopologyStrategy` refuses
+/// a `CREATE KEYSPACE` that names a datacenter no node is in, with
+/// `ConfigurationException: Unrecognized strategy option {<name>}`.
 pub(super) fn check_datacenter(
     what: &str,
     value: &str,

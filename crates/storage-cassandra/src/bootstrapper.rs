@@ -342,7 +342,18 @@ impl CassandraBootstrapper {
     /// earlier `init` created, with that `init`'s RF and datacenter. Without
     /// this check, `init` would write its own values to `extenddb.toml`, and
     /// the file would not describe the keyspaces.
-    async fn refuse_other_replication(&self, keyspace: &str) -> OpResult<()> {
+    ///
+    /// The error offers `DROP KEYSPACE` only for a keyspace that holds no
+    /// data: no table, or for the catalog keyspace only the `settings` table
+    /// that `init` creates before it takes the lock. For a keyspace that
+    /// holds other tables, it offers only the fixes that keep the data, with
+    /// the steps in the order that keeps every write for the keyspace's
+    /// change ([`crate::migrations::alter_steps`]).
+    ///
+    /// With `unreadable`, the catalog's status read failed: the keyspace has
+    /// more replicas than the cluster has nodes, and an `init` with the
+    /// keyspace's values stops again. The error then does not offer them.
+    async fn refuse_other_replication(&self, keyspace: &str, unreadable: bool) -> OpResult<()> {
         let found = crate::migrations::replication_differs(
             self.engine.session(),
             keyspace,
@@ -351,19 +362,43 @@ impl CassandraBootstrapper {
         )
         .await
         .map_err(|e| OpError::Internal(e.to_string()))?;
-        match found {
-            None => Ok(()),
-            Some(found) => Err(OpError::Internal(format!(
-                "Keyspace {keyspace} already exists with replication {found}, but this init \
-                 uses replication factor {} in datacenter {}. Give init the values the \
-                 keyspace has (with --replication-factor and --datacenter, or in \
-                 extenddb.toml for init --overwrite), or change the keyspace with ALTER \
-                 KEYSPACE. If the keyspace has more replicas than its datacenter has nodes, \
-                 change it with ALTER KEYSPACE or remove it with DROP KEYSPACE \
+        let Some((found, change)) = found else {
+            return Ok(());
+        };
+        let tables = crate::migrations::tables_of(self.engine.session(), keyspace)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        let is_catalog = keyspace == self.engine.catalog_keyspace();
+        let holds_no_data = tables.iter().all(|table| is_catalog && table == "settings");
+        let mismatch = format!(
+            "Keyspace {keyspace} already exists with replication {found}, but this init \
+             uses replication factor {} in datacenter {}.",
+            self.replication_factor, self.datacenter
+        );
+        let same_values = if unreadable {
+            "To fix it, "
+        } else {
+            "Give init the values the keyspace has (with --replication-factor and \
+             --datacenter, or in extenddb.toml for init --overwrite). Or "
+        };
+        Err(OpError::Internal(if holds_no_data {
+            format!(
+                "{mismatch} The keyspace holds no data. {same_values}change the keyspace \
+                 with ALTER KEYSPACE, or remove it with DROP KEYSPACE {keyspace} \
+                 (docs/cassandra-setup.md, Keyspace replication)."
+            )
+        } else {
+            let what = if is_catalog {
+                "a deployment's catalog"
+            } else {
+                "an account's tables"
+            };
+            format!(
+                "{mismatch} The keyspace holds {what}: do not drop it. {same_values}{} \
                  (docs/cassandra-setup.md, Keyspace replication).",
-                self.replication_factor, self.datacenter
-            ))),
-        }
+                crate::migrations::alter_steps(change)
+            )
+        }))
     }
 
     /// Refuse a catalog keyspace that exists, is not a catalog, and holds
@@ -373,8 +408,15 @@ impl CassandraBootstrapper {
     /// the application role included, and again before it creates the
     /// keyspace.
     ///
+    /// An initialized catalog, other than one whose `init` stopped before
+    /// its admin user ([`finishes_a_stopped_init`]), gets no replication
+    /// check: `init` refuses it under the lock as already initialized, and
+    /// advice to change its replication would only change a live catalog.
+    /// Returns whether the catalog is such a catalog.
+    ///
     /// [`foreign_contents`]: crate::migrations::foreign_contents
-    async fn refuse_a_foreign_keyspace(&self) -> OpResult<()> {
+    /// [`finishes_a_stopped_init`]: extenddb_storage::bootstrapper::finishes_a_stopped_init
+    async fn refuse_a_foreign_keyspace(&self) -> OpResult<bool> {
         let keyspace = self.engine.catalog_keyspace();
         let session = self.engine.session_arc();
         let status =
@@ -385,7 +427,7 @@ impl CassandraBootstrapper {
                     // keyspace that an earlier `init` left with more replicas
                     // than the cluster has nodes. The RF check reads at ONE
                     // and names the cause, so its error comes first.
-                    self.refuse_other_replication(&keyspace).await?;
+                    self.refuse_other_replication(&keyspace, true).await?;
                     return Err(OpError::Internal(e.to_string()));
                 }
             };
@@ -400,10 +442,13 @@ impl CassandraBootstrapper {
                     foreign.join(", ")
                 )));
             }
+        } else if !extenddb_storage::bootstrapper::finishes_a_stopped_init(self, &status).await? {
+            return Ok(true);
         }
         // After the foreign-keyspace check, so a keyspace of another program
         // gets that error, whatever its replication.
-        self.refuse_other_replication(&keyspace).await
+        self.refuse_other_replication(&keyspace, false).await?;
+        Ok(false)
     }
 
     /// The lowest account id in the catalog's `accounts` table, read through
@@ -455,7 +500,8 @@ impl CassandraBootstrapper {
                 self.engine.create_keyspace(&account_keyspace),
             )
             .await?;
-        self.refuse_other_replication(&account_keyspace).await?;
+        self.refuse_other_replication(&account_keyspace, false)
+            .await?;
         println!("--- Running the account migrations for the default account...");
         self.held.check("Migrate the default account's keyspace")?;
         let session = self.engine.session_arc();
@@ -604,12 +650,14 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Creating catalog keyspace '{keyspace}'...");
         let session = self.engine.session_arc();
-        self.refuse_a_foreign_keyspace().await?;
+        let initialized = self.refuse_a_foreign_keyspace().await?;
         self.engine
             .create_keyspace(&keyspace)
             .await
             .map_err(|e| OpError::Internal(format!("Create catalog keyspace: {e}")))?;
-        self.refuse_other_replication(&keyspace).await?;
+        if !initialized {
+            self.refuse_other_replication(&keyspace, false).await?;
+        }
         crate::migrations::create_lock_table(&session, &keyspace)
             .await
             .map_err(|e| OpError::Internal(e.to_string()))?;

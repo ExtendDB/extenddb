@@ -21,8 +21,8 @@ pub struct CassandraStorageConfig {
     #[serde(default = "default_keyspace_prefix")]
     pub keyspace_prefix: String,
 
-    /// Replication factor for keyspaces (default: 1, the factor `init` uses
-    /// when it has no `--replication-factor`)
+    /// Replication factor for keyspaces (default: 3, for a section with no
+    /// `replication_factor` line; `init` always writes the line)
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
 
@@ -50,7 +50,7 @@ fn default_keyspace_prefix() -> String {
 }
 
 fn default_replication_factor() -> u32 {
-    1
+    3
 }
 
 fn default_datacenter() -> String {
@@ -268,7 +268,7 @@ mod tests {
         let config = CassandraStorageConfig::new(vec!["localhost:9042".to_string()]);
 
         assert_eq!(config.keyspace_prefix, "extenddb");
-        assert_eq!(config.replication_factor, 1);
+        assert_eq!(config.replication_factor, 3);
         assert_eq!(config.datacenter, "datacenter1");
         assert_eq!(config.max_connections, 10);
         assert_eq!(config.username, None);
@@ -358,7 +358,7 @@ mod tests {
 
         // Verify defaults are applied
         assert_eq!(config.keyspace_prefix, "extenddb");
-        assert_eq!(config.replication_factor, 1);
+        assert_eq!(config.replication_factor, 3);
         assert_eq!(config.datacenter, "datacenter1");
         assert_eq!(config.max_connections, 10);
         assert_eq!(config.username, None);

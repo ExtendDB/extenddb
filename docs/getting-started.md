@@ -95,7 +95,7 @@ This will:
 
 **Important:** Save the admin credentials printed during init. They are shown once and cannot be retrieved later. These credentials are used to authenticate to the management API.
 
-**Re-initialization:** `extenddb init` will abort if either the catalog or data database already exists. To re-initialize, first run `extenddb destroy --config extenddb.toml --yes` to drop the existing databases, then run `extenddb init` again. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used.
+**Re-initialization:** `extenddb init` will abort if either the catalog or data database already exists. To re-initialize, first run `extenddb destroy --config extenddb.toml --yes` to drop the existing databases, then run `extenddb init` again. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see "Keyspace replication" in [cassandra-setup.md](cassandra-setup.md).
 
 To use a custom catalog database name:
 
