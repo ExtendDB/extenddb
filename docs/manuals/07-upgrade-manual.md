@@ -636,6 +636,72 @@ catalog migration is required.
 
 ---
 
+### v0.1.15: export files are created 0600 and the import and export directories the server creates 0700
+
+**What changed.** On Unix, `ExportTableToPointInTime` creates its file with
+mode 0600, and the server creates the directories that hold import and export
+files with mode 0700: a configured import or export root that does not exist
+at startup, and the account directory (`<export root>/<account id>`) that the
+first export of an account creates. Missing parent directories of a root are
+created 0755, so no directory the server creates is writable by group or
+others. Before this release these files and directories took their modes from
+the server's umask. Under umask 022, the usual umask of a shell or a container
+running `serve --foreground`, the directories were 0755 and the files 0644, so
+any local user could list the account directories and read every export. A
+server started as a daemon (`serve` without `--foreground`) runs with umask
+027, which gave 0750 and 0640, so the server user's group could. Now only the
+server's user and root can: the umask can only narrow these modes. A directory
+that already exists keeps its mode, and directories and export files created
+before the upgrade keep theirs. At startup the server logs a warning for each
+root that has an existing parent directory writable by group or others without
+the sticky bit, naming that directory and its mode, and starts: a user who can
+write to such a directory can rename the root away and put a directory of their
+own in its place.
+
+**Who is affected.** Anyone who reads export files as another user than the
+server's: a member of the server user's group under the systemd unit in the
+deployment guide (`User=extenddb`, `Group=extenddb`, `Type=forking`), or a host
+user who reads exports through a bind mount while the container runs as uid
+10001 (`Dockerfile`) or 65532 (`Dockerfile.dev`). On the import side, a server
+under umask 002 used to create a missing import root 0775, so members of the
+server user's group could put import files into it. A root the server creates
+is now 0700, so they cannot, unless they can write to a parent directory of the
+root (the startup warning above). An operator who relies on that access creates
+the root before the first start, with the group and mode wanted; an existing
+root keeps its mode.
+
+When the import root is also an export root (the deprecated
+`import_export_root` key, or one path listed under both `[import]` and
+`[export]`), that is not enough. Import files go under `<root>/<account id>`,
+and the first export of an account creates that directory 0700 when it does not
+exist, so the group can no longer put import files into it; before this release
+a server under umask 002 created it 0775. Create each `<root>/<account id>`
+before the account's first export, with the group and mode wanted (a directory
+that already exists keeps its mode), or configure separate import and export
+roots. Export files in such a root are still created 0600.
+
+**Migration.** Nothing is required. To remove group and other access from the
+export files and directories written before the upgrade, run as the server's
+user or as root, for each export root:
+
+```bash
+find <export root> -mindepth 1 -maxdepth 1 -type d \
+  -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' \
+  -exec chmod -R go-rwx {} +
+```
+
+The command clears the group and other bits of each account directory (a
+directory directly under the root whose name is a 12-digit account id) and of
+every directory and file under it, and leaves the owner's (0755 becomes 0700,
+0644 becomes 0600). It leaves alone the root itself and every other entry in
+it: files directly under the root, and directories with other names, such as
+another application's in a shared temporary directory. When the export root is
+also an import root, the command removes group and other access to the import
+files in the account directories as well, including the group access that the
+previous paragraph sets up. No catalog migration is required.
+
+---
+
 ### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,

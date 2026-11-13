@@ -17,6 +17,7 @@ pub mod console;
 pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
+mod import_export_roots;
 mod item_authz;
 pub mod key_info_cache;
 mod leading_keys;

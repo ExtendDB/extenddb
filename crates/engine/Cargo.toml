@@ -48,3 +48,9 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # A storage engine for the tests that need an `OperationContext`.
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
+# Scratch directories that are removed when a test panics.
+tempfile = "3"
+
+# `tests/private_modes.rs` sets umask 0.
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
