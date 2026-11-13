@@ -107,11 +107,16 @@ migration_ids! {
     /// escape that lets a PostgreSQL catalog hold U+0000 in a name (#367).
     AttributeNameEscape = 11, "attribute_name_escape",
         "store attribute names through the escape that lets PostgreSQL jsonb hold U+0000";
+    /// Makes every access key ID unique. PostgreSQL, SQLite and Cassandra key
+    /// `access_keys` by the ID; MongoDB had no unique index on it, so an
+    /// import stored a second key under an ID that a key already had.
+    UniqueAccessKeyIds = 12, "unique_access_key_ids",
+        "make every access key ID unique, which the MongoDB catalog did not enforce";
 }
 
 /// Highest id that has shipped in a release. Bodies at or below it are frozen:
 /// each backend pins their checksums, kinds and convergent flags, and
-/// `forget` refuses them. The v1.0 release PR raises it to 11.
+/// `forget` refuses them. The v1.0 release PR raises it to 12.
 pub const RELEASED_THROUGH: u32 = 0;
 
 impl MigrationId {

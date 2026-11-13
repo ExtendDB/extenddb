@@ -125,6 +125,8 @@ These settings require a server restart to take effect.
 |-----|---------|-------------|
 | `backend` | `postgres` | Storage backend (only `postgres` supported) |
 
+ExtendDB owns the collections, tables and indexes of its catalog and data databases. A change to them, such as an added index, is not supported and can make a later migration fail.
+
 #### [storage.postgres]
 
 | Key | Default | Description |
@@ -710,11 +712,11 @@ DynamoDB. The `Resource` element of a policy is matched field by field, and a
 | GetRecords | the stream the shard iterator reads |
 | ListStreams | `table/<name>/stream/*` when a table is named, else `table/*/stream/*` |
 | DescribeBackup, DeleteBackup | the `BackupArn` |
-| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` |
+| CreateBackup, DescribeContinuousBackups, UpdateContinuousBackups | `table/<name>` (an `UpdateContinuousBackups` that enables point-in-time recovery is refused before authorization) |
 | ExportTableToPointInTime | the source `table/<name>` |
 | ImportTable | the new `table/<name>` |
 | RestoreTableFromBackup | the backup ARN, plus Scan, Query, GetItem, PutItem, UpdateItem, DeleteItem and BatchWriteItem on the target `table/<name>` |
-| RestoreTableToPointInTime | the same item actions on the target `table/<name>`, then the source `table/<name>` |
+| RestoreTableToPointInTime | refused before authorization (point-in-time recovery is not supported) |
 | ListTables | `table/*` |
 | DescribeLimits | `*` |
 | DescribeEndpoints | not authorized (signed request, no IAM permission) |
@@ -778,13 +780,12 @@ upgrading:
   DynamoDB returns for an iterator it did not issue. Shard iterators expire after
   15 minutes.
 - **Restores.** A restore writes items into its target table, so
-  RestoreTableFromBackup and RestoreTableToPointInTime require the item write
-  and read actions on the target table in addition to the restore action. A
+  RestoreTableFromBackup requires the item write and read actions on the
+  target table in addition to the restore action. A
   principal that could previously restore with only the restore permission now
-  also needs those actions on the target table name. RestoreTableToPointInTime
-  checks the item actions on the target before the restore action, as DynamoDB
-  does, so a principal with no policy is denied naming `dynamodb:Scan` on the
-  target table.
+  also needs those actions on the target table name. From v0.1.15,
+  RestoreTableToPointInTime is refused before authorization, for every
+  principal, because point-in-time recovery is not supported.
 - **Denial messages.** An AccessDeniedException now ends with the clause the
   service uses: "with an explicit deny in an identity-based policy" when an
   explicit Deny matched the request, or "because no identity-based policy allows
@@ -1071,7 +1072,7 @@ Check that PostgreSQL is running and the connection string in `extenddb.toml` is
 
 **The catalog has pending migrations, or is ahead of the binary:**
 
-On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 10, and ExtendDB <release> needs migration 11`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
+On PostgreSQL, SQLite, Cassandra and MongoDB, `serve` reads the catalog's migration status before it opens the engine and refuses a catalog it cannot serve, printing the status and the command that resolves it. A catalog with pending migrations exits 3, for example `the catalog is at migration 11, and ExtendDB <release> needs migration 12`, followed by the pending migrations and `extenddb migrate --config extenddb.toml --yes`. A catalog that a newer release migrated with a breaking migration exits 4 and names that release's migrations; upgrade the binary rather than the catalog. The [Upgrade Manual](07-upgrade-manual.md#the-catalog-status) lists every status with its exit code and the stop / migrate / start sequence.
 
 ### Authentication Errors
 
@@ -1091,7 +1092,7 @@ The IAM policy does not allow the operation. Check attached policies with `list-
 
 **Slow queries:**
 
-Check PostgreSQL query performance with `EXPLAIN ANALYZE`. Ensure indexes exist on key columns.
+Check PostgreSQL query performance with `EXPLAIN ANALYZE`.
 
 **High connection count:**
 

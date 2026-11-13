@@ -201,6 +201,9 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
                 ),
             ],
         },
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
 
@@ -228,7 +231,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::RestoreProgress
         | MigrationId::WarmThroughput
         | MigrationId::AccountMetrics
-        | MigrationId::AttributeNameEscape => RunsIn::Transaction,
+        | MigrationId::AttributeNameEscape
+        | MigrationId::UniqueAccessKeyIds => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

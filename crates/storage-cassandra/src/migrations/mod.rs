@@ -182,6 +182,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
              columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
              as it was written",
         ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
+             EXISTS, so an ID can be stored once",
+        ),
     }
 }
 
