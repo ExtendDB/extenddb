@@ -45,8 +45,8 @@ fn owner_only_modes_hold_under_a_umask_of_zero() {
 }
 
 /// `create_private_dir_all` creates the directory asked for 0700 and its
-/// missing ancestors with the default mode, and leaves the existing parent
-/// alone.
+/// missing ancestors 0755, never writable by group or others, and leaves the
+/// existing parent alone.
 fn missing_directories() {
     let dir = scratch("missing");
     let base = dir.path();
@@ -57,7 +57,7 @@ fn missing_directories() {
     for dir in [base.join("a"), base.join("a").join("b")] {
         assert_eq!(
             mode_of(&dir),
-            Mode(0o777),
+            Mode(0o755),
             "a missing ancestor, {}",
             dir.display()
         );

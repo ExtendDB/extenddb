@@ -5,11 +5,12 @@
 //!
 //! An export file holds a table's items, so it is created `0600`, and the
 //! directory extenddb creates to hold such files is created `0700`. Both
-//! modes are set at creation time, so there is no window in which the process
-//! umask decides who can read the data. Missing parents of that directory are
-//! created with the default mode, as `mkdir -p -m 0700` does, and a directory
-//! that already exists keeps its mode. On targets other than Unix the helpers
-//! fall back to the platform defaults.
+//! modes are set at creation time, so the process umask cannot widen them; it
+//! can only narrow them. Missing parents of that directory are created `0755`
+//! (less the umask's bits), so other users can still reach siblings created
+//! there later but no parent extenddb creates is writable by group or others.
+//! A directory that already exists keeps its mode. On targets other than Unix
+//! the helpers fall back to the platform defaults.
 
 use std::io;
 use std::path::Path;
@@ -17,23 +18,30 @@ use std::path::Path;
 /// Mode of a directory extenddb creates for table data.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
+/// Mode of a missing parent of such a directory: searchable by everyone,
+/// writable by the owner only, so no other user can rename the directory
+/// below it or put another in its place.
+const PARENT_DIR_MODE: u32 = 0o755;
+
 /// Mode of a file that holds table data.
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// Create `path`, owner-only on Unix, and every missing ancestor with the
-/// default mode (`0777` less the umask), as `mkdir -p -m 0700` does.
+/// Create `path`, owner-only on Unix, and every missing ancestor `0755`, both
+/// less the umask's bits.
 ///
 /// Only `path` itself is made owner-only: an ancestor may be a directory
 /// such as `/srv/data` that other users need for siblings created later.
 /// Like `std::fs::create_dir_all`, this succeeds when `path` already exists,
-/// and it never changes the mode of a directory it did not create.
+/// and it never changes the mode of a directory it did not create. A umask
+/// that masks owner bits narrows the modes further (under umask 0200 `path`
+/// is `0500`, and nothing can be created in it).
 ///
 /// # Errors
 ///
 /// Returns the I/O error from creating any missing directory.
 pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    // The same steps as `create_dir_all`, with the mode on the last one.
+    // The same steps as `create_dir_all`, with the modes above.
     if path.as_os_str().is_empty() {
         return Ok(());
     }
@@ -44,7 +52,9 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     match path.parent() {
-        Some(parent) => std::fs::create_dir_all(parent)?,
+        Some(parent) => dir_builder(PARENT_DIR_MODE)
+            .recursive(true)
+            .create(parent)?,
         None => return Err(io::Error::other("failed to create whole tree")),
     }
     create_once_parent_exists(path)
@@ -171,7 +181,7 @@ mod tests {
 
     #[test]
     fn create_private_dir_all_makes_only_the_last_directory_owner_only() {
-        let parent_mode = default_dir_mode();
+        let parent_mode = Mode(default_dir_mode().0 & 0o755);
         let dir = scratch("dirs");
         let base = dir.path();
         let leaf = base.join("a").join("b").join("c");
@@ -182,7 +192,7 @@ mod tests {
             assert_eq!(
                 mode_of(&dir),
                 parent_mode,
-                "a missing ancestor, {}",
+                "a missing ancestor is 0755 less the umask, {}",
                 dir.display()
             );
         }

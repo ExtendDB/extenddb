@@ -228,8 +228,10 @@
 # server creates to hold import and export files are created with mode 0700: a
 # missing import or export root, created at startup, and the account directory
 # an export creates under each export root. Missing parent directories of a
-# root are created with the default mode, as `mkdir -p -m 0700` does. A
-# directory that already exists keeps its mode.
+# root are created 0755. A directory that already exists keeps its mode. The
+# umask can only narrow these modes. At startup the server warns about a root
+# with a parent directory that group or others can write to without the
+# sticky bit, since another user could replace the root through it.
 #
 # [import]
 # paths = ["/var/lib/extenddb/imports"]
