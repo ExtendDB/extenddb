@@ -71,7 +71,6 @@ pub async fn handle_batch_write_item(
             }
         }
     }
-
     // Attribute names over the size limit are request-shape validation: every
     // PutRequest item is checked before any table lookup and before the key
     // checks, so a request naming a missing table, or an item missing its key,
@@ -85,6 +84,14 @@ pub async fn handle_batch_write_item(
             )?;
         }
     }
+
+    // Every number in every request is checked before any table is looked up
+    // or written: the service reports a malformed number ahead of a missing
+    // table, a key type mismatch, a missing key and a duplicate key, and
+    // writes none of a batch whose later put holds one (measured 2026-10-27).
+    // An attribute name over the size limit comes first: for one item holding
+    // both, the service answered either fault (measured 2026-11-11).
+    extenddb_core::validation::number::operations::batch_write_item(&input)?;
 
     // Read every table's key info before anything is written. A lookup that
     // failed is reported where `check_batch` reaches its table, so the first
