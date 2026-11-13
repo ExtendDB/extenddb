@@ -18,7 +18,7 @@ use extenddb_core::types::{
     AttributeDefinition, AttributeValue, Condition, ConditionalOperator, KeySchemaElement, KeyType,
     ScalarAttributeType,
 };
-use extenddb_core::validation::{validate_attribute_number, validate_no_empty_key_value};
+use extenddb_core::validation::validate_no_empty_key_value;
 
 /// Desugar legacy `KeyConditions` into a `KeyCondition` struct and expression maps.
 ///
@@ -514,26 +514,6 @@ pub fn desugar_filter(
 
 const INVALID_PARAMS: &str = "One or more parameter values were invalid: ";
 
-/// `validate_attribute_number` with one difference in wording. An empty
-/// number in a legacy condition value, `{"N": ""}` on its own or inside `NS`,
-/// `L` or `M`, answers `The parameter cannot be converted to a numeric value: `,
-/// the separator kept with nothing after it. Measured on a top-level value on
-/// 2026-10-24, and on 2026-11-12 inside `NS`, `L`, `M` and an `M` in an `L`,
-/// in `ScanFilter`, `QueryFilter` and `KeyConditions`; every other number
-/// error answers the text `validate_attribute_number` already gives.
-/// `validate_attribute_number` reports an empty number with the `EMPTY` text
-/// below, without the separator, and uses that text for nothing else, so the
-/// match adds the separator to that one message.
-fn validate_legacy_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
-    const EMPTY: &str = "The parameter cannot be converted to a numeric value";
-    validate_attribute_number(value).map_err(|err| match err {
-        DynamoDbError::ValidationException(m) if m == EMPTY => {
-            DynamoDbError::ValidationException(format!("{EMPTY}: "))
-        }
-        other => other,
-    })
-}
-
 /// Validate one legacy condition (`ScanFilter`, `QueryFilter` or
 /// `KeyConditions` entry) the way the service does at request time, before
 /// the table is looked up and before any row is read, with its messages
@@ -570,9 +550,7 @@ pub fn validate_legacy_condition(
     operator: &str,
     values: &[AttributeValue],
 ) -> Result<(), DynamoDbError> {
-    for value in values {
-        validate_legacy_number(value)?;
-    }
+    extenddb_core::validation::number::operations::condition_values(values)?;
     let refuse = |text: String| {
         Err(DynamoDbError::ValidationException(format!(
             "{INVALID_PARAMS}{text}"

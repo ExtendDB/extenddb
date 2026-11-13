@@ -2527,14 +2527,7 @@ fn validate_lsi_requires_range_key(input: &CreateTableInput) -> Result<(), Dynam
     Ok(())
 }
 
-/// Validate every number inside one attribute value (`N`, `NS`, and the
-/// numbers nested in `L` and `M`) with the service's messages.
-///
-/// # Errors
-///
-/// Returns `DynamoDbError::ValidationException` for the first number that is
-/// not a valid `DynamoDB` number.
-pub fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
+fn validate_attribute_number(value: &AttributeValue) -> Result<(), DynamoDbError> {
     match value {
         AttributeValue::N(n) => {
             number::validate_and_normalize_number(n)?;
