@@ -108,14 +108,13 @@ async fn rows_no_values(
     session: &Arc<CassandraSession>,
     query: &str,
 ) -> Result<Vec<cdrs_tokio::types::rows::Row>, StorageError> {
-    let result = session
-        .query(query)
-        .await
-        .map_err(|e| StorageError::Internal(format!("scan query failed: {e}")))?;
-    let body = result
-        .response_body()
-        .map_err(|e| StorageError::Internal(format!("scan parse failed: {e}")))?;
-    Ok(body.into_rows().unwrap_or_default())
+    crate::cassandra_util::query_rows(
+        session,
+        query,
+        cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+        "scan query failed",
+    )
+    .await
 }
 
 impl crate::CassandraEngine {
@@ -310,7 +309,7 @@ impl crate::CassandraEngine {
         // exactly one row, and `token()` is independent of the queried table's
         // schema, so this needs neither the data table to exist nor a matching
         // row in it.
-        let rows = cassandra_util::query_rows::<StorageError>(
+        let rows = cassandra_util::system_read::<StorageError>(
             &self.session_arc(),
             "SELECT token(?) AS t FROM system.local",
             QueryValues::SimpleValues(vec![Value::from(pk_text.as_str())]),

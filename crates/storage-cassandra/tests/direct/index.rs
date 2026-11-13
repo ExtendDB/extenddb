@@ -1949,7 +1949,7 @@ async fn test_a_delete_removes_the_index_row_a_backfill_wrote() {
 async fn keyspace_tables(engine: &CassandraEngine, keyspace: &str) -> Vec<String> {
     use cdrs_tokio::types::IntoRustByName as _;
 
-    extenddb_storage_cassandra::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+    extenddb_storage_cassandra::cassandra_util::system_read::<extenddb_storage::error::StorageError>(
         &engine.session_arc(),
         "SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?",
         cdrs_tokio::query_values!(keyspace),
@@ -1971,7 +1971,7 @@ async fn schema_table_id(
 ) -> Option<uuid::Uuid> {
     use cdrs_tokio::types::IntoRustByName as _;
 
-    extenddb_storage_cassandra::cassandra_util::query_rows::<extenddb_storage::error::StorageError>(
+    extenddb_storage_cassandra::cassandra_util::system_read::<extenddb_storage::error::StorageError>(
         &engine.session_arc(),
         "SELECT id FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
         cdrs_tokio::query_values!(keyspace, table),

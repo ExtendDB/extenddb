@@ -24,7 +24,7 @@ impl PasswordHashStore for CassandraCatalogStore {
             let query = format!(
                 "SELECT password_hash FROM {catalog_keyspace}.admin_users WHERE admin_name = ?"
             );
-            let rows = crate::cassandra_util::query_rows_quorum(
+            let rows = crate::cassandra_util::query_rows(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(admin_name.as_str()),
@@ -49,7 +49,7 @@ impl PasswordHashStore for CassandraCatalogStore {
                 "SELECT password_hash FROM {catalog_keyspace}.iam_users \
                  WHERE account_id = ? AND user_name = ?"
             );
-            let rows = crate::cassandra_util::query_rows_quorum(
+            let rows = crate::cassandra_util::query_rows(
                 &session,
                 &query,
                 cdrs_tokio::query_values!(account_id.as_str(), user_name.as_str()),

@@ -3,8 +3,7 @@
 
 //! `put_item` and `get_item` implementations for the Cassandra backend.
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
+use crate::cassandra_util::PolicySession as _;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::expression::{Expr, ExpressionMaps};
 use extenddb_core::types::{Item, TableKeyInfo};
@@ -15,6 +14,7 @@ use extenddb_storage::util::{composite_pk_to_text, parse_sk, pk_to_text, sk_colu
 use super::ddl::data_table_name;
 use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
+use crate::cassandra_util::{Stmt, batch};
 use crate::stream_util::stream_record_statement;
 
 /// How a put maintains GSIs.
@@ -151,8 +151,7 @@ impl CassandraEngine {
         };
         // The batch carries the timestamp, so the index statements pass none
         // of their own (Cassandra refuses a batch with both).
-        let mut batch = BatchQueryBuilder::new()
-            .with_consistency(Consistency::LocalQuorum)
+        let mut batch = batch()
             .with_timestamp(stamp)
             .add_query(cql, cdrs_tokio::query::QueryValues::SimpleValues(values));
         if !indexes.is_empty() {
@@ -171,7 +170,7 @@ impl CassandraEngine {
         let built = batch
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
-        self.session.batch(built).await.map_err(|error| {
+        self.session.run_batch(built).await.map_err(|error| {
             StorageError::Internal(format!("put_restored_item_at batch: {error}"))
         })?;
         Ok(())
@@ -324,8 +323,14 @@ impl CassandraEngine {
                 "SELECT item_data, version, prepared_txn_id FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let old_result =
-                query_with_pk_sk(&self.session, &select_query, pk_text.as_ref(), &sk).await?;
+            let old_result = query_with_pk_sk(
+                &self.session,
+                &select_query,
+                Stmt::Read,
+                pk_text.as_ref(),
+                &sk,
+            )
+            .await?;
 
             let body = old_result
                 .response_body()
@@ -607,7 +612,7 @@ impl CassandraEngine {
 
         let result = self
             .session
-            .query_with_values(&insert_cql, insert_qv)
+            .run(Stmt::Lwt, &insert_cql, insert_qv)
             .await
             .map_err(|e| StorageError::Internal(format!("put_item_if_not_exists: {e}")))?;
 
@@ -654,7 +659,7 @@ impl CassandraEngine {
         }
         // The index statements carry the version; the queue rows and the
         // stream record keep Cassandra's timestamp (`data::version`).
-        let mut batch = BatchQueryBuilder::new().with_consistency(Consistency::LocalQuorum);
+        let mut batch = batch();
 
         if !indexes.is_empty() {
             super::index::sync_indexes_at(
@@ -694,7 +699,7 @@ impl CassandraEngine {
         let built = batch
             .build()
             .map_err(|error| StorageError::Internal(error.to_string()))?;
-        self.session.batch(built).await.map_err(|error| {
+        self.session.run_batch(built).await.map_err(|error| {
             StorageError::Internal(format!("put_item_if_not_exists batch: {error}"))
         })?;
 
@@ -704,19 +709,12 @@ impl CassandraEngine {
         Ok(None) // return_old is always None — item didn't exist
     }
 
-    /// Implementation of `DataEngine::get_item`.
-    /// Read an item at `LOCAL_QUORUM`.
+    /// Read an item at `LOCAL_QUORUM` for a TTL decision.
     ///
-    /// [`Self::get_item_impl`] reads at the driver's default consistency, which is
-    /// correct for an eventually-consistent `GetItem` but not for a TTL decision:
-    /// the expiration worker and the reconciliation outbox both treat `None` as
-    /// authoritative and act on it destructively — retiring queue work, or
-    /// dropping an outbox row — and a lagging replica reads as `None` for an item
-    /// that exists. Acting on that would leave the item with no expiration entry
-    /// and therefore never expiring.
-    ///
-    /// All TTL writes commit at `LOCAL_QUORUM`, so a `LOCAL_QUORUM` read
-    /// intersects them and cannot miss a committed item.
+    /// The expiration worker and the reconciliation outbox both treat `None`
+    /// as authoritative and act on it destructively: they retire queue work,
+    /// or drop an outbox row. All TTL writes commit at `LOCAL_QUORUM`, so a
+    /// `LOCAL_QUORUM` read intersects them and cannot miss a committed item.
     pub(crate) async fn get_item_quorum(
         &self,
         key_info: &TableKeyInfo,
@@ -753,13 +751,9 @@ impl CassandraEngine {
             )
         };
 
-        let rows = crate::cassandra_util::query_rows_quorum(
-            &self.session,
-            &query,
-            values,
-            "get_item_quorum",
-        )
-        .await?;
+        let rows =
+            crate::cassandra_util::query_rows(&self.session, &query, values, "get_item_quorum")
+                .await?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -767,6 +761,7 @@ impl CassandraEngine {
         item_data.map(json_to_item).transpose()
     }
 
+    /// Implementation of `DataEngine::get_item`, at `LOCAL_QUORUM`.
     pub(crate) async fn get_item_impl(
         &self,
         key_info: &TableKeyInfo,
@@ -795,7 +790,8 @@ impl CassandraEngine {
                 "SELECT item_data FROM {data_keyspace}.{ddb_table} WHERE pk = ? AND {sk_col} = ?"
             );
 
-            let result = query_with_pk_sk(&self.session, &query, pk_text.as_ref(), &sk).await?;
+            let result =
+                query_with_pk_sk(&self.session, &query, Stmt::Read, pk_text.as_ref(), &sk).await?;
 
             let body = result
                 .response_body()
@@ -815,7 +811,11 @@ impl CassandraEngine {
 
             let result = self
                 .session
-                .query_with_values(&query, cdrs_tokio::query_values!(pk_text.as_ref() as &str))
+                .run(
+                    Stmt::Read,
+                    &query,
+                    cdrs_tokio::query_values!(pk_text.as_ref() as &str),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Get item: {e}")))?;
 

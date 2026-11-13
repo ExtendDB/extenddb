@@ -61,6 +61,8 @@ pub use config::CassandraStorageConfig;
 pub use engine::{CassandraEngine, CassandraSession};
 pub use metadata_engine::TtlBackfillCursor;
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
@@ -373,9 +375,17 @@ fn server_components_factory(
         let catalog_keyspace = format!("{}_catalog", cassandra_config.keyspace_prefix);
         let enc_key_query =
             format!("SELECT value FROM {catalog_keyspace}.settings WHERE key = 'encryption_key'");
-        let enc_key_result = engine.session.query(&enc_key_query).await.map_err(|e| {
-            BackendError::InitializationFailed(format!("Failed to load encryption key: {e}"))
-        })?;
+        let enc_key_result = engine
+            .session
+            .run(
+                Stmt::Read,
+                &enc_key_query,
+                cdrs_tokio::query::QueryValues::SimpleValues(vec![]),
+            )
+            .await
+            .map_err(|e| {
+                BackendError::InitializationFailed(format!("Failed to load encryption key: {e}"))
+            })?;
         let enc_key_body = enc_key_result.response_body().map_err(|e| {
             BackendError::InitializationFailed(format!(
                 "Failed to parse encryption key response: {e}"

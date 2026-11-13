@@ -3,6 +3,8 @@
 
 //! `StreamEngine` trait implementation for `CassandraEngine`.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_core::types::{StreamDescription, StreamRecord, StreamSummary};
 use extenddb_storage::StreamEngine;
@@ -39,7 +41,7 @@ impl CassandraEngine {
         let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
         let result = self
             .session
-            .query_with_values(&query, cdrs_tokio::query_values!(table_id))
+            .run(Stmt::Read, &query, cdrs_tokio::query_values!(table_id))
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -79,7 +81,7 @@ impl StreamEngine for CassandraEngine {
         })
     }
 
-    #[allow(unused_variables)] // `after` is used in query_with_values below
+    #[allow(unused_variables)] // `after` is used in the records read below
     fn get_stream_records(
         &self,
         account_id: &str,
@@ -123,9 +125,11 @@ impl StreamEngine for CassandraEngine {
                 "SELECT table_id, starting_sequence_number, ending_sequence_number \
                  FROM {keyspace}.stream_shards WHERE shard_id = ?"
             );
-            let shard_read = self
-                .session
-                .query_with_values(&shard_query, cdrs_tokio::query_values!(shard_id.as_str()));
+            let shard_read = self.session.run(
+                Stmt::Read,
+                &shard_query,
+                cdrs_tokio::query_values!(shard_id.as_str()),
+            );
 
             let query = if after_sequence.is_some() {
                 format!(
@@ -143,14 +147,19 @@ impl StreamEngine for CassandraEngine {
             let records_read = async {
                 if let Some(ref after) = after_sequence {
                     self.session
-                        .query_with_values(
+                        .run(
+                            Stmt::Read,
                             &query,
                             cdrs_tokio::query_values!(physical.as_str(), after.as_str()),
                         )
                         .await
                 } else {
                     self.session
-                        .query_with_values(&query, cdrs_tokio::query_values!(physical.as_str()))
+                        .run(
+                            Stmt::Read,
+                            &query,
+                            cdrs_tokio::query_values!(physical.as_str()),
+                        )
                         .await
                 }
             };

@@ -83,13 +83,13 @@
 //! that read the in-catalog row before the conversion does not claim the
 //! index row after it.
 
+use crate::cassandra_util::PolicySession as _;
+use crate::cassandra_util::Stmt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cdrs_tokio::consistency::Consistency;
-use cdrs_tokio::query::BatchQueryBuilder;
 use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
@@ -512,7 +512,7 @@ impl CassandraEngine {
             "SELECT * FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ?",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -595,7 +595,7 @@ impl CassandraEngine {
             #[allow(clippy::cast_possible_truncation)]
             let bucket_i32 = bucket as i32;
             if bucket >= known {
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &probe,
                     cdrs_tokio::query_values!(backup_arn, bucket_i32),
@@ -607,7 +607,11 @@ impl CassandraEngine {
                 }
             }
             self.session
-                .query_with_values(&delete, cdrs_tokio::query_values!(backup_arn, bucket_i32))
+                .run(
+                    Stmt::Write,
+                    &delete,
+                    cdrs_tokio::query_values!(backup_arn, bucket_i32),
+                )
                 .await
                 .map_err(|e| StorageError::Internal(format!("Delete backup payload: {e}")))?;
             bucket += 1;
@@ -644,7 +648,8 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_account WHERE account_id = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &by_account,
                 cdrs_tokio::query_values!(
                     backup.account_id.as_str(),
@@ -659,7 +664,8 @@ impl CassandraEngine {
             "DELETE FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ? AND created_at = ? AND backup_arn = ?"
         );
         self.session
-            .query_with_values(
+            .run(
+                Stmt::Write,
                 &by_table,
                 cdrs_tokio::query_values!(
                     backup.account_id.as_str(),
@@ -869,7 +875,7 @@ impl CassandraEngine {
              WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let row = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let row = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, target_name),
@@ -902,7 +908,7 @@ impl CassandraEngine {
              WHERE account_id = ? AND table_name = ?",
             self.catalog_keyspace()
         );
-        let row = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let row = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, table_name),
@@ -942,7 +948,7 @@ impl CassandraEngine {
              ALLOW FILTERING",
             self.catalog_keyspace()
         );
-        let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+        let rows = crate::cassandra_util::query_rows::<StorageError>(
             &self.session,
             &query,
             cdrs_tokio::query_values!(account_id, backup_arn),
@@ -1251,7 +1257,8 @@ impl CassandraEngine {
             let bucket_i32 = bucket as i32;
             let rows = self
                 .session
-                .query_with_values(
+                .run(
+                    Stmt::Read,
                     &query,
                     cdrs_tokio::query_values!(job.backup_arn.as_str(), bucket_i32),
                 )
@@ -1998,7 +2005,8 @@ impl LegacyBackupReader for CassandraEngine {
                         #[allow(clippy::cast_possible_truncation)]
                         let bucket_i32 = bucket as i32;
                         self.session
-                            .query_with_values(
+                            .run(
+                                Stmt::Write,
                                 &insert_item,
                                 cdrs_tokio::query_values!(
                                     backup_arn.as_str(),
@@ -2070,8 +2078,7 @@ impl LegacyBackupReader for CassandraEngine {
             // once its heartbeat is stale, rather than an AVAILABLE backup no
             // listing ever shows.
             let list_rows: Result<(), StorageError> = async {
-                let batch = BatchQueryBuilder::new()
-                    .with_consistency(Consistency::LocalQuorum)
+                let batch = crate::cassandra_util::batch()
                     .add_query(
                         insert_by_account,
                         cdrs_tokio::query_values!(
@@ -2099,7 +2106,7 @@ impl LegacyBackupReader for CassandraEngine {
                         ),
                     );
                 self.session
-                    .batch(
+                    .run_batch(
                         batch
                             .build()
                             .map_err(|e| StorageError::Internal(e.to_string()))?,
@@ -2205,7 +2212,8 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_table WHERE account_id = ? AND table_name = ?"
                 );
                 self.session
-                    .query_with_values(
+                    .run(
+                        Stmt::Read,
                         &query,
                         cdrs_tokio::query_values!(account_id.as_str(), table_name),
                     )
@@ -2215,7 +2223,11 @@ impl LegacyBackupReader for CassandraEngine {
                     "SELECT backup_arn FROM {catalog}.backups_by_account WHERE account_id = ?"
                 );
                 self.session
-                    .query_with_values(&query, cdrs_tokio::query_values!(account_id.as_str()))
+                    .run(
+                        Stmt::Read,
+                        &query,
+                        cdrs_tokio::query_values!(account_id.as_str()),
+                    )
                     .await
             };
             let rows = result
@@ -2421,7 +2433,7 @@ impl LegacyBackupReader for CassandraEngine {
                      heartbeat_at FROM {catalog}.backups_by_arn \
                      WHERE backup_status = ? ALLOW FILTERING"
                 );
-                let rows = crate::cassandra_util::query_rows_quorum::<StorageError>(
+                let rows = crate::cassandra_util::query_rows::<StorageError>(
                     &self.session,
                     &query,
                     cdrs_tokio::query_values!(status),
