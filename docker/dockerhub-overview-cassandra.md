@@ -10,8 +10,7 @@ before you rely on it; the setup guide below lists its known limitations.
 ## Quick start
 
 The Cassandra backend requires Apache Cassandra 4.1 or newer with
-`PasswordAuthenticator` enabled and a local datacenter named `datacenter1`.
-Read the
+`PasswordAuthenticator` enabled. Read the
 [Cassandra setup guide](https://github.com/ExtendDB/extenddb/blob/main/docs/cassandra-setup.md)
 first: it explains these requirements and the backend's known limitations.
 Run `CassandraAuthorizer`, under which `init` grants the application role only
@@ -49,14 +48,19 @@ docker run --rm \
   --config /var/lib/extenddb/extenddb.toml \
   --cassandra-contact-points cassandra.example.com:9042 \
   --cassandra-user <superuser> \
+  --replication-factor <1 for one node, 3 for three or more nodes> \
+  --datacenter <datacenter name from nodetool status> \
   --bind-addr 0.0.0.0 \
   --tls-san localhost \
   --tls-san 127.0.0.1
 ```
 
-`init` creates its keyspaces with replication factor 1. On a multi-node
-cluster, raise it afterwards as "Keyspace replication" in the setup guide
-describes.
+`init` creates its keyspaces with `--replication-factor` replicas in the
+`--datacenter` datacenter, and writes both to the configuration. Use a
+replication factor of 3 on a cluster of at least three nodes, and 1 on a
+single node. Use the datacenter name that `nodetool status` prints for your
+nodes. The defaults are replication factor 1 and `datacenter1`. To change the
+replication later, follow "Keyspace replication" in the setup guide.
 
 Start the server using the generated configuration:
 

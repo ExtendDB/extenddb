@@ -405,6 +405,216 @@ pub(crate) async fn replication_of(
     Ok(Some(replication_literal(&map)))
 }
 
+/// `keyspace`'s replication as `system_schema` records it, when it is not
+/// `NetworkTopologyStrategy` with `replication_factor` replicas in
+/// `datacenter` only; `None` when it is, or when the keyspace does not
+/// exist. Reads at ONE, so it works when the keyspace has more replicas than
+/// the cluster has nodes.
+///
+/// # Errors
+///
+/// The read fails.
+pub(crate) async fn replication_differs(
+    session: &CassandraSession,
+    keyspace: &str,
+    datacenter: &str,
+    replication_factor: u32,
+) -> Result<Option<(String, ReplicationChange)>, MigrationError> {
+    let found = rows(
+        session,
+        "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = ?",
+        cdrs_tokio::query_values!(keyspace),
+        Consistency::One,
+        &format!("read the replication of {keyspace}"),
+    )
+    .await?;
+    let Some(row) = found.first() else {
+        return Ok(None);
+    };
+    let map = text_map(row, "replication", "read the replication")?;
+    Ok(
+        (!replicates_as(&map, datacenter, replication_factor)).then(|| {
+            (
+                replication_literal(&map),
+                change_to(&map, datacenter, replication_factor),
+            )
+        }),
+    )
+}
+
+/// The datacenters of the cluster's nodes: the `data_center` of the node
+/// that answers in `system.local`, and of each node in its
+/// `system.peers_v2`.
+///
+/// # Errors
+///
+/// A read fails.
+pub(crate) async fn cluster_datacenters(
+    session: &CassandraSession,
+) -> Result<std::collections::BTreeSet<String>, MigrationError> {
+    let context = "read the cluster's datacenters";
+    let mut datacenters = std::collections::BTreeSet::new();
+    for cql in [
+        "SELECT data_center FROM system.local",
+        "SELECT data_center FROM system.peers_v2",
+    ] {
+        for row in rows(
+            session,
+            cql,
+            cdrs_tokio::query_values!(),
+            Consistency::One,
+            context,
+        )
+        .await?
+        {
+            if let Some(datacenter) = nullable::<String>(&row, "data_center", context)? {
+                datacenters.insert(datacenter);
+            }
+        }
+    }
+    Ok(datacenters)
+}
+
+/// The deployment's keyspaces (the catalog and every account keyspace) whose
+/// replication differs from `replication_factor` replicas in `datacenter`,
+/// each with its replication as `system_schema` records it. `serve` warns of
+/// each: Cassandra keeps a keyspace's replication until an `ALTER KEYSPACE`
+/// changes it, so a config edited after `init` changes only the account
+/// keyspaces created afterwards.
+///
+/// # Errors
+///
+/// The read fails.
+pub async fn replication_mismatches(
+    session: &CassandraSession,
+    keyspace_prefix: &str,
+    datacenter: &str,
+    replication_factor: u32,
+) -> Result<Vec<(String, String, ReplicationChange)>, MigrationError> {
+    let context = "read the keyspaces' replication";
+    let found = rows(
+        session,
+        "SELECT keyspace_name, replication FROM system_schema.keyspaces",
+        cdrs_tokio::query_values!(),
+        Consistency::One,
+        context,
+    )
+    .await?;
+    let mut mismatches = Vec::new();
+    for row in &found {
+        let keyspace = column::<String>(row, "keyspace_name", context)?;
+        if !is_deployment_keyspace(&keyspace, keyspace_prefix) {
+            continue;
+        }
+        let map = text_map(row, "replication", context)?;
+        if !replicates_as(&map, datacenter, replication_factor) {
+            mismatches.push((
+                keyspace,
+                replication_literal(&map),
+                change_to(&map, datacenter, replication_factor),
+            ));
+        }
+    }
+    mismatches.sort();
+    Ok(mismatches)
+}
+
+/// The change that makes a keyspace's replication match the config, which
+/// decides the safe order of `ALTER KEYSPACE` and `nodetool repair`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReplicationChange {
+    /// More replicas in the same datacenter: `ALTER KEYSPACE`, then repair,
+    /// so the new replicas get the data.
+    Raise,
+    /// Fewer replicas in the same datacenter: repair first, so each
+    /// remaining replica holds every write, then `ALTER KEYSPACE`, then
+    /// `nodetool cleanup`.
+    Lower,
+    /// Another strategy or datacenter. One `ALTER KEYSPACE` moves the
+    /// replicas at once, and the new ones have no copy to repair from.
+    Other,
+}
+
+/// The steps that change a keyspace's replication by `change` without losing
+/// a write, as one clause for an operator message.
+pub(crate) fn alter_steps(change: ReplicationChange) -> &'static str {
+    match change {
+        ReplicationChange::Raise => {
+            "stop every ExtendDB server of the deployment, raise the keyspace's replication \
+             factor with ALTER KEYSPACE, to no more than the node count, then run \
+             `nodetool repair -full` on each node"
+        }
+        ReplicationChange::Lower => {
+            "stop every ExtendDB server of the deployment, run `nodetool repair -full` on \
+             each node, then lower the keyspace's replication factor with ALTER KEYSPACE, \
+             then run `nodetool cleanup` on each node. Lowering it before the repair can \
+             lose writes"
+        }
+        ReplicationChange::Other => {
+            "stop every ExtendDB server of the deployment, then change the keyspace's \
+             replication strategy or datacenter as the Cassandra documentation describes. \
+             One ALTER KEYSPACE that moves the replicas can lose writes"
+        }
+    }
+}
+
+/// The change from a keyspace's replication `map` to `replication_factor`
+/// replicas in `datacenter`. A map that is `NetworkTopologyStrategy` with
+/// `datacenter` as its only datacenter is a raise or a lower; any other map
+/// is [`ReplicationChange::Other`].
+fn change_to(
+    map: &std::collections::HashMap<String, String>,
+    datacenter: &str,
+    replication_factor: u32,
+) -> ReplicationChange {
+    let network_topology = map.get("class").is_some_and(|class| {
+        class == "NetworkTopologyStrategy" || class.ends_with(".NetworkTopologyStrategy")
+    });
+    let found = map.get(datacenter).and_then(|n| n.parse::<u32>().ok());
+    match found {
+        Some(found) if network_topology && map.len() == 2 && found < replication_factor => {
+            ReplicationChange::Raise
+        }
+        Some(found) if network_topology && map.len() == 2 && found > replication_factor => {
+            ReplicationChange::Lower
+        }
+        _ => ReplicationChange::Other,
+    }
+}
+
+/// Whether `keyspace` is this deployment's catalog or one of its account
+/// keyspaces.
+fn is_deployment_keyspace(keyspace: &str, keyspace_prefix: &str) -> bool {
+    let Some(rest) = keyspace
+        .strip_prefix(keyspace_prefix)
+        .and_then(|r| r.strip_prefix('_'))
+    else {
+        return false;
+    };
+    // An account id is 12 ASCII digits (`generate_account_id`). Any other
+    // text after `account_` belongs to another deployment whose prefix
+    // starts with this one, such as `acme_account` for `acme`.
+    rest == "catalog"
+        || rest
+            .strip_prefix("account_")
+            .is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether a `system_schema` replication map is `NetworkTopologyStrategy`
+/// with `replication_factor` replicas in `datacenter` and none elsewhere.
+fn replicates_as(
+    map: &std::collections::HashMap<String, String>,
+    datacenter: &str,
+    replication_factor: u32,
+) -> bool {
+    let network_topology = map.get("class").is_some_and(|class| {
+        class == "NetworkTopologyStrategy" || class.ends_with(".NetworkTopologyStrategy")
+    });
+    network_topology
+        && map.len() == 2
+        && map.get(datacenter) == Some(&replication_factor.to_string())
+}
+
 /// A replication map as a CQL map literal, in a stable order.
 pub(crate) fn replication_literal(map: &std::collections::HashMap<String, String>) -> String {
     let mut entries: Vec<(&String, &String)> = map.iter().collect();
@@ -421,7 +631,63 @@ pub(crate) fn replication_literal(map: &std::collections::HashMap<String, String
 mod tests {
     use extenddb_storage::migrations::{AdminRole, MigrationError, Target};
 
-    use super::{Deployment, TRANSIENT_CODES, replication_literal, retryable};
+    use super::{
+        Deployment, ReplicationChange, TRANSIENT_CODES, change_to, is_deployment_keyspace,
+        replicates_as, replication_literal, retryable,
+    };
+
+    /// A keyspace in the config's datacenter only is a raise or a lower. A
+    /// keyspace in another datacenter, in more than one, or at
+    /// `SimpleStrategy` is another change.
+    #[test]
+    fn the_change_is_a_raise_a_lower_or_another_change() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let nts = "org.apache.cassandra.locator.NetworkTopologyStrategy";
+        let simple = "org.apache.cassandra.locator.SimpleStrategy";
+        for (pairs, datacenter, rf, expected) in [
+            (
+                vec![("class", nts), ("dc1", "1")],
+                "dc1",
+                3,
+                ReplicationChange::Raise,
+            ),
+            (
+                vec![("class", nts), ("dc1", "3")],
+                "dc1",
+                1,
+                ReplicationChange::Lower,
+            ),
+            (
+                vec![("class", nts), ("dc1", "3")],
+                "dc2",
+                3,
+                ReplicationChange::Other,
+            ),
+            (
+                vec![("class", nts), ("dc1", "3"), ("dc2", "3")],
+                "dc1",
+                1,
+                ReplicationChange::Other,
+            ),
+            (
+                vec![("class", simple), ("replication_factor", "1")],
+                "dc1",
+                3,
+                ReplicationChange::Other,
+            ),
+        ] {
+            assert_eq!(
+                change_to(&map(&pairs), datacenter, rf),
+                expected,
+                "{pairs:?} to {rf} in {datacenter}"
+            );
+        }
+    }
 
     /// The errors a request may be sent again after, decided by the code
     /// (finding 4): no answer or a failed connection, which carry no code,
@@ -503,5 +769,54 @@ mod tests {
             "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'dc1': '3', \
              'dc2': '1'}"
         );
+    }
+
+    fn replication(entries: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_keyspace_replicates_as_configured_only_with_that_one_datacenter() {
+        let nts = "org.apache.cassandra.locator.NetworkTopologyStrategy";
+        assert!(replicates_as(
+            &replication(&[("class", nts), ("dc1", "3")]),
+            "dc1",
+            3
+        ));
+        for other in [
+            replication(&[("class", nts), ("dc1", "1")]),
+            replication(&[("class", nts), ("datacenter1", "3")]),
+            replication(&[("class", nts), ("dc1", "3"), ("dc2", "3")]),
+            replication(&[
+                ("class", "org.apache.cassandra.locator.SimpleStrategy"),
+                ("replication_factor", "3"),
+            ]),
+        ] {
+            assert!(!replicates_as(&other, "dc1", 3), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_catalog_and_account_keyspaces_are_the_deployments() {
+        for keyspace in ["acme_catalog", "acme_account_123456789012"] {
+            assert!(is_deployment_keyspace(keyspace, "acme"), "{keyspace}");
+        }
+        for keyspace in [
+            "acme",
+            "acme_account_",
+            "acme_account_12345",
+            // The deployment of prefix `acme_account`, not of `acme`.
+            "acme_account_catalog",
+            "acme_account_account_123456789012",
+            "acme_other",
+            "acmex_catalog",
+            "other_catalog",
+            "system_auth",
+        ] {
+            assert!(!is_deployment_keyspace(keyspace, "acme"), "{keyspace}");
+        }
     }
 }

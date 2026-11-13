@@ -561,6 +561,20 @@ async fn role_rows(session: &CassandraSession, role: &str) -> usize {
         .len()
 }
 
+/// The cluster's node count: the coordinator and its peers.
+async fn node_count(session: &CassandraSession) -> usize {
+    let peers = session
+        .query("SELECT peer FROM system.peers_v2")
+        .await
+        .expect("read system.peers_v2")
+        .response_body()
+        .expect("body")
+        .into_rows()
+        .unwrap_or_default()
+        .len();
+    peers + 1
+}
+
 /// The tables of `keyspace`, in name order.
 async fn helpers_tables(session: &CassandraSession, keyspace: &str) -> Vec<String> {
     use cdrs_tokio::types::IntoRustByName;
@@ -933,8 +947,32 @@ async fn bootstrapper_as(
     app_user: &str,
     app_password: &str,
 ) -> extenddb_storage_cassandra::CassandraBootstrapper {
+    let config = helpers::test_config();
+    bootstrapper_with(
+        prefix,
+        app_user,
+        app_password,
+        config.replication_factor,
+        &config.datacenter,
+    )
+    .await
+}
+
+/// `init`'s bootstrapper for the deployment of `prefix`, connected as the
+/// test node's superuser, that creates its keyspaces with
+/// `replication_factor` replicas in `datacenter`, as `init
+/// --replication-factor --datacenter` does.
+async fn bootstrapper_with(
+    prefix: &str,
+    app_user: &str,
+    app_password: &str,
+    replication_factor: u32,
+    datacenter: &str,
+) -> extenddb_storage_cassandra::CassandraBootstrapper {
     let mut config = helpers::test_config();
     config.keyspace_prefix = prefix.to_owned();
+    config.replication_factor = replication_factor;
+    config.datacenter = datacenter.to_owned();
     config.rebuild_cached_connection_string();
     let (host, port) = helpers::test_contact_point()
         .split_once(':')
@@ -1021,6 +1059,470 @@ async fn the_default_account_step_run_again_keeps_one_account_and_completes_its_
             version: MigrationId::LATEST.number()
         }
     );
+}
+
+/// An `init` that finds the catalog keyspace already there, as a resumed
+/// `init` does, refuses it when its RF or datacenter differs from the ones
+/// this `init` was given. `CREATE KEYSPACE IF NOT EXISTS` keeps the existing
+/// keyspace's RF and datacenter, so without the check `init` would write the
+/// new values to `extenddb.toml` while the keyspace kept the old ones.
+#[tokio::test]
+async fn init_refuses_a_catalog_keyspace_with_another_replication_factor_or_datacenter() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let config = helpers::test_config();
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+
+    // An earlier `init` created the catalog keyspace: RF 1 in datacenter1.
+    let (prefix, _drops) = new_prefix("rfcheck");
+    let catalog = format!("{prefix}_catalog");
+    cql(
+        &session,
+        &format!(
+            "CREATE KEYSPACE {catalog} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'datacenter1': 1}}"
+        ),
+    )
+    .await;
+
+    for (replication_factor, datacenter) in [(2, "datacenter1"), (1, "dc2")] {
+        let err = bootstrapper_with(&prefix, &user, &password, replication_factor, datacenter)
+            .await
+            .create_catalog_db()
+            .await
+            .expect_err("a catalog keyspace with another RF or datacenter is refused");
+        let err = format!("{err:?}");
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '1'"),
+            "RF {replication_factor} in {datacenter}: {err}"
+        );
+
+        // `ensure_app_user`, `init`'s first step, refuses the keyspace
+        // before it creates the application role.
+        let role = format!("{prefix}_app");
+        let refused = bootstrapper_with(
+            &prefix,
+            &role,
+            "a-new-password",
+            replication_factor,
+            datacenter,
+        )
+        .await
+        .ensure_app_user()
+        .await;
+        let roles = role_rows(&session, &role).await;
+        if roles > 0 {
+            cql(&session, &format!("DROP ROLE IF EXISTS {role}")).await;
+        }
+        let err = format!(
+            "{:?}",
+            refused.expect_err("ensure_app_user refuses the keyspace")
+        );
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '1'"),
+            "ensure_app_user, RF {replication_factor} in {datacenter}: {err}"
+        );
+        assert_eq!(roles, 0, "the refused init created the role {role}");
+    }
+
+    // The same RF and datacenter: the keyspace is taken, as a resumed
+    // `init` takes it.
+    bootstrapper_with(&prefix, &user, &password, 1, "datacenter1")
+        .await
+        .create_catalog_db()
+        .await
+        .expect("a catalog keyspace with the same RF and datacenter is taken");
+
+    // An earlier `init` gave RF 3 on this one-node cluster and stopped: the
+    // catalog keyspace has 3 replicas, so a quorum read of it fails. A
+    // second `init` with RF 1 gets the RF error, not the failed read.
+    let (prefix, _drops) = new_prefix("rfhigh");
+    let catalog = format!("{prefix}_catalog");
+    // The stopped `init`: its catalog step creates the keyspace and the lock
+    // table, then its quorum writes fail.
+    bootstrapper_with(&prefix, &user, &password, 3, "datacenter1")
+        .await
+        .create_catalog_db()
+        .await
+        .expect("the catalog step of an init at RF 3");
+    let second = bootstrapper_with(&prefix, &user, &password, 1, "datacenter1").await;
+    // `ensure_app_user` is `init`'s first step that reads the catalog, so it
+    // gets the RF error first, before it creates the application role.
+    for (step, result) in [
+        ("ensure_app_user", second.ensure_app_user().await),
+        ("create_catalog_db", second.create_catalog_db().await),
+    ] {
+        let err = format!(
+            "{:?}",
+            result.expect_err("a catalog keyspace with RF 3 is refused by an init given RF 1")
+        );
+        assert!(
+            err.contains(&catalog) && err.contains("'datacenter1': '3'"),
+            "{step}: {err}"
+        );
+        // The keyspace holds only the `settings` table, so DROP is offered.
+        assert!(
+            err.contains(&format!("DROP KEYSPACE {catalog}")),
+            "{step}: {err}"
+        );
+    }
+
+    // A catalog that holds a deployment's tables, at RF 3. The error must
+    // not offer DROP KEYSPACE: following it would remove the catalog.
+    let (prefix, _drops) = new_prefix("rfdata");
+    let catalog = format!("{prefix}_catalog");
+    keyspace(&session, &catalog).await;
+    migrate_catalog_keyspace(session.clone(), &prefix, "test", TIMEOUT)
+        .await
+        .expect("migrate the catalog");
+    cql(
+        &session,
+        &format!(
+            "ALTER KEYSPACE {catalog} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'datacenter1': 3}}"
+        ),
+    )
+    .await;
+    let unreadable = node_count(&session).await < 2;
+    let second = bootstrapper_with(&prefix, &user, &password, 1, "datacenter1").await;
+    for (step, result) in [
+        ("ensure_app_user", second.ensure_app_user().await),
+        ("create_catalog_db", second.create_catalog_db().await),
+    ] {
+        let err = format!(
+            "{:?}",
+            result.expect_err("a catalog keyspace with data at RF 3 is refused")
+        );
+        assert!(
+            err.contains(&catalog)
+                && err.contains("'datacenter1': '3'")
+                && err.contains("a deployment's catalog"),
+            "{step}: {err}"
+        );
+        // RF 3 to 1 lowers the factor: repair before the ALTER, cleanup after.
+        let repair = err.find("nodetool repair -full");
+        let alter = err.find("ALTER KEYSPACE");
+        let cleanup = err.find("nodetool cleanup");
+        assert!(
+            matches!((repair, alter, cleanup), (Some(r), Some(a), Some(c)) if r < a && a < c),
+            "{step}: {err}"
+        );
+        assert!(!err.contains("DROP KEYSPACE"), "{step}: {err}");
+        // At RF 3, a QUORUM read needs 2 replicas. On one node the status
+        // read fails, and an init with the keyspace's values would stop
+        // again, so the error does not offer it. On 2 or more nodes the
+        // read works, and the error offers it.
+        let offers_same_values = err.contains("Give init the values");
+        if unreadable {
+            assert!(
+                !offers_same_values && err.contains("To fix it, stop every"),
+                "{step}: {err}"
+            );
+        } else {
+            assert!(offers_same_values, "{step}: {err}");
+        }
+    }
+}
+
+/// `serve`'s start-up check names the deployment's keyspaces whose
+/// replication differs from the config, and no keyspace of another
+/// deployment whose name starts with this deployment's prefix.
+#[tokio::test]
+async fn the_start_up_warning_names_only_the_deployments_mismatched_keyspaces() {
+    use extenddb_storage_cassandra::migrations::replication_mismatches;
+    use extenddb_storage_cassandra::startup_replication_warnings;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let session = session().await;
+    let (prefix, mut drops) = new_prefix("rfwarn");
+    let at = |replicas: u32| {
+        format!("{{'class': 'NetworkTopologyStrategy', 'datacenter1': {replicas}}}")
+    };
+    // The config asks for 1 replica. The deployment has one keyspace at 1
+    // and two at 2. Three keyspaces of other deployments are at 2.
+    let keyspaces = [
+        (format!("{prefix}_catalog"), 2),
+        (format!("{prefix}_account_111111111111"), 1),
+        (format!("{prefix}_account_222222222222"), 2),
+        (format!("{prefix}_account_catalog"), 2),
+        (format!("{prefix}x_catalog"), 2),
+        (format!("{prefix}_account_12345"), 2),
+    ];
+    for (keyspace, replicas) in &keyspaces {
+        cql(
+            &session,
+            &format!(
+                "CREATE KEYSPACE {keyspace} WITH replication = {}",
+                at(*replicas)
+            ),
+        )
+        .await;
+        if !drops.0.contains(keyspace) {
+            drops.0.push(keyspace.clone());
+        }
+    }
+    let mismatched = [
+        format!("{prefix}_account_222222222222"),
+        format!("{prefix}_catalog"),
+    ];
+
+    let found = replication_mismatches(&session, &prefix, "datacenter1", 1)
+        .await
+        .expect("read the keyspaces' replication");
+    let names: Vec<&str> = found.iter().map(|(k, _, _)| k.as_str()).collect();
+    assert_eq!(names, mismatched, "{found:?}");
+
+    let mut config = helpers::test_config();
+    config.keyspace_prefix.clone_from(&prefix);
+    config.replication_factor = 1;
+    config.datacenter = "datacenter1".to_owned();
+    let warnings = startup_replication_warnings(&session, &config).await;
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for (warning, keyspace) in warnings.iter().zip(&mismatched) {
+        assert!(
+            warning.contains(&format!("Keyspace {keyspace} has replication")),
+            "{warning}"
+        );
+    }
+
+    // A datacenter the cluster lacks: one warning, naming every keyspace of
+    // the deployment and no other keyspace.
+    config.datacenter = "dc-missing".to_owned();
+    let warnings = startup_replication_warnings(&session, &config).await;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    assert!(warning.contains("datacenter = \"dc-missing\""), "{warning}");
+    for keyspace in [
+        format!("{prefix}_catalog"),
+        format!("{prefix}_account_111111111111"),
+        format!("{prefix}_account_222222222222"),
+    ] {
+        assert!(warning.contains(&keyspace), "{keyspace}: {warning}");
+    }
+    for other in ["_account_catalog", "x_catalog", "_account_12345"] {
+        assert!(
+            !warning.contains(&format!("{prefix}{other}")),
+            "{other}: {warning}"
+        );
+    }
+}
+
+/// `from_config` is the only path from `--replication-factor`,
+/// `--datacenter` and the config file to `init`. Its values must reach both
+/// the config section `init` writes and the `CREATE KEYSPACE` it sends. The
+/// test node is in `datacenter1`. Cassandra's `NetworkTopologyStrategy`
+/// refuses a `CREATE KEYSPACE` that names a datacenter no node is in, with
+/// `Unrecognized strategy option {<name>}`. So that error shows that the
+/// test's datacenter reached the statement.
+#[tokio::test]
+async fn init_takes_the_replication_from_the_flags_and_the_config_file() {
+    use extenddb_storage::bootstrapper::Bootstrapper;
+    use extenddb_storage_cassandra::CassandraBootstrapper;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let config = helpers::test_config();
+    let contact_point = helpers::test_contact_point();
+    let user = config.username.clone().unwrap_or_default();
+    let password = config.password.clone().unwrap_or_default();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    // The flags, with no config file: `init`.
+    let (prefix, _drops) = new_prefix("rfflags");
+    let args: Vec<String> = [
+        "--cassandra-contact-points",
+        contact_point.as_str(),
+        "--cassandra-user",
+        user.as_str(),
+        "--cassandra-pass",
+        password.as_str(),
+        "--keyspace-prefix",
+        prefix.as_str(),
+        "--replication-factor",
+        "3",
+        "--datacenter",
+        "dc-x",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let missing = dir.path().join("no-such-file.toml");
+    let from_flags = CassandraBootstrapper::from_config(missing.to_str().expect("utf-8"), &args)
+        .await
+        .unwrap_or_else(|e| panic!("from_config with the flags: {e:?}"));
+
+    // The config file: `init --overwrite`.
+    let (file_prefix, _file_drops) = new_prefix("rffile");
+    let path = dir.path().join("extenddb.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[storage.cassandra]\n\
+             contact_points = [\"{contact_point}\"]\n\
+             keyspace_prefix = \"{file_prefix}\"\n\
+             replication_factor = 2\n\
+             datacenter = \"dc-y\"\n"
+        ),
+    )
+    .expect("write the config file");
+    let args: Vec<String> = [
+        "--cassandra-user",
+        user.as_str(),
+        "--cassandra-pass",
+        password.as_str(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let from_file = CassandraBootstrapper::from_config(path.to_str().expect("utf-8"), &args)
+        .await
+        .unwrap_or_else(|e| panic!("from_config with the file: {e:?}"));
+
+    for (what, bootstrapper, replication_factor, datacenter) in [
+        ("the flags", &from_flags, 3, "dc-x"),
+        ("the file", &from_file, 2, "dc-y"),
+    ] {
+        let section = bootstrapper.generate_backend_config_section();
+        assert!(
+            section.contains(&format!("replication_factor = {replication_factor} "))
+                && section.contains(&format!("datacenter = \"{datacenter}\"")),
+            "{what}: {section}"
+        );
+        let err = format!(
+            "{:?}",
+            bootstrapper
+                .create_catalog_db()
+                .await
+                .expect_err("a keyspace in a datacenter the node lacks is refused")
+        );
+        assert!(
+            err.contains(&format!("Unrecognized strategy option {{{datacenter}}}")),
+            "{what}: {err}"
+        );
+    }
+}
+
+/// A resumed `init` refuses the default account's keyspace by name when an
+/// operator changed it to `SimpleStrategy`, and finishes once `ALTER
+/// KEYSPACE` puts it back. The keyspace holds the account's tables, so the
+/// error must not offer `DROP KEYSPACE`.
+#[tokio::test]
+async fn init_refuses_an_account_keyspace_at_simple_strategy_until_it_is_altered() {
+    use extenddb_storage::bootstrapper::{
+        Bootstrapper, finishes_a_stopped_init, write_bootstrap_rows,
+    };
+    use extenddb_storage::migrations::run_with_status;
+
+    if helpers::skip_without_cassandra() {
+        return;
+    }
+    let _runs = ACCOUNT_RUNS.write().await;
+    let session = session().await;
+    let (prefix, mut drops) = new_prefix("rfsimple");
+    let migrations = CassandraCatalogMigrations;
+    let store = CassandraCatalogStore::catalog_only(session.clone(), prefix.clone());
+
+    // An `init` that stopped after its default account, before its admin user.
+    let first = bootstrapper(&prefix).await;
+    let target = first.init_target();
+    first
+        .create_catalog_db()
+        .await
+        .expect("the catalog keyspace");
+    let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+    let status = migrations
+        .status_under_lock(&lock, &target)
+        .await
+        .expect("status");
+    run_with_status(&migrations, &status, &lock, "test", RunKind::Create)
+        .await
+        .expect("create");
+    first.hold(&lock);
+    first.bootstrap_encryption_key().await.expect("key");
+    first.bootstrap_default_account().await.expect("account");
+    migrations.release(lock).await;
+    let accounts = store.list_all_accounts().await.expect("list");
+    assert_eq!(accounts.len(), 1, "{accounts:?}");
+    let account = format!("{prefix}_account_{}", accounts[0].0);
+    drops.0.push(account.clone());
+
+    cql(
+        &session,
+        &format!(
+            "ALTER KEYSPACE {account} WITH replication = \
+             {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ),
+    )
+    .await;
+
+    // A resumed `init` refuses the keyspace and writes no admin user.
+    let resume = || async {
+        let next = bootstrapper(&prefix).await;
+        next.create_catalog_db()
+            .await
+            .expect("the catalog keyspace is taken");
+        let lock = migrations.lock(&target, TIMEOUT).await.expect("lock");
+        let status = migrations
+            .status_under_lock(&lock, &target)
+            .await
+            .expect("status");
+        assert!(
+            finishes_a_stopped_init(&next, &status)
+                .await
+                .expect("decided")
+        );
+        next.hold(&lock);
+        let result = write_bootstrap_rows(&next, None, None).await;
+        migrations.release(lock).await;
+        result
+    };
+    let err = format!(
+        "{:?}",
+        resume()
+            .await
+            .expect_err("an account keyspace at SimpleStrategy is refused")
+    );
+    assert!(
+        err.contains(&format!("Keyspace {account} already exists"))
+            && err.contains("SimpleStrategy")
+            && err.contains("an account's tables")
+            && err.contains("as the Cassandra documentation describes"),
+        "{err}"
+    );
+    // A change of strategy moves the replicas: no ALTER-then-repair steps.
+    assert!(!err.contains("nodetool repair"), "{err}");
+    assert!(!err.contains("DROP KEYSPACE"), "{err}");
+    assert!(
+        !bootstrapper(&prefix)
+            .await
+            .has_admin_user()
+            .await
+            .expect("read"),
+        "the refused init wrote the admin user"
+    );
+
+    // After ALTER KEYSPACE, the next `init` finishes.
+    cql(
+        &session,
+        &format!(
+            "ALTER KEYSPACE {account} WITH replication = \
+             {{'class': 'NetworkTopologyStrategy', 'datacenter1': 1}}"
+        ),
+    )
+    .await;
+    let admin = resume().await.expect("init finishes after ALTER KEYSPACE");
+    assert_eq!(admin.username, "admin");
+    assert_eq!(store.list_all_accounts().await.expect("list"), accounts);
+    drop(drops);
+    helpers::flush_pending_drops(&session).await;
 }
 
 /// An `init` killed after its default account, before its admin user,
@@ -1115,6 +1617,23 @@ async fn init_finishes_a_catalog_stopped_before_its_admin_user() {
         key
     );
     assert_eq!(store.list_all_accounts().await.expect("list"), accounts);
+
+    // An init with another replication factor on the initialized catalog
+    // gets no advice to change the live catalog's replication: it is
+    // refused below as already initialized.
+    let config = helpers::test_config();
+    let other_rf = bootstrapper_with(
+        &prefix,
+        &config.username.clone().unwrap_or_default(),
+        &config.password.clone().unwrap_or_default(),
+        2,
+        "datacenter1",
+    )
+    .await;
+    other_rf
+        .create_catalog_db()
+        .await
+        .expect("no replication error on an initialized catalog");
 
     // The init after that is refused.
     let last = bootstrapper(&prefix).await;

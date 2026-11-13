@@ -21,7 +21,7 @@ use crate::config::CassandraStorageConfig;
 use crate::engine::CassandraEngine;
 
 mod guards;
-use guards::{HeldLease, check_name};
+use guards::{HeldLease, check_datacenter, check_name};
 
 // Helper structs for parsing Cassandra rows
 #[derive(Debug, Clone, TryFromRow)]
@@ -45,6 +45,59 @@ pub struct CassandraBootstrapper {
     /// The lease of the migration lock `init` holds while the bootstrap rows
     /// are written, set by [`Bootstrapper::hold`].
     held: HeldLease,
+    /// The replication `init` creates its keyspaces with, written to the
+    /// config so `serve` creates later account keyspaces the same way.
+    replication_factor: u32,
+    datacenter: String,
+}
+
+/// The replication factor and datacenter `init` uses: `--replication-factor`
+/// and `--datacenter` when given, else the config file's values when there is
+/// one (`init --overwrite`), else 1 and `datacenter1`, for a single node. A
+/// flag that disagrees with the config file is refused, as for the other
+/// flags, and so is a replication factor that is not a positive integer.
+fn resolve_replication(
+    cli_replication_factor: Option<&str>,
+    cli_datacenter: Option<&str>,
+    in_file: Option<(u32, &str)>,
+) -> Result<(u32, String), extenddb_storage::error::StorageError> {
+    use extenddb_storage::error::StorageError;
+
+    let cli_replication_factor = cli_replication_factor
+        .map(|rf| match rf.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(StorageError::Internal(format!(
+                "Invalid --replication-factor '{rf}': must be a positive integer"
+            ))),
+        })
+        .transpose()?;
+    let (replication_factor, datacenter) = match in_file {
+        Some((file_rf, file_dc)) => {
+            if file_rf == 0 {
+                return Err(StorageError::Internal(
+                    "replication_factor in the config file must be a positive integer".to_owned(),
+                ));
+            }
+            check_conflict(
+                cli_replication_factor.as_ref(),
+                &file_rf,
+                "--replication-factor",
+            )?;
+            check_conflict(
+                cli_datacenter.map(str::to_owned).as_ref(),
+                &file_dc.to_owned(),
+                "--datacenter",
+            )?;
+            check_datacenter("the datacenter in the config file", file_dc)?;
+            (file_rf, file_dc.to_owned())
+        }
+        None => {
+            let datacenter = cli_datacenter.unwrap_or("datacenter1");
+            check_datacenter("the datacenter (--datacenter)", datacenter)?;
+            (cli_replication_factor.unwrap_or(1), datacenter.to_owned())
+        }
+    };
+    Ok((replication_factor, datacenter))
 }
 
 impl CassandraBootstrapper {
@@ -67,6 +120,8 @@ impl CassandraBootstrapper {
                 cassandra_config.keyspace_prefix
             ),
             held: HeldLease::default(),
+            replication_factor: cassandra_config.replication_factor,
+            datacenter: cassandra_config.datacenter.clone(),
         })
     }
 
@@ -112,11 +167,12 @@ impl CassandraBootstrapper {
         let cassandra_pass = extract_arg(cli_args, "--cassandra-pass");
         let keyspace_prefix = extract_arg(cli_args, "--keyspace-prefix");
         let replication_factor = extract_arg(cli_args, "--replication-factor");
+        let datacenter = extract_arg(cli_args, "--datacenter");
         let extenddb_user = extract_arg(cli_args, "--extenddb-user");
         let extenddb_pass = extract_arg(cli_args, "--extenddb-pass");
 
         // Load config file if it exists
-        let (contact_points, user, password, prefix, rf_from_config) = if std::path::Path::new(
+        let (contact_points, user, password, prefix, replication_in_file) = if std::path::Path::new(
             config_path,
         )
         .exists()
@@ -184,20 +240,6 @@ impl CassandraBootstrapper {
                 )));
             }
 
-            if let Some(ref cli_rf) = replication_factor {
-                let cli_rf_val = cli_rf.parse::<u32>().map_err(|_| {
-                    StorageError::Internal(format!(
-                        "Invalid --replication-factor '{cli_rf}': must be a positive integer"
-                    ))
-                })?;
-                if cli_rf_val != config.replication_factor {
-                    return Err(StorageError::Internal(format!(
-                        "--replication-factor {} conflicts with config file replication_factor {}",
-                        cli_rf_val, config.replication_factor
-                    )));
-                }
-            }
-
             (
                 config.contact_points,
                 config.username.unwrap_or_else(|| "extenddb".to_string()),
@@ -205,7 +247,7 @@ impl CassandraBootstrapper {
                     .password
                     .unwrap_or_else(|| "extenddb-local-dev".to_string()),
                 config.keyspace_prefix,
-                config.replication_factor,
+                Some((config.replication_factor, config.datacenter)),
             )
         } else {
             // No config file - use defaults (single-node dev environment)
@@ -214,9 +256,16 @@ impl CassandraBootstrapper {
                 "extenddb".to_string(),
                 "extenddb-local-dev".to_string(),
                 "extenddb".to_string(),
-                1, // RF=1 for single-node dev
+                None,
             )
         };
+        let (resolved_replication_factor, resolved_datacenter) = resolve_replication(
+            replication_factor.as_deref(),
+            datacenter.as_deref(),
+            replication_in_file
+                .as_ref()
+                .map(|(rf, dc)| (*rf, dc.as_str())),
+        )?;
 
         // CLI args override config (or use config values if no CLI arg provided)
         let resolved_contact_points = cassandra_contact_points.map_or(contact_points, |cp| {
@@ -227,8 +276,6 @@ impl CassandraBootstrapper {
         let resolved_admin_user = cassandra_user
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cassandra".to_owned()));
         let resolved_keyspace_prefix = keyspace_prefix.unwrap_or(prefix);
-        let resolved_replication_factor =
-            replication_factor.map_or(rf_from_config, |rf| rf.parse::<u32>().unwrap_or(1));
         let resolved_app_user = extenddb_user.unwrap_or(user);
         let resolved_app_password = extenddb_pass.unwrap_or(password);
         check_name("the application role (--extenddb-user)", &resolved_app_user)?;
@@ -268,7 +315,7 @@ impl CassandraBootstrapper {
             password: cassandra_pass,
             keyspace_prefix: resolved_keyspace_prefix,
             replication_factor: resolved_replication_factor,
-            datacenter: "datacenter1".to_string(),
+            datacenter: resolved_datacenter,
             max_connections: 10,
             cached_connection_string: None,
             instance_id: None,
@@ -290,32 +337,118 @@ impl CassandraBootstrapper {
 }
 
 impl CassandraBootstrapper {
+    /// Refuse `keyspace` when its RF or datacenter differs from the ones this
+    /// `init` uses. `CREATE KEYSPACE IF NOT EXISTS` keeps a keyspace an
+    /// earlier `init` created, with that `init`'s RF and datacenter. Without
+    /// this check, `init` would write its own values to `extenddb.toml`, and
+    /// the file would not describe the keyspaces.
+    ///
+    /// The error offers `DROP KEYSPACE` only for a keyspace that holds no
+    /// data: no table, or for the catalog keyspace only the `settings` table
+    /// that `init` creates before it takes the lock. For a keyspace that
+    /// holds other tables, it offers only the fixes that keep the data, with
+    /// the steps in the order that keeps every write for the keyspace's
+    /// change ([`crate::migrations::alter_steps`]).
+    ///
+    /// With `unreadable`, the catalog's status read failed: the keyspace has
+    /// more replicas than the cluster has nodes, and an `init` with the
+    /// keyspace's values stops again. The error then does not offer them.
+    async fn refuse_other_replication(&self, keyspace: &str, unreadable: bool) -> OpResult<()> {
+        let found = crate::migrations::replication_differs(
+            self.engine.session(),
+            keyspace,
+            &self.datacenter,
+            self.replication_factor,
+        )
+        .await
+        .map_err(|e| OpError::Internal(e.to_string()))?;
+        let Some((found, change)) = found else {
+            return Ok(());
+        };
+        let tables = crate::migrations::tables_of(self.engine.session(), keyspace)
+            .await
+            .map_err(|e| OpError::Internal(e.to_string()))?;
+        let is_catalog = keyspace == self.engine.catalog_keyspace();
+        let holds_no_data = tables.iter().all(|table| is_catalog && table == "settings");
+        let mismatch = format!(
+            "Keyspace {keyspace} already exists with replication {found}, but this init \
+             uses replication factor {} in datacenter {}.",
+            self.replication_factor, self.datacenter
+        );
+        let same_values = if unreadable {
+            "To fix it, "
+        } else {
+            "Give init the values the keyspace has (with --replication-factor and \
+             --datacenter, or in extenddb.toml for init --overwrite). Or "
+        };
+        Err(OpError::Internal(if holds_no_data {
+            format!(
+                "{mismatch} The keyspace holds no data. {same_values}change the keyspace \
+                 with ALTER KEYSPACE, or remove it with DROP KEYSPACE {keyspace} \
+                 (docs/cassandra-setup.md, Keyspace replication)."
+            )
+        } else {
+            let what = if is_catalog {
+                "a deployment's catalog"
+            } else {
+                "an account's tables"
+            };
+            format!(
+                "{mismatch} The keyspace holds {what}: do not drop it. {same_values}{} \
+                 (docs/cassandra-setup.md, Keyspace replication).",
+                crate::migrations::alter_steps(change)
+            )
+        }))
+    }
+
     /// Refuse a catalog keyspace that exists, is not a catalog, and holds
     /// what another program put there ([`foreign_contents`]), naming it.
-    /// `init` calls it before it writes anything, the application role
-    /// included, and again before it creates the keyspace.
+    /// Then refuse a catalog keyspace whose RF or datacenter differs from
+    /// the ones this `init` uses. `init` calls it before it writes anything,
+    /// the application role included, and again before it creates the
+    /// keyspace.
+    ///
+    /// An initialized catalog, other than one whose `init` stopped before
+    /// its admin user ([`finishes_a_stopped_init`]), gets no replication
+    /// check: `init` refuses it under the lock as already initialized, and
+    /// advice to change its replication would only change a live catalog.
+    /// Returns whether the catalog is such a catalog.
     ///
     /// [`foreign_contents`]: crate::migrations::foreign_contents
-    async fn refuse_a_foreign_keyspace(&self) -> OpResult<()> {
+    /// [`finishes_a_stopped_init`]: extenddb_storage::bootstrapper::finishes_a_stopped_init
+    async fn refuse_a_foreign_keyspace(&self) -> OpResult<bool> {
         let keyspace = self.engine.catalog_keyspace();
         let session = self.engine.session_arc();
-        let status = crate::migrations::catalog_status(session.clone(), &self.keyspace_prefix)
-            .await
-            .map_err(|e| OpError::Internal(e.to_string()))?;
-        if status != extenddb_storage::migrations::CatalogStatus::Uninitialized {
-            return Ok(());
+        let status =
+            match crate::migrations::catalog_status(session.clone(), &self.keyspace_prefix).await {
+                Ok(status) => status,
+                Err(e) => {
+                    // The status read is at QUORUM, so it fails on a catalog
+                    // keyspace that an earlier `init` left with more replicas
+                    // than the cluster has nodes. The RF check reads at ONE
+                    // and names the cause, so its error comes first.
+                    self.refuse_other_replication(&keyspace, true).await?;
+                    return Err(OpError::Internal(e.to_string()));
+                }
+            };
+        if status == extenddb_storage::migrations::CatalogStatus::Uninitialized {
+            let foreign = crate::migrations::foreign_contents(&session, &keyspace)
+                .await
+                .map_err(|e| OpError::Internal(e.to_string()))?;
+            if !foreign.is_empty() {
+                return Err(OpError::AlreadyExists(format!(
+                    "Keyspace '{keyspace}' exists and is not an ExtendDB catalog: it holds \
+                     {}. Choose another --keyspace-prefix.",
+                    foreign.join(", ")
+                )));
+            }
+        } else if !extenddb_storage::bootstrapper::finishes_a_stopped_init(self, &status).await? {
+            return Ok(true);
         }
-        let foreign = crate::migrations::foreign_contents(&session, &keyspace)
-            .await
-            .map_err(|e| OpError::Internal(e.to_string()))?;
-        if foreign.is_empty() {
-            return Ok(());
-        }
-        Err(OpError::AlreadyExists(format!(
-            "Keyspace '{keyspace}' exists and is not an ExtendDB catalog: it holds {}. Choose \
-             another --keyspace-prefix.",
-            foreign.join(", ")
-        )))
+        // After the foreign-keyspace check, so a keyspace of another program
+        // gets that error, whatever its replication.
+        self.refuse_other_replication(&keyspace, false).await?;
+        Ok(false)
     }
 
     /// The lowest account id in the catalog's `accounts` table, read through
@@ -367,6 +500,8 @@ impl CassandraBootstrapper {
                 self.engine.create_keyspace(&account_keyspace),
             )
             .await?;
+        self.refuse_other_replication(&account_keyspace, false)
+            .await?;
         println!("--- Running the account migrations for the default account...");
         self.held.check("Migrate the default account's keyspace")?;
         let session = self.engine.session_arc();
@@ -402,8 +537,9 @@ impl CassandraBootstrapper {
 #[async_trait]
 impl Bootstrapper for CassandraBootstrapper {
     async fn ensure_app_user(&self) -> OpResult<()> {
-        // A keyspace of another program is refused before the role exists,
-        // so a refused `init` creates nothing.
+        // A keyspace of another program, or a catalog keyspace with another
+        // RF or datacenter, is refused before the role exists, so a refused
+        // `init` creates nothing.
         self.refuse_a_foreign_keyspace().await?;
         let user = &self.config.app_user;
         let password = &self.config.app_password;
@@ -514,11 +650,14 @@ impl Bootstrapper for CassandraBootstrapper {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Creating catalog keyspace '{keyspace}'...");
         let session = self.engine.session_arc();
-        self.refuse_a_foreign_keyspace().await?;
+        let initialized = self.refuse_a_foreign_keyspace().await?;
         self.engine
             .create_keyspace(&keyspace)
             .await
             .map_err(|e| OpError::Internal(format!("Create catalog keyspace: {e}")))?;
+        if !initialized {
+            self.refuse_other_replication(&keyspace, false).await?;
+        }
         crate::migrations::create_lock_table(&session, &keyspace)
             .await
             .map_err(|e| OpError::Internal(e.to_string()))?;
@@ -805,6 +944,8 @@ impl Bootstrapper for CassandraBootstrapper {
             &self.keyspace_prefix,
             &self.config.app_user,
             &self.config.app_password,
+            self.replication_factor,
+            &self.datacenter,
         )
     }
 }
@@ -817,22 +958,28 @@ impl CassandraBootstrapper {
     /// connection without credentials. The values are TOML-quoted (a role
     /// that already existed keeps whatever password the operator supplied).
     /// `write_config` makes the file 0600.
+    ///
+    /// Writes the replication factor and datacenter `init` created its
+    /// keyspaces with, so the account keyspaces `serve` creates later match.
     fn backend_config_section(
         contact_point: &str,
         keyspace_prefix: &str,
         app_user: &str,
         app_password: &str,
+        replication_factor: u32,
+        datacenter: &str,
     ) -> String {
         let user = toml::Value::String(app_user.to_owned());
         let password = toml::Value::String(app_password.to_owned());
+        let datacenter = toml::Value::String(datacenter.to_owned());
         format!(
             r#"[storage.cassandra]
 contact_points = ["{contact_point}"]
 username = {user}               # Application role
 password = {password}
 keyspace_prefix = "{keyspace_prefix}"
-replication_factor = 1           # Single node (use 3+ for production)
-datacenter = "datacenter1"
+replication_factor = {replication_factor}           # Use 3 or more for a multi-node cluster
+datacenter = {datacenter}
 max_connections = 10"#
         )
     }
@@ -849,6 +996,8 @@ mod tests {
             "mycompany",
             "extenddb",
             "pw",
+            1,
+            "datacenter1",
         );
         assert!(
             section.contains("keyspace_prefix = \"mycompany\""),
@@ -874,6 +1023,8 @@ mod tests {
                 "pfx",
                 "app_role",
                 password,
+                1,
+                "datacenter1",
             );
             let doc: toml::Value = toml::from_str(&section).expect("section parses");
             let config: crate::config::CassandraStorageConfig = doc
@@ -890,6 +1041,117 @@ mod tests {
                 "password not carried"
             );
             assert_eq!(config.keyspace_prefix, "pfx");
+        }
+    }
+
+    /// `init` once wrote `replication_factor = 1` and `datacenter1` whatever
+    /// it created its keyspaces with, so the account keyspaces `serve`
+    /// created later could differ from the catalog's.
+    #[test]
+    fn backend_config_section_carries_the_replication() {
+        let section = CassandraBootstrapper::backend_config_section(
+            "127.0.0.1:9042",
+            "pfx",
+            "app_role",
+            "pw",
+            3,
+            "dc-east.1",
+        );
+        let doc: toml::Value = toml::from_str(&section).expect("section parses");
+        let config: crate::config::CassandraStorageConfig = doc
+            .get("storage")
+            .and_then(|s| s.get("cassandra"))
+            .expect("storage.cassandra")
+            .clone()
+            .try_into()
+            .expect("section is a CassandraStorageConfig");
+        assert_eq!(config.replication_factor, 3);
+        assert_eq!(config.datacenter, "dc-east.1");
+    }
+
+    #[test]
+    fn replication_defaults_to_one_replica_in_datacenter1() {
+        assert_eq!(
+            super::resolve_replication(None, None, None).expect("defaults"),
+            (1, "datacenter1".to_owned())
+        );
+    }
+
+    #[test]
+    fn replication_flags_are_used_without_a_config_file() {
+        assert_eq!(
+            super::resolve_replication(Some("3"), Some("dc1"), None).expect("flags"),
+            (3, "dc1".to_owned())
+        );
+    }
+
+    /// The config file's datacenter was once ignored for `datacenter1`.
+    #[test]
+    fn replication_comes_from_the_config_file() {
+        assert_eq!(
+            super::resolve_replication(None, None, Some((3, "dc1"))).expect("file"),
+            (3, "dc1".to_owned())
+        );
+        assert_eq!(
+            super::resolve_replication(Some("3"), Some("dc1"), Some((3, "dc1")))
+                .expect("agreeing flags"),
+            (3, "dc1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_replication_flag_that_disagrees_with_the_config_file_is_refused() {
+        for (rf, dc) in [(Some("1"), None), (None, Some("dc2"))] {
+            let err = super::resolve_replication(rf, dc, Some((3, "dc1")))
+                .expect_err("conflict refused")
+                .to_string();
+            assert!(err.contains("conflicts with config file"), "{err}");
+        }
+    }
+
+    /// The bootstrapper refuses an RF that is not a positive integer, as
+    /// clap does for the flag: from `--replication-factor`, and from the
+    /// config file on `init --overwrite`.
+    #[test]
+    fn a_replication_factor_that_is_not_a_positive_integer_is_refused() {
+        for rf in ["0", "-1", "three", ""] {
+            let err = super::resolve_replication(Some(rf), None, None)
+                .expect_err("refused")
+                .to_string();
+            assert!(err.contains("must be a positive integer"), "{rf}: {err}");
+        }
+        let err = super::resolve_replication(None, None, Some((0, "dc1")))
+            .expect_err("zero in the file refused")
+            .to_string();
+        assert!(err.contains("must be a positive integer"), "{err}");
+    }
+
+    /// The error names where the bad datacenter came from: the flag, or the
+    /// config file on `init --overwrite`.
+    #[test]
+    fn a_bad_datacenter_error_names_its_source() {
+        let from_flag = super::resolve_replication(None, Some("dc 1"), None)
+            .expect_err("refused")
+            .to_string();
+        assert!(from_flag.contains("--datacenter"), "{from_flag}");
+
+        let from_file = super::resolve_replication(None, None, Some((1, "dc 1")))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            from_file.contains("datacenter in the config file")
+                && !from_file.contains("--datacenter"),
+            "{from_file}"
+        );
+    }
+
+    #[test]
+    fn a_datacenter_that_would_break_the_create_keyspace_is_refused() {
+        for dc in ["", "dc'1", "dc 1", "dc1}"] {
+            assert!(
+                super::resolve_replication(None, Some(dc), None).is_err(),
+                "{dc:?} accepted"
+            );
         }
     }
 }

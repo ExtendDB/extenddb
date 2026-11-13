@@ -59,7 +59,7 @@ services:
         exec docker-entrypoint.sh cassandra -f
     environment:
       # No CASSANDRA_DC: the image then keeps SimpleSnitch, whose datacenter
-      # is datacenter1, the name init writes into the keyspace definitions.
+      # is datacenter1, init's default --datacenter.
       CASSANDRA_CLUSTER_NAME: extenddb-dev
       MAX_HEAP_SIZE: ${CASSANDRA_MAX_HEAP_SIZE:-1024M}
       HEAP_NEWSIZE: ${CASSANDRA_HEAP_NEWSIZE:-128M}

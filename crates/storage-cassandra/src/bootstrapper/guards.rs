@@ -107,6 +107,31 @@ pub(super) fn check_name(
     )))
 }
 
+/// Refuse a datacenter name holding anything other than ASCII letters,
+/// digits, `_`, `-` and `.`. The name is written between single quotes into
+/// every `CREATE KEYSPACE`, so a quote would break the statement. `what`
+/// names where the value came from, for the error.
+///
+/// This checks the name's characters only, not that the cluster has the
+/// datacenter. Cassandra checks that: its `NetworkTopologyStrategy` refuses
+/// a `CREATE KEYSPACE` that names a datacenter no node is in, with
+/// `ConfigurationException: Unrecognized strategy option {<name>}`.
+pub(super) fn check_datacenter(
+    what: &str,
+    value: &str,
+) -> Result<(), extenddb_storage::error::StorageError> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Ok(());
+    }
+    Err(extenddb_storage::error::StorageError::Internal(format!(
+        "{what} {value:?} may hold only ASCII letters, digits, '_', '-' and '.'"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::HeldLease;
