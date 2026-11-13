@@ -162,3 +162,14 @@ condition: service_healthy` work with no extra wiring.
   but not enforced as capacity.
 - No TLS and no access control (see dev-mode above): never expose it beyond
   the local machine, and never store real data in it.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

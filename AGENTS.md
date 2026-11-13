@@ -5,8 +5,8 @@ This document provides AI agents with essential context for working on the Exten
 ## Project Overview
 
 **ExtendDB** is an open source DynamoDB-compatible runtime with pluggable storage, released under the Apache 2.0
-License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and initially developed
-by AWS engineers. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
+License. ExtendDB is a clean-room implementation of the DynamoDB wire protocol, written in Rust and maintained
+by AWS. It is not a fork of DynamoDB and contains no DynamoDB source code. ExtendDB speaks the DynamoDB wire
 protocol: any AWS SDK, CLI, or tool that works with DynamoDB works with ExtendDB, unchanged.
 
 - **Language:** Rust (edition 2024, MSRV 1.88+)
