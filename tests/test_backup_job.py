@@ -12,13 +12,13 @@ store's root:
   waits for the slot and is answered only once the first job has ended (the
   first backup AVAILABLE), and a third is accepted at once afterwards; a wait
   that outlives the 30 s bound is LimitExceededException naming the bound;
-- a table holding an `N` value the wire let in (#618: `1E126` or `abc` in a
-  non-key attribute, `1E126` in the range key of a key-ordered table) written
-  through each of the four paths that store it unvalidated (BatchWriteItem,
-  TransactWriteItems, UpdateItem on an absent item in the key it creates,
-  ImportTable) gives a FAILED row, no manifest under the root, three log
-  lines naming each item's key and attribute, and a FAILED reason giving the
-  count and the first item and naming #618;
+- a table holding items with an `N` value the service cannot store (#618:
+  `1E126` or `abc` in a non-key attribute, `1E126` or more in the range key
+  of a key-ordered table), in the shapes the write paths stored before they
+  checked numbers and written straight into the table's storage on each
+  backend, gives a FAILED row, no manifest under the root, three log lines
+  naming each item's key and attribute, and a FAILED reason giving the count
+  and the first item and naming #618;
 - an item over `max_item_size_bytes` (stored under the default limit, the
   server restarted with a lower one) gives a reason that does not name #618;
 - a refused item with a UUID hash key and a ten-digit epoch `N` range key is
@@ -139,6 +139,30 @@ PostgreSQL):
   RUNNING restore exist proceeds once a server's held-claim cycle has
   finished the one and failed the other.
 
+`backup migrate-legacy`, on the three deployments (the catalog reads on
+SQLite and PostgreSQL):
+
+- two in-catalog backups (taken with `[backup.store] kind = "disabled"`)
+  of a table with a GSI and items of every type, the store then
+  configured: `<arn>` (spelt with another region) and `--all` copy each
+  into the store under its ARN, a manifest of kind `legacy_in_catalog`;
+  the in-catalog rows are gone, items and definition with them, a rerun
+  finds nothing, and the server lists each once, describes it as before,
+  restores it with the table's items and deletes it from the store; the
+  command needs exactly one of `<arn>` and `--all`;
+- `--all` goes on past a backup holding items #618 let in and (SQLite,
+  PostgreSQL) one under a 13-digit id, refusing each with its reason and
+  keeping its in-catalog rows, and exits 1; the 13-digit one restores and
+  a new backup of the restored table is store-backed;
+- (PostgreSQL) `migrate-legacy` fails at once while another maintenance
+  command holds the claim, and, holding it, waits for a live job and makes
+  `backup purge --confirm` fail at once;
+- (SQLite, PostgreSQL) a stopped migration's whole copy and a partial one,
+  then DeleteBackup of both in-catalog backups: `backup sync` adopts
+  neither, naming the deleted backup and the command, `--all` deletes both
+  copies with a note each and exits 0, and the backups stay deleted; a
+  malformed `<arn>` exits 2 before the claim is taken.
+
 The binary at `EXTENDDB_BINARY` decides which deployment runs: a SQLite build,
 a PostgreSQL build (with `EXTENDDB_TEST_PG_CONNECTION_STRING`) or a MongoDB
 build (with `EXTENDDB_TEST_MONGODB_URI`, a replica set of this suite's own: the
@@ -159,12 +183,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 
-import boto3
 import pytest
-import requests
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
 from botocore.exceptions import ClientError
 
 import lifecycle_helpers as lh
@@ -341,24 +362,6 @@ def _started(d: _Deployment, log_path: str) -> tuple[_Server, object, dict]:
         server.stop()
         raise
     return server, _client(d.port, creds), creds
-
-
-def _signed_post(d: _Deployment, creds: dict, operation: str, body: dict) -> requests.Response:
-    """A hand-signed request for an operation botocore's model would refuse
-    (ImportTable's `FileSource`)."""
-    body_bytes = json.dumps(body).encode("utf-8")
-    headers = {
-        "X-Amz-Target": f"DynamoDB_20120810.{operation}",
-        "Content-Type": "application/x-amz-json-1.0",
-    }
-    endpoint = f"https://127.0.0.1:{d.port}"
-    frozen = boto3.Session(
-        aws_access_key_id=creds["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=creds["AWS_SECRET_ACCESS_KEY"],
-    ).get_credentials().get_frozen_credentials()
-    aws_req = AWSRequest(method="POST", url=endpoint, data=body_bytes, headers=headers)
-    SigV4Auth(frozen, "dynamodb", "us-east-1").add_auth(aws_req)
-    return requests.post(endpoint, data=body_bytes, headers=dict(aws_req.headers), verify=False)
 
 
 def _wait_active(ddb, name: str, timeout: float = 60.0) -> None:
@@ -593,111 +596,197 @@ def _load(d: _Deployment, creds: dict, name: str, n: int) -> None:
         list(pool.map(write, range(0, n, 25)))
 
 
-# The three items each path stores: `1E126` and `abc` in a non-key attribute
-# and `1E126` in the range key (an `abc` range key is refused by the number
-# column on PostgreSQL and SQLite, so no path stores one). UpdateItem
-# validates the values its expression sets, so its three items carry the bad
-# value in the key it creates.
+# Items holding an `N` value the service cannot store (#618), in the shapes
+# the write paths stored before they checked numbers. `values`: `1E126` and
+# `abc` in non-key attributes and `1E126` in the range key, as BatchWriteItem,
+# TransactWriteItems and ImportTable stored them. `keys`: three range keys out
+# of range, as UpdateItem stored them on an absent item, in the key it
+# created. Each path refuses them now, so the cells write them into the
+# table's storage (`_seed_stored_items`): the backup's check of stored items
+# guards the items a table still holds from before. An `abc` range key has no
+# stored form, since every backend's range key column holds a number or an
+# order-preserving text of one.
 BAD_ITEMS = [
     {"pk": {"S": "a"}, "sk": {"N": "1"}, "amount": {"N": "1E126"}},
     {"pk": {"S": "a"}, "sk": {"N": "2"}, "note": {"N": "abc"}},
     {"pk": {"S": "b"}, "sk": {"N": "1E126"}},
 ]
 BAD_KEYS = [
-    {"pk": {"S": "a"}, "sk": {"N": "1E126"}},
-    {"pk": {"S": "b"}, "sk": {"N": "1E127"}},
-    {"pk": {"S": "c"}, "sk": {"N": "1E128"}},
+    {"pk": {"S": "a"}, "sk": {"N": "1E126"}, "note": {"S": "created from the key"}},
+    {"pk": {"S": "b"}, "sk": {"N": "1E127"}, "note": {"S": "created from the key"}},
+    {"pk": {"S": "c"}, "sk": {"N": "1E128"}, "note": {"S": "created from the key"}},
 ]
+STORED_ITEMS = {"values": BAD_ITEMS, "keys": BAD_KEYS}
 GOOD_ITEMS = [{"pk": {"S": "z"}, "sk": {"N": str(i)}, "amount": {"N": str(i)}} for i in range(5)]
 
 
-def _write_batch(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    ddb.batch_write_item(
-        RequestItems={name: [{"PutRequest": {"Item": i}} for i in BAD_ITEMS + GOOD_ITEMS]}
-    )
-    return BAD_ITEMS
+def _seed_cell(d: _Deployment) -> None:
+    """The cells that seed stored items write a MongoDB deployment's
+    documents with `mongosh` in the replica set's container (`_mongosh`),
+    which `EXTENDDB_TEST_MONGODB_CONTAINER` names."""
+    if d.backend == "mongodb" and not _mongodb_container():
+        pytest.skip("EXTENDDB_TEST_MONGODB_CONTAINER is unset: the MongoDB items are seeded with mongosh in it")
 
 
-def _write_transact(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    ddb.transact_write_items(
-        TransactItems=[{"Put": {"TableName": name, "Item": i}} for i in BAD_ITEMS + GOOD_ITEMS]
-    )
-    return BAD_ITEMS
+def _key_text(value: dict) -> str:
+    """A key attribute's text in storage: the `S` or `N` as written."""
+    (text,) = value.values()
+    return text
 
 
-def _write_update(d, ddb, creds, name):
-    _create_composite_table(ddb, name)
-    for key in BAD_KEYS:
-        ddb.update_item(
-            TableName=name,
-            Key=key,
-            UpdateExpression="SET note = :v",
-            ExpressionAttributeValues={":v": {"S": "created from the key"}},
+def _sqlite_number_key(n: str) -> str:
+    """The SQLite backend's text for an `N` range key, as
+    `encode_orderable_number` (crates/storage-sqlite/src/number_key.rs)
+    writes it: `1` for zero; otherwise a class digit (`2` for a positive
+    value, `0` for a negative one), the exponent `E` of the form
+    `0.d1d2... x 10^E` in six digits (100000 + E, or 100000 - E for a
+    negative value), and the digits without trailing zeros (for a negative
+    value each digit complemented to 9 - d, then `:`)."""
+    value = Decimal(n)
+    if value == 0:
+        return "1"
+    sign, digits, exponent = value.as_tuple()
+    digits = list(digits)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    e = len(digits) + exponent
+    if sign:
+        return f"0{100000 - e:06d}" + "".join(str(9 - x) for x in digits) + ":"
+    return f"2{100000 + e:06d}" + "".join(str(x) for x in digits)
+
+
+def _mongodb_id(item: dict) -> str:
+    """A MongoDB base-table document's `_id`: the hash and range key texts
+    as a netstring, `<bytes>:<text>,` each (`composite_id` in
+    crates/storage-mongodb/src/data/mod.rs)."""
+    parts = [_key_text(item["pk"]), _key_text(item["sk"])]
+    return "".join(f"{len(p.encode())}:{p}," for p in parts)
+
+
+def _pg_data_connection_string(catalog: str) -> str:
+    """The data database's connection string: `init` names the data
+    database after the catalog, less the `_catalog` suffix."""
+    base, _, database = catalog.rpartition("/")
+    assert database.endswith("_catalog"), catalog
+    return f"{base}/{database[: -len('_catalog')]}"
+
+
+def _seed_stored_items(d: _Deployment, name: str, items: list[dict]) -> None:
+    """Write `items` into the storage of the key-ordered table `name` (hash
+    key `pk` S, range key `sk` N) past the wire, which refuses them, in the
+    form the server writes an item:
+
+    - SQLite: a row of `"_ddb_<table id>"` in the database file, with `pk`
+      the hash key's text, `sk_n` the range key's text from
+      `_sqlite_number_key` and `item_data` the item as DynamoDB JSON;
+    - PostgreSQL: the same row in the data database, with `sk_n` a
+      `NUMERIC` and `item_data` a `JSONB`;
+    - MongoDB: a document of `extenddb_data._ddb_<table id>` holding `_id`
+      (`_mongodb_id`), `pk`, `sk_n` as a Decimal128 and `item_data`, written
+      with `mongosh` in the replica set's container.
+
+    The table id is read from the catalog. The caller writes `GOOD_ITEMS`
+    through the wire first, and the form is checked against the one the
+    server stored for `GOOD_ITEMS[0]`: a change to the stored form fails
+    here, before any row the server might not read is written."""
+    good = GOOD_ITEMS[0]
+    if d.backend == "mongodb":
+        table_id = _mongosh(
+            f"const t = db.tables.findOne({{'_id.account_id': {json.dumps(ACCOUNT)}, "
+            f"'_id.table_name': {json.dumps(name)}}});\nprint(JSON.stringify(t.table_id))"
         )
-    for item in GOOD_ITEMS:
-        ddb.put_item(TableName=name, Item=item)
-    return BAD_KEYS
+        coll = f'db.getSiblingDB("extenddb_data").getCollection({json.dumps("_ddb_" + table_id)})'
+        row = _mongosh(
+            f"const g = {coll}.findOne({{_id: {json.dumps(_mongodb_id(good))}}});\n"
+            "print(JSON.stringify(g && {pk: g.pk, sk_n: g.sk_n.toString(), item_data: g.item_data}))"
+        )
+        assert row and row["pk"] == _key_text(good["pk"]), row
+        assert Decimal(row["sk_n"]) == Decimal(good["sk"]["N"]) and row["item_data"] == good, row
+        docs = ", ".join(
+            f"{{_id: {json.dumps(_mongodb_id(i))}, pk: {json.dumps(_key_text(i['pk']))}, "
+            f"sk_n: NumberDecimal({json.dumps(i['sk']['N'])}), item_data: {json.dumps(i)}}}"
+            for i in items
+        )
+        n = _mongosh(f"print(Object.keys({coll}.insertMany([{docs}]).insertedIds).length)")
+        assert n == len(items), n
+        return
+    rows = [(_key_text(i["pk"]), i["sk"]["N"], json.dumps(i, separators=(",", ":"))) for i in items]
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            found = conn.execute(
+                "SELECT table_id FROM tables WHERE account_id = ? AND table_name = ?", (ACCOUNT, name)
+            ).fetchone()
+            assert found, f"no catalog row for {name}"
+            data = f'"_ddb_{found[0]}"'
+            row = conn.execute(
+                f"SELECT item_data FROM {data} WHERE pk = ? AND sk_n = ?",
+                (_key_text(good["pk"]), _sqlite_number_key(good["sk"]["N"])),
+            ).fetchone()
+            assert row and json.loads(row[0]) == good, row
+            conn.executemany(
+                f"INSERT INTO {data} (pk, sk_n, item_data) VALUES (?, ?, ?)",
+                [(pk, _sqlite_number_key(sk), item) for pk, sk, item in rows],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    import psycopg2
 
-
-def _write_import(d, ddb, creds, name):
-    path = os.path.join(d.cwd, ACCOUNT, f"{name}.json")
-    with open(path, "w") as f:
-        for item in BAD_ITEMS + GOOD_ITEMS:
-            f.write(json.dumps({"Item": item}) + "\n")
-    resp = _signed_post(
-        d,
-        creds,
-        "ImportTable",
-        {
-            "FileSource": {"Path": path},
-            "InputFormat": "DYNAMODB_JSON",
-            "TableCreationParameters": {
-                "TableName": name,
-                "AttributeDefinitions": [
-                    {"AttributeName": "pk", "AttributeType": "S"},
-                    {"AttributeName": "sk", "AttributeType": "N"},
-                ],
-                "KeySchema": [
-                    {"AttributeName": "pk", "KeyType": "HASH"},
-                    {"AttributeName": "sk", "KeyType": "RANGE"},
-                ],
-                "BillingMode": "PAY_PER_REQUEST",
-            },
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["ImportTableDescription"]["ImportStatus"] == "COMPLETED", resp.text
-    _wait_active(ddb, name)
-    return BAD_ITEMS
-
-
-WRITE_PATHS = {
-    "batch_write_item": _write_batch,
-    "transact_write_items": _write_transact,
-    "update_item": _write_update,
-    "import_table": _write_import,
-}
+    conn = psycopg2.connect(d.catalog)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_id FROM tables WHERE account_id = %s AND table_name = %s", (ACCOUNT, name))
+            found = cur.fetchone()
+    finally:
+        conn.close()
+    assert found, f"no catalog row for {name}"
+    data = f'"_ddb_{found[0]}"'
+    conn = psycopg2.connect(_pg_data_connection_string(d.catalog))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT item_data FROM {data} WHERE pk = %s AND sk_n = %s::numeric",
+                (_key_text(good["pk"]), good["sk"]["N"]),
+            )
+            row = cur.fetchone()
+            assert row and row[0] == good, row
+            cur.executemany(f"INSERT INTO {data} (pk, sk_n, item_data) VALUES (%s, %s::numeric, %s::jsonb)", rows)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _key_json(item: dict) -> str:
     return json.dumps({"pk": item["pk"], "sk": item["sk"]}, separators=(",", ":"))
 
 
-@pytest.mark.parametrize("path", sorted(WRITE_PATHS))
-def test_an_item_the_wire_let_in_fails_the_backup(deployment, tmp_path, path):
-    """Three items with an `N` value #618 let in, stored through one write
-    path, and five that restore: CreateBackup answers CREATING, the job
-    validates every item (three log lines, one per item, with its key and
-    attribute path), the row is FAILED with a reason giving the count and
-    the first item and naming #618, DescribeBackup is BackupNotFound,
-    ListBackups omits it, and no manifest is under the root."""
+@pytest.mark.parametrize("kind", sorted(STORED_ITEMS))
+def test_a_stored_item_holding_an_invalid_number_fails_the_backup(deployment, tmp_path, kind):
+    """Three stored items holding an `N` value the service cannot store
+    (#618), written into the table's storage in the shapes the write paths
+    stored before they checked numbers (`_seed_stored_items`; `kind` names
+    the set in `STORED_ITEMS`), and five that restore: CreateBackup answers
+    CREATING, the job validates every item (three log lines, one per item,
+    with its key and attribute path), the row is FAILED with a reason giving
+    the count and the first item and naming #618, DescribeBackup is
+    BackupNotFound, ListBackups omits it, and no manifest is under the
+    root."""
     d = deployment
-    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    _seed_cell(d)
+    server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
     try:
-        name = f"n618-{path.replace('_', '')}-{uuid.uuid4().hex[:6]}"
-        bad = WRITE_PATHS[path](d, ddb, creds, name)
+        name = f"n618-{kind}-{uuid.uuid4().hex[:6]}"
+        _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        bad = STORED_ITEMS[kind]
+        _seed_stored_items(d, name, bad)
         stored = ddb.scan(TableName=name, ConsistentRead=True)["Items"]
         assert len(stored) == len(bad) + len(GOOD_ITEMS), stored
         details = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]
@@ -727,18 +816,21 @@ def test_an_item_the_wire_let_in_fails_the_backup(deployment, tmp_path, path):
 
 
 def test_a_refused_item_with_a_uuid_and_epoch_key_is_named_whole(deployment, tmp_path):
-    """One refused item with a realistic key, a UUID hash key and a ten-digit
-    epoch range key, and `amount: abc`: the log line and the FAILED reason
-    carry the whole key as DynamoDB JSON (`{"pk":{"S":"<uuid>"},"sk":{"N":
-    "1761955200"}}`), not a shortened form, and the wire's reason for the
-    value, so an operator can find the item from either."""
+    """One stored item the backup refuses, written into storage as
+    `_seed_stored_items` does, with a realistic key, a UUID hash key and a
+    ten-digit epoch range key, and `amount: abc`: the log line and the FAILED
+    reason carry the whole key as DynamoDB JSON (`{"pk":{"S":"<uuid>"},"sk":
+    {"N":"1761955200"}}`), not a shortened form, and the wire's reason for
+    the value, so an operator can find the item from either."""
     d = deployment
+    _seed_cell(d)
     server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
     try:
         name = f"n618-key-{uuid.uuid4().hex[:6]}"
         _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
         item = {"pk": {"S": str(uuid.uuid4())}, "sk": {"N": "1761955200"}, "amount": {"N": "abc"}}
-        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in [item] + GOOD_ITEMS]})
+        _seed_stored_items(d, name, [item])
         arn = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
         _wait_backup_gone(ddb, arn)
         key = _key_json(item)
@@ -2091,19 +2183,103 @@ def test_prune_missing_and_the_unhealthy_store_refusals(deployment, tmp_path):
         server.stop()
 
 
+def _second_command(d: _Deployment, *args, bound: float = 30.0):
+    """`extenddb backup <args>` with a bound of its own: a command that takes
+    a claim it should have been refused waits for the jobs the holder waits
+    for, and the bound turns that into the cell's failure."""
+    import subprocess
+
+    try:
+        return subprocess.run(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, *args],
+            cwd=d.cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=bound,
+        )
+    except subprocess.TimeoutExpired as e:
+        pytest.fail(f"backup {' '.join(args)} was not refused within {bound:.0f} s: {e.stdout!r}")
+
+
+def test_a_second_maintenance_command_fails_at_once_beside_a_live_holder(deployment, tmp_path):
+    """On PostgreSQL and MongoDB, a second maintenance command fails at once
+    beside a live holder, by the claim's stale window: on MongoDB nothing
+    but the claim record's heartbeat age decides the take (PostgreSQL's
+    advisory lock decides it there first). The holder is `backup sync
+    --prune-missing`, waiting out the owner window of a FAILED backup row
+    whose job refused the #618 items; `backup purge --confirm`, `backup
+    migrate-legacy --all` and `backup sync --adopt-store` each exit 1 within
+    seconds, naming the one-at-a-time rule and the holder. The holder,
+    signalled, stops before any change and releases the claim, and a plain
+    sync then runs. SQLite has no second command to refuse: the serve lock
+    refuses it before any claim is read."""
+    d = deployment
+    if d.backend == "sqlite":
+        pytest.skip("on SQLite the serve lock refuses a second writing command before any claim is read")
+    _seed_cell(d)
+    import subprocess
+
+    server, ddb, _ = _started(d, str(tmp_path / "serve.log"))
+    try:
+        name = f"n618-claim-{uuid.uuid4().hex[:6]}"
+        _create_composite_table(ddb, name)
+        ddb.batch_write_item(RequestItems={name: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        _seed_stored_items(d, name, BAD_ITEMS)
+        arn = ddb.create_backup(TableName=name, BackupName="refused")["BackupDetails"]["BackupArn"]
+        deadline = time.monotonic() + 90
+        while arn not in _failed_rows(d):
+            assert time.monotonic() < deadline, "the backup job did not fail on the #618 items"
+            time.sleep(0.5)
+    finally:
+        server.stop()
+    out_path = str(tmp_path / "holder.out")
+    with open(out_path, "wb") as out:
+        holder = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "sync", "--prune-missing"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(out_path).read():
+            assert holder.poll() is None, open(out_path).read()
+            assert time.monotonic() < deadline, open(out_path).read()
+            time.sleep(0.2)
+        assert arn in open(out_path).read(), open(out_path).read()
+        for args in (("purge", "--confirm"), ("migrate-legacy", "--all"), ("sync", "--adopt-store")):
+            started = time.monotonic()
+            res = _second_command(d, *args)
+            took = time.monotonic() - started
+            out = res.stdout + res.stderr
+            assert res.returncode == 1, (args, out)
+            assert "one maintenance command runs at a time" in out, (args, out)
+            assert "extenddb backup sync on " in out, (args, out)
+            assert took < 15, f"{args} took {took:.1f} s to refuse"
+            print(f"{d.backend}: {' '.join(args)} refused in {took:.1f} s")
+        assert holder.poll() is None, "the holder stopped while the others ran"
+        holder.send_signal(15)
+        assert holder.wait(timeout=30) == 1
+        text = open(out_path).read()
+        assert "stopped before any change: SIGTERM received while waiting" in text, text
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=10)
+    assert arn in _failed_rows(d)
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
 def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
     """`backup sync --prune-missing` takes the maintenance claim and waits
     for a CREATING row whose owner beat just now (the row edited at the
     catalog, its heartbeat the database's now); while it waits, `backup
     purge --confirm`, `backup sync --adopt-store`, and `--move-store`,
-    `--forget-store` (of a root a second backup's row was edited to name)
-    and `--forget-backup` each fail within seconds, exit 1, naming the
-    one-at-a-time rule, and change nothing. The
+    `--forget-store` (of a root a second backup's row was edited to name),
+    `--forget-backup` and `backup migrate-legacy --all` each fail within
+    seconds, exit 1, naming the one-at-a-time rule, and change nothing. The
     first command, signalled, stops before any change and releases the
     claim. `--adopt-store` on the root this catalog owns then takes the
     claim and waits for the same live job ("Waiting for running jobs to
-    finish"), and a signal stops it before any change; after that a plain
-    sync and `--prune-missing` run. SQLite has
+    finish"), and a signal stops it before any change; so does `backup
+    migrate-legacy --all`, beside which `backup purge --confirm` fails at
+    once; after that a plain sync and `--prune-missing` run. SQLite has
     no second command to refuse: every writing command takes the serve lock
     first, which the sync cell shows."""
     _sync_cell(deployment)
@@ -2152,6 +2328,7 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
             ("sync", "--move-store", elsewhere),
             ("sync", "--forget-store", elsewhere),
             ("sync", "--forget-backup", moved),
+            ("migrate-legacy", "--all"),
         ):
             started = time.monotonic()
             res = d.run("backup", *args)
@@ -2197,6 +2374,35 @@ def test_a_second_maintenance_command_fails_at_once(deployment, tmp_path):
         if adopting.poll() is None:
             adopting.kill()
             adopting.wait(timeout=10)
+    assert _rows(d)[busy] == "CREATING"
+    # `migrate-legacy` takes the claim and waits for the same live job, as
+    # purge does; while it waits a second command fails at once, and a
+    # signal stops it before any change.
+    migrate_path = str(tmp_path / "migrate.out")
+    with open(migrate_path, "wb") as out:
+        migrating = subprocess.Popen(
+            [EXTENDDB_BINARY, "backup", "--config", d.config, "migrate-legacy", "--all"],
+            cwd=d.cwd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    try:
+        deadline = time.monotonic() + 60
+        while "Waiting for running jobs to finish" not in open(migrate_path).read():
+            assert migrating.poll() is None, open(migrate_path).read()
+            assert time.monotonic() < deadline, open(migrate_path).read()
+            time.sleep(0.2)
+        text = open(migrate_path).read()
+        assert 'Took the maintenance claim as "extenddb backup migrate-legacy on ' in text, text
+        res = d.run("backup", "purge", "--confirm")
+        assert res.returncode == 1 and "one maintenance command runs at a time" in res.stdout + res.stderr, res
+        migrating.send_signal(15)
+        assert migrating.wait(timeout=30) == 1
+        text = open(migrate_path).read()
+        assert "stopped before any change: SIGTERM received while waiting" in text, text
+        assert "migrated " not in text, text
+    finally:
+        if migrating.poll() is None:
+            migrating.kill()
+            migrating.wait(timeout=10)
     assert _rows(d)[busy] == "CREATING"
     _set_status(d, busy, "AVAILABLE")
     res = d.run("backup", "sync", "--prune-missing")
@@ -4017,3 +4223,481 @@ def test_a_maintenance_command_waits_out_a_deleting_row_and_a_dead_restore(deplo
     assert _rows(d) == {b2: "DELETED"}
     assert not os.path.exists(_prefix(d, name, b2)), "the DELETING row's deletion was not finished"
     assert os.path.isdir(root)
+
+
+def _catalog_rows(d: _Deployment, statement: str, params: tuple) -> list[tuple]:
+    """The rows one query on the deployment's catalog returns (`?`
+    placeholders, which become `%s` on PostgreSQL)."""
+    if d.backend == "sqlite":
+        try:
+            import pysqlite3 as sqlite3
+        except ImportError:
+            import sqlite3
+        conn = sqlite3.connect(d.catalog, timeout=10)
+        try:
+            return conn.execute(statement, params).fetchall()
+        finally:
+            conn.close()
+    import psycopg2
+
+    conn = psycopg2.connect(d.catalog)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(statement.replace("?", "%s"), params)
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def _in_catalog_rows(d: _Deployment, arn: str) -> tuple[str, int, int]:
+    """An in-catalog backup's rows at the catalog: its `backups` status
+    (`""` when it has no row), and its `backup_items` and
+    `backup_definitions` row counts."""
+    status = _catalog_rows(d, "SELECT backup_status FROM backups WHERE backup_arn = ?", (arn,))
+    items = _catalog_rows(d, "SELECT count(*) FROM backup_items WHERE backup_arn = ?", (arn,))[0][0]
+    definitions = _catalog_rows(d, "SELECT count(*) FROM backup_definitions WHERE backup_arn = ?", (arn,))[0][0]
+    return (status[0][0] if status else "", items, definitions)
+
+
+def _copy_in_catalog_backup(d: _Deployment, arn: str, new_arn: str) -> None:
+    """Copy an in-catalog backup's `backups`, `backup_items` and
+    `backup_definitions` rows under `new_arn`, every column but the ARN (and
+    SQLite's item `id`) as it is: a backup an earlier release took under an
+    id of another shape, restorable through the in-catalog reader."""
+    for table in ("backups", "backup_items", "backup_definitions"):
+        if d.backend == "sqlite":
+            columns = [r[1] for r in _catalog_rows(d, f"PRAGMA table_info({table})", ())]
+        else:
+            columns = [
+                r[0]
+                for r in _catalog_rows(
+                    d,
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = ? "
+                    "AND table_schema = current_schema() ORDER BY ordinal_position",
+                    (table,),
+                )
+            ]
+        columns = [c for c in columns if c != "id"]
+        chosen = ", ".join("?" if c == "backup_arn" else c for c in columns)
+        n = _catalog(
+            d,
+            f"INSERT INTO {table} ({', '.join(columns)}) SELECT {chosen} FROM {table} WHERE backup_arn = ?",
+            (new_arn, arn),
+        )
+        assert n >= 1, f"{table}: {n} rows copied"
+
+
+def _typed_canonical(item: dict) -> str:
+    """`_canonical` for items holding binaries and sets: a binary as hex,
+    each set's members sorted."""
+
+    def norm(value):
+        if isinstance(value, dict):
+            return {
+                k: sorted(norm(v) for v in vs) if k in ("NS", "SS", "BS") else norm(vs)
+                for k, vs in value.items()
+            }
+        if isinstance(value, list):
+            return [norm(v) for v in value]
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).hex()
+        return value
+
+    return json.dumps(norm(item), sort_keys=True, separators=(",", ":"))
+
+
+def _migrate(d: _Deployment, *args):
+    res = d.run("backup", "migrate-legacy", *args)
+    print(f"migrate-legacy {' '.join(args)}: exit {res.returncode}\n{res.stdout}{res.stderr}")
+    return res
+
+
+# Items the in-catalog copy has to carry whole: a number set, a binary, a
+# map holding a list, a boolean and a null beside the keys.
+TYPED_ITEMS = [
+    {
+        "pk": {"S": f"typed-{i}"},
+        "sk": {"N": str(i)},
+        "g": {"S": "typed"},
+        "ns": {"NS": ["1", "2.5", str(10**20)]},
+        "b": {"B": bytes([0, 255, i])},
+        "m": {"M": {"l": {"L": [{"S": "x"}, {"N": "-1E-5"}]}, "t": {"BOOL": True}, "z": {"NULL": True}}},
+    }
+    for i in range(3)
+]
+
+
+def test_migrate_legacy_carries_in_catalog_backups_into_the_store_under_their_arns(deployment, tmp_path):
+    """Two in-catalog backups of a table with a GSI (taken with `[backup.store]
+    kind = "disabled"`), then the store configured and the server started on
+    it once. On PostgreSQL and MongoDB the command runs beside the server; on
+    SQLite the server is stopped, the serve lock being the command's.
+    `migrate-legacy` needs exactly one of `<arn>` and `--all` (exit 2). The
+    first backup by its ARN spelt with another region migrates under its own
+    ARN: exit 0, its line with the item count, the claim line, the summary;
+    `--all` then migrates the second, and again finds nothing to migrate; the
+    first by ARN again is "already in the store". Each prefix holds a
+    manifest of kind `legacy_in_catalog` with no marker, unordered, under the
+    backup's name and the item count. `backup list` shows both rows
+    AVAILABLE; on SQLite and PostgreSQL each in-catalog backup's `backups`
+    row is gone, with no item and no definition row left. The server then
+    lists each backup once, describes it as before the migration but for the
+    sizes, restores it with the table's items and its GSI answering,
+    and DeleteBackup of one deletes its prefix. A plain sync adopts
+    nothing."""
+    d = deployment
+    _set_store_disabled(d)
+    server = _Server(d.config, str(tmp_path / "serve-disabled.log"))
+    try:
+        _wait_health(d.port, lambda h: True, server=server)
+        creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
+        ddb = _client(d.port, creds)
+        name = f"legacy-{uuid.uuid4().hex[:8]}"
+        _create_composite_table(ddb, name, gsi=True)
+        _load(d, creds, name, 300)
+        for item in TYPED_ITEMS:
+            ddb.put_item(TableName=name, Item=item)
+        source = sorted(_typed_canonical(i) for i in _scan_items(ddb, name))
+        assert len(source) == 303
+        first = ddb.create_backup(TableName=name, BackupName="nightly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, first, timeout=60)
+        second = ddb.create_backup(TableName=name, BackupName="weekly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, second, timeout=60)
+        before = {arn: ddb.describe_backup(BackupArn=arn)["BackupDescription"] for arn in (first, second)}
+        assert "is writing the in-catalog backup format" in server.log_text()
+    finally:
+        server.stop()
+    if not os.path.isdir(d.root):
+        os.mkdir(d.root, 0o700)
+    _set_root(d, d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        store_id = _store_id(d.root)
+        if d.backend == "sqlite":
+            server.stop()
+        print(f"branch: {d.backend}, the server {'stopped' if d.backend == 'sqlite' else 'running'}")
+        for args in ((), ("--all", first)):
+            res = _migrate(d, *args)
+            assert res.returncode == 2, res.stdout + res.stderr
+            assert "migrate-legacy <ARN|--all>" in res.stderr, res.stderr
+
+        region = first.split(":")[3]
+        respelt = first.replace(f":{region}:", ":eu-west-3:", 1)
+        res = _migrate(d, respelt)
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert f"Store:  filesystem {os.path.realpath(d.root)} (store id {store_id})" in res.stdout, res.stdout
+        assert 'Took the maintenance claim as "extenddb backup migrate-legacy on ' in res.stdout, res.stdout
+        assert "every backup and restore job of this catalog answers LimitExceededException" in res.stdout
+        assert f"migrated {first} (account {ACCOUNT}): 303 items, " in res.stdout, res.stdout
+        assert (
+            "1 migrated, 0 finished, 0 already in the store, 0 deleted, 0 refused, 0 skipped, 0 failed ==="
+            in res.stdout
+        ), res.stdout
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", res.stdout)
+        assert re.search(
+            r"INFO extenddb::audit: copied an in-catalog backup into the store and replaced it by its catalog "
+            rf'row action="backup migrate-legacy" account_id={ACCOUNT} backup_arn={re.escape(first)}$',
+            plain,
+            re.M,
+        ), plain
+
+        res = _migrate(d, "--all")
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert f"migrated {second} (account {ACCOUNT}): 303 items, " in res.stdout, res.stdout
+        assert first not in res.stdout, res.stdout
+        assert (
+            "1 migrated, 0 finished, 0 already in the store, 0 deleted, 0 refused, 0 skipped, 0 failed ==="
+            in res.stdout
+        ), res.stdout
+        res = _migrate(d, "--all")
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "No in-catalog backup to migrate." in res.stdout, res.stdout
+        res = _migrate(d, first)
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert f"{first} (account {ACCOUNT}) is already in the store: nothing to migrate" in res.stdout, res.stdout
+        assert "0 finished, 1 already in the store, 0 deleted" in res.stdout, res.stdout
+
+        for arn, backup_name in ((first, "nightly"), (second, "weekly")):
+            with open(os.path.join(_prefix(d, name, arn), "extenddb-manifest.json")) as f:
+                manifest = json.load(f)
+            assert manifest["backup_arn"] == arn, manifest["backup_arn"]
+            assert manifest["backup_name"] == backup_name
+            assert manifest["snapshot"] == {"kind": "legacy_in_catalog", "marker": ""}, manifest["snapshot"]
+            assert manifest["item_order"] == "unordered"
+            assert manifest["source_backend"] == d.backend, manifest["source_backend"]
+            assert manifest["source_table"]["item_count"] == 303
+            assert [g["IndexName"] for g in manifest["source_table"]["global_secondary_indexes"]] == ["by-g"]
+            assert sum(f["item_count"] for f in manifest["data_files"]) == 303
+        rows = _rows(d)
+        assert rows == {first: "AVAILABLE", second: "AVAILABLE"}, rows
+        if d.catalog:
+            for arn in (first, second):
+                assert _in_catalog_rows(d, arn) == ("", 0, 0), arn
+        if d.backend == "sqlite":
+            server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+
+        listed = [s["BackupArn"] for s in ddb.list_backups(TableName=name)["BackupSummaries"]]
+        assert sorted(listed) == sorted([first, second]), listed
+        for arn in (first, second):
+            after = ddb.describe_backup(BackupArn=arn)["BackupDescription"]
+            was = before[arn]
+            for member in ("BackupArn", "BackupName", "BackupStatus", "BackupCreationDateTime"):
+                assert after["BackupDetails"][member] == was["BackupDetails"][member], (member, after, was)
+            # The rest of the answer is the in-catalog backup's but for the
+            # source table's size, which becomes the copied items' sum.
+            for section in ("SourceTableDetails", "SourceTableFeatureDetails"):
+                a = {k: v for k, v in after[section].items() if k != "TableSizeBytes"}
+                b = {k: v for k, v in was[section].items() if k != "TableSizeBytes"}
+                assert a == b, (section, after, was)
+            assert after["SourceTableDetails"]["TableName"] == name
+            assert after["SourceTableDetails"]["ItemCount"] == 303
+            gsis = after["SourceTableFeatureDetails"]["GlobalSecondaryIndexes"]
+            assert [g["IndexName"] for g in gsis] == ["by-g"], gsis
+        target = f"{name}-r"
+        resp = ddb.restore_table_from_backup(TargetTableName=target, BackupArn=first)["TableDescription"]
+        assert resp["TableStatus"] == "CREATING", resp
+        _wait_active(ddb, target, timeout=120)
+        assert sorted(_typed_canonical(i) for i in _scan_items(ddb, target)) == source
+        hits = ddb.query(
+            TableName=target,
+            IndexName="by-g",
+            KeyConditionExpression="g = :g",
+            ExpressionAttributeValues={":g": {"S": "typed"}},
+        )["Items"]
+        assert len(hits) == 3, hits
+        ddb.delete_backup(BackupArn=second)
+        deadline = time.monotonic() + 60
+        while os.path.exists(_prefix(d, name, second)):
+            assert time.monotonic() < deadline, "the deleted backup's prefix is still there"
+            time.sleep(0.2)
+        listed = [s["BackupArn"] for s in ddb.list_backups(TableName=name)["BackupSummaries"]]
+        assert listed == [first], listed
+    finally:
+        server.stop()
+    res = d.run("backup", "sync")
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "0 backup(s) adopted" in res.stdout, res.stdout
+
+
+def _keep_in_catalog_backup(d: _Deployment, arn: str, tag: str) -> None:
+    """Copy an in-catalog backup's `backups`, `backup_items` and
+    `backup_definitions` rows aside, into tables named after `tag`."""
+    for table in ("backups", "backup_items", "backup_definitions"):
+        _catalog(d, f"CREATE TABLE kept_{table}_{tag} AS SELECT * FROM {table} WHERE backup_arn = ?", (arn,))
+
+
+def _put_back_in_catalog_backup(d: _Deployment, arn: str, tag: str) -> None:
+    """The rows `_keep_in_catalog_backup` set aside, put back, and the
+    backup's `backup_index` row deleted: the catalog a migration that
+    stopped after its copy and before its replacement leaves."""
+    for table in ("backups", "backup_items", "backup_definitions"):
+        _catalog(d, f"INSERT INTO {table} SELECT * FROM kept_{table}_{tag}", ())
+        _catalog(d, f"DROP TABLE kept_{table}_{tag}", ())
+    assert _catalog(d, "DELETE FROM backup_index WHERE backup_arn = ?", (arn,)) == 1, arn
+
+
+def test_a_backup_deleted_after_a_stopped_migration_never_comes_back(deployment, tmp_path):
+    """Two in-catalog backups migrated, then the catalog put back as a
+    migration that stopped after its copy leaves it (the in-catalog rows
+    back, no catalog row; the store keeps the whole copy of one and only the
+    data files of the other). A malformed `<arn>` exits 2 before the claim
+    is taken. `backup sync` adopts neither while the in-catalog backups are
+    AVAILABLE. DeleteBackup of both answers DELETED. `backup sync` then
+    still adopts neither, naming the deleted backup and the command;
+    `migrate-legacy --all` deletes both copies, a note under each line, and
+    exits 0; a rerun and a sync find nothing, and the backups stay deleted."""
+    d = deployment
+    if not d.catalog:
+        pytest.skip("the stopped migration's catalog is built at the SQLite and PostgreSQL catalog")
+    _set_store_disabled(d)
+    server = _Server(d.config, str(tmp_path / "serve-disabled.log"))
+    try:
+        _wait_health(d.port, lambda h: True, server=server)
+        creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
+        ddb = _client(d.port, creds)
+        name, whole = _small_backed_up_table(ddb, "gone")
+        part = ddb.create_backup(TableName=name, BackupName="weekly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, part, timeout=60)
+    finally:
+        server.stop()
+    if not os.path.isdir(d.root):
+        os.mkdir(d.root, 0o700)
+    _set_root(d, d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        if d.backend == "sqlite":
+            server.stop()
+        res = _migrate(d, "not-an-arn")
+        assert res.returncode == 2, res.stdout + res.stderr
+        assert "not a backup ARN" in res.stderr, res.stderr
+        assert "maintenance claim" not in res.stdout + res.stderr, res.stdout
+
+        tags = {whole: uuid.uuid4().hex[:8], part: uuid.uuid4().hex[:8]}
+        for arn, tag in tags.items():
+            _keep_in_catalog_backup(d, arn, tag)
+        res = _migrate(d, "--all")
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "2 migrated, " in res.stdout, res.stdout
+        for arn, tag in tags.items():
+            _put_back_in_catalog_backup(d, arn, tag)
+            assert _in_catalog_rows(d, arn) == ("AVAILABLE", HAND_BUILT_ITEMS, 1), arn
+        partial = _prefix(d, name, part)
+        for entry in os.listdir(partial):
+            if entry != "data":
+                os.remove(os.path.join(partial, entry))
+        assert os.listdir(partial) == ["data"], os.listdir(partial)
+        assert os.path.isfile(os.path.join(_prefix(d, name, whole), "extenddb-manifest.json"))
+
+        res = d.run("backup", "sync")
+        out = res.stdout + res.stderr
+        assert "0 backup(s) adopted" in res.stdout, out
+        assert f"an in-catalog backup (AVAILABLE) holds this ARN; run extenddb backup migrate-legacy {whole}" in out
+
+        if d.backend == "sqlite":
+            server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+        for arn in tags:
+            deleted = ddb.delete_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert deleted["BackupStatus"] == "DELETED", deleted
+            assert _in_catalog_rows(d, arn) == ("DELETED", 0, 0), arn
+        if d.backend == "sqlite":
+            server.stop()
+
+        res = d.run("backup", "sync")
+        out = res.stdout + res.stderr
+        assert "0 backup(s) adopted" in res.stdout, out
+        assert (
+            "an in-catalog backup with this ARN was deleted; this prefix is a copy a stopped migration "
+            f"left, which extenddb backup migrate-legacy {whole} deletes"
+        ) in out, out
+        assert _rows(d) == {}, _rows(d)
+
+        res = _migrate(d, "--all")
+        assert res.returncode == 0, res.stdout + res.stderr
+        for arn in tags:
+            line = f"deleted {arn} (account {ACCOUNT}): the backup was deleted; nothing to migrate\n"
+            note = (
+                f"  deleted the copy a stopped run left under {_key_prefix(name, arn)}: its in-catalog "
+                "backup was deleted\n"
+            )
+            assert line + note in res.stdout, res.stdout
+            assert not os.path.exists(_prefix(d, name, arn)), arn
+        assert (
+            "0 migrated, 0 finished, 0 already in the store, 2 deleted, 0 refused, 0 skipped, 0 failed ==="
+            in res.stdout
+        ), res.stdout
+        res = _migrate(d, "--all")
+        assert res.returncode == 0 and "No in-catalog backup to migrate." in res.stdout, res.stdout
+        res = d.run("backup", "sync")
+        assert "0 backup(s) adopted" in res.stdout, res.stdout + res.stderr
+
+        if d.backend == "sqlite":
+            server, ddb, creds = _started(d, str(tmp_path / "serve3.log"))
+        for arn in tags:
+            with pytest.raises(ClientError) as gone:
+                ddb.describe_backup(BackupArn=arn)
+            assert gone.value.response["Error"]["Code"] == "BackupNotFoundException", gone.value.response
+        assert ddb.list_backups(TableName=name)["BackupSummaries"] == []
+    finally:
+        server.stop()
+
+
+def test_migrate_legacy_refuses_a_13_digit_id_or_an_item_618_let_in_and_keeps_both(deployment, tmp_path):
+    """Three in-catalog backups: one of a table holding three items with an
+    `N` value #618 let in (written into storage, `_seed_stored_items`), one
+    of a table that restores, and (SQLite, PostgreSQL) a copy of the
+    second's rows under a 13-digit backup id, the shape every 0.1.x release
+    issued. `migrate-legacy --all`
+    migrates the second and goes on past the other two, each refused with
+    its reason and its way out (the item count, the first item and #618;
+    the id of the 13-digit shape), and exits 1 naming the two. The refused
+    backups keep their in-catalog rows and get no prefix; the server
+    describes each AVAILABLE, and the way out works: the 13-digit backup
+    restores through the in-catalog reader and a new backup of the restored
+    table is store-backed under a new ARN."""
+    d = deployment
+    _seed_cell(d)
+    _set_store_disabled(d)
+    server = _Server(d.config, str(tmp_path / "serve-disabled.log"))
+    try:
+        _wait_health(d.port, lambda h: True, server=server)
+        creds = _provision(d.port, d.cert, ADMIN_PASSWORD)
+        ddb = _client(d.port, creds)
+        bad_table = f"n618-legacy-{uuid.uuid4().hex[:6]}"
+        _create_composite_table(ddb, bad_table)
+        ddb.batch_write_item(RequestItems={bad_table: [{"PutRequest": {"Item": i}} for i in GOOD_ITEMS]})
+        bad = BAD_ITEMS
+        _seed_stored_items(d, bad_table, bad)
+        bad_arn = ddb.create_backup(TableName=bad_table, BackupName="nightly")["BackupDetails"]["BackupArn"]
+        _wait_backup_available(ddb, bad_arn, timeout=60)
+        name, good = _small_backed_up_table(ddb, "legacy")
+    finally:
+        server.stop()
+    old = ""
+    if d.catalog:
+        millis, suffix = _backup_id(good).split("-")
+        old = good.rsplit("/", 1)[0] + f"/{int(millis)}-{suffix}"
+        assert len(_backup_id(old).split("-")[0]) == 13, old
+        _copy_in_catalog_backup(d, good, old)
+    if not os.path.isdir(d.root):
+        os.mkdir(d.root, 0o700)
+    _set_root(d, d.root)
+    server, ddb, creds = _started(d, str(tmp_path / "serve.log"))
+    try:
+        if d.backend == "sqlite":
+            server.stop()
+        res = _migrate(d, "--all")
+        out = res.stdout + res.stderr
+        assert res.returncode == 1, out
+        assert f"migrated {good} (account {ACCOUNT}): {HAND_BUILT_ITEMS} items, " in res.stdout, out
+        first = sorted(bad, key=lambda i: (i["pk"]["S"], float(i["sk"]["N"])))[0]
+        refused = (
+            f"refused {bad_arn} (account {ACCOUNT}): {len(bad)} item(s) cannot be restored; first: key "
+            f"{_key_json(first)}, attribute "
+        )
+        assert refused in res.stdout, out
+        line = res.stdout.split(refused, 1)[1].split("\n", 1)[0]
+        assert " (#618); restore it (RestoreTableFromBackup), correct the items the log names, and take a new " \
+            "backup of the restored table, which has a new ARN. Its in-catalog backup is kept" in line, line
+        refusals = 2 if old else 1
+        if old:
+            assert (
+                f"refused {old} (account {ACCOUNT}): its backup id {_backup_id(old)} has the 13-digit shape a "
+                "0.1.x release issued, and a store prefix carries only the 14-digit shape; restore it "
+                "(RestoreTableFromBackup) and take a new backup of the restored table, which has a new ARN. "
+                "Its in-catalog backup is kept"
+            ) in res.stdout, out
+        logged = re.findall(rf"backup {re.escape(bad_arn)}: item cannot be restored: key ", res.stdout)
+        assert len(logged) == len(bad), out
+        assert (
+            f"1 migrated, 0 finished, 0 already in the store, 0 deleted, {refusals} refused, 0 skipped, "
+            "0 failed ==="
+        ) in res.stdout, out
+        assert f"{refusals} backup(s) were not migrated; see above" in res.stderr, out
+        assert not os.path.exists(_prefix(d, bad_table, bad_arn)), "the refused copy was left"
+        assert sorted(os.listdir(os.path.join(d.root, ACCOUNT))) == [name], os.listdir(os.path.join(d.root, ACCOUNT))
+        assert os.listdir(os.path.join(d.root, ACCOUNT, name)) == [_backup_id(good)]
+        assert _rows(d) == {good: "AVAILABLE"}
+        if d.catalog:
+            assert _in_catalog_rows(d, bad_arn) == ("AVAILABLE", len(bad) + len(GOOD_ITEMS), 1)
+            assert _in_catalog_rows(d, old) == ("AVAILABLE", HAND_BUILT_ITEMS, 1)
+            assert _in_catalog_rows(d, good) == ("", 0, 0)
+        res = _migrate(d, bad_arn)
+        assert res.returncode == 1 and refused in res.stdout, res.stdout + res.stderr
+
+        if d.backend == "sqlite":
+            server, ddb, creds = _started(d, str(tmp_path / "serve2.log"))
+        for arn in [bad_arn] + ([old] if old else []):
+            details = ddb.describe_backup(BackupArn=arn)["BackupDescription"]["BackupDetails"]
+            assert details["BackupStatus"] == "AVAILABLE", details
+        if old:
+            listed = [s["BackupArn"] for s in ddb.list_backups(TableName=name)["BackupSummaries"]]
+            assert sorted(listed) == sorted([good, old]), listed
+            target = f"{name}-r"
+            ddb.restore_table_from_backup(TargetTableName=target, BackupArn=old)
+            _wait_active(ddb, target, timeout=120)
+            assert _count(ddb, target) == HAND_BUILT_ITEMS
+            again = ddb.create_backup(TableName=target, BackupName="carried")["BackupDetails"]["BackupArn"]
+            _wait_backup_available(ddb, again, timeout=60)
+            assert os.path.isfile(os.path.join(_prefix(d, target, again), "extenddb-manifest.json"))
+    finally:
+        server.stop()

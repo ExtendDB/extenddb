@@ -72,6 +72,10 @@ pub(crate) async fn handle_update_item_with(
     let input: UpdateItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     extenddb_core::validation::validate_table_name(&input.table_name, &ctx.limits)?;
+    // A number the service cannot read in the key comes next, ahead of the
+    // parameter and expression checks, the table lookup and the key schema
+    // checks (measured 2026-10-27).
+    extenddb_core::validation::number::operations::update_item_key(&input)?;
 
     // An attribute name over the size limit is input validation: it is
     // reported ahead of the table lookup, the expressions, the condition and
@@ -112,6 +116,9 @@ pub(crate) async fn handle_update_item_with(
             ("ConditionExpression", has_condition),
         ],
     )?;
+    // A legacy Expected value's number is read ahead of the condition
+    // (measured 2026-11-11).
+    extenddb_core::validation::number::operations::expected_values(input.expected.as_ref())?;
 
     // Desugar legacy AttributeUpdates into UpdateExpression if present.
     let (effective_update_expr, extra_expr_values, extra_expr_names) =

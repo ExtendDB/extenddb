@@ -56,3 +56,14 @@ decision, write a new ADR.
 | [0027](0027-cassandra-index-row-version-stamps.md) | Cassandra: index rows carry the base-row version as their write timestamp | Accepted |
 | [0029](0029-crates-io-packaging.md) | The workspace crates go to crates.io together, at one version with exact pins | Accepted |
 | [0030](0030-optional-mimalloc-allocator.md) | mimalloc is an opt-in global allocator for the server binary | Proposed |
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

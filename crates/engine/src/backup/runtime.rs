@@ -674,7 +674,16 @@ impl ConfiguredStore {
     /// Whether a call abandoned at its bound has not returned (module doc).
     #[must_use]
     pub fn check_call_in_flight(&self) -> bool {
-        self.check_call_in_flight.caller().is_some()
+        self.call_in_flight_caller().is_some()
+    }
+
+    /// The caller whose call abandoned at its bound has not returned
+    /// ([`BoundedCalls`]'s `what`, such as `check`, `deletion` or `startup
+    /// sync's store call`), if any: the caller the refusal of the next call
+    /// names.
+    #[must_use]
+    pub fn call_in_flight_caller(&self) -> Option<&'static str> {
+        self.check_call_in_flight.caller()
     }
 
     /// Whether a deletion fence's read abandoned at its bound has not
@@ -1398,6 +1407,14 @@ impl BackupStore for BoundedCalls<'_> {
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>> {
         let prefix = prefix.to_owned();
         self.run(move |store| Box::pin(async move { store.delete_prefix(&prefix).await }))
+    }
+
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        let written = written.clone();
+        self.run(move |store| Box::pin(async move { store.delete_written(&written).await }))
     }
 
     fn validate(&self) -> BoxFuture<'_, Result<(), StoreError>> {

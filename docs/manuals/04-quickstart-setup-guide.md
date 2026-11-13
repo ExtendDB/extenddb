@@ -133,7 +133,7 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog migration 9 (postgres)
+# catalog migration 12 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
 # test-hooks disabled
@@ -178,7 +178,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 9
+  OK: Current: the catalog is at migration 12
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -426,6 +426,6 @@ See `docs/troubleshooting.md` for the full troubleshooting guide.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

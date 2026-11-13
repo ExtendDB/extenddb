@@ -17,6 +17,10 @@
 //! | `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup`, `ListBackups`, `DescribeBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime` | ValidationException [`OWNER_ONLY`] | "Access is denied" |
 //! | `RestoreTableToPointInTime` | ValidationException [`OWNER_ONLY`] | the same |
 //!
+//! The server refuses every `RestoreTableToPointInTime`, and an
+//! `UpdateContinuousBackups` that enables point-in-time recovery, before this
+//! code runs.
+//!
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
@@ -114,6 +118,8 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
             .map(extenddb_core::backup_format::trim_backup_arn)
             .and_then(|v| other(v, v.to_owned())),
         "ExportTableToPointInTime" => named("TableArn"),
+        // The server refuses every RestoreTableToPointInTime before this
+        // code runs.
         "RestoreTableToPointInTime" => named("SourceTableArn"),
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             batch_or_transaction(operation, input, account_id)
@@ -143,7 +149,15 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
 /// each is authorized for: `Mixed` when they are in more than one account
 /// (a bare name is in the caller's), else the first in another account.
 fn batch_or_transaction(operation: &str, input: &Value, account_id: &str) -> Option<OtherAccount> {
-    let targets = crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())?;
+    // Only each target's table and action are read here. The limits govern
+    // how the expressions are read for Attributes, which this check ignores,
+    // so the defaults serve.
+    let targets = crate::leading_keys::batch_transact_targets(
+        operation,
+        input,
+        &HashMap::new(),
+        &extenddb_core::limits::LimitsConfig::default(),
+    )?;
     let mut accounts = BTreeSet::new();
     let mut first = None;
     for target in targets {
@@ -239,7 +253,7 @@ async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, Dyn
 }
 
 /// The principal a denial names, in the form the service writes it.
-fn principal_arn(identity: &AuthIdentity) -> String {
+pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
     match identity {
         AuthIdentity::User {
             account_id,

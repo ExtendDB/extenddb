@@ -183,9 +183,9 @@ impl MongoEngine {
                         batch.clear();
                         return Ok(u64::try_from(sent).unwrap_or(u64::MAX));
                     }
-                    CommitOutcome::RerunBody => backoff_sleep(attempt).await,
+                    CommitOutcome::RerunBody(_) => backoff_sleep(attempt).await,
                 },
-                Err(TxErr::Transient) => {
+                Err(TxErr::Transient(_)) => {
                     let _ = session.abort_transaction().await;
                     backoff_sleep(attempt).await;
                 }
