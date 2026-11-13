@@ -3,8 +3,9 @@
 
 //! Request body JSON parsing with a bounded nesting depth.
 //!
-//! `serde_json`'s deserializer refuses any document nested past 128 levels with
-//! a recursion error, which the server turned into a `SerializationException`.
+//! `serde_json`'s deserializer refuses any document nested 128 levels deep or
+//! deeper with a recursion error, which the server turned into a
+//! `SerializationException`.
 //! Amazon DynamoDB instead parses requests nested far past that and answers
 //! with the validation that applies (the 32 level document limit, or whichever
 //! check runs first), so the parser has to reach those checks rather than
@@ -32,12 +33,13 @@ use extenddb_core::error::DynamoDbError;
 /// accepts; `serde_json`'s own default is 128.
 ///
 /// Amazon DynamoDB has no fixed ceiling. A PutItem whose attribute is up to
-/// about 1700 single-key wrappers (about 3400 structural levels) gets the
-/// nesting `ValidationException` on every send; from about 1800 wrappers the
+/// 1500 single-key wrappers (about 3000 structural levels) gets the nesting
+/// `ValidationException` on every send that is a 400; from 1700 wrappers the
 /// answer varies from request to request between that and a message-less
-/// `SerializationException`, with 4000 wrappers also drawing a 500
-/// `InternalFailure`; 5000 wrappers and deeper are refused on every send
-/// (measured 2026-11-12, us-east-1, 24 sends per depth across four windows).
+/// `SerializationException`; 5000 wrappers and deeper are refused on every
+/// send. At 1500 wrappers and deeper a few sends are a 500 `InternalFailure`
+/// instead (measured 2026-11-12 and 2026-11-13, us-east-1, 24 or more sends
+/// per depth across several windows).
 /// An unknown top-level member is ignored at any depth (20000 levels is a 200).
 /// The ceiling, 5200 structural levels or about 2598 wrappers, sits inside the
 /// band where the service itself varies: every depth the service answers
@@ -56,11 +58,12 @@ use extenddb_core::error::DynamoDbError;
 const MAX_REQUEST_JSON_DEPTH: usize = 5200;
 
 /// Deepest structural nesting the handler parses before the caller is
-/// authenticated: `serde_json`'s default recursion limit, which the server
-/// parsed on a default 2 MiB worker stack before the limit was lifted. A body
-/// nested deeper is only scanned until authentication succeeds, so an
-/// unauthenticated request can never make the handler recurse past this depth.
-pub(crate) const UNAUTHENTICATED_PARSE_DEPTH: usize = 128;
+/// authenticated: the 127 levels `serde_json`'s default recursion limit of 128
+/// accepts (it refuses the 128th), which the server parsed on a default 2 MiB
+/// worker stack before the limit was lifted. A body nested deeper is only
+/// scanned until authentication succeeds, so an unauthenticated request can
+/// never make the handler recurse past this depth.
+pub(crate) const UNAUTHENTICATED_PARSE_DEPTH: usize = 127;
 
 /// Stack each thread that handles requests needs, in bytes.
 ///
@@ -286,7 +289,7 @@ mod tests {
         // Rows: the malformed body. Each gets the server's long standing
         // wording around the deserializer's own description, so a change to
         // `serialization_error`'s format fails here.
-        for body in [&b"{not json"[..], br#"{"a":1} tail"#] {
+        for body in [&b"{not json"[..], br#"{"a":1"#] {
             let err = parse(body).unwrap_err();
             assert!(matches!(err, DynamoDbError::SerializationException(_)));
             assert_eq!(err.message(), expected_message(body), "{body:?}");
@@ -297,8 +300,18 @@ mod tests {
     fn the_unauthenticated_depth_is_serde_json_default() {
         // The handler parses a body within this depth before authentication, as
         // the server did with the deserializer's default limit on a default
-        // stack; a deeper one waits for authentication.
-        assert_eq!(UNAUTHENTICATED_PARSE_DEPTH, 128);
+        // stack; a deeper one waits for authentication. Checked against
+        // serde_json itself: with its default limit, a body at this depth
+        // parses and a body one level deeper is the recursion error.
+        let nested = |levels: usize| [b"[".repeat(levels), b"]".repeat(levels)].concat();
+        serde_json::from_slice::<Value>(&nested(UNAUTHENTICATED_PARSE_DEPTH))
+            .expect("serde_json's default limit must parse a body at the depth");
+        let err =
+            serde_json::from_slice::<Value>(&nested(UNAUTHENTICATED_PARSE_DEPTH + 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("recursion limit exceeded"),
+            "{err}"
+        );
         assert!(nesting_depth(&deep_body(62)) <= UNAUTHENTICATED_PARSE_DEPTH);
         assert!(nesting_depth(&deep_body(63)) > UNAUTHENTICATED_PARSE_DEPTH);
     }

@@ -4,16 +4,18 @@
 """A deeply nested request body is parsed and answered by the depth that
 applies, not refused by the JSON parser.
 
-The JSON deserializer used to refuse any body nested past 128 structural levels
-with a SerializationException, so a request whose attribute nested past that
-never reached the nesting-depth check. Amazon DynamoDB parses such a request and
-answers with the document nesting "Nesting Levels have exceeded supported
-limits..." ValidationException. It has no fixed ceiling: a PutItem attribute of
-up to about 1700 single-key wrappers (about 3400 JSON levels) got that
-ValidationException on every send, from about 1800 wrappers the answer varied
-from request to request between it and a message-less SerializationException,
-and 5000 wrappers and deeper got the SerializationException on every send
-(us-east-1, 2026-11-12, 24 sends per depth across four windows).
+The JSON deserializer used to refuse any body nested 128 or more structural
+levels deep with a SerializationException, so a request whose attribute nested
+past that never reached the nesting-depth check. Amazon DynamoDB parses such a
+request and answers with the document nesting "Nesting Levels have exceeded
+supported limits..." ValidationException. It has no fixed ceiling: a PutItem
+attribute of up to 1500 single-key wrappers (about 3000 JSON levels) got that
+ValidationException on every send that was a 400, from 1700 wrappers the answer
+varied from request to request between it and a message-less
+SerializationException, and 5000 wrappers and deeper got the
+SerializationException on every send. A few sends at 1500 wrappers and deeper
+were a 500 InternalFailure instead (us-east-1, 2026-11-12 and 2026-11-13, 24 or
+more sends per depth across several windows).
 
 Dual-target: runs against the service and against ExtendDB on every backend.
 
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 
 import boto3
 import pytest
@@ -89,17 +92,30 @@ def _raw_put_body(table_name: str, pk: str, wrappers: int) -> bytes:
 
 
 def _raw_put(dynamodb_client, table_name: str, pk: str, wrappers: int):
-    """Sign and POST a raw deep PutItem body with the caller's own credentials."""
+    """Sign and POST a raw deep PutItem body with the caller's own credentials.
+
+    Sent up to three times while the answer is a 500. The service gives a deep
+    body a 500 InternalFailure now and then (1500 wrappers: 2 of 56 sends; 2000:
+    1 of 37; 2598: 2 of 48; us-east-1, 2026-11-13), and the client library
+    retries a 500 by default, so the boto3 cases in this file never see one.
+    """
     frozen = boto3.Session().get_credentials().get_frozen_credentials()
-    return signed_post(
-        dynamodb_client.meta.endpoint_url,
-        frozen.access_key,
-        frozen.secret_key,
-        dynamodb_client.meta.region_name,
-        "PutItem",
-        _raw_put_body(table_name, pk, wrappers),
-        session_token=frozen.token,
-    )
+    body = _raw_put_body(table_name, pk, wrappers)
+    for attempt in range(3):
+        if attempt:
+            time.sleep(attempt)
+        resp = signed_post(
+            dynamodb_client.meta.endpoint_url,
+            frozen.access_key,
+            frozen.secret_key,
+            dynamodb_client.meta.region_name,
+            "PutItem",
+            body,
+            session_token=frozen.token,
+        )
+        if resp.status_code != 500:
+            break
+    return resp
 
 
 def _is_nesting_validation_error(err: dict) -> bool:
@@ -143,9 +159,11 @@ def test_an_attribute_far_past_the_parse_limit_still_validates(
 def test_a_deep_body_the_service_always_validates_is_a_nesting_error(
     dynamodb_client, table, wrappers
 ):
-    # Up to 1500 wrappers the service answered the document nesting
-    # ValidationException on every send (24 of 24 per depth). Built as raw JSON
-    # so the client does not recurse.
+    # Up to 1500 wrappers the service's 400 was the document nesting
+    # ValidationException on every send (1500 wrappers: 102 of 104 sends across
+    # 2026-11-12 and 2026-11-13, the other 2 a 500 that _raw_put retries); from
+    # 1700 wrappers the answer varies. Built as raw JSON so the client does not
+    # recurse.
     resp = _raw_put(dynamodb_client, table, f"deep{wrappers}", wrappers)
     assert resp.status_code == 400, resp.text
     assert _is_nesting_validation_error(resp.json()), resp.text
@@ -155,11 +173,11 @@ def test_a_deep_body_the_service_always_validates_is_a_nesting_error(
 def test_a_body_in_the_varying_band_gets_one_of_the_two_answers(
     dynamodb_client, table, wrappers
 ):
-    # From about 1800 wrappers the service's answer varies per request: the
-    # nesting ValidationException or the message-less SerializationException
-    # (2000 wrappers: 23 and 1 of 24 in one set of windows, the other way round
-    # in others). 2598 wrappers is the deepest body the server's ceiling
-    # admits; it parses it and answers the ValidationException.
+    # From 1700 wrappers the service's answer varies per request: the nesting
+    # ValidationException or the message-less SerializationException (2000
+    # wrappers: 23 and 1 of 24 in one set of windows, 17 and 14 of 32 in
+    # another). 2598 wrappers is the deepest body the server's ceiling admits;
+    # it parses it and answers the ValidationException.
     resp = _raw_put(dynamodb_client, table, f"deep{wrappers}", wrappers)
     assert resp.status_code == 400, resp.text
     err = resp.json()
