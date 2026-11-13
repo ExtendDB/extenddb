@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_from, parse_key_condition_from, parse_projection_from, parse_update_from,
+    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_operator_count,
+    validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -89,8 +90,24 @@ pub fn check_expression_size(
 pub fn parse_condition_expr(expr: &str, limits: &LimitsConfig) -> Result<Expr, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::Condition, limits)?;
     tokenize_expression(expr, limits)
-        .and_then(|tokens| parse_condition_with_depth_limit(&tokens, limits.max_expression_depth))
+        .and_then(|tokens| parse_condition_from(&tokens, expr, limits.max_expression_depth))
         .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))
+}
+
+/// Refuse a condition or filter whose operator count exceeds the service's cap
+/// of 300 (`Invalid <kind>: The expression contains too many operators;
+/// operator count: <n>`).
+///
+/// Measured 2026-10-25 (us-east-1): the check runs after the syntax, reserved
+/// word, undefined placeholder and operand type checks and before the unused
+/// placeholder check and the table lookup. `TransactWriteItems` counts a
+/// different total for the same text and does not call this.
+///
+/// # Errors
+///
+/// Returns `DynamoDbError::ValidationException` when the count is over the cap.
+pub fn check_operator_count(expr: &Expr, kind: ExpressionKind) -> Result<(), DynamoDbError> {
+    validate_operator_count(expr, kind)
 }
 
 /// Tokenize, reserved-word check, and parse an `UpdateExpression`.
@@ -205,6 +222,9 @@ pub fn resolve_condition(
     if let Some(ref expr) = condition {
         validate_ordering_operand_types(expr, &maps)
             .map_err(|e| prefix_expression_error(e, ExpressionKind::Condition))?;
+        // After the operand type check (an ordering operator on a BOOL beats
+        // the count), before the unused placeholder check and the table lookup.
+        check_operator_count(expr, ExpressionKind::Condition)?;
     }
     Ok((condition, maps))
 }
@@ -230,7 +250,7 @@ pub fn parse_projection_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_projection(&tokens)
+        parse_projection_from(&tokens, proj_str)
     });
     result.map_err(|e| prefix_expression_error(e, ExpressionKind::Projection))
 }
@@ -257,7 +277,17 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        // The service counts operators on the whole expression before it
+        // applies the key condition grammar: `pk = :v OR` + 150 terms answers
+        // the count, not the operator refusal, and 151 AND-joined equalities
+        // answer the count ahead of the one-condition-per-key check (measured
+        // 2026-10-25). The general condition parser supplies the count; when
+        // it does not accept the text, the key condition parser reports the
+        // error in its own words.
+        if let Ok(expr) = parse_condition_from(&tokens, expr, limits.max_expression_depth) {
+            check_operator_count(&expr, ExpressionKind::KeyCondition)?;
+        }
+        parse_key_condition_from(&tokens, expr)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
@@ -404,6 +434,96 @@ mod tests {
         assert!(
             matches!(&err, DynamoDbError::ValidationException(msg)
                 if msg.contains("Expression size has exceeded the maximum allowed size")),
+            "got {err:?}"
+        );
+    }
+
+    // Operator cap placement, measured 2026-10-25 (us-east-1).
+
+    fn chain(n: usize) -> String {
+        vec!["#v = :v"; n].join(" OR ")
+    }
+
+    #[test]
+    fn count_over_the_cap_is_refused_with_the_full_count() {
+        let limits = LimitsConfig::default();
+        // 151 comparisons and 150 ORs: 301 [a30].
+        let err =
+            resolve_condition(Some(&chain(151)), None, None, None, None, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ConditionExpression: The expression contains too many operators; operator count: 301"),
+            "got {err:?}"
+        );
+        // 150 comparisons and 149 ORs: 299, accepted [a30].
+        assert!(resolve_condition(Some(&chain(150)), None, None, None, None, &limits).is_ok());
+    }
+
+    #[test]
+    fn ordering_operand_type_beats_the_count() {
+        // [p17] 299 operators plus `#v < :b` with a BOOL value.
+        let limits = LimitsConfig::default();
+        let expr = format!("{} OR #v < :b", chain(150));
+        let mut values = HashMap::new();
+        values.insert(":v".to_owned(), AttributeValue::S("x".to_owned()));
+        values.insert(":b".to_owned(), AttributeValue::Bool(true));
+        let err =
+            resolve_condition(Some(&expr), None, Some(&values), None, None, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg.contains("Incorrect operand type for operator or function; operator or function: <, operand type: BOOL")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn syntax_error_beats_the_count() {
+        // [e04] a 300-term chain followed by ` = =`.
+        let limits = LimitsConfig::default();
+        let expr = format!("{} = =", chain(300));
+        let err = resolve_condition(Some(&expr), None, None, None, None, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ConditionExpression: Syntax error; token: \"=\", near: \":v = =\""),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn key_condition_count_runs_before_the_key_grammar() {
+        let limits = LimitsConfig::default();
+        // [a62] `pk = :v OR` + 150 terms: 301, the count, not the OR refusal.
+        let expr = format!("pk = :v OR {}", vec!["#v = :v"; 150].join(" AND "));
+        let err = parse_key_condition_expr(&expr, &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: The expression contains too many operators; operator count: 301"),
+            "got {err:?}"
+        );
+        // [a63] two conditions joined by OR under the cap: the key grammar answers.
+        let err = parse_key_condition_expr("pk = :v OR sk = :s", &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: only AND is supported between key conditions"),
+            "got {err:?}"
+        );
+        // [d23] a syntax error is reported by the key grammar in the service's words.
+        let err = parse_key_condition_expr("pk = :v AND", &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"AND\""),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn projection_syntax_error_quotes_the_source() {
+        // [d27]
+        let limits = LimitsConfig::default();
+        let err = parse_projection_expr("#v, , #v", &limits).unwrap_err();
+        assert!(
+            matches!(&err, DynamoDbError::ValidationException(msg)
+            if msg == "Invalid ProjectionExpression: Syntax error; token: \",\", near: \", , #v\""),
             "got {err:?}"
         );
     }
