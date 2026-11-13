@@ -179,9 +179,10 @@ class TestExportTable:
             assert export_desc["ExportFormat"] == "DYNAMODB_JSON"
 
             # The file holds the table's items, so only the server's user may
-            # read it, whatever the server's umask.
+            # read it; the server's umask can only narrow the mode.
             if os.name == "posix":
-                assert stat.S_IMODE(os.stat(export_path).st_mode) == 0o600
+                mode = stat.S_IMODE(os.stat(export_path).st_mode)
+                assert mode == 0o600, oct(mode)
 
             # Verify file contents.
             with open(export_path) as f:
