@@ -28,6 +28,7 @@ mod registration;
 mod repeated_headers;
 mod request_attributes;
 mod request_helpers;
+mod request_parse;
 mod request_tags;
 mod response;
 mod serve;
@@ -35,6 +36,7 @@ mod table_name_gate;
 mod throttle_helpers;
 mod workers;
 
+pub use request_parse::REQUEST_WORKER_STACK_SIZE;
 pub use serve::{
     BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
     WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
@@ -143,6 +145,11 @@ pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// It stops on SIGINT or SIGTERM, or when `state`'s admission asks for a
 /// stop after the serving registration was lost; both drain the listener
 /// the same way and remove the PID file.
+///
+/// The runtime this runs on must give its threads at least
+/// [`REQUEST_WORKER_STACK_SIZE`] of stack: an authenticated request body nested
+/// to the parser's ceiling recurses to that depth on the handling thread, and
+/// Tokio's default 2 MiB overflows there.
 pub async fn start_server(
     listener: tokio::net::TcpListener,
     state: AppState,

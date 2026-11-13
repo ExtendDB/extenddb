@@ -290,6 +290,12 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     // join it, holding the process open after the drain until SIGKILL.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // An authenticated request body nested to the parser's ceiling is
+        // parsed, converted to typed AttributeValues and dropped on a worker
+        // thread, each step recursing to the body's depth; the server crate
+        // that sets the ceiling sizes the stack it needs (about twice the
+        // measured need, far above Tokio's 2 MiB default).
+        .thread_stack_size(extenddb_server::REQUEST_WORKER_STACK_SIZE)
         .build()?;
     let result = crate::run_then_shut_down(runtime, extenddb_server::serve(params));
     // `serve` has printed the refusal; end with its code, which `migrate`
