@@ -1194,12 +1194,10 @@ pub fn validate_update_item(
     // Validate number values supplied via ExpressionAttributeValues. Unlike a
     // PutItem item (validated by validate_item_numbers), these are checked here
     // because the AttributeValue deserializer intentionally stores malformed
-    // numbers raw and defers rejection to the validation layer. Real DynamoDB
-    // wraps the error as:
-    //   "ExpressionAttributeValues contains invalid value: <inner> for key <k>"
-    if let Some(values) = &input.expression_attribute_values {
-        validate_expression_attribute_value_numbers(values)?;
-    }
+    // numbers raw and defers rejection to the validation layer. The service
+    // answers `1 validation error detected: ` and the number message, with no
+    // ExpressionAttributeValues wrapper (measured 2026-11-11).
+    number::operations::update_item_values(input)?;
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
@@ -1212,29 +1210,6 @@ pub fn validate_update_item(
         }
     }
 
-    Ok(())
-}
-
-/// Validate number values provided via `ExpressionAttributeValues`, matching the
-/// service's wrapped message: `ExpressionAttributeValues contains invalid value:
-/// <inner> for key <placeholder>`. Keys are visited in sorted order so the
-/// reported placeholder is deterministic when several values are invalid.
-fn validate_expression_attribute_value_numbers(
-    values: &std::collections::HashMap<String, AttributeValue>,
-) -> Result<(), DynamoDbError> {
-    let mut keys: Vec<&String> = values.keys().collect();
-    keys.sort();
-    for key in keys {
-        match validate_attribute_number(&values[key]) {
-            Ok(()) => {}
-            Err(DynamoDbError::ValidationException(inner)) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                )));
-            }
-            Err(other) => return Err(other),
-        }
-    }
     Ok(())
 }
 
@@ -4139,7 +4114,9 @@ mod tests {
     #[test]
     fn update_item_rejects_malformed_number_in_eav() {
         // The AttributeValue deserializer stores malformed numbers raw and
-        // defers rejection here. Matches real DynamoDB's wrapped message.
+        // defers rejection here. The service answers the prefix and the
+        // number message, with no ExpressionAttributeValues wrapper (measured
+        // 2026-11-11, `12e` and `abc`).
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4147,13 +4124,14 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
-             The parameter cannot be converted to a numeric value: 12e for key :v"
+            "1 validation error detected: \
+             The parameter cannot be converted to a numeric value: 12e"
         );
     }
 
     #[test]
     fn update_item_rejects_number_overflow_in_eav() {
+        // Measured 2026-11-11 with `1E126` and `1E2147483648`.
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4162,14 +4140,15 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
+            "1 validation error detected: \
              Number overflow. Attempting to store a number with magnitude larger than \
-             supported range for key :v"
+             supported range"
         );
     }
 
     #[test]
     fn update_item_rejects_invalid_number_set_member_in_eav() {
+        // Measured 2026-11-11 with `NS [1, abc]`.
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4179,8 +4158,8 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
-             The parameter cannot be converted to a numeric value: abc for key :v"
+            "1 validation error detected: \
+             The parameter cannot be converted to a numeric value: abc"
         );
     }
 

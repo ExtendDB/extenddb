@@ -150,6 +150,21 @@ pub async fn handle_batch_get_item(
         table_projections.insert(table_name.clone(), projection);
     }
 
+    // A number the service cannot read in a key is checked after every
+    // table's projection and duplicate checks, and before the table lookups,
+    // with tables in name order so that a request answers the same way each
+    // time. Measured 2026-10-27, the service answered a duplicate key in the
+    // first table of the request body ahead of a malformed number in the
+    // second, which this pass follows, and a malformed number in the first
+    // table ahead of a duplicate key in the second, where this pass reports
+    // the duplicate, as before this check.
+    let mut table_names: Vec<&String> = input.request_items.keys().collect();
+    table_names.sort();
+    for table_name in table_names {
+        let keys = &input.request_items[table_name].keys;
+        extenddb_core::validation::number::operations::batch_get_keys(keys)?;
+    }
+
     let mut responses: HashMap<String, Vec<Item>> = HashMap::new();
     let mut total_rcu: f64 = 0.0;
     let mut total_pre_proj_bytes: usize = 0;

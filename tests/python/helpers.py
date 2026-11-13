@@ -107,12 +107,17 @@ def make_raw_client(endpoint_url: str | None, service_name: str = "dynamodb"):
 MEMBER_PATTERN = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
 
 
-def assert_validation(exc, message: str) -> None:
-    """A 400 ValidationException with exactly this message."""
+def assert_validation(exc, message: str, code: str = "ValidationException") -> None:
+    """A 400 with this error code, ValidationException by default, and
+    exactly this message."""
     resp = exc.response
     assert resp["ResponseMetadata"]["HTTPStatusCode"] == 400, resp
-    assert resp["Error"]["Code"] == "ValidationException", resp["Error"]
+    assert resp["Error"]["Code"] == code, resp["Error"]
     assert resp["Error"]["Message"] == message, resp["Error"]["Message"]
+
+
+# The message of every refused point-in-time recovery request on ExtendDB.
+PITR_REFUSAL = "Point-in-time recovery is not supported by this storage backend"
 
 
 def assert_member_pattern(exc, location: str, value: str) -> None:

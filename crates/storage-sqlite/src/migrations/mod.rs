@@ -152,6 +152,9 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
              where U+0000 is the six-character escape \\u0000, so every name reads back as it was \
              written",
         ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, so an ID can be stored once",
+        ),
     }
 }
 

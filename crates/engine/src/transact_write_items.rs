@@ -78,13 +78,23 @@ pub async fn handle_transact_write_items(
         }
     }
 
+    // The client request token's length and pattern are checked ahead of the
+    // actions (measured 2026-10-27: a 37-character token is reported ahead of
+    // a missing table, a condition syntax error and a malformed key number;
+    // measured 2026-11-11: ahead of an attribute name over the size limit and
+    // a number the service cannot read).
+    if let Some(ref token) = input.client_request_token {
+        validate_client_request_token(token)?;
+    }
+
     // Validation runs in the order the service applies it, each phase over
     // every item before the next phase starts:
     //   1. per item, in order, with no table needed: the attribute name sizes
     //      of the item's expression maps and, for a Put, of its item, the
-    //      nesting of the item's ExpressionAttributeValues, expression
-    //      grammar, the semantic walk, unused names and values, then for a
-    //      Put the item size and the item nesting (top-level
+    //      numbers of the item's ExpressionAttributeValues and of its key or
+    //      item, the nesting of the item's ExpressionAttributeValues,
+    //      expression grammar, the semantic walk, unused names and values,
+    //      then for a Put the item size and the item nesting (top-level
     //      ValidationException),
     //   2. table lookup (ResourceNotFoundException),
     //   3. the 4 MB request total (top-level ValidationException),
@@ -176,10 +186,6 @@ pub async fn handle_transact_write_items(
     // The token is passed to the storage layer and checked atomically within
     // the write transaction, guaranteeing that token storage and data writes
     // commit together.
-    if let Some(ref token) = input.client_request_token {
-        validate_client_request_token(token)?;
-    }
-
     let idempotency =
         input
             .client_request_token
@@ -447,6 +453,19 @@ fn parse_write_expressions(
     // a later member's name refusal, and a member's own name refusal comes
     // ahead of every other check on that member.
     validate_member_attribute_name_sizes(twi, limits)?;
+
+    // The member's numbers come next, ahead of its item size, so a Put item
+    // is not sized while it holds a number the service cannot read: sizing
+    // one builds a string as long as the exponent and ends the process.
+    // Within an action the service answers the number ahead of a missing
+    // table, a condition or update syntax error, an unused value, an empty
+    // key, a key update and an item over the size limit (6 of 6 sends each,
+    // measured 2026-11-12); beside a value nested too deep it answered either
+    // (2 and 4 of 6). Across actions an earlier action's condition syntax
+    // error or unused value comes first, and a later action's number comes
+    // ahead of an earlier action's missing table (6 of 6), since every table
+    // lookup follows this phase.
+    extenddb_core::validation::number::operations::transact_write_item(twi)?;
 
     let (names, values, condition_expression, update_expression) = if let Some(put) = &twi.put {
         (
