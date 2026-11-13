@@ -55,6 +55,7 @@ decision, write a new ADR.
 | [0026](0026-credential-crypto-on-aws-lc.md) | Credential cryptography uses AWS-LC through aws-lc-rs | Accepted |
 | [0027](0027-cassandra-index-row-version-stamps.md) | Cassandra: index rows carry the base-row version as their write timestamp | Accepted |
 | [0029](0029-crates-io-packaging.md) | The workspace crates go to crates.io together, at one version with exact pins | Accepted |
+| [0030](0030-optional-mimalloc-allocator.md) | mimalloc is an opt-in global allocator for the server binary | Proposed |
 
 ---
 
