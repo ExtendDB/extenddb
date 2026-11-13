@@ -130,6 +130,14 @@ docker run -d -p 127.0.0.1:18080:18080 \
 `docker-compose.dev.yml` at the repository root defines both as services
 (`extenddb-dev`, and `extenddb-dev-memory` under the `memory` profile).
 
+**Export files.** The image configures no import or export root. When you set
+one, for example with `-e EXTENDDB__IMPORT_EXPORT_ROOT=/exports` and a bind
+mount at `/exports`, each export file is created with mode 0600 and owned by
+the container's uid, 65532, so a host user cannot read it through the mount:
+copy it out with `docker cp <container>:/exports/<account id>/<file> .`, or
+run the container as the host user (`--user "$(id -u):$(id -g)"`) in the
+in-memory mode, since the image's state directory belongs to uid 65532.
+
 ## Health
 
 The image carries a Docker `HEALTHCHECK` (the binary's own `healthcheck`

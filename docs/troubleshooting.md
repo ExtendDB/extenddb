@@ -926,11 +926,17 @@ Keys imported earlier keep working while import is disabled.
 
 **Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
 
-### `Cannot write export file: <error>`
+### `Cannot write export file`
 
 **Cause:** The export destination path is not writable (permission denied, disk full, etc.).
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Check that the extenddb process has write access to the destination directory. The server creates the account directory (`<export root>/<account id>`) at the account's first export; any other directory in `FilePath` must already exist, or the export fails with `Parent directory does not exist or is not accessible`.
+
+### `Permission denied` opening an export file or directory after upgrading to v0.1.15
+
+**Cause:** From v0.1.15 the server creates export files with mode 0600, and the roots and account directories it creates with mode 0700, so only the server's user and root can read them. A member of the server user's group, or a host user reading through a bind mount while the container runs as another uid, is refused.
+
+**Fix:** Read the file as the server's user or as root, copy it out of the container with `docker cp <container>:<path> .`, or run the container as the reader's uid (`--user`). The upgrade manual's [v0.1.15 entry](manuals/07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the details, and how to keep a group's access to import files.
 
 ### `Invalid table ARN: <arn>`
 
