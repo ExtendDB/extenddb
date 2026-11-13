@@ -257,7 +257,7 @@ LICENSE_HTML = """<div class="license-page">
 See the LICENSE file in the project root for the full text.</p>
 <p>This software is provided &ldquo;as is&rdquo; without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
-&ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc.</p>
+&ldquo;DynamoDB&rdquo; is a trademark of Amazon.com, Inc. or its affiliates.</p>
 </div>
 <div style="page-break-after: always"></div>
 """

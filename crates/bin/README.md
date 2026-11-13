@@ -1,9 +1,9 @@
 # ExtendDB
 
-> **ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB and does
-> not contain any DynamoDB source code.** "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-> implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are documented
-> in [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
+> **ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB and does not contain any DynamoDB
+> source code. It is not an AWS service.** "DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates. ExtendDB is
+> a clean-room implementation that speaks the DynamoDB wire protocol. Behavioral differences from the real service are
+> documented in [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
 ExtendDB is a DynamoDB-compatible API server. Any AWS SDK, CLI or tool that works with DynamoDB works with ExtendDB.
 This crate builds the `extenddb` binary.

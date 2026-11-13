@@ -3,7 +3,7 @@
 
 ## Notice
 
-**ExtendDB (extenddb) is not Amazon DynamoDB.** This software is an independent, clean-room implementation that provides a DynamoDB-compatible API. It does not contain, derive from, or link to any Amazon DynamoDB source code, libraries, or proprietary components.
+**ExtendDB (extenddb) is not Amazon DynamoDB.** This software is a clean-room implementation that provides a DynamoDB-compatible API. It does not contain, derive from, or link to any Amazon DynamoDB source code, libraries, or proprietary components.
 
 "DynamoDB", "Amazon DynamoDB", "AWS", and "Amazon Web Services" are trademarks of Amazon.com, Inc. or its affiliates. ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
 

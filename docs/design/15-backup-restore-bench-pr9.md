@@ -318,4 +318,4 @@ See [LICENSE](../../LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
-"DynamoDB" is a trademark of Amazon.com, Inc.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
