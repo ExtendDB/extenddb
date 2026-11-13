@@ -9,12 +9,13 @@
 //! therefore holds a single test, which sets umask 0 and runs every case in
 //! order. Under umask 0 a mode the code does not set shows up as `0777` or
 //! `0666`. The unit tests in `src/private_fs.rs` check the same modes under
-//! the inherited umask.
+//! the inherited umask. Scratch directories are `tempfile::TempDir`s, so a
+//! failed assertion does not leave them behind.
 
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use extenddb_core::limits::LimitsConfig;
@@ -25,6 +26,7 @@ use extenddb_engine::{
 use extenddb_storage::server_components::ServerComponentsOptions;
 use extenddb_storage_sqlite::SqliteConfig;
 use serde_json::json;
+use tempfile::TempDir;
 
 const REGION: &str = "us-east-1";
 
@@ -46,7 +48,8 @@ fn owner_only_modes_hold_under_a_umask_of_zero() {
 /// missing ancestors with the default mode, and leaves the existing parent
 /// alone.
 fn missing_directories() {
-    let base = scratch("missing");
+    let dir = scratch("missing");
+    let base = dir.path();
     let leaf = base.join("a").join("b").join("c");
 
     create_private_dir_all(&leaf).unwrap();
@@ -54,52 +57,63 @@ fn missing_directories() {
     for dir in [base.join("a"), base.join("a").join("b")] {
         assert_eq!(
             mode_of(&dir),
-            0o777,
+            Mode(0o777),
             "a missing ancestor, {}",
             dir.display()
         );
     }
-    assert_eq!(mode_of(&leaf), 0o700);
-    assert_eq!(mode_of(&base), 0o755, "the existing parent keeps its mode");
-    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(mode_of(&leaf), Mode(0o700));
+    assert_eq!(
+        mode_of(base),
+        Mode(0o755),
+        "the existing parent keeps its mode"
+    );
 }
 
 /// An existing directory keeps its mode, whether it is the one asked for or
 /// an ancestor of it, and a second call changes nothing.
 fn existing_directories() {
-    let base = scratch("existing");
-    let shared = base.join("shared");
+    let dir = scratch("existing");
+    let shared = dir.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     set_mode(&shared, 0o775);
 
     create_private_dir_all(&shared).unwrap();
     assert_eq!(
         mode_of(&shared),
-        0o775,
+        Mode(0o775),
         "an existing directory keeps its mode"
     );
 
     let child = shared.join("child");
     create_private_dir_all(&child).unwrap();
-    assert_eq!(mode_of(&shared), 0o775, "an existing parent keeps its mode");
-    assert_eq!(mode_of(&child), 0o700);
+    assert_eq!(
+        mode_of(&shared),
+        Mode(0o775),
+        "an existing parent keeps its mode"
+    );
+    assert_eq!(mode_of(&child), Mode(0o700));
 
     create_private_dir_all(&child).unwrap();
-    assert_eq!(mode_of(&child), 0o700, "a second call changes nothing");
-    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(
+        mode_of(&child),
+        Mode(0o700),
+        "a second call changes nothing"
+    );
 }
 
 /// An `ExportTableToPointInTime` on a file-backed `SqliteEngine` creates
 /// the account directory 0700 and the export file 0600, and leaves the root
 /// alone.
 fn export_through_the_handler() {
-    let base = scratch("export");
+    let dir = scratch("export");
+    let base = dir.path();
     let root = base.join("exports");
     std::fs::create_dir(&root).unwrap();
     set_mode(&root, 0o755);
 
     let (account_dir, file) = block_on(async {
-        let ctx = context(&base, &root).await;
+        let ctx = context(base, &root).await;
         let account_dir = root.join(&*ctx.account_id);
         let file = account_dir.join("modes.json");
         handle_create_table(
@@ -125,18 +139,21 @@ fn export_through_the_handler() {
         (account_dir, file)
     });
 
-    assert_eq!(mode_of(&account_dir), 0o700, "the account directory");
-    assert_eq!(mode_of(&file), 0o600, "the export file");
-    assert_eq!(mode_of(&root), 0o755, "the configured root keeps its mode");
-    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(mode_of(&account_dir), Mode(0o700), "the account directory");
+    assert_eq!(mode_of(&file), Mode(0o600), "the export file");
+    assert_eq!(
+        mode_of(&root),
+        Mode(0o755),
+        "the configured root keeps its mode"
+    );
 }
 
 /// Control: the standard calls follow the umask, so the cases above would
 /// have seen `0777` and `0666` had the code not set the modes.
 fn standard_calls_follow_the_umask() {
     let base = scratch("control");
-    let dir = base.join("plain");
-    let file = base.join("plain.json");
+    let dir = base.path().join("plain");
+    let file = base.path().join("plain.json");
 
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::OpenOptions::new()
@@ -145,9 +162,8 @@ fn standard_calls_follow_the_umask() {
         .open(&file)
         .unwrap();
 
-    assert_eq!(mode_of(&dir), 0o777);
-    assert_eq!(mode_of(&file), 0o666);
-    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(mode_of(&dir), Mode(0o777));
+    assert_eq!(mode_of(&file), Mode(0o666));
 }
 
 /// A context on a file-backed `SqliteEngine` under `base`, in the account
@@ -192,28 +208,43 @@ async fn context(base: &Path, root: &Path) -> OperationContext {
     }
 }
 
-/// A fresh `0755` directory under the temp dir.
-fn scratch(name: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "extenddb-private-modes-{name}-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&base).unwrap();
-    set_mode(&base, 0o755);
-    base
+/// A fresh `0755` directory under the temp dir, removed when dropped.
+///
+/// The temp dir is canonicalized first. The export root is passed
+/// canonicalized and the export path is checked against it as written, so a
+/// temp dir reached through a symlink (`/var` on macOS) would put the export
+/// path outside the root.
+fn scratch(name: &str) -> TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("extenddb-private-modes-{name}-"))
+        .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+        .unwrap();
+    set_mode(dir.path(), 0o755);
+    dir
+}
+
+/// A permission mode that prints in octal when an assertion fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mode(u32);
+
+impl std::fmt::Debug for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:04o}", self.0)
+    }
 }
 
 fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-fn mode_of(path: &Path) -> u32 {
-    std::fs::symlink_metadata(path)
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777
+fn mode_of(path: &Path) -> Mode {
+    Mode(
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+    )
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

@@ -45,50 +45,62 @@ mod tests {
     //! engine's `tests/private_modes.rs`.
 
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+
+    use tempfile::TempDir;
 
     use super::resolve_roots;
 
-    /// A fresh `0755` directory under the temp dir.
-    fn scratch() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "extenddb-roots-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        set_mode(&base, 0o755);
-        base
+    /// A permission mode that prints in octal when an assertion fails.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Mode(u32);
+
+    impl std::fmt::Debug for Mode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:04o}", self.0)
+        }
+    }
+
+    /// A fresh `0755` directory under the canonical temp dir, removed when
+    /// dropped, also when the test panics.
+    fn scratch() -> TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("extenddb-roots-")
+            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .unwrap();
+        set_mode(dir.path(), 0o755);
+        dir
     }
 
     fn set_mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::symlink_metadata(path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777
+    fn mode_of(path: &Path) -> Mode {
+        Mode(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+        )
     }
 
     /// The mode a directory created without a mode gets under the inherited
     /// umask: `0777` less the umask's bits.
-    fn default_dir_mode() -> u32 {
+    fn default_dir_mode() -> Mode {
         let base = scratch();
-        let probe = base.join("probe");
+        let probe = base.path().join("probe");
         std::fs::DirBuilder::new()
             .mode(0o777)
             .create(&probe)
             .unwrap();
         let mode = mode_of(&probe);
-        std::fs::remove_dir_all(&base).unwrap();
         assert_eq!(
-            mode & 0o700,
+            mode.0 & 0o700,
             0o700,
             "these tests need a umask that masks no owner bit, not {:03o}",
-            0o777 & !mode
+            0o777 & !mode.0
         );
         mode
     }
@@ -96,33 +108,46 @@ mod tests {
     #[test]
     fn a_missing_root_is_created_owner_only() {
         let default = default_dir_mode();
-        let base = scratch();
+        if default == Mode(0o700) {
+            eprintln!("skipped: the inherited umask gives every directory 0700");
+            return;
+        }
+        let dir = scratch();
+        let base = dir.path();
         let root = base.join("exports").join("nested");
 
         let resolved = resolve_roots(&[root.display().to_string()], "export").unwrap();
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(*resolved[0], root.canonicalize().unwrap());
-        assert_eq!(mode_of(&root), 0o700);
+        assert_eq!(mode_of(&root), Mode(0o700));
         assert_eq!(
             mode_of(&base.join("exports")),
             default,
             "a missing ancestor gets the default mode"
         );
-        assert_eq!(mode_of(&base), 0o755, "an existing ancestor keeps its mode");
-        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(
+            mode_of(base),
+            Mode(0o755),
+            "an existing ancestor keeps its mode"
+        );
     }
 
     #[test]
     fn an_existing_root_keeps_its_mode() {
-        let base = scratch();
+        let dir = scratch();
+        let base = dir.path();
         let root = base.join("shared");
         std::fs::create_dir(&root).unwrap();
         set_mode(&root, 0o775);
 
         resolve_roots(&[root.display().to_string()], "import").unwrap();
 
-        assert_eq!(mode_of(&root), 0o775);
-        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(mode_of(&root), Mode(0o775));
+        assert_eq!(
+            mode_of(base),
+            Mode(0o755),
+            "the root's parent keeps its mode"
+        );
     }
 }

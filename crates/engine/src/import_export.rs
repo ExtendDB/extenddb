@@ -245,6 +245,8 @@ pub async fn handle_export_table(
         &ctx.export_paths,
         &ctx.account_id,
     )?;
+    // `validate_path_parent` has just required the parent to exist, so this
+    // creates a directory only when another process removes it in between.
     if let Some(parent) = output_path.parent() {
         create_private_dir_all(parent).map_err(|_| {
             DynamoDbError::ValidationException("Cannot create output directory".to_owned())
