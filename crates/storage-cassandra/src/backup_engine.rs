@@ -1220,6 +1220,40 @@ impl CassandraEngine {
         }
     }
 
+    /// The items of one payload bucket of `backup_arn`, each with the byte
+    /// length of its stored JSON.
+    async fn read_backup_bucket(
+        &self,
+        account_keyspace: &str,
+        backup_arn: &str,
+        bucket: i64,
+    ) -> Result<Vec<(Item, usize)>, StorageError> {
+        let query = format!(
+            "SELECT item_data FROM {account_keyspace}.backup_items WHERE backup_arn = ? AND bucket = ?"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let bucket = bucket as i32;
+        let rows = self
+            .session
+            .query_with_values(&query, cdrs_tokio::query_values!(backup_arn, bucket))
+            .await
+            .map_err(|e| StorageError::Internal(format!("Read backup payload: {e}")))?
+            .response_body()
+            .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
+            .into_rows()
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let item_data: String = row
+                .get_r_by_name("item_data")
+                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            let item: Item = serde_json::from_str(&item_data)
+                .map_err(|e| StorageError::Internal(format!("Deserialize backup item: {e}")))?;
+            items.push((item, item_data.len()));
+        }
+        Ok(items)
+    }
+
     async fn copy_backup_into_target(
         &self,
         job: &RestoreJob,
@@ -1232,19 +1266,32 @@ impl CassandraEngine {
             key_schema: job.key_schema.clone(),
             base_key_schema: job.key_schema.clone(),
             attribute_definitions: job.attribute_definitions.clone(),
-            // The restore write path reads the target's indexes from the
-            // catalog by table_id; these routing fields are not consulted by it.
+            // The copy reads the target's indexes from the catalog by
+            // table_id (below); the writer does not consult these routing
+            // fields.
             has_lsi: false,
             global_secondary_indexes: Vec::new(),
             local_secondary_indexes: Vec::new(),
             stream_specification: None,
             vector_indexes: Vec::new(),
         };
+        // The target's indexes, read at LOCAL_QUORUM: the restore wrote them
+        // moments ago, and an index a lagging replica omits would be left
+        // empty for every restored item. Every GSI is written in the item's
+        // own batch, as LSIs always are: the target turns ACTIVE only after
+        // its last item is written, and DynamoDB reports a restored table's
+        // indexes as complete at ACTIVE.
+        let mut indexes = crate::data::index::fetch_indexes_for_table_quorum(
+            &job.table_id,
+            &self.session,
+            &self.catalog_keyspace(),
+        )
+        .await
+        .map_err(CopyError::Failed)?;
+        for index in &mut indexes {
+            index.propagation_delay_ms = Some(0);
+        }
         let account_keyspace = self.account_keyspace(&job.account_id);
-        let writer = self
-            .restore_writer(&key_info)
-            .await
-            .map_err(CopyError::Failed)?;
         let read_bucket = |bucket: i64| {
             let account_keyspace = &account_keyspace;
             async move {
@@ -1267,17 +1314,21 @@ impl CassandraEngine {
             .map_ok(|items| futures::stream::iter(items.into_iter().map(Ok)))
             .try_flatten()
             .map_ok(|(item, item_len)| {
-                let writer = &writer;
-                let heartbeat = &heartbeat;
+                let key_info = &key_info;
+                let indexes = &indexes;
                 async move {
-                    // The read stage checks ownership per bucket; with two
-                    // buckets read ahead and 64 writes in flight, up to three
-                    // buckets of items would otherwise still be written into
-                    // a target the sweep has claimed.
+                    // The read stage checks ownership per bucket; with the
+                    // buckets read ahead and the writes in flight, items of
+                    // up to three buckets would otherwise still be written
+                    // into a target the sweep has claimed.
                     if heartbeat.is_lost() {
                         return Err(CopyError::OwnershipLost);
                     }
-                    self.write_restored_item(writer, &item)
+                    // The clock reading a new row's version takes
+                    // (`data::version`), also the write timestamp of the
+                    // item's base and index rows.
+                    let stamp = crate::data::version::now_micros();
+                    self.put_restored_item_at(key_info, indexes, &item, stamp)
                         .await
                         .map_err(CopyError::Failed)?;
                     Ok::<usize, CopyError>(item_len)

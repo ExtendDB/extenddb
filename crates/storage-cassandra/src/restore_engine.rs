@@ -429,8 +429,8 @@ impl RestoreEngine for CassandraEngine {
             let generation = claim.generation();
             let key_info = self.restore_target_key_info(target).await?;
             // The target's indexes, once per file (a CREATING target's do not
-            // change), every GSI synchronous as the put path's
-            // `IndexWrites::AllSynchronous` makes them.
+            // change), every GSI synchronous as `put_restored_item_at` takes
+            // them.
             let mut indexes = crate::data::index::fetch_indexes_for_table(
                 &target.table_id,
                 &self.session,

@@ -17,16 +17,6 @@ use super::{json_to_item, query_with_pk_sk};
 use crate::CassandraEngine;
 use crate::stream_util::stream_record_statement;
 
-/// How a put maintains GSIs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IndexWrites {
-    /// Each GSI by its propagation delay: synchronous at 0, otherwise through
-    /// the `gsi_pending` queue.
-    AsConfigured,
-    /// Every GSI in the item's own batch, as with a 0 delay.
-    AllSynchronous,
-}
-
 impl CassandraEngine {
     /// Implementation of `DataEngine::put_item`.
     ///
@@ -43,41 +33,41 @@ impl CassandraEngine {
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
     ) -> Result<Option<Item>, StorageError> {
-        self.put_item_with_retry(
-            key_info,
-            item,
-            return_old,
-            condition,
-            maps,
-            stream,
-            IndexWrites::AsConfigured,
-        )
-        .await
-    }
+        use super::delete_item::{TTL_CLAIM_MAX_RETRIES, ttl_claim_backoff};
 
-    /// The write a restore copy makes for one backup item: the ordinary put
-    /// path (same base-row write, same index maintenance helpers, same
-    /// projection), with every GSI written in the item's own logged batch as
-    /// LSIs always are, instead of through the asynchronous propagation queue.
-    /// A restore target becomes ACTIVE only after its last item is written,
-    /// and DynamoDB reports a restored table's indexes as complete at ACTIVE;
-    /// queueing the rows would let ACTIVE precede them.
-    pub(crate) async fn put_restored_item(
-        &self,
-        key_info: &TableKeyInfo,
-        item: Item,
-    ) -> Result<(), StorageError> {
-        self.put_item_with_retry(
-            key_info,
-            item,
-            false,
-            None,
-            &ExpressionMaps::default(),
-            None,
-            IndexWrites::AllSynchronous,
-        )
-        .await
-        .map(|_| ())
+        // The system delay, read at most once for all attempts.
+        let sys_delay_read = tokio::sync::OnceCell::new();
+        for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
+            match self
+                .put_item_impl_inner(
+                    key_info,
+                    item.clone(),
+                    return_old,
+                    condition,
+                    maps,
+                    stream,
+                    &sys_delay_read,
+                )
+                .await
+            {
+                Err(StorageError::TransactionConflict(message))
+                    if attempt == TTL_CLAIM_MAX_RETRIES =>
+                {
+                    return Err(StorageError::TransactionConflict(message));
+                }
+                // A lost OCC race (another writer committed between our read and
+                // write) surfaces as TransactionConflict from the inner call, for
+                // both conditional and unconditional puts. Retry against the new
+                // version: the inner call re-reads the current item and
+                // re-evaluates any condition against it. After exhausting retries,
+                // surface as TransactionConflict (DynamoDB's behaviour for
+                // persistent write contention). A genuine condition failure is
+                // returned as ConditionFailed *before* the write and is not retried.
+                Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
+                other => return other,
+            }
+        }
+        unreachable!("loop returns on the final attempt")
     }
 
     /// The write a store-backed restore makes for one backup item, at the
@@ -95,7 +85,9 @@ impl CassandraEngine {
     /// later ordinary write's `next_row_version` is above it and its index
     /// rows resolve in order (`data::version`). `indexes` are the target's,
     /// read once per data file by the caller, each with its propagation delay
-    /// zeroed so every GSI is written in the batch as LSIs always are.
+    /// zeroed so every GSI is written in the batch as LSIs always are. The
+    /// legacy copy (`backup_engine`) writes each item through this too, with
+    /// the indexes read once per copy and the clock reading as `stamp`.
     pub(crate) async fn put_restored_item_at(
         &self,
         key_info: &TableKeyInfo,
@@ -178,55 +170,6 @@ impl CassandraEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn put_item_with_retry(
-        &self,
-        key_info: &TableKeyInfo,
-        item: Item,
-        return_old: bool,
-        condition: Option<&Expr>,
-        maps: &ExpressionMaps,
-        stream: Option<&StreamCapture>,
-        index_writes: IndexWrites,
-    ) -> Result<Option<Item>, StorageError> {
-        use super::delete_item::{TTL_CLAIM_MAX_RETRIES, ttl_claim_backoff};
-
-        // The system delay, read at most once for all attempts.
-        let sys_delay_read = tokio::sync::OnceCell::new();
-        for attempt in 0..=TTL_CLAIM_MAX_RETRIES {
-            match self
-                .put_item_impl_inner(
-                    key_info,
-                    item.clone(),
-                    return_old,
-                    condition,
-                    maps,
-                    stream,
-                    index_writes,
-                    &sys_delay_read,
-                )
-                .await
-            {
-                Err(StorageError::TransactionConflict(message))
-                    if attempt == TTL_CLAIM_MAX_RETRIES =>
-                {
-                    return Err(StorageError::TransactionConflict(message));
-                }
-                // A lost OCC race (another writer committed between our read and
-                // write) surfaces as TransactionConflict from the inner call, for
-                // both conditional and unconditional puts. Retry against the new
-                // version: the inner call re-reads the current item and
-                // re-evaluates any condition against it. After exhausting retries,
-                // surface as TransactionConflict (DynamoDB's behaviour for
-                // persistent write contention). A genuine condition failure is
-                // returned as ConditionFailed *before* the write and is not retried.
-                Err(StorageError::TransactionConflict(_)) => ttl_claim_backoff(attempt).await,
-                other => return other,
-            }
-        }
-        unreachable!("loop returns on the final attempt")
-    }
-
-    #[allow(clippy::too_many_arguments)]
     async fn put_item_impl_inner(
         &self,
         key_info: &TableKeyInfo,
@@ -235,7 +178,6 @@ impl CassandraEngine {
         condition: Option<&Expr>,
         maps: &ExpressionMaps,
         stream: Option<&StreamCapture>,
-        index_writes: IndexWrites,
         sys_delay_read: &tokio::sync::OnceCell<u64>,
     ) -> Result<Option<Item>, StorageError> {
         let data_keyspace = self.account_keyspace(&key_info.account_id);
@@ -250,7 +192,7 @@ impl CassandraEngine {
 
         // Fetch indexes for GSI/LSI updates
         // Both are catalog reads with no data dependency; overlap them.
-        let (mut indexes, ttl_config) = futures::try_join!(
+        let (indexes, ttl_config) = futures::try_join!(
             super::index::fetch_indexes_for_table(
                 &key_info.table_id,
                 &self.session,
@@ -268,14 +210,8 @@ impl CassandraEngine {
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         }
-        if index_writes == IndexWrites::AllSynchronous {
-            for index in &mut indexes {
-                index.propagation_delay_ms = Some(0);
-            }
-        }
         // Read live, once per write call however often it retries, and only
-        // when some GSI follows the system setting. `AllSynchronous` set
-        // every index's delay to 0 above, so it reads nothing.
+        // when some GSI follows the system setting.
         let sys_delay = self.system_index_delay_once(&indexes, sys_delay_read).await;
 
         // Always use read-then-write path to check prepared_txn_id for transaction safety.
