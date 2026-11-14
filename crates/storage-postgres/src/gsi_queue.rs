@@ -462,8 +462,8 @@ async fn next_ready_wait(
 }
 
 /// Whether the data database has `idx_gsi_pending_table_claim`, the index the
-/// per-table claim and the per-batch listing walk (data migration
-/// `005_gsi_pending_table_claim.sql`).
+/// per-table claim and the per-batch listing walk (migration 13,
+/// `gsi_pending_table_claim`).
 pub async fn claim_index_present(pool: &PgPool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_indexes \
@@ -484,7 +484,7 @@ async fn warn_if_claim_index_missing(pool: &PgPool) {
             "gsi_pending has no idx_gsi_pending_table_claim index, so the upgrade's migrate step \
              was skipped; index propagation runs, but each claim sorts the partition's ready rows \
              and each batch's table listing scans gsi_pending. Stop the servers and run \
-             `extenddb migrate --yes` to apply data migration 005_gsi_pending_table_claim.sql"
+             `extenddb migrate --yes` to apply migration 13, gsi_pending_table_claim"
         ),
         Err(e) => tracing::debug!("could not check for idx_gsi_pending_table_claim: {e}"),
     }

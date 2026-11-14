@@ -722,6 +722,6 @@ async fn a_ledger_document_this_binary_cannot_read_stops_the_status() {
         .expect_err("an error");
     migrations.close().await;
     assert!(error.to_string().contains("\"sideways\""), "{error}");
-    assert_eq!(MigrationId::LATEST.number(), 12);
+    assert_eq!(MigrationId::LATEST.number(), 13);
     d.drop_databases().await;
 }

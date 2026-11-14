@@ -186,6 +186,10 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
             "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
              EXISTS, so an ID can be stored once",
         ),
+        MigrationId::GsiPendingTableClaim => Migration::NotApplicable(
+            "the index is on the PostgreSQL data database's gsi_pending, for the per-table claim \
+             of the PostgreSQL queue workers",
+        ),
     }
 }
 

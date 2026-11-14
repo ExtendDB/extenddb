@@ -155,6 +155,10 @@ pub fn migration(id: MigrationId) -> Migration<SqliteStores> {
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
+        MigrationId::GsiPendingTableClaim => Migration::NotApplicable(
+            "the index is on the PostgreSQL data database's gsi_pending, for the per-table claim \
+             of the PostgreSQL queue workers",
+        ),
     }
 }
 

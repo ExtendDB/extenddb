@@ -1,6 +1,7 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
--- Per-table claim order for the propagation queue.
+-- Migration 13, gsi_pending_table_claim, PostgreSQL data database: the
+-- per-table claim order for the propagation queue.
 --
 -- A queue worker serves the tables in its partition in turn, claiming each
 -- table's oldest ready row: WHERE worker_partition = $1 AND table_id = $2 AND
@@ -21,16 +22,9 @@
 -- the plan for a small table in a partition another table dominates, and for a
 -- table before its first ANALYZE. Both plans are under 0.05 ms.
 --
--- Apply with `extenddb migrate --yes` during the stop / migrate / restart
--- upgrade sequence. A server started without it serves correctly and logs a
--- warning at startup that names the skipped step; until the index exists, a
--- claim for a table behind another table's backlog reads past that backlog, and
--- the per-batch listing scans gsi_pending (33 ms at 40,000 queued rows), so the
--- drain rate falls while the queue is large.
-
-BEGIN;
+-- `extenddb migrate --yes` applies it during the stop / migrate / start
+-- upgrade sequence, and a server refuses a deployment where it is pending.
+-- IF NOT EXISTS makes a second run change nothing.
 
 CREATE INDEX IF NOT EXISTS idx_gsi_pending_table_claim
     ON gsi_pending (worker_partition, table_id, id);
-
-COMMIT;
