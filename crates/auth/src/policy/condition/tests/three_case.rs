@@ -81,9 +81,10 @@ fn unresolvable_key_is_unresolvable_for_every_operator() {
 fn variable_naming_unresolvable_key_is_unresolvable_with_or_without_default() {
     // Case 3 read through a condition value: the variable has no value to
     // expand to, and the service, which has one, would not use the default.
-    // Every operator yields Unresolvable, so a Deny applies and an Allow does
-    // not grant whatever the operator says. A later value of the condition
-    // that names the key counts as the first one does.
+    // Every operator that expands the value (the string and ARN ones) yields
+    // Unresolvable, so a Deny applies and an Allow does not grant whatever the
+    // operator says. A later value of the condition that names the key counts
+    // as the first one does.
     let ctx = TestContext::new()
         .with("aws:PrincipalTag/team", vec!["blue"])
         .unresolvable("aws:PrincipalOrgID");

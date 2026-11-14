@@ -403,15 +403,14 @@ def test_iam_user_manages_its_own_access_keys(world: World) -> None:
     assert key_id not in world.mgmt.list_access_keys(b.id, user).text
 
 
-def test_iam_user_reads_its_own_account_page_and_user_page(world: World) -> None:
-    # #731 tracks which pages of its own account an IAM-user session should
-    # read, so the pages of the account's other users, groups and roles are
-    # not checked here either way.
+def test_iam_user_reads_its_own_user_page_and_not_its_account_page(world: World) -> None:
+    # tests/test_console_iam_user_pages.py checks every page of the user's
+    # own account; here the account page stands for them.
     b, user = world.b, world.viewer_name
     resp = world.viewer.get(PAGES["account"](b))
-    assert resp.status_code == 200, resp.status_code
-    assert "location" not in resp.headers
-    assert b.name in resp.text
+    assert resp.status_code == 303, resp.status_code
+    assert resp.headers.get("location") == "/console"
+    assert b.name not in resp.text
 
     resp = world.viewer.get(f"/accounts/{b.id}/users/{user}")
     assert resp.status_code == 200, resp.status_code
@@ -443,7 +442,7 @@ def test_home_page_shows_deployment_counts_to_admins_only(world: World) -> None:
     assert page.status_code == 200, page.status_code
     assert "Admin Users" not in page.text
     assert "<p>Accounts</p>" not in page.text
-    assert f'<a href="/console/accounts/{world.b.id}">' in page.text
+    assert f'<a href="/console/accounts/{world.b.id}/users/{world.viewer_name}">' in page.text
     for name in world.a.names() + [world.a.id]:
         assert name not in page.text, name
 
