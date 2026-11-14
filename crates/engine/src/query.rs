@@ -47,32 +47,13 @@ pub async fn handle_query(
     body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
-    // Pre-scanned before typed deserialization, sequentially: Query stops at
-    // the FIRST invalid enum, checking ReturnConsumedCapacity ahead of Select.
-    // Measured 2026-08-24 (us-east-1): both invalid answers "1 validation
-    // error detected" naming returnConsumedCapacity alone. (Scan is the
-    // opposite on both counts: it aggregates, select-first; see handle_scan.)
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "ReturnConsumedCapacity",
-            valid: &["INDEXES", "TOTAL", "NONE"],
-            clause: crate::EnumClause::Named("returnConsumedCapacity"),
-        }],
-    )?;
-    crate::validate_enum_fields(
-        &body,
-        &[crate::EnumField {
-            json_name: "Select",
-            valid: &[
-                "SPECIFIC_ATTRIBUTES",
-                "COUNT",
-                "ALL_ATTRIBUTES",
-                "ALL_PROJECTED_ATTRIBUTES",
-            ],
-            clause: crate::EnumClause::Named("select"),
-        }],
-    )?;
+    // Request-time checks on the raw body, in the service's order: Limit, the
+    // ReturnConsumedCapacity enum, the expression and non-expression parameter
+    // mix, every number in ExpressionAttributeValues, the Select enum. They
+    // run before typed deserialization so a field that does not deserialize
+    // does not stop the ones before it. The server runs the same function
+    // ahead of the IAM decision; see `query_key_values`.
+    crate::query_key_values::validate_query_request_body(&body)?;
     let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
@@ -137,14 +118,7 @@ pub async fn handle_query(
         validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
+    // Limit >= 1 is checked at request time in validate_query_request_body.
 
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
@@ -166,34 +140,9 @@ pub async fn handle_query(
         key_info.clone()
     };
 
-    // --- Legacy vs expression mutual exclusivity checks ---
-    let kce_present = input.key_condition_expression.is_some();
-    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-    let has_fe = input.filter_expression.is_some();
-    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_pe = input.projection_expression.is_some();
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
+    // The legacy versus expression mutual exclusivity check runs at request
+    // time in validate_query_request_body.
     let has_cond_op = input.conditional_operator.is_some();
-
-    // KeyConditions legitimately combines with FilterExpression and
-    // ProjectionExpression, so it joins the mixing check only when
-    // KeyConditionExpression is also present.
-    extenddb_core::validation::validate_no_expression_param_mixing(
-        &[
-            ("AttributesToGet", has_atg),
-            ("QueryFilter", has_qf),
-            ("ConditionalOperator", has_cond_op),
-            ("KeyConditions", has_kc && kce_present),
-        ],
-        &[
-            ("ProjectionExpression", has_pe),
-            ("FilterExpression", has_fe),
-            ("KeyConditionExpression", kce_present),
-        ],
-    )?;
 
     // An explicitly empty KeyConditionExpression is rejected up front, before
     // the expression-parameter-usage checks (matching real DynamoDB).
@@ -277,11 +226,9 @@ pub async fn handle_query(
     // HASH or several RANGE attributes) every clause is assigned by name, every
     // HASH attribute needs an equality and the RANGE conditions must cover a
     // leading run of the RANGE attributes with equalities before the last one.
-    // A wrong-typed value is reported where the service reports it: after those
-    // structural rules and before the non-key rule on a multi-attribute key
-    // schema, and ahead of the missing-key check on a single-attribute one
-    // (measured 2026-10-21: `pk = :n` on an S key with a second clause on a
-    // non-key attribute reports the type, not the missing key).
+    // On a multi-attribute key schema the service reports a wrong-typed value
+    // after those structural rules and before the non-key rule, so the
+    // classifier runs the type check there.
     //
     // On a multi-attribute key schema the classifier refuses a clause on an
     // attribute outside the key schema (`Query condition missed key schema
@@ -291,11 +238,23 @@ pub async fn handle_query(
     // 2026-10-30 on a GSI with HASH `GSI2PK` and RANGE `GSI2SK`: `GSI2PK = :h
     // AND PK = :k` answers `Query condition missed key schema element: GSI2SK`
     // whether `:k` has the table's type for `PK` or not, so the service's type
-    // check does not see an attribute outside the queried key schema. The
-    // single-attribute path has no non-key rule yet: a clause on another
-    // attribute reaches storage, which applies it to the first RANGE
-    // attribute, so it keeps checking against the table's definitions, which
-    // refuse a value of the wrong type before storage does.
+    // check does not see an attribute outside the queried key schema.
+    //
+    // On a single-attribute key schema the service reports a wrong-typed value
+    // after the missing-key, filter, projection, unused-value and Select
+    // checks (measured 2026-11-06). The classifier does not run the type check
+    // there, and `validate_key_condition_types` reports the value below. `pk =
+    // :n` on an S key with a second clause on a non-key attribute reports the
+    // type, not a missing key schema element (measured 2026-10-21). This path
+    // has no non-key rule, so that query also reaches the check below.
+    // Legacy `KeyConditions` are checked by the classifier: against the key
+    // schema's definitions on a multi-attribute key schema and against the
+    // table's on a single-attribute one. The check below runs only where the
+    // classifier did not check (`!check_types_here`). For a legacy value of
+    // the wrong type on a single-attribute key schema, the service reports the
+    // projection, Select, filter, QueryFilter and unused-value checks first
+    // (measured 2026-11-11 and 2026-11-12), so the classifier's check answers
+    // ahead of them there, where the service does not.
     let multipart = extenddb_core::types::is_multipart_key_schema(&query_key_info.key_schema);
     let key_schema_definitions: Vec<extenddb_core::types::AttributeDefinition> = query_key_info
         .attribute_definitions
@@ -313,16 +272,19 @@ pub async fn handle_query(
     } else {
         &query_key_info.attribute_definitions
     };
+    let check_types_here = multipart || legacy_kc_maps.is_some();
     key_condition.resolve_key_schema_with(
         &query_key_info.key_schema,
         &effective_maps.names,
-        |path, value| check_key_value_type(path, value, type_definitions, effective_maps),
+        |path, value| {
+            if check_types_here {
+                check_key_value_type(path, value, type_definitions, effective_maps)
+            } else {
+                Ok(())
+            }
+        },
     )?;
-    refuse_begins_with_on_number(
-        &key_condition,
-        &query_key_info.attribute_definitions,
-        effective_maps,
-    )?;
+    refuse_begins_with_on_number(&key_condition, effective_maps)?;
     // On a single-attribute key schema, validate that the partition key is
     // actually referenced in the condition. The classifier has already required
     // an equality on every HASH attribute of a multi-attribute one.
@@ -488,6 +450,19 @@ pub async fn handle_query(
         )?;
     }
 
+    // A key condition value whose type is not the key attribute's type is
+    // refused after the key schema, filter, projection, unused value and
+    // Select checks and before the ExclusiveStartKey check (measured
+    // 2026-10-24). The classifier above checked the values of legacy
+    // `KeyConditions` and of every multi-attribute key schema.
+    if !check_types_here {
+        crate::query_key_values::validate_key_condition_types(
+            &key_condition,
+            effective_maps,
+            &query_key_info.attribute_definitions,
+        )?;
+    }
+
     // Validate ExclusiveStartKey matches the key schema
     if let Some(ref start_key) = input.exclusive_start_key {
         validate_query_exclusive_start_key(start_key, &key_info, index_info.as_ref())?;
@@ -630,7 +605,7 @@ fn resolve_path_attr_name(
 /// `attribute_definitions` is not checked here. On a multi-attribute key
 /// schema the caller passes the queried key schema's definitions only, and the
 /// classifier reports a clause on any other attribute.
-fn check_key_value_type(
+pub(crate) fn check_key_value_type(
     path: &[PathElement],
     expr: &extenddb_core::expression::Expr,
     attribute_definitions: &[extenddb_core::types::AttributeDefinition],
@@ -664,37 +639,40 @@ fn check_key_value_type(
         Ok(())
     } else {
         Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: Condition parameter type does not match \
-             schema type"
-                .to_owned(),
+            crate::query_key_values::KEY_CONDITION_TYPE_MISMATCH.to_owned(),
         ))
     }
 }
 
-/// Refuse `begins_with` on a number key attribute (measured 2026-10-21:
-/// `Invalid KeyConditionExpression: Incorrect operand type for operator or
-/// function; operator or function: begins_with, operand type: N`).
+/// Refuse a `begins_with` key condition whose value is not an S or a B, with
+/// the value's type in the text: `Invalid KeyConditionExpression: Incorrect
+/// operand type for operator or function; operator or function: begins_with,
+/// operand type: N`.
+///
+/// Measured on the service 2026-11-06: the value's type decides the refusal,
+/// not the sort key's type. An N or a BOOL value is refused on an S, an N and
+/// a B sort key alike. An S or a B value on a sort key of another type gets
+/// the type mismatch from the type check instead. The refusal comes before the
+/// unused-value, projection overlap and Select checks and before a wrong-typed
+/// partition key value. A placeholder that has no value passes here, and the
+/// existing checks report it.
 fn refuse_begins_with_on_number(
     key_condition: &extenddb_core::expression::KeyCondition,
-    attribute_definitions: &[extenddb_core::types::AttributeDefinition],
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    use extenddb_core::expression::SortKeyCondition;
-    use extenddb_core::types::ScalarAttributeType;
+    use extenddb_core::expression::{Expr, SortKeyCondition};
 
-    if let Some(SortKeyCondition::BeginsWith { path, .. }) = &key_condition.sk_condition
-        && let Some(attr) = resolve_path_attr_name(path, &maps.names)
-        && attribute_definitions
-            .iter()
-            .any(|d| d.attribute_name == attr && d.attribute_type == ScalarAttributeType::N)
-    {
-        return Err(DynamoDbError::ValidationException(
-            "Invalid KeyConditionExpression: Incorrect operand type for operator or function; \
-             operator or function: begins_with, operand type: N"
-                .to_owned(),
-        ));
-    }
-    Ok(())
+    let Some(SortKeyCondition::BeginsWith { path, prefix }) = &key_condition.sk_condition else {
+        return Ok(());
+    };
+    // The operand check of the filter, applied to the key condition's call.
+    let call = Expr::Function {
+        name: "begins_with".to_owned(),
+        args: vec![Expr::Path(path.clone()), prefix.clone()],
+    };
+    extenddb_core::expression::validate_begins_with_operands(&call, maps).map_err(|e| {
+        crate::expression_helpers::prefix_expression_error(e, ExpressionKind::KeyCondition)
+    })
 }
 
 /// Validate that all `#name` references in an expression AST are defined.
@@ -798,3 +776,11 @@ mod empty_key_condition_tests {
         assert!(reject_empty_key_condition_expression(Some("pk = :v")).is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "query_begins_with_tests.rs"]
+mod begins_with_tests;
+
+#[cfg(test)]
+#[path = "query_gate_tests.rs"]
+mod gate_tests;
