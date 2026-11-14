@@ -507,9 +507,9 @@ impl MongoEngine {
         // this loop does. The error means another put's item is already in
         // the collection, so the next attempt finds that item, replaces it
         // and returns it as the old image; if a delete removed that item
-        // first, the next attempt inserts. This path makes at most
-        // `CREATE_RACE_ATTEMPTS` attempts and backs off between them, the
-        // budget a lost create race has on the transaction path below.
+        // first, the next attempt inserts. Attempts share the transient
+        // retry budget and back off between them, as the transaction path
+        // below does.
         if condition.is_none()
             && stream.is_none()
             && self.gsi_cache_get_fresh(&key_info.table_id) == Some(false)
@@ -520,7 +520,7 @@ impl MongoEngine {
                 .upsert(true)
                 .return_document(ReturnDocument::Before)
                 .build();
-            for attempt in 0..CREATE_RACE_ATTEMPTS {
+            for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
                 match coll
                     .find_one_and_replace(key_filter.clone(), &new_doc)
                     .with_options(opts.clone())
@@ -536,7 +536,7 @@ impl MongoEngine {
                     Err(e) => return Err(StorageError::Internal(e.to_string())),
                 }
             }
-            return Err(create_race_exhausted(CREATE_RACE_ATTEMPTS));
+            return Err(create_race_exhausted(TRANSIENT_RETRY_ATTEMPTS));
         }
 
         let mut session = self
@@ -550,7 +550,7 @@ impl MongoEngine {
         let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
                 return Err(contention_deadline_exhausted(
                     "PutItem",
@@ -652,8 +652,8 @@ impl MongoEngine {
                     // item's `_id` without matching the key filter. It runs
                     // the transaction again with the backoff of a write
                     // conflict and counts the attempt against
-                    // `CREATE_RACE_ATTEMPTS`, and the put gives up with the
-                    // create race error once that many attempts have met
+                    // `TRANSIENT_RETRY_ATTEMPTS`, and the put gives up with
+                    // the create race error once that many attempts have met
                     // such a document.
                     let old_doc = match coll
                         .find_one_and_replace(key_filter.clone(), new_doc)
@@ -715,7 +715,7 @@ impl MongoEngine {
                         // contention on an item, so it gives up here with the
                         // create race error rather than spending the
                         // contention budget.
-                        if lost_create_races >= CREATE_RACE_ATTEMPTS {
+                        if lost_create_races >= TRANSIENT_RETRY_ATTEMPTS {
                             return Err(create_race_exhausted(lost_create_races));
                         }
                     }
@@ -732,7 +732,7 @@ impl MongoEngine {
         // Retry ceiling exhausted: see `write_conflict::retry_budget_exhausted`.
         Err(crate::write_conflict::retry_budget_exhausted(
             "PutItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -808,7 +808,7 @@ impl MongoEngine {
         let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
                 return Err(contention_deadline_exhausted(
                     "DeleteItem",
@@ -916,7 +916,7 @@ impl MongoEngine {
 
         Err(crate::write_conflict::retry_budget_exhausted(
             "DeleteItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -1072,7 +1072,7 @@ impl MongoEngine {
         let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
                 return Err(contention_deadline_exhausted(
                     "UpdateItem",
@@ -1292,7 +1292,7 @@ impl MongoEngine {
         // the same contention on the same item.
         Err(crate::write_conflict::retry_budget_exhausted(
             "UpdateItem",
-            TRANSIENT_RETRY_ATTEMPTS,
+            CONTENTION_RETRY_ATTEMPTS,
             &last_cause,
         ))
     }
@@ -2469,7 +2469,7 @@ impl MongoEngine {
         let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             // A transaction that reaches the deadline stops retrying and
             // falls through to the give-up after the loop, which answers
             // `TransactionCanceledException` with a `TransactionConflict`
@@ -2676,7 +2676,7 @@ impl MongoEngine {
         // TransactionCanceled to TransactionCanceledException; the
         // reason codes are echoed back in the message.
         tracing::warn!(
-            attempts = TRANSIENT_RETRY_ATTEMPTS,
+            attempts = CONTENTION_RETRY_ATTEMPTS,
             error = %last_cause,
             "TransactWriteItems: could not commit; answering TransactionCanceled"
         );
@@ -3586,7 +3586,7 @@ impl MongoEngine {
         // GSI backfill job in `ttl_worker.rs`, not inside a request: no
         // caller is waiting for a reply, and giving up on the clock would
         // leave the index CREATING with its cursor where it stopped.
-        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
+        for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             session
                 .start_transaction()
                 .with_options(tx_options.clone())
@@ -3756,7 +3756,7 @@ impl MongoEngine {
     ) -> Result<CommitOutcome, StorageError> {
         #[cfg(not(feature = "test-hooks"))]
         let _ = gate_table;
-        for attempt in 0..COMMIT_RETRY_ATTEMPTS {
+        for attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
             let commit_res = session.commit_transaction().await;
             #[cfg(feature = "test-hooks")]
             let commit_res = self
@@ -3859,15 +3859,24 @@ pub(crate) struct GsiBackfillProgress {
 
 // ── Contention / retry helpers ──────────────────────────────────────────
 
-/// Maximum number of times to retry a write that MongoDB aborted as a
-/// transient conflict. Small enough that we don't lock a partition on
-/// sustained hot-key contention; large enough to absorb ordinary
-/// snapshot-isolation aborts. Matches the OCC retry ceiling elsewhere
-/// in this file.
+/// Maximum number of attempts of the retry loops that the measurements behind
+/// [`CONTENTION_RETRY_ATTEMPTS`] do not cover: the backup and restore
+/// transactions, the in-place retry of `commitTransaction` after an
+/// `UnknownTransactionCommitResult`, and the create-race give-up of an
+/// unconditional PutItem and of UpdateItem's native upsert.
+///
+/// The commit retry waits for the reply of one idempotent commit and never
+/// re-runs the body. A lost create race is not a write conflict: the attempt
+/// found no item and its insert hit an item another writer created and deleted
+/// again. #431 measured this budget, with its backoff, as the one that lets
+/// that race resolve: a put blocked by a document that is removed 100 ms after
+/// the put starts commits well inside it, and the storage tests fail when the
+/// cap is put back to 5. A longer budget on either loop only delays the HTTP
+/// 500 it answers.
 pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 
-/// Maximum number of times to retry a write that MongoDB aborted as a
-/// transient conflict.
+/// Maximum number of times a contention retry loop re-runs a transaction that
+/// MongoDB aborted as a transient conflict.
 ///
 /// MongoDB aborts the loser of a same-document conflict at once instead of
 /// queueing it, so a hot key is settled by retries with backoff: of N
@@ -3887,10 +3896,10 @@ pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 /// shared host, under the SDKs' request timeouts.
 ///
 /// This budget sizes the contention retry loops only: the put, delete,
-/// update, transact and GSI backfill loops, which re-run their transaction
-/// body after a conflict. The commit retry and the create-race give-up have
-/// their own budgets below, because the measurements that set this one say
-/// nothing about either.
+/// update, transact and GSI backfill loops and the transaction of the key
+/// repair pass, which re-run their transaction body after a conflict. The
+/// other retry loops read [`TRANSIENT_RETRY_ATTEMPTS`], because the
+/// measurements that set this one say nothing about them.
 const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
 
 /// Wall-clock deadline for the contention retry loop of one request.
@@ -3956,29 +3965,6 @@ const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
 /// test has to race 1,000 attempts against a wall clock. Every production
 /// construction uses this value.
 pub(crate) const CONTENTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Maximum number of times to retry `commitTransaction` in place after an
-/// `UnknownTransactionCommitResult`.
-///
-/// Not a contention loop: the label means the commit's outcome is unknown,
-/// the commit is idempotent and the body must not be re-run, so these
-/// attempts are waiting for one reply rather than racing other writers. No
-/// measurement sizes a longer wait, and a longer one only delays the HTTP
-/// 500 this path answers when the outcome stays unknown, so it keeps the
-/// value every write path used before the contention budget was raised.
-const COMMIT_RETRY_ATTEMPTS: u32 = 50;
-
-/// Maximum number of attempts of an unconditional PutItem that may lose the
-/// create race before it gives up.
-///
-/// A lost create race is not a write conflict: the attempt found no item and
-/// its insert hit an item another writer created and deleted again. #431
-/// measured this budget, with its backoff, as the one that lets the race
-/// resolve: a put blocked by a document that is removed 100 ms after the put
-/// starts commits well inside it, and the storage tests fail when the cap is
-/// put back to 5. A longer budget only delays the HTTP 500 this path
-/// answers, so the contention budget above does not govern it.
-const CREATE_RACE_ATTEMPTS: u32 = 50;
 
 /// Return type of `try_build_native_update`. Distinguishes an
 /// operator-document update (`{$set, $unset, $inc}`) from an
@@ -4124,7 +4110,7 @@ pub(crate) fn is_duplicate_key(e: &mongodb::error::Error) -> bool {
 /// The error when every attempt of an unconditional PutItem lost the create
 /// race: on the sessionless path, each attempt found no item, and its insert
 /// hit an item another writer created, which was deleted again before the
-/// next attempt read it; on the transaction path, `CREATE_RACE_ATTEMPTS`
+/// next attempt read it; on the transaction path, `TRANSIENT_RETRY_ATTEMPTS`
 /// attempts met a document that holds the item's `_id` without matching the
 /// key filter.
 /// `attempt` is the number of attempts made. The message is the internal
@@ -4749,14 +4735,14 @@ mod tests {
         assert!(!contention_deadline_passed(0, spent, CONTENTION_DEADLINE));
         assert!(contention_deadline_passed(1, spent, CONTENTION_DEADLINE));
         assert!(contention_deadline_passed(
-            TRANSIENT_RETRY_ATTEMPTS - 1,
+            CONTENTION_RETRY_ATTEMPTS - 1,
             spent,
             CONTENTION_DEADLINE
         ));
         let fresh = std::time::Instant::now();
         assert!(!contention_deadline_passed(1, fresh, CONTENTION_DEADLINE));
         assert!(!contention_deadline_passed(
-            TRANSIENT_RETRY_ATTEMPTS - 1,
+            CONTENTION_RETRY_ATTEMPTS - 1,
             fresh,
             CONTENTION_DEADLINE
         ));

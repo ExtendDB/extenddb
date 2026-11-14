@@ -18,7 +18,7 @@ use extenddb_core::expression::ExpressionMaps;
 use extenddb_core::types::{Item, TableKeyInfo};
 use extenddb_storage::error::StorageError;
 
-use super::super::CREATE_RACE_ATTEMPTS;
+use super::super::TRANSIENT_RETRY_ATTEMPTS;
 use super::{finish, item_key, s, scratch_engine, table, with};
 use crate::MongoEngine;
 use crate::data::{data_collection_name, document_to_item, item_to_document};
@@ -53,8 +53,8 @@ fn document_id(item: &Item, key_info: &TableKeyInfo) -> Bson {
 }
 
 /// An unconditional PutItem whose insert keeps colliding on `_id` retries for
-/// the whole create race budget, then gives up with the create race error, on
-/// the sessionless path and on the transaction path.
+/// the whole retry budget, then gives up with the create race error, on the
+/// sessionless path and on the transaction path.
 ///
 /// A document that holds the item's `_id` under a different `pk` makes every
 /// attempt collide: the put's filter on `pk` finds no item, and its insert
@@ -79,7 +79,7 @@ async fn live_unconditional_put_retries_a_lost_create_race_and_then_gives_up() {
             .put_item_impl(&key_info, item, true, None, &maps, None)
             .await;
 
-        let want = format!("could not create the item after {CREATE_RACE_ATTEMPTS} attempts");
+        let want = format!("could not create the item after {TRANSIENT_RETRY_ATTEMPTS} attempts");
         match res {
             Err(StorageError::Internal(msg)) => assert!(
                 msg.contains(&want),

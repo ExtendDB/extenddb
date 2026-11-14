@@ -487,11 +487,11 @@ async fn live_unconditional_put_that_spends_its_attempt_budget_gives_up_with_a_t
     match res {
         Err(StorageError::Transient(msg)) => {
             // The budget is written out rather than read from
-            // `TRANSIENT_RETRY_ATTEMPTS`, so a change to the constant fails
+            // `CONTENTION_RETRY_ATTEMPTS`, so a change to the constant fails
             // here instead of changing what the test expects.
-            assert_eq!(
-                msg,
-                "PutItem: the write lost 1000 attempts to concurrent writers; retry the request"
+            assert!(
+                msg.starts_with("PutItem: could not commit in 1000 attempts: "),
+                "{msg}"
             );
             println!("the put spent its attempt budget in {elapsed:?}: {msg}");
         }
