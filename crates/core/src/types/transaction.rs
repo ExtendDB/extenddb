@@ -316,11 +316,21 @@ impl CancellationReason {
         }
     }
 
-    /// Internal reason for a wrong-typed key found while preparing a
+    /// Internal reason for a wrong-typed key supplied in the request of a
     /// transaction member: a table key element that does not match the
-    /// schema, or a secondary-index key (on a written item or as a literal
-    /// operand) that does not match its attribute definition. Never reaches a
-    /// client: [`Self::resolve_key_faults`] rewrites it to `ValidationError`.
+    /// schema, or a secondary-index key (on a Put item or as an Update's
+    /// literal operand) that does not match its attribute definition. Never
+    /// reaches a client: [`Self::resolve_key_faults`] rewrites it to
+    /// `ValidationError`.
+    ///
+    /// A wrong type an Update writes from `if_not_exists` or from an
+    /// attribute reference is not this reason. With the path present the
+    /// value comes from the stored item; with the path absent the fallback
+    /// is a literal from the request, and the service ranks it with the
+    /// values taken from the item. The service reports both as a plain
+    /// positional `ValidationError` and leaves the other members' outcomes
+    /// in place, so the storage layers carry them as
+    /// [`Self::validation_error`].
     #[must_use]
     pub fn key_type_mismatch(msg: impl Into<String>) -> Self {
         Self {
@@ -342,47 +352,47 @@ impl CancellationReason {
         }
     }
 
-    /// Whether this reason is one of the internal key faults that
-    /// [`Self::resolve_key_faults`] gives precedence to. A backend that runs
-    /// members out of request order can stop once the earliest such member
-    /// in request order is known: a wrong-typed key there outranks every later
-    /// member, and an empty index key there outranks every later member that
-    /// is not itself a wrong-typed key.
-    #[must_use]
-    pub fn is_key_fault(&self) -> bool {
-        self.code == KEY_TYPE_MISMATCH_CODE || self.code == INDEX_KEY_EMPTY_ABORT_CODE
-    }
-
     /// Apply the precedence `DynamoDB` gives key faults across the members of
-    /// a `TransactWriteItems` request, measured on the service. A wrong-typed
-    /// key (table or secondary index) on any member cancels the transaction
-    /// with the first such member's `ValidationError` in position and `None`
-    /// in every other position, whatever those members' own faults were.
-    /// Otherwise an empty secondary-index key on any member aborts the whole
-    /// request with a top-level `ValidationException`, outranking failed
-    /// conditions and unapplicable statements on the other members. Otherwise
-    /// the reasons are returned as they are.
+    /// a `TransactWriteItems` request, measured on the service: the first
+    /// internal key fault in request order decides. A wrong-typed key there
+    /// (see [`Self::key_type_mismatch`]) cancels the transaction with that
+    /// member's `ValidationError` and `None` in every other position,
+    /// whatever those members' own faults were. An empty secondary-index key
+    /// there (see [`Self::index_key_empty_abort`]) answers the whole request
+    /// with a top-level `ValidationException` carrying its message. With no
+    /// internal key fault the reasons are returned as they are: a wrong type
+    /// an Update writes from the stored item arrives as a plain
+    /// `ValidationError` and the other members keep their own outcomes beside
+    /// it (measured: `[ValidationError, ConditionalCheckFailed]`).
+    ///
+    /// The storage layers resolve the faults supplied in the request (table
+    /// keys, a Put item's index keys, an Update's literal types) over every
+    /// member before any member is applied. They then run the members before
+    /// the first Update member with an empty index-key literal and put that
+    /// literal's reason at its position, so the reasons carry only empty
+    /// values, the first of which decides, beside plain reasons: an empty
+    /// value an earlier member wrote from the item answers ahead of the
+    /// literal (measured 2026-11-01).
     ///
     /// # Errors
     ///
     /// Returns `Err(message)` when the request must be answered with a
     /// top-level `ValidationException` carrying `message`.
-    pub fn resolve_key_faults(reasons: Vec<Self>) -> Result<Vec<Self>, String> {
-        let first_type_mismatch = reasons
+    pub fn resolve_key_faults(mut reasons: Vec<Self>) -> Result<Vec<Self>, String> {
+        let Some(first) = reasons
             .iter()
-            .position(|r| r.code == KEY_TYPE_MISMATCH_CODE);
-        let mut reasons = reasons;
+            .position(|r| r.code == KEY_TYPE_MISMATCH_CODE || r.code == INDEX_KEY_EMPTY_ABORT_CODE)
+        else {
+            return Ok(reasons);
+        };
+        if reasons[first].code == INDEX_KEY_EMPTY_ABORT_CODE {
+            return Err(reasons.swap_remove(first).message.unwrap_or_default());
+        }
         for (i, reason) in reasons.iter_mut().enumerate() {
-            match first_type_mismatch {
-                Some(first) if i == first => reason.code = "ValidationError".to_owned(),
-                Some(_) => *reason = Self::none(),
-                None if reason.code == INDEX_KEY_EMPTY_ABORT_CODE => {
-                    if let Some(message) = reason.message.take() {
-                        return Err(message);
-                    }
-                    *reason = Self::none();
-                }
-                None => {}
+            if i == first {
+                reason.code = "ValidationError".to_owned();
+            } else {
+                *reason = Self::none();
             }
         }
         Ok(reasons)
@@ -436,41 +446,165 @@ mod tests {
         );
     }
 
+    // The kinds of fault a transaction member can carry into the resolver:
+    // two internal key faults (a wrong type supplied in the request, an empty
+    // index key) and the plain reasons beside them (a wrong type an Update
+    // writes from the stored item, a failed condition). Each test below puts
+    // one pair in both member orders; the expected answers are the measured
+    // ones (2026-10-30 rows A2, B1, C1, D1, E1, F1, F2 and their reversals;
+    // 2026-10-31 section 1, a Put item's empty key against a wrong type in
+    // the request, which the first in request order decides).
+    const COMPUTED: &str =
+        "The update expression attempted to update the secondary index key to unsupported type";
+
+    fn type_fault() -> CancellationReason {
+        CancellationReason::key_type_mismatch("type")
+    }
+
+    fn empty_fault() -> CancellationReason {
+        CancellationReason::index_key_empty_abort("empty key")
+    }
+
+    fn computed_fault() -> CancellationReason {
+        CancellationReason::validation_error(COMPUTED)
+    }
+
+    fn failed_condition() -> CancellationReason {
+        CancellationReason::condition_check_failed_with_item(None)
+    }
+
+    /// `[first, second]` and `[second, first]`, resolved.
+    fn both_orders(
+        first: fn() -> CancellationReason,
+        second: fn() -> CancellationReason,
+    ) -> [Result<Vec<CancellationReason>, String>; 2] {
+        [
+            CancellationReason::resolve_key_faults(vec![first(), second()]),
+            CancellationReason::resolve_key_faults(vec![second(), first()]),
+        ]
+    }
+
+    /// Assert a cancellation with `ValidationError` carrying the type fault's
+    /// message at `at` and `None`, with no message, everywhere else.
+    fn assert_type_fault_at(out: &Result<Vec<CancellationReason>, String>, at: usize) {
+        let out = out.as_ref().expect("a cancellation");
+        for (i, reason) in out.iter().enumerate() {
+            if i == at {
+                assert_eq!(reason.code, "ValidationError");
+                assert_eq!(reason.message.as_deref(), Some("type"));
+            } else {
+                assert_eq!(reason.code, "None", "position {i}");
+                assert_eq!(reason.message, None, "position {i}");
+            }
+        }
+    }
+
     #[test]
-    fn an_empty_index_key_becomes_a_top_level_message_over_other_member_faults() {
-        let reasons = vec![
-            CancellationReason::condition_check_failed_with_item(None),
-            CancellationReason::index_key_empty_abort("empty key"),
+    fn a_wrong_type_and_an_empty_key_answer_whichever_comes_first() {
+        let [type_first, empty_first] = both_orders(type_fault, empty_fault);
+        assert_type_fault_at(&type_first, 0);
+        assert_eq!(empty_first.unwrap_err(), "empty key");
+    }
+
+    #[test]
+    fn a_wrong_type_in_the_request_masks_a_computed_wrong_type_in_either_order() {
+        let [type_first, computed_first] = both_orders(type_fault, computed_fault);
+        assert_type_fault_at(&type_first, 0);
+        assert_type_fault_at(&computed_first, 1);
+    }
+
+    #[test]
+    fn a_wrong_type_in_the_request_masks_a_failed_condition_in_either_order() {
+        let [type_first, condition_first] = both_orders(type_fault, failed_condition);
+        assert_type_fault_at(&type_first, 0);
+        assert_type_fault_at(&condition_first, 1);
+    }
+
+    #[test]
+    fn an_empty_key_outranks_a_computed_wrong_type_in_either_order() {
+        for out in both_orders(empty_fault, computed_fault) {
+            assert_eq!(out.unwrap_err(), "empty key");
+        }
+    }
+
+    #[test]
+    fn an_empty_key_outranks_a_failed_condition_in_either_order() {
+        for out in both_orders(empty_fault, failed_condition) {
+            assert_eq!(out.unwrap_err(), "empty key");
+        }
+    }
+
+    #[test]
+    fn a_computed_wrong_type_and_a_failed_condition_keep_their_own_outcomes() {
+        let [computed_first, condition_first] = both_orders(computed_fault, failed_condition);
+        let computed_first = computed_first.unwrap();
+        assert_eq!(
+            codes(&computed_first),
+            ["ValidationError", "ConditionalCheckFailed"]
+        );
+        assert_eq!(computed_first[0].message.as_deref(), Some(COMPUTED));
+        let condition_first = condition_first.unwrap();
+        assert_eq!(
+            codes(&condition_first),
+            ["ConditionalCheckFailed", "ValidationError"]
+        );
+        assert_eq!(condition_first[1].message.as_deref(), Some(COMPUTED));
+    }
+
+    #[test]
+    fn only_the_first_of_two_wrong_types_is_reported() {
+        for (first, second) in [("second", "third"), ("third", "second")] {
+            let reasons = vec![
+                CancellationReason::none(),
+                CancellationReason::key_type_mismatch(first),
+                CancellationReason::key_type_mismatch(second),
+            ];
+            let out = CancellationReason::resolve_key_faults(reasons).unwrap();
+            assert_eq!(codes(&out), ["None", "ValidationError", "None"]);
+            assert_eq!(out[1].message.as_deref(), Some(first));
+            assert_eq!(out[2].message, None);
+        }
+    }
+
+    #[test]
+    fn the_first_of_two_empty_keys_answers() {
+        for (first, second) in [
+            ("put wording", "update wording"),
+            ("update wording", "put wording"),
+        ] {
+            let reasons = vec![
+                failed_condition(),
+                CancellationReason::index_key_empty_abort(first),
+                CancellationReason::index_key_empty_abort(second),
+            ];
+            assert_eq!(
+                CancellationReason::resolve_key_faults(reasons).unwrap_err(),
+                first
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_internal_fault_decides_among_plain_reasons() {
+        let empty_before_type = vec![
+            failed_condition(),
+            empty_fault(),
+            type_fault(),
             CancellationReason::validation_error("cannot apply"),
         ];
         assert_eq!(
-            CancellationReason::resolve_key_faults(reasons).unwrap_err(),
+            CancellationReason::resolve_key_faults(empty_before_type).unwrap_err(),
             "empty key"
         );
-    }
-
-    #[test]
-    fn a_type_mismatch_masks_every_other_member_including_an_empty_key() {
-        let reasons = vec![
-            CancellationReason::condition_check_failed_with_item(None),
-            CancellationReason::index_key_empty_abort("empty key"),
-            CancellationReason::key_type_mismatch("type"),
+        let type_before_empty = vec![
+            failed_condition(),
+            type_fault(),
+            empty_fault(),
             CancellationReason::validation_error("cannot apply"),
         ];
-        let out = CancellationReason::resolve_key_faults(reasons).unwrap();
-        assert_eq!(codes(&out), ["None", "None", "ValidationError", "None"]);
-        assert_eq!(out[2].message.as_deref(), Some("type"));
-    }
-
-    #[test]
-    fn only_the_first_type_mismatch_by_position_is_reported() {
-        let reasons = vec![
-            CancellationReason::none(),
-            CancellationReason::key_type_mismatch("second"),
-            CancellationReason::key_type_mismatch("third"),
-        ];
-        let out = CancellationReason::resolve_key_faults(reasons).unwrap();
-        assert_eq!(codes(&out), ["None", "ValidationError", "None"]);
-        assert_eq!(out[1].message.as_deref(), Some("second"));
+        assert_type_fault_at(
+            &CancellationReason::resolve_key_faults(type_before_empty),
+            1,
+        );
     }
 }

@@ -13,12 +13,17 @@ use extenddb_core::expression::{self, ExpressionMaps};
 use extenddb_core::types::{CancellationReason, Item, ReturnValuesOnConditionCheckFailure};
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{
+    IdempotencyKey, TransactGetOp, TransactWriteOp, transact_first_empty_literal,
+    transact_key_check_pass, transact_op_empty_literal_checks, transact_op_key_checks,
+};
 
-use super::index::{IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, sync_indexes};
+use super::index::{
+    IndexMeta, enqueue_async_indexes, fetch_indexes_for_table, fresh_attr_defs, sync_indexes,
+};
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    upsert_item_in_tx, write_stream_record_in_tx,
+    record_cancelled_token, upsert_item_in_tx, write_stream_record_in_tx,
 };
 use crate::sqlite_util::format_timestamp;
 use crate::store::SqliteEngine;
@@ -86,6 +91,27 @@ impl SqliteEngine {
             }
         }
 
+        // Key checks first, for every member, before the token is checked and
+        // before any row is read. They need only the request and the table
+        // metadata, and a fault among them decides the request under the
+        // service's precedence (the first such fault in request order) and
+        // leaves the token unused.
+        transact_key_check_pass(ops.iter().map(|op| {
+            let indexes = &table_indexes[op_table_name(op)];
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &op_key_info(op).attribute_definitions),
+            )
+        }))?;
+        // The first Update member with an empty index-key literal. Only the
+        // members before it run: an empty value one of them writes from the
+        // item answers ahead of the literal.
+        let empty_literal = transact_first_empty_literal(ops.iter().map(|op| {
+            transact_op_empty_literal_checks(op, &index_key_refs(&table_indexes[op_table_name(op)]))
+        }));
+        let run = empty_literal.as_ref().map_or(ops.len(), |(p, _)| *p);
+
         let mut tx = self
             .pool
             .begin_with("BEGIN IMMEDIATE")
@@ -100,35 +126,11 @@ impl SqliteEngine {
                 .await?;
         }
 
-        // Key checks first, for every member, before any row is read or
-        // locked. They need only the request and the table metadata, and a
-        // fault among them decides the request under the service's precedence
-        // (a wrong-typed key on any member, else an empty index key on any
-        // member), so a decided request never waits on a later member's row.
-        {
-            let mut key_reasons: Vec<CancellationReason> =
-                vec![CancellationReason::none(); ops.len()];
-            let mut any_key_fault = false;
-            for (i, op) in ops.iter().enumerate() {
-                let indexes = &table_indexes[op_table_name(op)];
-                if let Err(r) = transact_op_key_checks(op, indexes) {
-                    any_key_fault = true;
-                    key_reasons[i] = r;
-                }
-            }
-            if any_key_fault {
-                return Err(match CancellationReason::resolve_key_faults(key_reasons) {
-                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
-                    Err(message) => StorageError::Validation(message),
-                });
-            }
-        }
-
         let mut reasons: Vec<CancellationReason> = Vec::with_capacity(ops.len());
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = Vec::with_capacity(ops.len());
         let mut any_failed = false;
 
-        for op in ops {
+        for op in &ops[..run] {
             let indexes = &table_indexes[op_table_name(op)];
             match execute_transact_write_op(
                 &mut tx,
@@ -151,11 +153,29 @@ impl SqliteEngine {
                 Err(TxnOpError::Storage(e)) => return Err(e),
             }
         }
+        if let Some((_, reason)) = empty_literal {
+            any_failed = true;
+            reasons.push(reason);
+            reasons.resize(ops.len(), CancellationReason::none());
+        }
 
         if any_failed {
-            // Dropping `tx` without commit rolls back all writes. Key faults
-            // left the members as internal reasons; the shared resolver applies
-            // the service's cross-member precedence.
+            // Roll back every write. Key faults left the members as internal
+            // reasons; the shared resolver applies the service's cross-member
+            // precedence. The request passed the key checks, so its token
+            // stays used, as the service keeps it.
+            tx.rollback()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if let Some(key) = idempotency
+                && let Err(e) =
+                    record_cancelled_token(&self.pool, key.account_id, key.token, key.fingerprint)
+                        .await
+            {
+                // Nothing was applied, so the request still answers its
+                // cancellation; the token is left unused.
+                tracing::warn!("record_cancelled_token failed (the token stays unused): {e}");
+            }
             return Err(match CancellationReason::resolve_key_faults(reasons) {
                 Ok(reasons) => StorageError::TransactionCanceled(reasons),
                 Err(message) => StorageError::Validation(message),
@@ -290,71 +310,6 @@ pub(crate) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyR
         .collect()
 }
 
-/// The key checks a transaction member can fail before any row is read or
-/// locked: the table key's shape and types, and the secondary-index keys the
-/// member supplies in the request itself (a Put item's attributes, an Update
-/// statement's literal operands). Faults carry the internal reasons that
-/// `CancellationReason::resolve_key_faults` ranks. Values computed from the
-/// existing item are checked later, once the row is read.
-fn transact_op_key_checks(
-    op: &TransactWriteOp<'_>,
-    indexes: &[IndexMeta],
-) -> Result<(), CancellationReason> {
-    match op {
-        TransactWriteOp::Put { key_info, item, .. } => {
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(
-                item,
-                &idx_refs,
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_not_empty(
-                item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::Item,
-            )
-            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
-        }
-        TransactWriteOp::Update {
-            key_info,
-            key,
-            actions,
-            maps,
-            ..
-        } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
-            validation::validate_index_key_literal_operands(
-                actions,
-                &index_key_refs(indexes),
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-                maps,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-        TransactWriteOp::Delete { key_info, key, .. }
-        | TransactWriteOp::ConditionCheck { key_info, key, .. } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
-        }
-    }
-}
-
 /// Execute one transact-write op, returning `(old, new)` images for stream
 /// capture, or a cancellation reason on a failed condition / validation.
 async fn execute_transact_write_op(
@@ -375,7 +330,12 @@ async fn execute_transact_write_op(
         } => {
             // Key checks ran in the pre-pass; repeated so the arm stays
             // correct if called on its own.
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
+            transact_op_key_checks(
+                op,
+                &index_key_refs(indexes),
+                fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(TxnOpError::Cancel)?;
             let existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -459,8 +419,9 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
             let idx_refs = index_key_refs(indexes);
+            let attr_defs = fresh_attr_defs(indexes, &key_info.attribute_definitions);
+            transact_op_key_checks(op, &idx_refs, attr_defs).map_err(TxnOpError::Cancel)?;
             let existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -486,18 +447,20 @@ async fn execute_transact_write_op(
             validation::validate_transact_update_item_size(&item, max_item_size_bytes).map_err(
                 |e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())),
             )?;
-            // Secondary-index keys on the written item: a value computed from
-            // the existing item (an attribute reference, the fallback of
-            // if_not_exists) of the wrong type, reported with the service's
-            // computed-value wording, and a key left empty.
-            validation::validate_index_key_types_after_update(
-                &item,
-                &idx_refs,
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-            )
-            .map_err(|e| {
-                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
-            })?;
+            // Secondary-index keys on the written item: a wrong-typed value
+            // the statement wrote from an attribute reference or from
+            // if_not_exists, reported with the service's computed-value
+            // wording, and a key such a value leaves empty (an empty literal
+            // was found before any member ran). With the path absent the
+            // if_not_exists fallback is a literal from the request, which the
+            // service ranks with the values taken from the item. The type
+            // fault is a plain positional reason: the service leaves the
+            // other members' outcomes in place beside it, where a wrong type
+            // supplied in the request (the pre-pass) masks them.
+            validation::validate_index_key_types_after_update(&item, &idx_refs, attr_defs)
+                .map_err(|e| {
+                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                })?;
             validation::validate_index_key_not_empty(
                 &item,
                 &idx_refs,
@@ -590,4 +553,95 @@ fn eval_condition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod token_tests {
+    //! The `ClientRequestToken` of a request cancelled after the key checks.
+
+    use std::collections::BTreeMap;
+
+    use extenddb_core::expression::{self, ExpressionMaps};
+    use extenddb_core::types::{AttributeValue, Item, ReturnValuesOnConditionCheckFailure};
+    use extenddb_storage::error::StorageError;
+    use extenddb_storage::{DataEngine, IdempotencyKey, TableEngine, TransactWriteOp};
+    use serde_json::json;
+
+    use crate::SqliteEngine;
+
+    const ACCOUNT: &str = "123456789012";
+
+    /// A failed write of the cancelled token leaves the answer as it is:
+    /// nothing was applied, so the request answers its cancellation, not an
+    /// internal error.
+    #[tokio::test]
+    async fn a_failed_token_write_keeps_the_cancellation() {
+        let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
+            .await
+            .expect("engine");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
+        sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
+            .bind(ACCOUNT)
+            .execute(&engine.pool)
+            .await
+            .expect("account");
+        let input: extenddb_core::types::CreateTableInput = serde_json::from_value(json!({
+            "TableName": "t_token",
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+            "BillingMode": "PAY_PER_REQUEST"
+        }))
+        .expect("input");
+        engine.create_table(ACCOUNT, input).await.expect("create");
+        let key_info = engine
+            .table_key_info(ACCOUNT, "t_token")
+            .await
+            .expect("key info");
+        let maps = ExpressionMaps::default();
+        let seeded: Item = BTreeMap::from([("pk".to_owned(), AttributeValue::S("bp".to_owned()))]);
+        engine
+            .put_item(&key_info, seeded.clone(), false, None, &maps, None)
+            .await
+            .expect("seed bp");
+        // Every write of a cancelled token fails from here on.
+        sqlx::query(
+            "CREATE TRIGGER fail_cancelled_tokens BEFORE INSERT ON idempotency_tokens \
+             WHEN NEW.fingerprint LIKE 'cancelled:%' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("trigger");
+
+        let condition = expression::parse_condition(
+            &expression::tokenize("attribute_not_exists(pk)").expect("tokenize"),
+        )
+        .expect("parse");
+        let ops = [TransactWriteOp::Put {
+            key_info: &key_info,
+            item: &seeded,
+            condition: Some(&condition),
+            maps: &maps,
+            return_values_on_ccf: ReturnValuesOnConditionCheckFailure::None,
+            stream: None,
+        }];
+        let key = IdempotencyKey {
+            account_id: ACCOUNT,
+            token: "tok-failed-write",
+            fingerprint: "fp",
+        };
+        match engine.transact_write_items(&ops, Some(key)).await {
+            Err(StorageError::TransactionCanceled(reasons)) => {
+                assert_eq!(reasons.len(), 1);
+                assert_eq!(reasons[0].code, "ConditionalCheckFailed", "{reasons:?}");
+            }
+            other => panic!("expected the cancellation, got {other:?}"),
+        }
+    }
 }

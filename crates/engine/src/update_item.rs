@@ -263,11 +263,12 @@ pub(crate) async fn handle_update_item_with(
     validate_no_key_updates(&actions, &key_info, &maps)?;
 
     // A literal operand assigned to a secondary-index key must carry the key's
-    // declared type. DynamoDB checks this on the statement itself, ahead of
-    // the condition and ahead of applying any action, so it is reported even
-    // when the condition would fail or another action could not be applied.
-    // A value computed from the existing item is checked by the storage layer
-    // on the written item instead.
+    // declared type, and then may not be empty. DynamoDB checks both on the
+    // statement itself, in that order, ahead of the condition and ahead of
+    // applying any action, so they are reported even when the condition would
+    // fail or another action could not be applied. A value written from an
+    // attribute reference or from if_not_exists is checked by the storage
+    // layer on the written item instead.
     {
         let idx_refs: Vec<extenddb_core::validation::IndexKeyRef<'_>> = key_info
             .global_secondary_indexes
@@ -284,6 +285,7 @@ pub(crate) async fn handle_update_item_with(
             &key_info.attribute_definitions,
             &maps,
         )?;
+        extenddb_core::validation::validate_index_key_empty_literals(&actions, &idx_refs, &maps)?;
     }
 
     let return_old = matches!(

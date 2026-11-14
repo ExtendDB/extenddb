@@ -17,6 +17,11 @@ opposite-order test can deadlock; the shared-plus-private test checks the
 reason positions on Amazon DynamoDB. The mapping of a
 database-detected deadlock to TransactionConflict is pinned by the storage
 tests in crates/storage-postgres/tests/twi_conflict.rs.
+
+Two sends of one request with one ClientRequestToken at the same moment apply
+the request once (measured on Amazon DynamoDB, us-east-1, 2026-11-05, 20
+rounds, retries off). In 18 rounds one send answered OK and the other
+TransactionInProgressException; in 2 rounds both answered OK.
 """
 
 from __future__ import annotations
@@ -50,6 +55,10 @@ CANCEL_PREFIX = (
 @pytest.fixture(scope="module")
 def raw_client(endpoint_url):
     """A client that never retries, so every 5xx and every cancellation is seen."""
+    return _no_retry_client(endpoint_url)
+
+
+def _no_retry_client(endpoint_url):
     kwargs: dict = {
         "service_name": "dynamodb",
         "region_name": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
@@ -217,3 +226,55 @@ def test_conflict_reason_names_only_the_contended_item(
     assert committed + len(failures) == attempts
     assert attempts == WORKERS * TXNS_PER_WORKER, f"time budget cut the run at {attempts}"
     assert committed <= _counter(dynamodb_client, table, hot) <= committed + n_5xx
+
+
+TOKEN_ROUNDS = 10
+IN_PROGRESS = "TransactionInProgressException"
+
+
+def test_two_sends_of_one_request_with_one_token_apply_it_once(
+    dynamodb_client, endpoint_url, table
+):
+    """Two clients send one request with one fresh token at the same moment.
+
+    In every round n grows by 1, and each send answers OK or
+    TransactionInProgressException, as on Amazon DynamoDB (module docstring).
+    The clients never retry, so a TransactionInProgressException is seen
+    instead of retried.
+    """
+    pk = f"cnt-{uuid.uuid4().hex[:8]}"
+    dynamodb_client.put_item(TableName=table, Item={"pk": {"S": pk}, "n": {"N": "0"}})
+    clients = [_no_retry_client(endpoint_url) for _ in range(2)]
+    request = [
+        {
+            "Update": {
+                "TableName": table,
+                "Key": {"pk": {"S": pk}},
+                "UpdateExpression": "SET n = n + :one",
+                "ExpressionAttributeValues": {":one": {"N": "1"}},
+            }
+        }
+    ]
+
+    def send(client, token: str, start: threading.Barrier) -> str:
+        start.wait()
+        try:
+            client.transact_write_items(TransactItems=request, ClientRequestToken=token)
+            return "OK"
+        except ClientError as e:
+            return e.response["Error"]["Code"]
+
+    rounds = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for _ in range(TOKEN_ROUNDS):
+            token = uuid.uuid4().hex
+            before = _counter(dynamodb_client, table, pk)
+            start = threading.Barrier(2, timeout=30)
+            futures = [pool.submit(send, c, token, start) for c in clients]
+            answers = [f.result(timeout=60) for f in futures]
+            rounds.append((answers, _counter(dynamodb_client, table, pk) - before))
+
+    wrong = [
+        r for r in rounds if r[1] != 1 or any(a not in ("OK", IN_PROGRESS) for a in r[0])
+    ]
+    assert not wrong, f"{len(wrong)} of {TOKEN_ROUNDS} rounds: {rounds}"
