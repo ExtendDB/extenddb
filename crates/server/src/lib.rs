@@ -24,6 +24,7 @@ mod leading_keys;
 mod listener;
 pub mod management;
 mod metrics_endpoint;
+mod parameter_keys;
 pub mod rate_limit;
 mod registration;
 mod repeated_headers;
