@@ -22,7 +22,7 @@ use extenddb_storage::migrations::{
     CatalogStatus, LedgerRow, MigrationError, MigrationId, RunReport, Runner,
 };
 use extenddb_storage_mongodb::migrations::{
-    Definitions, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
+    Definitions, Index, MigrationLock, MongoMigrations, MongoTarget, Timing, catalog_status, lock,
     migrate_holding,
 };
 use futures::TryStreamExt;
@@ -37,9 +37,17 @@ pub const CATALOG_BASELINE: &str =
 pub const CATALOG_MIGRATION_6: &str =
     include_str!("../fixtures/0006_backup_catalog_index.expected.json");
 
+/// The collection migration 10 creates in place of `metrics`, which it drops.
+pub const CATALOG_MIGRATION_10: &str =
+    include_str!("../fixtures/0010_account_metrics.expected.json");
+
+/// The name of the index migration 12 creates on `access_keys`.
+pub const ACCESS_KEY_ID_INDEX: &str = "access_key_id_1";
+
 /// The catalog database's definitions after every migration: migration 1's,
-/// without `continuous_backups`, which migration 5 drops, and with what
-/// migration 6 adds.
+/// without `continuous_backups`, which migration 5 drops, and `metrics`,
+/// which migration 10 drops, with what migrations 6 and 10 add, and with the
+/// index migration 12 creates on `access_keys`.
 ///
 /// # Panics
 ///
@@ -48,15 +56,30 @@ pub const CATALOG_MIGRATION_6: &str =
 pub fn expected_catalog() -> Definitions {
     let mut expected: Definitions = serde_json::from_str(CATALOG_BASELINE).expect("migration 1");
     expected.remove("continuous_backups");
-    let added: Definitions = serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
-    for (name, collection) in added {
-        match expected.get_mut(&name) {
-            Some(existing) => existing.indexes.extend(collection.indexes),
-            None => {
-                expected.insert(name, collection);
+    expected.remove("metrics");
+    for (file, id) in [(CATALOG_MIGRATION_6, 6), (CATALOG_MIGRATION_10, 10)] {
+        let added: Definitions =
+            serde_json::from_str(file).unwrap_or_else(|e| panic!("migration {id}: {e}"));
+        for (name, collection) in added {
+            match expected.get_mut(&name) {
+                Some(existing) => existing.indexes.extend(collection.indexes),
+                None => {
+                    expected.insert(name, collection);
+                }
             }
         }
     }
+    expected
+        .get_mut("access_keys")
+        .expect("access_keys")
+        .indexes
+        .insert(
+            ACCESS_KEY_ID_INDEX.to_owned(),
+            Index {
+                key: vec![("access_key_id".to_owned(), serde_json::json!(1))],
+                options: [("unique".to_owned(), serde_json::json!(true))].into(),
+            },
+        );
     expected
 }
 

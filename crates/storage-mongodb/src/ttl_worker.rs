@@ -87,10 +87,12 @@ pub(crate) async fn stream_record_cleanup_worker(
 /// says the table has no indexes; an invalidated in-flight observation
 /// cannot publish that stale no-index result.
 ///
-/// A restore target whose copy stopped before its hand-over is not this
+/// A restore target whose load stopped before its hand-over is not this
 /// worker's: its job record keeps a stale heartbeat, and the backup
-/// reconciler fails the record and removes the target. Returns once
-/// `shutdown` fires, at its next pause between cycles.
+/// reconciler acts on it, by its kind: a legacy (in-catalog) record is
+/// failed and its target removed; a store-backed (`manifest`) record is
+/// taken over and its load resumed, and the hand-over comes from the resume.
+/// Returns once `shutdown` fires, at its next pause between cycles.
 pub(crate) async fn gsi_backfill_worker(storage: Arc<MongoEngine>, shutdown: CancellationToken) {
     while sleep_or_shutdown(&shutdown, GSI_BACKFILL_INTERVAL).await {
         let indexes_coll = storage.catalog_db.collection::<Document>("indexes");
@@ -287,9 +289,11 @@ async fn restore_backfill_is_ready(
 }
 
 /// Complete restored tables after every restored GSI/LSI has been populated.
-/// The restore request records `restore_backfill_pending` only after the base
-/// `$out` copy succeeds, so this remains safe to retry after a process restart
-/// or a client disconnect during index backfill.
+/// `restore_backfill_pending` is set only once every base document is in
+/// place: by the legacy copy after its `$out` succeeds, and by a store-backed
+/// restore's `finish_restore` after its count check (`hand_over_to_backfill`),
+/// so this remains safe to retry after a process restart or a client
+/// disconnect during index backfill.
 async fn finish_ready_restores(storage: &MongoEngine) {
     let tables_coll = storage.catalog_db.collection::<Document>("tables");
     let mut cursor = match tables_coll
@@ -488,10 +492,10 @@ async fn sweep_expired_items(storage: &MongoEngine, metrics: &MetricsCollector, 
                 }
                 Ok(_old_item) => {
                     deleted += 1;
-                    metrics.record_ttl_deletion(table_name);
+                    metrics.record_ttl_deletion(account_id, table_name);
                     if let Some(s) = staleness {
                         #[allow(clippy::cast_precision_loss)]
-                        metrics.record_ttl_staleness(table_name, s as f64);
+                        metrics.record_ttl_staleness(account_id, table_name, s as f64);
                     }
                 }
             }

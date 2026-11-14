@@ -16,6 +16,13 @@
 #   --mongo-port PORT  Host port to publish mongo on (default: 27021)
 #   --output DIR       Directory for logs and generated config
 #                      (default: /tmp/run-mongodb-tests-<ts>)
+#   --backup-store KIND  filesystem (default): the server gets a filesystem
+#                      [backup.store] under the output directory and the
+#                      suites read EXTENDDB_TEST_BACKUP_STORE=filesystem;
+#                      none: no [backup.store], the in-catalog backup path,
+#                      EXTENDDB_TEST_BACKUP_STORE=none. The legacy LSI
+#                      fallback cell of tests/test_mongodb_backup_restore.py
+#                      runs only under none.
 #   --keep             Do not tear down the mongo container / server
 #                      on exit (useful for post-run inspection)
 #   --mongo-only       Start the replica set, print its URI, and exit without
@@ -24,15 +31,12 @@
 #                      crate's snapshot tests). Tear down with
 #                      docker rm -f extenddb-runtests-mongo-<port>.
 #   --backup-store-root DIR
-#                      Configure a filesystem backup store at DIR (created
-#                      0700 if missing; a fresh directory per run, since the
-#                      store's identity file names the catalog that owns it
-#                      and this runner initializes a new catalog each time):
-#                      CreateBackup is then the store-backed job, which the
-#                      backup suites run with
-#                      EXTENDDB_TEST_BACKUP_STORE=filesystem. Without it the
-#                      server has no [backup.store] and CreateBackup is the
-#                      in-catalog create (EXTENDDB_TEST_BACKUP_STORE=none).
+#                      The filesystem store's root (default: backups/ under
+#                      the output directory), created 0700 if missing; a
+#                      fresh directory per run, since the store's identity
+#                      file names the catalog that owns it and this runner
+#                      initializes a new catalog each time. Implies
+#                      --backup-store filesystem.
 #   --rust-live        Also run the Rust live tests of the storage-mongodb
 #                      crate against this runner's replica set. They are
 #                      `#[ignore]`d, because they need a replica set, and
@@ -47,6 +51,7 @@
 #   devtools/run-mongodb-tests -- --pytest --filter test_put_item
 #   devtools/run-mongodb-tests --keep -- --pytest --filter test_rfc0003
 #   devtools/run-mongodb-tests --rust-live -- --rust --rust-integration
+#   devtools/run-mongodb-tests --backup-store none -- --pytest --filter test_mongodb_backup_restore
 #
 # Prerequisites:
 #   - Docker running
@@ -71,6 +76,7 @@ KEEP=false
 MONGO_ONLY=false
 RUST_LIVE=false
 BACKUP_STORE_ROOT=""
+BACKUP_STORE=filesystem
 RUN_TESTS_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -78,12 +84,18 @@ while [[ $# -gt 0 ]]; do
         --port)       BIND_PORT="$2"; shift 2 ;;
         --mongo-port) MONGO_PORT="$2"; shift 2 ;;
         --output)     OUTPUT_DIR="$2"; shift 2 ;;
+        --backup-store)
+            case "$2" in
+                filesystem|none) BACKUP_STORE="$2" ;;
+                *) echo "error: --backup-store takes filesystem or none, not: $2" >&2; exit 1 ;;
+            esac
+            shift 2 ;;
         --keep)       KEEP=true; shift ;;
         --mongo-only) MONGO_ONLY=true; KEEP=true; shift ;;
         --rust-live)  RUST_LIVE=true; shift ;;
-        --backup-store-root) BACKUP_STORE_ROOT="$2"; shift 2 ;;
+        --backup-store-root) BACKUP_STORE_ROOT="$2"; BACKUP_STORE=filesystem; shift 2 ;;
         --)           shift; RUN_TESTS_ARGS=("$@"); break ;;
-        -h|--help)    sed -n '5,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '5,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -146,7 +158,7 @@ cleanup() {
     if $KEEP; then
         echo ""
         echo "=== --keep set; leaving mongo + extenddb running ==="
-        echo "  server log (startup): $SERVER_LOG"
+        echo "  server log:           $SERVER_LOG"
         echo "  mongo container:      $CONTAINER_NAME (port $MONGO_PORT)"
         echo "  tear down manually:   $BINARY stop --config $CONFIG; docker rm -f $CONTAINER_NAME"
         return
@@ -233,7 +245,38 @@ EXTENDDB_ADMIN_PASSWORD="$ADMIN_PASSWORD" "$BINARY" init \
 # `init` regenerates the config with default port 18443 and no
 # `[import]` / `[export]` sections. Rewrite with the port + defaults the
 # integration suite needs. This overwrite falls away once `extenddb init`
-# grows flags for these knobs.
+# grows flags for these knobs. With `--backup-store filesystem` (the
+# default) the `[backup.store]` is a filesystem root under the output
+# directory: CreateBackup is the store-backed job and RestoreTableFromBackup
+# the store-backed restore, which the MongoDB restore cells
+# (tests/test_mongodb_backup_restore.py) reach through the root
+# (EXTENDDB_TEST_BACKUP_ROOT) and the server's log (EXTENDDB_TEST_SERVER_LOG);
+# the suites read EXTENDDB_TEST_BACKUP_STORE=filesystem to expect that path.
+# With `--backup-store none` the section is absent, CreateBackup writes the
+# in-catalog format and the suites read EXTENDDB_TEST_BACKUP_STORE=none.
+BACKUP_ROOT="${BACKUP_STORE_ROOT:-$OUTPUT_DIR/backups}"
+STORE_SECTION=""
+if [[ "$BACKUP_STORE" == "filesystem" ]]; then
+    if [[ -z "$BACKUP_STORE_ROOT" ]]; then
+        # A root left by an earlier run of a reused --output directory
+        # carries that run's `extenddb-store.json`, which names that run's
+        # catalog; the container is recreated every run, so the new catalog's
+        # id differs and the server would find the store "owned by another
+        # catalog". Start from an empty root. A root the caller named is
+        # theirs to clear: it is created and made owner-only, nothing more.
+        rm -rf "$BACKUP_ROOT"
+    fi
+    mkdir -p "$BACKUP_ROOT"
+    chmod 0700 "$BACKUP_ROOT"
+    echo "  backup store: filesystem at $BACKUP_ROOT"
+    STORE_SECTION="
+[backup.store]
+kind = \"filesystem\"
+
+[backup.store.filesystem]
+path = \"$BACKUP_ROOT\"
+"
+fi
 cat > "$CONFIG" <<TOML
 [server]
 bind_addr = "127.0.0.1"
@@ -263,22 +306,11 @@ paths = ["$TMP_CANON"]
 [logging]
 level = "info"
 format = "pretty"
+
+[backup]
+reconcile_interval_secs = 2
+$STORE_SECTION
 TOML
-
-if [[ -n "$BACKUP_STORE_ROOT" ]]; then
-    # The store's root must be owner-only (the store refuses a wider mode).
-    mkdir -p "$BACKUP_STORE_ROOT"
-    chmod 0700 "$BACKUP_STORE_ROOT"
-    cat >> "$CONFIG" <<TOML
-
-[backup.store]
-kind = "filesystem"
-
-[backup.store.filesystem]
-path = "$BACKUP_STORE_ROOT"
-TOML
-    echo "  backup store: filesystem at $BACKUP_STORE_ROOT"
-fi
 
 # ---------------------------------------------------------------------------
 # Start extenddb server
@@ -286,11 +318,11 @@ fi
 
 echo ""
 echo "=== Starting extenddb server on 127.0.0.1:$BIND_PORT ==="
-# `extenddb serve` daemonizes itself (forks to background, writes its own
-# PID file under the config's run_dir, then returns), so no `&` is needed.
-# Startup banner and any pre-daemonize errors are captured to SERVER_LOG;
-# runtime logs go to syslog.
-"$BINARY" serve --config "$CONFIG" >"$SERVER_LOG" 2>&1
+# The server runs in the foreground in the background of this shell, with its
+# PID file written so `extenddb stop` (the cleanup) can signal it, and its
+# whole log in SERVER_LOG: the restore cells read the job's log lines there,
+# where a daemonized server's would go to syslog.
+"$BINARY" serve --foreground --write-pid-file --config "$CONFIG" >"$SERVER_LOG" 2>&1 &
 
 for i in $(seq 1 30); do
     if curl -sk "https://127.0.0.1:$BIND_PORT/health" >/dev/null 2>&1; then
@@ -321,15 +353,16 @@ if [[ " ${RUN_TESTS_ARGS[*]} " == *" --rust"* ]]; then
     EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
         cargo test -p extenddb-storage-mongodb --lib -- --ignored records_live
     echo ""
-    # The catalog migration tests: each runs in databases of its own on this
-    # server, and EXTENDDB_TEST_MONGODB_REQUIRED turns a skip for a missing
-    # server into a failure.
-    echo "=== Running MongoDB catalog migration tests (migrations_*) ==="
+    # The catalog migration tests and the metrics store test: each runs in
+    # databases of its own on this server, and EXTENDDB_TEST_MONGODB_REQUIRED
+    # turns a skip for a missing server into a failure.
+    echo "=== Running MongoDB catalog migration tests (migrations_*, metrics_store) ==="
     echo ""
     EXTENDDB_TEST_MONGODB_URI="mongodb://localhost:$MONGO_PORT/?replicaSet=rs0&directConnection=true" \
     EXTENDDB_TEST_MONGODB_REQUIRED=1 \
         cargo test -p extenddb-storage-mongodb --test migrations_fresh --test migrations_guards \
-            --test migrations_holders --test migrations_locks --test migrations_released
+            --test migrations_holders --test migrations_locks --test migrations_released \
+            --test migrations_spill --test metrics_store
     echo ""
 fi
 echo "=== Running test suite via devtools/run-tests --backend mongodb ==="
@@ -346,6 +379,18 @@ export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
 # MongoDB-specific tests use mongosh in this runner's container to verify
 # physical index lifecycle after exercising the DynamoDB API.
 export EXTENDDB_TEST_MONGODB_CONTAINER="$CONTAINER_NAME"
+
+# Where the server writes its backups, which run-tests requires for --pytest
+# and the backup suites read to pick their branch (filesystem: the
+# store-backed job and restore; none: the in-catalog format). The MongoDB
+# restore cells rewrite a backup's prefix under the store's root and read the
+# restore job's log lines from the server's log; without a store there is no
+# root and those cells skip, while the legacy LSI fallback cell runs.
+export EXTENDDB_TEST_BACKUP_STORE="$BACKUP_STORE"
+if [[ "$BACKUP_STORE" == "filesystem" ]]; then
+    export EXTENDDB_TEST_BACKUP_ROOT="$BACKUP_ROOT"
+fi
+export EXTENDDB_TEST_SERVER_LOG="$SERVER_LOG"
 
 # Some tests read EXTENDDB_CONFIG to invoke `extenddb settings` against
 # the running instance. Without this, they fall back to `./extenddb.toml`
@@ -397,6 +442,39 @@ if $RUST_LIVE; then
         echo "  ✓ MongoDB backup engine live Rust tests passed"
     else
         echo "  ✗ MongoDB backup engine live Rust tests failed"
+        RC=1
+    fi
+
+    # A deleted principal or account leaves nothing behind (#693, #694): the
+    # shared `iam_leftovers_conformance` check, and a deleted account's user
+    # and role granting nothing. Direct integration tests in tests/, which
+    # skip without a URI; REQUIRED makes that a failure here.
+    echo ""
+    echo "=== MongoDB IAM delete direct integration tests (storage-mongodb) ==="
+    if EXTENDDB_TEST_MONGODB_REQUIRED=1 \
+        cargo test -p extenddb-storage-mongodb --test iam_leftovers -- \
+        --test-threads=1; then
+        echo "  ✓ MongoDB IAM delete direct integration tests passed"
+    else
+        echo "  ✗ MongoDB IAM delete direct integration tests failed"
+        RC=1
+    fi
+
+
+    # The restore fence cells need the `test-hooks` feature (the GSI backfill
+    # gate `bulk_load` honours is compiled only under it), and no other job
+    # builds that feature, so the takeover fence has no CI coverage without
+    # this step. Run them one at a time against the same replica set.
+    echo ""
+    echo "=== MongoDB restore fence cells (storage-mongodb, test-hooks) ==="
+    if cargo test -p extenddb-storage-mongodb --lib --features test-hooks -- \
+        --ignored --test-threads=1 \
+        backup_engine::live_tests::a_takeover_during_bulk_load_fences_the_file_index_write \
+        backup_engine::live_tests::live_bulk_load_stops_at_a_lost_claim_between_two_insert_many_calls \
+        backup_engine::live_tests::live_bulk_load_records_each_batch_and_a_resume_continues_from_items_applied; then
+        echo "  ✓ MongoDB restore fence cells passed"
+    else
+        echo "  ✗ MongoDB restore fence cells failed"
         RC=1
     fi
 fi

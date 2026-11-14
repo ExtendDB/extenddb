@@ -465,3 +465,14 @@ This refactoring should be done **as part of the Cassandra streams implementatio
 - [DynamoDB Streams API Reference](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Operations_Amazon_DynamoDB_Streams.html)
 - [PostgreSQL Reference Implementation](../../extenddb/crates/storage-postgres/src/stream_engine.rs)
 - [Hybrid Logical Clocks Paper](https://cse.buffalo.edu/tech-reports/2014-04.pdf) (Kulkarni et al.)
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

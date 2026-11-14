@@ -8,6 +8,7 @@
 //! with correct headers (x-amzn-RequestId, x-amz-crc32, Content-Type).
 //! Supports TLS via `axum-server` with rustls when configured.
 
+pub(crate) mod arn_gate;
 pub(crate) mod authorization;
 pub mod authz_cache;
 pub(crate) mod authz_resource;
@@ -16,16 +17,22 @@ pub mod console;
 pub mod dev_credentials;
 mod handler;
 mod import_export_paths;
+mod import_export_roots;
+mod item_authz;
 pub mod key_info_cache;
 mod leading_keys;
+mod listener;
 pub mod management;
 mod metrics_endpoint;
 pub mod rate_limit;
 mod registration;
+mod repeated_headers;
+mod request_attributes;
 mod request_helpers;
 mod request_tags;
 mod response;
 mod serve;
+mod table_name_gate;
 mod throttle_helpers;
 mod workers;
 
@@ -53,6 +60,7 @@ pub use key_info_cache::CachedTableKeyInfoStore;
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 /// Application state shared across all handlers.
 pub struct AppState {
@@ -72,6 +80,8 @@ pub struct AppState {
     pub metrics: Arc<MetricsCollector>,
     /// Whether TLS is enabled (affects cookie Secure flag).
     pub tls_enabled: bool,
+    /// Header read timeout and body inactivity timeout for every connection.
+    pub request_timeout: Duration,
     /// Developer mode: authorization is opened for authenticated callers (SigV4
     /// is still verified). Only ever true in a `dev-mode` build bound to
     /// loopback; the bin's serve path enforces those preconditions.
@@ -115,9 +125,10 @@ pub struct ServerTlsConfig {
     pub key_path: PathBuf,
 }
 
-/// How long the listener drains active connections after a stop: the bound
-/// on HTTPS, and on plain HTTP the time after which the PID file is removed.
-/// `extenddb stop` waits for the sum of the shutdown bounds.
+/// How long the listener drains active connections after a stop, on HTTPS
+/// and on plain HTTP alike: connections still open at the bound are closed,
+/// and the PID file is removed once the drain ends. `extenddb stop` waits for
+/// the sum of the shutdown bounds.
 pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build and start the HTTP server on a pre-bound listener.
@@ -143,6 +154,7 @@ pub async fn start_server(
     const DYNAMODB_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
     let tls_enabled = state.tls_enabled;
+    let request_timeout = state.request_timeout;
     let catalog_store = state.catalog_store.clone();
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
@@ -233,8 +245,17 @@ pub async fn start_server(
         registration::refuse_while_unregistered,
     ));
 
-    // Apply security headers to all routes.
-    let app = app.layer(security_layers);
+    // Refuse a repeated host or authorization header on every route, then
+    // apply security headers to all routes (the refusal carries them too).
+    // A body that stops delivering data for `request_timeout` errors out, so a
+    // client that announces a Content-Length it never sends cannot hold the
+    // connection open. The handler answers that error with 408.
+    let app = app
+        .layer(axum::middleware::from_fn(
+            repeated_headers::refuse_repeated_headers,
+        ))
+        .layer(security_layers)
+        .layer(RequestBodyTimeoutLayer::new(request_timeout));
 
     // Add HSTS header only when TLS is enabled.
     let app = if tls_enabled {
@@ -246,88 +267,7 @@ pub async fn start_server(
         app
     };
 
-    let local_addr = listener.local_addr()?;
-
-    if let Some(tls_cfg) = tls {
-        // P57 Bug 2 fix: rustls 0.23 requires an explicit CryptoProvider.
-        // Install aws-lc-rs as the default before creating any TLS config.
-        // Ignore the error if a provider was already installed (e.g., by sqlx).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        tracing::info!("extenddb listening on {local_addr} (HTTPS)");
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            &tls_cfg.cert_path,
-            &tls_cfg.key_path,
-        )
-        .await
-        // AI-3: The error intentionally does not include the file path to avoid
-        // leaking filesystem structure in logs. See docs/troubleshooting.md for
-        // the "Failed to load TLS certificates" entry.
-        .map_err(|e| anyhow::anyhow!("Failed to load TLS certificates: {e}"))?;
-
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        let shutdown_pid = pid_file.clone();
-        let stop = admission.clone();
-        tokio::spawn(async move {
-            signal_or_stop(&stop).await;
-            shutdown_handle.graceful_shutdown(Some(CONNECTION_DRAIN_TIMEOUT));
-            // P50: Log timeout but don't call std::process::exit — let the
-            // runtime shut down normally so destructors (including ZeroizeOnDrop) run.
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            tracing::warn!("Graceful shutdown timed out, forcing PID file cleanup");
-            cleanup_pid_file(shutdown_pid.as_deref());
-        });
-
-        let std_listener = listener.into_std()?;
-        // AI-2: Use a custom acceptor that peeks the first byte of each
-        // connection. If it's plain HTTP (not 0x16 TLS ClientHello), write
-        // a 301 redirect to HTTPS and reject the connection before the TLS
-        // handshake. This gives users a helpful redirect instead of a
-        // confusing TLS handshake failure. The same acceptor sets
-        // TCP_NODELAY on every accepted socket before the handshake.
-        let redirect_acceptor = HttpsRedirectAcceptor { addr: local_addr };
-        axum_server::from_tcp_rustls(std_listener, rustls_config)?
-            .map(|tls| tls.acceptor(redirect_acceptor))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await?;
-    } else {
-        tracing::info!("extenddb listening on {local_addr}");
-        // The plain-HTTP listener's drain is bounded as the TLS listener's
-        // is: axum's graceful shutdown waits for every open connection with
-        // no bound of its own, and `extenddb stop` waits for the sum of the
-        // server's bounds, which counts this drain as `CONNECTION_DRAIN_TIMEOUT`.
-        let stopping = extenddb_storage::CancellationToken::new();
-        let serve = axum::serve(
-            nodelay_listener(listener),
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown({
-            let stopping = stopping.clone();
-            let pid_file = pid_file.clone();
-            async move {
-                graceful_shutdown(pid_file, admission).await;
-                stopping.cancel();
-            }
-        });
-        let drain_bound = async {
-            stopping.cancelled().await;
-            tokio::time::sleep(CONNECTION_DRAIN_TIMEOUT).await;
-        };
-        tokio::select! {
-            served = serve => served?,
-            () = drain_bound => tracing::warn!(
-                "connections still open {} s after the stop; the listener is closed with them",
-                CONNECTION_DRAIN_TIMEOUT.as_secs()
-            ),
-        }
-    }
-
-    // Normal shutdown path — clean up PID file after connections drain.
-    cleanup_pid_file(pid_file.as_deref());
-
-    Ok(())
+    listener::serve_app(listener, app, request_timeout, tls, pid_file, admission).await
 }
 
 /// GET /health — REQ-OBS-006.
@@ -363,268 +303,4 @@ async fn health_check(
         StatusCode::OK,
         axum::Json(json!({ "status": status, "components": components })),
     )
-}
-
-async fn graceful_shutdown(pid_file: Option<PathBuf>, admission: registration::Admission) {
-    signal_or_stop(&admission).await;
-    // P50: Spawn a timeout task that cleans up the PID file if connections
-    // don't drain. Does NOT call std::process::exit — the runtime shuts down
-    // normally so destructors (including ZeroizeOnDrop) run.
-    tokio::spawn(async move {
-        tokio::time::sleep(CONNECTION_DRAIN_TIMEOUT).await;
-        tracing::warn!(
-            "Graceful shutdown timed out after {}s, forcing PID file cleanup",
-            CONNECTION_DRAIN_TIMEOUT.as_secs()
-        );
-        cleanup_pid_file(pid_file.as_deref());
-    });
-}
-
-/// Remove the PID file if it exists. Best-effort — log but don't fail.
-fn cleanup_pid_file(pid_file: Option<&std::path::Path>) {
-    if let Some(path) = pid_file
-        && let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("Failed to remove PID file {}: {e}", path.display());
-    }
-}
-
-/// Set `TCP_NODELAY` on an accepted socket.
-///
-/// With Nagle's algorithm on, the kernel holds a small write while an earlier
-/// small write on the connection is unacknowledged, and the client's delayed
-/// ACK leaves with its next request on that connection or when its timer
-/// fires (about 40 ms on Linux). Once one response is written while the
-/// previous one is unacknowledged, each response waits for the client's next
-/// request, and the reply to that request is held behind it in turn. The
-/// response latency then equals the gap between the client's requests on the
-/// connection, for every gap under the delayed-ACK timer. `TCP_NODELAY` sends
-/// each write as it is made. The option lives on the TCP socket, so under TLS
-/// it is set before the handshake and applies below the TLS stream. A failure
-/// to set it is logged at debug and the connection is served with the kernel
-/// default.
-fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!("Failed to set TCP_NODELAY on accepted connection: {e}");
-    }
-}
-
-/// The plaintext listener: a `TcpListener` whose accepted sockets carry
-/// `TCP_NODELAY`.
-type NodelayListener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
-
-/// Wrap the plaintext listener so every accepted socket carries `TCP_NODELAY`.
-///
-/// `axum::serve` does not set the option itself; `ListenerExt::tap_io` is its
-/// hook for per-connection socket options.
-fn nodelay_listener(listener: tokio::net::TcpListener) -> NodelayListener {
-    use axum::serve::ListenerExt;
-    listener.tap_io(|stream| set_tcp_nodelay(stream))
-}
-
-/// AI-2: Acceptor that detects plain HTTP connections on the TLS port.
-///
-/// Sets `TCP_NODELAY` on the accepted socket first (see [`set_tcp_nodelay`]).
-/// Then peeks the first byte of the connection. If it's `0x16` (TLS
-/// `ClientHello`), the connection passes through to the TLS acceptor. If it's
-/// a plain HTTP verb, a 301 redirect to `https://` is written and the
-/// connection is rejected with an IO error (which `axum_server` handles by
-/// dropping it).
-///
-/// `axum_server` 0.8 ships a `NoDelayAcceptor`, but it cannot be stacked under
-/// this acceptor without a generic wrapper, so this acceptor sets the option
-/// itself, and logs instead of rejecting on failure.
-#[derive(Clone)]
-struct HttpsRedirectAcceptor {
-    addr: std::net::SocketAddr,
-}
-
-impl<S: Send + 'static> axum_server::accept::Accept<tokio::net::TcpStream, S>
-    for HttpsRedirectAcceptor
-{
-    type Stream = tokio::net::TcpStream;
-    type Service = S;
-    type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
-        >,
-    >;
-
-    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
-        let addr = self.addr;
-        Box::pin(async move {
-            set_tcp_nodelay(&stream);
-            let mut peek_buf = [0u8; 1];
-            match stream.peek(&mut peek_buf).await {
-                Ok(0) => {
-                    // Connection closed before sending data.
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionReset,
-                        "empty connection",
-                    ))
-                }
-                Ok(_) if peek_buf[0] == 0x16 => {
-                    // TLS ClientHello — pass through to TLS acceptor.
-                    Ok((stream, service))
-                }
-                Ok(_) => {
-                    // Plain HTTP — send redirect and reject.
-                    send_https_redirect(&stream, addr);
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "plain HTTP redirected to HTTPS",
-                    ))
-                }
-                Err(e) => Err(e),
-            }
-        })
-    }
-}
-
-/// Write an HTTP 301 redirect response to HTTPS on the raw TCP stream.
-fn send_https_redirect(stream: &tokio::net::TcpStream, addr: std::net::SocketAddr) {
-    let location = format!("https://{addr}/");
-    let response = format!(
-        "HTTP/1.1 301 Moved Permanently\r\n\
-         Location: {location}\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\r\n"
-    );
-    // Best-effort write — if it fails, the client already got a connection error.
-    let _ = stream.try_write(response.as_bytes());
-}
-
-/// Resolves on a shutdown signal, or once `admission` asks for a stop
-/// because the serving registration could not be taken again.
-async fn signal_or_stop(admission: &registration::Admission) {
-    tokio::select! {
-        () = shutdown_signal() => admission.mark_signalled(),
-        () = admission.stop_requested() => {
-            tracing::info!(
-                "Stopping because the serving registration could not be taken again, draining \
-                 connections..."
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    let Ok(mut sigterm) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    else {
-        tracing::error!("Failed to register SIGTERM handler, falling back to Ctrl+C only");
-        let _ = ctrl_c.await;
-        tracing::info!("Shutdown signal received, draining connections...");
-        return;
-    };
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = sigterm.recv() => {},
-    }
-    tracing::info!("Shutdown signal received, draining connections...");
-}
-
-/// Non-unix: there is no SIGTERM; Ctrl+C (which tokio maps to the console
-/// control handler on Windows) is the only shutdown signal — and it only
-/// fires for an interactive console. Supervisors that terminate the process
-/// directly (including the npm launcher's `stop()`, which is
-/// `TerminateProcess` on Windows) hard-kill without reaching this path, so
-/// the worker drain is skipped. That is acceptable: drain only cancels and
-/// joins background workers — it flushes nothing, and storage commits
-/// per-transaction.
-#[cfg(not(unix))]
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("Shutdown signal received, draining connections...");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// Bind a loopback listener and connect one client to it.
-    async fn bind_and_connect() -> (TcpListener, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let client = TcpStream::connect(addr).await.expect("connect");
-        (listener, client)
-    }
-
-    /// The TLS path: the acceptor that runs before the TLS handshake sets
-    /// `TCP_NODELAY` on the accepted socket, read back from the socket the
-    /// acceptor hands on.
-    #[tokio::test]
-    async fn tls_acceptor_sets_tcp_nodelay_before_the_handshake() {
-        use axum_server::accept::Accept;
-
-        let (listener, mut client) = bind_and_connect().await;
-        // A TLS ClientHello starts with the handshake record type.
-        client
-            .write_all(&[0x16])
-            .await
-            .expect("write ClientHello byte");
-        let (accepted, _) = listener.accept().await.expect("accept");
-        assert!(
-            !accepted.nodelay().expect("read TCP_NODELAY"),
-            "a fresh accepted socket has Nagle on"
-        );
-
-        let acceptor = HttpsRedirectAcceptor {
-            addr: listener.local_addr().expect("local addr"),
-        };
-        let (stream, ()) = acceptor
-            .accept(accepted, ())
-            .await
-            .expect("a TLS ClientHello passes through to the TLS acceptor");
-        assert!(stream.nodelay().expect("read TCP_NODELAY"));
-    }
-
-    /// The plaintext path: the listener handed to `axum::serve` sets
-    /// `TCP_NODELAY` on every socket it accepts.
-    #[tokio::test]
-    async fn plaintext_listener_sets_tcp_nodelay_on_accepted_sockets() {
-        use axum::serve::Listener;
-
-        let (listener, client) = bind_and_connect().await;
-        let mut listener = nodelay_listener(listener);
-        let (accepted, peer) = listener.accept().await;
-        assert_eq!(peer, client.local_addr().expect("client addr"));
-        assert!(accepted.nodelay().expect("read TCP_NODELAY"));
-    }
-
-    /// A stop that the registration supervisor asks for ends the plaintext
-    /// server through the graceful shutdown a signal starts.
-    #[tokio::test]
-    async fn a_stop_after_a_lost_registration_ends_the_server_as_a_signal_does() {
-        use std::future::IntoFuture;
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let admission = registration::Admission::default();
-        let app = Router::new().route("/", get(|| async { "served" }));
-        let server = tokio::spawn(
-            axum::serve(listener, app)
-                .with_graceful_shutdown(graceful_shutdown(None, admission.clone()))
-                .into_future(),
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!server.is_finished(), "the server stopped by itself");
-        admission.stop("the registration could not be taken again".to_owned());
-        tokio::time::timeout(Duration::from_secs(10), server)
-            .await
-            .expect("the server stops within 10 s of the stop")
-            .expect("the server task")
-            .expect("the server");
-        assert_eq!(
-            admission.stop_reason(),
-            Some("the registration could not be taken again")
-        );
-    }
 }

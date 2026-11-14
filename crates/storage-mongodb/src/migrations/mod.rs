@@ -41,6 +41,12 @@ mod m0005_drop_continuous_backups;
 #[rustfmt::skip]
 #[allow(clippy::all, deprecated)]
 mod m0006_backup_catalog_index;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0010_account_metrics;
+#[rustfmt::skip]
+#[allow(clippy::all, deprecated)]
+mod m0012_unique_access_key_ids;
 mod postcheck;
 
 use std::time::Duration;
@@ -164,6 +170,41 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
             "a MongoDB write draws its stream sequence number from its shard's counter inside its \
              transaction, so the records of a shard commit in number order",
         ),
+        MigrationId::RestoreProgress => Migration::NotApplicable(
+            "a store-backed restore records its progress on the target's restore job record \
+             (restore_job.file_index); the restore_progress table is PostgreSQL's data \
+             database's",
+        ),
+        MigrationId::WarmThroughput => Migration::NotApplicable(
+            "the catalog collections have no validator, so a table or index document carries \
+             a warm_throughput field without a schema change",
+        ),
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0010_account_metrics::AccountMetrics,
+                m0010_account_metrics::SOURCE,
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "MongoDB stores the catalog's attribute names as BSON string values, which carry their \
+             length and so can hold U+0000, and every name reads back as it was written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::Applies {
+            // A unique index is never additive (CONTRIBUTING.md): the
+            // previous release does not expect the index to refuse a write.
+            kind: Kind::Breaking,
+            // Once the index is built no ID has a second copy, so running
+            // the body again deletes nothing and keeps the index.
+            convergent: true,
+            bodies: vec![StoreBody::code(
+                StoreKind::Catalog,
+                &m0012_unique_access_key_ids::UniqueAccessKeyIds,
+                m0012_unique_access_key_ids::SOURCE,
+            )],
+        },
     }
 }
 

@@ -52,7 +52,7 @@ impl AuthorizationStore for MongoCatalogStore {
         &self,
         account_id: &str,
         user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>> {
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>> {
         let account_id = account_id.to_owned();
         let user_name = user_name.to_owned();
         Box::pin(async move {
@@ -101,9 +101,10 @@ impl AuthorizationStore for MongoCatalogStore {
             Ok(docs
                 .into_iter()
                 .filter_map(|d| {
+                    let group = d.get_str("principal_name").ok()?.to_owned();
                     let bson_val = d.get("policy_document")?;
                     let json_val: serde_json::Value = bson::from_bson(bson_val.clone()).ok()?;
-                    Some(json_val.to_string())
+                    Some((group, json_val.to_string()))
                 })
                 .collect())
         })

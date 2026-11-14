@@ -185,6 +185,10 @@ pub struct RequestParams {
     pub return_consumed_capacity: Option<String>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
+    /// `dynamodb:FullTableScan` for a request that is not a scan
+    /// (`RequestContext::build` sets it to `true` for one). `None` leaves the
+    /// key absent; a PartiQL read by key sets `false`.
+    pub full_table_scan: Option<bool>,
     /// The caller ARN (`aws:PrincipalArn`), when known.
     pub principal_arn: Option<String>,
     /// The caller's account id (`aws:PrincipalAccount`), when known.
@@ -301,7 +305,8 @@ impl RequestContext {
     /// Build context for a `DynamoDB` operation.
     ///
     /// `principal_tags` and `resource_tags` come from the identity and target
-    /// table respectively. `is_scan` should be true for Scan operations.
+    /// table respectively. `is_scan` should be true for Scan operations; for
+    /// any other request `params.full_table_scan` gives the key.
     /// `params` carries operation-specific request parameters.
     #[must_use]
     pub fn build(
@@ -319,7 +324,11 @@ impl RequestContext {
             select: params.select,
             return_values: params.return_values,
             return_consumed_capacity: params.return_consumed_capacity,
-            full_table_scan: if is_scan { Some(true) } else { None },
+            full_table_scan: if is_scan {
+                Some(true)
+            } else {
+                params.full_table_scan
+            },
             enclosing_operation: params.enclosing_operation,
             principal_arn: params.principal_arn,
             principal_account: params.principal_account,
@@ -468,13 +477,19 @@ impl ConditionContext for RequestContext {
         // ExtendDB applies that only to `aws:TagKeys`, which it populates on
         // exactly the three operations the AWS service authorization reference
         // lists it for (TagResource, UntagResource, CreateTable with Tags), so
-        // its absence here is the service's absence. `dynamodb:Attributes` is
-        // left absent on writes, on reads that project with `AttributesToGet`
-        // and on batch and transaction targets, and `dynamodb:LeadingKeys` on
-        // query shapes the extractor cannot pin to a partition value, where the
-        // service populates both; for those two an absent key keeps the
-        // no-match rule, so an Allow gated on a bare negated operator over them
-        // grants nothing, as the service grants nothing for the present key.
+        // its absence here is the service's absence. `dynamodb:LeadingKeys` is
+        // left absent on query shapes the extractor cannot pin to a partition
+        // value, where the service populates it. `dynamodb:Attributes` is
+        // absent only on a `SearchVectors` with no `ProjectionExpression`
+        // (#729) and, on a table that does not exist, on a `GetItem`,
+        // transaction `Get` or `BatchGetItem` that names no attribute outside
+        // its keys, a `Query` whose key condition the key condition parser
+        // refuses and that names none elsewhere, and a `Scan` that names none.
+        // On the service the key is present on a `Scan` that names no
+        // attribute, and an Allow gated on a bare `StringNotEquals` over it
+        // grants no `Scan` (measured 2026-11-01).
+        // For those two keys an absent key keeps the no-match rule, so an
+        // Allow gated on a bare negated operator over them grants nothing.
         super::casefold::case_fold(key) == "aws:tagkeys"
     }
 }
@@ -996,6 +1011,25 @@ mod tests {
         assert_eq!(
             ctx.resolve_key("dynamodb:FullTableScan"),
             Some(vec!["true"])
+        );
+    }
+
+    #[test]
+    fn request_context_full_table_scan_set_by_the_request() {
+        // A PartiQL read by key carries "false" (measured 2026-11-03); a
+        // request that sets nothing leaves the key absent unless it is a scan.
+        let ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                full_table_scan: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.resolve_key("dynamodb:FullTableScan"),
+            Some(vec!["false"])
         );
     }
 

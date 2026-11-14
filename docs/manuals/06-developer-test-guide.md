@@ -157,13 +157,76 @@ devtools/run-tests --extenddb --pytest --filter test_put_item
    server without the section has by default (`backups/` beside its database
    file); `s3` for an S3 store; `none` for a server without a store
    (`kind = "disabled"`, or PostgreSQL, MongoDB and Cassandra without the
-   section). With a configured store CreateBackup is asynchronous and this
-   release refuses to restore its backups, so the backup tests derive their
-   expected outcome from the variable and fail rather than guess when it is
-   unset; `run-tests --pytest` refuses before any test runs with
+   section). With a configured store CreateBackup is asynchronous and
+   RestoreTableFromBackup of its backups is the store-backed restore job
+   (the response is `CREATING` and the table is loaded in the background),
+   so the backup tests derive their expected outcome from the variable and
+   fail rather than guess when it is unset; `run-tests --pytest` refuses before any test runs with
    `error: --extenddb --pytest requires EXTENDDB_TEST_BACKUP_STORE to be set.`
    The suites check the value against the server's `/health` `backup_store`
    component, so a wrong value fails too.
+
+**The backup store and job suites** (`tests/test_backup_store_config.py`
+and `tests/test_backup_job.py`) start servers of their own, so `run-tests`
+excludes them and they run by name:
+`python3 -m pytest tests/test_backup_store_config.py tests/test_backup_job.py -v`.
+`EXTENDDB_BINARY` names the release build under test and decides which
+deployment the cells use: a SQLite build (the default root beside the
+database file) or a PostgreSQL build, which also needs
+`EXTENDDB_TEST_PG_CONNECTION_STRING` and
+`EXTENDDB_TEST_PG_ADMIN_CONNECTION_STRING`. The S3 cells (the store
+configuration suite's S3 rows and the job suite's store-outage cell) need a
+moto server at `EXTENDDB_TEST_S3_ENDPOINT` (`http://127.0.0.1:<port>`);
+without it they skip. They set the credentials moto accepts
+(`testing`/`testing`, `us-east-1`) themselves, in the server's environment
+and on their own client, so nothing else needs to be exported. The job suite's restore cells size their
+backup from `EXTENDDB_TEST_RESTORE_ITEMS` (default 10,000; at least two data
+files are needed), and the multi-part-key cell enables
+`[limits] allow_multipart_table_keys` on its own deployment. CI runs both
+suites on the PostgreSQL job and the two SQLite jobs; the PostgreSQL job
+and the SQLite S3 job start moto, so the outage cell runs there and skips on
+the plain SQLite job (`.github/workflows/integration.yml`).
+
+**The MongoDB backup cells** of `tests/test_mongodb_backup_restore.py` that
+read the store's root and the server's log skip unless
+`EXTENDDB_TEST_BACKUP_ROOT` (the server's filesystem store root) and
+`EXTENDDB_TEST_SERVER_LOG` (the file the server logs to) are set;
+`devtools/run-mongodb-tests` serves a filesystem store and exports both
+(and `EXTENDDB_TEST_BACKUP_STORE=filesystem`), so run them through it:
+`devtools/run-mongodb-tests -- --pytest --filter test_mongodb_backup_restore`.
+The suite's legacy LSI fallback cell edits an in-catalog backup and runs
+only on a server without a store:
+`devtools/run-mongodb-tests --backup-store none -- --pytest --filter test_mongodb_backup_restore`
+(the runner then writes no `[backup.store]` and exports
+`EXTENDDB_TEST_BACKUP_STORE=none`; the store-backed cells skip under it).
+The CI jobs run the suite with `filesystem`.
+
+**The cross-backend restore matrix** is `devtools/backup-restore-matrix`:
+one cell per invocation (`--source <sqlite|postgres|mongodb> --target
+<sqlite|postgres|mongodb|cassandra>`, plus `--duplicate-key`, `--vector` or
+`--adopt-store`), each starting a source and a target server from the
+per-backend release binaries (`--bin-<backend>`, defaulting to
+`target/rel-<backend>/release/extenddb`) against PostgreSQL at
+`127.0.0.1:55432`, MongoDB at `127.0.0.1:27117` and Cassandra at
+`127.0.0.1:9042`; its MongoDB and Cassandra cells need `pymongo` and
+`cassandra-driver` (`requirements-matrix.txt`). A cell copies the source's
+backup prefix under the target's root and adopts it with `extenddb backup
+sync` on the target (with the target's server stopped when it is SQLite);
+`--adopt-store` points the target's store at the source's root instead,
+adopts the root with `backup sync --adopt-store` and checks that the
+source's server then reports the store owned by another catalog. The
+nightly workflow `.github/workflows/matrix-nightly.yml` builds the four
+binaries, starts the three services and runs the twelve plain cells, the
+four duplicate-key cells, the eight vector cells and two `--adopt-store`
+cells (SQLite to PostgreSQL and back); `workflow_dispatch` runs it on
+demand. The same workflow runs the restore kill points of every backend in
+four jobs (`restore-kill-points-<backend>`), each building its backend's
+binary with `extenddb-app/backup-test-hooks` and starting its backend as
+the matrix job does, through `devtools/backup-kill-points.py restore
+<backend> <point> --bin <binary> --work <dir>` (the Cassandra job builds a
+plain SQLite binary too, the `--source-bin` whose backup the Cassandra
+target restores); every point ends ACTIVE with the exact base and GSI
+counts, except the tampered-file point, whose target is removed.
 
 The `run-tests` script automatically:
 - Performs health check on the target endpoint
@@ -172,6 +235,7 @@ The `run-tests` script automatically:
 - Sets `control_plane_delay_seconds` to 0.05 for fast test cycles
 - Sets `index_propagation_delay_ms` to 0 for immediate GSI updates
 - Enables throttling for production-like behavior
+- Sets `allow_credential_import` to `true` for the access key import tests
 - Configures import/export paths for file operation tests
 - Extracts and exports `EXTENDDB_TEST_PG_CONNECTION_STRING` for CLI lifecycle tests
 
@@ -209,6 +273,8 @@ devtools/run-tests --extenddb --pytest --parallel
 devtools/run-tests --extenddb --pytest --parallel=4
 
 # Direct execution (for quick iteration during development)
+# The access key import tests need import enabled. devtools/run-tests sets it.
+./target/debug/extenddb settings --config extenddb.toml set allow_credential_import true
 python3 -m pytest tests/ -v
 python3 -m pytest tests/test_put_item.py -v
 python3 -m pytest tests/test_put_item.py::test_put_item_basic -v
@@ -305,6 +371,6 @@ Output goes to `pdfs/` (gitignored).
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

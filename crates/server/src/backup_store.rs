@@ -41,7 +41,11 @@
 //! refusal of `open` or `validate` a startup error, and an identity failure
 //! an unhealthy store (reported on `/health`, its rows' restores and deletes
 //! refused naming the kind and the category, rechecked each cycle). A
-//! command that found no store learns why from [`NotConfigured`].
+//! command that found no store learns why from [`NotConfigured`]. `backup
+//! sync` ([`Caller::SyncCommand`]) is the one exception to the leniency: a
+//! defaulted root whose identity file names another catalog is configured
+//! and unhealthy for it, so that `--adopt-store` can adopt the root a
+//! catalog re-created by `destroy` and `init` finds.
 //!
 //! A filesystem store's `validate` and identity check run here, before the
 //! listener, bounded by [`LOCAL_CHECK_TIMEOUT`]: a root on a local disk
@@ -65,6 +69,16 @@
 //! refusal that is not a transport failure (a missing or denied bucket) then
 //! makes the store unhealthy rather than stopping startup.
 //!
+//! A SQLite catalog with no database file (`:memory:`, the `sqlite-memory`
+//! build's default) is new at every start, `catalog_id` included. Its
+//! store's checks write `ephemeral_catalog: true` in an identity file they
+//! create and adopt a root whose file another in-memory catalog wrote
+//! (`extenddb_engine::store_identity`'s module doc), and its startup sync
+//! is pending: the server runs it before it serves when the filesystem
+//! store's check passed here, and the reconciler runs it after the first
+//! check that passes otherwise (`extenddb_engine::sync::startup_sync`). A
+//! root a durable catalog owns stays unhealthy there as anywhere.
+//!
 //! Transport failures (the store unreachable: no region, no credentials, a
 //! refused connection) and failures of the identity check or the manifest
 //! probe (a denial the store reports while a check runs, say a directory
@@ -73,7 +87,7 @@
 //! the operations that touch the store refused, and the check run again
 //! each reconciler cycle until it passes.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use extenddb_backup_store::{BackupStore, BackupStoreKind, StoreError};
@@ -113,12 +127,21 @@ pub enum Caller {
     /// the directory neither created nor locked; the checks run as a
     /// server's do.
     Command,
+    /// `backup sync`: as `Command`, except that a defaulted root whose
+    /// identity file names another catalog stays configured, unhealthy,
+    /// while the catalog has no rows for it, where `Command` and `Server`
+    /// take the warning path (module doc): it is the root a catalog
+    /// re-created by `destroy` and `init` finds, and `--adopt-store` is the
+    /// command that adopts it.
+    SyncCommand,
     /// A command that reads beside a server (`backup list`, the purge's dry
     /// run): as `Command`, and no check of the store runs, so a root is left
     /// as it is found (neither the default directory nor an identity file is
     /// created; a default root that does not exist yet leaves the store
-    /// unconfigured, logged); the store is returned `checking` and the
-    /// command reads what it needs itself.
+    /// unconfigured, logged, as [`NotConfigured::DefaultRootMissing`] or,
+    /// when the catalog holds rows for it, as
+    /// [`NotConfigured::DefaultRootMissingWithRows`]); the store is
+    /// returned `checking` and the command reads what it needs itself.
     ReadOnlyCommand,
 }
 
@@ -130,9 +153,19 @@ pub enum NotConfigured {
     Absent,
     /// `kind = "disabled"`.
     Disabled,
-    /// A read-only command found that the default root does not exist yet:
-    /// no server has run with this database file.
+    /// A read-only command found that the default root does not exist yet,
+    /// and the catalog holds no rows for it: no server has run with this
+    /// database file.
     DefaultRootMissing(PathBuf),
+    /// A read-only command found the default root missing while the catalog
+    /// holds rows for it: moved away, or a symbolic link to a volume that
+    /// is gone. `label` is the root as the rows record it (the link's
+    /// target, for a link), `store_ids` the ids they carry.
+    DefaultRootMissingWithRows {
+        root: PathBuf,
+        label: String,
+        store_ids: Vec<String>,
+    },
     /// The defaulted root could not be created, opened, validated or checked
     /// while the catalog has no rows for it (module doc): the warning path.
     DefaultRootUnusable {
@@ -148,22 +181,34 @@ impl std::fmt::Display for NotConfigured {
         match self {
             Self::Absent => f.write_str(
                 "no backup store is configured: [backup.store] is absent and this backend has \
-                 no default root, so there are no store-backed backups to list or purge",
+                 no default root, so there are no store-backed backups to list, purge or sync",
             ),
             Self::Disabled => f.write_str(
                 "no backup store is configured: [backup.store] is disabled, so there are no \
-                 store-backed backups to list or purge",
+                 store-backed backups to list, purge or sync",
             ),
             Self::DefaultRootMissing(root) => write!(
                 f,
                 "the default root {} does not exist yet: no server has run with this database \
-                 file, so there are no store-backed backups to list or purge",
+                 file, so there are no store-backed backups to list, purge or sync",
                 root.display()
+            ),
+            Self::DefaultRootMissingWithRows {
+                root,
+                label,
+                store_ids,
+            } => write!(
+                f,
+                "the default root {} is missing while the catalog holds rows for {label} (store \
+                 id {}): a volume that is not mounted, a directory moved away, or a link to a \
+                 volume that is gone; put the root back before listing, purging or syncing it",
+                root.display(),
+                store_ids.join(", ")
             ),
             Self::DefaultRootUnusable { root, problem } => write!(
                 f,
                 "the default root {root} failed its check ({problem}) and the catalog has no \
-                 rows for it, so there are no store-backed backups to list or purge; the \
+                 rows for it, so there are no store-backed backups to list, purge or sync; the \
                  warning above says how to fix the root"
             ),
         }
@@ -314,6 +359,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         && let Some(fs) = &config.filesystem
         && !fs.path.exists()
     {
+        if let Some((label, store_ids)) = missing_root_with_rows(catalog, &fs.path).await? {
+            let why = NotConfigured::DefaultRootMissingWithRows {
+                root: fs.path.clone(),
+                label,
+                store_ids,
+            };
+            tracing::warn!("backup store: {why}");
+            return Ok(StoreSetup::without_store(runtime, why));
+        }
         tracing::info!(
             "backup store: the default root {} does not exist yet (no server has run with this \
              database file); there are no store-backed backups to list",
@@ -383,7 +437,16 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
         (StoreKind::S3, Some(s3)) => (s3.bucket.clone(), s3.prefix.clone()),
         _ => (opened.root.clone(), String::new()),
     };
-    let configured = |store: ConfiguredStore| store.with_manifest_names(bucket, key_prefix);
+    // A SQLite database with no file is in memory: its catalog is new at
+    // every start, so the store's checks mark the identity file they write
+    // and adopt a root another in-memory catalog owned, and the startup
+    // sync is pending (module doc).
+    let ephemeral_catalog = backend == "sqlite" && database_file.is_none();
+    let configured = |store: ConfiguredStore| {
+        store
+            .with_manifest_names(bucket, key_prefix)
+            .with_ephemeral_catalog(ephemeral_catalog)
+    };
 
     // The spool and its lock: configuration errors on every backend.
     let (spool, spool_lock) = match (resolved.spool_path, caller) {
@@ -391,7 +454,9 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             let (spool, lock) = take_spool(&path)?;
             (Some(spool), Some(lock))
         }
-        (Some(_), Caller::Command | Caller::ReadOnlyCommand) | (None, _) => (None, None),
+        (Some(_), Caller::Command | Caller::SyncCommand | Caller::ReadOnlyCommand) | (None, _) => {
+            (None, None)
+        }
     };
     let spool_line = spool
         .as_ref()
@@ -431,7 +496,15 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
     // here (`run_local_checks`). A `validate` refusal is a configuration
     // error; a store condition or the identity check's failure degrades the
     // store; on the defaulted root without rows either is the warning.
-    let outcome = match run_local_checks(&*opened.store, kind, &opened.root, catalog, backend).await
+    let outcome = match run_local_checks(
+        &*opened.store,
+        kind,
+        &opened.root,
+        catalog,
+        backend,
+        ephemeral_catalog,
+    )
+    .await
     {
         LocalChecks::Done(outcome) => outcome,
         LocalChecks::Refused(e) => {
@@ -483,7 +556,12 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
             opened.root,
             identity.store_id
         ),
-        Err(problem) if defaulted && !default_root_has_rows(catalog, &opened.root).await => {
+        Err(problem)
+            if defaulted
+                && !(caller == Caller::SyncCommand
+                    && matches!(problem, StoreProblem::ForeignCatalog { .. }))
+                && !default_root_has_rows(catalog, &opened.root).await =>
+        {
             let problem = problem.to_string();
             warn_default_root_unusable(&opened.root, &problem);
             return Ok(StoreSetup::without_store(
@@ -494,21 +572,55 @@ pub async fn configure_described<C: BackupCatalog + ?Sized>(
                 },
             ));
         }
-        Err(problem) => tracing::error!(
-            "backup store: {kind} {} is unhealthy: {problem}; the server starts, restore and \
-             delete of a backup in the store are refused, /health reports the backup_store \
-             component unhealthy, and the check runs again each reconciler cycle{}",
-            opened.root,
-            rows_note(defaulted)
-        ),
+        Err(problem) => {
+            // The `backup sync` exception configures a defaulted root
+            // another catalog owns whether or not this catalog has rows for
+            // it; the clause says which.
+            let note = if defaulted
+                && caller == Caller::SyncCommand
+                && matches!(problem, StoreProblem::ForeignCatalog { .. })
+                && !default_root_has_rows(catalog, &opened.root).await
+            {
+                SYNC_EXCEPTION_NOTE
+            } else {
+                rows_note(defaulted)
+            };
+            if caller == Caller::Server {
+                tracing::error!(
+                    "backup store: {kind} {} is unhealthy: {problem}; the server starts, restore \
+                     and delete of a backup in the store are refused, /health reports the \
+                     backup_store component unhealthy, and the check runs again each reconciler \
+                     cycle{note}",
+                    opened.root,
+                );
+            } else if caller == Caller::SyncCommand
+                && matches!(problem, StoreProblem::ForeignCatalog { .. })
+            {
+                // `backup sync`'s own line: a root another catalog owns is
+                // the state `--adopt-store` acts on, so the line is a
+                // warning; the command's output names the owner and says
+                // whether it adopted the root or refused.
+                tracing::warn!(
+                    "backup store: {kind} {} is owned by another catalog: {problem}{note}",
+                    opened.root,
+                );
+            } else {
+                // A command's own line: no server starts, and the command
+                // says what it does with an unhealthy store.
+                tracing::error!(
+                    "backup store: {kind} {} is unhealthy: {problem}{note}",
+                    opened.root,
+                );
+            }
+        }
     }
-    let configured = configured(ConfiguredStore::new(
-        kind,
-        opened.root,
-        opened.store,
-        spool,
-        outcome,
-    ));
+    let configured = configured(
+        ConfiguredStore::new(kind, opened.root, opened.store, spool, outcome)
+            // Its health is settled here, so the flag changes no check; it
+            // tells a command's refusal that the root is the shared default
+            // one.
+            .defaulted(defaulted),
+    );
     Ok(StoreSetup::with_store(runtime, configured, spool_lock))
 }
 
@@ -525,7 +637,8 @@ enum LocalChecks {
 }
 
 /// A filesystem store's startup checks: `validate`, then
-/// [`store_identity::establish`], bounded by [`LOCAL_CHECK_TIMEOUT`] so a
+/// [`store_identity::establish`] (which, for an in-memory catalog, adopts a
+/// root another in-memory catalog owned), bounded by [`LOCAL_CHECK_TIMEOUT`] so a
 /// root on a mount that stops answering after `open` does not hold the
 /// listener. The store's synchronous filesystem calls run on the blocking
 /// pool, so the bound fires whichever call stalls; a timed-out check leaves
@@ -536,11 +649,13 @@ async fn run_local_checks<C: BackupCatalog + ?Sized>(
     root: &str,
     catalog: &C,
     backend: &str,
+    ephemeral_catalog: bool,
 ) -> LocalChecks {
     let checks = async {
         match store.validate().await {
             Ok(()) => LocalChecks::Done(
-                store_identity::establish(store, kind, root, catalog, backend).await,
+                store_identity::establish(store, kind, root, catalog, backend, ephemeral_catalog)
+                    .await,
             ),
             // A store condition, not a configuration error: the probe write
             // or the root's resolution failed (module doc).
@@ -583,6 +698,14 @@ fn rows_note(defaulted: bool) -> &'static str {
     }
 }
 
+/// The clause of the unhealthy line under the `backup sync` exception
+/// ([`Caller::SyncCommand`]): a defaulted root another catalog owns, with
+/// no rows of this catalog.
+const SYNC_EXCEPTION_NOTE: &str = " (the default root beside the database file, which every \
+     database file in that directory shares; the catalog has no backup rows for it, and it is \
+     configured for `backup sync`, so --adopt-store can adopt it from the catalog its \
+     extenddb-store.json names)";
+
 /// The warning for a defaulted root whose creation, `open`, `validate` or
 /// identity check failed while the catalog has no rows for it: the store is
 /// left unconfigured, as the module doc says.
@@ -592,9 +715,11 @@ fn warn_default_root_unusable(root: &str, problem: &str) {
          backup rows for it, so the store is unconfigured and CreateBackup writes in-catalog \
          backups. Fix the root (it must be owned by this user with mode 0700, under directories \
          owned by root or this user that others cannot write to, and its extenddb-store.json, \
-         if any, must name this catalog: a catalog re-created by `destroy` and `init` needs the \
-         old file removed or a new root), configure [backup.store] to choose another, or set \
-         kind = \"disabled\" to silence this"
+         if any, must name this catalog: a catalog re-created by `destroy` and `init` adopts the \
+         root and its backups with `extenddb backup sync --adopt-store`, once no server of the \
+         catalog the file names runs, and the root is shared by every database file in its \
+         directory), configure [backup.store] to choose another, or set kind = \"disabled\" to \
+         silence this"
     );
 }
 
@@ -684,6 +809,117 @@ fn banner_target(config: &extenddb_backup_store::BackupStoreConfig) -> String {
             shown_path(&fs.path)
         ),
         None => format!("filesystem {}", shown_path(&fs.path)),
+    }
+}
+
+/// How many symbolic links [`link_chain`] replaces before it stops: the
+/// usual `SYMLOOP_MAX`, past which the kernel refuses the path (`ELOOP`).
+const LINK_HOPS: usize = 40;
+
+/// The label of a defaulted filesystem root that does not exist, and the
+/// store ids the catalog records for it, when it records any. The labels
+/// tried, in order: each path of [`link_chain`] (the path as configured,
+/// then the path after each symbolic link along it is replaced by its
+/// target), each also with its longest existing ancestor canonicalized
+/// ([`canonical_ancestor`]). Rows recorded through links carry the
+/// canonical directory the last target names, which the last of them is
+/// when the target's own directory is gone.
+async fn missing_root_with_rows<C: BackupCatalog + ?Sized>(
+    catalog: &C,
+    path: &Path,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let mut labels: Vec<String> = Vec::new();
+    for path in &link_chain(path) {
+        for label in [Some(path.clone()), canonical_ancestor(path)]
+            .into_iter()
+            .flatten()
+        {
+            let label = label.display().to_string();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+    }
+    for label in labels {
+        let ids = catalog
+            .read_store_ids(StoreKind::Filesystem, &label)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("the catalog's rows for the default root could not be read: {e}")
+            })?;
+        if !ids.is_empty() {
+            return Ok(Some((label, ids)));
+        }
+    }
+    Ok(None)
+}
+
+/// `path`, then the path each time the first symbolic link along it, read
+/// component by component from the start, is replaced by its target (a
+/// relative target joined to the link's directory), whether or not the
+/// target exists, the way the kernel resolves a path; at most
+/// [`LINK_HOPS`] links, so a loop of links ends.
+fn link_chain(path: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![path.to_path_buf()];
+    let mut current = path.to_path_buf();
+    for _ in 0..LINK_HOPS {
+        let components: Vec<Component<'_>> = current.components().collect();
+        let mut prefix = PathBuf::new();
+        let mut replaced = None;
+        for (i, component) in components.iter().enumerate() {
+            prefix.push(component);
+            if !matches!(component, Component::Normal(_)) {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(&prefix) {
+                let base = match prefix.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+                replaced = Some(
+                    components[i + 1..]
+                        .iter()
+                        .fold(base, |path, rest| path.join(rest)),
+                );
+                break;
+            }
+        }
+        match replaced {
+            Some(next) => {
+                chain.push(next.clone());
+                current = next;
+            }
+            None => break,
+        }
+    }
+    chain
+}
+
+/// `path` with its longest existing ancestor canonicalized and the rest of
+/// its components joined back on (a `..` among them taking off the
+/// component before it, since none of them exists to be a link); `None`
+/// when no ancestor resolves.
+fn canonical_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut rest: Vec<Component<'_>> = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(current) {
+            let mut resolved = canonical;
+            for component in rest.iter().rev() {
+                if *component == Component::ParentDir {
+                    resolved.pop();
+                } else {
+                    resolved.push(component);
+                }
+            }
+            return Some(resolved);
+        }
+        match current.components().next_back()? {
+            component @ (Component::Normal(_) | Component::ParentDir) => rest.push(component),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+        current = current.parent()?;
     }
 }
 
@@ -935,17 +1171,19 @@ mod tests {
     use extenddb_storage::BoxedFuture;
     use extenddb_storage::backup_catalog::{
         BackupKey, BackupRow, BackupStatus, DeleteStart, JobClaim, MaintenanceClaim, RestoreJobRow,
-        RestoreTargetKey, StoreIdentity, TimeBounds,
+        RestoreTargetKey, StoreIdentity, StoreRootCount, TimeBounds,
     };
     use extenddb_storage::error::StorageError;
     use futures::stream::BoxStream;
 
-    /// A catalog whose rows for every root carry `ids`, or whose rows cannot
-    /// be read (`rows_unreadable`), with no backup row to list; every other
-    /// method is an error, since the startup checks never reach it.
+    /// A catalog whose rows for every root carry `ids` (only for the root
+    /// `ids_root` when it is set), or whose rows cannot be read
+    /// (`rows_unreadable`), with no backup row to list; every other method
+    /// is an error, since the startup checks never reach it.
     #[derive(Default)]
     struct StubCatalog {
         ids: Vec<String>,
+        ids_root: Option<String>,
         rows_unreadable: bool,
     }
 
@@ -967,11 +1205,48 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Box<dyn JobClaim>, StorageError>> {
             unused()
         }
+        fn insert_backup_row<'a>(
+            &'a self,
+            _row: &'a BackupRow,
+        ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+            unused()
+        }
         fn claim_dead_backup<'a>(
             &'a self,
             _key: &'a BackupKey,
             _stale_after: std::time::Duration,
         ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+            unused()
+        }
+        fn claim_restore<'a>(
+            &'a self,
+            _account_id: &'a str,
+            _input: extenddb_core::types::CreateTableInput,
+            _registration: &'a extenddb_storage::backup_catalog::RestoreRegistrationRow,
+        ) -> BoxedFuture<
+            'a,
+            Result<(extenddb_core::types::TableDescription, Box<dyn JobClaim>), StorageError>,
+        > {
+            unused()
+        }
+        fn claim_restore_dead<'a>(
+            &'a self,
+            _key: &'a RestoreTargetKey,
+            _stale_after: std::time::Duration,
+            _spool_host: Option<&'a str>,
+        ) -> BoxedFuture<'a, Result<Option<Box<dyn JobClaim>>, StorageError>> {
+            unused()
+        }
+        fn read_restore_job<'a>(
+            &'a self,
+            _key: &'a RestoreTargetKey,
+        ) -> BoxedFuture<'a, Result<Option<RestoreJobRow>, StorageError>> {
+            unused()
+        }
+        fn list_restore_jobs<'a>(
+            &'a self,
+            _status: Option<extenddb_storage::backup_catalog::JobStatus>,
+        ) -> BoxedFuture<'a, Result<Vec<RestoreJobRow>, StorageError>> {
             unused()
         }
         fn list_backup_rows<'a>(
@@ -1009,6 +1284,12 @@ mod tests {
         ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
             unused()
         }
+        fn row_holding_backup_id<'a>(
+            &'a self,
+            _backup_id: &'a str,
+        ) -> BoxedFuture<'a, Result<Option<BackupRow>, StorageError>> {
+            unused()
+        }
         fn start_backup_delete<'a>(
             &'a self,
             _key: &'a BackupKey,
@@ -1024,7 +1305,16 @@ mod tests {
         fn remove_backup_row<'a>(
             &'a self,
             _key: &'a BackupKey,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
         ) -> BoxedFuture<'a, Result<bool, StorageError>> {
+            unused()
+        }
+        fn forget_available_backup_row<'a>(
+            &'a self,
+            _key: &'a BackupKey,
+        ) -> BoxedFuture<'a, Result<extenddb_storage::backup_catalog::ForgetRow, StorageError>>
+        {
             unused()
         }
         fn remove_dead_creating_backup_row<'a>(
@@ -1073,7 +1363,7 @@ mod tests {
         fn read_store_ids<'a>(
             &'a self,
             _store_kind: StoreKind,
-            _store_root: &'a str,
+            store_root: &'a str,
         ) -> BoxedFuture<'a, Result<Vec<String>, StorageError>> {
             if self.rows_unreadable {
                 return Box::pin(async {
@@ -1082,8 +1372,33 @@ mod tests {
                     ))
                 });
             }
-            let ids = self.ids.clone();
+            let ids = match &self.ids_root {
+                Some(root) if root != store_root => Vec::new(),
+                _ => self.ids.clone(),
+            };
             Box::pin(async move { Ok(ids) })
+        }
+        fn list_backup_rows_by_root<'a>(
+            &'a self,
+            _store_kind: StoreKind,
+            _store_root: &'a str,
+            _status: Option<BackupStatus>,
+        ) -> BoxStream<'a, Result<BackupRow, StorageError>> {
+            Box::pin(futures::stream::once(unused()))
+        }
+        fn rewrite_store<'a>(
+            &'a self,
+            _from_kind: StoreKind,
+            _from_root: &'a str,
+            _keys: &'a [BackupKey],
+            _to: &'a StoreIdentity,
+        ) -> BoxedFuture<'a, Result<u64, StorageError>> {
+            unused()
+        }
+        fn summarize_store_roots(
+            &self,
+        ) -> BoxedFuture<'_, Result<Vec<StoreRootCount>, StorageError>> {
+            unused()
         }
         fn maintenance_claim<'a>(
             &'a self,
@@ -1262,6 +1577,62 @@ mod tests {
             "{why:?}"
         );
         assert!(why.to_string().contains("no rows for it"), "{why}");
+        // `backup sync` is the exception: the same root is a configured,
+        // unhealthy store for it, which `--adopt-store` adopts; a purge
+        // takes the warning path as the server does.
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::SyncCommand,
+        )
+        .await
+        .unwrap();
+        assert_eq!(setup.not_configured, None);
+        assert_eq!(
+            setup
+                .runtime
+                .configured_store()
+                .expect("configured for sync")
+                .health()
+                .category(),
+            Some("owned by another catalog")
+        );
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::Command,
+        )
+        .await
+        .unwrap();
+        assert!(setup.runtime.configured_store().is_none());
+        // The exception is for a root another catalog owns only: another
+        // failure of the defaulted root takes the warning path for sync too.
+        std::fs::write(root.join(store_identity::STORE_IDENTITY_KEY), b"not json").unwrap();
+        let setup = configure_described(
+            &backup,
+            Some(&database),
+            "sqlite",
+            &without_rows,
+            Caller::SyncCommand,
+        )
+        .await
+        .unwrap();
+        assert!(setup.runtime.configured_store().is_none());
+        assert!(
+            matches!(&setup.not_configured, Some(NotConfigured::DefaultRootUnusable { problem, .. })
+                if problem.contains("could not be read")),
+            "{:?}",
+            setup.not_configured
+        );
+        std::fs::write(
+            root.join(store_identity::STORE_IDENTITY_KEY),
+            foreign.to_bytes(),
+        )
+        .unwrap();
         // The same file over rows for the root: a configured, unhealthy
         // store (`owned by another catalog`), not the warning.
         let setup = configure_described(
@@ -1396,7 +1767,14 @@ mod tests {
         // fails here instead of hanging.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            run_local_checks(&stalled, StoreKind::Filesystem, "/r", &catalog, "test"),
+            run_local_checks(
+                &stalled,
+                StoreKind::Filesystem,
+                "/r",
+                &catalog,
+                "test",
+                false,
+            ),
         )
         .await
         .expect("the checks return at their bound");
@@ -1411,7 +1789,8 @@ mod tests {
             context: "write probe /r/.put-validate.tmp".to_owned(),
             source: std::io::Error::from_raw_os_error(28),
         }));
-        let outcome = run_local_checks(&io, StoreKind::Filesystem, "/r", &catalog, "test").await;
+        let outcome =
+            run_local_checks(&io, StoreKind::Filesystem, "/r", &catalog, "test", false).await;
         let LocalChecks::Done(Err(problem)) = outcome else {
             panic!("an I/O failure of the probe degrades the store");
         };
@@ -1421,8 +1800,15 @@ mod tests {
         let denied = FakeStore(Validate::Fails(|| {
             StoreError::PermissionDenied("/r has mode 0755".to_owned())
         }));
-        let outcome =
-            run_local_checks(&denied, StoreKind::Filesystem, "/r", &catalog, "test").await;
+        let outcome = run_local_checks(
+            &denied,
+            StoreKind::Filesystem,
+            "/r",
+            &catalog,
+            "test",
+            false,
+        )
+        .await;
         assert!(matches!(
             outcome,
             LocalChecks::Refused(StoreError::PermissionDenied(_))
@@ -1444,6 +1830,17 @@ mod tests {
             missing
                 .to_string()
                 .contains("/srv/db/backups does not exist yet")
+        );
+        let with_rows = NotConfigured::DefaultRootMissingWithRows {
+            root: PathBuf::from("/srv/db/backups"),
+            label: "/mnt/vol/backups".to_owned(),
+            store_ids: vec!["store-1".to_owned()],
+        }
+        .to_string();
+        assert!(
+            with_rows.contains("/srv/db/backups is missing while the catalog holds rows for /mnt/vol/backups (store id store-1)")
+                && !with_rows.contains("no server has run"),
+            "{with_rows}"
         );
         let unusable = NotConfigured::DefaultRootUnusable {
             root: "/srv/db/backups".to_owned(),
@@ -1543,5 +1940,103 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The labels a missing default root's rows are looked up under follow
+    /// every symbolic link along the path: a chain of two links, a
+    /// directory link in the middle of the path, a chain of relative
+    /// links, a path spelled through a linked directory, and one spelled
+    /// with `..` (its canonical form), each with the link's volume renamed
+    /// away; a loop of links ends with no label found.
+    #[tokio::test]
+    async fn a_missing_default_root_is_looked_up_through_every_link_of_its_path() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let found = |label: &Path| StubCatalog {
+            ids: vec!["store-1".to_owned()],
+            ids_root: Some(label.display().to_string()),
+            ..StubCatalog::default()
+        };
+        let lookup = |catalog: StubCatalog, path: PathBuf| async move {
+            missing_root_with_rows(&catalog, &path).await.unwrap()
+        };
+        let expect = |label: &Path| Some((label.display().to_string(), vec!["store-1".to_owned()]));
+
+        // backups -> l2 -> vol/backups, absolute targets, vol renamed away.
+        let a = base.join("a");
+        std::fs::create_dir_all(a.join("vol/backups")).unwrap();
+        symlink(a.join("vol/backups"), a.join("l2")).unwrap();
+        symlink(a.join("l2"), a.join("backups")).unwrap();
+        std::fs::rename(a.join("vol"), a.join("vol-away")).unwrap();
+        let label = a.join("vol/backups");
+        assert_eq!(
+            lookup(found(&label), a.join("backups")).await,
+            expect(&label)
+        );
+
+        // data -> mnt/disk1, the path data/backups, disk1 renamed away.
+        let b = base.join("b");
+        std::fs::create_dir_all(b.join("mnt/disk1/backups")).unwrap();
+        symlink(b.join("mnt/disk1"), b.join("data")).unwrap();
+        std::fs::rename(b.join("mnt/disk1"), b.join("mnt/disk1-away")).unwrap();
+        let label = b.join("mnt/disk1/backups");
+        assert_eq!(
+            lookup(found(&label), b.join("data/backups")).await,
+            expect(&label)
+        );
+
+        // backups -> l2 -> vol/backups, relative targets, vol renamed away.
+        let c = base.join("c");
+        std::fs::create_dir_all(c.join("vol/backups")).unwrap();
+        symlink("vol/backups", c.join("l2")).unwrap();
+        symlink("l2", c.join("backups")).unwrap();
+        std::fs::rename(c.join("vol"), c.join("vol-away")).unwrap();
+        let label = c.join("vol/backups");
+        assert_eq!(
+            lookup(found(&label), c.join("backups")).await,
+            expect(&label)
+        );
+
+        // The database's directory reached through a linked directory: the
+        // rows carry the real directory.
+        let e = base.join("e");
+        std::fs::create_dir_all(e.join("real/db")).unwrap();
+        symlink(e.join("real"), e.join("alias")).unwrap();
+        let label = e.join("real/db/backups");
+        assert_eq!(
+            lookup(found(&label), e.join("alias/db/backups")).await,
+            expect(&label)
+        );
+
+        // A path spelled with `..`: its canonical form.
+        let d = base.join("d");
+        std::fs::create_dir_all(d.join("db/sub")).unwrap();
+        let label = d.join("db/backups");
+        assert_eq!(
+            lookup(found(&label), d.join("db/sub/../backups")).await,
+            expect(&label)
+        );
+
+        // A loop of links: the walk stops at the hop limit, nothing found.
+        // The walk runs on its own thread, so a walk that does not stop
+        // fails this cell by name within seconds rather than hanging it.
+        let f = base.join("f");
+        std::fs::create_dir_all(&f).unwrap();
+        symlink(f.join("y"), f.join("x")).unwrap();
+        symlink(f.join("x"), f.join("y")).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let looped = f.join("x/backups");
+        std::thread::spawn(move || {
+            let _ = sent.send(link_chain(&looped).len());
+        });
+        let hops = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the walk of a loop of links ends at the hop limit");
+        assert!(hops <= LINK_HOPS + 1, "{hops} hops");
+        assert_eq!(
+            lookup(found(&base.join("elsewhere")), f.join("x/backups")).await,
+            None
+        );
     }
 }

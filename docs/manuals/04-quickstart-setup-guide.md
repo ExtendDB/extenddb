@@ -130,9 +130,10 @@ Check the version:
 ```bash
 ./target/release/extenddb version
 # extenddb 0.1.14
-# catalog migration 7 (postgres)
+# catalog migration 12 (postgres)
 # commit abc1234
 # built 2026-04-17T12:00:00Z
+# test-hooks disabled
 ```
 
 ### Initialization
@@ -148,13 +149,15 @@ Options:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--catalog-db` | `extenddb_catalog` | Catalog database name |
-| `--data-db` | `<catalog>_data` | Data database name |
+| `--data-db` | the catalog's name without `_catalog` (`extenddb` for the default catalog) | Data database name |
 | `--pg-host` | `localhost` | PostgreSQL host |
 | `--pg-port` | `5432` | PostgreSQL port |
-| `--pg-user` | `extenddb` | PostgreSQL user |
-| `--pg-password` | `extenddb-local-dev` | PostgreSQL password |
+| `--pg-user` | `$USER`, then `postgres` | PostgreSQL admin role, used for `CREATE DATABASE` and `CREATE USER` |
+| `--pg-pass` | none (or `EXTENDDB_PG_PASSWORD`) | The admin role's password |
+| `--extenddb-user` | `extenddb` | The application role the server connects as |
+| `--extenddb-pass` | `extenddb-local-dev` (or `EXTENDDB_APP_PASSWORD`) | The application role's password |
 
-The command generates `extenddb.toml` with the connection details. If `extenddb.toml` already exists, `init` loads defaults from it.
+The command generates `extenddb.toml` with the connection details. If `extenddb.toml` already exists, `init` refuses (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one.
 
 **Save the admin credentials** printed during init. They are shown once and cannot be retrieved later.
 
@@ -172,7 +175,7 @@ Config:           extenddb.toml
 Catalog database: extenddb_catalog
 
 --- Checking catalog migrations...
-  OK: Current: the catalog is at migration 7
+  OK: Current: the catalog is at migration 12
 --- Checking catalog connection...
   OK: Connected to catalog.
 --- Checking data database...
@@ -420,6 +423,6 @@ See `docs/troubleshooting.md` for the full troubleshooting guide.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
