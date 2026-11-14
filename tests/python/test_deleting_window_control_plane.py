@@ -193,6 +193,7 @@ class TestDeletingWindowControlPlane:
         try:
             arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
             dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k1", "Value": "v1"}])
+            _settle_tags(dynamodb_client, is_extenddb, arn)
             dynamodb_client.delete_table(TableName=name)
             with pytest.raises(ClientError) as exc:
                 dynamodb_client.tag_resource(ResourceArn=arn, Tags=[{"Key": "k2", "Value": "v2"}])
@@ -329,38 +330,9 @@ class TestDeletingWindowTimeToLive:
 
 
 class TestDeletingWindowTags:
-    """``TagResource`` and ``UntagResource`` on the table ARN are refused during
-    the window and ``ListTagsOfResource`` is served with the tags (measured
-    2026-10-25). The table's stream ARN is a resource of its own: both writes
-    and the read are served on it during the window (measured 2026-10-26)."""
-
-    def test_tag_calls_during_the_window(self, dynamodb_client, is_extenddb):
-        name = unique_name("del-window")
-        lock = _open_window(dynamodb_client, is_extenddb, name)
-        try:
-            arn = dynamodb_client.describe_table(TableName=name)["Table"]["TableArn"]
-            dynamodb_client.tag_resource(
-                ResourceArn=arn, Tags=[{"Key": "env", "Value": "test"}]
-            )
-            _settle_tags(dynamodb_client, is_extenddb, arn)
-            dynamodb_client.delete_table(TableName=name)
-
-            with pytest.raises(ClientError) as exc:
-                dynamodb_client.tag_resource(
-                    ResourceArn=arn, Tags=[{"Key": "added", "Value": "in-window"}]
-                )
-            _assert_in_use(exc.value, name)
-
-            with pytest.raises(ClientError) as exc:
-                dynamodb_client.untag_resource(ResourceArn=arn, TagKeys=["env"])
-            _assert_in_use(exc.value, name)
-
-            listed = dynamodb_client.list_tags_of_resource(ResourceArn=arn)
-            assert listed["Tags"] == [{"Key": "env", "Value": "test"}]
-        finally:
-            if lock is not None:
-                lock.release()
-        wait_for_deleted(dynamodb_client, name, timeout=120.0)
+    """The table's stream ARN is a resource of its own: both tag writes and the
+    read are served on it during the window (measured 2026-10-26), where the
+    table ARN refuses the writes (``TestDeletingWindowControlPlane``)."""
 
     def test_stream_arn_tag_resource_is_served(self, dynamodb_client, is_extenddb):
         """TagResource on the stream ARN, the first tag write after the delete,

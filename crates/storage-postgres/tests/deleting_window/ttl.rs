@@ -139,6 +139,7 @@ async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
 
     let ctx = extenddb_engine::OperationContext {
         storage: Arc::new(s.engine.clone()),
+        backup: Arc::new(extenddb_engine::BackupRuntime::new(1)),
         limits: Arc::new(extenddb_core::limits::LimitsConfig::default()),
         region: Arc::from("us-east-1"),
         account_id: Arc::from(ACCOUNT),
@@ -147,6 +148,7 @@ async fn update_ttl_disable_during_the_window_sends_no_drop_index() {
         authorized_key_info: extenddb_engine::AuthorizedKeyInfo::default(),
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         table_key_info_lookup: None,
+        item_authorizer: None,
     };
     let out = extenddb_engine::handle_update_time_to_live(
         json!({"TableName": TABLE,

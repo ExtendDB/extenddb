@@ -14,16 +14,11 @@
 //! (`tables`, `indexes`, `vector_indexes`, `table_restores`) and two on MongoDB
 //! and Cassandra (`tables`, `indexes`). `DescribeTimeToLive`,
 //! `UpdateTimeToLive`, `TagResource`, `UntagResource` and `ListTagsOfResource`
-//! each make it once per call. The tag path keeps the key-info read after it
-//! for every status but `DELETING`, so a tag call on an `ACTIVE` table sends
-//! seven queries before its tag statements on PostgreSQL and SQLite, where it
-//! sent three, and four on MongoDB and Cassandra, where it sent two.
-//! `DescribeTimeToLive` on an `ACTIVE` table sends five and three, where it
-//! sent one. `UpdateTimeToLive` sends the four or two more, and on a
-//! `DELETING` table it skips the TTL read after the write and the index
-//! statements.
+//! each make it once per call. `DescribeTimeToLive` on an `ACTIVE` table sends
+//! five and three, where it sent one. `UpdateTimeToLive` sends the four or two
+//! more, and on a `DELETING` table it skips the TTL read after the write and
+//! the index statements.
 
-use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{DescribeTableInput, TableStatus};
 use extenddb_storage::error::StorageError;
 
@@ -50,15 +45,4 @@ pub(crate) async fn read_table_status(
         )
         .await?;
     Ok(desc.table_status)
-}
-
-/// The service's refusal of a change to a table that is being deleted, worded
-/// once in [`extenddb_core::error::ErrorMessageKey::TableBeingDeleted`] and
-/// classified the way the control-plane mappers classify
-/// [`StorageError::TableBeingDeleted`].
-pub(crate) fn being_deleted(table_name: &str) -> DynamoDbError {
-    DynamoDbError::ResourceInUseException(extenddb_core::error::error_message(
-        extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
-        &[table_name],
-    ))
 }

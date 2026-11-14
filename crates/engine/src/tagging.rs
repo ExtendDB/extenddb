@@ -101,9 +101,9 @@ enum WhileDeleting {
 /// window (measured 2026-10-26), so `resource` decides: a stream's tags belong
 /// to the stream, which stays describable after its table is deleted. The key
 /// info carries no status, and the data plane reads a `DELETING` table as
-/// found on PostgreSQL and SQLite, so the status is read with
-/// `describe_table`. Any other answer from it is left to the existence check
-/// that follows.
+/// found on PostgreSQL and SQLite, so the status is read from the catalog
+/// (`table_lifecycle::read_table_status`). Any other answer from it is left to
+/// the existence check that follows.
 ///
 /// Returns whether the table is `DELETING` and the request is served: the
 /// key-info read reports a `DELETING` row as not found on MongoDB and
@@ -115,19 +115,10 @@ async fn refuse_while_deleting(
     ctx: &OperationContext,
     while_deleting: WhileDeleting,
 ) -> Result<bool, DynamoDbError> {
-    let Ok(desc) = ctx
-        .storage
-        .describe_table(
-            &ctx.account_id,
-            extenddb_core::types::DescribeTableInput {
-                table_name: table_name.to_owned(),
-            },
-        )
-        .await
-    else {
+    let Ok(status) = crate::table_lifecycle::read_table_status(table_name, ctx).await else {
         return Ok(false);
     };
-    if desc.table_status != TableStatus::Deleting {
+    if status != TableStatus::Deleting {
         return Ok(false);
     }
     if while_deleting == WhileDeleting::Refuse && !tag_subresource_is_stream(resource) {
