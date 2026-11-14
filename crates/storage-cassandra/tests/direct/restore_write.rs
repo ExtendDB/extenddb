@@ -24,8 +24,8 @@ use extenddb_storage::{
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::backup_engine::{
-    attr, create_active_table, item, key, ks, make_gsis_synchronous, put_all, query_index, restore,
-    wait_active,
+    assert_index_rows_carry_the_base_versions, attr, create_active_table, item, key, ks,
+    make_gsis_synchronous, put_all, query_index, restore, wait_active,
 };
 use crate::helpers::{TestAccount, setup_engine};
 
@@ -236,6 +236,17 @@ async fn test_restored_rows_carry_a_version_and_take_every_later_write() {
             "restored row {id}/{sort} version {version:?} is not a clock reading"
         );
     }
+    // Every GSI and LSI row carries its base row's version as its write
+    // timestamp, as `put_restored_item_at` writes it. The items are keyed by
+    // `value`, which is unique per item and projected into both indexes.
+    assert_index_rows_carry_the_base_versions(
+        &engine,
+        &restored.account_id,
+        &restored.table_id,
+        "value",
+        &["ByGroup", "ByLocal"],
+    )
+    .await;
     assert_eq!(
         index_keys(&engine, &restored, "ByGroup", "gpk", "g1").await,
         ["a|1", "a|2"]

@@ -1326,7 +1326,9 @@ impl CassandraEngine {
                     }
                     // The clock reading a new row's version takes
                     // (`data::version`), also the write timestamp of the
-                    // item's base and index rows.
+                    // item's base and index rows, so the host and node
+                    // clock rule of `restore_engine`'s module doc applies to
+                    // this copy too.
                     let stamp = crate::data::version::now_micros();
                     self.put_restored_item_at(key_info, indexes, &item, stamp)
                         .await
