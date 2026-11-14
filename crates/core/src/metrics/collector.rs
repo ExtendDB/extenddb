@@ -125,8 +125,10 @@ impl MetricsCollector {
 
     /// Prune data points older than 1 day.
     ///
-    /// Segment buckets are overwritten in place as time advances and need no
-    /// pruning.
+    /// Segment buckets inside the window are overwritten in place as time
+    /// advances; the prune drops the rings of an account's operation once no
+    /// bucket of the last day remains, so an account that stopped sending
+    /// requests, or was deleted, holds no segment memory after a day.
     pub fn prune(&self) {
         let now = Instant::now();
         let cutoff = now.checked_sub(Duration::from_secs(86400)).unwrap_or(now);
@@ -137,6 +139,11 @@ impl MetricsCollector {
             acc.prune(cutoff);
         }
         map.retain(|_, acc| !acc.is_empty());
+        drop(map);
+        // Clock read under the lock, as in `record_segments`.
+        if let Ok(mut store) = self.segments.write() {
+            store.prune(Instant::now());
+        }
     }
 }
 

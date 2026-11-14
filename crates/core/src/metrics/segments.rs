@@ -14,8 +14,11 @@
 //! `accounts * operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes. The
 //! server only records operations that pass `is_known_operation`, which caps
 //! `operations` at the size of the dispatch table, and only for a request
-//! that authenticated, so `accounts` is the number of accounts in the catalog
-//! that sent a request, which operators create.
+//! that authenticated. `accounts` is the number of accounts that sent a
+//! request within the coarse ring's window, the last 1,440 to 1,441 minutes:
+//! the collector's prune, every five minutes, drops the rings of an account's
+//! operation once that window holds no bucket of theirs, and the account once
+//! it holds no operation.
 //!
 //! The account is a key because `/metrics` filters the segments by account.
 //! A query without the filter sums every account's buckets per operation.
@@ -204,7 +207,8 @@ impl SegmentStore {
 
     /// Adds one request of `account_id`. Steady state is two hash lookups and
     /// two bucket updates; the only allocation is the rings of an account's
-    /// operation seen for the first time.
+    /// operation that has none, because it is the first request or because
+    /// `prune` dropped them.
     pub(super) fn record(
         &mut self,
         account_id: &str,
@@ -275,6 +279,24 @@ impl SegmentStore {
                 }
             })
             .collect()
+    }
+
+    /// Drops the rings of each account's operation whose coarse ring holds no
+    /// bucket of the whole-ring window at `now`, then each account left with
+    /// no operation. The fine ring's windows lie inside the coarse ring's, so
+    /// no query answer changes; an account that has sent no request for the
+    /// length of the coarse ring releases its memory.
+    pub(super) fn prune(&mut self, now: Instant) {
+        let elapsed = self.elapsed_secs(now);
+        self.by_account.retain(|_, operations| {
+            operations.retain(|_, rings| {
+                let ring = &rings.coarse;
+                let mut in_window = Bucket::default();
+                ring.sum_from(ring.first_slot(elapsed, None), &mut in_window);
+                in_window.count > 0
+            });
+            !operations.is_empty()
+        });
     }
 
     /// Number of (account, operation) pairs with rings allocated.

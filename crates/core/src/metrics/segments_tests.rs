@@ -371,6 +371,56 @@ fn ring_lap_and_stale_slots() {
     assert_eq!(store.bucket_count(), BUCKETS_PER_OPERATION);
 }
 
+/// The prune drops the rings of an account's operation once the coarse ring's
+/// whole-ring window holds no bucket of theirs, and the account once it holds
+/// no operation. An account whose last request is still in the window keeps
+/// its rings and the data in them.
+#[test]
+fn prune_drops_idle_accounts_and_keeps_active_ones() {
+    let epoch = Instant::now();
+    let mut store = SegmentStore::new(epoch);
+    store.record(ACCOUNTS[0], "GetItem", &segs(1.0), at(epoch, 0));
+    store.record(ACCOUNTS[0], "Scan", &segs(1.0), at(epoch, 0));
+    store.record(ACCOUNTS[1], "GetItem", &segs(1.0), at(epoch, 0));
+    store.record(ACCOUNTS[1], "GetItem", &segs(1.0), at(epoch, 60));
+    assert_eq!(store.bucket_count(), 3 * BUCKETS_PER_OPERATION);
+
+    // At 1440 minutes, minute 0 is the oldest slot of the ring: nothing goes.
+    store.prune(at(epoch, 1440 * 60));
+    assert_eq!(store.by_account.len(), 2);
+    assert_eq!(store.bucket_count(), 3 * BUCKETS_PER_OPERATION);
+    assert_eq!(
+        count_of(
+            &store.query(TimeWindow::AllTime, None, at(epoch, 1440 * 60)),
+            "Scan"
+        ),
+        1
+    );
+
+    // One minute later minute 0 has left the ring. The first account's two
+    // operations have no other bucket, so their rings go and the account with
+    // them. The second account's GetItem ring has minute 1 and stays.
+    store.prune(at(epoch, 1441 * 60));
+    assert_eq!(store.by_account.len(), 1);
+    assert_eq!(store.bucket_count(), BUCKETS_PER_OPERATION);
+    assert!(
+        store
+            .query(TimeWindow::AllTime, Some(ACCOUNTS[0]), at(epoch, 1441 * 60))
+            .is_empty()
+    );
+    assert_eq!(
+        count_of(
+            &store.query(TimeWindow::AllTime, Some(ACCOUNTS[1]), at(epoch, 1441 * 60)),
+            "GetItem"
+        ),
+        1
+    );
+    // The dropped account's next request allocates its rings again.
+    store.record(ACCOUNTS[0], "Scan", &segs(2.0), at(epoch, 1441 * 60));
+    assert_eq!(store.by_account.len(), 2);
+    assert_eq!(store.bucket_count(), 2 * BUCKETS_PER_OPERATION);
+}
+
 /// One request every second for three laps of the coarse ring, queried at
 /// every ring and window boundary and every 977 s in between. The expected
 /// count and mean have a closed form (an arithmetic series over the included

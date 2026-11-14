@@ -196,7 +196,7 @@ fn record_and_query_segments() {
 }
 
 #[test]
-fn prune_leaves_segments_alone_and_the_ring_ages_them_out() {
+fn prune_keeps_recent_segments_and_the_ring_ages_them_out() {
     use crate::metrics::types::LatencySegments;
     use std::time::Duration;
 

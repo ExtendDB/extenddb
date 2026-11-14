@@ -359,10 +359,12 @@ ExtendDB's own `AccountId` dimension.
   Each account's operation holds 301 one-second and 1,441 one-minute buckets
   of 64 bytes, 111,488 bytes, so the breakdown holds at most
   `accounts x operations x 111,488` bytes: with the 40 operations the server
-  dispatches, 4,459,520 bytes (4.25 MiB) per account that has sent a
-  request. The segments are recorded only for authenticated requests, so
-  `accounts` is bounded by the accounts in the catalog, which operators
-  create.
+  dispatches, 4,459,520 bytes (4.25 MiB) per account. `accounts` counts the
+  accounts that sent a request in the last day (the 24-hour ring, 1,440 to
+  1,441 minutes): the metrics prune, every five minutes, drops the buckets of
+  an account's operation once that window holds none of its requests, and the
+  account once it holds no operation. The segments are recorded only for
+  authenticated requests.
 - `source`: `"database"` when served from the persistent `MetricsStore`,
   `"memory"` when served from the in-process `MetricsCollector` fallback.
 

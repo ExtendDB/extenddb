@@ -368,9 +368,11 @@ rate (for example six 40-byte points per GetItem, held for 60 to 120 seconds)
 and not with uptime, and per-operation latency segments are summed into fixed
 time buckets per account and operation, at most 111,488 bytes (109 KiB)
 per operation an account has sent. With the 40 operations the server
-dispatches that is 4,459,520 bytes (4.25 MiB) per account, so the
-segments grow with the number of accounts that send requests, which the
-operator controls, and not with the request rate, the table count or uptime.
+dispatches that is 4,459,520 bytes (4.25 MiB) per account that sent a
+request in the last day: the five-minute metrics prune drops the buckets of
+an account that has sent no request for a day. So the segments grow with the
+number of accounts that sent a request in the last day, and not with the
+request rate, the table count or uptime.
 
 Releases through 0.1.13 kept one latency segment record per data-plane
 request in memory for 24 hours, about 190 bytes per request. On those

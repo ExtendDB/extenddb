@@ -8,7 +8,8 @@
 //! of per-key accumulators. A background task prunes data points older than
 //! 1 day every 5 minutes. Per-account, per-operation latency segments are
 //! summed into fixed time buckets at record time (see `segments`), so they
-//! hold a bounded amount of memory and need no pruning.
+//! hold a bounded amount of memory; the same task drops the buckets of an
+//! account that has sent no request for a day.
 //!
 //! REQ-OBS-005: Metrics endpoint.
 
