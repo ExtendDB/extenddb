@@ -266,7 +266,7 @@ When `extenddb init` creates the first admin user, it seeds a default policy. Wh
 }
 ```
 
-Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. Policy variable support (REQ-ABAC-006) remains deferred.
+Note: the `${account_id}` and `${user_name}` in the default policy are literal substitutions performed at user creation time, not IAM policy variables. IAM policy variables are expanded when a policy is evaluated (REQ-ABAC-006, `policy/variables.rs`).
 
 ## 6. Catalog Schema Changes for Multi-Account
 
@@ -492,6 +492,6 @@ These must match real DynamoDB error format (HTTP status, error code, message st
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -17,21 +17,38 @@
 //! | `CreateTable`, `DescribeTimeToLive`, `UpdateTimeToLive`, `DescribeContinuousBackups`, `UpdateContinuousBackups`, `CreateBackup`, `ListBackups`, `DescribeBackup`, `RestoreTableFromBackup`, `ExportTableToPointInTime` | ValidationException [`OWNER_ONLY`] | "Access is denied" |
 //! | `RestoreTableToPointInTime` | ValidationException [`OWNER_ONLY`] | the same |
 //!
+//! The server refuses every `RestoreTableToPointInTime`, and an
+//! `UpdateContinuousBackups` that enables point-in-time recovery, before this
+//! code runs.
+//!
 //! `DeleteTable`, `DeleteItem` and `DeleteBackup` were not sent to the
 //! service; they take the answers of `UpdateTable`, `UpdateItem` and
 //! `DescribeBackup`. `SearchVectors` has no service counterpart and takes the
-//! answers of `DescribeTable`. On the service the ARN shape checks sit
-//! between the two answers: an index or backup ARN in `ResourceArn`, or a
-//! `StreamArn` in another partition or region, is "Access is denied" in an
-//! account that does not exist and gets the shape ValidationException in one
-//! that does. ExtendDB runs its own shape checks at that point. They do not
-//! check a `StreamArn`'s partition or region (#451), so such a `StreamArn` in
-//! an account the catalog holds gets the denial. A table ARN in `TableName`
-//! with another partition, service or region, or naming an index or backup,
-//! gets the answers above, where the service answers a ValidationException
-//! (#794). A batch or transaction whose tables are
-//! in more than one account, the caller's included, is refused with
-//! [`MIXED_ACCOUNTS`] whichever accounts they are.
+//! answers of `DescribeTable`.
+//!
+//! On the service a `StreamArn` that is not a stream ARN (a table, index or
+//! backup ARN included), or has an empty partition, service or account field,
+//! is ValidationException "Invalid StreamArn" before any of these answers, in
+//! every account (measured 2026-11-05); `authorize_request` checks it before
+//! this refusal ([`super::validate_stream_arn_kind`]). The other ARN shape
+//! checks sit between the two answers: an index or backup ARN in
+//! `ResourceArn`, or a `StreamArn` with another partition, service or region,
+//! an empty region included, is "Access is denied" in an account that does
+//! not exist and gets the shape ValidationException in one that does
+//! (measured 2026-11-03 and 2026-11-05). ExtendDB runs its own shape checks at
+//! that point ([`answer`]). A table ARN in `TableName` with another partition,
+//! service or region, or naming an index or backup, gets the answers above,
+//! where the service answers a ValidationException (#794). A stream ARN with
+//! an empty region in a tag operation's `ResourceArn`, in an account that
+//! exists, gets [`resource_policy_denial`], where the service's denial ends
+//! after the resource ARN, with no reason clause (measured 2026-11-05). A
+//! batch or transaction whose tables are in more than one account, the
+//! caller's included, is refused with [`MIXED_ACCOUNTS`] whichever accounts
+//! they are.
+//!
+//! An account segment that is not 12 ASCII digits gets the answers for an
+//! account that does not exist, without a catalog lookup (measured
+//! 2026-11-06; see [`account_in_catalog`]).
 //!
 //! An account exists here when this deployment's catalog holds it. Fields the
 //! service reads as a name rather than an ARN (`ListStreams` `TableName`,
@@ -101,6 +118,8 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
             .map(extenddb_core::backup_format::trim_backup_arn)
             .and_then(|v| other(v, v.to_owned())),
         "ExportTableToPointInTime" => named("TableArn"),
+        // The server refuses every RestoreTableToPointInTime before this
+        // code runs.
         "RestoreTableToPointInTime" => named("SourceTableArn"),
         "BatchGetItem" | "BatchWriteItem" | "TransactGetItems" | "TransactWriteItems" => {
             batch_or_transaction(operation, input, account_id)
@@ -130,7 +149,15 @@ pub(crate) fn find(operation: &str, input: &Value, account_id: &str) -> Option<O
 /// each is authorized for: `Mixed` when they are in more than one account
 /// (a bare name is in the caller's), else the first in another account.
 fn batch_or_transaction(operation: &str, input: &Value, account_id: &str) -> Option<OtherAccount> {
-    let targets = crate::leading_keys::batch_transact_targets(operation, input, &HashMap::new())?;
+    // Only each target's table and action are read here. The limits govern
+    // how the expressions are read for Attributes, which this check ignores,
+    // so the defaults serve.
+    let targets = crate::leading_keys::batch_transact_targets(
+        operation,
+        input,
+        &HashMap::new(),
+        &extenddb_core::limits::LimitsConfig::default(),
+    )?;
     let mut accounts = BTreeSet::new();
     let mut first = None;
     for target in targets {
@@ -198,7 +225,19 @@ pub(crate) fn refusal(
 /// True when this deployment's catalog holds `account`. A deployment without
 /// a catalog store knows no other account. A lookup failure fails the request
 /// (it is refused either way) with the authorization layer's internal error.
+///
+/// An account segment that is not 12 ASCII digits is not looked up: the
+/// management API creates no such account, on PostgreSQL one that carries
+/// U+0000 cannot be bound, and Cassandra refuses the empty one as a partition
+/// key, so the lookup would fail the request with an internal error. The
+/// service answers it as an account that does not exist (measured 2026-11-06
+/// with `1234` and U+0000, `12345678901x`, 11 and 13 digits, in `TableArn`,
+/// `SourceTableArn`, `ResourceArn`, `StreamArn`, `BackupArn` and the
+/// control-plane `TableName`).
 async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, DynamoDbError> {
+    if !extenddb_core::arn::is_account_id(account) {
+        return Ok(false);
+    }
     let Some(store) = state.catalog_store.as_ref() else {
         return Ok(false);
     };
@@ -214,7 +253,7 @@ async fn account_in_catalog(state: &AppState, account: &str) -> Result<bool, Dyn
 }
 
 /// The principal a denial names, in the form the service writes it.
-fn principal_arn(identity: &AuthIdentity) -> String {
+pub(crate) fn principal_arn(identity: &AuthIdentity) -> String {
     match identity {
         AuthIdentity::User {
             account_id,
@@ -231,10 +270,14 @@ fn principal_arn(identity: &AuthIdentity) -> String {
 /// The error for `operation` naming `resource` in another account. For an
 /// account that exists ExtendDB's ARN shape checks run first, and one that
 /// does not is refused before them, as on the service (measured 2026-11-03
-/// with an index or backup ARN in `ResourceArn`). The service also answers a
-/// `StreamArn` in another partition or region with its shape
-/// ValidationException there; ExtendDB's `StreamArn` check does not cover
-/// those (#451).
+/// with an index or backup ARN in `ResourceArn`, and 2026-11-05 with a
+/// `StreamArn` in another partition, service or region, an empty region
+/// included). For a `StreamArn` the shape check compares the partition,
+/// service and region with this deployment's (`region` is the server's), so
+/// such a `StreamArn` in an account that exists is "Invalid StreamArn". A
+/// `StreamArn` that is not a stream ARN, or has an empty partition, service or
+/// account field, does not reach this point: `authorize_request` refuses it
+/// first, in every account (measured 2026-11-05).
 fn answer(
     operation: &str,
     input: &Value,
@@ -242,6 +285,7 @@ fn answer(
     resource: &str,
     known: bool,
     principal: &str,
+    region: &str,
 ) -> DynamoDbError {
     if known {
         let shape = if matches!(
@@ -250,7 +294,7 @@ fn answer(
         ) {
             super::validate_tag_resource_arn_shape(resource)
         } else {
-            super::validate_operation_arns(operation, input)
+            super::validate_operation_arns(operation, input, region)
         };
         if let Err(e) = shape {
             return e;
@@ -294,6 +338,7 @@ pub(crate) async fn refuse(
         &resource,
         known,
         &principal_arn(identity),
+        &state.region,
     ))
 }
 

@@ -13,6 +13,7 @@ check prints one line, `ok` or `FAIL` and what was checked, with the
 command's output indented under a FAIL; `finish` prints the count of failed
 checks or `all checks passed` and returns the script's exit code.
 """
+import os
 import signal
 import subprocess
 import time
@@ -125,6 +126,20 @@ def stop(proc: subprocess.Popen) -> None:
             proc.wait()
 
 
+def with_filesystem_store(config: str, work: str) -> tuple[str, str]:
+    """A copy of `config` with a filesystem backup store at `<work>/backups`
+    (created `0700`), for the backup commands' store-configured runs; the
+    copy's path and the root's canonical path, as the commands print it."""
+    root = os.path.realpath(os.path.join(work, "backups"))
+    os.mkdir(root, 0o700)
+    store_config = os.path.join(work, "extenddb-store.toml")
+    with open(config, encoding="utf-8") as f:
+        base = f.read()
+    with open(store_config, "w", encoding="utf-8") as f:
+        f.write(f'{base}\n[backup.store]\nkind = "filesystem"\n\n[backup.store.filesystem]\npath = "{root}"\n')
+    return store_config, root
+
+
 def finish() -> int:
     """Print the outcome of every check reported, and return the exit code."""
     if failures:
@@ -161,13 +176,80 @@ def start_mongo(container: str, port: int, mongod_args: tuple[str, ...] = (), mo
     )
     if started.returncode != 0:
         return report(False, f"start {container}", started.stderr)
-    for _ in range(60):
-        if mongosh(container, port, "db.runCommand({ping: 1}).ok")[1].strip().endswith("1"):
-            break
-        time.sleep(1)
-    mongosh(container, port, f"rs.initiate({{_id: 'rs0', members: [{{_id: 0, host: 'localhost:{port}'}}]}})")
-    for _ in range(60):
-        if mongosh(container, port, "db.hello().isWritablePrimary")[1].strip().endswith("true"):
-            return True
-        time.sleep(1)
-    return report(False, f"{container} did not become primary", docker("logs", container).stdout[-2000:])
+    return become_primary(container, port)
+
+
+# Waits for mongod to answer, initiates the one-member set rs0 and waits for
+# the member to be primary, all in one mongosh process against one deadline,
+# so a slow start costs only time. Prints `primary`, or throws naming the
+# step that ran out of time and what it last saw. The caller defines PORT and
+# SECONDS. Every command here is allowed by the localhost exception.
+_BECOME_PRIMARY_JS = """
+const deadline = Date.now() + SECONDS * 1000;
+const left = () => deadline - Date.now();
+let last = "nothing tried";
+let admin = null;
+while (admin === null) {
+  if (left() <= 0) throw new Error(`mongod on ${PORT} did not answer within ${SECONDS} s (last: ${last})`);
+  try {
+    const db = connect(`mongodb://localhost:${PORT}/admin?directConnection=true&serverSelectionTimeoutMS=1000`);
+    const pong = db.runCommand({ping: 1});
+    if (pong.ok === 1) {
+      admin = db;
+    } else {
+      last = JSON.stringify(pong);
+      db.getMongo().close();
+      sleep(100);
+    }
+  } catch (e) {
+    last = e.message;
+    sleep(100);
+  }
+}
+// An initiated member names its set in hello, which needs no login; once a
+// user exists the localhost exception no longer allows replSetInitiate.
+if (!admin.runCommand({hello: 1}).setName) {
+  const initiated = admin.runCommand(
+    {replSetInitiate: {_id: "rs0", members: [{_id: 0, host: `localhost:${PORT}`}]}});
+  if (initiated.ok !== 1 && initiated.codeName !== "AlreadyInitialized") {
+    throw new Error(`replSetInitiate failed: ${JSON.stringify(initiated)}`);
+  }
+}
+// An awaitable hello answers when the topology changes, so this waits for
+// the election instead of sleeping and asking again. An error reply has no
+// topologyVersion to wait on, so that path pauses and asks plainly.
+let hello = admin.runCommand({hello: 1});
+while (!hello.isWritablePrimary) {
+  if (left() <= 0) throw new Error(`not primary within ${SECONDS} s: ${JSON.stringify(hello)}`);
+  if (hello.ok === 1 && hello.topologyVersion) {
+    hello = admin.runCommand(
+      {hello: 1, topologyVersion: hello.topologyVersion, maxAwaitTimeMS: Math.min(left(), 10000)});
+  } else {
+    sleep(100);
+    hello = admin.runCommand({hello: 1});
+  }
+}
+print("primary");
+"""
+
+
+def become_primary(container: str, port: int, seconds: int = 120) -> bool:
+    """Make the mongod in `container` on `port` a one-member replica set rs0
+    and wait for it to be primary. The check fails with what mongosh last saw
+    and the end of the container's log, at the step that failed, instead of
+    at whatever command runs next."""
+    script = f"const PORT = {port}, SECONDS = {seconds};\n{_BECOME_PRIMARY_JS}"
+    try:
+        done = docker("exec", container, "mongosh", "--nodb", "--quiet", "--eval", script, timeout=seconds + 30)
+        out = done.stdout + done.stderr
+        # mongosh may add warnings on either stream; the script's own answer
+        # is the last line it prints.
+        lines = done.stdout.strip().splitlines()
+        ok = done.returncode == 0 and bool(lines) and lines[-1].strip() == "primary"
+    except subprocess.TimeoutExpired as e:
+        ok, out = False, f"mongosh did not finish within {seconds + 30} s\n{_text(e.stdout)}{_text(e.stderr)}"
+    if ok:
+        return True
+    logs = docker("logs", container)
+    return report(False, f"{container} becomes primary", f"{out}\n--- docker logs ---\n"
+                  f"{(logs.stdout + logs.stderr)[-2000:]}")

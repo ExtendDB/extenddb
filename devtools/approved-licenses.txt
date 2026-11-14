@@ -3,7 +3,6 @@
 
 #
 # Amazon pre-approved open source licenses (SPDX identifiers)
-# Source: https://policy.a2z.com/docs/82475/publication#0ac159cb-89be-3e40-bc20-f67d4b2dbad0
 # Last reviewed: 2026-04-20
 #
 # Lines starting with # are comments. Blank lines are ignored.
