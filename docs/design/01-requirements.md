@@ -97,7 +97,7 @@ Error responses must be byte-for-byte compatible with DynamoDB:
 
 **Requirements:**
 - REQ-ERR-001: Error JSON must contain `__type` field with `com.amazonaws.dynamodb.v20120810#` prefix
-- REQ-ERR-002: Error JSON must contain `message` field with descriptive text
+- REQ-ERR-002: Error JSON must contain a message field with descriptive text, under the key DynamoDB uses: `Message` on `TransactionCanceledException` and `IdempotentParameterMismatchException`, `message` on the other errors measured
 - REQ-ERR-003: HTTP status codes must match DynamoDB exactly (see error catalog below)
 - REQ-ERR-004: SDK retry behavior must work identically (throttling errors return 400, not 429)
 

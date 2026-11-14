@@ -8,6 +8,10 @@ use axum::response::{IntoResponse, Response};
 use extenddb_core::error::DynamoDbError;
 use serde_json::Value;
 
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod tests;
+
 /// Hardcoded fallback body for when response serialization itself fails.
 const SERIALIZATION_FAILURE_BODY: &[u8] =
     br#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"Internal error"}"#;
@@ -33,8 +37,9 @@ pub(crate) fn success_response(body: &Value, request_id: &str) -> Response {
         .into_response()
 }
 
-/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field.
-/// REQ-ERR-003: Omit `message` when empty (real `DynamoDB` behavior, verified 2026-05-04).
+/// REQ-ERR-001: `__type` with prefix. REQ-ERR-002: message field, under the
+/// key [`message_key`] picks. REQ-ERR-003: Omit the message field when empty
+/// (real `DynamoDB` behavior, verified 2026-05-04).
 pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Response {
     // Fix #14: Use full_error_type() which includes the prefix
     let mut body = serde_json::json!({
@@ -44,7 +49,7 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
     // UnknownOperationException and other errors with no message).
     let msg = error.message();
     if !msg.is_empty() {
-        body["message"] = serde_json::Value::String(msg.to_owned());
+        body[message_key(error)] = serde_json::Value::String(msg.to_owned());
     }
     // TransactionCanceledException includes per-item CancellationReasons
     if let Some(reasons) = error.cancellation_reasons() {
@@ -70,6 +75,20 @@ pub(crate) fn error_response(error: &DynamoDbError, request_id: &str) -> Respons
         body_bytes,
     )
         .into_response()
+}
+
+/// The key that carries the error message. `DynamoDB` sends `Message` on
+/// `TransactionCanceledException` and `IdempotentParameterMismatchException`
+/// and `message` on every other error measured (us-east-1, raw bodies,
+/// 2026-10-29 and 2026-11-03). `TransactionInProgressException` also models
+/// its member as `Message`, but it was not measured and ExtendDB does not
+/// raise it, so it keeps `message` here.
+fn message_key(error: &DynamoDbError) -> &'static str {
+    match error {
+        DynamoDbError::TransactionCanceledException { .. }
+        | DynamoDbError::IdempotentParameterMismatchException(_) => "Message",
+        _ => "message",
+    }
 }
 
 /// Classify and record error metrics for a failed `DynamoDB` request.
