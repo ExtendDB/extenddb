@@ -3865,20 +3865,12 @@ pub(crate) struct GsiBackfillProgress {
 
 // ── Contention / retry helpers ──────────────────────────────────────────
 
-/// Maximum number of attempts of the retry loops that the measurements behind
-/// [`CONTENTION_RETRY_ATTEMPTS`] do not cover: the backup and restore
-/// transactions, the in-place retry of `commitTransaction` after an
-/// `UnknownTransactionCommitResult`, and the create-race give-up of an
-/// unconditional PutItem and of UpdateItem's native upsert.
-///
-/// The commit retry waits for the reply of one idempotent commit and never
-/// re-runs the body. A lost create race is not a write conflict: the attempt
-/// found no item and its insert hit an item another writer created and deleted
-/// again. #431 measured this budget, with its backoff, as the one that lets
-/// that race resolve: a put blocked by a document that is removed 100 ms after
-/// the put starts commits well inside it, and the storage tests fail when the
-/// cap is put back to 5. A longer budget on the commit retry or a create race
-/// only delays the error that loop answers when it runs out.
+/// Maximum number of attempts of the backup and restore transactions, the
+/// in-place retry of `commitTransaction`, and the create-race give-up of an
+/// unconditional PutItem and of UpdateItem's native upsert. #431 measured it,
+/// with this backoff, for the create race. A put blocked by a document that
+/// another writer removes 100 ms later commits well inside 50 attempts. With a
+/// cap of 5 the storage tests fail.
 pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 
 /// Maximum number of times a contention retry loop re-runs a transaction that

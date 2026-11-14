@@ -108,10 +108,7 @@ pub async fn handle_batch_write_item(
         lookups.push(ctx.table_key_info_uncached(table_name).await);
     }
 
-    // The writes of the batch run in one request clock scope that starts with
-    // the batch, so a backend that bounds how long a contended write keeps
-    // retrying measures one bound for the whole batch instead of one per write
-    // request.
+    // One contention deadline for the batch's writes: see `request_clock`.
     extenddb_storage::request_clock::scope(
         started,
         write_batch(
