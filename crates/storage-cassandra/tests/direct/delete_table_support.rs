@@ -211,6 +211,7 @@ pub(crate) fn gsi_input(name: &str, gsis: usize) -> CreateTableInput {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         });
     }
     input.global_secondary_indexes = Some(indexes);
