@@ -40,13 +40,13 @@ The steps run in this order; every rejection is HTTP 400.
 
 1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationToken`
 2. Parse credential scope, signed headers, and signature; malformed: `IncompleteSignatureException`. A request with more than one `host` or `authorization` header is refused before this point with a plain 400, as the service's front end does
-3. Look up the access key in the credential store (through the credential cache, see below); unknown: `UnrecognizedClientException`
-4. Check `X-Amz-Date` against the server clock: more than 15 minutes of skew is `UnrecognizedClientException` (signature expired)
-5. Check the credential scope: the region must be this server's `[server] region` and the service must be `dynamodb`; otherwise `InvalidSignatureException` carrying one sentence per failing part, region first, as the service reports it
+3. Check `X-Amz-Date` against the server clock: more than 15 minutes of skew is `UnrecognizedClientException` (signature expired)
+4. Check the credential scope: the region must be this server's `[server] region` and the service must be `dynamodb`; otherwise `InvalidSignatureException` carrying one sentence per failing part, region first, as the service reports it. The scope date must also be the `YYYYMMDD` prefix of `X-Amz-Date`, and its sentence comes after the region and service sentences
+5. Look up the access key in the credential store (through the credential cache, see below); unknown: `UnrecognizedClientException`. The lookup also checks the session expiry of a temporary key, and refuses an expired session at once with `ExpiredTokenException`, before the signature check. It also reads whether the key is active, and step 9 applies that decision
 6. Compare the session token: a temporary key must present its stored token, and a long-term key must present none; the decision is applied at step 9
 7. Reconstruct the canonical request and the string-to-sign. `host` must be among the signed headers. Repeated headers contribute their values comma-joined. The hashed-payload line is the SHA-256 of the body the server received; a client-supplied `x-amz-content-sha256` header is not used for it, so a request whose body was altered after signing, or signed with a literal such as `UNSIGNED-PAYLOAD`, fails at step 8
 8. Derive the signing key (HMAC-SHA256 chain over date, region, service, "aws4_request") and compare the computed signature with the provided one in constant time; mismatch: `InvalidSignatureException`
-9. Apply the deferred decisions from steps 3 and 6, after the signature check so that failure paths take the same time: an inactive key or a wrong or missing token is `UnrecognizedClientException`
+9. Apply the deferred decisions from steps 5 and 6, after the signature check so that failure paths take the same time: an inactive key or a wrong or missing token is `UnrecognizedClientException`
 
 Request bodies are parsed before authentication (the service does the same), so a malformed body returns `SerializationException` whatever the signature. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
 
