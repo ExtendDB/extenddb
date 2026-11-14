@@ -67,7 +67,7 @@ async fn apply_migrates_a_released_catalog_and_refuse_writes_nothing() {
         .await
         .expect("applied");
     let report = prepared.run.expect("a run");
-    assert_eq!(report.applied.len(), 7, "{report:?}");
+    assert_eq!(report.applied.len(), 13, "{report:?}");
     assert_eq!(
         d.status().await,
         CatalogStatus::Current {
@@ -258,7 +258,7 @@ async fn two_prepare_to_serve_runs_under_apply_migrate_once() {
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 7],
+        [0, 13],
         "one migrates, and the other takes the lock after it and applies nothing"
     );
     assert_eq!(
