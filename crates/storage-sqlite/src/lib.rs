@@ -47,6 +47,7 @@ mod snapshot_engine;
 mod sqlite_util;
 mod store;
 mod stream;
+mod stream_lifecycle;
 #[cfg(test)]
 mod stream_tests;
 mod table_engine;
@@ -54,6 +55,7 @@ mod table_helpers;
 mod update_table;
 mod vector_bench;
 mod vector_search;
+mod warm_throughput;
 mod worker;
 mod workers;
 

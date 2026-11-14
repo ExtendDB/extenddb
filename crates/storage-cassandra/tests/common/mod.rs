@@ -273,6 +273,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(account_id, input).await.unwrap();
@@ -338,6 +339,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -356,6 +358,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -432,6 +435,7 @@ impl TestTable {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         let input = extenddb_core::types::CreateTableInput {
@@ -450,6 +454,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -548,6 +553,7 @@ impl TestTable {
             tags: None,
             table_class: None,
             deletion_protection_enabled: None,
+            warm_throughput: None,
         };
 
         let table_desc = engine.create_table(&account_id, input).await.unwrap();
@@ -638,6 +644,234 @@ pub async fn setup_engine() -> CassandraEngine {
     .unwrap();
 
     engine
+}
+
+/// An engine on a keyspace prefix of its own, with a migrated catalog.
+///
+/// Background work that walks every account keyspace under a prefix (the GSI
+/// workers) sees only this engine's accounts, so other tests running at the
+/// same time cannot change what a test observes. The catalog and every
+/// account made with [`isolated_gsi_account`] are queued for dropping when
+/// this is dropped.
+pub struct IsolatedEngine {
+    pub engine: Arc<CassandraEngine>,
+    pub config: CassandraStorageConfig,
+    keyspaces: std::sync::Mutex<Vec<String>>,
+}
+
+impl IsolatedEngine {
+    /// The catalog's settings store, as `extenddb settings set` writes it.
+    pub fn settings(&self) -> CassandraCatalogStore {
+        create_catalog_store(&self.engine, &self.config)
+    }
+}
+
+impl Drop for IsolatedEngine {
+    fn drop(&mut self) {
+        if let Ok(mut keyspaces) = self.keyspaces.lock() {
+            for keyspace in keyspaces.drain(..) {
+                queue_keyspace_drop(keyspace);
+            }
+        }
+    }
+}
+
+/// Start an [`IsolatedEngine`] whose keyspace prefix begins with `tag`.
+pub async fn isolated_engine(tag: &str) -> IsolatedEngine {
+    let mut config = test_config();
+    config.keyspace_prefix = format!("{tag}_{}", &unique_test_id()[..10]);
+    config.cached_connection_string = None;
+    config.ensure_cached_connection_string();
+    let engine = Arc::new(CassandraEngine::new(&config, "us-east-1").await.unwrap());
+    // Keyspaces earlier tests in this process left queued for dropping.
+    flush_pending_drops(&engine.session_arc()).await;
+    let catalog_ks = engine.catalog_keyspace();
+    engine.create_keyspace(&catalog_ks).await.unwrap();
+    ensure_keyspace_rf(&engine, &catalog_ks).await.unwrap();
+    extenddb_storage_cassandra::migrations::migrate_catalog_keyspace(
+        engine.session_arc(),
+        &config.keyspace_prefix,
+        "test",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .unwrap();
+    IsolatedEngine {
+        engine,
+        config,
+        keyspaces: std::sync::Mutex::new(vec![catalog_ks]),
+    }
+}
+
+/// An account of an [`IsolatedEngine`] with one table.
+pub struct IsolatedAccount {
+    pub keyspace: String,
+    pub key_info: TableKeyInfo,
+}
+
+/// Create a migrated account on `isolated`'s prefix, registered in its
+/// catalog, with table `table`: hash key `id` (S) and GSI `gsi` on `gsi_pk`
+/// (S), all attributes projected. The GSI sets no delay of its own, so it
+/// follows the system `index_propagation_delay_ms`.
+pub async fn isolated_gsi_account(
+    isolated: &IsolatedEngine,
+    table: &str,
+    gsi: &str,
+    gsi_pk: &str,
+) -> IsolatedAccount {
+    use extenddb_core::types::{CreateTableInput, GsiInput, Projection, ProjectionType};
+
+    let input = CreateTableInput {
+        table_name: table.to_string(),
+        key_schema: vec![KeySchemaElement {
+            attribute_name: "id".to_string(),
+            key_type: KeyType::Hash,
+        }],
+        attribute_definitions: vec![
+            AttributeDefinition {
+                attribute_name: "id".to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+            AttributeDefinition {
+                attribute_name: gsi_pk.to_string(),
+                attribute_type: ScalarAttributeType::S,
+            },
+        ],
+        local_secondary_indexes: None,
+        global_secondary_indexes: Some(vec![GsiInput {
+            index_name: gsi.to_string(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: gsi_pk.to_string(),
+                key_type: KeyType::Hash,
+            }],
+            projection: Projection {
+                projection_type: ProjectionType::All,
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            warm_throughput: None,
+        }]),
+        vector_indexes: None,
+        billing_mode: None,
+        table_throughput_mode: None,
+        provisioned_throughput: None,
+        on_demand_throughput: None,
+        stream_specification: None,
+        sse_specification: None,
+        tags: None,
+        table_class: None,
+        deletion_protection_enabled: None,
+        warm_throughput: None,
+    };
+    isolated_account(isolated, input).await
+}
+
+/// Create an account keyspace on `isolated`'s prefix that holds only an
+/// empty `gsi_pending` table, so a GSI worker pass reads one more keyspace.
+/// Cheaper than a migrated account: two schema changes. Returns its name.
+pub async fn isolated_queue_keyspace(isolated: &IsolatedEngine) -> String {
+    let engine = &isolated.engine;
+    let keyspace = engine.account_keyspace(&unique_test_account());
+    isolated.keyspaces.lock().unwrap().push(keyspace.clone());
+    engine.create_keyspace(&keyspace).await.unwrap();
+    ensure_keyspace_rf(engine, &keyspace).await.unwrap();
+    engine
+        .session()
+        .query(format!(
+            "CREATE TABLE IF NOT EXISTS {keyspace}.gsi_pending ( \
+                 worker_partition int, last_ready_at timestamp STATIC, \
+                 ready_at timestamp, id timeuuid, table_id text, old_item text, \
+                 new_item text, index_context text, \
+                 PRIMARY KEY ((worker_partition), ready_at, id) \
+             ) WITH CLUSTERING ORDER BY (ready_at ASC, id ASC)"
+        ))
+        .await
+        .unwrap();
+    keyspace
+}
+
+/// The account keyspaces on `isolated`'s prefix, in the order the GSI
+/// workers read them (`system_schema` order).
+pub async fn isolated_account_keyspaces(isolated: &IsolatedEngine) -> Vec<String> {
+    use cdrs_tokio::types::IntoRustByName as _;
+    let prefix = format!("{}_account_", isolated.config.keyspace_prefix);
+    isolated
+        .engine
+        .session()
+        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+        .await
+        .unwrap()
+        .response_body()
+        .unwrap()
+        .into_rows()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let name: Result<String, _> = row.get_r_by_name("keyspace_name");
+            name.ok()
+        })
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
+/// Create a migrated account on `isolated`'s prefix, registered in its
+/// catalog, with the table `input` describes.
+pub async fn isolated_account(
+    isolated: &IsolatedEngine,
+    input: extenddb_core::types::CreateTableInput,
+) -> IsolatedAccount {
+    let engine = &isolated.engine;
+    let account_id = unique_test_account();
+    let keyspace = engine.account_keyspace(&account_id);
+    // Queued first, so a failure below still cleans it up.
+    isolated.keyspaces.lock().unwrap().push(keyspace.clone());
+    engine.create_keyspace(&keyspace).await.unwrap();
+    ensure_keyspace_rf(engine, &keyspace).await.unwrap();
+    extenddb_storage_cassandra::migrations::migrate_account(
+        engine.session_arc(),
+        &isolated.config.keyspace_prefix,
+        &keyspace,
+        "test",
+    )
+    .await
+    .unwrap();
+    engine
+        .session()
+        .query_with_values(
+            format!(
+                "INSERT INTO {}.accounts (account_id, account_name, created_at) \
+                 VALUES (?, ?, toTimestamp(now()))",
+                engine.catalog_keyspace()
+            ),
+            cdrs_tokio::query_values!(account_id.as_str(), "Isolated Test Account"),
+        )
+        .await
+        .unwrap();
+
+    let table_name = input.table_name.clone();
+    let key_schema = input.key_schema.clone();
+    let attribute_definitions = input.attribute_definitions.clone();
+    let has_lsi = input
+        .local_secondary_indexes
+        .as_ref()
+        .is_some_and(|lsis| !lsis.is_empty());
+    let description = engine.create_table(&account_id, input).await.unwrap();
+    IsolatedAccount {
+        keyspace,
+        key_info: TableKeyInfo {
+            table_name,
+            account_id,
+            table_id: description.table_id,
+            key_schema: key_schema.clone(),
+            base_key_schema: key_schema,
+            attribute_definitions,
+            has_lsi,
+            global_secondary_indexes: Vec::new(),
+            local_secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+            stream_specification: None,
+        },
+    }
 }
 
 /// Creates a CassandraCatalogStore from engine for tests.

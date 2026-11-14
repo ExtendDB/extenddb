@@ -38,8 +38,10 @@ impl CassandraCatalogStore {
                 "IAM group already exists".to_owned(),
             ));
         }
-
-        Ok(())
+        // A group deleted before deletes removed them could have left rows
+        // under this name.
+        self.clear_new_principal(account_id, "group", group_name)
+            .await
     }
 
     pub(crate) async fn delete_group_impl(
@@ -50,18 +52,11 @@ impl CassandraCatalogStore {
         if !self.group_exists(account_id, group_name).await? {
             return Err(OpError::NotFound("IAM group not found".to_owned()));
         }
-
-        let catalog_keyspace = self.catalog_keyspace();
-        crate::cassandra_util::apply_lwt(
-            self.session(),
-            &format!(
-                "DELETE FROM {catalog_keyspace}.iam_groups WHERE account_id = ? AND group_name = ? IF EXISTS"
-            ),
-            cdrs_tokio::query_values!(account_id, group_name),
-            "delete_group",
-        )
-        .await?;
-        Ok(())
+        // What the group owns goes first, and its row last (see `dependents`).
+        self.delete_principal_dependents(account_id, "group", group_name)
+            .await?;
+        self.delete_principal_row(account_id, "group", group_name)
+            .await
     }
 
     pub(crate) async fn list_groups_impl(

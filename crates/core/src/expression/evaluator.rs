@@ -14,7 +14,9 @@ use crate::error::DynamoDbError;
 use crate::types::AttributeValue;
 
 use super::ast::{CompareOp, Expr, PathElement};
-use super::resolver::{ExpressionMaps, attribute_type_code, resolve_path};
+use super::resolver::{
+    ExpressionMaps, ParsedNumber, attribute_type_code, number_value, resolve_path,
+};
 
 /// Evaluate a condition expression against an item.
 ///
@@ -127,13 +129,11 @@ fn resolve_to_value<'a>(
     }
 }
 
-/// Look up a pre-parsed `BigDecimal` for a placeholder expression.
+/// Look up a pre-parsed number for a placeholder expression.
 ///
-/// Returns `None` if the expression is not a placeholder or has no pre-parsed value.
-fn placeholder_numeric<'a>(
-    expr: &Expr,
-    maps: &'a ExpressionMaps,
-) -> Option<&'a bigdecimal::BigDecimal> {
+/// Returns `None` if the expression is not a placeholder or has no pre-parsed
+/// value.
+fn placeholder_numeric<'a>(expr: &Expr, maps: &'a ExpressionMaps) -> Option<ParsedNumber<'a>> {
     if let Expr::Placeholder(name) = expr {
         maps.get_parsed_numeric(name)
     } else {
@@ -158,51 +158,47 @@ pub fn compare_orderable(left: &AttributeValue, right: &AttributeValue) -> Optio
     }
 }
 
+/// One side of a numeric comparison as a decimal: the placeholder's
+/// pre-parsed value when there is one, else `n` read with [`number_value`].
+/// `None` when the number is not one the service can store.
+fn comparison_number<'a>(
+    n: &str,
+    parsed: Option<ParsedNumber<'a>>,
+) -> Option<Cow<'a, bigdecimal::BigDecimal>> {
+    match parsed {
+        Some(ParsedNumber::Number(d)) => Some(Cow::Borrowed(d)),
+        Some(ParsedNumber::Refused) => None,
+        None => number_value(n).map(Cow::Owned),
+    }
+}
+
 /// Compare two `AttributeValue`s using the given operator.
 ///
 /// `DynamoDB` comparison rules:
 /// - Same-type comparisons only (except N vs N which is numeric)
 /// - S: lexicographic UTF-8
-/// - N: numeric comparison via `BigDecimal` (pre-parsed values used when available)
+/// - N: numeric comparison via `BigDecimal` (pre-parsed values used when available).
+///   An `N` that is not a number the service can store compares as a value of
+///   another type: only `<>` is true, so `a <> b` agrees with `NOT (a = b)`.
 /// - B: lexicographic byte comparison
 /// - BOOL, NULL, L, M, SS, NS, BS: only equality
-// Allow single_match_else: the match arms bind an owned fallback value
-// and return a reference, which doesn't simplify to if-let.
-#[allow(clippy::single_match_else)]
 fn compare_values(
     left: &AttributeValue,
     right: &AttributeValue,
     op: CompareOp,
-    left_parsed: Option<&bigdecimal::BigDecimal>,
-    right_parsed: Option<&bigdecimal::BigDecimal>,
+    left_parsed: Option<ParsedNumber<'_>>,
+    right_parsed: Option<ParsedNumber<'_>>,
 ) -> bool {
     match (left, right) {
         (AttributeValue::S(l), AttributeValue::S(r)) => apply_op(l.cmp(r), op),
         (AttributeValue::N(l), AttributeValue::N(r)) => {
-            // Use pre-parsed values when available; fall back to parsing.
-            let l_owned;
-            let ld = match left_parsed {
-                Some(d) => d,
-                None => {
-                    let Ok(d) = l.parse::<bigdecimal::BigDecimal>() else {
-                        return false;
-                    };
-                    l_owned = d;
-                    &l_owned
-                }
+            let Some(ld) = comparison_number(l, left_parsed) else {
+                return matches!(op, CompareOp::Ne);
             };
-            let r_owned;
-            let rd = match right_parsed {
-                Some(d) => d,
-                None => {
-                    let Ok(d) = r.parse::<bigdecimal::BigDecimal>() else {
-                        return false;
-                    };
-                    r_owned = d;
-                    &r_owned
-                }
+            let Some(rd) = comparison_number(r, right_parsed) else {
+                return matches!(op, CompareOp::Ne);
             };
-            apply_op(ld.cmp(rd), op)
+            apply_op(ld.as_ref().cmp(rd.as_ref()), op)
         }
         (AttributeValue::B(l), AttributeValue::B(r)) => apply_op(l.cmp(r), op),
         // For non-orderable types, only equality is meaningful

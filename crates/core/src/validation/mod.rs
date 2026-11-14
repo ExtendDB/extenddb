@@ -3,6 +3,7 @@
 pub mod number;
 pub mod restorable_item;
 pub mod vector_item;
+pub mod warm_throughput;
 
 pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
@@ -11,6 +12,15 @@ pub use restorable_item::{
 pub use vector_item::{
     MAX_HASH_KEY_SIZE, MAX_INLINE_FILTER_SIZE, validate_vector_write,
     validate_vector_write_changed, vector_components, vector_norm,
+};
+pub use warm_throughput::{
+    DELETE_GSI_WITH_WARM_THROUGHPUT, DELETION_PROTECTION_MUST_BE_ONLY_OPERATION,
+    INDEX_CHANGE_WITH_STREAM_CHANGE, ON_DEMAND_THROUGHPUT_NEEDS_BILLING_MODE,
+    SSE_MUST_BE_ONLY_OPERATION, TABLE_CLASS_MUST_BE_ONLY_OPERATION,
+    WARM_THROUGHPUT_MUST_BE_ONLY_OPERATION, WarmThroughputSubject,
+    validate_create_table_warm_throughput, validate_created_gsi_warm_throughput,
+    validate_warm_throughput_is_only_operation, validate_warm_throughput_on_create,
+    validate_warm_throughput_on_update,
 };
 
 use crate::error::{DynamoDbError, ErrorMessageKey, error_message};
@@ -131,6 +141,7 @@ pub fn validate_create_table(
     ))?;
     validate_vector_indexes(input)?;
     validate_stream_specification(input)?;
+    validate_create_table_warm_throughput(input)?;
     Ok(())
 }
 
@@ -665,15 +676,21 @@ fn validate_index_projections(input: &CreateTableInput) -> Result<(), DynamoDbEr
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` when `StreamEnabled` is false
-/// but a `StreamViewType` is present.
+/// but a `StreamViewType` is present, or `StreamEnabled` is true without one
+/// (measured 2026-10-24; its order against the other CreateTable checks is not
+/// measured, so it sits with the other stream check).
 fn validate_stream_specification(input: &CreateTableInput) -> Result<(), DynamoDbError> {
-    if let Some(stream) = &input.stream_specification
-        && !stream.stream_enabled
-        && stream.stream_view_type.is_some()
-    {
-        return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
-        ));
+    if let Some(stream) = &input.stream_specification {
+        if !stream.stream_enabled && stream.stream_view_type.is_some() {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Table is being created with a stream disabled, UpdateViewType should not be specified".to_owned(),
+            ));
+        }
+        if stream.stream_enabled && stream.stream_view_type.is_none() {
+            return Err(DynamoDbError::ValidationException(
+                "One or more parameter values were invalid: Table is being created with a stream enabled, UpdateViewType is required".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1177,12 +1194,10 @@ pub fn validate_update_item(
     // Validate number values supplied via ExpressionAttributeValues. Unlike a
     // PutItem item (validated by validate_item_numbers), these are checked here
     // because the AttributeValue deserializer intentionally stores malformed
-    // numbers raw and defers rejection to the validation layer. Real DynamoDB
-    // wraps the error as:
-    //   "ExpressionAttributeValues contains invalid value: <inner> for key <k>"
-    if let Some(values) = &input.expression_attribute_values {
-        validate_expression_attribute_value_numbers(values)?;
-    }
+    // numbers raw and defers rejection to the validation layer. The service
+    // answers `1 validation error detected: ` and the number message, with no
+    // ExpressionAttributeValues wrapper (measured 2026-11-11).
+    number::operations::update_item_values(input)?;
 
     if let Some(updates) = &input.attribute_updates {
         validate_attribute_values_nesting_depth(updates.values().filter_map(|u| u.value.as_ref()))?;
@@ -1195,29 +1210,6 @@ pub fn validate_update_item(
         }
     }
 
-    Ok(())
-}
-
-/// Validate number values provided via `ExpressionAttributeValues`, matching the
-/// service's wrapped message: `ExpressionAttributeValues contains invalid value:
-/// <inner> for key <placeholder>`. Keys are visited in sorted order so the
-/// reported placeholder is deterministic when several values are invalid.
-fn validate_expression_attribute_value_numbers(
-    values: &std::collections::HashMap<String, AttributeValue>,
-) -> Result<(), DynamoDbError> {
-    let mut keys: Vec<&String> = values.keys().collect();
-    keys.sort();
-    for key in keys {
-        match validate_attribute_number(&values[key]) {
-            Ok(()) => {}
-            Err(DynamoDbError::ValidationException(inner)) => {
-                return Err(DynamoDbError::ValidationException(format!(
-                    "ExpressionAttributeValues contains invalid value: {inner} for key {key}"
-                )));
-            }
-            Err(other) => return Err(other),
-        }
-    }
     Ok(())
 }
 
@@ -2030,7 +2022,7 @@ pub fn validate_select_projection(
     }
     if matches!(select, Some(Select::AllProjectedAttributes)) && !has_index_name {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
         ));
     }
     Ok(())
@@ -2943,6 +2935,7 @@ mod tests {
             deletion_protection_enabled: None,
             table_class: None,
             on_demand_throughput: None,
+            warm_throughput: None,
         }
     }
 
@@ -3186,6 +3179,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3218,6 +3212,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3246,6 +3241,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_err());
     }
@@ -3280,6 +3276,7 @@ mod tests {
                 read_capacity_units: 5,
                 write_capacity_units: 5,
             }),
+            warm_throughput: None,
         }]);
         let err = validate_create_table(&input, &limits).unwrap_err();
         assert!(
@@ -3308,6 +3305,7 @@ mod tests {
                 non_key_attributes: None,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         }]);
         assert!(validate_create_table(&input, &limits).is_ok());
     }
@@ -3353,6 +3351,7 @@ mod tests {
                     write_capacity_units: write,
                 }
             }),
+            warm_throughput: None,
         }]);
         input
     }
@@ -3402,6 +3401,7 @@ mod tests {
                 key_schema: vec![make_ks("gsi_pk", KeyType::Hash)],
                 projection: include(0..gsi_end),
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input.local_secondary_indexes = Some(vec![crate::types::LsiInput {
                 index_name: "my-lsi".to_owned(),
@@ -4107,7 +4107,9 @@ mod tests {
     #[test]
     fn update_item_rejects_malformed_number_in_eav() {
         // The AttributeValue deserializer stores malformed numbers raw and
-        // defers rejection here. Matches real DynamoDB's wrapped message.
+        // defers rejection here. The service answers the prefix and the
+        // number message, with no ExpressionAttributeValues wrapper (measured
+        // 2026-11-11, `12e` and `abc`).
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4115,13 +4117,14 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
-             The parameter cannot be converted to a numeric value: 12e for key :v"
+            "1 validation error detected: \
+             The parameter cannot be converted to a numeric value: 12e"
         );
     }
 
     #[test]
     fn update_item_rejects_number_overflow_in_eav() {
+        // Measured 2026-11-11 with `1E126` and `1E2147483648`.
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4130,14 +4133,15 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
+            "1 validation error detected: \
              Number overflow. Attempting to store a number with magnitude larger than \
-             supported range for key :v"
+             supported range"
         );
     }
 
     #[test]
     fn update_item_rejects_invalid_number_set_member_in_eav() {
+        // Measured 2026-11-11 with `NS [1, abc]`.
         let limits = LimitsConfig::default();
         let key_schema = vec![make_ks("pk", KeyType::Hash)];
         let attr_defs = vec![make_ad("pk", ScalarAttributeType::S)];
@@ -4147,8 +4151,8 @@ mod tests {
         let err = validate_update_item(&input, &limits, &key_schema, &attr_defs).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ExpressionAttributeValues contains invalid value: \
-             The parameter cannot be converted to a numeric value: abc for key :v"
+            "1 validation error detected: \
+             The parameter cannot be converted to a numeric value: abc"
         );
     }
 
@@ -4428,7 +4432,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
         );
         assert!(
             validate_select_projection(
@@ -4548,6 +4552,7 @@ mod tests {
                 non_key_attributes: non_key,
             },
             provisioned_throughput: None,
+            warm_throughput: None,
         };
 
         input.global_secondary_indexes = Some(vec![gsi(None)]);
@@ -4587,6 +4592,7 @@ mod tests {
                     non_key_attributes: non_key,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]);
             input
         };
@@ -4695,6 +4701,17 @@ mod tests {
             stream_view_type: Some(StreamViewType::NewImage),
         });
         assert!(validate_create_table(&input, &LimitsConfig::default()).is_ok());
+
+        // Enabled without a view type is refused (measured 2026-10-24).
+        input.stream_specification = Some(StreamSpecification {
+            stream_enabled: true,
+            stream_view_type: None,
+        });
+        let err = validate_create_table(&input, &LimitsConfig::default()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "One or more parameter values were invalid: Table is being created with a stream enabled, UpdateViewType is required"
+        );
     }
 
     #[test]

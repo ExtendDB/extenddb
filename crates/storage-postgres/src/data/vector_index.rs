@@ -41,6 +41,7 @@ use extenddb_storage::vector_lifecycle::{
 use pgvector::Vector;
 
 use super::{all_sort_key_info, vector_table_name};
+use crate::catalog_json::from_catalog_json;
 
 /// Read the vector index metadata for a table from the catalog.
 ///
@@ -74,14 +75,14 @@ where
 
     let mut out = Vec::with_capacity(rows.len());
     for (index_id, dimensions, vector_attribute, search_schema, projection, index_status) in rows {
-        let attr: extenddb_core::types::VectorAttribute = serde_json::from_value(vector_attribute)
+        let attr: extenddb_core::types::VectorAttribute = from_catalog_json(vector_attribute)
             .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?;
         let search_schema: Vec<extenddb_core::types::SearchSchemaElement> = match search_schema {
-            Some(value) => serde_json::from_value(value)
+            Some(value) => from_catalog_json(value)
                 .map_err(|e| StorageError::Internal(format!("vector search_schema: {e}")))?,
             None => Vec::new(),
         };
-        let projection: extenddb_core::types::Projection = serde_json::from_value(projection)
+        let projection: extenddb_core::types::Projection = from_catalog_json(projection)
             .map_err(|e| StorageError::Internal(format!("vector projection: {e}")))?;
         let hash_attribute_name = search_schema
             .iter()
@@ -1095,10 +1096,8 @@ pub async fn rebuild_stuck_vector_indexes(
             );
             continue;
         };
-        let base_key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attribute_definitions: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let attribute_definitions: Vec<AttributeDefinition> = from_catalog_json(ad_json)?;
         let dimensions = u32::try_from(dimensions)
             .map_err(|_| StorageError::Internal("vector dimensions out of range".to_owned()))?;
 

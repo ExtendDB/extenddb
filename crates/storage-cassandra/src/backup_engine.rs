@@ -63,12 +63,25 @@
 //! `backups_by_arn` row (`owner_generation`, `heartbeat_at`) and heartbeats it
 //! while it copies. [`LegacyBackupReader::abandoned_creating_backups`] reports
 //! a CREATING row whose heartbeat is stale, fenced to DELETING, for the
-//! reconciler to finish through [`LegacyBackupReader::delete`].
+//! reconciler to finish through [`LegacyBackupReader::delete_fenced`].
 //!
 //! `restore_table_from_backup` spawns one task that registers and then
 //! copies; the request future waits only for the registration outcome and
 //! returns the CREATING description, so a dropped request does not stop the
 //! restore.
+//!
+//! # `extenddb backup migrate-legacy`
+//!
+//! `items` reads a backup's buckets in order, each in pages by `item_index`
+//! (a copy of the restore's read, which fetches a bucket whole).
+//! `replace_with_index_row` converts the `backups_by_arn` row into its
+//! catalog index row in place with one lightweight transaction conditioned
+//! as DeleteBackup's claim is plus `store_kind = null`
+//! (`backup_catalog.rs`), then writes its list and status entries and
+//! deletes the buckets; the row is never both kinds, and no DELETED row is
+//! left. DeleteBackup's claim carries `store_kind = null` too, so a delete
+//! that read the in-catalog row before the conversion does not claim the
+//! index row after it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,14 +94,15 @@ use cdrs_tokio::types::map::Map;
 use cdrs_tokio::types::{AsRust, IntoRustByName, rows::Row};
 use extenddb_core::types::{
     AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, CreateTableInput,
-    DeleteTableInput, GsiInput, KeySchemaElement, LsiInput, ProvisionedThroughput,
+    DeleteTableInput, GsiInput, Item, KeySchemaElement, LsiInput, ProvisionedThroughput,
     SourceTableDetails, TableDescription, TableKeyInfo,
 };
 use extenddb_storage::backup_catalog::{
-    AbandonedLegacyBackup, RestoreRegistrationRow, new_generation,
+    AbandonedLegacyBackup, BackupRow, BackupStatus, LegacyBackupItems, LegacyBackupKey, Replaced,
+    RestoreRegistrationRow, new_generation,
 };
 use extenddb_storage::backup_definition::{
-    BACKUP_DEFINITION_VERSION, BackupTableDefinition, throughput_from_catalog,
+    BACKUP_DEFINITION_VERSION, BackupTableDefinition, LegacyVectorState, throughput_from_catalog,
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
@@ -182,7 +196,7 @@ pub(crate) struct StoredBackup {
     pub(crate) backup_status: String,
     backup_type: String,
     backup_size_bytes: i64,
-    item_count: i64,
+    pub(crate) item_count: i64,
     key_schema: String,
     attribute_definitions: String,
     billing_mode: String,
@@ -561,7 +575,7 @@ impl CassandraEngine {
     /// The create writes buckets in order and publishes `item_count` last, so
     /// a create that died mid-copy leaves a row whose count is 0 and whose
     /// buckets are contiguous from 0; the probe finds them all.
-    async fn cleanup_backup_payload(
+    pub(crate) async fn cleanup_backup_payload(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -598,6 +612,30 @@ impl CassandraEngine {
                 .map_err(|e| StorageError::Internal(format!("Delete backup payload: {e}")))?;
             bucket += 1;
         }
+    }
+
+    /// The second half of a legacy delete, on a row that is DELETING: its
+    /// list entries and payload go (idempotent, so a second caller that
+    /// finds the row DELETING may run it too), then the row is marked
+    /// DELETED under a lightweight transaction conditioned on DELETING.
+    async fn finish_delete(&self, backup: &StoredBackup) -> Result<(), StorageError> {
+        self.remove_backup_index_rows(backup).await?;
+        self.cleanup_backup_payload(&backup.account_id, &backup.backup_arn, backup.item_count)
+            .await?;
+        let mark_deleted = format!(
+            "UPDATE {}.backups_by_arn SET backup_status = 'DELETED' \
+             WHERE account_id = ? AND backup_arn = ? \
+             IF backup_status = 'DELETING'",
+            self.catalog_keyspace()
+        );
+        crate::cassandra_util::query_lwt(
+            &self.session,
+            &mark_deleted,
+            cdrs_tokio::query_values!(backup.account_id.as_str(), backup.backup_arn.as_str()),
+        )
+        .await
+        .map_err(|e| StorageError::Internal(format!("Mark backup deleted: {e}")))?;
+        Ok(())
     }
 
     async fn remove_backup_index_rows(&self, backup: &StoredBackup) -> Result<(), StorageError> {
@@ -691,6 +729,7 @@ impl CassandraEngine {
                         write_capacity_units: pt.write_capacity_units,
                     }
                 }),
+                warm_throughput: None,
             })
             .collect();
         let local_secondary_indexes = table
@@ -727,20 +766,30 @@ impl CassandraEngine {
     /// Register a restore target on its source backup, only while the backup
     /// is AVAILABLE and no other restore is registered on it (one restore of
     /// a backup at a time, as the service: a second one while the first is
-    /// CREATING is `BackupInUse`). Returns whether it registered; when it did
-    /// not, [`Self::registration_refusal`] tells which condition failed.
+    /// CREATING is `BackupInUse`). A legacy restore's registration
+    /// (`in_catalog`) is also conditioned on `store_kind = null`: the row
+    /// `replace_with_index_row` converted into an index row after the
+    /// restore read it is no longer the in-catalog backup the restore copies
+    /// from. Returns whether it registered; when it did not,
+    /// [`Self::registration_refusal`] tells which condition failed.
     async fn register_restore(
         &self,
         account_id: &str,
         backup_arn: &str,
         table_id: &str,
         target_name: &str,
+        in_catalog: bool,
     ) -> Result<bool, StorageError> {
         let query = format!(
             "UPDATE {}.backups_by_arn SET active_restores[?] = ? \
              WHERE account_id = ? AND backup_arn = ? \
-             IF backup_status = 'AVAILABLE' AND active_restores = null",
-            self.catalog_keyspace()
+             IF backup_status = 'AVAILABLE' AND active_restores = null{}",
+            self.catalog_keyspace(),
+            if in_catalog {
+                " AND store_kind = null"
+            } else {
+                ""
+            }
         );
         let result = crate::cassandra_util::query_lwt(
             &self.session,
@@ -1459,10 +1508,11 @@ impl CassandraEngine {
         // registration. See the module docs for what this does and does not
         // guarantee. A refusal caused only by stale registrations is retried
         // once they are cleared, a bounded number of times.
+        crate::test_hooks::before_legacy_restore_registration(&backup_arn).await;
         let mut registered = Ok(false);
         for _ in 0..REGISTRATION_ATTEMPTS {
             registered = self
-                .register_restore(account_id, &backup_arn, &table_id, &target_name)
+                .register_restore(account_id, &backup_arn, &table_id, &target_name, true)
                 .await;
             match registered {
                 Ok(true) => break,
@@ -1653,7 +1703,7 @@ impl CassandraEngine {
         let mut registered = Ok(false);
         for _ in 0..REGISTRATION_ATTEMPTS {
             registered = self
-                .register_restore(account_id, &backup_arn, &table_id, &target_name)
+                .register_restore(account_id, &backup_arn, &table_id, &target_name, false)
                 .await;
             match registered {
                 Ok(true) => break,
@@ -1714,6 +1764,85 @@ impl CassandraEngine {
         }
 
         Ok((description, generation))
+    }
+}
+
+impl CassandraEngine {
+    /// The in-catalog rows (`store_kind` null) of every account whose status
+    /// `keep` keeps, by creation time and then ARN: a range read of
+    /// `backups_by_arn` at quorum in pages of [`LEGACY_KEYS_PAGE`] rows (the
+    /// table keeps the converted rows and every other backup's row too, so
+    /// one response of the whole table could pass the coordinator's range
+    /// timeout), each page's kept keys collected and the rest dropped
+    /// before the next page is read, sorted here. A row whose columns do
+    /// not decode is an error; a row with no `created_at` sorts first.
+    async fn legacy_keys(
+        &self,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<LegacyBackupKey>, StorageError> {
+        use cdrs_tokio::frame::message_result::RowsMetadataFlags;
+        const WHAT: &str = "in-catalog backups";
+        let scan = format!(
+            "SELECT account_id, backup_arn, backup_status, store_kind, created_at \
+             FROM {}.backups_by_arn",
+            self.catalog_keyspace()
+        );
+        let page_size = crate::test_hooks::legacy_keys_page_size().unwrap_or(LEGACY_KEYS_PAGE);
+        let decode = |column: &str, e: cdrs_tokio::error::Error| {
+            StorageError::Internal(format!("{WHAT}: column {column} does not decode: {e}"))
+        };
+        let mut keys = Vec::new();
+        let mut paging_state = None;
+        loop {
+            let mut params = cdrs_tokio::statement::StatementParamsBuilder::new()
+                .with_consistency(Consistency::LocalQuorum)
+                .with_page_size(page_size);
+            if let Some(state) = paging_state.take() {
+                params = params.with_paging_state(state);
+            }
+            let failed =
+                |e: cdrs_tokio::error::Error| StorageError::Internal(format!("{WHAT}: {e}"));
+            let body = self
+                .session
+                .query_with_params(&scan, params.build())
+                .await
+                .map_err(failed)?
+                .response_body()
+                .map_err(failed)?;
+            paging_state = body
+                .as_rows_metadata()
+                .filter(|metadata| metadata.flags.contains(RowsMetadataFlags::HAS_MORE_PAGES))
+                .and_then(|metadata| metadata.paging_state.clone());
+            for row in body.into_rows().unwrap_or_default() {
+                let store_kind: Option<String> = row
+                    .get_by_name("store_kind")
+                    .map_err(|e| decode("store_kind", e))?;
+                let status: String =
+                    crate::cassandra_util::get_column(&row, "backup_status", WHAT)?;
+                if store_kind.is_some() || !keep(&status) {
+                    continue;
+                }
+                let created_at: i64 = row
+                    .get_by_name("created_at")
+                    .map_err(|e| decode("created_at", e))?
+                    .unwrap_or(0);
+                keys.push((
+                    created_at,
+                    LegacyBackupKey {
+                        account_id: crate::cassandra_util::get_column(&row, "account_id", WHAT)?,
+                        backup_arn: crate::cassandra_util::get_column(&row, "backup_arn", WHAT)?,
+                        status: BackupStatus::parse(&status)?,
+                    },
+                ));
+            }
+            if paging_state.is_none() {
+                break;
+            }
+        }
+        keys.sort_by(|(a_at, a), (b_at, b)| {
+            a_at.cmp(b_at).then_with(|| a.backup_arn.cmp(&b.backup_arn))
+        });
+        Ok(keys.into_iter().map(|(_, key)| key).collect())
     }
 }
 
@@ -2142,10 +2271,16 @@ impl LegacyBackupReader for CassandraEngine {
                 "UPDATE {}.backups_by_arn SET backup_status = 'DELETING', \
                  heartbeat_at = toTimestamp(now()) \
                  WHERE account_id = ? AND backup_arn = ? \
-                 IF backup_status = 'AVAILABLE' AND active_restores = null",
+                 IF backup_status = 'AVAILABLE' AND active_restores = null AND store_kind = null",
                 self.catalog_keyspace()
             );
             let mut attempt = 0;
+            // Whether this DeleteBackup moved the row to DELETING: only that
+            // one answers DELETED. One that finds the row DELETING (another
+            // DeleteBackup's, running or stopped) finishes the cleanup,
+            // which is idempotent, and answers not found, as on PostgreSQL
+            // and SQLite, whatever the timing.
+            let mut claimed = false;
             while backup.backup_status == "AVAILABLE" {
                 self.ensure_backup_not_restoring(&backup).await?;
                 crate::test_hooks::before_delete_claim(&backup_arn).await;
@@ -2157,6 +2292,7 @@ impl LegacyBackupReader for CassandraEngine {
                 .await
                 .map_err(|e| StorageError::Internal(format!("Mark backup deleting: {e}")))?;
                 if crate::cassandra_util::lwt_applied(&result)? {
+                    claimed = true;
                     break;
                 }
                 attempt += 1;
@@ -2179,24 +2315,11 @@ impl LegacyBackupReader for CassandraEngine {
                 }
             }
 
-            self.remove_backup_index_rows(&backup).await?;
-            self.cleanup_backup_payload(&account_id, &backup_arn, backup.item_count)
-                .await?;
+            self.finish_delete(&backup).await?;
 
-            let mark_deleted = format!(
-                "UPDATE {}.backups_by_arn SET backup_status = 'DELETED' \
-                 WHERE account_id = ? AND backup_arn = ? \
-                 IF backup_status = 'DELETING'",
-                self.catalog_keyspace()
-            );
-            crate::cassandra_util::query_lwt(
-                &self.session,
-                &mark_deleted,
-                cdrs_tokio::query_values!(account_id.as_str(), backup_arn.as_str()),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Mark backup deleted: {e}")))?;
-
+            if !claimed {
+                return Err(backup_not_found(&backup_arn));
+            }
             Ok(BackupDescription {
                 backup_details: BackupDetails {
                     backup_status: "DELETED".to_owned(),
@@ -2218,44 +2341,7 @@ impl LegacyBackupReader for CassandraEngine {
         Box::pin(async move {
             Self::validate_account_id(&account_id)?;
             let backup = self.load_available_backup(&account_id, &backup_arn).await?;
-            let definition = backup.parsed_definition()?;
-            let provisioned_throughput = match &definition {
-                Some(definition) => definition.provisioned_throughput.clone(),
-                // A backup row written before V005: the throughput column it
-                // has always carried. That column holds {0, 0} for an
-                // on-demand source; treat a non-positive value as unrecorded,
-                // as the restore of catalog 0.0.3 did (it fell back to 5/5).
-                None => {
-                    let value = backup
-                        .provisioned_throughput
-                        .as_deref()
-                        .map(serde_json::from_str::<serde_json::Value>)
-                        .transpose()
-                        .map_err(|e| StorageError::Internal(format!("Parse throughput: {e}")))?;
-                    throughput_from_catalog(value.as_ref())
-                        .filter(|pt| pt.read_capacity_units > 0 && pt.write_capacity_units > 0)
-                }
-            };
-            Ok(BackupRestoreSource {
-                backup_arn: backup.backup_arn.clone(),
-                backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
-                    backup.created_at,
-                ),
-                source_table_name: backup.table_name.clone(),
-                source_table_arn: backup.table_arn.clone(),
-                source_table_id: backup.table_id.clone(),
-                key_schema: backup.parsed_key_schema()?,
-                attribute_definitions: backup.parsed_attribute_definitions()?,
-                billing_mode: backup.billing_mode.clone(),
-                provisioned_throughput,
-                item_count: backup.item_count,
-                table_size_bytes: backup.backup_size_bytes,
-                table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
-                    backup.table_created_at,
-                ),
-                definition,
-                legacy_vector_index_count: 0,
-            })
+            restore_source_of(&backup)
         })
     }
 
@@ -2302,18 +2388,22 @@ impl LegacyBackupReader for CassandraEngine {
         })
     }
 
-    /// In-catalog rows whose owner is dead, for the reconciler's `delete`:
-    /// a DELETING row whose `heartbeat_at` is older than `stale_after` on the
-    /// coordinator's clock, a deletion its process did not finish; and a
-    /// CREATING row whose stamp is that old (or unset, a row from before the
-    /// heartbeat existed), fenced to DELETING here with a lightweight
-    /// transaction conditioned on the status and heartbeat observed and
-    /// setting a fresh `owner_generation`, so a create that beats in between
-    /// keeps its row and one that comes back later finds its claim lost at
-    /// its next heartbeat. DELETING is scanned first, so a row this pass
-    /// fences is reported once. `delete` finishes a DELETING row and refuses
-    /// a CREATING one, so a client's DeleteBackup of a backup still being
-    /// created stays "not found" while the reconciler's goes through.
+    /// In-catalog rows whose owner is dead, for the reconciler's
+    /// `delete_fenced`: a DELETING row whose `heartbeat_at` is older than
+    /// `stale_after` on the coordinator's clock, a deletion its process did
+    /// not finish; and a CREATING row whose stamp is that old (or unset, a
+    /// row from before the heartbeat existed), fenced to DELETING here with
+    /// a lightweight transaction conditioned on the status and heartbeat
+    /// observed and setting a fresh `owner_generation`, so a create that
+    /// beats in between keeps its row and one that comes back later finds
+    /// its claim lost at its next heartbeat. DELETING is scanned first, so a
+    /// row this pass fences is reported once. The reconciler finishes the
+    /// row through `delete_fenced`, which answers `Ok` for a DELETING row; a
+    /// client's DeleteBackup goes through `delete`, which refuses a CREATING
+    /// row and answers a DELETING one "not found" (that call did not move it
+    /// there), so the client's answer for a backup still being created,
+    /// fenced or not, stays "not found" while the reconciler counts its
+    /// deletion.
     fn abandoned_creating_backups(
         &self,
         stale_after: Duration,
@@ -2365,7 +2455,7 @@ impl LegacyBackupReader for CassandraEngine {
                         account_id,
                         backup_arn,
                         // Reported, fenced to DELETING; the reconciler
-                        // removes it through `delete`.
+                        // removes it through `delete_fenced`.
                         removed: false,
                     });
                 }
@@ -2373,11 +2463,361 @@ impl LegacyBackupReader for CassandraEngine {
             Ok(abandoned)
         })
     }
+
+    /// The row must be DELETING: fenced by `abandoned_creating_backups`, or
+    /// left by a DeleteBackup that stopped (the scan reports a stale
+    /// DELETING row too). Its list entries and payload go and it is marked
+    /// DELETED, as `delete` does after its claim; `Ok` also for a row a
+    /// DeleteBackup that found it DELETING has since finished. A row in any
+    /// other status (a create's, or AVAILABLE) is not this caller's: "not
+    /// found", nothing changed.
+    fn delete_fenced<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<(), StorageError>> {
+        Box::pin(async move {
+            Self::validate_account_id(account_id)?;
+            let backup = self.load_backup(account_id, backup_arn).await?;
+            match backup.backup_status.as_str() {
+                "DELETING" => self.finish_delete(&backup).await,
+                "DELETED" => Ok(()),
+                _ => Err(backup_not_found(backup_arn)),
+            }
+        })
+    }
+
+    /// A range read of `backups_by_arn` at quorum (no index serves every
+    /// account; the restore-registration sweep reads the table the same
+    /// way), keeping the in-catalog rows (`store_kind` null) that are not
+    /// DELETED.
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys(|status| status != "DELETED"))
+    }
+
+    /// A converted row is an index row (`store_kind` set), so every DELETED
+    /// in-catalog row is a DeleteBackup's.
+    fn list_deleted(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys(|status| status == "DELETED"))
+    }
+
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        Box::pin(async move {
+            Self::validate_account_id(account_id)?;
+            self.load_stored_backup(account_id, backup_arn)
+                .await?
+                .filter(StoredBackup::is_in_catalog)
+                .map(|backup| BackupStatus::parse(&backup.backup_status))
+                .transpose()
+        })
+    }
+
+    /// The DELETED in-catalog `backups_by_arn` row goes, with one
+    /// lightweight transaction conditioned on DELETED and `store_kind =
+    /// null` (the DeleteBackup removed its list entries and item buckets);
+    /// an index row, or an in-catalog row in another status, is left. An
+    /// answer lost in transit is settled by a read of the partition: no row
+    /// means removed.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            Self::validate_account_id(account_id)?;
+            let statement = format!(
+                "DELETE FROM {}.backups_by_arn WHERE account_id = ? AND backup_arn = ? \
+                 IF backup_status = 'DELETED' AND store_kind = null",
+                self.catalog_keyspace()
+            );
+            match crate::cassandra_util::query_lwt(
+                &self.session,
+                &statement,
+                cdrs_tokio::query_values!(account_id, backup_arn),
+            )
+            .await
+            {
+                Ok(result) => crate::cassandra_util::lwt_applied(&result),
+                Err(e) => match self.load_stored_backup(account_id, backup_arn).await? {
+                    None => Ok(true),
+                    Some(_) => Err(StorageError::Internal(format!(
+                        "Remove deleted backup {backup_arn}: {e}"
+                    ))),
+                },
+            }
+        })
+    }
+
+    /// The AVAILABLE in-catalog row (its source as `restore_source` reads
+    /// it), then its item buckets in order, each read in pages of
+    /// [`LEGACY_ITEMS_PAGE`] rows by `item_index` rather than whole as the
+    /// restore's copy reads it, so one response holds at most a page of
+    /// items at the line cap.
+    fn items(
+        &self,
+        account_id: &str,
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        let account_id = account_id.to_owned();
+        let backup_arn = backup_arn.to_owned();
+        Box::pin(async move {
+            Self::validate_account_id(&account_id)?;
+            let backup = self.load_available_backup(&account_id, &backup_arn).await?;
+            let source = restore_source_of(&backup)?;
+            let cursor = LegacyItemsCursor {
+                engine: self.clone(),
+                query: format!(
+                    "SELECT item_index, item_data FROM {}.backup_items \
+                     WHERE backup_arn = ? AND bucket = ? AND item_index > ? LIMIT ?",
+                    self.account_keyspace(&account_id)
+                ),
+                backup_arn,
+                buckets: bucket_count(backup.item_count),
+                bucket: 0,
+                after: -1,
+                page: std::collections::VecDeque::new(),
+                done: false,
+            };
+            Ok(LegacyBackupItems {
+                backup_name: backup.backup_name.clone(),
+                source,
+                vector_state: LegacyVectorState::Unsupported,
+                items: Box::pin(futures::stream::unfold(cursor, LegacyItemsCursor::next)),
+            })
+        })
+    }
+
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Replaced, StorageError>> {
+        Box::pin(self.replace_legacy_row(row))
+    }
+}
+
+/// Rows of `backups_by_arn` one page of the `list_all` and `list_deleted`
+/// scan carries.
+const LEGACY_KEYS_PAGE: i32 = 1000;
+
+/// Rows of one item bucket `items` reads per query.
+const LEGACY_ITEMS_PAGE: i32 = 8;
+
+/// The parameters of one page of `items`: the values at consistency `ALL`.
+/// The in-catalog create wrote each bucket row at `ONE`, so a read of fewer
+/// than every replica can miss a row one replica alone holds and end short;
+/// at `ALL` every live replica's rows are merged, and a replica that does
+/// not answer fails the read rather than shortening it
+/// ([`legacy_items_read_error`]).
+fn legacy_items_page_params(
+    values: cdrs_tokio::query::QueryValues,
+) -> cdrs_tokio::statement::StatementParams {
+    cdrs_tokio::statement::StatementParamsBuilder::new()
+        .with_consistency(Consistency::All)
+        .with_values(values)
+        .build()
+}
+
+/// A failed page read of `items`: a replica that did not answer the read
+/// at `ALL` (unavailable, timed out, or failed) is named, with what to do;
+/// any other error as it is.
+fn legacy_items_read_error(e: &cdrs_tokio::error::Error) -> StorageError {
+    use cdrs_tokio::frame::message_error::ErrorType;
+    match e {
+        cdrs_tokio::error::Error::Server { body, .. }
+            if matches!(
+                body.ty,
+                ErrorType::Unavailable(_) | ErrorType::ReadTimeout(_) | ErrorType::ReadFailure(_)
+            ) =>
+        {
+            StorageError::Internal(format!(
+                "Read backup payload: a replica of the account keyspace did not answer; run \
+                 again when every replica is up ({e})"
+            ))
+        }
+        _ => StorageError::Internal(format!("Read backup payload: {e}")),
+    }
+}
+
+/// Where `items`' stream is: the bucket, the last `item_index` read in it,
+/// and the page not yet handed out.
+struct LegacyItemsCursor {
+    engine: CassandraEngine,
+    query: String,
+    backup_arn: String,
+    buckets: i64,
+    bucket: i64,
+    after: i64,
+    page: std::collections::VecDeque<String>,
+    done: bool,
+}
+
+impl LegacyItemsCursor {
+    async fn next(mut self) -> Option<(Result<Item, StorageError>, Self)> {
+        while self.page.is_empty() {
+            if self.done || self.bucket >= self.buckets {
+                return None;
+            }
+            if let Err(e) = self.read_page().await {
+                self.done = true;
+                return Some((Err(e), self));
+            }
+        }
+        let item_data = self.page.pop_front()?;
+        let item = serde_json::from_str::<Item>(&item_data)
+            .map_err(|e| StorageError::Internal(format!("Deserialize backup item: {e}")));
+        if item.is_err() {
+            self.done = true;
+        }
+        Some((item, self))
+    }
+
+    /// The next page of the current bucket; a short page ends the bucket.
+    async fn read_page(&mut self) -> Result<(), StorageError> {
+        #[allow(clippy::cast_possible_truncation)]
+        let bucket = self.bucket as i32;
+        let rows = self
+            .engine
+            .session
+            .query_with_params(
+                &self.query,
+                legacy_items_page_params(cdrs_tokio::query_values!(
+                    self.backup_arn.as_str(),
+                    bucket,
+                    self.after,
+                    LEGACY_ITEMS_PAGE
+                )),
+            )
+            .await
+            .map_err(|e| legacy_items_read_error(&e))?
+            .response_body()
+            .map_err(|e| StorageError::Internal(format!("Parse backup payload: {e}")))?
+            .into_rows()
+            .unwrap_or_default();
+        let full = rows.len() >= usize::try_from(LEGACY_ITEMS_PAGE).unwrap_or(usize::MAX);
+        for row in rows {
+            let item_index: i64 = row
+                .get_r_by_name("item_index")
+                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            let item_data: String = row
+                .get_r_by_name("item_data")
+                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            self.after = item_index;
+            self.page.push_back(item_data);
+        }
+        if !full {
+            self.bucket += 1;
+            self.after = -1;
+        }
+        Ok(())
+    }
+}
+
+/// The recorded source of an AVAILABLE in-catalog `backup`, as
+/// `restore_source` answers it.
+fn restore_source_of(backup: &StoredBackup) -> Result<BackupRestoreSource, StorageError> {
+    let definition = backup.parsed_definition()?;
+    let provisioned_throughput = match &definition {
+        Some(definition) => definition.provisioned_throughput.clone(),
+        // A backup row written before V005: the throughput column it
+        // has always carried. That column holds {0, 0} for an
+        // on-demand source; treat a non-positive value as unrecorded,
+        // as the restore of catalog 0.0.3 did (it fell back to 5/5).
+        None => {
+            let value = backup
+                .provisioned_throughput
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+                .transpose()
+                .map_err(|e| StorageError::Internal(format!("Parse throughput: {e}")))?;
+            throughput_from_catalog(value.as_ref())
+                .filter(|pt| pt.read_capacity_units > 0 && pt.write_capacity_units > 0)
+        }
+    };
+    Ok(BackupRestoreSource {
+        backup_arn: backup.backup_arn.clone(),
+        backup_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(backup.created_at),
+        source_table_name: backup.table_name.clone(),
+        source_table_arn: backup.table_arn.clone(),
+        source_table_id: backup.table_id.clone(),
+        key_schema: backup.parsed_key_schema()?,
+        attribute_definitions: backup.parsed_attribute_definitions()?,
+        billing_mode: backup.billing_mode.clone(),
+        provisioned_throughput,
+        item_count: backup.item_count,
+        table_size_bytes: backup.backup_size_bytes,
+        table_creation_date_time: crate::cassandra_util::millis_to_seconds_f64(
+            backup.table_created_at,
+        ),
+        definition,
+        legacy_vector_index_count: 0,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `items` reads every page at `ALL`, the one level at which a row
+    /// written at `ONE` to one replica cannot be missed by a live read.
+    #[test]
+    fn the_legacy_item_pages_are_read_at_all() {
+        let params =
+            legacy_items_page_params(cdrs_tokio::query_values!("arn", 0_i32, -1_i64, 8_i32));
+        assert_eq!(params.query_params.consistency, Consistency::All);
+        assert!(params.query_params.values.is_some());
+    }
+
+    /// A replica that does not answer the read at `ALL` is named, the
+    /// errors decoded from the server's reply bodies (Unavailable 0x1000,
+    /// ReadTimeout 0x1200, ReadFailure 0x1300, each at ALL with 2 of 3
+    /// replicas); another error keeps its text.
+    #[test]
+    fn a_replica_that_does_not_answer_the_legacy_item_read_is_named() {
+        use cdrs_tokio::frame::Version;
+        use cdrs_tokio::frame::message_error::{ErrorBody, ErrorType};
+        let addr: std::net::SocketAddr = "127.0.0.1:9042".parse().unwrap();
+        let server = |ty| cdrs_tokio::error::Error::Server {
+            body: ErrorBody {
+                message: "Cannot achieve consistency level ALL".to_owned(),
+                ty,
+            },
+            addr,
+        };
+        // consistency ALL (0x0005), then the code's own fields.
+        let replies: [(i32, Vec<u8>); 3] = [
+            (0x1000, vec![0, 5, 0, 0, 0, 3, 0, 0, 0, 2]),
+            (0x1200, vec![0, 5, 0, 0, 0, 2, 0, 0, 0, 3, 0]),
+            (0x1300, vec![0, 5, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 1, 0]),
+        ];
+        for (code, bytes) in replies {
+            let ty = ErrorType::from_cursor_with_code(
+                &mut std::io::Cursor::new(&bytes[..]),
+                code,
+                Version::V4,
+            )
+            .unwrap_or_else(|e| panic!("reply {code:#x}: {e}"));
+            let StorageError::Internal(text) = legacy_items_read_error(&server(ty)) else {
+                panic!("an internal error")
+            };
+            assert!(
+                text.contains(
+                    "a replica of the account keyspace did not answer; run again when every \
+                     replica is up"
+                ),
+                "{code:#x}: {text}"
+            );
+        }
+        let StorageError::Internal(text) = legacy_items_read_error(&server(ErrorType::Invalid))
+        else {
+            panic!("an internal error")
+        };
+        assert!(text.starts_with("Read backup payload: "), "{text}");
+        assert!(!text.contains("did not answer"), "{text}");
+    }
 
     #[test]
     fn item_buckets_are_bounded() {

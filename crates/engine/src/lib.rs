@@ -12,8 +12,10 @@ mod backup;
 pub use backup::{
     BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
     OTHER_STORE, RESTORE_REGISTRATION_TIMEOUT, S3_CHECK_TIMEOUT, STORE_IDENTITY_KEY, Spool,
-    StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
-    check_configured_store, maintenance, read_identity_bounded, reconciler, store_identity,
+    StoreFence, StoreHealth, StoreHealthReport, StoreIdentityFile, StoreProblem, TARGET_NOT_EMPTY,
+    check_configured_store, check_configured_store_read_only, maintenance, migrate_legacy,
+    read_identity_bounded, reconciler, refuse_point_in_time_recovery, store_identity,
+    store_maintenance, sync,
 };
 mod batch_get_item;
 mod batch_write_item;
@@ -27,6 +29,7 @@ mod describe_table;
 mod expected;
 mod expression_helpers;
 mod get_item;
+mod gsi_updates;
 mod import_export;
 mod import_export_io;
 mod index_helpers;
@@ -36,6 +39,7 @@ mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod per_table_capacity;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
@@ -53,6 +57,7 @@ mod ttl;
 mod update_item;
 mod update_table;
 mod vector_gate;
+mod warm_throughput;
 #[cfg(feature = "partiql")]
 use partiql::PartiqlExecutor;
 
@@ -180,6 +185,26 @@ pub(crate) fn serialize_output(
 pub(crate) fn sanitize_storage_error(e: extenddb_storage::error::StorageError) -> DynamoDbError {
     tracing::error!(internal_error = %e, "storage internal error");
     DynamoDbError::InternalServerError("Internal server error".to_owned())
+}
+
+/// The null-member sentence for a `StreamSpecification` object without
+/// `StreamEnabled`, on `CreateTable` and `UpdateTable` alike (measured
+/// 2026-10-24). Checked before the body is deserialised, where the missing
+/// field would otherwise surface as a serialization error; its order against
+/// the other request checks is not measured. A `StreamSpecification` that is
+/// not an object is left to deserialisation, which refuses it as a
+/// `SerializationException`.
+pub(crate) fn require_stream_enabled_member(body: &serde_json::Value) -> Result<(), DynamoDbError> {
+    if let Some(spec) = body.get("StreamSpecification").filter(|v| v.is_object())
+        && spec
+            .get("StreamEnabled")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        return Err(DynamoDbError::ValidationException(
+            "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Map a serde deserialization error to the appropriate `DynamoDB` error type.

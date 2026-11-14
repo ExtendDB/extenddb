@@ -7,16 +7,17 @@ ExtendDB deliberately diverges from real DynamoDB here (see
 docs/differences-from-dynamodb.md): DescribeContinuousBackups always reports
 PointInTimeRecoveryStatus DISABLED, UpdateContinuousBackups refuses to enable
 recovery with ContinuousBackupsUnavailableException, and
-RestoreTableToPointInTime refuses with PointInTimeRecoveryUnavailableException
-after resolving the source table. These tests pin that divergence, so they run
-only against ExtendDB.
+RestoreTableToPointInTime refuses every request with
+PointInTimeRecoveryUnavailableException. Point-in-time recovery is not in this
+release, so the server gives both refusals before it authorizes the request or
+reads any table: every caller and every request shape gets the same answer.
+These tests pin that divergence, so they run only against ExtendDB.
 
-The request validation before those answers, and its order, are the
-service's: a missing table name member and the table name constraints, the
-missing recovery specification, the restore's source member and time members,
-and TableNotFoundException for a missing table on all three operations. The
-expected texts were measured on DynamoDB, two samples each, with client-side
-parameter validation off.
+The request validation of DescribeContinuousBackups and of a disable, and its
+order, are the service's: a missing table name member and the table name
+constraints, the missing recovery specification, and TableNotFoundException
+for a missing table. The expected texts were measured on DynamoDB, two samples
+each, with client-side parameter validation off.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ import uuid
 
 import pytest
 from botocore.exceptions import ClientError
+
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip(),
@@ -44,27 +47,11 @@ FLAG_REQUIRED = (
     "'pointInTimeRecoverySpecification.pointInTimeRecoveryEnabled' "
     "failed to satisfy constraint: Member must not be null"
 )
-NO_RESTORE_TIME = (
-    "Invalid Request: Either one of RestoreDateTime or UseLatestRestorableTime "
-    "must be specified, but not both"
-)
-TWO_RESTORE_TIMES = (
-    "Invalid Request: Both RestoreDateTime and UseLatestRestorableTime cannot be set "
-    "for point-in-time restore request. Please specify either RestoreDateTime time "
-    "or UseLatestRestorableTime"
-)
-SOURCE_NAMED_TWICE = (
-    "Invalid Request: Must provide exactly one of: sourceTableArn, sourceTableName"
-)
-INVALID_TABLE_ARN = "Invalid Request: Table ARN is invalid."
 NAME_PATTERN = "Member must satisfy regular expression pattern: [a-zA-Z0-9_.-]+"
 EMPTY_TABLE_NAME = (
     "2 validation errors detected: Value '' at 'tableName' failed to satisfy "
     "constraint: Member must have length greater than or equal to 3; Value '' at "
     f"'tableName' failed to satisfy constraint: {NAME_PATTERN}"
-)
-SOURCE_TABLE_NAME_LENGTH = (
-    "TableName must be at least 3 characters long and at most 255 characters long"
 )
 
 
@@ -85,13 +72,6 @@ def _assert_error(call, code: str, message: str, **params) -> None:
 
 def _table_not_found(name: str) -> tuple[str, str]:
     return "TableNotFoundException", f"Table not found: {name}"
-
-
-def _recovery_not_enabled(name: str) -> tuple[str, str]:
-    return (
-        "PointInTimeRecoveryUnavailableException",
-        f"Point in time recovery is not enabled for table '{name}'",
-    )
 
 
 def test_describe_continuous_backups_reports_recovery_disabled(
@@ -116,10 +96,8 @@ def test_enable_point_in_time_recovery_is_refused(
             TableName=unique_table_name,
             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
         )
-    assert (
-        excinfo.value.response["Error"]["Code"]
-        == "ContinuousBackupsUnavailableException"
-    )
+    err = excinfo.value.response["Error"]
+    assert (err["Code"], err["Message"]) == ENABLE_REFUSED
 
     resp = dynamodb_client.describe_continuous_backups(TableName=unique_table_name)
     assert (
@@ -146,50 +124,29 @@ def test_disable_point_in_time_recovery_reports_disabled(
     }
 
 
-def test_restore_to_point_in_time_is_refused(
-    dynamodb_client, create_and_cleanup_table, unique_table_name
-):
-    """Restore on an existing table fails with the restore-modeled exception."""
-    create_and_cleanup_table()
-    _assert_error(
-        dynamodb_client.restore_table_to_point_in_time,
-        *_recovery_not_enabled(unique_table_name),
-        SourceTableName=unique_table_name,
-        TargetTableName=f"{unique_table_name}-restored",
-        UseLatestRestorableTime=True,
-    )
-
-
-def test_restore_to_point_in_time_missing_source_table(dynamodb_client):
-    """Restore resolves the source table first: a missing table reports
-    TableNotFoundException, not the recovery-unavailable error."""
-    missing = _missing_name()
-    _assert_error(
-        dynamodb_client.restore_table_to_point_in_time,
-        *_table_not_found(missing),
-        SourceTableName=missing,
-        TargetTableName=f"{missing}-restored",
-        UseLatestRestorableTime=True,
-    )
-
-
-def test_a_missing_table_is_table_not_found_on_both_continuous_backups_operations(
+def test_a_missing_table_on_the_continuous_backups_operations(
     dynamodb_client,
 ):
-    """TableNotFoundException with the service's text, for either flag."""
+    """TableNotFoundException with the service's text on a describe and a
+    disable. An enable is refused before the table is looked up."""
     missing = _missing_name()
     _assert_error(
         dynamodb_client.describe_continuous_backups,
         *_table_not_found(missing),
         TableName=missing,
     )
-    for enabled in (False, True):
-        _assert_error(
-            dynamodb_client.update_continuous_backups,
-            *_table_not_found(missing),
-            TableName=missing,
-            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": enabled},
-        )
+    _assert_error(
+        dynamodb_client.update_continuous_backups,
+        *_table_not_found(missing),
+        TableName=missing,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
+    )
+    _assert_error(
+        dynamodb_client.update_continuous_backups,
+        *ENABLE_REFUSED,
+        TableName=missing,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+    )
 
 
 def test_the_recovery_specification_is_required_before_the_table_is_looked_up(
@@ -213,8 +170,7 @@ def test_the_recovery_specification_is_required_before_the_table_is_looked_up(
 def test_a_missing_table_name_member_is_the_required_parameter_text(
     dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
 ):
-    """No TableName, no restore source, or no TargetTableName: the same text,
-    and a missing target is reported before the source is looked up."""
+    """No TableName on a describe or a disable: the service's text."""
     create_and_cleanup_table()
     client = dynamodb_client_no_validation
     _assert_error(
@@ -226,129 +182,14 @@ def test_a_missing_table_name_member_is_the_required_parameter_text(
         TABLE_NAME_REQUIRED,
         PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
     )
-    restore = client.restore_table_to_point_in_time
-    for params in (
-        {"TargetTableName": f"{unique_table_name}-restored"},
-        {"SourceTableName": unique_table_name},
-        {"SourceTableName": _missing_name()},
-    ):
-        _assert_error(
-            restore,
-            "ValidationException",
-            TABLE_NAME_REQUIRED,
-            UseLatestRestorableTime=True,
-            **params,
-        )
-
-
-def test_restore_checks_the_source_then_the_time_members_then_recovery(
-    dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
-):
-    """The source lookup comes before the time members, the time members
-    before the recovery check, and the target is never looked up."""
-    create_and_cleanup_table()
-    other = f"{unique_table_name}-other"
-    create_and_cleanup_table(table_name=other)
-    restore = dynamodb_client_no_validation.restore_table_to_point_in_time
-    target = f"{unique_table_name}-restored"
-    missing = _missing_name()
-
-    _assert_error(
-        restore, *_table_not_found(missing), SourceTableName=missing, TargetTableName=target
-    )
-    for times in ({}, {"UseLatestRestorableTime": False}):
-        _assert_error(
-            restore,
-            "ValidationException",
-            NO_RESTORE_TIME,
-            SourceTableName=unique_table_name,
-            TargetTableName=target,
-            **times,
-        )
-    _assert_error(
-        restore,
-        "ValidationException",
-        TWO_RESTORE_TIMES,
-        SourceTableName=unique_table_name,
-        TargetTableName=target,
-        UseLatestRestorableTime=True,
-        RestoreDateTime=1_700_000_000,
-    )
-    _assert_error(
-        restore,
-        *_recovery_not_enabled(unique_table_name),
-        SourceTableName=unique_table_name,
-        TargetTableName=target,
-        RestoreDateTime=1_700_000_000,
-    )
-    # An existing target is not checked before the recovery check.
-    _assert_error(
-        restore,
-        *_recovery_not_enabled(unique_table_name),
-        SourceTableName=unique_table_name,
-        TargetTableName=other,
-        UseLatestRestorableTime=True,
-    )
-
-
-def test_restore_source_table_arn_names_the_source_and_must_name_a_table(
-    dynamodb_client, dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
-):
-    """SourceTableArn names the source as SourceTableName does; an index ARN
-    is refused, with or without a time member; giving both is refused."""
-    create_and_cleanup_table()
-    other = f"{unique_table_name}-other"
-    create_and_cleanup_table(table_name=other)
-    table_arn = dynamodb_client.describe_table(TableName=unique_table_name)["Table"][
-        "TableArn"
-    ]
-    prefix = table_arn[: -len(unique_table_name)]
-    restore = dynamodb_client_no_validation.restore_table_to_point_in_time
-    target = f"{unique_table_name}-restored"
-    missing = _missing_name()
-
-    _assert_error(
-        restore,
-        *_recovery_not_enabled(unique_table_name),
-        SourceTableArn=table_arn,
-        TargetTableName=target,
-        UseLatestRestorableTime=True,
-    )
-    _assert_error(
-        restore,
-        *_table_not_found(missing),
-        SourceTableArn=prefix + missing,
-        TargetTableName=target,
-        UseLatestRestorableTime=True,
-    )
-    for times in ({"UseLatestRestorableTime": True}, {}):
-        _assert_error(
-            restore,
-            "ValidationException",
-            INVALID_TABLE_ARN,
-            SourceTableArn=f"{table_arn}/index/gsi1",
-            TargetTableName=target,
-            **times,
-        )
-    for arn in (table_arn, prefix + other):
-        _assert_error(
-            restore,
-            "ValidationException",
-            SOURCE_NAMED_TWICE,
-            SourceTableName=unique_table_name,
-            SourceTableArn=arn,
-            TargetTableName=target,
-            UseLatestRestorableTime=True,
-        )
 
 
 def test_an_empty_table_name_is_refused_before_the_table_is_looked_up(
     dynamodb_client_no_validation,
 ):
-    """An empty TableName fails the length and pattern constraints on both
-    continuous-backups operations (M335 probes 56 and 57), and an empty
-    SourceTableName fails the length check on the restore (probe 58), before
-    any table is looked up."""
+    """An empty TableName fails the length and pattern constraints on a
+    describe and a disable (M335 probes 56 and 57), before any table is
+    looked up."""
     client = dynamodb_client_no_validation
     _assert_error(
         client.describe_continuous_backups,
@@ -362,31 +203,6 @@ def test_an_empty_table_name_is_refused_before_the_table_is_looked_up(
         EMPTY_TABLE_NAME,
         TableName="",
         PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False},
-    )
-    _assert_error(
-        client.restore_table_to_point_in_time,
-        "ValidationException",
-        SOURCE_TABLE_NAME_LENGTH,
-        SourceTableName="",
-        TargetTableName=f"{_missing_name()}-restored",
-        UseLatestRestorableTime=True,
-    )
-
-
-def test_a_table_arn_as_the_restore_source_name_fails_the_name_pattern(
-    dynamodb_client_no_validation,
-):
-    """SourceTableName holding a table ARN fails the name pattern at
-    sourceTableName, before the lookup (M335 probe 46)."""
-    arn = f"arn:aws:dynamodb:us-east-1:123456789012:table/{_missing_name()}"
-    _assert_error(
-        dynamodb_client_no_validation.restore_table_to_point_in_time,
-        "ValidationException",
-        f"1 validation error detected: Value '{arn}' at 'sourceTableName' failed to "
-        f"satisfy constraint: {NAME_PATTERN}",
-        SourceTableName=arn,
-        TargetTableName=f"{_missing_name()}-restored",
-        UseLatestRestorableTime=True,
     )
 
 
@@ -404,3 +220,43 @@ def test_the_recovery_flag_as_the_string_false_disables(
         "ContinuousBackupsStatus": "ENABLED",
         "PointInTimeRecoveryDescription": {"PointInTimeRecoveryStatus": "DISABLED"},
     }
+
+
+def test_every_restore_gets_the_refusal(
+    dynamodb_client, dynamodb_client_no_validation, create_and_cleanup_table, unique_table_name
+):
+    """Every RestoreTableToPointInTime gets the same refusal: an existing
+    source, a missing one, an index ARN, a source named twice or not at all,
+    no target, bad names and bad time members."""
+    create_and_cleanup_table()
+    table_arn = dynamodb_client.describe_table(TableName=unique_table_name)["Table"][
+        "TableArn"
+    ]
+    prefix = table_arn[: -len(unique_table_name)]
+    target = f"{unique_table_name}-restored"
+    missing = _missing_name()
+    shapes = [
+        {"SourceTableName": unique_table_name, "TargetTableName": target,
+         "UseLatestRestorableTime": True},
+        {"SourceTableArn": table_arn, "TargetTableName": target,
+         "RestoreDateTime": 1_700_000_000},
+        {"SourceTableName": missing, "TargetTableName": target, "UseLatestRestorableTime": True},
+        {"SourceTableArn": prefix + missing, "TargetTableName": target,
+         "UseLatestRestorableTime": True},
+        {"SourceTableArn": f"{table_arn}/index/gsi1", "TargetTableName": target},
+        {"SourceTableName": unique_table_name, "SourceTableArn": table_arn,
+         "TargetTableName": target, "UseLatestRestorableTime": True},
+        {"TargetTableName": target, "UseLatestRestorableTime": True},
+        {"SourceTableName": unique_table_name, "UseLatestRestorableTime": True},
+        {"SourceTableName": "", "TargetTableName": target, "UseLatestRestorableTime": True},
+        {"SourceTableName": f"arn:aws:dynamodb:us-east-1:123456789012:table/{missing}",
+         "TargetTableName": target, "UseLatestRestorableTime": True},
+        {"SourceTableName": unique_table_name, "TargetTableName": target},
+        {"SourceTableName": unique_table_name, "TargetTableName": target,
+         "UseLatestRestorableTime": True, "RestoreDateTime": 1_700_000_000},
+        {"SourceTableName": unique_table_name, "TargetTableName": unique_table_name,
+         "UseLatestRestorableTime": True},
+    ]
+    restore = dynamodb_client_no_validation.restore_table_to_point_in_time
+    for params in shapes:
+        _assert_error(restore, *RESTORE_REFUSED, **params)
