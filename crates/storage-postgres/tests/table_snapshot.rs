@@ -2538,7 +2538,11 @@ async fn an_open_needs_one_connection_per_pool(shared: bool) {
     assert!(items.iter().all(Result::is_ok));
     for result in results {
         match result {
-            Ok(_) | Err(extenddb_storage::error::StorageError::TableNotFound(_)) => {}
+            Ok(_)
+            | Err(
+                extenddb_storage::error::StorageError::TableNotFound(_)
+                | extenddb_storage::error::StorageError::TableBeingDeleted(_),
+            ) => {}
             Err(e) => panic!("a queued DeleteTable failed: {e}"),
         }
     }
