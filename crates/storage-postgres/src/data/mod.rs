@@ -3,28 +3,33 @@
 
 //! Per-DynamoDB-table DDL and item CRUD for the `PostgreSQL` backend.
 //!
-//! Each Virtual `DynamoDB` table maps to a `PostgreSQL` table named `_ddb_<TableName>`.
+//! Each Virtual `DynamoDB` table maps to a `PostgreSQL` table named `_ddb_<table_id>`.
 //! Partition keys are stored as TEXT. Sort keys use typed columns (`sk_s`, `sk_n`, `sk_b`)
 //! for correct ordering. The full item is stored as JSONB in `item_data`.
 
 use extenddb_core::types::{AttributeDefinition, Item, KeySchemaElement, ScalarAttributeType};
 use extenddb_storage::error::StorageError;
 
+/// Prefix of every data relation this backend creates for a table: the base
+/// table, its secondary indexes and its vector indexes. It keeps them apart
+/// from the catalog's tables and the data database's queue tables, and it is
+/// how `extenddb catalog-check` finds them.
+pub(crate) const STORAGE_RELATION_PREFIX: &str = "_ddb_";
+
 /// SQL table name for a Virtual `DynamoDB` table.
 ///
-/// Uses `_ddb_` prefix to avoid collisions with catalog metadata tables.
-/// Includes `account_id` for multi-account isolation (Phase 12a).
-/// Table names are validated at the engine layer (alphanumeric + `_.-`),
-/// so this is safe for identifier construction.
+/// Uses the `_ddb_` prefix to avoid collisions with catalog metadata tables.
+/// Named from the catalog's `table_id`, a server-generated UUID, so no client
+/// input reaches this identifier.
 #[must_use]
 pub fn data_table_name(table_id: &str) -> String {
-    format!("\"_ddb_{table_id}\"")
+    format!("\"{STORAGE_RELATION_PREFIX}{table_id}\"")
 }
 
 /// SQL table name for a GSI/LSI data table.
 #[must_use]
 pub fn index_table_name(index_id: &str) -> String {
-    format!("\"_ddb_{index_id}\"")
+    format!("\"{STORAGE_RELATION_PREFIX}{index_id}\"")
 }
 
 /// SQL table name for a vector index's data table.
@@ -42,7 +47,7 @@ pub fn index_table_name(index_id: &str) -> String {
 /// The id is a server-generated UUID, so no client input reaches this identifier.
 #[must_use]
 pub fn vector_table_name(index_id: &str) -> String {
-    format!("\"_ddb_vec_{index_id}\"")
+    format!("\"{STORAGE_RELATION_PREFIX}vec_{index_id}\"")
 }
 
 /// Look up all RANGE key attribute definitions from the key schema (preserving order).
@@ -132,6 +137,7 @@ macro_rules! bind_sk_execute {
 }
 
 // Submodules declared after macros so they can use bind_sk_fetch_optional/bind_sk_execute.
+pub(crate) mod catalog_check;
 mod data_engine;
 mod ddl;
 mod delete_item;
