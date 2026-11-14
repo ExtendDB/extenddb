@@ -3874,8 +3874,8 @@ pub(crate) struct GsiBackfillProgress {
 /// again. #431 measured this budget, with its backoff, as the one that lets
 /// that race resolve: a put blocked by a document that is removed 100 ms after
 /// the put starts commits well inside it, and the storage tests fail when the
-/// cap is put back to 5. A longer budget on either loop only delays the HTTP
-/// 500 it answers.
+/// cap is put back to 5. A longer budget on the commit retry or a create race
+/// only delays the error that loop answers when it runs out.
 pub(crate) const TRANSIENT_RETRY_ATTEMPTS: u32 = 50;
 
 /// Maximum number of times a contention retry loop re-runs a transaction that
