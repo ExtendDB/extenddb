@@ -165,11 +165,14 @@ async fn scratch() -> Scratch {
 }
 
 async fn set_delay(db: &PgPool, secs: f64) {
-    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'control_plane_delay_seconds'")
-        .bind(secs.to_string())
-        .execute(db)
-        .await
-        .expect("set the control-plane delay");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(secs.to_string())
+    .execute(db)
+    .await
+    .expect("set the control-plane delay");
 }
 
 /// Create `TABLE` as ACTIVE, keyed on `pk`.
@@ -281,6 +284,8 @@ fn update_input() -> UpdateTableInput {
         table_class: None,
         on_demand_throughput: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     }
 }
 
