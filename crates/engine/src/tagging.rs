@@ -5,7 +5,8 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
-    ListTagsOfResourceInput, ListTagsOfResourceOutput, TagResourceInput, UntagResourceInput,
+    ListTagsOfResourceInput, ListTagsOfResourceOutput, TableStatus, TagResourceInput,
+    UntagResourceInput,
 };
 use serde_json::Value;
 
@@ -96,25 +97,31 @@ enum WhileDeleting {
 /// `TagResource` and `UntagResource` on a `DELETING` table with
 /// `ResourceInUseException` and the sentence `DeleteTable` and `UpdateTable`
 /// give in that window, and serves `ListTagsOfResource` (measured
-/// 2026-11-03). The key info carries no status, and the data plane reads a
-/// `DELETING` table as found on PostgreSQL and SQLite, so the status is read
-/// with `describe_table`. Any other answer from it is left to the existence
-/// check that follows.
+/// 2026-11-03). On the table's stream ARN both writes are served in the same
+/// window (measured 2026-10-26), so `resource` decides: a stream's tags belong
+/// to the stream, which stays describable after its table is deleted. The key
+/// info carries no status, and the data plane reads a `DELETING` table as
+/// found on PostgreSQL and SQLite, so the status is read from the catalog
+/// (`table_lifecycle::read_table_status`). Any other answer from it is left to
+/// the existence check that follows.
+///
+/// Returns whether the table is `DELETING` and the request is served: the
+/// key-info read reports a `DELETING` row as not found on MongoDB and
+/// Cassandra, so such a request skips it and every backend answers the window
+/// the same way.
 async fn refuse_while_deleting(
     table_name: &str,
+    resource: &str,
     ctx: &OperationContext,
-) -> Result<(), DynamoDbError> {
-    if let Ok(desc) = ctx
-        .storage
-        .describe_table(
-            &ctx.account_id,
-            extenddb_core::types::DescribeTableInput {
-                table_name: table_name.to_owned(),
-            },
-        )
-        .await
-        && desc.table_status == extenddb_core::types::TableStatus::Deleting
-    {
+    while_deleting: WhileDeleting,
+) -> Result<bool, DynamoDbError> {
+    let Ok(status) = crate::table_lifecycle::read_table_status(table_name, ctx).await else {
+        return Ok(false);
+    };
+    if status != TableStatus::Deleting {
+        return Ok(false);
+    }
+    if while_deleting == WhileDeleting::Refuse && !tag_subresource_is_stream(resource) {
         return Err(DynamoDbError::ResourceInUseException(
             extenddb_core::error::error_message(
                 extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
@@ -122,7 +129,7 @@ async fn refuse_while_deleting(
             ),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Validate that the ARN refers to an existing table owned by the caller.
@@ -141,7 +148,8 @@ async fn refuse_while_deleting(
 /// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
 /// | Stream ARN with a different partition, service, or region | `ValidationException` (`Invalid StreamArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
-/// | Table is `DELETING`, for `TagResource` and `UntagResource` (`while_deleting` is `Refuse`) | `ResourceInUseException` (`Table is being deleted`) |
+/// | Table is `DELETING`, for `TagResource` and `UntagResource` on the table ARN (`while_deleting` is `Refuse`) | `ResourceInUseException` (`Table is being deleted`) |
+/// | Table is `DELETING`, for `ListTagsOfResource` and for the stream ARN | served |
 ///
 /// Account is checked before the partition, service, and region, matching the
 /// service: a cross-account ARN is denied without revealing whether its other
@@ -217,23 +225,32 @@ async fn validate_resource_arn(
         ))
     })?;
 
-    if while_deleting == WhileDeleting::Refuse {
-        refuse_while_deleting(table_name, ctx).await?;
+    // A served request on a DELETING table skips the key-info read, which
+    // reports such a row as not found on MongoDB and Cassandra.
+    if refuse_while_deleting(table_name, resource, ctx, while_deleting).await? {
+        return Ok(());
     }
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
         .table_key_info(&ctx.account_id, table_name)
         .await
-        .map_err(|e| match e {
-            extenddb_storage::error::StorageError::TableNotFound(_) => {
-                DynamoDbError::ResourceNotFoundException(format!(
-                    "Requested resource not found: ResourceArn: {arn} not found"
-                ))
-            }
-            other => sanitize_storage_error(other),
-        })?;
+        .map_err(|e| arn_storage_error(e, arn))?;
 
     Ok(())
+}
+
+/// Report a storage error from the table lookup behind a resource ARN: a
+/// missing table names the ARN, as the service does, and anything else is a
+/// fault.
+fn arn_storage_error(e: extenddb_storage::error::StorageError, arn: &str) -> DynamoDbError {
+    match e {
+        extenddb_storage::error::StorageError::TableNotFound(_) => {
+            DynamoDbError::ResourceNotFoundException(format!(
+                "Requested resource not found: ResourceArn: {arn} not found"
+            ))
+        }
+        other => sanitize_storage_error(other),
+    }
 }
 
 /// Handle `TagResource` — add or overwrite tags on a resource.
@@ -241,6 +258,8 @@ async fn validate_resource_arn(
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
+/// Returns `ResourceInUseException` if the ARN names a table that is being
+/// deleted.
 /// Returns `ValidationException` if the resource ARN is empty.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_tag_resource(
@@ -277,6 +296,8 @@ pub async fn handle_tag_resource(
 /// # Errors
 ///
 /// Returns `ResourceNotFoundException` if the resource does not exist.
+/// Returns `ResourceInUseException` if the ARN names a table that is being
+/// deleted.
 /// Returns `ValidationException` if the resource ARN is empty.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_untag_resource(
@@ -327,6 +348,8 @@ pub async fn handle_list_tags_of_resource(
         ));
     }
 
+    // Served while the table is DELETING, with the tags, as the service serves
+    // it (measured 2026-10-25): the read is not a change to the resource.
     validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Serve).await?;
 
     let tags = ctx
@@ -345,10 +368,29 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        deployment_scope_error, tag_subresource_not_dynamodb_resource,
+        arn_storage_error, deployment_scope_error, tag_subresource_not_dynamodb_resource,
         tag_subresource_not_table_or_stream,
     };
     use extenddb_core::error::DynamoDbError;
+    use extenddb_storage::error::StorageError;
+
+    /// A missing table behind a resource ARN names the ARN; anything else is a
+    /// fault, not a client error.
+    #[test]
+    fn a_missing_table_behind_an_arn_names_the_arn() {
+        let arn = "arn:aws:dynamodb:us-east-1:123456789012:table/t";
+        match arn_storage_error(StorageError::TableNotFound("t".to_owned()), arn) {
+            DynamoDbError::ResourceNotFoundException(msg) => assert_eq!(
+                msg,
+                format!("Requested resource not found: ResourceArn: {arn} not found")
+            ),
+            other => panic!("expected ResourceNotFoundException, got {other:?}"),
+        }
+        assert!(matches!(
+            arn_storage_error(StorageError::Internal("boom".to_owned()), arn),
+            DynamoDbError::InternalServerError(_)
+        ));
+    }
 
     /// The tag handler refuses exactly the ARNs the shared predicate puts
     /// outside this deployment, the predicate the server's StreamArn scope

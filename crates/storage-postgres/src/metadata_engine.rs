@@ -77,9 +77,14 @@ impl MetadataEngine for PostgresEngine {
             let ttl_val: Option<&str> = if enabled { Some(&attribute_name) } else { None };
             let index_ready = false;
 
+            // DELETING is admitted beside ACTIVE: the service runs
+            // UpdateTimeToLive's ordinary rules during the window and the write
+            // lands on the catalog row the delete then removes (measured
+            // 2026-10-25). The other non-ACTIVE statuses keep their refusal.
             let result = sqlx::query(
                 "UPDATE tables SET ttl_attribute = $1, ttl_index_ready = $4 \
-                 WHERE account_id = $2 AND table_name = $3 AND table_status = 'ACTIVE'",
+                 WHERE account_id = $2 AND table_name = $3 \
+                 AND table_status IN ('ACTIVE', 'DELETING')",
             )
             .bind(ttl_val)
             .bind(&account_id)

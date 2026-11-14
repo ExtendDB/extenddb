@@ -152,9 +152,14 @@ impl MetadataEngine for MongoEngine {
 
             let result = coll
                 .update_one(
+                    // DELETING is admitted beside ACTIVE: the service runs
+                    // UpdateTimeToLive's ordinary rules during the window and
+                    // the write lands on the catalog document the delete then
+                    // removes (measured 2026-10-25). The other non-ACTIVE
+                    // statuses keep their refusal.
                     doc! {
                         "_id": { "account_id": &account_id, "table_name": &table_name },
-                        "table_status": "ACTIVE",
+                        "table_status": { "$in": ["ACTIVE", "DELETING"] },
                     },
                     doc! {
                         "$set": {
@@ -347,8 +352,16 @@ impl MetadataEngine for MongoEngine {
             let tables_coll = self.catalog_db.collection::<Document>("tables");
             let id_filter =
                 doc! { "_id": { "account_id": &account_id, "table_name": &table_name } };
+            // ACTIVE only: a delete call drops the data collection after it
+            // marks the document DELETING, and create_index on a dropped
+            // collection creates it again. A build that reads the document
+            // after the mark gets TableNotFound, which the engine logs as
+            // deferred.
             let table_doc = tables_coll
-                .find_one(id_filter.clone())
+                .find_one(doc! {
+                    "_id": { "account_id": &account_id, "table_name": &table_name },
+                    "table_status": "ACTIVE",
+                })
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .ok_or_else(|| StorageError::TableNotFound(table_name.clone()))?;

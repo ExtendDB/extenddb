@@ -5,7 +5,7 @@
 
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::types::{
-    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TimeToLiveSpecificationOutput,
+    DescribeTimeToLiveInput, DescribeTimeToLiveOutput, TableStatus, TimeToLiveSpecificationOutput,
     TimeToLiveStatus, UpdateTimeToLiveInput, UpdateTimeToLiveOutput,
 };
 use extenddb_core::validation::validate_table_name;
@@ -15,10 +15,31 @@ use serde_json::Value;
 use crate::OperationContext;
 use crate::serialize_output;
 
+/// Gate a `DescribeTimeToLive` request on the table's catalog status.
+///
+/// The service refuses the call while the table is `CREATING` or `DELETING`,
+/// with one sentence that names the state, and serves it while the table is
+/// `ACTIVE` or `UPDATING`. Measured: `DELETING` on 2026-10-25 on three tables,
+/// the refusal coming back before and after an `UpdateTimeToLive` inside the
+/// same window; `CREATING` and `UPDATING` on 2026-10-26, five calls each.
+/// `UpdateTimeToLive` has no equivalent refusal, so the gate is on this path
+/// only.
+fn check_describe_status(status: TableStatus) -> Result<(), DynamoDbError> {
+    let key = match status {
+        TableStatus::Creating => extenddb_core::error::ErrorMessageKey::DescribeTtlWhileCreating,
+        TableStatus::Deleting => extenddb_core::error::ErrorMessageKey::DescribeTtlWhileDeleting,
+        TableStatus::Active | TableStatus::Updating => return Ok(()),
+    };
+    Err(DynamoDbError::ValidationException(
+        extenddb_core::error::error_message(key, &[]),
+    ))
+}
+
 /// Handle `DescribeTimeToLive` — return TTL configuration for a table.
 ///
 /// # Errors
 ///
+/// Returns `ValidationException` if the table is `CREATING` or `DELETING`.
 /// Returns `ResourceNotFoundException` if the table does not exist.
 /// Returns `InternalServerError` on storage failures.
 pub async fn handle_describe_time_to_live(
@@ -29,6 +50,14 @@ pub async fn handle_describe_time_to_live(
         serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
     validate_table_name(&input.table_name, &ctx.limits)?;
+
+    // The TTL columns live on the catalog row, which outlives the status
+    // change, so the read below answers for a DELETING table too: the status
+    // is what decides, and the key-info read cannot supply it.
+    let status = crate::table_lifecycle::read_table_status(&input.table_name, ctx)
+        .await
+        .map_err(storage_to_dynamo)?;
+    check_describe_status(status)?;
 
     let desc = ctx
         .storage
@@ -116,6 +145,13 @@ pub async fn handle_update_time_to_live(
         None
     };
 
+    // The status decides whether the index work after the write runs at all.
+    // It is read before the write: a delete that starts between the two meets
+    // that work, as before.
+    let status = crate::table_lifecycle::read_table_status(&input.table_name, ctx)
+        .await
+        .map_err(storage_to_dynamo)?;
+
     ctx.storage
         .update_ttl(
             &ctx.account_id,
@@ -126,7 +162,15 @@ pub async fn handle_update_time_to_live(
         .await
         .map_err(storage_to_dynamo)?;
 
-    if input.time_to_live_specification.enabled {
+    if status == TableStatus::Deleting {
+        // No index DDL for a table being deleted: the delete removes its data
+        // table or collection with the index, so the catalog write above is
+        // the whole change. If it ran, a PostgreSQL DROP INDEX would wait, with
+        // no lock timeout, behind whatever holds the data table, and the
+        // table's data-plane requests would queue behind it; a MongoDB
+        // create_index on the dropped collection would create the collection
+        // again, and no catalog document would be left to name it.
+    } else if input.time_to_live_specification.enabled {
         // Backends that report ENABLING (Cassandra, PostgreSQL) get the
         // backfill kicked off in the background: it is a full table scan, and
         // awaiting it made the API call take as long as the table is large.
@@ -226,9 +270,11 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
         StorageError::TableNotActive(name) => {
             DynamoDbError::ResourceInUseException(format!("Table {name} is not in ACTIVE state"))
         }
-        // No TTL path raises this today (the TTL metadata paths answer
-        // TableNotActive for every non-ACTIVE status), but the variant exists
-        // and a backend that raises it here must not become a 500.
+        // No TTL path raises this today: UpdateTimeToLive is served on a
+        // DELETING row, DescribeTimeToLive refuses it in the handler with the
+        // service's ValidationException, and the other non-ACTIVE statuses
+        // answer TableNotActive. The variant exists and a backend that raises
+        // it here must not become a 500.
         StorageError::TableBeingDeleted(name) => {
             DynamoDbError::ResourceInUseException(extenddb_core::error::error_message(
                 extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
@@ -289,6 +335,36 @@ mod tests {
     fn max_length_accepted() {
         let max = "a".repeat(255);
         assert!(validate_ttl_attribute_name(&max).is_ok());
+    }
+
+    /// DescribeTimeToLive is refused while the table is CREATING or DELETING,
+    /// with the service's sentence for each byte for byte, and served while it
+    /// is ACTIVE or UPDATING.
+    #[test]
+    fn describe_is_refused_while_creating_or_deleting() {
+        for (status, sentence) in [
+            (
+                TableStatus::Deleting,
+                "Cannot describe time to live while table is in DELETING state: \
+                 Current table state is DELETING",
+            ),
+            (
+                TableStatus::Creating,
+                "Cannot describe time to live while table is in CREATING state: \
+                 Current table state is CREATING",
+            ),
+        ] {
+            match check_describe_status(status).unwrap_err() {
+                DynamoDbError::ValidationException(msg) => assert_eq!(msg, sentence),
+                other => panic!("expected ValidationException for {status:?}, got {other:?}"),
+            }
+        }
+        for status in [TableStatus::Active, TableStatus::Updating] {
+            assert!(
+                check_describe_status(status).is_ok(),
+                "{status:?} must be served"
+            );
+        }
     }
 
     #[test]
