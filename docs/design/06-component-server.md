@@ -305,13 +305,16 @@ GET /metrics → 200 OK (application/json)
 ```
 
 This is **not** Prometheus exposition format. The response is a custom JSON
-schema that uses DynamoDB CloudWatch-style metric names and dimensions.
+schema that uses DynamoDB CloudWatch-style metric names and dimensions, and
+ExtendDB's own `AccountId` dimension.
 
 **Query parameters** (`MetricsQuery` in `crates/core/src/metrics/types.rs`):
 
 - `window`: `LastMinute` | `Last5Minutes` | `LastHour` | `LastDay` | `AllTime`
 - `start`, `end`: ISO 8601 (custom range, alternative to `window`)
 - `granularity`: `1m` | `5m` | `15m` | `1h` (auto-selected if omitted)
+- `account_id`: only the metrics of this account (leaves out the metrics of
+  the whole deployment, which have no account)
 - `table_name`: filter by table
 - `metric`: filter by metric name
 
@@ -320,13 +323,15 @@ schema that uses DynamoDB CloudWatch-style metric names and dimensions.
 ```json
 {
   "metrics":  [ { "metric": "SuccessfulRequestLatency",
-                  "dimensions": [ { "TableName": "Users" },
+                  "dimensions": [ { "AccountId": "123456789012" },
+                                  { "TableName": "Users" },
                                   { "Operation":  "GetItem" } ],
                   "window": "Last5Minutes",
                   "sum": 26033.0, "count": 50, "min": 321.0, "max": 714.0 } ],
   "buckets": [ { "timestamp": "2026-05-29T00:02:00Z",
                   "metric": "SuccessfulRequestLatency",
-                  "dimensions": [ { "TableName": "Users" } ],
+                  "dimensions": [ { "AccountId": "123456789012" },
+                                  { "TableName": "Users" } ],
                   "sum": 1234.0, "count": 5, "min": 200.0, "max": 410.0 } ],
   "segments": [ { "operation": "GetItem", "count": 50,
                   "avg": { "auth_us": 12.0, "authz_us": 4.0,
@@ -356,13 +361,19 @@ DynamoDB CloudWatch-aligned:
 - `TimeToLiveDeletedItemCount`, `TtlDeletionStaleness`
 
 ExtendDB-internal:
-- `RequestCount` (HTTP request count, dimension: `Operation`)
+- `RequestCount` (HTTP request count, dimensions: `AccountId`, `Operation`)
 - `StorageQueryCount`, `StorageQueryLatency` (dimensions: source, category)
 - `PoolActiveConnections`, `PoolIdleConnections`, `PoolAcquireLatency`
 - `WorkerLastSuccess`, `WorkerCycleLatency`, `WorkerErrorCount`
 
 **Dimensions** (from the `Dimension` enum):
 
+- `AccountId(String)`, ExtendDB's own: the account of the request or table
+  the metric belongs to; absent on a metric of the whole deployment (pool,
+  worker, storage query and backup job metrics). Each stored row records it
+  (on SQLite, PostgreSQL and Cassandra as part of the key), so two accounts'
+  tables of the same name have their own rows. The `account_id` filter also
+  applies to `segments`.
 - `TableName(String)`
 - `GlobalSecondaryIndexName(String)`
 - `Operation(String)`
@@ -623,6 +634,6 @@ The handler calls `core::capacity::calculator` to compute consumed RCU/WCU, then
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

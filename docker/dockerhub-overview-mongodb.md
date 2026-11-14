@@ -44,7 +44,7 @@ Start the server using the generated configuration:
 
 ```console
 docker run --rm --name extenddb-mongodb \
-  -p 18443:18443 \
+  -p 127.0.0.1:18443:18443 \
   -v "$PWD/extenddb-data:/var/lib/extenddb" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
@@ -76,28 +76,41 @@ Pin `X.Y.Z` or a digest for production; a version tag is never overwritten.
 `sha-<commit>` are unpromoted build candidates, not releases. Both
 `linux/amd64` and `linux/arm64` ship as one multi-architecture index.
 
-Every published image is signed with ExtendDB's release key, an elliptic-curve
-P-256 key held in the AWS Key Management Service. The public key is committed
-in the repository as
-[`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem).
-Verify an image before deploying it:
+Every published image is signed with Sigstore cosign, with a Rekor
+transparency-log entry. Releases through 0.1.14 use a committed release key,
+[`extenddb-signing.pub.pem`](https://github.com/ExtendDB/extenddb/blob/main/extenddb-signing.pub.pem):
 
 ```console
 cosign verify --key extenddb-signing.pub.pem \
   docker.io/extenddb/extenddb-mongodb:X.Y.Z
 ```
 
-The same images and their signatures are mirrored by digest to
-`ghcr.io/extenddb/extenddb-mongodb` and
-`public.ecr.aws/extenddb/extenddb-mongodb`.
+From the first release after the keyless migration (named in the release
+notes), signatures are keyless: the certificate names the GitHub Actions
+workflow and ref that signed the image, and no public key is needed.
+
+```console
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/ExtendDB/extenddb/\.github/workflows/(release-image|sign-image)\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  docker.io/extenddb/extenddb-mongodb:X.Y.Z
+```
+
+The signer identity separates tiers: routine backend releases are signed by
+`release-image.yml` and routine dev releases by `release-dev-image.yml`, so
+this pattern rejects a routinely-signed dev image. The break-glass signer
+`sign-image.yml` can sign any tier, so it is the one identity both patterns
+share; drop it to pin verification to the routine per-tier path. The same
+images and their signatures are mirrored by digest to
+`ghcr.io/extenddb/extenddb-mongodb` and `public.ecr.aws/extenddb/extenddb-mongodb`.
 
 ## Note
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-implementation that speaks the DynamoDB wire protocol; behavioral differences
-from the service are documented in
+ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB
+and does not contain any DynamoDB source code. It is not an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates. ExtendDB is a
+clean-room implementation that speaks the DynamoDB wire protocol; behavioral
+differences from the service are documented in
 [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
 More at [extenddb.org](https://extenddb.org) and
