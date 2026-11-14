@@ -870,6 +870,7 @@ pub async fn isolated_account(
             local_secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
             stream_specification: None,
+            creation_date_time: 0.0,
         },
     }
 }
