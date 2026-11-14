@@ -276,12 +276,9 @@ async fn live_a_single_item_write_that_reaches_the_deadline_answers_a_transient_
         let elapsed = started.elapsed();
         match res {
             Err(StorageError::Transient(msg)) => {
-                assert_eq!(
-                    msg,
-                    format!(
-                        "{operation}: the write lost to concurrent writers for 2 seconds; \
-                         retry the request"
-                    )
+                assert!(
+                    msg.starts_with(&format!("{operation}: could not commit in 2 seconds: ")),
+                    "{msg}"
                 );
                 println!("{operation} gave up on the deadline in {elapsed:?}: {msg}");
             }
@@ -355,9 +352,9 @@ async fn live_a_write_in_a_request_scope_measures_the_deadline_from_the_scope_st
     let _ = holder.abort_transaction().await;
 
     match held {
-        Err(StorageError::Transient(msg)) => assert_eq!(
-            msg,
-            "PutItem: the write lost to concurrent writers for 2 seconds; retry the request"
+        Err(StorageError::Transient(msg)) => assert!(
+            msg.starts_with("PutItem: could not commit in 2 seconds: "),
+            "{msg}"
         ),
         other => panic!("want the transient deadline error, got: {other:?}"),
     }

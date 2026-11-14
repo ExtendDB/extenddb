@@ -552,9 +552,10 @@ impl MongoEngine {
         let mut last_cause = String::new();
         for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
-                return Err(contention_deadline_exhausted(
+                return Err(crate::write_conflict::contention_deadline_exhausted(
                     "PutItem",
                     self.contention_deadline,
+                    &last_cause,
                 ));
             }
             let new_doc =
@@ -810,9 +811,10 @@ impl MongoEngine {
         let mut last_cause = String::new();
         for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
-                return Err(contention_deadline_exhausted(
+                return Err(crate::write_conflict::contention_deadline_exhausted(
                     "DeleteItem",
                     self.contention_deadline,
+                    &last_cause,
                 ));
             }
             // Capture before the transaction's first database operation so a
@@ -1074,9 +1076,10 @@ impl MongoEngine {
         let mut last_cause = String::new();
         for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
-                return Err(contention_deadline_exhausted(
+                return Err(crate::write_conflict::contention_deadline_exhausted(
                     "UpdateItem",
                     self.contention_deadline,
+                    &last_cause,
                 ));
             }
             // Capture before the transaction's first database operation. A
@@ -3917,16 +3920,13 @@ const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
 /// 10 s sits above the 9.5 to 12.7 s a put spends losing all 1,000 attempts
 /// and below botocore's 60 s default read timeout, so a caller gets an answer
 /// to retry rather than a socket timeout. Which bound a write reaches first
-/// depends on the host's load, and which error class the caller is told
-/// depends on that for two of the four operations: PutItem answers HTTP 503
-/// on either bound, and `TransactWriteItems` answers
-/// `TransactionCanceledException` on either bound, but DeleteItem and
-/// UpdateItem answer HTTP 503 on the deadline and 400
-/// `TransactionConflictException` when their attempt budget runs out first
-/// (measured in 2 of 4 rounds against a held document, where the 1,000
-/// attempts and the deadline both land near 10 s). #475, the fix for #437,
-/// replaces the 400 of those two paths, after which every single-item write
-/// answers 503 whichever bound it reaches.
+/// depends on the host's load: against a held document, where the 1,000
+/// attempts and the deadline both land near 10 s, a DeleteItem reached its
+/// attempt budget first in 2 of 4 rounds. The caller gets the same error class
+/// on either bound: HTTP 503 for the single-item writes (see
+/// `write_conflict::retry_budget_exhausted` and
+/// `write_conflict::contention_deadline_exhausted`) and
+/// `TransactionCanceledException` for `TransactWriteItems`.
 ///
 /// The deadline is read before an attempt starts, so a request answers within
 /// the deadline plus the attempt already running. That attempt has no bound
@@ -4147,24 +4147,6 @@ fn contention_deadline_passed(
 /// a loop measures from the start of its own call.
 fn contention_clock_start() -> std::time::Instant {
     extenddb_storage::request_clock::started().unwrap_or_else(std::time::Instant::now)
-}
-
-/// The error for a write that stopped retrying because the engine's
-/// contention deadline passed while it was losing to concurrent writers.
-/// `operation` names the API operation and `deadline` is the deadline that
-/// passed, in seconds with any fraction, so a deadline a test sets below one
-/// second does not read as 0 seconds.
-///
-/// Like the attempt-budget give-up of PutItem this is a
-/// [`StorageError::Transient`], which the engine answers as HTTP 503
-/// `ServiceUnavailable`: the SDK retry modes retry a 503 on their own and the
-/// retry succeeds once the contention has passed, whereas a 400
-/// `TransactionConflictException` is handed to the application.
-fn contention_deadline_exhausted(operation: &str, deadline: std::time::Duration) -> StorageError {
-    StorageError::Transient(format!(
-        "{operation}: the write lost to concurrent writers for {} seconds; retry the request",
-        deadline.as_secs_f64()
-    ))
 }
 
 /// Build a `mongodb::error::Error` carrying the given error labels.
@@ -4777,40 +4759,6 @@ mod tests {
         })
         .await;
         assert_eq!(inside, (batch_started, batch_started));
-    }
-
-    /// The give-up on the deadline is the transient error the engine answers
-    /// as HTTP 503, and its message names the operation and the wait.
-    #[test]
-    fn the_deadline_give_up_is_transient_and_names_the_operation() {
-        for operation in ["PutItem", "DeleteItem", "UpdateItem"] {
-            match contention_deadline_exhausted(operation, CONTENTION_DEADLINE) {
-                StorageError::Transient(msg) => {
-                    assert!(msg.starts_with(&format!("{operation}: ")), "{msg}");
-                    assert!(
-                        msg.contains("lost to concurrent writers for 10 seconds"),
-                        "{msg}"
-                    );
-                    assert!(msg.contains("retry the request"), "{msg}");
-                }
-                other => panic!("want Transient, got {other:?}"),
-            }
-        }
-        // The message carries the deadline that passed, not the default, and
-        // a deadline below one second keeps its fraction.
-        for (deadline, wait) in [
-            (std::time::Duration::from_secs(2), "2 seconds"),
-            (std::time::Duration::from_millis(250), "0.25 seconds"),
-            (std::time::Duration::from_millis(1500), "1.5 seconds"),
-        ] {
-            match contention_deadline_exhausted("PutItem", deadline) {
-                StorageError::Transient(msg) => assert!(
-                    msg.contains(&format!("lost to concurrent writers for {wait};")),
-                    "{msg}"
-                ),
-                other => panic!("want Transient, got {other:?}"),
-            }
-        }
     }
 
     /// Build a write error with the given code, the form `insert_one`
