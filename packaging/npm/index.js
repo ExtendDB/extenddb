@@ -277,8 +277,9 @@ function stopChild(child) {
  */
 async function start(options = {}) {
   // One deadline for the whole start. The version check and the health wait
-  // share it, so start() takes about one startupTimeoutMs: a health probe in
-  // flight at the deadline can add up to its 1 s timeout. Number() reads a
+  // share it, so start() takes about one startupTimeoutMs when the server
+  // prints no catalog migration line; each one restarts the wait. A health
+  // probe in flight at the deadline can add up to its 1 s timeout. Number() reads a
   // numeric string such as "20000" as that many ms. A fraction, Infinity or a value
   // above 2^31-1 works because start() compares the deadline with the clock
   // and gives a timer only a clamped delay.
