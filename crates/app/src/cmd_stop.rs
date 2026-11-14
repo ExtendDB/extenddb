@@ -3,8 +3,9 @@
 
 //! `extenddb stop` — stop the running extenddb server.
 //!
-//! Reads the PID file, sends SIGTERM, polls until the process exits (or
-//! times out), and cleans up the stale PID file.
+//! Reads the PID file, checks that a running server holds it, sends SIGTERM,
+//! polls until the process exits (or times out), and cleans up the stale PID
+//! file.
 
 #[cfg(unix)]
 use std::thread;
@@ -76,8 +77,11 @@ pub fn run(args: &StopArgs) {
         None => extenddb_config::pid_file_path_default(port),
     };
 
-    let pid_str = match std::fs::read_to_string(&pid_file) {
-        Ok(s) => s.trim().to_owned(),
+    // The PID and whether a running server holds the file, from one open of
+    // it, so a server that replaces the file meanwhile cannot pair its lock
+    // with the stale PID.
+    let contents = match extenddb_server::pid_file::read(&pid_file) {
+        Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // `serve --foreground` writes no PID file, so a missing file does
             // not mean nothing is running. Probe the port before saying so.
@@ -104,6 +108,7 @@ pub fn run(args: &StopArgs) {
             std::process::exit(1);
         }
     };
+    let pid_str = contents.text.trim();
 
     let pid: i32 = if let Ok(p) = pid_str.parse() {
         p
@@ -112,12 +117,51 @@ pub fn run(args: &StopArgs) {
         std::process::exit(1);
     };
 
-    // Check if the process is alive before sending SIGTERM.
-    if !is_process_alive(pid) {
-        eprintln!("Process {pid} is not running. Cleaning up stale PID file.");
-        let _ = std::fs::remove_file(&pid_file);
-        // Exit 0: the user's intent ("stop extenddb") is satisfied — the server
-        // is not running. This makes scripting easier (e.g. `extenddb stop && ...`).
+    // A running server holds a lock on its PID file. When nothing holds it, the
+    // PID is stale: the server is gone and the system may have given the PID to
+    // another process, which must not be signalled. The lock is checked first
+    // because `is_process_alive` reports a server another user runs as gone.
+    if !contents.held {
+        if !is_process_alive(pid) {
+            eprintln!("Process {pid} is not running. Cleaning up stale PID file.");
+            let _ = extenddb_server::pid_file::remove_stale(&pid_file, &contents);
+            // Exit 0: the user's intent ("stop extenddb") is satisfied, since
+            // the server is not running. This makes scripting easier (e.g.
+            // `extenddb stop && ...`).
+            return;
+        }
+        // The address `serve` would bind with the same config file and
+        // `EXTENDDB__` variables, including when there is no file.
+        let bind_addr = app_config
+            .as_ref()
+            .map(|c| c.server.bind_addr.clone())
+            .or_else(|| {
+                extenddb_config::load_builtin_defaults()
+                    .ok()
+                    .map(|c| c.server.bind_addr)
+            })
+            .unwrap_or_else(|| extenddb_config::ServerConfig::default().bind_addr);
+        let probed = listen_probe_addrs(&bind_addr, port);
+        if let Some(addr) = probed.iter().find(|a| is_listening(a)) {
+            eprintln!(
+                "PID file {} names process {pid}, but no extenddb server holds the file, so \
+                 `stop` cannot tell whether that process is the server listening on {addr}, \
+                 and does not signal it.\n\
+                 A server that an earlier extenddb release started with `serve --foreground \
+                 --write-pid-file` holds no lock on its PID file. If process {pid} is that \
+                 server, stop it with: kill {pid}",
+                pid_file.display(),
+            );
+            std::process::exit(1);
+        }
+        let probed: Vec<String> = probed.iter().map(ToString::to_string).collect();
+        eprintln!(
+            "PID file {} names process {pid}, which is not an extenddb server: no server \
+             holds the file and nothing listens on {}. Cleaning up stale PID file.",
+            pid_file.display(),
+            probed.join(", "),
+        );
+        let _ = extenddb_server::pid_file::remove_stale(&pid_file, &contents);
         return;
     }
 
@@ -135,8 +179,9 @@ pub fn run(args: &StopArgs) {
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     loop {
         if !is_process_alive(pid) {
-            // Process exited — clean up PID file if the server didn't already.
-            let _ = std::fs::remove_file(&pid_file);
+            // Process exited: clean up its PID file if the server didn't
+            // already, but not a file a new server has put in its place.
+            let _ = extenddb_server::pid_file::remove_stale(&pid_file, &contents);
             println!("extenddb stopped (pid {pid})");
             return;
         }
@@ -158,10 +203,82 @@ pub fn run(args: &StopArgs) {
     }
 }
 
+/// The addresses a server on `port` configured with `bind_addr` answers on:
+/// that address, both loopback addresses for a wildcard one, the addresses a
+/// host name resolves to, and 127.0.0.1 in every case.
+#[cfg(unix)]
+fn listen_probe_addrs(bind_addr: &str, port: u16) -> Vec<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+
+    // serve binds `{bind_addr}:{port}`, so it also accepts an IPv6 address in
+    // brackets.
+    let host = bind_addr
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(bind_addr);
+    let mut addrs = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+    match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => addrs.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port))),
+        Ok(ip) => addrs.push(SocketAddr::new(ip, port)),
+        Err(_) => addrs.extend((host, port).to_socket_addrs().into_iter().flatten()),
+    }
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
+/// Whether something accepts a TCP connection on `addr`.
+#[cfg(unix)]
+fn is_listening(addr: &std::net::SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(addr, Duration::from_millis(500)).is_ok()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
-    use super::SHUTDOWN_TIMEOUT;
+    use std::net::SocketAddr;
     use std::time::Duration;
+
+    use super::{SHUTDOWN_TIMEOUT, listen_probe_addrs};
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        let mut v: Vec<SocketAddr> = list.iter().map(|a| a.parse().unwrap()).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn a_specific_address_is_probed_with_loopback() {
+        assert_eq!(
+            listen_probe_addrs("10.1.2.3", 18443),
+            addrs(&["10.1.2.3:18443", "127.0.0.1:18443"])
+        );
+        for ipv6 in ["::1", "[::1]"] {
+            assert_eq!(
+                listen_probe_addrs(ipv6, 18443),
+                addrs(&["[::1]:18443", "127.0.0.1:18443"]),
+                "{ipv6}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wildcard_address_is_probed_on_both_loopbacks() {
+        for wildcard in ["0.0.0.0", "::", "[::]"] {
+            assert_eq!(
+                listen_probe_addrs(wildcard, 18443),
+                addrs(&["127.0.0.1:18443", "[::1]:18443"]),
+                "{wildcard}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_bind_address_is_probed_once() {
+        assert_eq!(
+            listen_probe_addrs("127.0.0.1", 18443),
+            addrs(&["127.0.0.1:18443"])
+        );
+    }
 
     /// `stop` waits at least as long as the server's shutdown can take with
     /// a backup job in its failure path: 5 s of connection drain, 30 s of

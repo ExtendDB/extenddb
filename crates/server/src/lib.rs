@@ -24,6 +24,8 @@ mod leading_keys;
 mod listener;
 pub mod management;
 mod metrics_endpoint;
+#[cfg(unix)]
+pub mod pid_file;
 pub mod rate_limit;
 mod registration;
 mod repeated_headers;

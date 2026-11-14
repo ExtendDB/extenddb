@@ -254,6 +254,18 @@ journalctl -t extenddb -f
 
 **Fix:** Delete the PID file manually and use `extenddb status` or `ps` to find the extenddb process. Stop it with `kill <pid>`.
 
+### `PID file <path> names process <pid>, which is not an extenddb server`
+
+**Cause:** A running server holds a lock on its PID file, and nothing holds this one. The process it names is alive, but nothing accepts connections on the port at the bind address `stop` reads from the config file and the `EXTENDDB__` variables, or at 127.0.0.1. `stop` takes the process for one the system gave the PID to after the server exited without removing its file, for example after a crash. It does not signal it, removes the stale file, and exits 0.
+
+**Fix:** If no server should be running, none. A server that an earlier release started with `serve --foreground --write-pid-file`, bound to an address the config `stop` read does not name, also holds no lock: if `extenddb serve` then fails to bind the port, find that server with `ss -ltnp` and stop it with `kill <pid>`.
+
+### `PID file <path> names process <pid>, but no extenddb server holds the file`
+
+**Cause:** Nothing holds the PID file's lock, but the process it names is alive and something accepts connections on the server's address, so `stop` cannot tell whether that process is the server and does not signal it. A server that an earlier release started with `serve --foreground --write-pid-file` holds no lock on its PID file.
+
+**Fix:** Check the process with `ps -p <pid>`. If it is the server, stop it with `kill <pid>`; a server started by this release holds the lock, and `extenddb stop` works with it.
+
 ### `Failed to send SIGTERM to pid <pid>: <error>`
 
 **Cause:** `extenddb stop` found a valid PID but could not send SIGTERM. Common causes: permission denied (the extenddb process is owned by a different user) or the process exited between the liveness check and the signal send.
