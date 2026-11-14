@@ -44,7 +44,7 @@ use crate::{DispatchMetrics, DispatchResult};
 /// Returns `DynamoDbError` for validation failures, missing tables, or storage errors.
 #[allow(clippy::cast_possible_wrap)] // item counts won't exceed i64::MAX
 pub async fn handle_query(
-    body: Value,
+    mut body: Value,
     ctx: &OperationContext,
 ) -> Result<DispatchResult, DynamoDbError> {
     // Pre-scanned before typed deserialization, sequentially: Query stops at
@@ -60,7 +60,11 @@ pub async fn handle_query(
             clause: crate::EnumClause::Named("returnConsumedCapacity"),
         }],
     )?;
-    crate::validate_enum_fields(
+    // The service checks Select after Limit, the request's parameters, the
+    // FilterExpression and the KeyConditionExpression (measured 2026-11-11),
+    // so an invalid Select is left out of the typed input and its error waits
+    // for those checks below.
+    let select_check = crate::validate_enum_fields(
         &body,
         &[crate::EnumField {
             json_name: "Select",
@@ -72,8 +76,50 @@ pub async fn handle_query(
             ],
             clause: crate::EnumClause::Named("select"),
         }],
-    )?;
-    let input: QueryInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
+    );
+    if select_check.is_err()
+        && let Some(fields) = body.as_object_mut()
+    {
+        fields.remove("Select");
+    }
+    // An invalid Select still comes ahead of a body that does not
+    // deserialize, as it did when it was checked before deserialization.
+    let input: QueryInput = match serde_json::from_value(body) {
+        Ok(input) => input,
+        Err(err) => {
+            select_check?;
+            return Err(crate::deserialize_error(err));
+        }
+    };
+
+    // Validate Limit >= 1 (REQ-QUERY-001). The service checks Limit ahead of
+    // every other fault measured (2026-11-11, us-east-1).
+    if let Some(limit) = input.limit
+        && limit < 1
+    {
+        return Err(DynamoDbError::ValidationException(
+                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
+            ));
+    }
+
+    // Build expression maps from request (used for expression-based parameters)
+    let maps = build_expression_maps(
+        input.expression_attribute_names.as_ref(),
+        input.expression_attribute_values.as_ref(),
+    );
+
+    // The service checks a Query in this order (measured 2026-11-11 in
+    // us-east-1): Limit, then the request's parameters, then every
+    // FilterExpression fault, then every KeyConditionExpression fault, then
+    // Select, the table, the index and ConsistentRead.
+    check_request_parameters(&input)?;
+    let filter_expression = parse_filter_expression(&input, &maps, &ctx.limits)?;
+    let key_condition_expression = input
+        .key_condition_expression
+        .as_deref()
+        .map(|kce| crate::expression_helpers::parse_key_condition_expr(kce, &maps, &ctx.limits))
+        .transpose()?;
+    select_check?;
 
     // P118: Fetch key_info first so we can use table_id for index lookup.
     let key_info = ctx
@@ -137,15 +183,6 @@ pub async fn handle_query(
         validate_query_select_index_support(input.select, index_info.as_ref())?;
     }
 
-    // Validate Limit >= 1 (REQ-QUERY-001)
-    if let Some(limit) = input.limit
-        && limit < 1
-    {
-        return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'Limit' failed to satisfy constraint: Member must have value greater than or equal to 1".to_owned(),
-            ));
-    }
-
     // For index queries, build a key_info that reflects the index's key schema
     // so the storage layer uses the correct SK column for the index table.
     let query_key_info = if let Some(ref idx) = index_info {
@@ -166,78 +203,9 @@ pub async fn handle_query(
         key_info.clone()
     };
 
-    // --- Legacy vs expression mutual exclusivity checks ---
-    let kce_present = input.key_condition_expression.is_some();
-    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
-    let has_fe = input.filter_expression.is_some();
-    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
-    let has_pe = input.projection_expression.is_some();
-    let has_atg = input
-        .attributes_to_get
-        .as_ref()
-        .is_some_and(|a| !a.is_empty());
-    let has_cond_op = input.conditional_operator.is_some();
-
-    // KeyConditions legitimately combines with FilterExpression and
-    // ProjectionExpression, so it joins the mixing check only when
-    // KeyConditionExpression is also present.
-    extenddb_core::validation::validate_no_expression_param_mixing(
-        &[
-            ("AttributesToGet", has_atg),
-            ("QueryFilter", has_qf),
-            ("ConditionalOperator", has_cond_op),
-            ("KeyConditions", has_kc && kce_present),
-        ],
-        &[
-            ("ProjectionExpression", has_pe),
-            ("FilterExpression", has_fe),
-            ("KeyConditionExpression", kce_present),
-        ],
-    )?;
-
-    // An explicitly empty KeyConditionExpression is rejected up front, before
-    // the expression-parameter-usage checks (matching real DynamoDB).
-    reject_empty_key_condition_expression(input.key_condition_expression.as_deref())?;
-
-    // Build expression maps from request (used for expression-based parameters)
-    let maps = build_expression_maps(
-        input.expression_attribute_names.as_ref(),
-        input.expression_attribute_values.as_ref(),
-    );
-
-    // Reject EAN/EAV supplied with no expression that references them. Legacy
-    // KeyConditions does not count as an expression. Query emits no values suffix.
-    let has_kce = input
-        .key_condition_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_filter_expr = input
-        .filter_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    let has_proj_expr = input
-        .projection_expression
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
-    extenddb_core::expression::validate_expression_param_usage(
-        input.expression_attribute_names.as_ref(),
-        has_kce || has_filter_expr || has_proj_expr,
-        input.expression_attribute_values.as_ref(),
-        has_kce || has_filter_expr,
-        &[],
-    )?;
-
-    // ConditionalOperator requires a QueryFilter with two or more conditions.
-    extenddb_core::validation::validate_conditional_operator_usage(
-        has_cond_op,
-        input.query_filter.as_ref().map_or(0, HashMap::len),
-    )?;
-
     // Parse KeyConditionExpression or desugar legacy KeyConditions
-    let (mut key_condition, legacy_kc_maps) = if let Some(kce_str) =
-        input.key_condition_expression.as_deref()
-    {
-        let parsed = crate::expression_helpers::parse_key_condition_expr(kce_str, &ctx.limits)?;
+    let (mut key_condition, legacy_kc_maps) = if let Some(parsed) = key_condition_expression {
+        // Parsed and checked above, after the FilterExpression.
         (parsed, None)
     } else if let Some(ref kc) = input.key_conditions {
         let key_schema_pairs: Vec<(String, bool)> = query_key_info
@@ -335,29 +303,22 @@ pub async fn handle_query(
         }
     }
 
-    // Parse FilterExpression or desugar legacy QueryFilter
-    let (filter, filter_maps) = if let Some(ref qf) = input.query_filter {
-        if qf.is_empty() {
-            (
-                parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-                None,
-            )
-        } else {
+    // Desugar a legacy QueryFilter. A FilterExpression was parsed and checked
+    // above; the parameter mixing check refuses a request with both.
+    let (filter, filter_maps) = match input.query_filter {
+        Some(ref qf) if !qf.is_empty() => {
             let cond_op = input.conditional_operator.unwrap_or_default();
             let (expr, fmaps) = desugar_filter(qf, cond_op)?;
             (Some(expr), Some(fmaps))
         }
-    } else {
-        (
-            parse_optional_filter(input.filter_expression.as_deref(), &ctx.limits)?,
-            None,
-        )
+        _ => (filter_expression, None),
     };
 
-    // Validate #name references in filter are defined in ExpressionAttributeNames
-    if let Some(ref filter_expr) = filter {
+    // A desugared QueryFilter's paths: a legacy attribute name that starts with
+    // `#` reads as a reference. A FilterExpression's were checked when parsed.
+    if let (Some(f), Some(_)) = (&filter, &filter_maps) {
         let names = input.expression_attribute_names.as_ref();
-        validate_name_refs_in_expr(filter_expr, names, ExpressionKind::Filter)?;
+        validate_name_refs_in_expr(f, names, ExpressionKind::Filter)?;
     }
 
     // Parse ProjectionExpression or desugar legacy AttributesToGet
@@ -478,14 +439,13 @@ pub async fn handle_query(
         ExpressionMaps::new(names, values)
     };
 
-    // Validate begins_with operand types upfront (before any rows are read).
-    if let Some(ref f) = filter {
-        extenddb_core::expression::validate_begins_with_operands(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
-        extenddb_core::expression::validate_ordering_operand_types(f, &combined_maps).map_err(
-            |e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter),
-        )?;
+    // The filter's operand types against the values legacy KeyConditions or a
+    // QueryFilter add. A FilterExpression was checked against the request's own
+    // values when it was parsed.
+    if let Some(f) = &filter
+        && (filter_maps.is_some() || legacy_kc_maps.is_some())
+    {
+        check_filter_operand_types(f, &combined_maps)?;
     }
 
     // Validate ExclusiveStartKey matches the key schema
@@ -695,6 +655,110 @@ fn refuse_begins_with_on_number(
         ));
     }
     Ok(())
+}
+
+/// The checks of a request's parameters, in this order: the mixing of
+/// expression and non-expression parameters, an empty
+/// `KeyConditionExpression`, `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues` with no expression that uses them, and
+/// `ConditionalOperator` without a `QueryFilter` of two or more conditions.
+///
+/// `handle_query` runs these after the `Limit` check and ahead of every other
+/// check (measured 2026-11-11).
+fn check_request_parameters(input: &QueryInput) -> Result<(), DynamoDbError> {
+    // --- Legacy vs expression mutual exclusivity checks ---
+    let kce_present = input.key_condition_expression.is_some();
+    let has_kc = input.key_conditions.as_ref().is_some_and(|m| !m.is_empty());
+    let has_fe = input.filter_expression.is_some();
+    let has_qf = input.query_filter.as_ref().is_some_and(|m| !m.is_empty());
+    let has_pe = input.projection_expression.is_some();
+    let has_atg = input
+        .attributes_to_get
+        .as_ref()
+        .is_some_and(|a| !a.is_empty());
+    let has_cond_op = input.conditional_operator.is_some();
+
+    // KeyConditions legitimately combines with FilterExpression and
+    // ProjectionExpression, so it joins the mixing check only when
+    // KeyConditionExpression is also present.
+    extenddb_core::validation::validate_no_expression_param_mixing(
+        &[
+            ("AttributesToGet", has_atg),
+            ("QueryFilter", has_qf),
+            ("ConditionalOperator", has_cond_op),
+            ("KeyConditions", has_kc && kce_present),
+        ],
+        &[
+            ("ProjectionExpression", has_pe),
+            ("FilterExpression", has_fe),
+            ("KeyConditionExpression", kce_present),
+        ],
+    )?;
+
+    // An explicitly empty KeyConditionExpression is rejected up front, before
+    // the expression-parameter-usage checks (matching real DynamoDB).
+    reject_empty_key_condition_expression(input.key_condition_expression.as_deref())?;
+
+    // Reject EAN/EAV supplied with no expression that references them. Legacy
+    // KeyConditions does not count as an expression. Query emits no values suffix.
+    let has_kce = input
+        .key_condition_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_filter_expr = input
+        .filter_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    let has_proj_expr = input
+        .projection_expression
+        .as_ref()
+        .is_some_and(|s| !s.is_empty());
+    extenddb_core::expression::validate_expression_param_usage(
+        input.expression_attribute_names.as_ref(),
+        has_kce || has_filter_expr || has_proj_expr,
+        input.expression_attribute_values.as_ref(),
+        has_kce || has_filter_expr,
+        &[],
+    )?;
+
+    // ConditionalOperator requires a QueryFilter with two or more conditions.
+    extenddb_core::validation::validate_conditional_operator_usage(
+        has_cond_op,
+        input.query_filter.as_ref().map_or(0, HashMap::len),
+    )
+}
+
+/// Parse the request's `FilterExpression` and refuse its faults before the key
+/// condition is parsed and the table is read: grammar and reserved words,
+/// undefined `#name` references, operand types, then undefined `:value`
+/// references (measured 2026-11-11, us-east-1).
+fn parse_filter_expression(
+    input: &QueryInput,
+    maps: &ExpressionMaps,
+    limits: &extenddb_core::limits::LimitsConfig,
+) -> Result<Option<extenddb_core::expression::Expr>, DynamoDbError> {
+    let Some(filter) = parse_optional_filter(input.filter_expression.as_deref(), limits)? else {
+        return Ok(None);
+    };
+    let names = input.expression_attribute_names.as_ref();
+    validate_name_refs_in_expr(&filter, names, ExpressionKind::Filter)?;
+    check_filter_operand_types(&filter, maps)?;
+    let mut placeholders = Vec::new();
+    extenddb_core::expression::collect_value_placeholders(&filter, &mut placeholders);
+    for placeholder in &placeholders {
+        maps.resolve_value_for(placeholder, ExpressionKind::Filter.as_str())?;
+    }
+    Ok(Some(filter))
+}
+
+/// Refuse a `begins_with` or ordering operand of the wrong type in a filter.
+fn check_filter_operand_types(
+    filter: &extenddb_core::expression::Expr,
+    maps: &ExpressionMaps,
+) -> Result<(), DynamoDbError> {
+    extenddb_core::expression::validate_begins_with_operands(filter, maps)
+        .and_then(|()| extenddb_core::expression::validate_ordering_operand_types(filter, maps))
+        .map_err(|e| crate::expression_helpers::prefix_expression_error(e, ExpressionKind::Filter))
 }
 
 /// Validate that all `#name` references in an expression AST are defined.

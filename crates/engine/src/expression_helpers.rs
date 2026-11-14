@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{
     Expr, ExpressionKind, ExpressionMaps, KeyCondition, PathElement, Token, UpdateAction,
-    parse_condition_with_depth_limit, parse_key_condition, parse_projection, parse_update_from,
-    tokenize_for, tokenize_with_limit, validate_no_reserved_words, validate_ordering_operand_types,
+    parse_condition_with_depth_limit, parse_key_condition_with_maps, parse_projection,
+    parse_update_from, tokenize_for, tokenize_with_limit, validate_no_reserved_words,
+    validate_ordering_operand_types,
 };
 use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{AttributeValue, ConditionalOperator, ExpectedAttributeValue};
@@ -237,14 +238,20 @@ pub fn parse_projection_expr(
 
 /// Size-check, tokenize, reserved-word check, and parse a `KeyConditionExpression`.
 ///
+/// `maps` holds the request's `ExpressionAttributeNames` and
+/// `ExpressionAttributeValues`. The parse reads them to refuse an undefined
+/// reference, a `begins_with` operand of the wrong type and a second
+/// condition on one key attribute.
+///
 /// Errors carry the `KeyConditionExpression` prefix, matching Amazon `DynamoDB`.
 ///
 /// # Errors
 ///
 /// Returns `DynamoDbError::ValidationException` for over-size, syntax, or
-/// reserved-word errors.
+/// reserved-word errors, and for the faults above.
 pub fn parse_key_condition_expr(
     expr: &str,
+    maps: &ExpressionMaps,
     limits: &LimitsConfig,
 ) -> Result<KeyCondition, DynamoDbError> {
     check_expression_size(expr, ExpressionKind::KeyCondition, limits)?;
@@ -257,7 +264,7 @@ pub fn parse_key_condition_expr(
         if limits.enforce_reserved_keywords {
             validate_no_reserved_words(&tokens)?;
         }
-        parse_key_condition(&tokens)
+        parse_key_condition_with_maps(&tokens, maps)
     })
     .map_err(|e| prefix_expression_error(e, ExpressionKind::KeyCondition))
 }
@@ -406,5 +413,38 @@ mod tests {
                 if msg.contains("Expression size has exceeded the maximum allowed size")),
             "got {err:?}"
         );
+    }
+
+    /// `parse_key_condition_expr` reads the request's `ExpressionAttributeNames`
+    /// and `ExpressionAttributeValues`, keyed with `#` and `:` as a request
+    /// carries them: a duplicate written through `#p` and an undefined `#u`
+    /// each answer the service's message. The core tests cover the other
+    /// rows.
+    #[test]
+    fn key_condition_parse_reads_the_request_maps() {
+        let names: HashMap<String, String> = [("#p".to_owned(), "pk".to_owned())].into();
+        let values: HashMap<String, AttributeValue> = [":a", ":b", ":c"]
+            .into_iter()
+            .map(|k| (k.to_owned(), AttributeValue::S("v".to_owned())))
+            .collect();
+        let maps = build_expression_maps(Some(&names), Some(&values));
+        for (expr, want) in [
+            (
+                "#p = :a AND pk = :b",
+                "Invalid KeyConditionExpression: KeyConditionExpressions must only contain \
+                 one condition per key",
+            ),
+            (
+                "pk = :a AND pk = :b AND #u = :c",
+                "Invalid KeyConditionExpression: An expression attribute name used in the \
+                 document path is not defined; attribute name: #u",
+            ),
+        ] {
+            let got = parse_key_condition_expr(expr, &maps, &LimitsConfig::default());
+            assert!(
+                matches!(&got, Err(DynamoDbError::ValidationException(msg)) if msg == want),
+                "expr {expr}: got {got:?}"
+            );
+        }
     }
 }

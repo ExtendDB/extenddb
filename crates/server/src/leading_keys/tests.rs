@@ -664,6 +664,28 @@ fn query_unreadable_partition_equality_binds_no_other_clause() {
     assert_ne!(r, Some(vec!["alice".to_owned()]));
 }
 
+/// A second condition on one key attribute keeps the partition equality's
+/// value, so a principal fenced to `own` reaches the engine, which refuses the
+/// key condition, and one fenced away from it is denied. The engine refuses
+/// every such key condition; which value the service binds for one is not
+/// measured.
+#[test]
+fn query_duplicate_key_condition_binds_the_partition_equality() {
+    for kce in ["pk = :own AND sk = :b AND sk = :c", "pk = :own AND pk = :b"] {
+        let input = json!({
+            "TableName": "t",
+            "KeyConditionExpression": kce,
+            "ExpressionAttributeValues": {
+                ":own": {"S": "own"},
+                ":b": {"S": "bob"},
+                ":c": {"S": "carol"},
+            },
+        });
+        let r = single_table_leading_keys(&input, "Query", Some(&main_table()), MAX_TOKENS);
+        assert_eq!(r, Some(vec!["own".to_owned()]), "{kce}");
+    }
+}
+
 /// Two non-equality clauses on the partition key: which operand the service
 /// binds is not measured, so neither is bound, in either clause order.
 #[test]
