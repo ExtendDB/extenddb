@@ -27,6 +27,9 @@ pub enum ShardIteratorType {
     Latest,
     AtSequenceNumber,
     AfterSequenceNumber,
+    /// Start at the first record whose creation time is at or after
+    /// `GetShardIteratorInput::timestamp`.
+    AtTimestamp,
 }
 
 /// Stream status.
@@ -201,6 +204,10 @@ pub struct GetShardIteratorInput {
     pub shard_iterator_type: ShardIteratorType,
     #[serde(rename = "SequenceNumber", default)]
     pub sequence_number: Option<String>,
+    /// Epoch seconds, fractional milliseconds allowed. Used with
+    /// `AT_TIMESTAMP`; the service refuses it with every other type.
+    #[serde(rename = "Timestamp", default)]
+    pub timestamp: Option<f64>,
 }
 
 /// `GetShardIterator` response.

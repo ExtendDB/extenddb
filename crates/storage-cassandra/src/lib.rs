@@ -41,6 +41,7 @@ mod password_hash_store;
 pub(crate) mod propagation_hold;
 mod restore_engine;
 mod snapshot_engine;
+pub mod stream_at_timestamp;
 mod stream_engine;
 mod stream_lifecycle;
 pub mod stream_util;

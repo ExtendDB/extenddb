@@ -47,6 +47,7 @@ mod search_vectors;
 mod start_key;
 pub mod stream_capture;
 mod streams;
+mod streams_iterator_params;
 mod tagging;
 mod transact_get_items;
 mod transact_write_helpers;

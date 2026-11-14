@@ -721,6 +721,21 @@ impl StreamEngine for PostgresEngine {
             Ok(row.map(|(s,)| s))
         })
     }
+
+    fn first_sequence_number_at_or_after(
+        &self,
+        shard_id: &str,
+        at_ms: i64,
+    ) -> BoxFuture<'_, Result<Option<String>, StorageError>> {
+        let shard_id = shard_id.to_owned();
+        Box::pin(async move {
+            // The seek reads `stream_records`, so the shard's committed writes
+            // are numbered first, as for LATEST above.
+            self.number_before_read_or_log(&shard_id, None).await;
+            self.first_sequence_number_at_or_after_impl(&shard_id, at_ms)
+                .await
+        })
+    }
 }
 
 impl PostgresEngine {
