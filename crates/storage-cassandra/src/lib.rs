@@ -63,7 +63,7 @@ pub use metadata_engine::TtlBackfillCursor;
 
 use cdrs_tokio::types::IntoRustByName;
 use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
-use extenddb_storage::server_components::{BackendError, ServerComponents};
+use extenddb_storage::server_components::{BackendError, ServerComponents, check_encryption_key};
 use std::sync::Arc;
 
 // ============================================================================
@@ -391,6 +391,7 @@ fn server_components_factory(
         let enc_key: String = enc_key_row.get_r_by_name("value").map_err(|e| {
             BackendError::InitializationFailed(format!("Failed to parse encryption key: {e}"))
         })?;
+        check_encryption_key(&enc_key)?;
 
         let catalog_store = Arc::new(
             CassandraCatalogStore::with_encryption_key(

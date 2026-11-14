@@ -28,7 +28,10 @@ the `sha2` and `hmac` crates and compared signatures with a hand-written loop.
 
 AWS-LC is already in every ExtendDB binary. ExtendDB installs the
 `rustls::crypto::aws_lc_rs` provider for its TLS server and clients, and sqlx
-connects to PostgreSQL with `tls-rustls-aws-lc-rs`.
+connects to PostgreSQL with `tls-rustls-aws-lc-rs`. The MongoDB driver does not
+use the installed provider. With its default `rustls-tls` feature it builds its
+TLS client configuration on `rustls::crypto::ring`, so the MongoDB backend
+connects to MongoDB through ring.
 
 ## Options Considered
 
@@ -39,9 +42,10 @@ connects to PostgreSQL with `tls-rustls-aws-lc-rs`.
    encryption, and the SigV4 SHA-256, HMAC-SHA256 and signature compare, all
    from AWS-LC, the library the TLS provider already uses.
 3. **Move the credential path onto ring.** ring has the same primitives and is
-   in `Cargo.lock`, but of the backend builds only the MongoDB one links it.
-   ExtendDB does not use ring as its TLS provider, and ring has no Federal
-   Information Processing Standards (FIPS) module.
+   in `Cargo.lock`, but of the backend builds only the MongoDB one links it,
+   for the MongoDB driver's TLS connections. The ExtendDB TLS server and its
+   other TLS clients do not use ring, and ring has no Federal Information
+   Processing Standards (FIPS) module.
 
 ## Decision
 
