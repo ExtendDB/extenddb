@@ -62,8 +62,8 @@ built with that feature needs no path configured.
 
 ## Developer mode
 
-A build-time profile that makes ExtendDB a drop-in replacement for DynamoDB
-Local: plain HTTP on loopback, open authorization, and a seeded credential — with
+A build-time profile that builds ExtendDB dev, a drop-in replacement for
+DynamoDB Local: plain HTTP on loopback, open authorization, and a seeded credential — with
 real SigV4 verification still in force. It is enabled by the `dev-mode` feature
 and, by a compile-time guard, **can never be built with the Postgres backend**.
 
