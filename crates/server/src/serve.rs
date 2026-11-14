@@ -605,6 +605,10 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
     // app crate's `config::is_tls_enabled` applies the same rule for clients.
     let tls_enabled = app_config.server.tls.enabled && !dev_mode;
 
+    // Dev-mode host guard names, parsed and logged by `dev_host_guard`.
+    let raw_hosts = app_config.server.dev_allowed_hosts.as_deref();
+    let dev_allowed_hosts = crate::dev_host_guard::allowed_hosts(dev_mode, raw_hosts);
+
     // P53: Resolve import and export path lists. Supports both the new
     // [import]/[export] sections and the deprecated import_export_root.
     //
@@ -751,6 +755,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
         tls_enabled,
         request_timeout: Duration::from_secs(app_config.server.request_timeout_secs),
         dev_mode,
+        dev_allowed_hosts,
         import_paths,
         export_paths,
         throttle: throttle.clone(),

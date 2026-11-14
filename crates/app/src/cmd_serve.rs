@@ -411,13 +411,24 @@ fn print_dev_mode_banner(
     use extenddb_server::dev_credentials;
 
     let dev_creds = dev_credentials::resolve()?;
-    let lines = dev_mode_banner_lines(
+    let mut lines = dev_mode_banner_lines(
         &config::redact_password(app_config.storage.connection_config()),
         app_config.server.bind_addr.trim(),
         port,
         &dev_creds,
         dev_credentials::ignored_aws_env_key(&dev_creds).as_deref(),
     );
+    // The host rule the server enforces, so the operator sees it without
+    // reading the log. Dropped entries are named too.
+    let raw = app_config.server.dev_allowed_hosts.as_deref().unwrap_or("");
+    let (kept, dropped) = extenddb_server::parse_dev_allowed_hosts(raw);
+    lines.push(format!("  {}", extenddb_server::dev_host_rule_line(&kept)));
+    for entry in dropped {
+        lines.push(format!(
+            "  Note: {}",
+            extenddb_server::dev_host_dropped_entry_note(&entry)
+        ));
+    }
     // Same stream split as the main banner: stdout for the daemon parent,
     // stderr in foreground mode so supervisors capture one stream.
     for msg in lines {

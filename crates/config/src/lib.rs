@@ -84,6 +84,18 @@ pub struct ServerConfig {
     /// client can hold a connection open. Default 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Developer mode only: a single comma-separated string of bare host names
+    /// (no port, scheme or wildcard) a browser request may use, beyond an IP
+    /// address, `localhost` and any `.localhost` name. A dev-mode server
+    /// refuses a browser request (one carrying an `Origin` or `Sec-Fetch-Site`
+    /// header) whose host is none of these, and checks every request to
+    /// `/management` and `/metrics` the same way whether or not it carries
+    /// either header. This stops a page whose name resolves to the loopback
+    /// address from driving the local server. Entries that are not bare host
+    /// names are dropped with a startup warning. Ignored outside a dev-mode
+    /// build.
+    #[serde(default)]
+    pub dev_allowed_hosts: Option<String>,
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -100,6 +112,7 @@ impl Default for ServerConfig {
             tls: TlsConfig::default(),
             throttling_enabled: None,
             request_timeout_secs: default_request_timeout_secs(),
+            dev_allowed_hosts: None,
         }
     }
 }

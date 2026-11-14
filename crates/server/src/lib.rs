@@ -15,6 +15,7 @@ pub(crate) mod authz_resource;
 pub mod backup_store;
 pub mod console;
 pub mod dev_credentials;
+pub(crate) mod dev_host_guard;
 mod handler;
 mod import_export_paths;
 mod import_export_roots;
@@ -36,6 +37,10 @@ mod table_name_gate;
 mod throttle_helpers;
 mod workers;
 
+pub use dev_host_guard::{
+    dropped_entry_note as dev_host_dropped_entry_note, parse_dev_allowed_hosts,
+    rule_line as dev_host_rule_line,
+};
 pub use serve::{
     BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
     WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
@@ -86,6 +91,12 @@ pub struct AppState {
     /// is still verified). Only ever true in a `dev-mode` build bound to
     /// loopback; the bin's serve path enforces those preconditions.
     pub dev_mode: bool,
+    /// Host names a dev-mode browser request, and any dev-mode request to
+    /// `/management` or `/metrics`, may use beyond an IP literal, `localhost`
+    /// and a `.localhost` name. Validated and lowercased at startup from
+    /// `server.dev_allowed_hosts`. Empty outside dev mode, where the host guard
+    /// is not installed.
+    pub dev_allowed_hosts: std::sync::Arc<[String]>,
     /// Allowed directories for import file operations. Empty means imports
     /// are disabled (secure default).
     pub import_paths: Arc<[Arc<std::path::PathBuf>]>,
@@ -156,6 +167,8 @@ pub async fn start_server(
     let tls_enabled = state.tls_enabled;
     let request_timeout = state.request_timeout;
     let catalog_store = state.catalog_store.clone();
+    let dev_mode = state.dev_mode;
+    let dev_allowed_hosts = state.dev_allowed_hosts.clone();
     let auth_cache_for_mgmt = state.auth_cache.clone();
     let auth_cache_for_console = state.auth_cache.clone();
     let metrics_for_console = state.metrics.clone();
@@ -244,6 +257,10 @@ pub async fn start_server(
         admission.clone(),
         registration::refuse_while_unregistered,
     ));
+
+    // Dev-mode host guard. Added before the security headers so its 403s carry
+    // them; it still runs before every handler and before authentication.
+    let app = dev_host_guard::install(app, dev_mode, dev_allowed_hosts);
 
     // Refuse a repeated host or authorization header on every route, then
     // apply security headers to all routes (the refusal carries them too).
