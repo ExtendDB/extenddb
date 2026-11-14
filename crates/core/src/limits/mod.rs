@@ -154,9 +154,13 @@ fn default_max_expression_length_bytes() -> usize {
 fn default_max_expression_depth() -> usize {
     150
 }
+
+/// The default `max_policy_document_bytes`: the AWS IAM limit of 6,144 bytes
+/// for an inline policy.
+pub const DEFAULT_MAX_POLICY_DOCUMENT_BYTES: usize = 6_144;
+
 fn default_max_policy_document_bytes() -> usize {
-    // AWS IAM limit: 6,144 bytes for inline policies.
-    6_144
+    DEFAULT_MAX_POLICY_DOCUMENT_BYTES
 }
 fn default_max_import_file_bytes() -> u64 {
     // 10 GB default.

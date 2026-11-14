@@ -545,6 +545,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
             principal_tags: make_cache_cfg("principal_tags"),
             resource_tags: make_cache_cfg("resource_tags"),
             session_data: make_cache_cfg("session_data"),
+            max_policy_document_bytes: app_config.limits.max_policy_document_bytes,
         };
         Arc::new(if cache_enabled {
             crate::CachedAuthzStore::new(store, cfg)

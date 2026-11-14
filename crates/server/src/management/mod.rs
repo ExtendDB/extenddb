@@ -59,6 +59,9 @@ pub struct ManagementState {
     /// Whether the listener serves TLS, resolved into `aws:SecureTransport`
     /// during trust policy evaluation.
     pub secure_transport: bool,
+    /// The configured `max_policy_document_bytes`: a policy or permissions
+    /// boundary over it is refused on write.
+    pub max_policy_document_bytes: usize,
 }
 
 /// Build the management API router.

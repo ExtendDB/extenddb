@@ -162,6 +162,7 @@ pub async fn start_server(
     let authz_cache_for_mgmt = state.authz_cache.clone();
     let table_key_info_cache_for_mgmt = state.table_key_info_cache.clone();
     let mgmt_region = state.region.clone();
+    let max_policy_document_bytes = state.limits.max_policy_document_bytes;
     let version_info = state.version_info.clone();
     let docs_store = state.docs_store.clone();
     let listen_url = {
@@ -212,6 +213,7 @@ pub async fn start_server(
             table_key_info_cache: table_key_info_cache_for_mgmt,
             region: mgmt_region,
             secure_transport: tls_enabled,
+            max_policy_document_bytes,
         });
         let mgmt_router = management::router().with_state(mgmt_state);
         app = app.nest("/management", mgmt_router);
@@ -225,6 +227,7 @@ pub async fn start_server(
             docs_store: docs_store.clone(),
             auth_cache: auth_cache_for_console,
             metrics: metrics_for_console,
+            max_policy_document_bytes,
             secure_cookies: tls_enabled,
         });
         let console_router = console::router().with_state(console_state);

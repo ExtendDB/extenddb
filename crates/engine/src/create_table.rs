@@ -66,6 +66,10 @@ pub async fn handle_create_table(
         ctx.storage.as_vector_search(),
     )?;
 
+    // After the definition checks, as the service orders it: the table quota
+    // and the provisioned-capacity maxima.
+    crate::table_limits::enforce_create_table(ctx, &input).await?;
+
     let table_name = input.table_name.clone();
     // Kept for the post-condition check below, since `input` is moved into the
     // backend call.

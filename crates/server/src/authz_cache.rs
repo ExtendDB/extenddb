@@ -55,6 +55,10 @@ pub struct AuthzCacheConfig {
     pub principal_tags: SwrCacheConfig,
     pub resource_tags: SwrCacheConfig,
     pub session_data: SwrCacheConfig,
+    /// The size limit a stored policy is parsed with: the configured
+    /// `max_policy_document_bytes`, which the write path applies too. A
+    /// stored policy over it does not parse, and its principal is denied.
+    pub max_policy_document_bytes: usize,
 }
 
 impl Default for AuthzCacheConfig {
@@ -85,6 +89,7 @@ impl Default for AuthzCacheConfig {
                 name: "session_data",
                 ..base
             },
+            max_policy_document_bytes: extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
         }
     }
 }
@@ -165,19 +170,20 @@ impl CachedAuthzStore {
         // The principal creation-time caches reuse the per-principal tag cache
         // sizing; capture it before the field initializers consume it.
         let created_at_cfg = cfg.principal_tags.clone();
+        let max_bytes = cfg.max_policy_document_bytes;
         Self {
             user_policies: mk_cache(
-                make_user_policies_loader(inner.clone()),
+                make_user_policies_loader(inner.clone(), max_bytes),
                 cfg.identity_policies.clone(),
                 pass_through,
             ),
             user_group_policies: mk_cache(
-                make_user_group_policies_loader(inner.clone()),
+                make_user_group_policies_loader(inner.clone(), max_bytes),
                 cfg.group_policies.clone(),
                 pass_through,
             ),
             user_boundary: mk_cache(
-                make_user_boundary_loader(inner.clone()),
+                make_user_boundary_loader(inner.clone(), max_bytes),
                 cfg.boundary.clone(),
                 pass_through,
             ),
@@ -187,12 +193,12 @@ impl CachedAuthzStore {
                 pass_through,
             ),
             role_policies: mk_cache(
-                make_role_policies_loader(inner.clone()),
+                make_role_policies_loader(inner.clone(), max_bytes),
                 cfg.identity_policies.clone(),
                 pass_through,
             ),
             role_boundary: mk_cache(
-                make_role_boundary_loader(inner.clone()),
+                make_role_boundary_loader(inner.clone(), max_bytes),
                 cfg.boundary,
                 pass_through,
             ),
@@ -202,7 +208,7 @@ impl CachedAuthzStore {
                 pass_through,
             ),
             session_data: mk_cache(
-                make_session_data_loader(inner.clone()),
+                make_session_data_loader(inner.clone(), max_bytes),
                 cfg.session_data,
                 pass_through,
             ),
@@ -747,7 +753,10 @@ type CreatedAtLoader = Loader<(String, String), Arc<String>, OpError>;
 // not exist" through this API, AND both should expire on the short
 // `negative_ttl`, not the long `ttl`. Otherwise probes against
 // nonexistent principals fill the LRU with empty positive entries.
-fn make_user_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoader {
+fn make_user_policies_loader(
+    inner: Arc<dyn AuthorizationStore>,
+    max_bytes: usize,
+) -> PolDocsLoader {
     Arc::new(move |(account_id, user_name): (String, String)|
         -> BoxFuture<'static, OpResult<Option<PolicyList>>> {
         let inner = inner.clone();
@@ -755,6 +764,7 @@ fn make_user_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
             let raw = inner.fetch_user_policies(&account_id, &user_name).await?;
             policy_list_if_nonempty(
                 &raw,
+                max_bytes,
                 &format_args!("an inline policy of user {user_name} in account {account_id}"),
             )
         }
@@ -762,7 +772,10 @@ fn make_user_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
     })
 }
 
-fn make_user_group_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoader {
+fn make_user_group_policies_loader(
+    inner: Arc<dyn AuthorizationStore>,
+    max_bytes: usize,
+) -> PolDocsLoader {
     Arc::new(move |(account_id, user_name): (String, String)|
         -> BoxFuture<'static, OpResult<Option<PolicyList>>> {
         let inner = inner.clone();
@@ -775,6 +788,7 @@ fn make_user_group_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDoc
             for (group_name, json) in &raw {
                 docs.push(parse_document(
                     json,
+                    max_bytes,
                     &format_args!(
                         "an inline policy of group {group_name} in account {account_id} (user \
                          {user_name} is a member)"
@@ -787,7 +801,10 @@ fn make_user_group_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDoc
     })
 }
 
-fn make_role_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoader {
+fn make_role_policies_loader(
+    inner: Arc<dyn AuthorizationStore>,
+    max_bytes: usize,
+) -> PolDocsLoader {
     Arc::new(move |(account_id, role_name): (String, String)|
         -> BoxFuture<'static, OpResult<Option<PolicyList>>> {
         let inner = inner.clone();
@@ -795,6 +812,7 @@ fn make_role_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
             let raw = inner.fetch_role_policies(&account_id, &role_name).await?;
             policy_list_if_nonempty(
                 &raw,
+                max_bytes,
                 &format_args!("an inline policy of role {role_name} in account {account_id}"),
             )
         }
@@ -808,15 +826,19 @@ fn make_role_policies_loader(inner: Arc<dyn AuthorizationStore>) -> PolDocsLoade
 /// Parse errors propagate. `owner` names whose policies these are.
 fn policy_list_if_nonempty(
     raw: &[String],
+    max_bytes: usize,
     owner: &dyn fmt::Display,
 ) -> OpResult<Option<PolicyList>> {
     if raw.is_empty() {
         return Ok(None);
     }
-    parse_documents(raw, owner).map(|v| Some(Arc::new(v)))
+    parse_documents(raw, max_bytes, owner).map(|v| Some(Arc::new(v)))
 }
 
-fn make_user_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoader {
+fn make_user_boundary_loader(
+    inner: Arc<dyn AuthorizationStore>,
+    max_bytes: usize,
+) -> BoundaryLoader {
     Arc::new(move |(account_id, user_name): (String, String)|
         -> BoxFuture<'static, OpResult<Option<Arc<PolicyDocument>>>> {
         let inner = inner.clone();
@@ -824,6 +846,7 @@ fn make_user_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoad
             match inner.fetch_user_boundary(&account_id, &user_name).await? {
                 Some(json_str) => Ok(Some(parse_document(
                     &json_str,
+                    max_bytes,
                     &format_args!(
                         "the permissions boundary of user {user_name} in account {account_id}"
                     ),
@@ -835,7 +858,10 @@ fn make_user_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoad
     })
 }
 
-fn make_role_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoader {
+fn make_role_boundary_loader(
+    inner: Arc<dyn AuthorizationStore>,
+    max_bytes: usize,
+) -> BoundaryLoader {
     Arc::new(move |(account_id, role_name): (String, String)|
         -> BoxFuture<'static, OpResult<Option<Arc<PolicyDocument>>>> {
         let inner = inner.clone();
@@ -843,6 +869,7 @@ fn make_role_boundary_loader(inner: Arc<dyn AuthorizationStore>) -> BoundaryLoad
             match inner.fetch_role_boundary(&account_id, &role_name).await? {
                 Some(json_str) => Ok(Some(parse_document(
                     &json_str,
+                    max_bytes,
                     &format_args!(
                         "the permissions boundary of role {role_name} in account {account_id}"
                     ),
@@ -940,7 +967,7 @@ fn make_role_created_at_loader(inner: Arc<dyn AuthorizationStore>) -> CreatedAtL
     })
 }
 
-fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader {
+fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>, max_bytes: usize) -> SessionLoader {
     Arc::new(move |(account_id, role_name, session_name): (String, String, String)|
         -> BoxFuture<'static, OpResult<Option<Arc<CachedSessionData>>>> {
         let inner = inner.clone();
@@ -953,6 +980,7 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
             let session_policy = match data.session_policy {
                 Some(json_str) => Some(parse_document(
                     &json_str,
+                    max_bytes,
                     &format_args!(
                         "the session policy of role {role_name} session {session_name} in \
                          account {account_id}"
@@ -973,11 +1001,12 @@ fn make_session_data_loader(inner: Arc<dyn AuthorizationStore>) -> SessionLoader
 
 fn parse_documents(
     jsons: &[String],
+    max_bytes: usize,
     owner: &dyn fmt::Display,
 ) -> OpResult<Vec<Arc<PolicyDocument>>> {
     let mut docs = Vec::with_capacity(jsons.len());
     for s in jsons {
-        docs.push(parse_document(s, owner)?);
+        docs.push(parse_document(s, max_bytes, owner)?);
     }
     Ok(docs)
 }
@@ -985,8 +1014,12 @@ fn parse_documents(
 /// Parse one stored policy. The error names `owner`, the principal the policy
 /// belongs to, and `authorization.rs` logs it as the one line for the denied
 /// request, so an operator can find the policy and rewrite it.
-fn parse_document(s: &str, owner: &dyn fmt::Display) -> OpResult<Arc<PolicyDocument>> {
-    PolicyDocument::from_json(s)
+fn parse_document(
+    s: &str,
+    max_bytes: usize,
+    owner: &dyn fmt::Display,
+) -> OpResult<Arc<PolicyDocument>> {
+    PolicyDocument::from_json_with_size_limit(s, max_bytes)
         .map(Arc::new)
         .map_err(|e| OpError::Internal(format!("policy parse failed: {owner}: {e}")))
 }
@@ -1235,6 +1268,7 @@ pub(crate) mod tests {
                 ..base.clone()
             },
             session_data: SwrCacheConfig { name: "sd", ..base },
+            max_policy_document_bytes: extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
         }
     }
 
@@ -1263,6 +1297,44 @@ pub(crate) mod tests {
             1,
             "second call must hit cache"
         );
+    }
+
+    /// A stored policy is parsed with the configured
+    /// `max_policy_document_bytes`. One byte over it, the load fails as a
+    /// parse failure, which authorization answers with `AccessDenied`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stored_policy_over_the_configured_size_does_not_load() {
+        let policy = allow_policy("dynamodb:GetItem");
+        let inner = Arc::new(CountingAuthzStore::default());
+        inner
+            .user_policies
+            .lock()
+            .unwrap()
+            .insert(("a".to_owned(), "u".to_owned()), vec![policy.clone()]);
+
+        let at = CachedAuthzStore::new(
+            inner.clone(),
+            AuthzCacheConfig {
+                max_policy_document_bytes: policy.len(),
+                ..fast_authz_cfg()
+            },
+        );
+        assert_eq!(at.fetch_user_policies("a", "u").await.unwrap().len(), 1);
+
+        let under = CachedAuthzStore::new(
+            inner,
+            AuthzCacheConfig {
+                max_policy_document_bytes: policy.len() - 1,
+                ..fast_authz_cfg()
+            },
+        );
+        match under.fetch_user_policies("a", "u").await {
+            Err(OpError::Internal(msg)) => assert!(
+                msg.starts_with("policy parse failed"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected a parse failure, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
