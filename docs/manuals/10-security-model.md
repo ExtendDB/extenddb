@@ -25,7 +25,7 @@ This document describes the security architecture of extenddb, including the thr
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
 - **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
 
 ## Authentication
@@ -373,6 +373,10 @@ Import/export file paths are validated:
 - Auth provider defaults to `builtin` (SigV4 + IAM policies). The server refuses to start with `auth.provider = "none"`.
 - TLS is mandatory. `extenddb init` generates a self-signed certificate; production deployments should use CA-signed certificates.
 
+### Import and Export Files
+
+On Unix, an export file is created with mode 0600, and the directories the server creates to hold import and export files are created with mode 0700: a configured import or export root that does not exist at startup, and the account directory that the first export of an account creates under each export root. The modes are set when the file or directory is created, so the server's umask can only narrow them, and only the server's user and root can list the account directories it creates or read an export. Missing parent directories of a root are created 0755 (less the umask), so no directory the server creates is writable by group or others. A directory that already exists keeps its mode: a root the operator creates with group access keeps that access, and the export files in it are still 0600. Import files go under `<root>/<account id>`. When one directory is both an import root and an export root (the deprecated `import_export_root`, or one path under both `[import]` and `[export]`), the first export of an account creates `<root>/<account id>` 0700, so a group that puts import files there needs each `<root>/<account id>` created beforehand with the mode it wants. Import files keep the modes they were written with. A user who can write to a parent directory of a root can rename the root away and put a directory of their own in its place, and the server, which holds the root's path, would then read imports from it and write exports into it. At startup the server logs a warning for each root that has such a parent directory (writable by group or others without the sticky bit), naming the directory and its mode, and starts. Releases before v0.1.15 created these directories and files with the umask's modes (0755 and 0644 under umask 022, 0750 and 0640 for a daemon, whose umask is 027), and an upgrade does not change the modes of those that exist; the upgrade manual's [v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the command that tightens them.
+
 ### Backup and Recovery
 
 Back the databases up with the backend's own tools (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry names each backend's databases), and keep table backups in a backup store whose access you restrict (the [Backup and Restore manual](14-backup-and-restore.md#securing-the-store)). On PostgreSQL the catalog and data databases are one copy: dump both with the server stopped (the admin guide's Data Recovery entry restores the dumps), or, when both databases are on one PostgreSQL server, take a base backup of that server and restore it with PostgreSQL's own procedure (the design guide allows the two databases on different PostgreSQL instances, which one base backup does not cover). With the default database names, and `umask 077` so that only the owner can read the files:
@@ -392,6 +396,6 @@ The encryption key is stored in the catalog database, so a catalog dump contains
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

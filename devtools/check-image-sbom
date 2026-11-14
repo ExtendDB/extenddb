@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Check the CycloneDX SBOM trivy wrote for one container image.
+
+    devtools/check-image-sbom SBOM.cdx.json DOCKERFILE
+
+The SBOM must be CycloneDX with components and carry exactly one
+`aquasecurity:trivy:ImageID` of the sha256 form, so it describes one image.
+When DOCKERFILE builds with `cargo auditable build`, the SBOM must list the
+crates the binary embeds; otherwise a missing crate list is a warning, since
+the image's binary carries no dependency record for trivy to read.
+
+The release workflows' build jobs (release-image.yml, release-dev-image.yml)
+and devtools/release-dry-run run this on the SBOM they generate. Under GitHub
+Actions (GITHUB_ACTIONS set) the messages are workflow annotations.
+
+Exit 0 when the SBOM passes, 1 otherwise, 2 on a usage error.
+"""
+
+import json
+import os
+import pathlib
+import re
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        return 2
+    sbom_path, dockerfile = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+    on_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    error = "::error::" if on_actions else "error: "
+    warning = "::warning::" if on_actions else "warning: "
+
+    try:
+        bom = json.loads(sbom_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"{error}{sbom_path} is not readable JSON: {e}")
+        return 1
+    components = bom.get("components") or []
+    crates = [c for c in components if str(c.get("purl", "")).startswith("pkg:cargo/")]
+    ids = [
+        p.get("value", "")
+        for p in bom.get("metadata", {}).get("component", {}).get("properties", [])
+        if p.get("name") == "aquasecurity:trivy:ImageID"
+    ]
+    if (
+        bom.get("bomFormat") != "CycloneDX"
+        or not components
+        or len(ids) != 1
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", ids[0])
+    ):
+        print(f"{error}{sbom_path} is not a CycloneDX SBOM of one image")
+        return 1
+
+    require_crates = "cargo auditable build" in dockerfile.read_text(encoding="utf-8")
+    if not crates:
+        if require_crates:
+            print(f"{error}{sbom_path} lists no crates, but {dockerfile} builds with cargo-auditable")
+            return 1
+        print(f"{warning}{sbom_path} lists no crates: {dockerfile} does not build with cargo-auditable")
+    print(f"{len(components)} components, {len(crates)} of them crates; image {ids[0]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -39,6 +39,7 @@ mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
 mod per_table_capacity;
+pub mod private_fs;
 mod put_item;
 mod query;
 mod read_helpers;
