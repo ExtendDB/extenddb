@@ -116,6 +116,11 @@ pub fn run(args: &ServeArgs, build: BuildInfo) -> anyhow::Result<()> {
     }
 
     crate::serve_catalog::lock_timeout(&app_config.server)?;
+    // `serve` checks this too, but after the catalog check, which under
+    // `apply` migrates the catalog. Refused here as well, so a server that
+    // cannot start migrates nothing.
+    extenddb_server::check_request_timeout_secs(app_config.server.request_timeout_secs)
+        .map_err(anyhow::Error::msg)?;
 
     // Fail fast, before binding the port, when no backend is installed.
     let backend = &app_config.storage.backend;

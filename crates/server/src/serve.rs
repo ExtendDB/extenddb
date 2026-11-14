@@ -250,7 +250,7 @@ const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
 ///
 /// Returns the startup error message when the value is outside the accepted
 /// range, so misconfiguration fails fast instead of reaching the listener.
-fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
+pub fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
     if secs == 0 {
         return Err(
             "Invalid [server] configuration: request_timeout_secs must be at least 1 \

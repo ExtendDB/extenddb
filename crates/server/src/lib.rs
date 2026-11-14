@@ -38,7 +38,7 @@ mod workers;
 
 pub use serve::{
     BuildInfo, CatalogRefusal, JOB_DRAIN_TIMEOUT, LogTarget, RegistrationLost, ServeParams,
-    WORKER_STOP_TIMEOUT, catalog_refusal, log_to_syslog_raw, serve,
+    WORKER_STOP_TIMEOUT, catalog_refusal, check_request_timeout_secs, log_to_syslog_raw, serve,
 };
 
 use std::path::PathBuf;
