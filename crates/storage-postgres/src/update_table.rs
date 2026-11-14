@@ -385,7 +385,7 @@ impl PostgresEngine {
 
         // Apply GSI updates (create/delete).
         // The WarmThroughput record each created GSI was inserted with, so the
-        // restart after the build leaves a later Update's record alone.
+        // restart before the response leaves a later Update's record alone.
         let mut created_warm: Vec<(String, serde_json::Value)> = Vec::new();
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
@@ -1109,8 +1109,11 @@ impl PostgresEngine {
             });
         }
 
-        // The build outlasts a new GSI's WarmThroughput UPDATING window; start
-        // it again so the response reports it as the service does.
+        // A new GSI's WarmThroughput UPDATING window starts at its insert, inside
+        // the catalog transaction. The work above, including the index's data
+        // table, the commit and the spawn of the build task, comes between the
+        // insert and the response. Start the window again here so the response
+        // reports it UPDATING, as the service does.
         self.restart_created_gsi_warm_throughput(&table_id, &created_warm)
             .await?;
 
