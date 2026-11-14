@@ -32,6 +32,8 @@ mod concurrent_account_creation;
 mod delete_item;
 #[path = "direct/groups.rs"]
 mod groups;
+#[path = "direct/gsi_backfilling.rs"]
+mod gsi_backfilling;
 #[path = "direct/gsi_worker_pass.rs"]
 mod gsi_worker_pass;
 #[path = "direct/iam_leftovers.rs"]

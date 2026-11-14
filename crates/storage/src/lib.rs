@@ -16,6 +16,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod diagnostics_store;
 pub mod error;
+pub mod gsi_backfill;
 pub mod hooks;
 #[doc(hidden)]
 #[cfg(feature = "test-util")]

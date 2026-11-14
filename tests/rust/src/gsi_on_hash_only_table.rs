@@ -14,10 +14,29 @@
 
 use crate::test_base::*;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate,
+    AttributeDefinition, CreateGlobalSecondaryIndexAction, GlobalSecondaryIndexUpdate, IndexStatus,
     KeySchemaElement, KeyType, Projection, ProjectionType, ScalarAttributeType,
 };
 use std::time::Duration;
+
+/// Poll DescribeTable until the named index reports ACTIVE (up to 60s).
+async fn wait_for_index_active(c: &aws_sdk_dynamodb::Client, table: &str, index_name: &str) {
+    for _ in 0..60 {
+        if let Ok(resp) = c.describe_table().table_name(table).send().await {
+            if let Some(t) = resp.table() {
+                let active = t.global_secondary_indexes().iter().any(|i| {
+                    i.index_name() == Some(index_name)
+                        && i.index_status() == Some(&IndexStatus::Active)
+                });
+                if active {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("Index {index_name} on {table} did not become ACTIVE within 60s");
+}
 
 const GSI_BACKFILL_TEST_GATE: &str = "gsi_backfill_test_gate";
 
@@ -163,6 +182,10 @@ async fn gsi_can_be_added_to_a_table_with_no_sort_key() {
             )
         });
     wait_for_active(c, &table).await;
+    // The table is ACTIVE again before the index is: the service refuses a
+    // Query naming an index that is still CREATING, and so do the backends
+    // whose UpdateTable returns before the backfill ends.
+    wait_for_index_active(c, &table, "hashOnlyIdx").await;
 
     // The index must exist on the table description, not merely have been
     // accepted by UpdateTable.
