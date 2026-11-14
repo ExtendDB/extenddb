@@ -22,6 +22,7 @@ mod put_get_item;
 mod query;
 mod query_helpers;
 mod scan;
+mod scan_rows;
 mod sk_range;
 mod transact_stream;
 pub mod transaction_ledger;
