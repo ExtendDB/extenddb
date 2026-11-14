@@ -234,7 +234,8 @@ impl SegmentStore {
     }
 
     /// Per-operation count and mean segments over `window`, sorted by
-    /// operation name: the requests of `account_id` when it is given, every
+    /// operation name: the requests of `account_id` when it is given and not
+    /// empty (an empty account is no filter, as in the stores), every
     /// account's requests summed per operation when it is not. Operations
     /// with no request in the window are omitted.
     ///
@@ -246,6 +247,7 @@ impl SegmentStore {
         account_id: Option<&str>,
         now: Instant,
     ) -> Vec<OperationSegments> {
+        let account_id = account_id.filter(|a| !a.is_empty());
         let elapsed = self.elapsed_secs(now);
         let (fine, window_secs) = ring_for(window);
         let mut by_operation: BTreeMap<&str, Bucket> = BTreeMap::new();

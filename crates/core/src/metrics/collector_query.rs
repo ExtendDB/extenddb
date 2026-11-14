@@ -162,7 +162,6 @@ impl MetricsCollector {
         window: TimeWindow,
         account_id: Option<&str>,
     ) -> Vec<OperationSegments> {
-        let account_id = account_id.filter(|a| !a.is_empty());
         // Clock read under the lock, paired with `record_segments`.
         let Ok(store) = self.segments.read() else {
             return Vec::new();
