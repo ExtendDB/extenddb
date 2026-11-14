@@ -19,12 +19,14 @@ This document describes the security architecture of extenddb, including the thr
 1. **Client ↔ extenddb**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
 2. **extenddb ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
 3. **Admin ↔ Management API/Console**: Authenticated via admin credentials or IAM user credentials. CSRF tokens protect the web console.
+4. **Catalog database contents**: Credential-equivalent. The AES-256-GCM key that encrypts access key secrets lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. On PostgreSQL the same table holds `data_database_connection_string`, the login for the data database; the console, the management API and the `settings` CLI mask it, but a reader of the catalog database gets it in full. Treat catalog read access, and any catalog backup, as equivalent to holding those credentials. See [Credential Storage](#credential-storage).
+5. **Server host**: Credential-equivalent as well. `extenddb.toml` holds the catalog connection string, and a running server keeps the encryption key and recently used decrypted secrets in process memory, so read access to the config file, a core dump of the server, or a read of its memory yields the same credentials.
 
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility.
-- **Key management**: Access key secrets are encrypted with a locally generated AES key stored in the catalog database. For HSM-grade key management, use a KMS-backed encryption layer at the PostgreSQL level.
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
+- **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
 
 ## Authentication
 
@@ -34,15 +36,19 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 
 #### SigV4 Verification
 
-1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme)
-2. Parse credential scope, signed headers, and signature
-3. Look up the access key in the credential store
-4. Decrypt the secret key (AES-256-GCM)
-5. Compute the signing key: HMAC-SHA256 chain over date, region, service, "aws4_request"
-6. Compute the string-to-sign from the canonical request. The hashed-payload line is the SHA-256 of the body the server received; a client-supplied `x-amz-content-sha256` header is not used for it, so a request whose body was altered after signing fails at step 7
-7. Compare computed signature against the provided signature (constant-time comparison)
-8. On mismatch: return `InvalidSignatureException` (HTTP 400)
-9. On unknown key: return `UnrecognizedClientException` (HTTP 400)
+The steps run in this order; every rejection is HTTP 400.
+
+1. Extract the `Authorization` header (AWS4-HMAC-SHA256 scheme); absent: `MissingAuthenticationToken`
+2. Parse credential scope, signed headers, and signature; malformed: `IncompleteSignatureException`. A request with more than one `host` or `authorization` header is refused before this point with a plain 400, as the service's front end does
+3. Look up the access key in the credential store (through the credential cache, see below); unknown: `UnrecognizedClientException`
+4. Check `X-Amz-Date` against the server clock: more than 15 minutes of skew is `UnrecognizedClientException` (signature expired)
+5. Check the credential scope: the region must be this server's `[server] region` and the service must be `dynamodb`; otherwise `InvalidSignatureException` carrying one sentence per failing part, region first, as the service reports it
+6. Compare the session token: a temporary key must present its stored token, and a long-term key must present none; the decision is applied at step 9
+7. Reconstruct the canonical request and the string-to-sign. `host` must be among the signed headers. Repeated headers contribute their values comma-joined. The hashed-payload line is the SHA-256 of the body the server received; a client-supplied `x-amz-content-sha256` header is not used for it, so a request whose body was altered after signing, or signed with a literal such as `UNSIGNED-PAYLOAD`, fails at step 8
+8. Derive the signing key (HMAC-SHA256 chain over date, region, service, "aws4_request") and compare the computed signature with the provided one in constant time; mismatch: `InvalidSignatureException`
+9. Apply the deferred decisions from steps 3 and 6, after the signature check so that failure paths take the same time: an inactive key or a wrong or missing token is `UnrecognizedClientException`
+
+Request bodies are parsed before authentication (the service does the same), so a malformed body returns `SerializationException` whatever the signature. Headers not named in `SignedHeaders` do not take part in verification; the service behaves the same way, and clients sign every `x-amz-*` header they send.
 
 #### Credential Types
 
@@ -54,15 +60,86 @@ extenddb uses SigV4 signature verification with a local credential store and IAM
 #### Credential Storage
 
 - Secret keys encrypted with AES-256-GCM using a per-catalog encryption key
-- Encryption key generated during `extenddb init` and stored in the catalog database
+- Encryption key generated during `extenddb init` and stored unwrapped in the catalog `settings` table, under the key `encryption_key`
+- The encryption key and the ciphertext it protects therefore share one trust domain: anyone who can read the catalog database can decrypt every stored access key secret. Restrict catalog database access to the extenddb service account, and protect catalog backups to the same standard as the credentials themselves.
+- The management API and web console redact `encryption_key` from settings responses. The key is readable only with catalog database access: a database client, or `extenddb settings get encryption_key --show-secret` on a host that holds the catalog connection string.
+- extenddb has no command to rotate the encryption key, and `extenddb settings set` refuses `encryption_key`. Replacing the key by hand in the catalog `settings` table makes every stored access key secret and session credential unreadable. The server reads the key at startup and keeps it in memory, so a rotation takes these steps in order:
+    1. Replace the value of `encryption_key` in the catalog `settings` table with 32 random bytes in standard base64, for example the output of `openssl rand -base64 32`. On MongoDB the key is the `value` field of the `settings` document whose `_id` is `encryption_key`. The server checks only that the key is present. A value of any other form makes every signed request, CreateAccessKey call and AssumeRole call fail.
+    2. Restart every server that serves the catalog. From the restart on, each request signed with an old access key or an unexpired session credential fails with `InternalServerError` (HTTP 500). Once step 3 deletes an old key, a request signed with it fails with `UnrecognizedClientException`.
+    3. Delete every access key and create a new one. For each client that uses AssumeRole session credentials, call AssumeRole again with `extenddb manage assume-role`. The web console and `extenddb manage` sign in with a password, so they still work for this step.
+    4. Give each client its new credentials: an access key ID and secret, or the new session's access key ID, secret and session token. Until then, each of its requests fails.
 - Console passwords hashed with bcrypt (cost factor 12)
-- No in-process credential cache — every request reads directly from PostgreSQL
+- Credentials and the inputs to authorization are cached in each server's memory; see Credential and Policy Caching below
+
+#### Credential and Policy Caching
+
+Each server keeps in-memory caches between the request path and the catalog database, so that a request does not read the catalog for every credential and policy lookup. The caches hold decrypted credentials (long-term access keys and AssumeRole session credentials), parsed user, group and role inline policies, permissions boundaries, principal tags, resource tags, role-session data, user and role creation times, and each table's key and index definitions. Authorization decisions themselves are not cached: policies are evaluated on every request. Item data is not cached. This section covers the credentials that sign API requests; web console logins are described under Web Console Security.
+
+The caches are on by default and are configured under `[auth.cache]` in `extenddb.toml` (see the Admin Guide):
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `enabled` | `true` | `false` makes every lookup read the catalog |
+| `ttl_seconds` | `60` | The oldest a cached entry can be when it is used. Must be greater than 0 |
+| `soft_ttl_seconds` | `30` | After this age an entry is still used, and a background read replaces it. Must not exceed `ttl_seconds` |
+| `negative_ttl_seconds` | `5` | How long an empty answer is cached: an unknown access key ID, a missing table, or a principal with no policies, boundary or tags. Must not exceed `ttl_seconds` |
+| `max_entries` | `10000` | Entries per cache; beyond this, entries are evicted. Must be greater than 0 |
+
+These settings, whether set in the file or through `EXTENDDB__AUTH__CACHE__*` environment variables, are read at startup; changing them takes a restart. A server whose settings break one of the limits above refuses to start.
+
+**How a change reaches the cache.** A change made on a server through the management API, the web console, or one of the DynamoDB operations named below takes effect on that server immediately. Deleting an access key, user or role, changing an inline policy, permissions boundary, group membership or a user's or role's tags, and calling `TagResource` or `UntagResource` drop the cached entries they affect before the call returns. `CreateTable`, `UpdateTable`, `DeleteTable`, `RestoreTableFromBackup` and `ImportTable` drop the table's key and index definitions, and `CreateTable` and `DeleteTable` also drop its tags. There are two exceptions. If a group change cannot list the group's members, the server logs a warning and those members' entries wait for `ttl_seconds`. The console's Delete user and Delete role do not drop the principal's cached creation time, so a user or role created again with the same name within `ttl_seconds` resolves to the old `aws:userid`, and a condition on `aws:userid` matches the old id in that window (#787). Every other change is seen when the cached entry is next refreshed or expires, within `ttl_seconds`. That covers:
+
+- a change made on one server, as seen by the other servers that serve the same catalog;
+- a change written to the catalog database directly rather than through a server.
+
+On those servers, a change to something that was cached as present (an access key, or a principal's existing policies, boundary or tags) takes up to `ttl_seconds` to arrive. A change to something that was cached as empty (a principal's first policy, boundary or tag) arrives within `negative_ttl_seconds`, because that is how long an empty answer is kept. Running more than one server on a catalog is not supported in this release (see the Deployment Guide); on SQLite, on Unix with the database on a local filesystem, a second server refuses to start. A request that has already been authorized when a credential is revoked is not stopped.
+
+**Revoking access at once.** To make a revocation take effect immediately, for example during incident response, take these steps in order.
+
+*Step 1: change the catalog.* Through the management API or console, delete the access key, the user, or the inline policy that grants the access, or remove the user from the group. The server that handles the call applies the change at once.
+
+AssumeRole session credentials (`ASIAEXTENDDB...`) cannot be deleted one at a time, and a session can last up to 12 hours. A session's permissions come from its role's inline policies, so deleting the role's inline policies stops the role's sessions. This affects every session of that role.
+
+*Step 2: flush the other servers.* On every other server that serves the same catalog, flush that server's cache. Run the command on that server's host with that server's config file, so that the CLI connects to that server and trusts its TLS certificate:
+
+```bash
+read -rs EXTENDDB_PASSWORD && export EXTENDDB_PASSWORD   # the admin password, not echoed
+extenddb manage --config /path/to/extenddb.toml --user ADMIN_NAME cache invalidate SCOPE
+unset EXTENDDB_PASSWORD
+```
+
+Replace `SCOPE` with the scope for what changed:
+
+| Change | Scope |
+|--------|-------|
+| A deleted access key | `credential --access-key-id <id>` |
+| A deleted account | `account --account-id <id>` |
+| A user's keys, inline policies, boundary or tags, or a deleted user | `user --account-id <id> --user-name <name>` |
+| A role's inline policies, boundary or tags, or a deleted role | `role --account-id <id> --role-name <name>` |
+| A group's inline policy or membership | `group-members --account-id <id> --user-names <name>,<name>` (every member), or `all --yes` |
+| A table's tags (`TagResource`, `UntagResource`) | `resource-tags --arn <table ARN>` |
+| A deleted table, a table created again with the same name, or an updated table | `table-key-info --account-id <id> --table-name <name>`, and for a deleted or recreated table also `resource-tags --arn <table ARN>` |
+| Unsure | `all --yes` |
+
+Without `--endpoint`, the CLI connects to `server.bind_addr` and `server.port` from the config file (`127.0.0.1` when `bind_addr` is `0.0.0.0`). With `--endpoint https://<host>:<port>`, it connects to `<host>`. When TLS is on (`server.tls.enabled`, or an `https://` endpoint), it trusts only the certificate at `server.tls.cert_path` in the config file it reads, and that certificate must cover the address the CLI connects to. The certificate `extenddb init` creates covers `localhost`, `127.0.0.1`, `bind_addr` when it is a specific address, and each name given with `--tls-san`. A CA-signed certificate usually covers none of the first three, so with one use `--endpoint https://<name in the certificate>:<port>`, and make `cert_path` a PEM file that also holds the issuing CA's certificate. Do not use a load balancer's address: each call reaches one server behind it and reports success. The same flush is available to admins at `POST /management/cache/invalidate` and on the console's cache page, and each acts only on the server it reaches.
+
+Instead of flushing, you can restart each server, which starts with empty caches. A server started with `auth.cache.enabled = false` (or `EXTENDDB__AUTH__CACHE__ENABLED=false` in its environment) reads the catalog on every request, at the cost of several catalog queries per request.
+
+Flushing a cache does not revoke anything by itself: it only makes the server read the catalog again, so step 1 comes first. If step 2 is not done and the servers are not restarted, a change made in step 1 reaches the other servers within `ttl_seconds` (60 seconds by default). Lowering `ttl_seconds` shortens that window and adds catalog reads; lower `soft_ttl_seconds` and `negative_ttl_seconds` with it so that neither exceeds it.
 
 ## Authorization
 
 ### Policy Evaluation — 5-Phase IAM Algorithm
 
-When `auth.provider = "builtin"`, every DynamoDB API request is authorized against IAM policies. The evaluation follows the same algorithm as real AWS IAM:
+When `auth.provider = "builtin"`, every authenticated DynamoDB API request is authorized against IAM policies, except these, which get an answer without an IAM decision:
+
+- `DescribeEndpoints`, which needs a signed request and no permission.
+- `RestoreTableToPointInTime`, and an `UpdateContinuousBackups` that enables point-in-time recovery, which are refused because point-in-time recovery is not supported.
+- A request that the service also answers before its IAM decision: a table name, index name or ARN outside the model's constraints, an ARN of the wrong kind or in another account, a stream ARN in another partition or region, a batch or transaction with no items or too many, and a shard iterator the server did not issue (see [Differences from DynamoDB](../differences-from-dynamodb.md)). A name or ARN that breaks only a length bound, an empty one included, is authorized first, except a `ListStreams` `TableName` of 1, 2 or more than 255 characters, which is refused first.
+- A PartiQL request that is refused before any of its statements is authorized: a member outside its constraints, or a statement that does not parse or breaks a rule of its form. The server authorizes a PartiQL request per statement.
+- A request the server cannot authorize because of a fault, such as a failed key lookup, which gets a server error.
+
+In dev mode no request gets an IAM decision. The evaluation follows the same algorithm as real AWS IAM:
 
 1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). If any Deny statement matches the action, resource, and conditions → **DENY**.
 2. **Permissions Boundary** — if a permissions boundary is set on the user or role, it must contain an Allow statement matching the action, resource, and conditions. If not → **DENY**.
@@ -81,9 +158,9 @@ Policy sources collected for evaluation:
 
 - **Unparseable policies deny**: A stored policy that cannot be parsed results in access denied, not silent skip. A corrupted Deny policy still denies; a corrupted Allow policy is treated as absent.
 - **Auth before JSON parse**: SigV4 signature verification runs before the request body is parsed. Invalid signatures are rejected with constant-time comparison before any business logic executes.
-- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from PostgreSQL. All must succeed for evaluation to proceed.
+- **Concurrent policy fetching**: Identity policies, group policies, and permissions boundaries are fetched concurrently from the catalog when they are not in the server's cache (see Credential and Policy Caching). All must succeed for evaluation to proceed.
 - **Constant-time rejection for inactive keys**: Inactive or expired access keys are rejected without timing differences that could reveal key existence.
-- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage.
+- **Policy document validation on write**: Policy documents are validated for JSON structure and size-capped (6,144 bytes) when attached via the management API. Invalid documents are rejected before storage. A `Version` other than the string `2012-10-17` or `2008-10-17` is refused; only a `2012-10-17` document expands policy variables.
 - **Expression depth and token limits**: Expression parsing enforces configurable depth (default 150) and token limits (default 4,096) to prevent resource exhaustion.
 
 ### Supported Condition Operators
@@ -117,7 +194,7 @@ Set operators and `IfExists` can be combined: `ForAllValues:StringEqualsIfExists
 | `dynamodb:FullTableScan` | Boolean | `true` for Scan operations |
 | `dynamodb:EnclosingOperation` | String | The enclosing operation for batch/transact sub-operations |
 
-Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values.
+Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition values in a `2012-10-17` document; a `2008-10-17` document, or one with no `Version`, compares the value as written, so `${aws:username}` is the literal text, as IAM does. In a `2012-10-17` document `${*}`, `${?}` and `${$}` stand for the literal characters `*`, `?` and `$`; in `StringLike`, `ArnLike` and `ArnEquals` the escaped character is matched literally while a `*` or `?` written in the policy is a wildcard (`a${*}` matches `a*` and not `abc`), and the result of an escape is not expanded again (`a${$}{x}` is the text `a${x}`). The `${key, 'default'}` form expands to `default` when the request does not carry `key`. Code points up to U+0020 around the key name are ignored, and so is whitespace (space, tab, newline, U+000B, U+000C and U+000D) around the quoted default, as in IAM. Inside a reference a `'` opens or closes a quoted span and a `}` inside it does not end the reference, so `${aws:username, '}x'}` expands to `}x`; a doubled `''` in a default stands for one `'`, so `${aws:username, 'x''y'}` expands to `x'y`; and an escape with a default is the escape, so `${*, 'x'}` is the character `*`. These rules were measured with the IAM policy simulator. A write of an inline user, group or role policy, a permissions boundary or a role trust policy refuses a reference that IAM refuses, in a condition value and in a `Resource` or `NotResource` pattern: one that no `}` closes, such as `a${` or `a${aws:username, '}'`, and one whose text is not an escape, a key name, or a key name, a `,` and one quoted default, such as `a${}`, `a${'x'}`, `a${aws user}` or `a${aws:username, 'x' 'y'}`. The error carries IAM's `MalformedPolicyDocument` message for the write path and `Version`, except that an `IpAddress` or `NotIpAddress` value in an identity policy with `Version` `2008-10-17` gets ExtendDB's malformed CIDR message. A role trust policy with `Version` `2008-10-17` or none stores such a value, and refuses it in an `Arn*` value only when no `}` follows the `${`, as IAM does, or, with ExtendDB's own message that names the key and the value, when the value does not have the six fields of an ARN. A session policy passed to AssumeRole is not checked this way. A stored policy that holds a reference the write now refuses is read as before: each `${` ends at the next `}`. A variable with no default whose key the request does not carry makes that value match nothing: a positive operator such as `StringEquals` does not match it and a negated operator such as `StringNotEquals` does, except that every `Arn*` operator is false against a request value that is not an ARN. A multivalued key such as `dynamodb:LeadingKeys` is not expanded; when the request carries it the value matches nothing, and a written default is used only when the request does not carry the key. Only the string and ARN operators (with or without `ForAnyValue:`, `ForAllValues:` or `IfExists`) expand variables. A numeric, date or address value written as a variable is compared as written. A `Bool` or `Null` value written as one is read as the boolean `false`, as IAM does, so `Null` then holds when the key is present and `Bool` holds when the request value is `false`. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`; the IAM policy simulator refuses a policy whose value has fewer, such as `${aws:ResourceTag/owner}`, and ExtendDB fails that condition closed in a document of any `Version`, so a `Deny` applies and an `Allow` does not grant. In a `2012-10-17` document ExtendDB also fails the condition closed when a reference holds a `}` followed by a `:`, as a quoted default can, and the expanded value has two to five fields, such as `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, and when the first field holds `${` and the expanded value has six fields, such as `${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*`. How IAM evaluates these values was not measured. A role trust policy follows its own `Version`. Because a negated operator holds for an unresolved variable, an `Allow` written as `StringNotEquals` against `${aws:PrincipalTag/team}` grants to a caller without that tag; add a `Null` condition on the tag to require it.
 
 ### Access Control Patterns
 
@@ -141,18 +218,18 @@ extenddb supports the same access control patterns as real AWS IAM:
 | `PutItem` | The table's key attributes, the item's attributes, `Expected`, and the attributes in `ConditionExpression` |
 | `UpdateItem` | The `Key` attributes, the table's key attributes, `AttributeUpdates`, `Expected`, the attributes in `ConditionExpression`, and the target of every `SET`, `REMOVE`, `ADD` and `DELETE` action in `UpdateExpression`; not the attributes a `SET` value reads |
 | `DeleteItem` | The `Key` attributes, the table's key attributes, `Expected`, and the attributes in `ConditionExpression` |
-| `Query` | The key attributes of the table and of the queried index, `AttributesToGet`, `QueryFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
-| `Scan` | The key attributes of the table and of the scanned index, `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
+| `Query` | The key attributes of the table and of the queried index, the attributes in `KeyConditionExpression` and `KeyConditions`, `AttributesToGet`, `QueryFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
+| `Scan` | The table's key attributes, `AttributesToGet`, `ScanFilter`, `ExclusiveStartKey`, and the attributes in `FilterExpression` and `ProjectionExpression` |
 | `SearchVectors` | The attributes in `ProjectionExpression`; the key is absent when there is none |
-| `BatchGetItem` | Per table: the attributes of every key, the table's key attributes, `AttributesToGet`, and the attributes in `ProjectionExpression` |
+| `BatchGetItem` | Per table: the table's key attributes, `AttributesToGet`, and the attributes in `ProjectionExpression`, as for `GetItem`; the names in `Keys` add nothing |
 | `BatchWriteItem` | Per table: the attributes of every `PutRequest` item and `DeleteRequest` key, and the table's key attributes, evaluated once with the union of the table's items |
 | `TransactGetItems`, `TransactWriteItems` | Per item, what the single-item operation holds: `Get` as `GetItem`, `Put` as `PutItem`, `Update` as `UpdateItem`, `Delete` as `DeleteItem`; a `ConditionCheck` holds the table's key attributes and the attributes in its `ConditionExpression` |
 
-The names come from the request alone. A `DeleteItem` holds the key attributes of the item it deletes, not the item's other attributes, and a read with no projection holds the key attributes while it returns every attribute of the item, so a `Deny` on `ForAnyValue:StringEquals` over an attribute blocks neither (measured on DynamoDB 2026-10-31). As in DynamoDB, a policy on `dynamodb:Attributes` does not stop an `UpdateItem` from copying a denied attribute's value into another attribute through a `SET` value: under a `Deny` on `ssn`, `SET #n = ssn` with `#n` for `name` is allowed, and a projection of `name` then returns the value (measured on DynamoDB 2026-11-01). A `Scan` holds the table's key attributes when it names no attribute, a `Select COUNT` `Scan` included, so a `Null` condition on the key does not match it: a `Deny` of `Scan` gated on `Null` with value `true` refuses neither a `Scan` with no projection nor a projected one, and an `Allow` of `Scan` gated on it grants neither a `Scan` with no projection nor a `Select COUNT` `Scan` (measured on DynamoDB 2026-11-01). A bare `StringNotEquals` on the key does not match whether the key is present or absent, so an `Allow` gated on it grants nothing; on DynamoDB it granted no `Scan`, whether the `Scan` named an attribute or not (measured 2026-11-01). An allowlist written as an `Allow` on `ForAllValues:StringEquals` must list the key attributes of the table and of every index the statement covers, because every item request other than `SearchVectors` holds them. The key is absent on a `SearchVectors` with no `ProjectionExpression` and, on a table that does not exist, on a `GetItem` or transaction `Get` that names no attribute outside its `Key`, a `Query` that names none outside its key condition and a `Scan` that names none.
+The names come from the request alone. A `DeleteItem` holds the key attributes of the item it deletes, not the item's other attributes, and a read with no projection holds the key attributes while it returns every attribute of the item, so a `Deny` on `ForAnyValue:StringEquals` over an attribute blocks neither (measured on DynamoDB 2026-10-31). As in DynamoDB, a policy on `dynamodb:Attributes` does not stop an `UpdateItem` from copying a denied attribute's value into another attribute through a `SET` value: under a `Deny` on `ssn`, `SET #n = ssn` with `#n` for `name` is allowed, and a projection of `name` then returns the value (measured on DynamoDB 2026-11-01). A `Scan` holds the table's key attributes when it names no attribute, a `Select COUNT` `Scan` included, so a `Null` condition on the key does not match it: a `Deny` of `Scan` gated on `Null` with value `true` refuses neither a `Scan` with no projection nor a projected one, and an `Allow` of `Scan` gated on it grants neither a `Scan` with no projection nor a `Select COUNT` `Scan` (measured on DynamoDB 2026-11-01). A bare `StringNotEquals` on the key does not match whether the key is present or absent, so an `Allow` gated on it grants nothing; on DynamoDB it granted no `Scan`, whether the `Scan` named an attribute or not (measured 2026-11-01). An allowlist written as an `Allow` on `ForAllValues:StringEquals` must list the table's key attributes, because every item request other than `SearchVectors` holds them. For a `Query` of an index, and for a later page of a `Scan` of an index, it must also list the index's key attributes. A `Query` of an index holds the index's full key schema, its sort key included, when the key condition names only the index's partition key (measured on DynamoDB 2026-11-09 on a global secondary index). The first page of a `Scan` of an index, which carries no `ExclusiveStartKey`, holds the table's key attributes and not the index's. On DynamoDB an `Allow` of `Scan` whose list holds the table's keys and not the index's grants that `Scan` of a global secondary index, and a `Deny` on the global secondary index's partition key does not refuse it. An `Allow` whose list holds the table's keys and the projected name grants that `Scan` of a local secondary index (measured 2026-11-09), and a `Deny` on the local secondary index's sort key does not refuse it (measured 2026-11-10). The other rules for a local secondary index follow from that key content. A later page carries the previous page's `LastEvaluatedKey` as its `ExclusiveStartKey`, which holds the table's and the index's key attributes, and the key holds them. So an allowlist that omits the index's key attributes refuses a later page, and a `Deny` on one of them refuses it. DynamoDB answers the same (measured 2026-11-10). Under an `Allow` whose list holds the table's keys, alone or with the projected name, it refused a later page of a `Scan` of the global and of the local secondary index, and allowed a later page of a `Scan` of the table. A `Deny` on the global secondary index's partition key, or on the local secondary index's sort key, refused a later page of a `Scan` of that index. On a table that does not exist, a `Query` holds the names in its key condition, a non-key name included, so a `Deny` on one of them answers `AccessDeniedException` rather than `ResourceNotFoundException`; a `GetItem` or `BatchGetItem` holds nothing from its key, so under a `Deny` on the key attribute both answer `ResourceNotFoundException` (measured on DynamoDB 2026-11-09). The key is absent on a `SearchVectors` with no `ProjectionExpression` and, on a table that does not exist, on a `GetItem`, transaction `Get` or `BatchGetItem` that names no attribute outside its keys, a `Query` whose key condition the key condition parser refuses and that names none elsewhere, and a `Scan` that names none. The table above covers the item, batch and transaction operations. A PartiQL statement (`ExecuteStatement`, `BatchExecuteStatement` and `ExecuteTransaction`) is authorized by the engine, one statement at a time, with the `dynamodb:PartiQL*` action of its type. The engine fills `dynamodb:Attributes` with the table's key attributes and the top-level names the statement uses (measured 2026-11-03). For a read of an index, it holds the index's key attributes only when the statement names them (not measured).
 
 A `Deny` on `dynamodb:Attributes` does not stop `ReturnValues` `ALL_OLD` or `ReturnValuesOnConditionCheckFailure` `ALL_OLD` from returning the whole stored item, the denied attribute included. Under a `Deny` on `ssn`, an `UpdateItem` of `name` with `ReturnValues` `ALL_OLD` returns the old item with `ssn` in it, and a `PutItem` whose condition fails and a `TransactWriteItems` `ConditionCheck` that fails, each with `ReturnValuesOnConditionCheckFailure` `ALL_OLD`, return the stored item with `ssn` in the error. DynamoDB does the same (measured 2026-11-01). ExtendDB returns the whole stored item in each of these cases, and on a `PutItem` with `ReturnValues` `ALL_OLD`, whose answer on DynamoDB was not measured. The IAM guide's guard against `ReturnValues` returning attributes is a condition on `dynamodb:ReturnValues`, which holds `NONE` on a write that carries no `ReturnValues` (see below). That key reflects the `ReturnValues` parameter alone, not `ReturnValuesOnConditionCheckFailure`, so an `Allow` gated on `dynamodb:ReturnValues` `NONE` grants a write that carries no `ReturnValues`, and such a write whose condition fails still returns the stored item in the error when it sets `ReturnValuesOnConditionCheckFailure` `ALL_OLD`.
 
-These entries were measured on DynamoDB on 2026-10-31 and 2026-11-01: the item attributes of `PutItem`; the target of a `SET`, `REMOVE`, `ADD` or `DELETE` action and the attributes a `SET` value reads; `ConditionExpression` on `PutItem`, `DeleteItem`, a `ConditionCheck` and a transaction `Delete`; `FilterExpression` on `Query` and `Scan`; `Expected` on `PutItem`, `AttributeUpdates`, `ScanFilter` and `QueryFilter`; `AttributesToGet` on `GetItem`, `Query`, `Scan` and `BatchGetItem`; the table's key attributes on `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `DeleteRequest`; projected document paths; reads with no projection; `DeleteItem`; a transaction `Update`; the `BatchGetItem`, `TransactGetItems`, `BatchWriteItem` and `TransactWriteItems` forms of a projection and a put; and the evaluation of a `BatchWriteItem` once per table. `ProjectionExpression` on `Query` and `Scan`, `Expected` and `ConditionExpression` on `UpdateItem`, and `Expected` on `DeleteItem` follow the rule measured for the same parameter on the other operations. The key attributes of the queried or scanned index follow the IAM guide's rule that a policy on `dynamodb:Attributes` lists the primary key and index key attributes of the table and of every secondary index the policy covers; they were not measured. Whether `ExclusiveStartKey` adds names of its own cannot be told on DynamoDB, because a valid start key holds only key attributes, which the key already holds.
+These entries were measured on DynamoDB on 2026-10-31 and 2026-11-01: the item attributes of `PutItem`; the target of a `SET`, `REMOVE`, `ADD` or `DELETE` action and the attributes a `SET` value reads; `ConditionExpression` on `PutItem`, `DeleteItem`, a `ConditionCheck` and a transaction `Delete`; `FilterExpression` on `Query` and `Scan`; `Expected` on `PutItem`, `AttributeUpdates`, `ScanFilter` and `QueryFilter`; `AttributesToGet` on `GetItem`, `Query`, `Scan` and `BatchGetItem`; the table's key attributes on `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `DeleteRequest`; projected document paths; reads with no projection; `DeleteItem`; a transaction `Update`; the `BatchGetItem`, `TransactGetItems`, `BatchWriteItem` and `TransactWriteItems` forms of a projection and a put; and the evaluation of a `BatchWriteItem` once per table. These were measured on 2026-11-09, on a table keyed on a partition and a sort key with a global and a local secondary index: the table's sort key; the key attributes of a queried global secondary index (in the key, its sort key included); on the first page of a `Scan`, the key attributes of a scanned global secondary index and the sort key of a scanned local secondary index (not in the key); and the key condition of a `Query` and the `Keys` of a `BatchGetItem` on a table that does not exist. These were measured on 2026-11-10, on a table of the same shape holding two items: a later page of a `Scan` of each index and of the table (the start key's names are in the key), and the first page of a `Scan` of the local secondary index under a `Deny` on its sort key (not in the key). `ProjectionExpression` on `Query` and `Scan`, `Expected` and `ConditionExpression` on `UpdateItem`, and `Expected` on `DeleteItem` follow the rule measured for the same parameter on the other operations. `ExclusiveStartKey` adds its names as written. The start key of a `Scan` of an index also holds the index's key attributes, and the key holds them, as on DynamoDB (measured 2026-11-10). On a `Query`, and on a `Scan` of the table, a valid start key holds only key attributes that the key already holds, so DynamoDB cannot show whether it adds names of its own there.
 
 `dynamodb:Select`, `dynamodb:ReturnValues` and `dynamodb:ReturnConsumedCapacity` hold the request's `Select`, `ReturnValues` and `ReturnConsumedCapacity`. When a request leaves the parameter out, the key holds the value the operation then uses, as on DynamoDB, so a condition decides the same way whether or not the caller writes that value out:
 
@@ -177,7 +254,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 - `Effect`: Allow, Deny
 - `Action` / `NotAction`: DynamoDB actions (e.g., `dynamodb:PutItem`, `dynamodb:*`)
-- `Resource` / `NotResource`: ARN patterns with wildcards
+- `Resource` / `NotResource`: ARN patterns with wildcards. In a `2012-10-17` document, `${key}` policy variables in the pattern are expanded from the request before matching (for example `arn:aws:dynamodb:*:*:table/${aws:username}`); a wildcard written after a variable still matches; `${key, 'default'}` falls back to `default`; `${*}`, `${?}` and `${$}` stand for literal characters; a variable whose key the request does not carry, or that names a multivalued key such as `dynamodb:LeadingKeys` that the request carries, makes the pattern match nothing (a written default is used only when the key is absent); a `:` inside a substituted value does not separate ARN fields. A `2008-10-17` document, or one with no `Version`, matches the pattern as written, as IAM does. The trimming around the key name and around the quoted default, a quoted `}` or `''` in a default, an escape with a default and the references a write refuses follow the rules for condition values above, and a space inside the quotes of a default is kept. A tag whose value is the empty string expands to no characters, as in IAM: `table/${aws:PrincipalTag/team}*` matches every table for a caller tagged `team=""`, while with no `team` tag it matches nothing. To refuse such a caller, add a condition such as `StringLike` on `aws:PrincipalTag/team` with the value `?*` to the `Allow` statement (measured with the IAM policy simulator). A `Deny NotResource` statement on such a pattern spares every table for that caller (also measured), and that condition on it does not change this.
 - `Condition`: Full condition block support (see operators and keys above)
 
 ## Transport Security
@@ -202,13 +279,42 @@ Replace the certificate and key files, then restart extenddb. There is no hot-re
 
 ## Web Console Security
 
+An admin session can read and change every account. Every page and form under `/console/accounts/{account_id}` serves an IAM-user session its own account only. When `{account_id}` is not the session's own account, the handler redirects the session to `/console`. The handler makes this comparison before it looks up the account in the path, so another account's ID and an ID that no account has get the same answer. The accounts list, and the deployment's account count and admin count on the console home page, are for admin sessions only. In its own account an IAM-user session opens its own user page, which lists its access keys, and creates and deletes its own access keys: the access key reads and writes the management API gives the same user. The console has no form to change the password or import a key. Its own user page leaves out the user's inline policies, groups and tags, which the management API does not give it either. Every other page and form under its account redirects it to `/console`: the account page, the pages of the other users, every group and role page, and every form that changes a user, group, role or policy, its own user and its own policies included. The handler compares the user name in the path with the session's own before it reads anything about that user, so another user's name and a name that no user has get the same answer. The only read before that comparison is the session check, which reads the password hash of the session's own principal.
+
 The management web console (`/console/*`) implements:
 
 - **CSRF protection**: Unique tokens generated per session, injected into all forms via JavaScript, validated on every POST handler
-- **Session management**: Server-side sessions with 8-hour expiry, HttpOnly cookies with `SameSite=Strict` and `Path=/console`
+- **Session management**: Server-side sessions that end 8 hours after login however active they are (the cookie's `Max-Age` is the same 8 hours), HttpOnly and `Secure` cookies with `SameSite=Strict` and `Path=/console` (a dev-mode build serves plain HTTP and leaves `Secure` off)
+- **Session revocation**: A session is bound to the password hash its admin or IAM user logged in with. Every console request reads that hash from the catalog again. When the principal has been deleted, or its password has been changed, the session is removed and the request is redirected to the login page. This happens at the session's next request on every server that shares the catalog, because no server keeps a copy of the hash between requests. On Cassandra the read and the writes that change the hash use `LOCAL_QUORUM`, so a server in another datacenter sees the change once it has replicated there. If the catalog cannot be read, the request gets HTTP 503 and the session is kept. A refused request does not count as activity, so the 8 hour idle timeout keeps running during a catalog outage.
 - **Security headers**: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
 - **HSTS**: Sent automatically (TLS is always enabled)
-- **Login rate limiting**: Failed login attempts are tracked per user. Excessive failures trigger account lockout.
+- **Login rate limiting**: Failed login attempts are counted per user and source address, and per source address, as described under [Login Rate Limiting](#login-rate-limiting).
+- **Admin-only metrics**: The metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) serve admin sessions only. The feed carries the table names, index names and traffic of every account, each request's or table's row under the account it was recorded for. An IAM-user session is redirected from the page and gets HTTP 403 with no metric data from the feed.
+
+## Login Rate Limiting
+
+The console login form, the management API (HTTP Basic auth) and the `/metrics` endpoint share one set of limits on failed logins. Attempts are stored in the catalog's `login_attempts` table, so every surface sees the same history.
+
+- **5 failures per user and source address in 15 minutes.** After the fifth wrong password for a user from one address, further attempts for that user from that address are answered `429 Too Many Requests` until the oldest failure is 15 minutes old. Attempts for the same user from other addresses are not affected, so a third party who knows an admin's name cannot lock the admin out.
+- **20 failures per source address in 15 minutes**, counted over all users. This caps guessing from one address at 20 passwords per 15 minutes however many names it tries.
+- **Attempts are reserved before the password is checked.** An attempt counts against both limits from the moment it is admitted until its failure is recorded, so a burst of concurrent wrong passwords is admitted up to the cap and the rest are refused without a password check.
+- **Bounded verification.** At most 4 bcrypt operations (password checks and password hashes) run at once per process. A login that waits more than 10 seconds for a slot is answered `500` and is not counted as a failure, since no password was checked.
+
+A successful login is not recorded. A storage error before or during the password check is answered `500` and is not counted against the caller.
+
+Every login that the limits admit runs one bcrypt check, or is answered `500` after waiting 10 seconds for a slot, whatever the name. When no admin or IAM user has the name, or the IAM user has no console password, that check runs against a fixed hash, and the login is answered and counted as a wrong password.
+
+The source address is the peer address of the TCP connection, with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) counted as the IPv4 address. Any other IPv6 address is counted by its /64 prefix, because a /64 is the block usually assigned to one host or site and a client can send from any address in it; all addresses in one /64 share one set of limits. ExtendDB does not read `X-Forwarded-For` or any other forwarded-address header (they are caller-supplied).
+
+Callers that reach ExtendDB from one address share one set of limits. Five failures for a user from any of them refuse that user to all of them, and 20 failures in total refuse every user, until the oldest failure is 15 minutes old. Callers share an address in these cases:
+
+- **A reverse proxy or load balancer** that opens its own connections to ExtendDB, so every request arrives from the proxy's address. Put a proxy or load balancer in front of ExtendDB only when it preserves the client address, or when callers behind it are trusted not to lock each other out.
+- **The server host itself.** `extenddb manage` and a `/metrics` scraper running on the server host connect from the same address. A scraper with a stale password for an admin refuses that admin on the host after 5 failures, `extenddb manage` included.
+- **A NAT gateway**, whose egress address is shared by every client behind it.
+
+To recover an address that is refused, wait until its oldest failure is 15 minutes old, or delete the address's rows from the catalog's `login_attempts` table.
+
+A password can be guessed against one user from many addresses at 5 attempts per address per 15 minutes; only the source-address limit and the strength of the password bound that. Use long passwords for admin users and restrict which networks can reach the management and console ports.
 
 ## Provisioned Throughput Throttling
 
@@ -264,14 +370,17 @@ Import/export file paths are validated:
 ### Credential Handling
 
 - `extenddb init` prints admin credentials once; they are not stored in plaintext
-- The `--password` flag accepts passwords via environment variable (`EXTENDDB_ADMIN_PASSWORD`) to avoid process listing exposure
-- Access key secrets are shown once on creation and cannot be retrieved afterward
+- `extenddb manage` reads the password from the `EXTENDDB_PASSWORD` environment variable when `--password` is not given, so the password does not appear in process listings
+- `extenddb manage` prints a warning on stderr when it gets `--password`
+- Access key secrets are shown once on creation, and no API or console page returns them again; a reader of the catalog database can still decrypt them (see [Credential Storage](#credential-storage))
 
 ### Logging
 
-- All logging goes to syslog (no log files with sensitive data on disk)
-- Management operations are audit-logged at WARN level
-- Log messages do not contain credentials, access keys, or item data
+- The server logs to syslog when it runs as a daemon and to stderr with `--foreground`, and writes no log files of its own
+- Some management operations are audit-logged at WARN, with target `extenddb::audit::manage` or `extenddb::audit::settings`: DeleteAdmin, user and role tag changes, AssumeRole (granted, and refused by the role's trust policy), and settings changes made through the management API. `extenddb settings set` changes the catalog without the server and prints its entry on its own standard output, so the server writes no audit entry for that change. Other management changes, such as creating or deleting IAM users, roles, access keys and policies, are not audit-logged
+- Audit entries are WARN events, so none are written while the log level (`logging.level`, or the `log_level` setting, which overrides it) is `error`, or while `logging.level` is `off` or a filter that turns the `extenddb::audit` targets off
+- Cache flushes (`cache invalidate`) are logged at INFO with the admin name, the scope and its selectors, so they are not recorded when the log level (`logging.level`, or the `log_level` setting, which overrides it) is `warn` or `error`
+- Log messages do not contain secret keys, passwords, or item data. Access key IDs can appear, for example in cache flush records
 
 ### Default Configuration
 
@@ -279,16 +388,21 @@ Import/export file paths are validated:
 - Auth provider defaults to `builtin` (SigV4 + IAM policies). The server refuses to start with `auth.provider = "none"`.
 - TLS is mandatory. `extenddb init` generates a self-signed certificate; production deployments should use CA-signed certificates.
 
+### Import and Export Files
+
+On Unix, an export file is created with mode 0600, and the directories the server creates to hold import and export files are created with mode 0700: a configured import or export root that does not exist at startup, and the account directory that the first export of an account creates under each export root. The modes are set when the file or directory is created, so the server's umask can only narrow them, and only the server's user and root can list the account directories it creates or read an export. Missing parent directories of a root are created 0755 (less the umask), so no directory the server creates is writable by group or others. A directory that already exists keeps its mode: a root the operator creates with group access keeps that access, and the export files in it are still 0600. Import files go under `<root>/<account id>`. When one directory is both an import root and an export root (the deprecated `import_export_root`, or one path under both `[import]` and `[export]`), the first export of an account creates `<root>/<account id>` 0700, so a group that puts import files there needs each `<root>/<account id>` created beforehand with the mode it wants. Import files keep the modes they were written with. A user who can write to a parent directory of a root can rename the root away and put a directory of their own in its place, and the server, which holds the root's path, would then read imports from it and write exports into it. At startup the server logs a warning for each root that has such a parent directory (writable by group or others without the sticky bit), naming the directory and its mode, and starts. Releases before v0.1.15 created these directories and files with the umask's modes (0755 and 0644 under umask 022, 0750 and 0640 for a daemon, whose umask is 027), and an upgrade does not change the modes of those that exist; the upgrade manual's [v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the command that tightens them.
+
 ### Backup and Recovery
 
-extenddb stores all state in PostgreSQL. Use standard PostgreSQL tools for backup and recovery:
+Back the databases up with the backend's own tools (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry names each backend's databases), and keep table backups in a backup store whose access you restrict (the [Backup and Restore manual](14-backup-and-restore.md#securing-the-store)). On PostgreSQL the catalog and data databases are one copy: dump both with the server stopped (the admin guide's Data Recovery entry restores the dumps), or, when both databases are on one PostgreSQL server, take a base backup of that server and restore it with PostgreSQL's own procedure (the design guide allows the two databases on different PostgreSQL instances, which one base backup does not cover). With the default database names, and `umask 077` so that only the owner can read the files:
 
 ```bash
+umask 077
 pg_dump extenddb_catalog > catalog_backup.sql
-pg_dump extenddb_catalog_data > data_backup.sql
+pg_dump extenddb > data_backup.sql
 ```
 
-Encryption keys are stored in the catalog database. A catalog backup includes the encryption key needed to decrypt access key secrets.
+The encryption key is stored in the catalog database, so a catalog dump contains both the key and the encrypted access key secrets. A catalog backup is credential-equivalent: store it encrypted, restrict who can read it, and do not copy it to less-protected environments (for example a developer machine or a shared bucket) to reproduce an issue.
 
 ---
 
@@ -297,6 +411,6 @@ Encryption keys are stored in the catalog database. A catalog backup includes th
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

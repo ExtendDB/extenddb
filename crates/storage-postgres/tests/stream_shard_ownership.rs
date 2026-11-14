@@ -24,6 +24,7 @@ use extenddb_core::types::{
     ScalarAttributeType, StreamSpecification, StreamViewType,
 };
 use extenddb_storage::error::StorageError;
+use extenddb_storage::stream_lineage::{ShardStream, parse_shard_id, shard_id};
 use extenddb_storage::util::stream_arn;
 use extenddb_storage::{StreamEngine, StreamRecordsResult, TableEngine};
 use extenddb_storage_postgres::stream_records_sql::{
@@ -73,20 +74,19 @@ impl Scratch {
             .create_table(account, stream_table(name))
             .await
             .expect("create a stream-enabled table");
-        sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_id = $2")
-            .bind(label)
-            .bind(&desc.table_id)
-            .execute(&self.db)
-            .await
-            .expect("pin the stream label");
-        let shard: String = sqlx::query_scalar(
+        self.relabel(&desc.table_id, label).await;
+        let shard = self.first_shard(&desc.table_id).await;
+        (desc.table_id, shard)
+    }
+
+    async fn first_shard(&self, table_id: &str) -> String {
+        sqlx::query_scalar(
             "SELECT shard_id FROM stream_shards WHERE table_id = $1 ORDER BY shard_id LIMIT 1",
         )
-        .bind(&desc.table_id)
+        .bind(table_id)
         .fetch_one(&self.db)
         .await
-        .expect("one shard id");
-        (desc.table_id, shard)
+        .expect("one shard id")
     }
 
     async fn write_records(&self, shard_id: &str, table_id: &str, seqs: &[u64]) {
@@ -130,7 +130,48 @@ impl Scratch {
             .expect("analyze the records");
     }
 
+    /// Pin the table's stream label to `label`. A shard id carries its
+    /// stream's label, so each shard row of the table, and the records keyed
+    /// on it, move to the id the stream `label` gives its index.
     async fn relabel(&self, table_id: &str, label: &str) {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT shard_id FROM stream_shards WHERE table_id = $1")
+                .bind(table_id)
+                .fetch_all(&self.db)
+                .await
+                .expect("shard ids");
+        for old in ids {
+            let Some((ShardStream::Labelled { view_type, .. }, index)) =
+                parse_shard_id(table_id, &old)
+            else {
+                panic!("{old} is not a labelled shard of {table_id}");
+            };
+            let new = shard_id(table_id, label, view_type, index).expect("label shape");
+            // The records reference the shard row, so the new row comes first
+            // and the old one goes last.
+            sqlx::query(
+                "INSERT INTO stream_shards (shard_id, table_id, parent_shard_id, \
+                 starting_sequence_number, ending_sequence_number) \
+                 SELECT $1, table_id, parent_shard_id, starting_sequence_number, \
+                 ending_sequence_number FROM stream_shards WHERE shard_id = $2",
+            )
+            .bind(&new)
+            .bind(&old)
+            .execute(&self.db)
+            .await
+            .expect("insert the relabelled shard row");
+            sqlx::query("UPDATE stream_records SET shard_id = $1 WHERE shard_id = $2")
+                .bind(&new)
+                .bind(&old)
+                .execute(&self.db)
+                .await
+                .expect("move the shard's records");
+            sqlx::query("DELETE FROM stream_shards WHERE shard_id = $1")
+                .bind(&old)
+                .execute(&self.db)
+                .await
+                .expect("remove the old shard row");
+        }
         sqlx::query("UPDATE tables SET stream_label = $1 WHERE table_id = $2")
             .bind(label)
             .bind(table_id)
@@ -140,9 +181,22 @@ impl Scratch {
     }
 }
 
+/// The server's base URL, or `None` to skip. With `EXTENDDB_TEST_PG_REQUIRED`
+/// set to any value but `0`, a job that must reach a server fails here
+/// instead.
 fn base_conn() -> Option<String> {
-    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").ok()?;
-    (!conn.trim().is_empty()).then(|| conn.trim_end_matches('/').to_owned())
+    let conn = std::env::var("EXTENDDB_TEST_PG_CONNECTION_STRING").unwrap_or_default();
+    if conn.trim().is_empty() {
+        let required =
+            std::env::var("EXTENDDB_TEST_PG_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "EXTENDDB_TEST_PG_CONNECTION_STRING is not set, and EXTENDDB_TEST_PG_REQUIRED says \
+             this job must reach a PostgreSQL server"
+        );
+        return None;
+    }
+    Some(conn.trim_end_matches('/').to_owned())
 }
 
 /// Every `.sql` file under `migrations/` and `data_migrations/`, each
@@ -195,10 +249,13 @@ async fn scratch() -> Scratch {
         .execute(&db)
         .await
         .expect("match the two-database layout");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     for account in [ACCOUNT, OTHER_ACCOUNT] {
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
             .bind(account)
@@ -404,8 +461,9 @@ async fn another_accounts_same_named_stream_is_not_found() {
     s.cleanup().await;
 }
 
-/// The table takes a new stream label while keeping its shard rows: the old
-/// ARN's iterator is refused and the new ARN reads every record.
+/// The table's stream takes a new label while keeping its records: the old
+/// ARN's iterator, and the old shard id under the new ARN, are refused, and
+/// the new stream's shard reads every record.
 #[tokio::test]
 async fn an_earlier_label_on_the_same_shards_is_not_found() {
     if base_conn().is_none() {
@@ -422,16 +480,23 @@ async fn an_earlier_label_on_the_same_shards_is_not_found() {
         .expect("current label reads");
 
     s.relabel(&table_id, LATER_LABEL).await;
-    s.write_records(&shard, &table_id, &[2]).await;
+    let new_shard = s.first_shard(&table_id).await;
+    assert_ne!(new_shard, shard);
+    s.write_records(&new_shard, &table_id, &[2]).await;
+    let new_arn = stream_arn(REGION, ACCOUNT, "t", LATER_LABEL);
     assert_stream_not_found(
         s.engine
             .get_stream_records(ACCOUNT, &old_arn, &shard, None, 10)
             .await,
     );
-    let new_arn = stream_arn(REGION, ACCOUNT, "t", LATER_LABEL);
+    assert_stream_not_found(
+        s.engine
+            .get_stream_records(ACCOUNT, &new_arn, &shard, None, 10)
+            .await,
+    );
     let (records, _) = s
         .engine
-        .get_stream_records(ACCOUNT, &new_arn, &shard, None, 10)
+        .get_stream_records(ACCOUNT, &new_arn, &new_shard, None, 10)
         .await
         .expect("new label reads");
     assert_eq!(records.len(), 2);

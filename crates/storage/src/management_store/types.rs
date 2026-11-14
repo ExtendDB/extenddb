@@ -6,7 +6,7 @@
 // ── Error types ────────────────────────────────────────────────────────
 
 /// Error from a management or operational storage operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpError {
     /// Input validation failed (caller should have caught this).
     Validation(String),
@@ -18,6 +18,39 @@ pub enum OpError {
     HasDependents(String),
     /// Internal storage error.
     Internal(String),
+    /// A database statement failed with this error code (PostgreSQL's
+    /// SQLSTATE). `message` is the driver's text, for logs and the
+    /// operator's commands; API responses never carry it.
+    Database { message: String, sqlstate: String },
+}
+
+impl OpError {
+    /// The database error code of the statement that failed, when the error
+    /// carries one.
+    #[must_use]
+    pub fn sqlstate(&self) -> Option<&str> {
+        match self {
+            Self::Database { sqlstate, .. } => Some(sqlstate),
+            Self::Validation(_)
+            | Self::AlreadyExists(_)
+            | Self::NotFound(_)
+            | Self::HasDependents(_)
+            | Self::Internal(_) => None,
+        }
+    }
+
+    /// The error's text, without the variant name that `{:?}` prints.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Validation(m)
+            | Self::AlreadyExists(m)
+            | Self::NotFound(m)
+            | Self::HasDependents(m)
+            | Self::Internal(m)
+            | Self::Database { message: m, .. } => m,
+        }
+    }
 }
 
 /// Result alias for management operations.
@@ -89,6 +122,10 @@ pub struct AdminEntry {
 #[derive(Debug, Clone)]
 pub struct MetricsRow {
     pub bucket: time::OffsetDateTime,
+    /// The account the row was recorded for; `None` for a metric of the
+    /// whole deployment, stored as the empty string on SQLite, PostgreSQL
+    /// and Cassandra and as a document without the field on MongoDB.
+    pub account_id: Option<String>,
     pub metric: String,
     pub table_name: Option<String>,
     pub index_name: Option<String>,
@@ -97,4 +134,36 @@ pub struct MetricsRow {
     pub count: i64,
     pub min: f64,
     pub max: f64,
+}
+
+/// The optional filters of [`super::MetricsStore::query_metrics`]. A `None`
+/// field matches every row, and an empty string counts as `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsFilter {
+    /// Only the rows recorded for this account.
+    pub account_id: Option<String>,
+    /// Only the rows of this table name.
+    pub table_name: Option<String>,
+    /// Only the rows of this metric.
+    pub metric: Option<String>,
+}
+
+impl MetricsFilter {
+    /// The account filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn account_id(&self) -> Option<&str> {
+        self.account_id.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// The table name filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn table_name(&self) -> Option<&str> {
+        self.table_name.as_deref().filter(|s| !s.is_empty())
+    }
+
+    /// The metric filter, with an empty string read as no filter.
+    #[must_use]
+    pub fn metric(&self) -> Option<&str> {
+        self.metric.as_deref().filter(|s| !s.is_empty())
+    }
 }

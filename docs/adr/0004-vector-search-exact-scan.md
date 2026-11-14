@@ -135,3 +135,14 @@ now, and gated on a measured need rather than on anticipation.
 **Not measured.** Cold cache, concurrency beyond one core, and real embedding
 distributions. Cold reads can only be worse; the other two do not change the
 layout decision.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

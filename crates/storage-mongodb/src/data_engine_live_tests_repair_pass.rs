@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use bson::{Bson, Document, doc};
 use extenddb_core::types::TableKeyInfo;
+use extenddb_storage::server_components::ServerComponentsOptions;
 use futures::TryStreamExt;
 
 use super::{
@@ -193,6 +194,185 @@ async fn live_the_spawned_key_repair_rewrites_documents_stored_without_their_key
         expected_document(&want, &key_info, 1),
         "the task repaired the document"
     );
+    let engine = Arc::try_unwrap(engine)
+        .ok()
+        .expect("the finished task dropped its engine");
+    finish(engine).await;
+}
+
+/// A server that refuses its catalog has written nothing. `serve`'s factory
+/// registers and reads the catalog's status (`register_and_check`) before it
+/// builds the engine and starts the repair, so a refusal there leaves the
+/// data alone. The factory opens the default databases, so this test calls
+/// the same `register_and_check` on scratch databases and pins the refusal
+/// that order relies on. With the catalog migrated through migration 5 only
+/// and a data document stored without its key, `register_and_check` refuses
+/// the catalog as behind, naming migration 6, leaves no registration, and
+/// the document keeps the shape the pre-#436 upsert stored. Once the catalog
+/// is migrated the same call accepts it, and a repair started after it, as
+/// the factory starts one, rewrites the document well within the first
+/// half's wait.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_a_refused_catalog_starts_no_key_repair() {
+    use crate::migrations::{
+        MongoTarget, SERVERS, Timing, migrate_through_for_tests, register_and_check,
+    };
+    use extenddb_storage::hooks::ServingRegistrar;
+    use extenddb_storage::migrations::{CatalogStatus, MigrationError, MigrationId};
+    use std::time::{Duration, Instant};
+
+    let engine = scratch_engine().await;
+    let target = MongoTarget::with_databases(
+        super::uri(),
+        engine.catalog_db.name(),
+        engine.data_db.name(),
+    );
+    migrate_through_for_tests(&target, MigrationId::DropContinuousBackups)
+        .await
+        .expect("migrations 1 to 5");
+    let key_info = table(&engine, "pass-refused", false);
+    let key = item_key(false);
+    engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .insert_one(catalog_row("refused", &key_info.table_id, &key_info))
+        .await
+        .expect("catalog row");
+    store_without_key(&engine, &key_info, &key, Some("upd")).await;
+    let collection = engine
+        .data_db
+        .collection::<Document>(&data_collection_name(&key_info.table_id));
+    let unrepaired = |document: &Document| document.get_object_id("_id").is_ok();
+
+    match register_and_check(&target, "test", Timing::PRODUCTION).await {
+        Ok(_) => panic!("a catalog without migration 6 is refused"),
+        Err(MigrationError::Status(CatalogStatus::Behind { version, pending })) => {
+            assert_eq!(version, Some(MigrationId::DropContinuousBackups.number()));
+            assert!(
+                pending
+                    .iter()
+                    .any(|p| p.id == MigrationId::BackupCatalogIndex.number()),
+                "{pending:?}"
+            );
+        }
+        Err(e) => panic!("expected a Behind refusal, got {e}"),
+    }
+    assert_eq!(
+        engine
+            .catalog_db
+            .collection::<Document>(SERVERS)
+            .count_documents(doc! {})
+            .await
+            .expect("count"),
+        0,
+        "the refused server deleted its registration"
+    );
+    // A repair of one document finishes in milliseconds (the second half
+    // measures it); two seconds is far past any such run.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        unrepaired(&stored(&engine, &key_info, &key).await),
+        "the refused open rewrote a data document"
+    );
+    assert_eq!(
+        collection.count_documents(doc! {}).await.expect("count"),
+        1,
+        "the refused open wrote a data document"
+    );
+
+    migrate_through_for_tests(&target, MigrationId::LATEST)
+        .await
+        .expect("migration 6");
+    let registration = register_and_check(&target, "test", Timing::PRODUCTION)
+        .await
+        .expect("a migrated catalog is served");
+    let engine = Arc::new(engine);
+    let started = Instant::now();
+    let repair = spawn_key_repair(Arc::clone(&engine));
+    let deadline = started + Duration::from_secs(30);
+    while unrepaired(&stored(&engine, &key_info, &key).await) {
+        assert!(
+            Instant::now() < deadline,
+            "the repair started after the accepted check did not rewrite the document"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    eprintln!(
+        "the repair rewrote the document {:?} after the check",
+        started.elapsed()
+    );
+    let want = with(key.clone(), "w", s("upd"));
+    assert_eq!(
+        stored(&engine, &key_info, &key).await,
+        expected_document(&want, &key_info, 1),
+        "the started repair rebuilt the document"
+    );
+    let _ = repair.await;
+    ServingRegistrar::release(&registration).await;
+    let engine = Arc::try_unwrap(engine)
+        .ok()
+        .expect("the finished task dropped its engine");
+    finish(engine).await;
+}
+
+/// A command that opens the catalog beside a server (`backup list`, the
+/// purge's dry run: `beside_server`) starts no key repair. The factory's
+/// `build_components` decides through `start_key_repair`, which this test
+/// calls with the engine the factory would hand it (the factory opens the
+/// default databases). With a data document stored without its key, the
+/// call for a command starts no task and the document is still in the shape
+/// the pre-#436 upsert stored two seconds later, far past a one document
+/// repair (the refusal test measures one in milliseconds). The same call for
+/// a server then starts the repair, which rewrites the document.
+#[tokio::test]
+#[ignore = "needs a MongoDB replica set in EXTENDDB_TEST_MONGODB_URI"]
+async fn live_an_open_beside_a_server_starts_no_key_repair() {
+    use std::time::{Duration, Instant};
+
+    let engine = scratch_engine().await;
+    let key_info = table(&engine, "pass-beside", false);
+    let key = item_key(false);
+    engine
+        .catalog_db
+        .collection::<Document>("tables")
+        .insert_one(catalog_row("beside", &key_info.table_id, &key_info))
+        .await
+        .expect("catalog row");
+    store_without_key(&engine, &key_info, &key, Some("upd")).await;
+    let unrepaired = |document: &Document| document.get_object_id("_id").is_ok();
+    let engine = Arc::new(engine);
+
+    let mut beside = ServerComponentsOptions::default();
+    beside.beside_server = true;
+    assert!(
+        crate::start_key_repair(&engine, &beside).is_none(),
+        "an open beside a server started a key repair"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        unrepaired(&stored(&engine, &key_info, &key).await),
+        "an open beside a server rewrote a data document"
+    );
+
+    let started = Instant::now();
+    let repair = crate::start_key_repair(&engine, &ServerComponentsOptions::default())
+        .expect("a server's open starts the repair");
+    let deadline = started + Duration::from_secs(30);
+    while unrepaired(&stored(&engine, &key_info, &key).await) {
+        assert!(
+            Instant::now() < deadline,
+            "the repair the server's open started did not rewrite the document"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let want = with(key.clone(), "w", s("upd"));
+    assert_eq!(
+        stored(&engine, &key_info, &key).await,
+        expected_document(&want, &key_info, 1),
+        "the server's repair rebuilt the document"
+    );
+    let _ = repair.await;
     let engine = Arc::try_unwrap(engine)
         .ok()
         .expect("the finished task dropped its engine");

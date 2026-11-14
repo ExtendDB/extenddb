@@ -104,7 +104,7 @@ pub(crate) enum NumberForm {
 /// spelling `10.0` matches on `GetItem` and does not match on
 /// `TransactGetItems`. An N value the engine would reject as malformed yields
 /// `None`, so the engine returns `ValidationException` before any data flows.
-fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
+pub(crate) fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
     let (type_tag, inner) = type_val.as_object()?.iter().next()?;
     let raw = inner.as_str().unwrap_or_default();
     if type_tag == "N" {

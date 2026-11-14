@@ -18,6 +18,7 @@ REQ-AUTH-001, REQ-AUTH-002
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import boto3
@@ -237,6 +238,98 @@ class TestAccessKeys:
     def test_create_access_key_for_nonexistent_user(self):
         resp = self.mgmt.create_access_key(self.account_id, "no-such-user-xyz")
         assert resp.status_code == 404
+
+
+class TestAccessKeyIdIsStoredOnce:
+    """An access key ID names one key: an import of an ID that a key already
+    has answers 409 and leaves that key as it was, on every backend."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, auth_env, mgmt, account_id, region):
+        self.endpoint = auth_env[0]
+        self.mgmt = mgmt
+        self.account_id = account_id
+        self.region = region
+
+    def _user(self, full_access=False):
+        name = f"ak-{uuid.uuid4().hex[:8]}"
+        resp = self.mgmt.create_user(self.account_id, name, "Pass123!")
+        assert resp.status_code == 201, resp.text
+        if full_access:
+            resp = self.mgmt.put_user_policy(self.account_id, name, "full", _full_policy())
+            assert resp.status_code in (200, 201, 204), resp.text
+        return name
+
+    @staticmethod
+    def _key_id():
+        return "AKIA" + uuid.uuid4().hex[:16].upper()
+
+    @staticmethod
+    def _secret():
+        return uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+    def _listed(self, user):
+        resp = self.mgmt.list_access_keys(self.account_id, user)
+        assert resp.status_code == 200, resp.text
+        return [k["access_key_id"] for k in resp.json()]
+
+    def _authenticates(self, key_id, secret):
+        """True when a request signed with the pair is allowed, False when
+        the server refuses the signature or the key."""
+        client = _make_client(self.endpoint, key_id, secret, self.region)
+        try:
+            client.list_tables()
+            return True
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            assert code in ("UnrecognizedClientException", "InvalidSignatureException"), e
+            return False
+
+    def test_an_id_another_user_holds_is_refused(self):
+        owner = self._user(full_access=True)
+        other = self._user(full_access=True)
+        try:
+            key_id, secret = self._key_id(), self._secret()
+            resp = self.mgmt.import_access_key(self.account_id, owner, key_id, secret)
+            assert resp.status_code == 201, resp.text
+            resp = self.mgmt.import_access_key(self.account_id, other, key_id, self._secret())
+            assert resp.status_code == 409, resp.text
+            assert "Access key ID already exists" in resp.text
+            assert self._listed(owner) == [key_id]
+            assert key_id not in self._listed(other)
+            assert self._authenticates(key_id, secret)
+        finally:
+            self.mgmt.delete_user(self.account_id, other)
+            self.mgmt.delete_user(self.account_id, owner)
+
+    def test_a_second_import_of_an_id_keeps_the_first_secret(self):
+        user = self._user(full_access=True)
+        try:
+            key_id, first, second = self._key_id(), self._secret(), self._secret()
+            resp = self.mgmt.import_access_key(self.account_id, user, key_id, first)
+            assert resp.status_code == 201, resp.text
+            resp = self.mgmt.import_access_key(self.account_id, user, key_id, second)
+            assert resp.status_code == 409, resp.text
+            assert self._listed(user) == [key_id]
+            assert self._authenticates(key_id, first)
+            assert not self._authenticates(key_id, second)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
+
+    def test_a_deleted_key_stops_authenticating_after_a_refused_import(self):
+        user = self._user(full_access=True)
+        try:
+            key_id, secret = self._key_id(), self._secret()
+            for expected in (201, 409):
+                resp = self.mgmt.import_access_key(self.account_id, user, key_id, secret)
+                assert resp.status_code == expected, resp.text
+            assert self._authenticates(key_id, secret)
+            resp = self.mgmt.delete_access_key(self.account_id, user, key_id)
+            assert resp.status_code == 204, resp.text
+            assert self._listed(user) == []
+            assert not self._authenticates(key_id, secret)
+        finally:
+            self.mgmt.delete_user(self.account_id, user)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1448,14 @@ class TestBackupAuthorization:
             backup_arn = admin_client.create_backup(
                 TableName=table, BackupName="authz",
             )["BackupDetails"]["BackupArn"]
+            # A store-backed backup is CREATING until its job ends; a restore
+            # of a CREATING backup is BackupInUse, so the cells wait here.
+            deadline = time.monotonic() + 120
+            while admin_client.describe_backup(
+                BackupArn=backup_arn
+            )["BackupDescription"]["BackupDetails"]["BackupStatus"] == "CREATING":
+                assert time.monotonic() < deadline, f"backup {backup_arn} still CREATING"
+                time.sleep(0.2)
             yield admin_client, table, backup_arn
         finally:
             for t in self.created:
@@ -1364,6 +1465,13 @@ class TestBackupAuthorization:
                     pass
             if backup_arn is not None:
                 try:
+                    # A store-backed backup is CREATING until its job ends
+                    # and refuses DeleteBackup until then.
+                    deadline = time.monotonic() + 120
+                    while time.monotonic() < deadline and admin_client.describe_backup(
+                        BackupArn=backup_arn
+                    )["BackupDescription"]["BackupDetails"]["BackupStatus"] == "CREATING":
+                        time.sleep(0.2)
                     admin_client.delete_backup(BackupArn=backup_arn)
                 except Exception:
                     pass
