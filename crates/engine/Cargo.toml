@@ -50,6 +50,7 @@ tokio = { workspace = true, features = ["test-util"] }
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
 # Scratch directories that are removed when a test panics.
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 # `tests/private_modes.rs` sets umask 0.
 [target.'cfg(unix)'.dev-dependencies]
