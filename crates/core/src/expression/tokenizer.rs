@@ -64,7 +64,10 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
     let bytes = input.as_bytes();
     let mut i = 0;
 
+    let mut prev_start: Option<usize> = None;
     while i < bytes.len() {
+        let tok_start = i;
+        let before = tokens.len();
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             b'(' => {
@@ -178,31 +181,15 @@ pub fn tokenize_with_limit(input: &str, max_tokens: usize) -> Result<Vec<Token>,
                     max_tokens,
                 )?;
             }
-            other => {
-                // The byte at `i` can be the first byte of a multi-byte
-                // character, and the five-byte window after it can end inside
-                // one. The token is the whole character, and the end of the
-                // window moves out to a character boundary. Every byte before
-                // the first invalid one is ASCII, so the start is already on a
-                // boundary; it is checked the same way so the slice stays valid
-                // if a token that admits other characters is added.
-                let ch = input
-                    .get(i..)
-                    .and_then(|rest| rest.chars().next())
-                    .unwrap_or(other as char);
-                let mut near_start = i.saturating_sub(5);
-                while !input.is_char_boundary(near_start) {
-                    near_start -= 1;
-                }
-                let mut near_end = std::cmp::min(i + 5, input.len());
-                while !input.is_char_boundary(near_end) {
-                    near_end += 1;
-                }
-                let near = &input[near_start..near_end];
+            _ => {
+                let (ch, near) = unknown_character(input, i, prev_start);
                 return Err(validation_err(&format!(
                     "Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
+        }
+        if tokens.len() > before {
+            prev_start = Some(tok_start);
         }
     }
 
@@ -227,7 +214,10 @@ pub fn tokenize_for(
     let bytes = input.as_bytes();
     let mut i = 0;
 
+    let mut prev_start: Option<usize> = None;
     while i < bytes.len() {
+        let tok_start = i;
+        let before = tokens.len();
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
             b'(' => {
@@ -341,26 +331,14 @@ pub fn tokenize_for(
                 )?;
             }
             _ => {
-                // Safety: use chars() to safely extract the character at this
-                // byte position, avoiding panics on multi-byte UTF-8 input.
-                let ch = input[i..].chars().next().unwrap_or('?');
-                let ch_len = ch.len_utf8();
-                let near_end = std::cmp::min(i + ch_len + 1, input.len());
-                // Clamp near_end to a valid char boundary
-                let near_end = if near_end <= input.len() {
-                    let mut end = near_end;
-                    while end < input.len() && !input.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    if end > input.len() { input.len() } else { end }
-                } else {
-                    input.len()
-                };
-                let near = &input[i..near_end];
+                let (ch, near) = unknown_character(input, i, prev_start);
                 return Err(DynamoDbError::ValidationException(format!(
                     "Invalid {kind}: Syntax error; token: \"{ch}\", near: \"{near}\""
                 )));
             }
+        }
+        if tokens.len() > before {
+            prev_start = Some(tok_start);
         }
     }
     Ok(tokens)
@@ -388,6 +366,65 @@ fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
+/// The token text and the `near` window the service reports for a character
+/// the expression grammar does not accept, at byte offset `at` of `input`.
+///
+/// Measured 2026-10-25 on FilterExpression, ConditionExpression,
+/// KeyConditionExpression, UpdateExpression and ProjectionExpression: the
+/// token is the character as sent (a whole code point, `é` or an emoji), and
+/// the window is the source text from the start of the previous token to the
+/// end of the next one, whitespace kept, each dropped when absent. Every
+/// character outside the grammar is a token of its own, so `#v = ééé` answers
+/// `token: "é", near: "= éé"`, and a name stops at the first such character,
+/// so `abéc = :v` answers `near: "abéc"`.
+///
+/// When no token comes before the character the window starts at the start
+/// of the expression, leading whitespace kept (`  é = :v` answers
+/// `near: "  é ="`), and U+0000 is removed from the token and the window
+/// (`#v = \0x` answers `token: "", near: "= x"`).
+///
+/// `prev_start` is the byte offset where the previous token starts.
+fn unknown_character(input: &str, at: usize, prev_start: Option<usize>) -> (String, String) {
+    let ch = input[at..].chars().next().unwrap_or('?');
+    let after = at + ch.len_utf8();
+    let end = next_token_end(input, after).unwrap_or(after);
+    let start = prev_start.unwrap_or(0);
+    let token = if ch == '\0' {
+        String::new()
+    } else {
+        ch.to_string()
+    };
+    (token, input[start..end].replace('\0', ""))
+}
+
+/// The byte offset where the next token after `from` ends, skipping the
+/// tokenizer's whitespace, or `None` at the end of input. Mirrors the token
+/// rules of [`tokenize_with_limit`], with a character outside the grammar
+/// counted as one token.
+fn next_token_end(input: &str, from: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut i = from;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    let first = *bytes.get(i)?;
+    let run = |mut j: usize, pred: fn(u8) -> bool| {
+        while j < bytes.len() && pred(bytes[j]) {
+            j += 1;
+        }
+        j
+    };
+    Some(match first {
+        b'<' if matches!(bytes.get(i + 1), Some(b'>' | b'=')) => i + 2,
+        b'>' if bytes.get(i + 1) == Some(&b'=') => i + 2,
+        b'(' | b')' | b'[' | b']' | b',' | b'.' | b'+' | b'-' | b'=' | b'<' | b'>' => i + 1,
+        b'#' | b':' => run(i + 1, is_ident_char),
+        c if is_ident_start(c) => run(i, is_ident_char),
+        c if c.is_ascii_digit() => run(i, |b| b.is_ascii_digit()),
+        _ => i + input[i..].chars().next().map_or(1, char::len_utf8),
+    })
+}
+
 fn keyword_or_ident(word: &str) -> Token {
     match word.to_ascii_uppercase().as_str() {
         "AND" => Token::And,
@@ -408,246 +445,5 @@ fn validation_err(msg: &str) -> DynamoDbError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenize_simple_comparison() {
-        let tokens = tokenize("price > :min").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("price".into()),
-                Token::Gt,
-                Token::Placeholder("min".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_name_ref_and_placeholder() {
-        let tokens = tokenize("#n = :v").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::NameRef("n".into()),
-                Token::Eq,
-                Token::Placeholder("v".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_all_operators() {
-        let tokens = tokenize("= <> < <= > >=").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Eq,
-                Token::Ne,
-                Token::Lt,
-                Token::Le,
-                Token::Gt,
-                Token::Ge
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_keywords_case_insensitive() {
-        let tokens = tokenize("SET REMOVE add DELETE And Or Not Between In").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Set,
-                Token::Remove,
-                Token::Add,
-                Token::Delete,
-                Token::And,
-                Token::Or,
-                Token::Not,
-                Token::Between,
-                Token::In,
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_path_with_index() {
-        let tokens = tokenize("items[0].name").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("items".into()),
-                Token::LBracket,
-                Token::Ident("0".into()),
-                Token::RBracket,
-                Token::Dot,
-                Token::Ident("name".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_arithmetic() {
-        let tokens = tokenize("price + :tax - :discount").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("price".into()),
-                Token::Plus,
-                Token::Placeholder("tax".into()),
-                Token::Minus,
-                Token::Placeholder("discount".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_empty_name_ref_rejected() {
-        let err = tokenize("# = :v").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("empty name reference"))
-        );
-    }
-
-    #[test]
-    fn tokenize_empty_placeholder_rejected() {
-        let err = tokenize("a = :").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("empty value placeholder"))
-        );
-    }
-
-    #[test]
-    fn tokenize_invalid_character_rejected() {
-        let err = tokenize("a @ b").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("Syntax error; token:"))
-        );
-    }
-
-    #[test]
-    fn tokenize_exceeds_token_limit() {
-        let err = tokenize_with_limit("a = b AND c = d", 3).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(msg) if msg.contains("maximum token count"))
-        );
-    }
-
-    #[test]
-    fn tokenize_whitespace_variants() {
-        let tokens = tokenize("a\t=\n:v\r").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("a".into()),
-                Token::Eq,
-                Token::Placeholder("v".into())
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_empty_input() {
-        let tokens = tokenize("").unwrap();
-        assert!(tokens.is_empty());
-    }
-
-    #[test]
-    fn tokenize_function_call() {
-        let tokens = tokenize("attribute_exists(#pk)").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("attribute_exists".into()),
-                Token::LParen,
-                Token::NameRef("pk".into()),
-                Token::RParen,
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_underscore_ident() {
-        let tokens = tokenize("_my_attr = :v").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Ident("_my_attr".into()),
-                Token::Eq,
-                Token::Placeholder("v".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenize_multibyte_utf8_near_an_invalid_byte_does_not_panic() {
-        // Each input has an invalid byte whose five-byte context window ends
-        // inside a two-, three- or four-byte character. In the second and
-        // fourth the invalid byte starts a multi-byte character itself.
-        for input in [
-            "\0\0\u{7}#\u{41f}",
-            "\u{41f}\u{41f}\u{41f}",
-            "a ; \u{1f600}",
-            "\u{65e5}\u{65e5}",
-            "$  \u{65e5}",
-        ] {
-            let err = tokenize_with_limit(input, 4096).unwrap_err();
-            assert!(
-                matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error")),
-                "{input:?}: {err:?}"
-            );
-        }
-
-        // The window ends at the end of the character it would have split.
-        let err = tokenize_with_limit("$  \u{65e5}", 4096).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg)
-                if msg.contains("token: \"$\", near: \"$  \u{65e5}\"")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn tokenize_reports_the_whole_invalid_character() {
-        let err = tokenize("a = \u{e9}").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg)
-                if msg.contains("token: \"\u{e9}\", near: \"a = \u{e9}\"")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn tokenize_ascii_error_context_is_five_bytes_either_side() {
-        let err = tokenize("attribute_exists(a) $ b").unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg)
-                if msg.contains("token: \"$\", near: \"s(a) $ b\"")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn tokenize_for_multibyte_utf8_does_not_panic() {
-        // Emoji (4-byte UTF-8) should produce a validation error, not a panic.
-        let err =
-            tokenize_for("a = 😀", 4096, super::super::ExpressionKind::Condition).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
-        );
-
-        // Accented character (2-byte UTF-8)
-        let err = tokenize_for("café", 4096, super::super::ExpressionKind::Filter).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
-        );
-
-        // Multi-byte at the very end
-        let err = tokenize_for("x + ñ", 4096, super::super::ExpressionKind::Update).unwrap_err();
-        assert!(
-            matches!(err, DynamoDbError::ValidationException(ref msg) if msg.contains("Syntax error"))
-        );
-    }
-}
+#[path = "tokenizer_tests.rs"]
+mod tests;
