@@ -54,6 +54,29 @@ pub fn new_stream_label() -> String {
     format_stream_label(time::OffsetDateTime::now_utc())
 }
 
+/// The instant a [`format_stream_label`] label names, as the epoch-seconds
+/// number `DescribeStream` renders in `CreationRequestDateTime` (measured on
+/// the service 2026-10-24: present on every stream, enabled or disabled). The
+/// label is the stream's creation instant to the millisecond, so no stored
+/// column is needed.
+///
+/// Two shapes are accepted: the 23-byte `YYYY-MM-DDThh:mm:ss.sss` this module
+/// writes, parsed by [`crate::stream_lineage::label_millis`], and the 19-byte
+/// `YYYY-MM-DDThh:mm:ss` that SQLite, PostgreSQL and MongoDB wrote on v0.1.3
+/// to v0.1.13 and Cassandra up to v0.1.14, which a stream enabled on those
+/// versions and never re-enabled still carries. The legacy shape names the
+/// instant with a `.000` fraction. `None` for any other shape.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // epoch ms fit f64's 53-bit mantissa
+pub fn stream_label_creation_date_time(label: &str) -> Option<f64> {
+    let millis = if label.len() == 19 {
+        crate::stream_lineage::label_millis(&format!("{label}.000"))?
+    } else {
+        crate::stream_lineage::label_millis(label)?
+    };
+    Some(millis as f64 / 1000.0)
+}
+
 /// Returns an ARN for the specified `DynamoDB` stream.
 #[must_use]
 pub fn stream_arn(region: &str, account_id: &str, table_name: &str, stream_label: &str) -> String {
@@ -215,5 +238,57 @@ mod stream_label_tests {
             format_stream_label(at((2026, 1, 2), (3, 4, 5, 500_000), 5)),
             "2026-01-01T22:04:05.500"
         );
+    }
+
+    /// `CreationRequestDateTime` is the label's instant, to the millisecond,
+    /// and round-trips through the formatter.
+    #[test]
+    fn creation_date_time_is_the_label_instant() {
+        use super::stream_label_creation_date_time;
+        assert_eq!(
+            stream_label_creation_date_time("1970-01-01T00:00:00.000"),
+            Some(0.0)
+        );
+        assert_eq!(
+            stream_label_creation_date_time("1970-01-01T00:00:01.748"),
+            Some(1.748)
+        );
+        // 2026-10-24T11:31:45.748Z, the label in the issue.
+        assert_eq!(
+            stream_label_creation_date_time("2026-10-24T11:31:45.748"),
+            Some(1_792_841_505.748)
+        );
+        // The 19-byte legacy label (v0.1.3 to v0.1.13 writers) is the instant
+        // with a .000 fraction.
+        assert_eq!(
+            stream_label_creation_date_time("2026-07-04T10:20:30"),
+            Some(1_783_160_430.0)
+        );
+        // 2026-01-02T03:04:05.007 UTC, through the formatter.
+        let label = format_stream_label(at((2026, 1, 2), (3, 4, 5, 7_000), 0));
+        assert_eq!(
+            stream_label_creation_date_time(&label),
+            Some(1_767_323_045.007)
+        );
+    }
+
+    #[test]
+    fn creation_date_time_refuses_other_shapes() {
+        use super::stream_label_creation_date_time;
+        for bad in [
+            "",
+            "2026-10-24T11:31:4",
+            "2026-10-24T11:31:4S",
+            "2026-10-24T11:31:45.7480",
+            "2026-10-24T11:31:45.748Z",
+            "2026-10-24 11:31:45.748",
+            "2026-10-24 11:31:45",
+            "2026-13-24T11:31:45.748",
+            "2026-10-24T25:31:45.748",
+            "2026-1O-24T11:31:45.748",
+            "2026-10-24T11:31:45:748",
+        ] {
+            assert_eq!(stream_label_creation_date_time(bad), None, "{bad:?}");
+        }
     }
 }
