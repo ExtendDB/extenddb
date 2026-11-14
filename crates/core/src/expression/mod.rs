@@ -22,6 +22,7 @@ mod search_condition;
 mod test_timeout;
 mod tokenizer;
 mod update_evaluator;
+mod update_nesting;
 mod update_parser;
 
 pub use ast::{ArithOp, CompareOp, Expr, PathElement, UpdateAction, removes_only};
@@ -45,5 +46,5 @@ pub use search_condition::{
     validate_search_condition_expression,
 };
 pub use tokenizer::{Token, tokenize, tokenize_for, tokenize_with_limit};
-pub use update_evaluator::apply_update_validated;
+pub use update_evaluator::{apply_update_item_validated, apply_update_validated};
 pub use update_parser::{parse_update, parse_update_from};
