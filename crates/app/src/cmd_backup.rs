@@ -678,6 +678,7 @@ async fn open_catalog(
                 release,
                 app_config,
                 Some(config_path),
+                false,
             )
             .await
             .into());
