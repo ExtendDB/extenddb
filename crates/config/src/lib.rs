@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// The knobs backup and restore jobs read ([`backup::BackupConfig`]).
+    #[serde(default)]
+    pub backup: backup::BackupConfig,
     /// Import configuration. Lists allowed source directories for import
     /// operations. If empty or absent, imports are denied (secure default).
     #[serde(default, rename = "import")]
@@ -75,6 +78,12 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// Seconds a connection may take to deliver its request headers, and
+    /// seconds a request body may go without delivering data, before the
+    /// server closes the connection. Bounds how long a stalled or malicious
+    /// client can hold a connection open. Default 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     /// Developer mode only: a single comma-separated string of bare host names
     /// (no port, scheme or wildcard) a browser request may use, beyond an IP
     /// address, `localhost` and any `.localhost` name. A dev-mode server
@@ -89,6 +98,10 @@ pub struct ServerConfig {
     pub dev_allowed_hosts: Option<String>,
 }
 
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -98,6 +111,7 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            request_timeout_secs: default_request_timeout_secs(),
             dev_allowed_hosts: None,
         }
     }
@@ -105,8 +119,8 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Operator-facing warnings for server settings that work but cost
-    /// something: today a `region` outside `[a-z0-9-]`, which makes the
-    /// backup ARNs the server issues unresolvable (see
+    /// something: today a `region` outside `[a-z0-9-]`, under which
+    /// `CreateBackup` is refused (see
     /// [`extenddb_storage::config::server_region_warning`]). Shown in the
     /// `serve` banner; the same warning is logged when the storage components
     /// are created.
@@ -187,6 +201,23 @@ impl StorageConfig {
     /// Get operator-facing warnings for non-default storage settings.
     pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
         self.config.startup_warnings()
+    }
+
+    /// The local file the database lives in, when the backend's database is
+    /// one file on this host ([`extenddb_storage::config::StorageConfig::database_file`]).
+    #[must_use]
+    pub fn database_file(&self) -> Option<PathBuf> {
+        self.config.database_file()
+    }
+
+    /// [`Self::database_file`] with the reason a location names no usable
+    /// file ([`extenddb_storage::config::StorageConfig::database_location`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    pub fn database_location(&self) -> Result<Option<PathBuf>, String> {
+        self.config.database_location()
     }
 
     /// Get a reference to the underlying trait object for factory calls.
@@ -416,7 +447,14 @@ fn default_log_format() -> String {
 /// in dev-mode builds.
 #[must_use]
 pub fn is_tls_enabled(config: &AppConfig) -> bool {
-    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+    serves_tls(&config.server.tls)
+}
+
+/// [`is_tls_enabled`] for the TLS section alone: whether a server with this
+/// section loads its certificate and key.
+#[must_use]
+pub fn serves_tls(tls: &TlsConfig) -> bool {
+    tls.enabled && !cfg!(feature = "dev-mode")
 }
 
 /// Load `AppConfig` from a config file (optional) and environment variables.
@@ -430,7 +468,17 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
         .add_source(config::File::with_name(config_path).required(false))
         .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
         .build()?;
-    Ok(config.try_deserialize()?)
+    validated(config.try_deserialize()?)
+}
+
+/// The cross-field checks a deserialized config still has to pass, and the
+/// paths made absolute while the working directory is still the shell's.
+fn validated(mut config: AppConfig) -> anyhow::Result<AppConfig> {
+    config.backup.validate().map_err(|e| anyhow::anyhow!(e))?;
+    if let Ok(cwd) = std::env::current_dir() {
+        config.backup.make_paths_absolute(&cwd);
+    }
+    Ok(config)
 }
 
 /// Load `AppConfig` entirely from built-in defaults and environment variables,
@@ -461,7 +509,7 @@ pub fn load_builtin_defaults() -> anyhow::Result<AppConfig> {
         ))
         .add_source(config::Environment::with_prefix("EXTENDDB").separator("__"))
         .build()?;
-    Ok(config.try_deserialize()?)
+    validated(config.try_deserialize()?)
 }
 
 /// Redact password from a connection string for safe logging (REQ-LOG-002).
@@ -508,6 +556,7 @@ pub fn pid_file_path_default(port: u16) -> PathBuf {
     pid_file_path(&ServerConfig::default().run_dir, port)
 }
 
+pub mod backup;
 mod display;
 pub use display::{MASK, build_config_entries, should_redact};
 

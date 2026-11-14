@@ -79,19 +79,6 @@ fn host_port(addr: &str, port: u16) -> String {
     }
 }
 
-/// Resolve the password from: CLI arg or `EXTENDDB_PASSWORD` env var.
-///
-/// Never reads from stdin. Errors if no password source is available.
-pub fn resolve_password(cli_password: Option<String>) -> anyhow::Result<String> {
-    if let Some(pw) = cli_password {
-        return Ok(pw);
-    }
-    if let Ok(pw) = std::env::var("EXTENDDB_PASSWORD") {
-        return Ok(pw);
-    }
-    anyhow::bail!("No password provided. Use --password VALUE or set EXTENDDB_PASSWORD.")
-}
-
 /// Build a Basic auth header value.
 pub fn basic_auth(user: &str, password: &str) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));

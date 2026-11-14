@@ -381,6 +381,7 @@ async fn gsi_table(s: &Scratch) -> TableKeyInfo {
             non_key_attributes: None,
         },
         provisioned_throughput: None,
+        warm_throughput: None,
     };
     s.engine
         .create_table(
@@ -865,6 +866,12 @@ async fn a_delete_that_loses_its_reservation_removes_the_winner_everywhere() {
             .expect("count c");
         assert_eq!(left, 0, "c is gone from {t}");
     }
+    // A write leaves its stream record in stream_pending until a read or the
+    // numbering worker numbers it (#808). This test stands in for the worker.
+    s.engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending stream records");
     let records: Vec<(serde_json::Value,)> = sqlx::query_as(
         "SELECT record_data FROM stream_records WHERE table_id = $1 ORDER BY sequence_number",
     )
