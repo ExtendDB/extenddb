@@ -98,6 +98,7 @@ async fn build_state() -> (Arc<AppState>, String) {
 
     let state = Arc::new(AppState {
         storage: components.engine,
+        backup_runtime: Arc::new(extenddb_engine::BackupRuntime::new(1)),
         auth: Arc::new(StubAuth {
             account_id: account_id.clone(),
         }),
@@ -109,6 +110,7 @@ async fn build_state() -> (Arc<AppState>, String) {
         version_info: Arc::from("test"),
         metrics: Arc::new(extenddb_core::metrics::MetricsCollector::new()),
         tls_enabled: false,
+        request_timeout: std::time::Duration::from_secs(30),
         dev_mode: true,
         import_paths: empty_paths.clone(),
         export_paths: empty_paths,
@@ -117,6 +119,7 @@ async fn build_state() -> (Arc<AppState>, String) {
         table_key_info_cache,
         config_entries: Vec::new(),
         docs_store: None,
+        admission: crate::registration::Admission::default(),
     });
     (state, account_id)
 }
