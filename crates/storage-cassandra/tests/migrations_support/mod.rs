@@ -20,9 +20,16 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 pub const CATALOG_MIGRATION_6: &str =
     include_str!("../fixtures/0006_backup_catalog_index.expected.json");
 
+/// The columns of `account_metrics`, which migration 10 creates in the
+/// catalog keyspace in place of `metrics`, which it drops.
+pub const CATALOG_MIGRATION_10: &str =
+    include_str!("../fixtures/0010_account_metrics.expected.json");
+
 /// The definitions a keyspace of `dir` (`catalog` or `account`) holds after
 /// every migration: migration 1's, without `continuous_backups`, which
-/// migration 5 drops, and in the catalog with what migration 6 adds.
+/// migration 5 drops, and in the catalog with what migration 6 adds, the
+/// `warm_throughput` column migration 9 adds to `tables` and `indexes`, and
+/// `account_metrics` in place of `metrics` (migration 10).
 ///
 /// # Panics
 ///
@@ -43,6 +50,24 @@ pub fn expected_definitions(dir: &str) -> postcheck::Definitions {
             serde_json::from_str(CATALOG_MIGRATION_6).expect("migration 6");
         expected.columns.extend(added.columns);
         expected.indexes.extend(added.indexes);
+        expected
+            .columns
+            .retain(|name, _| !name.starts_with("metrics."));
+        let added: postcheck::Definitions =
+            serde_json::from_str(CATALOG_MIGRATION_10).expect("migration 10");
+        expected.columns.extend(added.columns);
+        expected.indexes.extend(added.indexes);
+        for table in ["tables", "indexes"] {
+            expected.columns.insert(
+                format!("{table}.warm_throughput"),
+                postcheck::Column {
+                    kind: "regular".to_owned(),
+                    position: -1,
+                    clustering_order: "none".to_owned(),
+                    data_type: "text".to_owned(),
+                },
+            );
+        }
     }
     expected
 }

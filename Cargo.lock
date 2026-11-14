@@ -1016,9 +1016,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -1660,11 +1660,13 @@ dependencies = [
  "clap",
  "daemonize",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
  "extenddb-server",
  "extenddb-storage",
+ "futures",
  "libc",
  "rcgen",
  "rustls",
@@ -1683,12 +1685,15 @@ name = "extenddb-auth"
 version = "0.1.14"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
  "aws-lc-rs",
+ "aws-sigv4",
  "axum",
  "extenddb-cache",
  "extenddb-core",
  "futures",
  "hex",
+ "proptest",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
@@ -1740,9 +1745,11 @@ version = "0.1.14"
 dependencies = [
  "anyhow",
  "config",
+ "extenddb-backup-store",
  "extenddb-core",
  "extenddb-storage",
  "serde",
+ "tempfile",
  "toml",
  "tracing",
 ]
@@ -1768,17 +1775,23 @@ name = "extenddb-engine"
 version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-core",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "hex",
  "hmac 0.12.1",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1795,21 +1808,27 @@ dependencies = [
  "bcrypt",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-cache",
  "extenddb-config",
  "extenddb-core",
  "extenddb-engine",
  "extenddb-storage",
+ "extenddb-storage-sqlite",
  "futures",
  "hyper",
+ "hyper-util",
  "libc",
  "metrics",
  "rand 0.9.4",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "syslog-tracing",
+ "tempfile",
  "time",
  "tokio",
  "tower",
@@ -1854,17 +1873,21 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "bigdecimal",
+ "cassandra-protocol",
  "cdrs-tokio",
  "chrono",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-core",
+ "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-cassandra",
  "futures",
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "toml",
@@ -1913,7 +1936,9 @@ dependencies = [
  "bcrypt",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-core",
+ "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-postgres",
  "futures",
@@ -1923,6 +1948,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "time",
  "tokio",
  "toml",
@@ -1942,7 +1968,9 @@ dependencies = [
  "bigdecimal",
  "crc32fast",
  "extenddb-auth",
+ "extenddb-backup-store",
  "extenddb-core",
+ "extenddb-engine",
  "extenddb-storage",
  "extenddb-storage-sqlite",
  "futures",
@@ -1998,7 +2026,7 @@ checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
  "futures-core",
  "futures-sink",
- "spin 0.9.8",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -2845,7 +2873,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin 0.9.8",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -4194,9 +4222,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]

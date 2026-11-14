@@ -194,6 +194,12 @@ high expiration rates will accumulate backlog.
 
 ### Backup and restore
 
+> Superseded in part. This section describes the first implementation. Restores now run as background jobs that
+> restore the secondary indexes, and a backup in a configured backup store restores into Cassandra;
+> `CreateBackup` on Cassandra still writes the in-catalog backup, before it returns. See the
+> [Backup and Restore manual](../manuals/14-backup-and-restore.md) and the design,
+> [15-backup-restore.md](../design/15-backup-restore.md).
+
 Cassandra's native snapshot mechanism (`nodetool snapshot`) produces node-local SSTable artifacts managed outside CQL.
 Creating, enumerating, or restoring a distributed snapshot requires cluster-level orchestration that is not available
 through the driver session, so the backend implements on-demand backups as logical snapshots instead.
@@ -238,6 +244,11 @@ writes can race the scan. `RestoreTableToPointInTime` is not supported.
 and `ImportTable` execute synchronously and block the API response until complete. Amazon DynamoDB performs these
 asynchronously.
 
+> Superseded in part: `RestoreTableFromBackup` now answers `CREATING` and copies in the background on every backend,
+> and `CreateBackup` with a backup store does so on PostgreSQL, SQLite and MongoDB. On Cassandra `CreateBackup` still
+> completes before it returns, as do `ExportTableToPointInTime` and `ImportTable` on every backend. See the note under
+> "Backup and restore".
+
 **Transaction recovery is conservative.** Transactions found in PREPARING state during recovery are always rolled back,
 even if they could theoretically have been committed. This is safe but means a transaction that completed PREPARE and
 then encountered a server crash will be rolled back rather than committed.
@@ -256,7 +267,14 @@ path is suitable at scale.
 `ImportTable` to background jobs with status polling is planned but not yet implemented. This applies to all current
 ExtendDB backends.
 
+> Superseded in part: the restore, and `CreateBackup` with a backup store on PostgreSQL, SQLite and MongoDB, now run
+> as background jobs (the note under "Data movement operations are synchronous" above).
+
 **Restore does not recover GSI/LSI definitions, tags, TTL configuration, or stream history.**
+
+> Superseded in part: a restore now recovers the GSI and LSI definitions, rebuilt from the items, on every backend, of a backup
+> that recorded them; a backup an earlier release took may not have (the upgrade manual's Current Status section).
+> Tags, TTL configuration and stream history are still not restored.
 
 **Transaction fence uses item data equality.** The TTL deletion protocol conditions the final base item delete on the
 stored item image rather than a version counter. A monotonic version column would be a more robust fence and remove
@@ -266,3 +284,14 @@ the dependency on stable JSON encoding.
 item image, so a transaction that crashes between COMMIT and TTL queue reconciliation can leave the item's previous
 expiration entry in the queue until it comes due. The entry is inert — the worker revalidates before deleting — but it
 is queue garbage.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

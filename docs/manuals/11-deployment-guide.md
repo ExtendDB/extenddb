@@ -21,7 +21,7 @@ This guide covers deploying ExtendDB in various environments beyond local develo
 ExtendDB is a single Rust binary that connects to the storage backend it was built with (PostgreSQL by default; see [Storage backends](../storage-backends.md)). All durable state lives in the backend; ExtendDB keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
 - Running more than one ExtendDB instance against one catalog is not supported in this release (see [Multi-Instance Considerations](#multi-instance-considerations))
-- The backend's own HA, backup, and replication tools provide durability
+- The backend's own HA, backup, and replication tools provide durability; with `[backup.store]` configured (file-backed SQLite has one by default), table backups go to the store on PostgreSQL, SQLite and MongoDB; without one, and always on Cassandra, they are in-catalog backups inside the database; the [Backup and Restore manual](14-backup-and-restore.md) covers both
 - ExtendDB can run anywhere the storage backend is reachable
 
 ## Deployment Models
@@ -124,7 +124,13 @@ exec extenddb serve --foreground --config "$CONFIG"
 
 `extenddb stop` cannot stop a foreground server, because there is no PID file to
 read; stop the container instead, which delivers `SIGTERM` and triggers the same
-graceful shutdown. Outside a container, where you may want `stop` to work, add
+graceful shutdown. With a backup job running the shutdown takes up to 35
+seconds before the workers stop, and up to 76 seconds in all when the database
+is slow to answer (the admin guide's Stopping section); a runtime whose grace
+period is shorter (Docker's default is 10 s) kills the process during the job
+drain, and the reconciler resolves the job's row as it does after a crash. The
+repository's compose files set `stop_grace_period: 80s`, above that sum; a
+compose file of your own needs the same. Outside a container, where you may want `stop` to work, add
 `--write-pid-file`; it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
@@ -208,7 +214,7 @@ extenddb init \
 - [ ] Set `auth.provider = "builtin"` in `extenddb.toml`
 - [ ] Change the admin password from the auto-generated one
 - [ ] Create named accounts and IAM users with least-privilege policies
-- [ ] Disable credential import if not needed: `extenddb settings set allow_credential_import false`
+- [ ] Leave credential import off unless you need it. The server refuses imports unless `allow_credential_import` is `true`. If you enabled it to import keys, turn it off again: `extenddb settings set allow_credential_import false`
 
 ### Transport
 
@@ -227,12 +233,13 @@ extenddb init \
 - [ ] Use a dedicated PostgreSQL user for ExtendDB with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
-- [ ] Set up automated backups (pg_dump, WAL archiving, or managed service snapshots)
+- [ ] Set up automated backups that copy the catalog and data databases as one copy: a base backup with WAL archiving or managed service snapshots of the instance (either covers one instance, so only when both databases are on one PostgreSQL instance), or `pg_dump` of both with the server stopped, under `umask 077` (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry)
+- [ ] Configure `[backup.store]` (S3 for production) per the [Backup and Restore manual](14-backup-and-restore.md)
 - [ ] Monitor PostgreSQL disk usage, connection count, and query performance
 
 ### Monitoring
 
-- [ ] Poll `/metrics` for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
+- [ ] Poll `/metrics` with an admin user's credentials (HTTP Basic auth) for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
 - [ ] Monitor ExtendDB process with systemd, supervisord, or equivalent
@@ -265,6 +272,16 @@ User=extenddb
 Group=extenddb
 Restart=on-failure
 RestartSec=5
+# On a host that backs up tables of large items, one malloc arena keeps a
+# backup job's high-water mark at the pipeline's terms whatever the number of
+# large items it reads (the admin guide's [backup] max_concurrent_jobs row
+# gives the figures). It costs the request path a few percent (3.5 to 9.2%
+# on GetItem, Query and Scan on SQLite, about 2% on PostgreSQL (the scans,
+# 2.1%)), so the line is left to the operator. On SQLite it also lowers
+# the peak of a restore of tables whose items are larger than a few
+# hundred bytes, of any attribute types (the Backup and Restore manual
+# gives the figures):
+#Environment=MALLOC_ARENA_MAX=1
 
 [Install]
 WantedBy=multi-user.target
@@ -275,13 +292,16 @@ sudo systemctl enable extenddb
 sudo systemctl start extenddb
 ```
 
+With this unit only the `extenddb` user and root can read export files: the server creates them with mode 0600, and the import and export roots and account directories it creates with mode 0700, which the daemon's umask (027) can only narrow; before v0.1.15 that umask gave the `extenddb` group read access (see [the v0.1.15 entry](07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) of the upgrade manual). To give a group access to a root, for example to put import files into it, create the root before the first start with that group and the mode you want, since an existing directory keeps its mode; export files in it are still created 0600. Import files go under `<root>/<account id>`. When one directory is both an import and an export root (the deprecated `import_export_root`, or the same path under `[import]` and `[export]`), the first export of an account creates that directory 0700, so also create each `<root>/<account id>` beforehand with the group and mode you want, or use separate import and export roots. Keep each parent directory of a root writable by its owner only (root or `extenddb`): the server logs a warning at startup for a parent directory that group or others can write to without the sticky bit, since a user who can write to it could replace the root.
+
 ## Multi-Instance Considerations
 
 Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported in this release:
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
-- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation.
+- `/health` is a liveness check that does not query the database, so a load balancer cannot use it to take an instance with a broken database connection out of rotation. It does report the backup store: `components.backup_store` is `unhealthy` and `status` is `degraded` while the configured store cannot be reached or fails its identity check, with HTTP 200 kept, so a store outage never drains a replica.
+- Instances that share a catalog must share one backup store root (`[backup.store]`: one S3 bucket and prefix, or one shared mount that supports hard links, which the store's conditional create needs; some CIFS and FUSE mounts refuse `link(2)` with `EPERM`, and the server then reports the store as having failed validation, with the `link` error in the log line). A host-local directory configured at the same path on each host is not one root: once the catalog has rows for the root, the second instance finds the root's identity file missing or the newest backup's manifest absent and starts with the store unhealthy. While the catalog has no rows for the root (a fresh deployment, or one whose backups were purged), nothing tells the two directories apart: each instance creates its own identity file and store id and both start healthy, and the first backups then split the rows between two ids, which the next check reports as an identity mismatch. `backup purge`, plain `backup sync` and `--prune-missing` all refuse while the store is unhealthy, and `--forget-store` refuses the one root label both directories share. To clear it, keep one directory: remove each row that carries the other directory's store id with `extenddb backup sync --forget-backup <arn>` (`backup list` prints each row's `store_id`; the command runs on the unhealthy store and deletes no object), copy that directory's account directories, without its `extenddb-store.json`, into the kept one as the server's user, keeping directories `0700` and files `0600` (`cp -rp` or `rsync -a`; `backup sync` exits 1 on a directory left `0755`), point every instance at the kept directory over a shared mount, and run plain `backup sync`, which adopts them; or restore the catalog from a copy taken before the split, keep the directory whose store id the restored rows carry, and copy the other directory's account directories into it the same way before `backup sync` (the backups that the other directory's instance took after the catalog's copy are otherwise unknown to it). The [Backup and Restore manual](14-backup-and-restore.md#configuration) gives both, with the case of a `DELETING` row among them. Point every instance at one root before the first backup. To change the root later without losing the backups, reconfigure every instance to the new root, copy the old root's tree there without its `extenddb-store.json` (the new root has its own once the instances restart) and run `extenddb backup sync --move-store <old root>` ([Moving a store to a new root](14-backup-and-restore.md#moving-a-store-to-a-new-root)). Each instance on a host needs its own `spool_path`; the spool's `.lock` refuses a second instance. An existing spool directory must be owned by the server's user with mode `0700`, as the root must; a spool created `0755` stops startup naming it.
 
 On SQLite this limit is enforced: `extenddb serve` holds an exclusive lock on `<database>.lock` and a second server on the same file refuses to start. On PostgreSQL, MongoDB, and Cassandra it is not enforced. On PostgreSQL, if you start a second instance anyway, size `pool_size × instance_count + 3 × instance_count ≤ PostgreSQL max_connections`.
 
@@ -300,7 +320,7 @@ pool_size = 50  # Increase for higher concurrency
 
 Ensure PostgreSQL `max_connections` accommodates the total pool size plus overhead.
 
-Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests; a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
+Backup and restore work is bounded per server by `[backup] max_concurrent_jobs` (default 4): `CreateBackup` and `RestoreTableFromBackup` jobs together, on every backend, and a request that finds every slot held waits up to 30 s for one, holding nothing meanwhile, and is then refused with `LimitExceededException` and creates nothing. On PostgreSQL each running job holds one pooled connection for its copy plus one dedicated connection outside the pool for its claim, and startup raises `pool_size` and `catalog_pool_size` to at least `2 * max_concurrent_jobs + 10` with a warning naming both numbers (the admin guide's `[backup]` table). On SQLite a `CreateBackup` also holds its snapshot connection for its duration, and a server admits at most `pool_size / 2 - 1` of them at once (between 1 and 16; 4 for the default `pool_size` of 10), so that half the pool stays free for ordinary requests, and raises a smaller `pool_size` to `2 * (max_concurrent_jobs + 1)`, at most 34, so that bound refuses no job `max_concurrent_jobs` admits (the admin guide's `max_concurrent_jobs` row; above 16 jobs the slot refuses the seventeenth); a `CreateBackup` over that bound is refused at once with the same `LimitExceededException`. A MongoDB restore request that is not registered within 60 seconds answers an internal error while the restore goes on in the background; the MongoDB driver does not enforce `waitQueueTimeoutMS`, so the admission bound is what keeps a flood of restores from holding every pooled connection.
 
 ### Cassandra Connection Pool
 
@@ -350,6 +370,6 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

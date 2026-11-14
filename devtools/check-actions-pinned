@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Fails when a workflow or an action names another repository's action or
+reusable workflow by anything other than a full 40-character commit SHA:
+
+    devtools/check-actions-pinned [repository root]
+    devtools/check-actions-pinned --selftest
+
+The repository root defaults to the current directory. The check parses with
+PyYAML each workflow file in .github/workflows and each action.yml or
+action.yaml under the root, except under .git. It opens symlinked files
+through the link. It reads the `uses` value of each job (a reusable
+workflow), of each step of a job and of each step of a composite action
+(runs.steps). A value from another repository passes only as
+owner/repo[/path]@<40 lowercase hex characters>. By convention the version
+goes in a trailing comment, which YAML does not read. The check skips
+docker:// images. It follows a local reference (./path) to the workflow file
+that the path names, or to the action.yml or action.yaml in that folder.
+That file must exist.
+
+YAML 1.2 does not allow a repeated key in a mapping, and GitHub Actions does
+not read the merge key (<<) of YAML 1.1. PyYAML accepts both, so the check
+refuses both as parse errors.
+
+PyYAML follows YAML 1.1, which reads `yes`, `no`, `on` and `off` as booleans.
+GitHub reads only the YAML 1.2 core booleans (true, True, TRUE, false, False,
+FALSE). The check reads booleans as GitHub does, so job ids such as `yes` and
+`on` stay two jobs. It also refuses a mapping whose keys read as fewer values
+than the mapping has keys, for example the job ids `1` and `0x1`, so that no
+job that GitHub runs can drop out of the check.
+
+Exit code 0: every reference is pinned.
+Exit code 1: a reference is not pinned. The check lists each one with its
+file, job and step.
+Exit code 2: the check did not complete, for one of these causes:
+  - no workflow file
+  - a file that cannot be read or parsed, or that has the wrong shape
+  - a missing local file
+  - any other error
+
+--selftest runs the cases of SelfTest, each on a temporary tree.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import traceback
+import unittest
+
+try:
+    import yaml
+except ImportError as e:
+    print(f"error: {e}. The Actions pinned workflow installs PyYAML==6.0.3.", file=sys.stderr)
+    sys.exit(2)
+
+# owner/repo[/path]@<40-character commit SHA>. Unlike a tag or a branch, a
+# commit SHA always names the same code.
+PINNED = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(/[^@\s]+)?@[0-9a-f]{40}", re.ASCII)
+ACTION_FILES = ("action.yml", "action.yaml")
+MERGE_TAG = "tag:yaml.org,2002:merge"
+BOOL_TAG = "tag:yaml.org,2002:bool"
+
+
+class CheckError(Exception):
+    """A file that the check cannot read, parse or follow."""
+
+
+class Loader(yaml.SafeLoader):
+    """PyYAML's safe loader, with the YAML 1.2 core booleans that GitHub reads.
+    It refuses a mapping whose keys read as fewer values than it has keys."""
+
+    def construct_mapping(self, node, deep=False):
+        value = super().construct_mapping(node, deep=deep)
+        if len(value) < len(node.value):
+            raise CheckError(f"line {node.start_mark.line + 1}: two keys of one mapping read as one value")
+        return value
+
+
+Loader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag != BOOL_TAG]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+Loader.add_implicit_resolver(BOOL_TAG, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF"))
+
+
+def refuse_repeated_and_merge_keys(node: yaml.Node, seen: set[int]) -> None:
+    """Raise CheckError at a repeated key or a merge key anywhere under node.
+    An alias is the node of its anchor, so `seen` stops a loop."""
+    if id(node) in seen:
+        return
+    seen.add(id(node))
+    if isinstance(node, yaml.MappingNode):
+        keys = set()
+        for key, value in node.value:
+            line = key.start_mark.line + 1
+            if key.tag == MERGE_TAG:
+                raise CheckError(f"line {line}: a merge key (<<)")
+            if isinstance(key, yaml.ScalarNode):
+                if (key.tag, key.value) in keys:
+                    raise CheckError(f"line {line}: a repeated key {key.value!r}")
+                keys.add((key.tag, key.value))
+            refuse_repeated_and_merge_keys(key, seen)
+            refuse_repeated_and_merge_keys(value, seen)
+    elif isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            refuse_repeated_and_merge_keys(item, seen)
+
+
+def load(path: str):
+    """The document in the file at path, as Loader reads it."""
+    try:
+        with open(path, "rb") as f:
+            loader = Loader(f)
+            try:
+                node = loader.get_single_node()
+                if node is None:
+                    return None
+                refuse_repeated_and_merge_keys(node, set())
+                return loader.construct_document(node)
+            finally:
+                loader.dispose()
+    except (OSError, yaml.YAMLError) as e:
+        raise CheckError(" ".join(str(e).split())) from e
+
+
+def mapping(value, where: str) -> dict:
+    """value, which must be a mapping."""
+    if not isinstance(value, dict):
+        raise CheckError(f"{where} is not a mapping")
+    return value
+
+
+def step_references(parent: dict, where: str):
+    """(location, uses value, False) for each step under parent that has a
+    uses key."""
+    steps = parent.get("steps", [])
+    if not isinstance(steps, list):
+        raise CheckError(f"{where}.steps is not a list")
+    for i, step in enumerate(steps):
+        step = mapping(step, f"{where}.steps[{i}]")
+        if "uses" in step:
+            label = step.get("name") or step.get("id")
+            yield f"{where}.steps[{i}]" + (f" ({label})" if label else ""), step["uses"], False
+
+
+def references(doc, kind: str):
+    """(location, uses value, whether a job holds it) for each reference in a
+    workflow or an action document."""
+    doc = mapping(doc, "the document")
+    if kind == "action":
+        yield from step_references(mapping(doc.get("runs"), "runs"), "runs")
+        return
+    for job_id, job in mapping(doc.get("jobs"), "jobs").items():
+        job = mapping(job, f"jobs.{job_id}")
+        if "uses" in job:
+            yield f"jobs.{job_id}", job["uses"], True
+        yield from step_references(job, f"jobs.{job_id}")
+
+
+def local_files(value: str, is_job: bool) -> list[tuple[str, str]]:
+    """The (kind, path) of each file that a local reference can name. A job
+    names a workflow file. A step names a folder with an action.yml or
+    action.yaml."""
+    if is_job:
+        return [("workflow", os.path.normpath(value))]
+    return [("action", os.path.normpath(os.path.join(value, name))) for name in ACTION_FILES]
+
+
+def check(root: str) -> tuple[int, list[str]]:
+    """Check the tree at root. Return the exit code and the lines to print."""
+    errors, unpinned, counts = [], [], {"workflow": 0, "action": 0}
+    workflows = os.path.join(root, ".github", "workflows")
+    try:
+        names = sorted(os.listdir(workflows))
+    except (FileNotFoundError, NotADirectoryError):
+        names = []
+    queue = [
+        ("workflow", os.path.join(".github", "workflows", n)) for n in names if n.lower().endswith((".yml", ".yaml"))
+    ]
+    if not queue:
+        errors.append(f"error: no workflow file in {workflows}")
+
+    def walk_error(e: OSError) -> None:
+        errors.append(f"error: cannot list {e.filename}: {e.strerror}")
+
+    for top, dirs, files in os.walk(root, onerror=walk_error):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        queue += [("action", os.path.relpath(os.path.join(top, n), root)) for n in sorted(files) if n in ACTION_FILES]
+
+    done = set()
+    while queue:
+        kind, path = queue.pop(0)
+        full = os.path.join(root, path)
+        if (kind, os.path.realpath(full)) in done:
+            continue
+        done.add((kind, os.path.realpath(full)))
+        counts[kind] += 1
+        try:
+            for where, value, is_job in references(load(full), kind):
+                if not isinstance(value, str):
+                    errors.append(f"error: {path}: {where}: uses is not a string: {value!r}")
+                elif value.startswith("./"):
+                    found = [(k, p) for k, p in local_files(value, is_job) if os.path.isfile(os.path.join(root, p))]
+                    if not found:
+                        wanted = "a workflow file" if is_job else "a folder with an action.yml or action.yaml"
+                        errors.append(f"error: {path}: {where}: {value} does not name {wanted}")
+                    queue += found
+                elif not value.startswith("docker://") and not PINNED.fullmatch(value):
+                    unpinned.append(f"{path}: {where}: {value if value.isprintable() else repr(value)}")
+        except CheckError as e:
+            errors.append(f"error: {path}: {e}")
+
+    lines = (["These action references are not pinned to a full commit SHA:"] + unpinned) if unpinned else []
+    lines += errors
+    lines.append(f"Files checked: {counts['workflow']} workflow, {counts['action']} action.")
+    if not (errors or unpinned):
+        lines.append("Every reference to another repository is pinned to a commit SHA.")
+    return (2 if errors else 1 if unpinned else 0), lines
+
+
+def main(argv: list[str]) -> int:
+    if argv[1:] == ["--selftest"]:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
+        return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+    if len(argv) > 2 or (len(argv) == 2 and argv[1].startswith("-")):
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        code, lines = check(argv[1] if len(argv) == 2 else ".")
+    except Exception:  # an error the check did not foresee fails it
+        traceback.print_exc()
+        return 2
+    print("\n".join(lines))
+    return code
+
+
+SHA = "d23441a48e516b6c34aea4fa41551a30e30af803"
+
+
+def workflow(*lines: str) -> str:
+    """A workflow whose job `build` has the steps in lines, each line indented
+    as it is under `steps:`."""
+    return "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n" + "".join(
+        f"      {line}\n" for line in lines
+    )
+
+
+def composite(*lines: str) -> str:
+    """A composite action with the steps in lines."""
+    return "runs:\n  using: composite\n  steps:\n" + "".join(f"    {line}\n" for line in lines)
+
+
+def write_tree(top: str, files: dict[str, str], links: tuple[tuple[str, str], ...] = ()) -> None:
+    """Write files ({path: text}, with <sha> replaced by SHA) and symlinks
+    ((path, target) pairs) under top."""
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(top, path)), exist_ok=True)
+        with open(os.path.join(top, path), "w", encoding="utf-8") as f:
+            f.write(text.replace("<sha>", SHA))
+    for path, target in links:
+        os.makedirs(os.path.dirname(os.path.join(top, path)), exist_ok=True)
+        os.symlink(target, os.path.join(top, path))
+
+
+class SelfTest(unittest.TestCase):
+    """A pinned and an unpinned control, and the cases that a check reading
+    `uses:` lines one at a time gets wrong. Such a check passes the unpinned
+    references in A1 to A5. It fails the pinned references in B1 and B2. It
+    passes the trees in C1 and C2, which it cannot read. A6 and C3 hold job
+    ids that YAML 1.1 reads as one key."""
+
+    def run_check(self, files: dict[str, str], links=(), root: str = "") -> tuple[int, str]:
+        with tempfile.TemporaryDirectory() as top:
+            write_tree(top, files, links)
+            code, lines = check(os.path.join(top, root))
+        return code, "\n".join(lines)
+
+    def assert_line(self, out: str, line: str) -> None:
+        self.assertIn(line, out.splitlines(), out)
+
+    def test_control_pinned_references_pass(self) -> None:
+        code, out = self.run_check({
+            ".github/workflows/ci.yml": (
+                workflow(
+                    "- uses: actions/checkout@<sha> # v6.1.0",
+                    "- uses: 'actions/setup-python@<sha>'",
+                    "- uses: docker://alpine:3.20",
+                    "- uses: ./.github/actions/local",
+                )
+                + "  remote:\n    uses: owner/repo/.github/workflows/build.yml@<sha> # v1\n"
+                + "  local:\n    uses: ./.github/workflows/called.yml\n"
+            ),
+            ".github/workflows/called.yml": workflow("- uses: actions/cache@<sha> # v4"),
+            ".github/actions/local/action.yml": composite("- uses: actions/cache@<sha> # v4"),
+        })
+        self.assertEqual(code, 0, out)
+        self.assert_line(out, "Files checked: 2 workflow, 1 action.")
+
+    def test_control_an_unpinned_reference_fails_with_its_file_job_and_step(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": workflow(
+            "- uses: actions/checkout@<sha>", "- name: Cache", "  uses: actions/cache@v4")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.build.steps[1] (Cache): actions/cache@v4")
+        self.assertNotIn("checkout", out)
+
+    def test_a1_a_value_on_the_line_after_the_key_is_read(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": workflow("- uses:", "    actions/cache@v4")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.build.steps[0]: actions/cache@v4")
+
+    def test_a2_a_step_in_flow_style_is_read(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": workflow("- {uses: actions/cache@v4}")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.build.steps[0]: actions/cache@v4")
+
+    def test_a3_a_local_action_outside_github_is_read(self) -> None:
+        code, out = self.run_check({
+            ".github/workflows/ci.yml": workflow("- uses: ./ci/act"),
+            "ci/act/action.yml": composite("- uses: actions/cache@v4"),
+        })
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, "ci/act/action.yml: runs.steps[0]: actions/cache@v4")
+
+    def test_a4_symlinks_that_point_outside_the_repository_are_read(self) -> None:
+        code, out = self.run_check({
+            "repo/.github/workflows/ci.yml": workflow("- uses: ./.github/actions/act"),
+            "outside/linked.yml": workflow("- uses: actions/cache@v4"),
+            "outside/act/action.yml": composite("- uses: actions/setup-node@v4"),
+        }, links=(
+            ("repo/.github/workflows/linked.yml", "../../../outside/linked.yml"),
+            ("repo/.github/actions/act", "../../../outside/act"),
+        ), root="repo")
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/linked.yml: jobs.build.steps[0]: actions/cache@v4")
+        self.assert_line(out, ".github/actions/act/action.yml: runs.steps[0]: actions/setup-node@v4")
+
+    def test_a5_a_file_name_with_a_colon_is_read(self) -> None:
+        code, out = self.run_check({".github/workflows/a:b.yml": workflow("- uses: actions/cache@v4")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/a:b.yml: jobs.build.steps[0]: actions/cache@v4")
+
+    def test_a6_job_ids_that_yaml_1_1_reads_as_one_boolean_are_two_jobs(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": (
+            "on: push\njobs:\n"
+            "  yes:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n"
+            "  on:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@<sha>\n")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.yes.steps[0]: actions/cache@v4")
+
+    def test_b1_a_pinned_value_in_a_block_scalar_passes(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": workflow("- uses: >-", "    actions/cache@<sha>")})
+        self.assertEqual(code, 0, out)
+
+    def test_b2_a_pinned_value_with_an_anchor_and_its_alias_pass(self) -> None:
+        pinned = workflow("- uses: &cache actions/cache@<sha>", "- uses: *cache")
+        code, out = self.run_check({".github/workflows/ci.yml": pinned})
+        self.assertEqual(code, 0, out)
+        code, out = self.run_check({".github/workflows/ci.yml": pinned.replace("@<sha>", "@v4")})
+        self.assertEqual(code, 1, out)
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.build.steps[0]: actions/cache@v4")
+        self.assert_line(out, ".github/workflows/ci.yml: jobs.build.steps[1]: actions/cache@v4")
+
+    def test_c1_a_file_that_cannot_be_read_or_parsed_fails(self) -> None:
+        code, out = self.run_check({
+            ".github/workflows/ok.yml": workflow("- uses: actions/cache@<sha>"),
+            ".github/workflows/bad.yml": "jobs: [\n",
+            ".github/workflows/shape.yml": "jobs:\n  build:\n    steps: run\n",
+            ".github/workflows/repeated.yml": workflow("- uses: actions/cache@<sha>", "  uses: actions/cache@v4"),
+            ".github/workflows/merge.yml": workflow("- &step {uses: actions/cache@<sha>}", "- {<<: *step}"),
+        }, links=((".github/workflows/gone.yml", "missing.yml"),))
+        self.assertEqual(code, 2, out)
+        for name in ("bad", "shape", "repeated", "merge", "gone"):
+            self.assertIn(f"error: .github/workflows/{name}.yml: ", out)
+        self.assertNotIn("error: .github/workflows/ok.yml", out)
+
+    def test_c3_two_keys_that_read_as_one_value_fail(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": (
+            "on: push\njobs:\n"
+            "  1:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n"
+            "  0x1:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@<sha>\n")})
+        self.assertEqual(code, 2, out)
+        self.assertIn("error: .github/workflows/ci.yml: line 3: two keys of one mapping read as one value", out)
+
+    def test_c2_a_tree_with_no_workflow_file_fails(self) -> None:
+        for files in ({"README.md": "no .github folder\n"}, {".github/workflows/notes.txt": "no workflow\n"}):
+            code, out = self.run_check(files)
+            self.assertEqual(code, 2, out)
+            self.assertIn("error: no workflow file in ", out)
+
+    def test_a_missing_local_action_or_workflow_fails(self) -> None:
+        code, out = self.run_check({".github/workflows/ci.yml": (
+            workflow("- uses: ./ci/missing") + "  call:\n    uses: ./.github/workflows/missing.yml\n")})
+        self.assertEqual(code, 2, out)
+        self.assert_line(out, "error: .github/workflows/ci.yml: jobs.build.steps[0]: ./ci/missing"
+                              " does not name a folder with an action.yml or action.yaml")
+        self.assert_line(out, "error: .github/workflows/ci.yml: jobs.call: ./.github/workflows/missing.yml"
+                              " does not name a workflow file")
+
+    def test_the_command_exits_with_the_code_of_the_check(self) -> None:
+        trees = (
+            (0, {".github/workflows/ci.yml": workflow("- uses: actions/cache@<sha>")}),
+            (1, {".github/workflows/ci.yml": workflow("- uses: actions/cache@v4")}),
+            (2, {"README.md": "no .github folder\n"}),
+        )
+        for want, files in trees:
+            with tempfile.TemporaryDirectory() as top:
+                write_tree(top, files)
+                done = subprocess.run([sys.executable, os.path.abspath(__file__), top],
+                                      capture_output=True, text=True, timeout=60, check=False)
+            self.assertEqual(done.returncode, want, done.stdout + done.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

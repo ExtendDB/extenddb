@@ -1,5 +1,6 @@
 # catalog database
 table access_keys
+table account_metrics
 table accounts
 table admin_users
 table backup_definitions
@@ -20,7 +21,6 @@ table iam_users
 table idempotency_tokens
 table indexes
 table login_attempts
-table metrics
 table schema_history
 table settings
 table stream_records
@@ -35,6 +35,16 @@ column access_keys.account_id: text NOT NULL
 column access_keys.user_name: text NOT NULL
 column access_keys.is_active: boolean NOT NULL DEFAULT true
 column access_keys.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column account_metrics.bucket: timestamp with time zone NOT NULL
+column account_metrics.account_id: text NOT NULL DEFAULT ''::text
+column account_metrics.metric: text NOT NULL
+column account_metrics.table_name: text NOT NULL DEFAULT ''::text
+column account_metrics.index_name: text NOT NULL DEFAULT ''::text
+column account_metrics.operation: text NOT NULL DEFAULT ''::text
+column account_metrics.sum: double precision NOT NULL DEFAULT 0
+column account_metrics.count: bigint NOT NULL DEFAULT 0
+column account_metrics.min: double precision NOT NULL DEFAULT 'Infinity'::double precision
+column account_metrics.max: double precision NOT NULL DEFAULT '-Infinity'::double precision
 column accounts.account_id: text NOT NULL
 column accounts.account_name: text NOT NULL
 column accounts.created_at: timestamp with time zone NOT NULL DEFAULT now()
@@ -151,19 +161,11 @@ column indexes.projection: jsonb NOT NULL
 column indexes.index_status: text NOT NULL DEFAULT 'ACTIVE'::text
 column indexes.provisioned_throughput: jsonb
 column indexes.propagation_delay_ms: integer
+column indexes.warm_throughput: jsonb
 column login_attempts.principal: text NOT NULL
 column login_attempts.attempted_at: timestamp with time zone NOT NULL DEFAULT now()
 column login_attempts.success: boolean NOT NULL
 column login_attempts.source_ip: text
-column metrics.bucket: timestamp with time zone NOT NULL
-column metrics.metric: text NOT NULL
-column metrics.table_name: text NOT NULL DEFAULT ''::text
-column metrics.index_name: text NOT NULL DEFAULT ''::text
-column metrics.operation: text NOT NULL DEFAULT ''::text
-column metrics.sum: double precision NOT NULL DEFAULT 0
-column metrics.count: bigint NOT NULL DEFAULT 0
-column metrics.min: double precision NOT NULL DEFAULT 'Infinity'::double precision
-column metrics.max: double precision NOT NULL DEFAULT '-Infinity'::double precision
 column schema_history.filename: text NOT NULL
 column schema_history.applied_at: timestamp with time zone NOT NULL DEFAULT now()
 column settings.key: text NOT NULL
@@ -217,6 +219,7 @@ column tables.ttl_index_ready: boolean NOT NULL DEFAULT false
 column tables.table_class: text
 column tables.sse_specification: jsonb
 column tables.on_demand_throughput: jsonb
+column tables.warm_throughput: jsonb
 column tags.resource_arn: text NOT NULL
 column tags.tag_key: text NOT NULL
 column tags.tag_value: text NOT NULL
@@ -234,6 +237,7 @@ column vector_indexes.skipped_item_count: bigint
 column vector_indexes.build_owner: text
 column vector_indexes.build_heartbeat_at: timestamp with time zone
 index access_keys_pkey: CREATE UNIQUE INDEX access_keys_pkey ON public.access_keys USING btree (access_key_id)
+index account_metrics_pkey: CREATE UNIQUE INDEX account_metrics_pkey ON public.account_metrics USING btree (bucket, account_id, metric, table_name, index_name, operation)
 index accounts_account_name_key: CREATE UNIQUE INDEX accounts_account_name_key ON public.accounts USING btree (account_name)
 index accounts_pkey: CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (account_id)
 index admin_users_pkey: CREATE UNIQUE INDEX admin_users_pkey ON public.admin_users USING btree (admin_name)
@@ -264,7 +268,6 @@ index idx_backups_table: CREATE INDEX idx_backups_table ON public.backups USING 
 index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_created ON public.idempotency_tokens USING btree (created_at)
 index idx_login_attempts_principal_time: CREATE INDEX idx_login_attempts_principal_time ON public.login_attempts USING btree (principal, attempted_at DESC)
 index idx_login_attempts_source_ip_time: CREATE INDEX idx_login_attempts_source_ip_time ON public.login_attempts USING btree (source_ip, attempted_at DESC) WHERE (source_ip IS NOT NULL)
-index idx_metrics_bucket: CREATE INDEX idx_metrics_bucket ON public.metrics USING btree (bucket)
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
 index idx_table_restores_backup: CREATE INDEX idx_table_restores_backup ON public.table_restores USING btree (source_backup_arn)
@@ -272,7 +275,6 @@ index idx_table_restores_status: CREATE INDEX idx_table_restores_status ON publi
 index idx_tables_pending_transition: CREATE INDEX idx_tables_pending_transition ON public.tables USING btree (status_transition_at) WHERE (status_transition_at IS NOT NULL)
 index idx_vector_indexes_index_id: CREATE UNIQUE INDEX idx_vector_indexes_index_id ON public.vector_indexes USING btree (index_id)
 index indexes_pkey: CREATE UNIQUE INDEX indexes_pkey ON public.indexes USING btree (table_id, index_name)
-index metrics_pkey: CREATE UNIQUE INDEX metrics_pkey ON public.metrics USING btree (bucket, metric, table_name, index_name, operation)
 index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
 index settings_pkey: CREATE UNIQUE INDEX settings_pkey ON public.settings USING btree (key)
 index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
@@ -284,6 +286,7 @@ index tags_pkey: CREATE UNIQUE INDEX tags_pkey ON public.tags USING btree (resou
 index vector_indexes_pkey: CREATE UNIQUE INDEX vector_indexes_pkey ON public.vector_indexes USING btree (table_id, index_name)
 constraint access_keys.access_keys_account_id_user_name_fkey: FOREIGN KEY (account_id, user_name) REFERENCES iam_users(account_id, user_name) ON DELETE CASCADE
 constraint access_keys.access_keys_pkey: PRIMARY KEY (access_key_id)
+constraint account_metrics.account_metrics_pkey: PRIMARY KEY (bucket, account_id, metric, table_name, index_name, operation)
 constraint accounts.accounts_account_name_key: UNIQUE (account_name)
 constraint accounts.accounts_pkey: PRIMARY KEY (account_id)
 constraint admin_users.admin_users_pkey: PRIMARY KEY (admin_name)
@@ -324,7 +327,6 @@ constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (token)
 constraint indexes.chk_propagation_delay_ms_non_negative: CHECK (((propagation_delay_ms IS NULL) OR (propagation_delay_ms >= 0)))
 constraint indexes.indexes_pkey: PRIMARY KEY (table_id, index_name)
 constraint indexes.indexes_table_id_fkey: FOREIGN KEY (table_id) REFERENCES tables(table_id) ON DELETE CASCADE
-constraint metrics.metrics_pkey: PRIMARY KEY (bucket, metric, table_name, index_name, operation)
 constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
 constraint settings.settings_pkey: PRIMARY KEY (key)
 constraint stream_records.stream_records_pkey: PRIMARY KEY (shard_id, sequence_number)
@@ -346,7 +348,9 @@ sequence stream_seq: bigint START 1 INCREMENT 1
 table extenddb_migrations
 table gsi_pending
 table idempotency_tokens
+table restore_progress
 table schema_history
+table stream_pending
 table stream_records
 table stream_shards
 table vector_index_holds
@@ -369,8 +373,18 @@ column idempotency_tokens.account_id: text NOT NULL
 column idempotency_tokens.token: text NOT NULL
 column idempotency_tokens.fingerprint: text NOT NULL
 column idempotency_tokens.created_at: timestamp with time zone NOT NULL DEFAULT now()
+column restore_progress.table_id: text NOT NULL
+column restore_progress.file_index: bigint NOT NULL
+column restore_progress.items_applied: bigint NOT NULL
 column schema_history.filename: text NOT NULL
 column schema_history.applied_at: timestamp with time zone NOT NULL DEFAULT now()
+column stream_pending.shard_id: text NOT NULL
+column stream_pending.id: bigint NOT NULL DEFAULT nextval('stream_pending_id_seq'::regclass)
+column stream_pending.table_id: text NOT NULL
+column stream_pending.event_name: text NOT NULL
+column stream_pending.record_data: jsonb NOT NULL
+column stream_pending.record_bytes: bigint NOT NULL DEFAULT 0
+column stream_pending.created_at: timestamp with time zone NOT NULL
 column stream_records.shard_id: text NOT NULL
 column stream_records.sequence_number: text NOT NULL
 column stream_records.table_id: text NOT NULL
@@ -394,17 +408,23 @@ index idx_idempotency_tokens_created: CREATE INDEX idx_idempotency_tokens_create
 index idx_stream_records_created: CREATE INDEX idx_stream_records_created ON public.stream_records USING btree (created_at)
 index idx_stream_shards_table: CREATE INDEX idx_stream_shards_table ON public.stream_shards USING btree (table_id)
 index idx_vector_index_holds_table: CREATE INDEX idx_vector_index_holds_table ON public.vector_index_holds USING btree (table_id)
+index restore_progress_pkey: CREATE UNIQUE INDEX restore_progress_pkey ON public.restore_progress USING btree (table_id, file_index)
 index schema_history_pkey: CREATE UNIQUE INDEX schema_history_pkey ON public.schema_history USING btree (filename)
+index stream_pending_pkey: CREATE UNIQUE INDEX stream_pending_pkey ON public.stream_pending USING btree (shard_id, id)
 index stream_records_pkey: CREATE UNIQUE INDEX stream_records_pkey ON public.stream_records USING btree (shard_id, sequence_number)
 index stream_shards_pkey: CREATE UNIQUE INDEX stream_shards_pkey ON public.stream_shards USING btree (shard_id)
 index vector_index_holds_pkey: CREATE UNIQUE INDEX vector_index_holds_pkey ON public.vector_index_holds USING btree (table_id, index_id)
 constraint extenddb_migrations.extenddb_migrations_pkey: PRIMARY KEY (id)
 constraint gsi_pending.gsi_pending_pkey: PRIMARY KEY (id)
 constraint idempotency_tokens.idempotency_tokens_pkey: PRIMARY KEY (account_id, token)
+constraint restore_progress.restore_progress_pkey: PRIMARY KEY (table_id, file_index)
 constraint schema_history.schema_history_pkey: PRIMARY KEY (filename)
+constraint stream_pending.stream_pending_pkey: PRIMARY KEY (shard_id, id)
+constraint stream_pending.stream_pending_shard_id_fkey: FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE
 constraint stream_records.stream_records_pkey: PRIMARY KEY (shard_id, sequence_number)
 constraint stream_records.stream_records_shard_id_fkey: FOREIGN KEY (shard_id) REFERENCES stream_shards(shard_id) ON DELETE CASCADE
 constraint stream_shards.stream_shards_pkey: PRIMARY KEY (shard_id)
 constraint vector_index_holds.vector_index_holds_pkey: PRIMARY KEY (table_id, index_id)
 sequence gsi_pending_id_seq: bigint START 1 INCREMENT 1
+sequence stream_pending_id_seq: bigint START 1 INCREMENT 1
 sequence stream_seq: bigint START 1 INCREMENT 1

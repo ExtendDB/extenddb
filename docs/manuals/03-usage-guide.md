@@ -575,7 +575,7 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 | PartiQL (ExecuteStatement, BatchExecuteStatement, ExecuteTransaction) | ✗ (not implemented; returns UnknownOperationException) |
 | DAX | ✗ (not applicable) |
 | Global Tables | ✗ (not implemented; returns UnknownOperationException) |
-| On-demand backups (CreateBackup / RestoreTableFromBackup) | ✓ |
+| On-demand backups (CreateBackup / RestoreTableFromBackup) | ✓: CreateBackup to the configured filesystem or S3 backup store on PostgreSQL, SQLite and MongoDB (in-catalog without one and on Cassandra); RestoreTableFromBackup from the store into every backend (a filesystem or S3 store; a backup taken on one backend restores into another once the target's catalog has a row for it: copy its prefix under the target's root and run `extenddb backup sync`, or adopt the source's root with `extenddb backup sync --adopt-store`, which moves the root to the target's catalog: stop the source's servers first, and they then report the store owned by another catalog), and of in-catalog backups |
 | Point-in-time recovery | ✗ (`UpdateContinuousBackups` refuses to enable it; see differences-from-dynamodb.md) |
 | Import/Export (local filesystem) | ✓ (FileSource instead of S3) |
 
@@ -586,6 +586,6 @@ ExtendDB returns the DynamoDB error types and, where measured against the servic
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

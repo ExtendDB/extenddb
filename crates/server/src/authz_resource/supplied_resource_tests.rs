@@ -20,7 +20,8 @@ fn single(op: &str, input: serde_json::Value) -> AuthzTarget {
 /// policies are matched against the ARN as written (measured 2026-11-03 with
 /// a caller allowed only on the canonical ARN), the resource tags are read
 /// under the canonical ARN, and the denial names the ARN as written
-/// (measured 2026-10-20, no-policy caller).
+/// (measured 2026-10-20, no-policy caller). A stream ARN is kept as written in
+/// every role: it carries no resource tags for authorization.
 #[test]
 fn tag_resource_arn_respelled_fields_are_matched_and_named_as_written() {
     for supplied in [
@@ -38,10 +39,7 @@ fn tag_resource_arn_respelled_fields_are_matched_and_named_as_written() {
     let stream =
         "arn:aws-cn:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
     let t = single("TagResource", json!({ "ResourceArn": stream }));
-    assert_eq!(
-        t.resource,
-        "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188"
-    );
+    assert_eq!((t.resource.as_str(), t.supplied.as_str()), (stream, stream));
     assert_eq!(t.policy_resource(), stream);
 }
 
@@ -130,11 +128,14 @@ fn other_arn_fields_keep_the_supplied_spelling() {
         R,
         A,
     );
-    assert_eq!(v[0].resource, CANON);
-    assert_eq!(v[0].supplied, respelled_table);
+    // The item actions on the target come first and the restore action on
+    // the source last (issue #446).
+    let (source, target) = v.split_last().expect("restore targets");
+    assert_eq!(source.resource, CANON);
+    assert_eq!(source.supplied, respelled_table);
     let ptarget = "arn:aws:dynamodb:us-east-1:444455556666:table/pitr";
     assert!(
-        v[1..]
+        target
             .iter()
             .all(|t| t.resource == ptarget && t.supplied == ptarget)
     );

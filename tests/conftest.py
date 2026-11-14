@@ -24,6 +24,14 @@ from botocore.config import Config
 
 # D4: Suppress InsecureRequestWarning for self-signed TLS certs from ``extenddb init``.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# The message of every refused point-in-time recovery request: a restore and
+# an enable are refused before authorization, because point-in-time recovery
+# is not in this release.
+PITR_REFUSAL = "Point-in-time recovery is not supported by this storage backend"
+RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
+ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
+
+
 @pytest.fixture(scope="session")
 def endpoint_url() -> str | None:
     """Return the endpoint URL if targeting extenddb, None for real DynamoDB."""
