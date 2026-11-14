@@ -96,7 +96,7 @@ pub(crate) async fn handle_request(
     // --- Pre-auth body validation ---
     // Real DynamoDB validates request format (empty body, invalid JSON) before
     // authentication. Malformed requests get 400 regardless of auth state.
-    let input: Value = match serde_json::from_slice(&body) {
+    let mut input: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             return error_response(
@@ -107,6 +107,16 @@ pub(crate) async fn handle_request(
             );
         }
     };
+    // Any build that compiles the MongoDB backend crate (the MongoDB binary,
+    // or a build of the whole workspace) gets serde_json's `preserve_order`
+    // feature through `bson`, so there a parsed object keeps the order the
+    // client wrote its members in; other builds sort them by name. The typed
+    // input deserializers stop at the first member that fails, so on such a
+    // build a body with two faults got an error chosen by the client's member
+    // order. DynamoDB answered each two-fault Query and Scan body measured on
+    // 2026-11-03 alike in both orders. Sorting gives every build the sorted
+    // order; without `preserve_order` the call does nothing.
+    input.sort_all_objects();
 
     // --- Auth segment ---
     let auth_start = std::time::Instant::now();
