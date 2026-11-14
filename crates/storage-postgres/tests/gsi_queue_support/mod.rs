@@ -183,6 +183,7 @@ pub async fn table_with_gsi(s: &Scratch, name: &str) -> TableKeyInfo {
                         non_key_attributes: None,
                     },
                     provisioned_throughput: None,
+                    warm_throughput: None,
                 }]),
                 ..Default::default()
             },
