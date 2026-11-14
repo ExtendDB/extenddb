@@ -308,3 +308,14 @@ to 51.9 s, on a host whose load average ran between 1.8 and 12; 24 items of
 27.7 MB in 22.5 s on PostgreSQL and 26.8 s on SQLite; 1,200 items of 350 KB in
 3.3 s and 3.1 s. The backup side's 1M figures are in the PR 8 record (36 s on
 PostgreSQL under a loaded host, 12.5 s on SQLite).
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

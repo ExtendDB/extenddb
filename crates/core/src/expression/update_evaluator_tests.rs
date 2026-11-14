@@ -798,3 +798,172 @@ mod update_item_sizing {
         }
     }
 }
+
+/// Number arithmetic in `SET` and `ADD`: each operand is range checked before
+/// the sum is built, and the result is stored as the service spells it.
+mod number_arithmetic {
+    use super::*;
+    use crate::expression::test_timeout::within_10_s;
+
+    const OVERFLOW: &str =
+        "Number overflow. Attempting to store a number with magnitude larger than supported range";
+    const UNDERFLOW: &str = "Number underflow. Attempting to store a number with magnitude smaller than supported range";
+    const DIGITS: &str = "Attempting to store more than 38 significant digits in a Number";
+
+    /// Apply `expression` to an item whose `n` holds `stored`, with `:v` set
+    /// to `value`, and return the answer and the `n` left in the item. The
+    /// update runs on another thread, so a sum built from an operand that
+    /// was not range checked fails the test after 10 seconds instead of
+    /// hanging the suite, and a panic in the update is reported as one.
+    fn update_n(
+        expression: &'static str,
+        stored: &str,
+        value: &str,
+    ) -> (Result<(), DynamoDbError>, Option<AttributeValue>) {
+        let mut item = BTreeMap::from([("n".to_owned(), AttributeValue::N(stored.to_owned()))]);
+        let values = HashMap::from([("v".to_owned(), AttributeValue::N(value.to_owned()))]);
+        within_10_s(&format!("`{expression}` with n = {stored}"), move || {
+            let result = apply(expression, &mut item, HashMap::new(), values);
+            (result, item.remove("n"))
+        })
+    }
+
+    fn validation_message(result: Result<(), DynamoDbError>) -> String {
+        match result {
+            Err(DynamoDbError::ValidationException(message)) => message,
+            other => panic!("expected a ValidationException, got {other:?}"),
+        }
+    }
+
+    const EXPRESSIONS: [&str; 4] = [
+        "SET n = n + :v",
+        "SET n = :v - n",
+        "SET n = if_not_exists(n, :v) + :v",
+        "ADD n :v",
+    ];
+
+    /// A stored number outside the range, as an older release could store
+    /// it, is refused with the number check's message before it is added:
+    /// `1 + 1E999999999` would otherwise build an integer of about 10^9
+    /// digits. The item keeps its value.
+    #[test]
+    fn a_stored_operand_out_of_range_is_refused_before_the_sum() {
+        let digits = "1".repeat(39);
+        for (stored, expected) in [
+            ("1E999999999", OVERFLOW),
+            ("-1E999999999", OVERFLOW),
+            ("1E-999999999", UNDERFLOW),
+            ("1E126", OVERFLOW),
+            ("1E-131", UNDERFLOW),
+            (digits.as_str(), DIGITS),
+        ] {
+            for expression in EXPRESSIONS {
+                let (result, n) = update_n(expression, stored, "1");
+                assert_eq!(
+                    validation_message(result),
+                    expected,
+                    "`{expression}`, n = {stored}"
+                );
+                assert_eq!(
+                    n,
+                    Some(AttributeValue::N(stored.to_owned())),
+                    "`{expression}`"
+                );
+            }
+        }
+    }
+
+    /// A stored value that is not a number is refused with the service's
+    /// text for one, without the stored value: the caller may not be allowed
+    /// to read the item.
+    #[test]
+    fn a_stored_operand_that_is_not_a_number_is_refused_without_its_text() {
+        for stored in ["abc", " 5", "1E9223372036854775808", ""] {
+            for expression in EXPRESSIONS {
+                let (result, n) = update_n(expression, stored, "1");
+                assert_eq!(
+                    validation_message(result),
+                    "The parameter cannot be converted to a numeric value",
+                    "`{expression}`, n = {stored:?}"
+                );
+                assert_eq!(
+                    n,
+                    Some(AttributeValue::N(stored.to_owned())),
+                    "`{expression}`"
+                );
+            }
+        }
+    }
+
+    /// A zero whose exponent fits in 32 bits is read as `0`, as the number
+    /// check reads it, so `1 + 0E-999999999` is `1`. Read as written, the
+    /// zero's scale of 999999999 would scale the `1` to match it.
+    #[test]
+    fn a_stored_zero_adds_as_zero_whatever_its_exponent() {
+        for stored in ["0E-999999999", "0E999999999", "-0.0E-999999999"] {
+            for expression in EXPRESSIONS {
+                let (result, n) = update_n(expression, stored, "1");
+                result.unwrap_or_else(|e| panic!("`{expression}`, n = {stored}: {e:?}"));
+                assert_eq!(n, Some(AttributeValue::N("1".to_owned())), "`{expression}`");
+            }
+        }
+    }
+
+    /// The result is stored as the service spells it (measured 2026-11-03,
+    /// us-east-1): no trailing zeros after the point, no exponent, and `0`
+    /// for a zero.
+    #[test]
+    fn the_result_is_stored_as_the_service_spells_it() {
+        let min = format!("0.{}1", "0".repeat(129));
+        let twice_max_magnitude = format!("2{}", "0".repeat(125));
+        for (stored, expression, value, expected) in [
+            ("2.25", "SET n = n - :v", "0.25", "2"),
+            ("2.25", "ADD n :v", "-0.25", "2"),
+            ("1.5", "SET n = n - :v", "1.5", "0"),
+            ("1.5", "SET n = n + :v", "1.5", "3"),
+            ("1.5", "ADD n :v", "1.5", "3"),
+            ("2E-130", "SET n = n - :v", "1E-130", min.as_str()),
+            (
+                "1E125",
+                "SET n = n + :v",
+                "1E125",
+                twice_max_magnitude.as_str(),
+            ),
+        ] {
+            let (result, n) = update_n(expression, stored, value);
+            result.unwrap_or_else(|e| panic!("`{expression}`, n = {stored}: {e:?}"));
+            assert_eq!(
+                n,
+                Some(AttributeValue::N(expected.to_owned())),
+                "`{expression}`, n = {stored}"
+            );
+        }
+    }
+
+    /// A result outside the range or with more than 38 digits is a
+    /// `Number overflow`, a result below the range included (measured
+    /// 2026-11-03, us-east-1).
+    #[test]
+    fn a_result_out_of_range_is_an_overflow() {
+        for (stored, expression, value) in [
+            ("5E125", "SET n = n + :v", "5E125"),
+            ("5E125", "ADD n :v", "5E125"),
+            ("1E125", "SET n = n + :v", "1"),
+            ("1.1E-130", "SET n = n - :v", "1E-130"),
+            ("1.1E-130", "ADD n :v", "-1E-130"),
+            ("-1.1E-130", "SET n = n + :v", "1E-130"),
+        ] {
+            let (result, n) = update_n(expression, stored, value);
+            assert_eq!(
+                validation_message(result),
+                OVERFLOW,
+                "`{expression}`, n = {stored}"
+            );
+            assert_eq!(
+                n,
+                Some(AttributeValue::N(stored.to_owned())),
+                "`{expression}`"
+            );
+        }
+    }
+}

@@ -53,7 +53,7 @@ async fn two_migrators_started_together_apply_once_and_the_other_finds_nothing()
     applied.sort_unstable();
     assert_eq!(
         applied,
-        [0, 10],
+        [0, 13],
         "one applies every step and the other finds nothing"
     );
     assert_eq!(

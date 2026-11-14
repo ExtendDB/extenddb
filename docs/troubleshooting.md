@@ -124,6 +124,26 @@ The error intentionally does not name the specific file to avoid leaking filesys
    ```
 4. Verify PEM format — the cert file should start with `-----BEGIN CERTIFICATE-----` and the key file with `-----BEGIN PRIVATE KEY-----` (or `-----BEGIN EC PRIVATE KEY-----`).
 
+### TLS private key readable by other users
+
+`WARNING: TLS private key (server.tls.key_path) had permissions <mode>, which let other users read it. …`
+
+**Cause:** `extenddb serve`, or `extenddb init` when it keeps an existing certificate, found the TLS private key readable by group or other users. An older `init` that stopped before it set the key's mode left it that way, as does a key copied in with the default umask. The warning names the setting rather than the file, as the TLS load error above does, and goes to stderr: the terminal that ran the command, or the log stream under `--foreground`.
+
+What the server did depends on the rest of the message:
+
+- **`It is now 0600: group and other access were removed`**: the server could change the key's mode, because it owns the key or runs as root, and narrowed it. If another service read the key through its group, it can no longer read it. If `server.tls.key_path` is a symlink, the file it points to was changed.
+- **`Another user (uid <n>) owns it`**: the key is readable by every user, and the server cannot change it. What its owner should run depends on the key's group, which the message names:
+  - **`this server reads it through its group`**: remove other access with `chmod o-rwx <file>`. The group's access stays, and the server reads the key through it.
+  - **`this server is not in its group`**: the server reads the key through the access every user has, so `chmod o-rwx` alone would leave it unable to load the key. Give the key to the server's group first, then remove other access: `chgrp <server gid> <file>`, then `chmod 640 <file>`.
+
+  A key another user owns that only its owner and group can read is a supported layout and gets no warning.
+- **`it is on a read-only filesystem`**: set the mode where the file is provided. For a Kubernetes Secret volume, use `defaultMode: 0440` with the pod's `fsGroup` set to the server's group (gid 10001 in the official image). Secret volume files are owned by root, so `defaultMode: 0400` without a matching group would leave the key unreadable to a server that does not run as root.
+- **`was accepted but did not take effect`**: the filesystem keeps no file modes (vfat, some SMB and 9p mounts). Keep the key on a filesystem that does, or mount it with an owner-only mode.
+- **`setting it to 0600 failed: <error>`**: run `chmod 600` on the file as its owner.
+
+**Rotate the key if it may have been copied.** While its mode was wider, any local user could read the key. In the four cases where the server could not narrow it, the key stays readable until its mode is fixed, so fix the mode first: a key replaced before that lands at the same mode. Then, if a copy matters, replace the key and certificate by generating a new pair as in [Generating a self-signed certificate manually](getting-started.md#generating-a-self-signed-certificate-manually), with the key at the mode above, and restart the server. Do not rely on `extenddb init` for this: on a deployment that already has a config file, `init` stops at the config check before it reaches the certificate step. Clients that pinned the old certificate through `AWS_CA_BUNDLE` need the new `cert.pem`.
+
 ### `Config file <path> has permissions <mode>, which is too open.`
 
 **Cause:** The config file has group or world-readable permissions. Since the config file may contain the encryption key for credential storage, it must be restricted to owner-only access.
@@ -331,6 +351,12 @@ These errors occur when `auth.provider = "builtin"` is enabled.
 
 To allowlist attributes (allow only when *every* requested attribute is in the set), use `ForAllValues:` on an `Allow` statement. The same rule applies to `dynamodb:LeadingKeys`.
 
+`dynamodb:Attributes` holds the top-level names of the attributes the request names: the attributes of a `PutItem` item and of the items and keys in a `BatchWriteItem` request, the target of each `UpdateExpression` action, `AttributesToGet`, the first name of each projected document path (`secret` for `secret.a`), the attributes a `ConditionExpression` or `FilterExpression` reads, the legacy `Expected`, `AttributeUpdates`, `QueryFilter` and `ScanFilter` names, the attributes in a `Query` key condition, and on every item operation other than `SearchVectors` the key attributes of the table (and of the index a `Query` names). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured on DynamoDB 2026-11-09), and a later page also holds the index's key attributes, which its `ExclusiveStartKey` carries (measured 2026-11-10). The attributes a `SET` value reads are not in it. Batch requests are evaluated per table and transactions per item. The [security model manual](manuals/10-security-model.md) lists what the key holds for each operation, and how a PartiQL statement is authorized. It follows that:
+
+- A `Deny` on `ForAnyValue:StringEquals` over `ssn` does not block a `DeleteItem` of an item that holds `ssn`, or a read with no projection, which returns `ssn` with the rest of the item: neither request names `ssn`. DynamoDB answers the same way (measured 2026-10-31).
+- The same `Deny` does not block an `UpdateItem` that reads `ssn` only in a `SET` value. `SET #n = ssn` copies the value of `ssn` into `name`, and a projection of `name` then returns it. DynamoDB answers the same way (measured 2026-11-01).
+- An `Allow` on `ForAllValues:StringEquals` that does not list the table's key attributes grants no `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, batch or transaction request, because each of them holds the key attributes (measured on DynamoDB 2026-11-01 for `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `BatchWriteItem` `DeleteRequest`). List the key attributes of the table and, for a `Query` of an index or a later page of a `Scan` of an index, of every index the statement covers. A `Query` of an index holds the index's full key schema (measured on DynamoDB 2026-11-09 on a global secondary index). The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured the same day). A later page holds the index's key attributes from its `ExclusiveStartKey`. On DynamoDB an `Allow` that lists only the table's keys refused a later page of a `Scan` of a global and of a local secondary index (measured 2026-11-10).
+
 > Note: prior to v0.1.6, extenddb incorrectly treated a bare operator on these keys as an implicit AND across the requested values, so a single-attribute request appeared to be denied while a multi-attribute request leaked. That behavior diverged from AWS and gave a false sense of security. See the upgrade manual for migration guidance.
 
 ## Connection Issues
@@ -389,7 +415,7 @@ SELECT l.pid, l.mode, a.query_start, l.relation::regclass AS relation, a.query
 
 ### Data tables without a catalog row (PostgreSQL, separate data database)
 
-**Cause:** With a separate data database, a synchronous DeleteTable commits the catalog row removal first, then commits the drop of the table's data tables on the data database. If that data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. Only a process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the table's data tables on the data database with no catalog row naming them. Nothing reclaims them afterwards: DescribeTable reports the table gone, a same-name CreateTable gets a new table id, and the control plane only enumerates relations that still have a catalog row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run. (On one shared database the row and the drops commit together, so this cannot happen there.)
+**Cause:** A table's data relations (`_ddb_%`) are on the data database with no `tables` row naming them. Current releases do not create this state from an interrupted DeleteTable: with a separate data database a synchronous DeleteTable marks the catalog row `DELETING`, commits it, drops the table's data tables on the data database, and removes the row only after that drop has committed. If the data commit fails (the connection is terminated, a failover, a network fault), the server redoes the drop on a fresh connection for up to 60 seconds. A process that dies, or a data database unreachable for that whole window, between the catalog commit and the last retry leaves the row `DELETING` with its transition due; the control-plane poller (the next startup pass, or a later one) drops the data tables and removes the row once the data database is reachable again, so the relations are not left without a row. When the retries are exhausted the server logs, at error, the table id, the relation names, and the exact `DROP TABLE` to run, for an operator who would rather finish the drop by hand than wait for the poller. (On one shared database the row and the drops commit together, so none of this applies.) Relations a release from before this behaviour shipped left without a row are not swept automatically; find and drop them as below.
 
 To find such relations, compare the `_ddb_%` tables on the data database with the table ids the catalog still knows. On the catalog database:
 
@@ -900,11 +926,17 @@ Keys imported earlier keep working while import is disabled.
 
 **Fix:** Each line must be a valid JSON object. The format is one item per line: `{"Item": {"pk": {"S": "val"}, ...}}` or bare `{"pk": {"S": "val"}, ...}`.
 
-### `Cannot write export file: <error>`
+### `Cannot write export file`
 
 **Cause:** The export destination path is not writable (permission denied, disk full, etc.).
 
-**Fix:** Check that the extenddb process has write access to the destination directory. Parent directories are created automatically.
+**Fix:** Check that the extenddb process has write access to the destination directory. The server creates the account directory (`<export root>/<account id>`) at the account's first export; any other directory in `FilePath` must already exist, or the export fails with `Parent directory does not exist or is not accessible`.
+
+### `Permission denied` opening an export file or directory after upgrading to v0.1.15
+
+**Cause:** From v0.1.15 the server creates export files with mode 0600, and the roots and account directories it creates with mode 0700, so only the server's user and root can read them. A member of the server user's group, or a host user reading through a bind mount while the container runs as another uid, is refused.
+
+**Fix:** Read the file as the server's user or as root, copy it out of the container with `docker cp <container>:<path> .`, or run the container as the reader's uid (`--user`). The upgrade manual's [v0.1.15 entry](manuals/07-upgrade-manual.md#v0115-export-files-are-created-0600-and-the-import-and-export-directories-the-server-creates-0700) gives the details, and how to keep a group's access to import files.
 
 ### `Invalid table ARN: <arn>`
 
@@ -932,7 +964,7 @@ Keys imported earlier keep working while import is disabled.
 pool_size = 50  # default is 20
 ```
 
-If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb_data';`.
+If the problem persists, check for long-running queries or connection leaks with `SELECT * FROM pg_stat_activity WHERE datname = 'extenddb';` (the data database's default name).
 
 **Known limitation:** The HTTP status code should be 503 with a `Retry-After` header. This is tracked as technical debt.
 
@@ -983,6 +1015,6 @@ even after the extension exists.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

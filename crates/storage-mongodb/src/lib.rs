@@ -26,10 +26,12 @@ pub mod pushdown;
 mod restore_engine;
 mod snapshot_engine;
 mod stream_engine;
+mod stream_lifecycle;
 mod table_engine;
 mod ttl_worker;
 mod warm_throughput;
 mod worker_store;
+mod write_conflict;
 
 pub use bootstrapper::MongoBootstrapper;
 pub use catalog_store::MongoCatalogStore;

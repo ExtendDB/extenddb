@@ -237,27 +237,72 @@ fn evaluate_arithmetic(
         ));
     };
 
-    let ld: bigdecimal::BigDecimal = l.parse().map_err(|_| {
-        DynamoDbError::ValidationException("Invalid numeric value in expression".to_owned())
-    })?;
-    let rd: bigdecimal::BigDecimal = r.parse().map_err(|_| {
-        DynamoDbError::ValidationException("Invalid numeric value in expression".to_owned())
-    })?;
+    let (l, r) = (arithmetic_operand(l)?, arithmetic_operand(r)?);
+    arithmetic_result(&match op {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+    })
+}
 
-    let result = match op {
-        ArithOp::Add => ld + rd,
-        ArithOp::Sub => ld - rd,
-    };
-
-    let result_str = result.to_string();
-    // Validate the result is within DynamoDB's number range
-    crate::validation::number::validate_and_normalize_number(&result_str).map_err(|_| {
-        DynamoDbError::ValidationException(
-            "Number overflow. Attempting to store a number with magnitude larger than supported range".to_owned(),
-        )
+/// An operand of `+`, `-` or a number `ADD`, as a decimal, once it is known
+/// to be a number the service can store.
+///
+/// `bigdecimal` aligns two operands to the larger scale before it adds them,
+/// so the cost of a sum grows with the gap between the exponents:
+/// `1 + 1E999999999` builds an integer of about 10^9 digits. `UpdateItem` and
+/// `TransactWriteItems` check `ExpressionAttributeValues` before an update
+/// runs, but an operand can also be read from the stored item, and an item
+/// stored by an older release can hold a number that was never checked
+/// (#618). A number the service accepts has a magnitude between -129 and 126
+/// and at most 38 digits, which keeps a sum to a few hundred digits.
+///
+/// The decimal is parsed from the normalized text, not from `n`. The number
+/// check accepts a zero whose exponent fits in 32 bits without a range check
+/// and normalizes it to `0`; parsed as written, `1 + 0E-999999999` would
+/// scale `1` by 10^999999999.
+///
+/// # Errors
+///
+/// Returns the number check's `ValidationException` when `n` is out of range
+/// or has more than 38 digits. A value that is not a number is refused with
+/// the service's text for one, without the value: it can come from the
+/// stored item, which the caller may not be allowed to read.
+fn arithmetic_operand(n: &str) -> Result<bigdecimal::BigDecimal, DynamoDbError> {
+    use crate::validation::number::NumberFault;
+    let not_a_number =
+        || DynamoDbError::ValidationException(NumberFault::Malformed.text().to_owned());
+    let normalized = crate::validation::number::normalize_number(n).map_err(|fault| {
+        if fault.is_not_a_number() {
+            not_a_number()
+        } else {
+            fault.error(n)
+        }
     })?;
+    // Normalized text always parses; the error is not reachable.
+    normalized.parse().map_err(|_| not_a_number())
+}
 
-    Ok(AttributeValue::N(result_str))
+/// The result of `+`, `-` or a number `ADD`, spelled as the service stores
+/// it: `2.25 - 0.25` is `2` and `1.5 - 1.5` is `0` (measured 2026-11-03,
+/// us-east-1, `UpdateItem` and `TransactWriteItems`, each twice).
+///
+/// A result outside the range or with more than 38 digits is a
+/// `Number overflow`, a result below the range included: the service answers
+/// `Number overflow` for `1.1E-130 - 1E-130` and for `1E125 + 1` (measured
+/// the same way).
+///
+/// # Errors
+///
+/// Returns `ValidationException` with the overflow message.
+fn arithmetic_result(result: &bigdecimal::BigDecimal) -> Result<AttributeValue, DynamoDbError> {
+    crate::validation::number::validate_and_normalize_number(&result.to_string())
+        .map(AttributeValue::N)
+        .map_err(|_| {
+            DynamoDbError::ValidationException(
+                "Number overflow. Attempting to store a number with magnitude larger than supported range"
+                    .to_owned(),
+            )
+        })
 }
 
 /// Evaluate SET functions: `if_not_exists(path, value)`.
@@ -341,21 +386,7 @@ fn apply_add(
         ) => value,
         // Number: add to existing
         (Some(AttributeValue::N(existing_n)), AttributeValue::N(add_n)) => {
-            let ed: bigdecimal::BigDecimal = existing_n.parse().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid numeric value in expression".to_owned())
-            })?;
-            let ad: bigdecimal::BigDecimal = add_n.parse().map_err(|_| {
-                DynamoDbError::ValidationException("Invalid numeric value in expression".to_owned())
-            })?;
-            let result_str = (ed + ad).to_string();
-            crate::validation::number::validate_and_normalize_number(&result_str).map_err(
-                |_| {
-                    DynamoDbError::ValidationException(
-                        "Number overflow. Attempting to store a number with magnitude larger than supported range".to_owned(),
-                    )
-                },
-            )?;
-            AttributeValue::N(result_str)
+            arithmetic_result(&(arithmetic_operand(existing_n)? + arithmetic_operand(add_n)?))?
         }
         // Set: union with existing
         (Some(AttributeValue::SS(existing_set)), AttributeValue::SS(add_set)) => {

@@ -12,6 +12,7 @@ use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
+use crate::catalog_json::{from_catalog_json, unescape_json};
 use crate::data;
 
 /// Row type for table metadata queries.
@@ -70,14 +71,16 @@ pub(crate) struct VectorIndexRow {
 }
 
 impl From<VectorIndexRow> for VectorIndexCatalogRow {
+    /// The three documents carry attribute names, stored through the
+    /// escape of `catalog_json`; they are handed on decoded.
     fn from(row: VectorIndexRow) -> Self {
         Self {
             index_name: row.index_name,
             dimensions: i64::from(row.dimensions),
             distance_function: row.distance_function,
-            vector_attribute: row.vector_attribute,
-            search_schema: row.search_schema,
-            projection: row.projection,
+            vector_attribute: unescape_json(row.vector_attribute),
+            search_schema: row.search_schema.map(unescape_json),
+            projection: unescape_json(row.projection),
             index_status: row.index_status,
             backfilling: row.backfilling,
         }
@@ -194,10 +197,8 @@ impl PostgresEngine {
         let mut lsis: Vec<LsiDescription> = Vec::new();
 
         for idx in index_rows {
-            let ks = serde_json::from_value(idx.key_schema)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let proj = serde_json::from_value(idx.projection)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let ks = from_catalog_json(idx.key_schema)?;
+            let proj = from_catalog_json(idx.projection)?;
 
             if idx.index_type == "GSI" {
                 // F-1 fallback: old data may be stored as ProvisionedThroughput
@@ -266,10 +267,8 @@ impl PostgresEngine {
             }
         }
 
-        let key_schema = serde_json::from_value(row.key_schema)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs = serde_json::from_value(row.attribute_definitions)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema = from_catalog_json(row.key_schema)?;
+        let attr_defs = from_catalog_json(row.attribute_definitions)?;
         let stream_spec = row
             .stream_specification
             .map(serde_json::from_value)

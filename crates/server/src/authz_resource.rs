@@ -96,7 +96,8 @@ use stream_scope::{check_stream_arn_kind, check_stream_arn_scope, stream_arn_in_
 /// these for the target table name blocks a restore into it.
 /// `RestoreTableToPointInTime` checks them, Scan first, before the restore
 /// action: a caller with no policy is denied on `dynamodb:Scan` on the target
-/// table, as on the service (measured 2026-10-22, issue #446).
+/// table, as on the service (measured 2026-10-22, issue #446). The server
+/// refuses every `RestoreTableToPointInTime` before this code runs.
 const RESTORE_TARGET_ACTIONS: &[&str] = &[
     "Scan",
     "Query",
@@ -350,7 +351,8 @@ fn arn_is_backup(arn: &str) -> bool {
 ///
 /// `RestoreTableFromBackup` and `RestoreTableToPointInTime` carry no pre-authz
 /// ARN check: a wrong-kind source is authorized first (so a no-permissions
-/// principal is denied) and the engine refuses it afterwards. Tag operations
+/// principal is denied) and the engine refuses it afterwards. The server
+/// refuses every `RestoreTableToPointInTime` before this code runs. Tag operations
 /// keep their own measured shape check (`validate_tag_resource_arn_shape`);
 /// `GetRecords` is handled through its iterator by [`getrecords_resource`].
 pub(crate) fn validate_operation_arns(
@@ -747,7 +749,8 @@ pub(crate) fn authz_targets(
         // table (measured live). The service checks the target's item actions
         // first: a caller with no policy is denied on dynamodb:Scan on the
         // target table, not on the restore action on the source (measured
-        // 2026-10-22 with an index SourceTableArn).
+        // 2026-10-22 with an index SourceTableArn). The server refuses every
+        // RestoreTableToPointInTime before this code runs.
         "RestoreTableToPointInTime" => {
             let source = str_field(input, "SourceTableArn")
                 .or_else(|| str_field(input, "SourceTableName"))

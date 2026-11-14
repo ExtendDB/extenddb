@@ -28,7 +28,8 @@ deployment and reads `/health`, the server's log and the API's answers:
   `extenddb-store.json` in it, and a relative root resolved against the
   shell's directory in daemon mode;
 - `extenddb backup list` and `backup purge --confirm` on an empty store, and
-  `backup purge` refused while a server holds the SQLite serve lock (exit 6);
+  `backup purge` refused while a server holds the SQLite serve lock (exit 6),
+  as are `backup sync`'s row-changing options and `backup migrate-legacy`;
 - an in-memory SQLite server restarted onto the root it used: the second
   start adopts the root the first start's catalog owned and syncs before it
   listens, so the first start's backup is described and restored; every
@@ -110,10 +111,26 @@ def _append(config_path: str, toml: str) -> None:
         f.write("\n" + toml + "\n")
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+def _free_port(*avoid: int) -> int:
+    """A loopback port nothing is bound to, never one of `avoid`: a port
+    already picked for a server that has not bound it yet."""
+    s, port = _closed_port(*avoid)
+    s.close()
+    return port
+
+
+def _closed_port(*avoid: int) -> tuple[socket.socket, int]:
+    """A socket bound to a loopback port and not listening, and its port,
+    never one of `avoid`. While the socket is open a connection to the port
+    is refused and no other socket can bind it, so an endpoint naming the
+    port stays unreachable until the caller closes the socket."""
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        port = s.getsockname()[1]
+        if port not in avoid:
+            return s, port
+        s.close()
 
 
 class _Server:
@@ -735,7 +752,9 @@ class TestSqlite:
         d = sqlite_deployment
         moto_host, moto_port = _moto_or_skip()
         bucket = moto_bucket
-        dead_port = _free_port()
+        # Held bound until the forwarder takes the port: a port that is only
+        # free could be bound by another process, or be the server's own.
+        dead, dead_port = _closed_port(d.port)
         _append(
             d.config,
             "[backup]\nreconcile_interval_secs = 1\n"
@@ -743,9 +762,10 @@ class TestSqlite:
             f'bucket = "{bucket}"\nendpoint = "http://127.0.0.1:{dead_port}"\n'
             'force_path_style = true\nregion = "us-east-1"\n',
         )
-        server = _Server(d.config, str(tmp_path / "serve.log"), env=_s3_env())
+        server = None
         forwarder = None
         try:
+            server = _Server(d.config, str(tmp_path / "serve.log"), env=_s3_env())
             # The first check runs after the listener is up: the component is
             # `checking` first, then `unhealthy` when the connection is refused.
             health = _wait_health(
@@ -755,7 +775,7 @@ class TestSqlite:
             assert health["status"] == "degraded", health
             component = health["components"]["backup_store"]
             assert component["status"] == "unhealthy" and component["kind"] == "s3", component
-            assert component["reason"] == "unreachable", component
+            assert component["reason"] == "unreachable", (component, server.log_text()[-4000:])
             assert bucket not in json.dumps(component)
             spool = os.path.join(d.dir, "backup-spool")
             assert (os.stat(spool).st_mode & 0o777) == 0o700
@@ -775,6 +795,7 @@ class TestSqlite:
             assert bucket in log, "the operator's line names the bucket"
 
             # The endpoint starts answering: the next reconciler cycle recovers.
+            dead.close()
             forwarder = _Forwarder(dead_port, (moto_host, moto_port))
             health = _wait_health(
                 d.port, lambda h: h["components"]["backup_store"]["status"] == "healthy", timeout=30, server=server
@@ -812,9 +833,11 @@ class TestSqlite:
                 ddb.create_backup(TableName="Music", BackupName="again")
             _assert_store_refusal(refused.value, "s3", bucket, category="unreachable")
         finally:
+            dead.close()
             if forwarder is not None:
                 forwarder.stop()
-            server.stop()
+            if server is not None:
+                server.stop()
 
     def test_a_stalled_s3_endpoint_holds_neither_the_listener_nor_the_reconciler(self, sqlite_deployment, tmp_path):
         """An endpoint that accepts connections and never answers. Checked:
@@ -828,11 +851,10 @@ class TestSqlite:
         while the endpoint stalls (the next cycle's check opens a new
         connection to the tarpit within seconds of the abandoned one)."""
         d = sqlite_deployment
-        tarpit = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tarpit.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tarpit.bind(("127.0.0.1", 0))
+        # Never the server's port, which the server has not bound yet. The
+        # tarpit listens on the socket that `_closed_port` bound.
+        tarpit, tarpit_port = _closed_port(d.port)
         tarpit.listen(16)
-        tarpit_port = tarpit.getsockname()[1]
         held = []
         accepted_at = []
 
@@ -1596,6 +1618,18 @@ class TestSqlite:
             # it: exit 6, the code `migrate` uses for a locked catalog.
             assert res.returncode == 6, res.stdout + res.stderr
             assert "another extenddb process" in (res.stdout + res.stderr), res.stdout + res.stderr
+            # So is every option of `backup sync` that moves or removes rows,
+            # with or without a store to read, and `backup migrate-legacy`.
+            for args in (
+                ("sync", "--move-store", "/srv/elsewhere"),
+                ("sync", "--forget-store", "/srv/elsewhere"),
+                ("sync", "--forget-backup", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+                ("migrate-legacy", "--all"),
+                ("migrate-legacy", "arn:aws:dynamodb:us-east-1:123456789012:table/t/backup/01700000000000-00000000"),
+            ):
+                res = d.run("backup", *args)
+                assert res.returncode == 6, (args, res.stdout + res.stderr)
+                assert "another extenddb process" in (res.stdout + res.stderr), (args, res.stdout + res.stderr)
             assert server.proc.poll() is None, "the server kept running"
         finally:
             server.stop()

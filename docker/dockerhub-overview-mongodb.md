@@ -44,7 +44,7 @@ Start the server using the generated configuration:
 
 ```console
 docker run --rm --name extenddb-mongodb \
-  -p 18443:18443 \
+  -p 127.0.0.1:18443:18443 \
   -v "$PWD/extenddb-data:/var/lib/extenddb" \
   --read-only \
   --tmpfs /tmp:rw,noexec,nosuid,size=64m \
@@ -106,11 +106,11 @@ images and their signatures are mirrored by digest to
 
 ## Note
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-implementation that speaks the DynamoDB wire protocol; behavioral differences
-from the service are documented in
+ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB
+and does not contain any DynamoDB source code. It is not an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates. ExtendDB is a
+clean-room implementation that speaks the DynamoDB wire protocol; behavioral
+differences from the service are documented in
 [Differences from DynamoDB](https://github.com/ExtendDB/extenddb/blob/main/docs/differences-from-dynamodb.md).
 
 More at [extenddb.org](https://extenddb.org) and
