@@ -526,16 +526,25 @@ fn the_session_policy_check_runs_the_arn_check_and_not_the_version_or_sid_check(
     assert!(
         PolicyDocument::from_json_for_write(&other, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_err()
     );
-    assert!(PolicyDocument::from_json_for_session_policy(&other).is_ok());
-    let err = PolicyDocument::from_json_for_session_policy(&doc("2012-10-17", "", ""))
-        .expect_err("an empty Arn value is refused");
+    assert!(
+        PolicyDocument::from_json_for_session_policy(&other, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+            .is_ok()
+    );
+    let err = PolicyDocument::from_json_for_session_policy(
+        &doc("2012-10-17", "", ""),
+        DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
+    )
+    .expect_err("an empty Arn value is refused");
     assert_eq!(
         err.0,
         r#"Arn condition on aws:PrincipalArn holds "": its first field does not match arn"#
     );
     assert!(
-        PolicyDocument::from_json_for_session_policy(&doc("2012-10-17", "", "*:aws:iam:*"))
-            .is_err()
+        PolicyDocument::from_json_for_session_policy(
+            &doc("2012-10-17", "", "*:aws:iam:*"),
+            DEFAULT_MAX_POLICY_DOCUMENT_BYTES
+        )
+        .is_err()
     );
 }
 

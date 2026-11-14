@@ -228,20 +228,24 @@ impl PolicyDocument {
     /// condition value check of a policy write
     /// (`arn_value::validate_statement_arn_values`).
     ///
-    /// Everything `from_json` checks, so a session policy that would not load
-    /// on the request path is refused when the session is issued. The
-    /// `Version`, `Sid` and `${...}` reference checks of `from_json_for_write`
-    /// do not run: a session policy with another `Version`, such a `Sid` or
-    /// such a reference loads and evaluates on the request path, and
-    /// AssumeRole accepted one before. What STS answers for these session
-    /// policies was not measured.
+    /// Everything [`Self::from_json_with_size_limit`] checks with `max_bytes`,
+    /// the configured `max_policy_document_bytes`, so a session policy that
+    /// would not load on the request path, which parses it with the same
+    /// limit, is refused when the session is issued. The `Version`, `Sid` and
+    /// `${...}` reference checks of `from_json_for_write` do not run: a
+    /// session policy with another `Version`, such a `Sid` or such a reference
+    /// loads and evaluates on the request path, and AssumeRole accepted one
+    /// before. What STS answers for these session policies was not measured.
     ///
     /// # Errors
     ///
-    /// Returns `PolicyParseError` if `from_json` rejects the document or an
-    /// Arn condition value fails the write check.
-    pub fn from_json_for_session_policy(json: &str) -> Result<Self, PolicyParseError> {
-        let doc = Self::from_json(json)?;
+    /// Returns `PolicyParseError` if the document exceeds `max_bytes` or does
+    /// not parse, or an Arn condition value fails the write check.
+    pub fn from_json_for_session_policy(
+        json: &str,
+        max_bytes: usize,
+    ) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json_with_size_limit(json, max_bytes)?;
         super::arn_value::validate_statement_arn_values(&doc.statements)?;
         Ok(doc)
     }

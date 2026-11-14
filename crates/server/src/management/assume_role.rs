@@ -128,7 +128,7 @@ pub async fn assume_role(
             .into_response();
     }
     if let Some(ref sp) = request.session_policy
-        && let Err(msg) = check_session_policy(sp)
+        && let Err(msg) = check_session_policy(sp, state.max_policy_document_bytes)
     {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -217,22 +217,24 @@ pub async fn assume_role(
     .await
 }
 
-/// Refuse a session policy that does not load, or that holds an Arn condition
+/// Refuse a session policy that does not load with the configured
+/// `max_policy_document_bytes`, `max_bytes`, or that holds an Arn condition
 /// value the identity write check refuses
 /// (`PolicyDocument::from_json_for_session_policy`), answering
 /// `MalformedPolicyDocument`, the error the STS API reference lists for a
 /// malformed policy document.
 ///
 /// Before this check AssumeRole issued credentials for both. A session policy
-/// that does not load, such as one with a malformed CIDR, made every request
-/// with those credentials fail. A session policy with such an Arn value
-/// worked, and AssumeRole now refuses it for parity with the identity write
-/// check. The `Version` and `Sid` checks of a policy write do not apply, so a
-/// session policy that AssumeRole accepted for those keeps getting
-/// credentials. What STS answers for these session policies was not measured;
-/// the text after the code is ExtendDB's own.
-fn check_session_policy(session_policy: &Value) -> Result<(), String> {
-    PolicyDocument::from_json_for_session_policy(&session_policy.to_string())
+/// that does not load, such as one with a malformed CIDR or one over the size
+/// limit the request path parses it with, made every request with those
+/// credentials fail. A session policy with such an Arn value worked, and
+/// AssumeRole now refuses it for parity with the identity write check. The
+/// `Version` and `Sid` checks of a policy write do not apply, so a session
+/// policy that AssumeRole accepted for those keeps getting credentials. What
+/// STS answers for these session policies was not measured; the text after
+/// the code is ExtendDB's own.
+fn check_session_policy(session_policy: &Value, max_bytes: usize) -> Result<(), String> {
+    PolicyDocument::from_json_for_session_policy(&session_policy.to_string(), max_bytes)
         .map(|_| ())
         .map_err(|e| format!("MalformedPolicyDocument: {}", e.0))
 }
