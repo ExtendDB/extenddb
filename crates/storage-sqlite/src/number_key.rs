@@ -222,4 +222,116 @@ mod tests {
         assert!(enc("0") < enc("0.0000000001"));
         assert_eq!(enc("0"), "1");
     }
+
+    /// Binds this encoding to the backup format's key comparator: a
+    /// `key_ordered` backup of a table with an `N` sort key promises the
+    /// order `KeyOrder::compare` defines, and this backend produces it with
+    /// `ORDER BY pk, sk_n` only while the byte order of `sk_n` equals that
+    /// comparison. A change to either side fails here. The corpus is a fixed
+    /// pseudo-random set of `DynamoDB`-valid numbers (1 to 38 significant
+    /// digits, both signs, magnitudes from 10^-130 up to 10^120) plus the
+    /// boundary values the tests above use; magnitudes from 10^120 to the
+    /// 10^126 limit appear only through the two `9.99...E+125` boundary
+    /// values.
+    #[test]
+    fn number_key_order_matches_backup_format() {
+        use extenddb_core::backup_format::KeyOrder;
+        use extenddb_core::types::{
+            AttributeDefinition, AttributeValue, Item, KeySchemaElement, KeyType,
+            ScalarAttributeType,
+        };
+        use extenddb_core::validation::number::validate_and_normalize_number;
+
+        let order = KeyOrder::resolve(
+            &[
+                KeySchemaElement {
+                    attribute_name: "pk".to_owned(),
+                    key_type: KeyType::Hash,
+                },
+                KeySchemaElement {
+                    attribute_name: "sk".to_owned(),
+                    key_type: KeyType::Range,
+                },
+            ],
+            &[
+                AttributeDefinition {
+                    attribute_name: "pk".to_owned(),
+                    attribute_type: ScalarAttributeType::S,
+                },
+                AttributeDefinition {
+                    attribute_name: "sk".to_owned(),
+                    attribute_type: ScalarAttributeType::N,
+                },
+            ],
+        )
+        .unwrap();
+        let item = |n: &str| {
+            let mut m = Item::new();
+            m.insert("pk".to_owned(), AttributeValue::S("p".to_owned()));
+            m.insert("sk".to_owned(), AttributeValue::N(n.to_owned()));
+            m
+        };
+
+        let mut corpus: Vec<String> = [
+            "0",
+            "1",
+            "-1",
+            "1E-130",
+            "-1E-130",
+            "9.9999999999999999999999999999999999999E+125",
+            "-9.9999999999999999999999999999999999999E+125",
+            "1.2345678901234567890123456789012345678",
+            "1.2345678901234567890123456789012345679",
+            "0.12",
+            "0.123",
+            "-0.123",
+            "10",
+            "9",
+        ]
+        .iter()
+        .map(|s| validate_and_normalize_number(s).unwrap())
+        .collect();
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        while corpus.len() < 200 {
+            let digits = usize::try_from(next() % 38).unwrap() + 1;
+            let mut mantissa = String::new();
+            for i in 0..digits {
+                let d = next() % 10;
+                // No leading zero so the digit count is the significant count.
+                let d = if i == 0 && d == 0 { 1 } else { d };
+                mantissa.push(char::from(b'0' + u8::try_from(d).unwrap()));
+            }
+            // Exponent of the leading digit, -130 to 119, so
+            // 10^-130 <= |v| < 10^120, inside DynamoDB's range (below
+            // 10^126); the mantissa's `digits` digits follow it.
+            let exp = i64::try_from(next() % 250).unwrap() - 130;
+            let sign = if next() % 2 == 0 { "" } else { "-" };
+            let candidate = format!(
+                "{sign}{mantissa}E{}",
+                exp - i64::try_from(digits).unwrap() + 1
+            );
+            if let Ok(normalized) = validate_and_normalize_number(&candidate) {
+                corpus.push(normalized);
+            }
+        }
+        corpus.sort();
+        corpus.dedup();
+
+        for a in &corpus {
+            for b in &corpus {
+                let encoded = enc(a).cmp(&enc(b));
+                let format = order.compare(&item(a), &item(b)).unwrap();
+                assert_eq!(
+                    encoded, format,
+                    "{a} vs {b}: sk_n byte order {encoded:?}, backup format order {format:?}"
+                );
+            }
+        }
+    }
 }

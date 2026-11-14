@@ -1,22 +1,25 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Composite action: sign one verified image digest with the production KMS
-# key. Attached Cosign signature, LEGACY TAG-BASED storage (sha256-<hex>.sig
-# — required by the mirror tooling and published verify instructions), Rekor
-# transparency log ON.
+# Composite action: sign one verified image digest KEYLESS, using the
+# workflow's GitHub OIDC identity (Sigstore/Fulcio). Attached Cosign
+# signature, LEGACY TAG-BASED storage (sha256-<hex>.sig, required by the
+# mirror tooling and the published verify instructions), Rekor transparency
+# log ON. The Fulcio certificate binds each signature to the exact workflow
+# and ref that produced it, so image tier and the break-glass path are told
+# apart by signer identity, not by annotation alone.
 #
 # Single source of truth for the signing flags. cosign v3's defaults write a
 # new-format OCI referrer and NO .sig tag (hit live on ECR, 2026-08-14); the
 # three-flag combination below is the proven tag-based mode, and the
 # post-sign gate fails if the .sig tag did not appear.
 #
-# The CALLER is responsible for: reviewer-gated environment, AWS credentials
-# (OIDC role with kms:Sign on the key), and registry login. This action only
-# signs and verifies.
+# The CALLER is responsible for: reviewer-gated environment, id-token: write
+# permission (for the OIDC identity), and registry login. This action signs
+# and verifies; it needs no AWS credentials and no signing key.
 
 name: sign-image
-description: Sign a verified image digest with the production KMS key (tag-based .sig, Rekor on)
+description: Sign a verified image digest keyless via GitHub OIDC (tag-based .sig, Rekor on)
 
 inputs:
   image-repo:
@@ -27,9 +30,6 @@ inputs:
     required: true
   release-tag:
     description: 'Release the digest belongs to (vX.Y.Z); caller must have validated it'
-    required: true
-  key-arn:
-    description: 'KMS key ARN'
     required: true
   cosign-version:
     description: 'Pinned cosign version'
@@ -74,7 +74,6 @@ runs:
         IMAGE_REPO: ${{ inputs.image-repo }}
         DIGEST: ${{ inputs.digest }}
         RELEASE: ${{ inputs.release-tag }}
-        KEY_ARN: ${{ inputs.key-arn }}
         EXTRA_ANNOTATION: ${{ inputs.extra-annotation }}
       run: |
         set -euo pipefail
@@ -84,8 +83,11 @@ runs:
             || { echo "::error::extra-annotation must be key=value"; exit 1; }
           EXTRA_ARGS+=(-a "$EXTRA_ANNOTATION")
         fi
+        # Keyless: no --key. cosign detects the GitHub Actions OIDC token
+        # (id-token: write), gets a Fulcio cert bound to this workflow's
+        # identity, and uploads the entry to Rekor. The three flags below
+        # keep the proven legacy tag-based .sig storage.
         cosign sign --yes \
-          --key "awskms:///${KEY_ARN}" \
           --use-signing-config=false \
           --new-bundle-format=false \
           --tlog-upload=true \
@@ -108,12 +110,18 @@ runs:
         echo "sig-tag=$SIG_TAG" >> "$GITHUB_OUTPUT"
         echo "sig-digest=$SIG_DIGEST" >> "$GITHUB_OUTPUT"
 
-    - name: Verify the signature (includes the Rekor entry)
+    - name: Verify the signature (identity + Rekor entry)
       shell: bash
       env:
         IMAGE_REPO: ${{ inputs.image-repo }}
         DIGEST: ${{ inputs.digest }}
-        KEY_ARN: ${{ inputs.key-arn }}
       run: |
         set -euo pipefail
-        cosign verify --key "awskms:///${KEY_ARN}" "${IMAGE_REPO}@${DIGEST}" >/dev/null
+        # Keyless verify: the signature must trace to THIS workflow's Fulcio
+        # identity and the GitHub Actions OIDC issuer, and (keyless) to its
+        # Rekor entry. GITHUB_WORKFLOW_REF is owner/repo/.github/workflows/
+        # file.yml@ref, so the full certificate SAN is https://github.com/<it>.
+        cosign verify \
+          --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+          --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          "${IMAGE_REPO}@${DIGEST}" >/dev/null
