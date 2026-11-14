@@ -790,7 +790,7 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
         return;
     }
     let engine = setup_engine().await;
-    let table = TestTable::new(&engine, "StreamClampSeek", false).await;
+    let (key_info, label) = setup_stream_table(&engine, "StreamClampSeek").await;
     let view = StreamViewType::NewAndOldImages;
 
     let mut item = BTreeMap::new();
@@ -798,7 +798,7 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
     item.insert("val".to_string(), AttributeValue::S("real".to_string()));
     engine
         .put_item(
-            &table.key_info,
+            &key_info,
             item,
             false,
             None,
@@ -808,8 +808,11 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
         .await
         .unwrap();
 
-    let shard_id = shard_for("pk-clamp", &table.key_info.table_id);
-    let keyspace = format!("extenddb_ttl_test_account_{}", table.key_info.account_id);
+    // The records sit in the partition `shard_for` names; the seek takes the
+    // stream's shard id, as a client does.
+    let partition = shard_for("pk-clamp", &key_info.table_id);
+    let shard_id = stream_shard_for("pk-clamp", &key_info.table_id, &label, view);
+    let keyspace = format!("extenddb_ttl_test_account_{}", key_info.account_id);
     let rows = engine
         .session_arc()
         .query_with_values(
@@ -817,7 +820,7 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
                 "SELECT sequence_number, created_at, record_data FROM {keyspace}.stream_records \
                  WHERE shard_id = ?"
             ),
-            cdrs_tokio::query_values!(shard_id.as_str()),
+            cdrs_tokio::query_values!(partition.as_str()),
         )
         .await
         .unwrap()
@@ -845,9 +848,9 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
                  VALUES (?, ?, ?, 'Insert', ?, ?)"
             ),
             cdrs_tokio::query_values!(
-                shard_id.as_str(),
+                partition.as_str(),
                 clamped_seq.as_str(),
-                table.key_info.table_id.as_str(),
+                key_info.table_id.as_str(),
                 data.as_str(),
                 clamped_created
             ),
@@ -884,4 +887,85 @@ async fn test_at_timestamp_seek_skips_a_clamped_record_older_than_t() {
         .await
         .unwrap();
     assert!(got.is_some());
+}
+
+/// Every stream of a table keeps its records in the partition of the shard
+/// index, and the seek reads only the shard's own range of it. A closed shard
+/// answers nothing for a time after its close, even once the next stream has
+/// written to the same partition; the next stream's shard does not answer the
+/// record of the stream before it.
+#[tokio::test]
+async fn test_at_timestamp_seek_reads_only_the_shards_range() {
+    use crate::stream_disable::{activate, put, set_stream};
+    use extenddb_storage::StreamEngine;
+    use extenddb_storage_cassandra::cassandra_util::now_millis;
+
+    if crate::helpers::skip_without_cassandra() {
+        return;
+    }
+    let engine = setup_engine().await;
+    let name = "StreamSeekRange";
+    let (key_info, old_label) = setup_stream_table(&engine, name).await;
+    activate(&engine).await;
+    let account = key_info.account_id.as_str();
+    let view = StreamViewType::NewAndOldImages;
+
+    let start = now_millis() - 1_000;
+    put(&engine, account, name, "pk-range", view).await;
+    let old_shard = stream_shard_for("pk-range", &key_info.table_id, &old_label, view);
+    let old_seq = engine
+        .first_sequence_number_at_or_after(&old_shard, start)
+        .await
+        .unwrap()
+        .expect("the first stream's record");
+
+    set_stream(
+        &engine,
+        account,
+        name,
+        serde_json::json!({"StreamEnabled": false}),
+    )
+    .await
+    .unwrap();
+    let after_close = now_millis();
+    let enabled = set_stream(
+        &engine,
+        account,
+        name,
+        serde_json::json!({"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"}),
+    )
+    .await
+    .unwrap();
+    let new_label = enabled.latest_stream_label.expect("the new stream's label");
+    put(&engine, account, name, "pk-range", view).await;
+    let new_shard = stream_shard_for("pk-range", &key_info.table_id, &new_label, view);
+
+    // The closed shard keeps its record and ends at it, so the new stream's
+    // record in the same partition is not its answer after the close.
+    assert_eq!(
+        engine
+            .first_sequence_number_at_or_after(&old_shard, start)
+            .await
+            .unwrap(),
+        Some(old_seq.clone())
+    );
+    assert_eq!(
+        engine
+            .first_sequence_number_at_or_after(&old_shard, after_close)
+            .await
+            .unwrap(),
+        None
+    );
+    // The new stream's shard starts after the enable: for a time before the
+    // first stream's record, its answer is its own record.
+    let new_seq = engine
+        .first_sequence_number_at_or_after(&new_shard, start)
+        .await
+        .unwrap()
+        .expect("the new stream's record");
+    assert_ne!(new_seq, old_seq);
+    assert_eq!(
+        engine.latest_sequence_number(&new_shard).await.unwrap(),
+        Some(new_seq)
+    );
 }

@@ -64,7 +64,7 @@ from a request sent to that service or backend.
 
 | Area | DynamoDB | ExtendDB |
 |------|----------|------|
-| Shards | Shards open and close over time, with parent and child shards | A fixed number of shards per table (default 4), assigned by partition key hash; shards never close |
+| Shards | Shards open and close over time, with parent and child shards | Four shards per stream, assigned by partition key hash. They close when the stream is disabled (see Stream disable and enable under Control Plane) |
 | `AT_TIMESTAMP` iterator | The first record created at or after `Timestamp`, compared at millisecond precision; older than retention resolves to the oldest record; past the newest record resolves to after it; more than about a second in the future is a `ValidationException` | The same, on all four backends. The seek compares the record's stored creation time, taken from the same clock read as its `ApproximateCreationDateTime`. The future buffer is one second against the server clock |
 
 ## Time to Live (TTL)

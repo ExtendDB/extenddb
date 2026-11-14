@@ -27,28 +27,54 @@ pub fn sequence_lower_bound(at_ms: i64) -> String {
     format!("{:013}{:06}{:04}", at_ms.max(0), 0, 0)
 }
 
+/// The one lower-bound clause the seek sends: CQL takes a single start bound
+/// per clustering column. The shard's range starts after `after`
+/// (exclusive) and the seek at `bound` (inclusive); both are 23-digit
+/// sequence numbers, so string order is numeric order and the higher one
+/// decides, with its own operator.
+fn lower_bound_clause<'a>(bound: &'a str, after: &'a str) -> (&'static str, &'a str) {
+    if bound > after {
+        (">=", bound)
+    } else {
+        (">", after)
+    }
+}
+
 impl CassandraEngine {
+    /// The seek reads the shard's own range of its partition, as
+    /// `last_sequence_in` does: a stream's shard keeps its records in the
+    /// partition of its index, which every stream of the table shares.
     pub(crate) async fn first_sequence_number_at_or_after_impl(
         &self,
         shard_id: &str,
         at_ms: i64,
     ) -> Result<Option<String>, StorageError> {
         let keyspace = self.account_keyspace_for_shard(shard_id).await?;
+        let range = self.shard_range(&keyspace, shard_id).await?;
         let bound = sequence_lower_bound(at_ms);
+        let (lower_op, lower) = lower_bound_clause(&bound, &range.after);
+        let upper = if range.until.is_some() {
+            " AND sequence_number <= ?"
+        } else {
+            ""
+        };
         // A single-partition clustering range with one non-key filter; the
         // rows come back in clustering (sequence) order, so the first is the
         // minimum qualifying sequence.
         let query = format!(
             "SELECT sequence_number FROM {keyspace}.stream_records \
-             WHERE shard_id = ? AND sequence_number >= ? AND created_at >= ? \
+             WHERE shard_id = ? AND sequence_number {lower_op} ?{upper} AND created_at >= ? \
              LIMIT 1 ALLOW FILTERING"
         );
+        let values = match &range.until {
+            Some(until) => {
+                cdrs_tokio::query_values!(range.physical.as_str(), lower, until.as_str(), at_ms)
+            }
+            None => cdrs_tokio::query_values!(range.physical.as_str(), lower, at_ms),
+        };
         let result = self
             .session
-            .query_with_values(
-                &query,
-                cdrs_tokio::query_values!(shard_id, bound.as_str(), at_ms),
-            )
+            .query_with_values(&query, values)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         let rows = result
@@ -65,7 +91,19 @@ impl CassandraEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::sequence_lower_bound;
+    use super::{lower_bound_clause, sequence_lower_bound};
+
+    /// The seek's lower bound is the higher of the shard's start (exclusive)
+    /// and the time bound (inclusive), each with its own operator.
+    #[test]
+    fn the_higher_lower_bound_decides_with_its_own_operator() {
+        let start = "17927642400000000000007";
+        let later = sequence_lower_bound(1_792_764_248_050);
+        let earlier = sequence_lower_bound(1_792_764_000_000);
+        assert_eq!(lower_bound_clause(&later, start), (">=", later.as_str()));
+        assert_eq!(lower_bound_clause(&earlier, start), (">", start));
+        assert_eq!(lower_bound_clause(start, start), (">", start));
+    }
 
     #[test]
     fn lower_bound_is_the_first_sequence_in_that_millisecond() {

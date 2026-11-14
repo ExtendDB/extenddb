@@ -119,11 +119,10 @@ pub async fn handle_get_shard_iterator(
     // not be null", a bad member lists the set in this order.
     let type_value = body.get("ShardIteratorType");
     if type_value.is_none_or(serde_json::Value::is_null) {
-        return Err(DynamoDbError::ValidationException(
-            "1 validation error detected: Value at 'shardIteratorType' failed to satisfy \
-             constraint: Member must not be null"
-                .to_owned(),
-        ));
+        return Err(DynamoDbError::ValidationException(constraint(
+            "shardIteratorType",
+            "not be null",
+        )));
     }
     crate::validate_enum_fields(
         &body,

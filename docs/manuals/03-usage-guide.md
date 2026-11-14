@@ -396,7 +396,7 @@ aws dynamodbstreams get-shard-iterator \
 aws dynamodbstreams get-shard-iterator \
     --endpoint-url https://127.0.0.1:18443 \
     --stream-arn "<stream-arn>" \
-    --shard-id "shard-0" \
+    --shard-id "<shard-id>" \
     --shard-iterator-type AT_TIMESTAMP \
     --timestamp 1792764248.050
 
