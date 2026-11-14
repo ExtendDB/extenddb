@@ -34,6 +34,26 @@ impl MongoCatalogStore {
         }
     }
 
+    /// A store on `catalog_db`, a handle the caller opened with its own
+    /// options and name (the migration runner's).
+    #[must_use]
+    pub(crate) fn on_database(client: mongodb::Client, catalog_db: mongodb::Database) -> Self {
+        Self {
+            client,
+            catalog_db,
+            encryption_key: None,
+        }
+    }
+
+    /// A store on `catalog_db`, for the crate's integration tests (`tests/`),
+    /// which work in scratch databases of their own. Compiled only with the
+    /// `test-util` feature, which production builds do not enable.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn on_database_for_tests(client: mongodb::Client, catalog_db: mongodb::Database) -> Self {
+        Self::on_database(client, catalog_db)
+    }
+
     /// Get a reference to the catalog database.
     pub(crate) fn catalog_db(&self) -> &mongodb::Database {
         &self.catalog_db

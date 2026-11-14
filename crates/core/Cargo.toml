@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Core types, validation, errors and limits of the ExtendDB server. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde = { workspace = true }
@@ -13,6 +16,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 bigdecimal = { workspace = true }
+flate2 = { workspace = true }
+md-5 = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
 unicode-properties = { workspace = true }
+
+[features]
+default = ["partiql"]
+# PartiQL grammar, AST and query planning. Removable: with this off, the
+# `partiql` module is not compiled and nothing else in core references it.
+partiql = []

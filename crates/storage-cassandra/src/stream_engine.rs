@@ -4,16 +4,15 @@
 //! `StreamEngine` trait implementation for `CassandraEngine`.
 
 use cdrs_tokio::types::IntoRustByName;
-use extenddb_core::types::{
-    SequenceNumberRange, Shard, StreamDescription, StreamRecord, StreamStatus, StreamSummary,
-    StreamViewType,
-};
+use extenddb_core::types::{StreamDescription, StreamRecord, StreamSummary};
 use extenddb_storage::StreamEngine;
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{parse_stream_arn, stream_arn};
+use extenddb_storage::stream_lineage;
+use extenddb_storage::util::{parse_stream_arn, shard_in_stream, stream_arn};
 use futures::future::BoxFuture;
 
 use crate::CassandraEngine;
+use crate::stream_lifecycle::{physical_shard_id, shard_range_of};
 
 impl CassandraEngine {
     fn account_keyspace_for(&self, account_id: &str) -> String {
@@ -59,47 +58,6 @@ impl CassandraEngine {
 
         Ok(self.account_keyspace(&account_id))
     }
-
-    /// Like `account_keyspace_for_shard`, but also enforces that the shard's
-    /// table belongs to `caller_account_id`. Returns `Validation("Invalid
-    /// ShardIterator")` for both "shard not found" and "shard belongs to a
-    /// different account" — no information leakage about other accounts.
-    async fn account_keyspace_for_shard_owned_by(
-        &self,
-        shard_id: &str,
-        caller_account_id: &str,
-    ) -> Result<String, StorageError> {
-        let without_prefix = shard_id
-            .strip_prefix("shardId-")
-            .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
-        let table_id = without_prefix
-            .rsplit_once('-')
-            .map(|x| x.0)
-            .ok_or_else(|| StorageError::Validation("Invalid ShardIterator".to_owned()))?;
-
-        let catalog_keyspace = self.catalog_keyspace();
-        let query = format!("SELECT account_id FROM {catalog_keyspace}.tables WHERE table_id = ?");
-        let result = self
-            .session
-            .query_with_values(&query, cdrs_tokio::query_values!(table_id))
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-        let table_account_id: Option<String> = result
-            .response_body()
-            .map_err(|e| StorageError::Internal(e.to_string()))?
-            .into_rows()
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .and_then(|row| row.get_r_by_name("account_id").ok());
-
-        // Collapse "not found" and "wrong account" into the same error.
-        match table_account_id {
-            Some(ref owner) if owner == caller_account_id => Ok(self.account_keyspace(owner)),
-            _ => Err(StorageError::Validation("Invalid ShardIterator".to_owned())),
-        }
-    }
 }
 
 impl StreamEngine for CassandraEngine {
@@ -121,78 +79,166 @@ impl StreamEngine for CassandraEngine {
         })
     }
 
-    #[allow(unused_variables)] // `after` and `start` are used in query_with_values below
+    #[allow(unused_variables)] // `after` is used in query_with_values below
     fn get_stream_records(
         &self,
         account_id: &str,
+        stream_arn: &str,
         shard_id: &str,
         after_sequence: Option<&str>,
         limit: i64,
     ) -> BoxFuture<'_, Result<(Vec<StreamRecord>, Option<String>), StorageError>> {
         let account_id = account_id.to_string();
+        let stream_arn = stream_arn.to_string();
         let shard_id = shard_id.to_string();
         let after_sequence = after_sequence.map(str::to_string);
         Box::pin(async move {
-            // Ownership guard: resolve the shard's owning account from the
-            // catalog and reject the request if it doesn't match the caller.
-            // Mirrors the PostgreSQL two-step check. Both "shard not found" and
-            // "shard belongs to a different account" collapse to the same
-            // `Invalid ShardIterator` error — consistent with real DynamoDB
-            // Streams behaviour (no information leakage about other accounts).
-            let keyspace = self
-                .account_keyspace_for_shard_owned_by(&shard_id, &account_id)
-                .await?;
+            // Cassandra has no joins, so the stream resolves in two sequential
+            // round trips: the table the ARN names (catalog keyspace, by
+            // primary key: its id and current stream label), then the shard
+            // row and the records, issued together and awaited together on the
+            // account keyspace. The shard is the table's when its row carries
+            // that table id, and the stream's when `shard_in_stream` says so
+            // from the table's label and the shard id (with a read of the
+            // table's shard rows for a legacy id only); otherwise (another
+            // table, another account, or a stream of the same table the shard
+            // is not part of) the answer is the "stream does not exist" error
+            // and the records read are discarded. The keyspace follows from the
+            // caller's account, so no table id is parsed out of the shard id.
+            //
+            // A shard's records are a range of its index's partition
+            // (`stream_lifecycle`): after its starting number and, once closed,
+            // up to its ending number. The partition follows from the shard id
+            // alone (`physical_shard_id`), so the records read starts at the
+            // iterator's position together with the shard row read, and the
+            // range the shard row gives is applied to the rows it returns.
+            let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
+            let Some((table, _)) = self.stream_table_row(&account_id, &table_name).await? else {
+                return Err(extenddb_storage::util::stream_does_not_exist());
+            };
+            let keyspace = self.account_keyspace_for(&account_id);
+            let physical = physical_shard_id(&table.table_id, &shard_id);
 
-            let query = if let Some(ref after) = after_sequence {
+            let shard_query = format!(
+                "SELECT table_id, starting_sequence_number, ending_sequence_number \
+                 FROM {keyspace}.stream_shards WHERE shard_id = ?"
+            );
+            let shard_read = self
+                .session
+                .query_with_values(&shard_query, cdrs_tokio::query_values!(shard_id.as_str()));
+
+            let query = if after_sequence.is_some() {
                 format!(
-                    "SELECT record_data FROM {keyspace}.stream_records \
+                    "SELECT sequence_number, record_data FROM {keyspace}.stream_records \
                      WHERE shard_id = ? AND sequence_number > ? \
                      LIMIT {limit}"
                 )
             } else {
                 format!(
-                    "SELECT record_data FROM {keyspace}.stream_records \
+                    "SELECT sequence_number, record_data FROM {keyspace}.stream_records \
                      WHERE shard_id = ? \
                      LIMIT {limit}"
                 )
             };
+            let records_read = async {
+                if let Some(ref after) = after_sequence {
+                    self.session
+                        .query_with_values(
+                            &query,
+                            cdrs_tokio::query_values!(physical.as_str(), after.as_str()),
+                        )
+                        .await
+                } else {
+                    self.session
+                        .query_with_values(&query, cdrs_tokio::query_values!(physical.as_str()))
+                        .await
+                }
+            };
 
-            let result = if let Some(ref after) = after_sequence {
-                self.session
-                    .query_with_values(
-                        &query,
-                        cdrs_tokio::query_values!(shard_id.as_str(), after.as_str()),
+            let (shard_result, result) = futures::join!(shard_read, records_read);
+            let shard_row = shard_result
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .response_body()
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .into_rows()
+                .unwrap_or_default()
+                .into_iter()
+                .next();
+            let shard_table_id: Option<String> = shard_row
+                .as_ref()
+                .and_then(|row| row.get_r_by_name("table_id").ok());
+            let range = match shard_row {
+                Some(row) if shard_table_id.as_deref() == Some(table.table_id.as_str()) => {
+                    // A legacy id needs the table's shard rows: it is an
+                    // earlier, closed stream once the table has a labelled
+                    // shard.
+                    let owned = shard_in_stream(
+                        &table.table_id,
+                        &shard_id,
+                        table.stream_label.as_deref(),
+                        &stream_label,
+                        || async {
+                            let rows = self
+                                .stream_shard_rows(&keyspace, Some(&table.table_id))
+                                .await?;
+                            Ok::<bool, StorageError>(stream_lineage::has_labelled_shard(
+                                &table.table_id,
+                                &rows,
+                            ))
+                        },
                     )
-                    .await
-            } else {
-                self.session
-                    .query_with_values(&query, cdrs_tokio::query_values!(shard_id.as_str()))
-                    .await
-            }
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    .await?;
+                    if !owned {
+                        return Err(extenddb_storage::util::stream_does_not_exist());
+                    }
+                    shard_range_of(physical, &row)
+                }
+                _ => return Err(extenddb_storage::util::stream_does_not_exist()),
+            };
 
             let rows = result
+                .map_err(|e| StorageError::Internal(e.to_string()))?
                 .response_body()
                 .map_err(|e| StorageError::Internal(e.to_string()))?
                 .into_rows()
                 .unwrap_or_default();
 
-            let records: Vec<StreamRecord> = rows
-                .into_iter()
-                .map(|row| {
-                    let data: String = row
-                        .get_r_by_name("record_data")
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    serde_json::from_str(&data).map_err(|e| StorageError::Internal(e.to_string()))
-                })
-                .collect::<Result<_, _>>()?;
+            // The read started at the iterator's position, which is below the
+            // shard's start for a fresh iterator on a later stream: the rows up
+            // to the start are an earlier stream's and are skipped, and when no
+            // row of the shard follows them the next iterator starts at the
+            // shard's start. The rows past a closed shard's end are a later
+            // stream's.
+            let mut records: Vec<StreamRecord> = Vec::new();
+            let mut skipped_to_start = false;
+            for row in rows {
+                let sequence: String = row
+                    .get_r_by_name("sequence_number")
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if sequence <= range.after {
+                    skipped_to_start = true;
+                    continue;
+                }
+                if range.until.as_ref().is_some_and(|until| sequence > *until) {
+                    break;
+                }
+                let data: String = row
+                    .get_r_by_name("record_data")
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                records.push(
+                    serde_json::from_str(&data)
+                        .map_err(|e| StorageError::Internal(e.to_string()))?,
+                );
+            }
 
-            let last_seq = records.last().map(|r| r.dynamodb.sequence_number.clone());
+            let last_seq = records
+                .last()
+                .map(|r| r.dynamodb.sequence_number.clone())
+                .or_else(|| skipped_to_start.then(|| range.after.clone()));
             Ok((records, last_seq))
         })
     }
 
-    #[allow(unused_variables)] // `start` is used in query_with_values below
     fn describe_stream(
         &self,
         account_id: &str,
@@ -204,156 +250,25 @@ impl StreamEngine for CassandraEngine {
         let exclusive_start_shard_id = input.exclusive_start_shard_id.clone();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn_str)?;
-            let catalog_keyspace = self.catalog_keyspace();
-            let account_keyspace = self.account_keyspace_for(&account_id);
-
-            // Fetch table metadata from catalog
-            let query = format!(
-                "SELECT key_schema, stream_specification, table_status, table_id \
-                 FROM {catalog_keyspace}.tables \
-                 WHERE account_id = ? AND table_name = ? AND stream_label = ? \
-                 ALLOW FILTERING"
-            );
-            let result = self
-                .session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        table_name.as_str(),
-                        stream_label.as_str()
-                    ),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let rows = result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .unwrap_or_default();
-
-            let row = rows.into_iter().next().ok_or_else(|| {
-                StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn_str} not found."
-                ))
-            })?;
-
-            let ks_json: String = row
-                .get_r_by_name("key_schema")
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let stream_spec_json: Option<String> =
-                row.get_by_name("stream_specification").ok().flatten();
-            let table_status: String = row
-                .get_r_by_name("table_status")
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let table_id: String = row
-                .get_r_by_name("table_id")
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
+            let (table, ks_json) = self
+                .stream_table_row(&account_id, &table_name)
+                .await?
+                .ok_or_else(|| extenddb_storage::util::stream_not_found(&stream_arn_str))?;
             let key_schema = serde_json::from_str(&ks_json)
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let stream_view_type = stream_spec_json
-                .and_then(|s| {
-                    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-                    serde_json::from_value(v["StreamViewType"].clone()).ok()
-                })
-                .unwrap_or(StreamViewType::KeysOnly);
-
-            // Fetch shards from account keyspace via secondary index on table_id
-            let limit_val = limit.unwrap_or(100);
-            let shard_query = if let Some(ref start) = exclusive_start_shard_id {
-                format!(
-                    "SELECT shard_id, parent_shard_id, starting_sequence_number, ending_sequence_number \
-                     FROM {account_keyspace}.stream_shards \
-                     WHERE table_id = ? AND shard_id > ? \
-                     LIMIT {} ALLOW FILTERING",
-                    limit_val + 1
-                )
-            } else {
-                format!(
-                    "SELECT shard_id, parent_shard_id, starting_sequence_number, ending_sequence_number \
-                     FROM {account_keyspace}.stream_shards \
-                     WHERE table_id = ? \
-                     LIMIT {} ALLOW FILTERING",
-                    limit_val + 1
-                )
-            };
-
-            let shard_result = if let Some(ref start) = exclusive_start_shard_id {
-                self.session
-                    .query_with_values(
-                        &shard_query,
-                        cdrs_tokio::query_values!(table_id.as_str(), start.as_str()),
-                    )
-                    .await
-            } else {
-                self.session
-                    .query_with_values(&shard_query, cdrs_tokio::query_values!(table_id.as_str()))
-                    .await
-            }
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let shard_rows = shard_result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .unwrap_or_default();
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit_val as usize;
-            let last_shard = if shard_rows.len() > limit_usize {
-                let row = &shard_rows[limit_usize - 1];
-                let id: String = row
-                    .get_r_by_name("shard_id")
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                Some(id)
-            } else {
-                None
-            };
-
-            let shards: Vec<Shard> = shard_rows
-                .into_iter()
-                .take(limit_usize)
-                .map(|row| {
-                    let shard_id: String = row
-                        .get_r_by_name("shard_id")
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let parent_shard_id: Option<String> =
-                        row.get_by_name("parent_shard_id").ok().flatten();
-                    let starting: String = row
-                        .get_r_by_name("starting_sequence_number")
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let ending: Option<String> =
-                        row.get_by_name("ending_sequence_number").ok().flatten();
-                    Ok(Shard {
-                        shard_id,
-                        parent_shard_id,
-                        sequence_number_range: SequenceNumberRange {
-                            starting_sequence_number: starting,
-                            ending_sequence_number: ending,
-                        },
-                    })
-                })
-                .collect::<Result<_, StorageError>>()?;
-
-            let stream_status = if table_status == "DELETING" {
-                StreamStatus::Disabling
-            } else {
-                StreamStatus::Enabled
-            };
-
-            Ok(StreamDescription {
-                stream_arn: stream_arn_str,
-                stream_label,
-                stream_status,
-                stream_view_type,
-                table_name,
+            let account_keyspace = self.account_keyspace_for(&account_id);
+            let shards = self
+                .stream_shard_rows(&account_keyspace, Some(&table.table_id))
+                .await?;
+            stream_lineage::describe_stream(
+                stream_arn_str,
+                &table,
                 key_schema,
-                shards,
-                last_evaluated_shard_id: last_shard,
-            })
+                stream_label,
+                &shards,
+                limit,
+                exclusive_start_shard_id.as_deref(),
+            )
         })
     }
 
@@ -368,75 +283,21 @@ impl StreamEngine for CassandraEngine {
         let table_name = table_name.map(str::to_string);
         let exclusive_start_stream_arn = exclusive_start_stream_arn.map(str::to_string);
         Box::pin(async move {
-            let catalog_keyspace = self.catalog_keyspace();
-
-            // Cassandra doesn't support IS NOT NULL filtering efficiently; fetch all and filter.
-            // For list_streams the result set is bounded by the number of tables per account.
-            let query = format!(
-                "SELECT table_name, stream_label FROM {catalog_keyspace}.tables \
-                 WHERE account_id = ? ALLOW FILTERING"
-            );
-            let result = self
-                .session
-                .query_with_values(&query, cdrs_tokio::query_values!(account_id.as_str()))
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            use cdrs_tokio::types::IntoRustByName;
-            let rows = result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .unwrap_or_default();
-
-            // Parse start cursor
-            let start_cursor = exclusive_start_stream_arn
+            let start = exclusive_start_stream_arn
                 .as_deref()
                 .map(parse_stream_arn)
                 .transpose()?;
-
-            let mut summaries: Vec<StreamSummary> = rows
-                .into_iter()
-                .filter_map(|row| {
-                    let tn: String = row.get_r_by_name("table_name").ok()?;
-                    let label: Option<String> = row.get_by_name("stream_label").ok().flatten();
-                    let label = label?; // skip tables without streams
-                    if let Some(ref filter_tn) = table_name
-                        && &tn != filter_tn
-                    {
-                        return None;
-                    }
-                    Some(StreamSummary {
-                        stream_arn: stream_arn(&self.region, &account_id, &tn, &label),
-                        stream_label: label,
-                        table_name: tn,
-                    })
-                })
-                .collect();
-
-            // Sort for stable pagination (table_name, stream_label)
-            summaries.sort_by(|a, b| {
-                a.table_name
-                    .cmp(&b.table_name)
-                    .then(a.stream_label.cmp(&b.stream_label))
-            });
-
-            // Apply cursor
-            if let Some((start_table, start_label)) = start_cursor {
-                summaries
-                    .retain(|s| (&s.table_name, &s.stream_label) > (&start_table, &start_label));
-            }
-
-            #[allow(clippy::cast_sign_loss)]
-            let limit_usize = limit as usize;
-            let last_arn = if summaries.len() > limit_usize {
-                summaries.get(limit_usize - 1).map(|s| s.stream_arn.clone())
-            } else {
-                None
-            };
-            summaries.truncate(limit_usize);
-
-            Ok((summaries, last_arn))
+            let tables = self.stream_table_rows(&account_id).await?;
+            let account_keyspace = self.account_keyspace_for(&account_id);
+            let shards = self.stream_shard_rows(&account_keyspace, None).await?;
+            stream_lineage::list_streams(
+                &tables,
+                &shards,
+                table_name.as_deref(),
+                limit,
+                start,
+                |t, l| stream_arn(&self.region, &account_id, t, l),
+            )
         })
     }
 
@@ -494,71 +355,21 @@ impl StreamEngine for CassandraEngine {
         let shard_id = shard_id.to_string();
         Box::pin(async move {
             let (table_name, stream_label) = parse_stream_arn(&stream_arn)?;
-            let catalog_keyspace = self.catalog_keyspace();
-            let account_keyspace = self.account_keyspace_for(&account_id);
-
-            let query = format!(
-                "SELECT table_id FROM {catalog_keyspace}.tables \
-                 WHERE account_id = ? AND table_name = ? AND stream_label = ? \
-                 ALLOW FILTERING"
-            );
-            let result = self
-                .session
-                .query_with_values(
-                    &query,
-                    cdrs_tokio::query_values!(
-                        account_id.as_str(),
-                        table_name.as_str(),
-                        stream_label.as_str()
-                    ),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let rows = result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .unwrap_or_default();
-
-            let table_id: String = rows
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    StorageError::TableNotFound(format!(
-                        "Requested resource not found: Stream: {stream_arn} not found."
-                    ))
-                })
-                .and_then(|row| {
-                    row.get_r_by_name("table_id")
-                        .map_err(|e| StorageError::Internal(e.to_string()))
-                })?;
-
-            let shard_query = format!(
-                "SELECT shard_id FROM {account_keyspace}.stream_shards \
-                 WHERE shard_id = ? AND table_id = ? ALLOW FILTERING"
-            );
-            let shard_result = self
-                .session
-                .query_with_values(
-                    &shard_query,
-                    cdrs_tokio::query_values!(shard_id.as_str(), table_id.as_str()),
-                )
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let found = shard_result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .is_some_and(|r| !r.is_empty());
-
-            if !found {
-                return Err(StorageError::TableNotFound(format!(
-                    "Requested resource not found: Stream: {stream_arn} not found."
-                )));
-            }
-            Ok(())
+            let table = self.stream_table_row(&account_id, &table_name).await?;
+            let shards = match &table {
+                Some((t, _)) => {
+                    let account_keyspace = self.account_keyspace_for(&account_id);
+                    self.stream_shard_rows(&account_keyspace, Some(&t.table_id))
+                        .await?
+                }
+                None => Vec::new(),
+            };
+            stream_lineage::validate_shard(
+                table.as_ref().map(|(t, _)| t),
+                &stream_label,
+                &shards,
+                &shard_id,
+            )
         })
     }
 
@@ -569,26 +380,8 @@ impl StreamEngine for CassandraEngine {
         let shard_id = shard_id.to_string();
         Box::pin(async move {
             let keyspace = self.account_keyspace_for_shard(&shard_id).await?;
-            let query = format!(
-                "SELECT sequence_number FROM {keyspace}.stream_records \
-                 WHERE shard_id = ? ORDER BY sequence_number DESC LIMIT 1"
-            );
-            let result = self
-                .session
-                .query_with_values(&query, cdrs_tokio::query_values!(shard_id.as_str()))
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            let rows = result
-                .response_body()
-                .map_err(|e| StorageError::Internal(e.to_string()))?
-                .into_rows()
-                .unwrap_or_default();
-
-            Ok(rows
-                .into_iter()
-                .next()
-                .map(|row| row.get_r_by_name("sequence_number").unwrap_or_default()))
+            let range = self.shard_range(&keyspace, &shard_id).await?;
+            self.last_sequence_in(&keyspace, &range).await
         })
     }
 }

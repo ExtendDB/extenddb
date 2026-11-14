@@ -35,6 +35,13 @@ impl MetricsCollector {
 
         let mut results = Vec::new();
         for (key, acc) in map.iter() {
+            // Filter by account if specified; an empty string is no filter,
+            // as in the stores.
+            if let Some(account) = params.account_id.as_deref().filter(|a| !a.is_empty())
+                && key.account_id.as_deref() != Some(account)
+            {
+                continue;
+            }
             // Filter by table name if specified.
             if let Some(ref tn) = params.table_name
                 && key.table_name.as_deref() != Some(tn.as_str())
@@ -53,6 +60,9 @@ impl MetricsCollector {
             };
 
             let mut dimensions = Vec::new();
+            if let Some(ref account) = key.account_id {
+                dimensions.push(Dimension::AccountId(account.clone()));
+            }
             if let Some(ref tn) = key.table_name {
                 dimensions.push(Dimension::TableName(tn.clone()));
             }
@@ -142,9 +152,16 @@ impl MetricsCollector {
 
     /// Query average latency segments for the console deep-dive.
     ///
-    /// Returns per-operation averages over the given time window.
+    /// Returns per-operation averages over the given time window, of the
+    /// requests of `account_id` only when it is given (an empty string is no
+    /// filter).
     #[must_use]
-    pub fn query_segments(&self, window: TimeWindow) -> Vec<OperationSegments> {
+    pub fn query_segments(
+        &self,
+        window: TimeWindow,
+        account_id: Option<&str>,
+    ) -> Vec<OperationSegments> {
+        let account_id = account_id.filter(|a| !a.is_empty());
         let now = Instant::now();
         let cutoff = window_cutoff(window, now);
         let Ok(vec) = self.segments.read() else {
@@ -155,6 +172,9 @@ impl MetricsCollector {
             if let Some(c) = cutoff
                 && p.timestamp < c
             {
+                continue;
+            }
+            if account_id.is_some_and(|a| a != p.account_id) {
                 continue;
             }
             let e = by_op.entry(p.operation.clone()).or_default();
@@ -282,6 +302,7 @@ pub(super) fn aggregate(drained: Drained) -> Vec<FlushBucket> {
                     bucket: SystemTime::UNIX_EPOCH
                         + Duration::from_secs(u64::try_from(minute).unwrap_or(0)),
                     metric: key.metric,
+                    account_id: key.account_id.clone().unwrap_or_default(),
                     table_name: key.table_name.clone().unwrap_or_default(),
                     index_name: key.index_name.clone().unwrap_or_default(),
                     operation: key.operation.clone().unwrap_or_default(),

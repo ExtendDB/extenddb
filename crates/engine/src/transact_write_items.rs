@@ -20,11 +20,13 @@ use crate::transact_write_helpers::{
 use crate::{DispatchMetrics, DispatchResult};
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{Expr, ExpressionMaps, PathElement, UpdateAction};
+use extenddb_core::limits::LimitsConfig;
 use extenddb_core::types::{
     CancellationReason, Item, TransactWriteItem, TransactWriteItemsInput, TransactWriteItemsOutput,
 };
 use extenddb_core::validation::{
-    validate_attribute_name_sizes, validate_attribute_values_nesting_depth,
+    AttributeNameRequestForm, validate_attribute_name_sizes,
+    validate_attribute_values_nesting_depth, validate_expression_attribute_name_sizes,
     validate_item_nesting_depth, validate_item_size, validate_key_not_empty,
 };
 
@@ -75,12 +77,41 @@ pub async fn handle_transact_write_items(
         }
     }
 
+    // The client request token's length and pattern are checked ahead of the
+    // actions (measured 2026-10-27: a 37-character token is reported ahead of
+    // a missing table, a condition syntax error and a malformed key number;
+    // measured 2026-11-11: ahead of an attribute name over the size limit and
+    // a number the service cannot read).
+    if let Some(ref token) = input.client_request_token {
+        validate_client_request_token(token)?;
+    }
+
+    // Attribute names over the size limit are request-shape validation of
+    // each member, run for every member in request order before any member's
+    // table lookup: a request whose first member names a missing table
+    // answers with a later member's name refusal.
+    for twi in &input.transact_items {
+        validate_member_attribute_name_sizes(twi, &ctx.limits)?;
+    }
+
     // Resolve table key info, validate inputs, parse expressions, and check
     // for duplicate targets — all in a single pass to avoid redundant
     // `table_key_info` lookups.
     let mut prepared: Vec<PreparedOp> = Vec::with_capacity(input.transact_items.len());
     let mut seen_targets: HashSet<String> = HashSet::with_capacity(input.transact_items.len());
     for twi in &input.transact_items {
+        // Each action's numbers are checked before the action is prepared, so
+        // a Put item is not sized while it holds a number the service cannot
+        // read: sizing one builds a string as long as the exponent and ends
+        // the process. Within an action the service answers the number ahead
+        // of a missing table, a condition or update syntax error, an unused
+        // value, an empty key, a key update and an item over the size limit
+        // (6 of 6 sends each, measured 2026-11-12); beside a value nested too
+        // deep it answered either (2 and 4 of 6). Across actions an earlier
+        // action's fault still comes first: the service agrees for a condition
+        // syntax error and an unused value, and answers the later number for a
+        // missing table (6 of 6), as the base does too.
+        extenddb_core::validation::number::operations::transact_write_item(twi)?;
         let op = prepare_write_op(twi, ctx).await?;
         let target_key = op.canonical_target();
         if !seen_targets.insert(target_key) {
@@ -148,10 +179,6 @@ pub async fn handle_transact_write_items(
     // The token is passed to the storage layer and checked atomically within
     // the write transaction, guaranteeing that token storage and data writes
     // commit together.
-    if let Some(ref token) = input.client_request_token {
-        validate_client_request_token(token)?;
-    }
-
     let idempotency =
         input
             .client_request_token
@@ -209,7 +236,10 @@ pub async fn handle_transact_write_items(
         Err(e) => return Err(storage_err_to_dynamo(e)),
     }
 
-    // Stream records are now captured atomically within the storage transaction.
+    // The PostgreSQL, SQLite and MongoDB backends write stream records inside
+    // the storage transaction that writes the items. The Cassandra backend
+    // writes each record in a batch that runs after its item's write, so a
+    // failure there leaves the item without its record.
 
     // Per-item WCU: round each item individually, then sum (M-1).
     let mut per_table_wcu: HashMap<String, f64> = HashMap::new();
@@ -341,6 +371,52 @@ fn assigned_vector_attributes(actions: &[UpdateAction], maps: &ExpressionMaps) -
     assigned
 }
 
+/// Check the attribute names one `TransactWriteItems` member carries: the
+/// member's expression maps (any member type), then a `Put` member's item
+/// names and map keys. An over-limit name fails the whole request with a
+/// top-level ValidationException and no cancellation reasons.
+///
+/// Order, measured on the service (2026-10-21) with over-limit names in two
+/// places at once: a `Put` with a long `#n` and a long key in `:c` reports
+/// `:c` (values before names, as the `Update` member does), and a `Put` with a
+/// long item name and a long `#n` reports `#n` (expression maps before the
+/// item). A standalone `PutItem` with a long item name and a long `#n`
+/// reports the item, so that handler keeps the opposite order.
+fn validate_member_attribute_name_sizes(
+    twi: &TransactWriteItem,
+    limits: &LimitsConfig,
+) -> Result<(), DynamoDbError> {
+    let form = AttributeNameRequestForm::TransactionMember;
+    let (names, values) = if let Some(put) = &twi.put {
+        (
+            put.expression_attribute_names.as_ref(),
+            put.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(del) = &twi.delete {
+        (
+            del.expression_attribute_names.as_ref(),
+            del.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(upd) = &twi.update {
+        (
+            upd.expression_attribute_names.as_ref(),
+            upd.expression_attribute_values.as_ref(),
+        )
+    } else if let Some(cc) = &twi.condition_check {
+        (
+            cc.expression_attribute_names.as_ref(),
+            cc.expression_attribute_values.as_ref(),
+        )
+    } else {
+        return Ok(());
+    };
+    validate_expression_attribute_name_sizes(names, values, limits, form)?;
+    if let Some(put) = &twi.put {
+        validate_attribute_name_sizes(&put.item, limits, form)?;
+    }
+    Ok(())
+}
+
 /// Parse and validate a single `TransactWriteItem`, returning a `PreparedOp`.
 async fn prepare_write_op(
     twi: &TransactWriteItem,
@@ -353,7 +429,6 @@ async fn prepare_write_op(
             .map_err(storage_err_to_dynamo)?;
         validate_item_nesting_depth(&put.item)?;
         validate_item_size(&put.item, ctx.limits.max_item_size_bytes)?;
-        validate_attribute_name_sizes(&put.item, &ctx.limits)?;
         validate_key_not_empty(&put.item, &key_info.key_schema)?;
         let maps = build_expression_maps(
             put.expression_attribute_names.as_ref(),

@@ -90,6 +90,92 @@ pub fn parse_stream_arn(arn: &str) -> Result<(String, String), StorageError> {
     }
 }
 
+/// What `DescribeStream` answers for a stream ARN that names no stream of the
+/// caller's account. Measured 2026-10-24 on an existing table with its stream
+/// label changed: the sentence names the ARN and has no trailing period.
+#[must_use]
+pub fn stream_not_found(stream_arn: &str) -> StorageError {
+    StorageError::TableNotFound(format!(
+        "Requested resource not found: Stream: {stream_arn} not found"
+    ))
+}
+
+/// What `GetShardIterator` answers for a stream ARN that names no stream of the
+/// caller's account. Measured 2026-10-24 with a real shard id and a stream
+/// label three digits off.
+///
+/// `GetRecords` answers with the same sentence, both for such an ARN and for a
+/// shard that is not one of the named stream's shards. The service's iterator
+/// tokens are opaque, so a token that names such a stream or pairs a stream
+/// with another stream's shard cannot be built against it and the answer was
+/// not measured.
+pub const STREAM_DOES_NOT_EXIST: &str = "Requested resource not found: Stream does not exist";
+
+/// [`STREAM_DOES_NOT_EXIST`] as the storage error the engine maps to a
+/// `ResourceNotFoundException`.
+#[must_use]
+pub fn stream_does_not_exist() -> StorageError {
+    StorageError::TableNotFound(STREAM_DOES_NOT_EXIST.to_owned())
+}
+
+/// What `GetShardIterator` answers for a shard that is not one of the named
+/// stream's shards. Measured 2026-10-24 for a shard id of the table's other
+/// stream, on the old and on the new stream ARN, and for a well-formed shard id
+/// the account never had.
+pub const SHARD_DOES_NOT_EXIST: &str = "Requested resource not found: Shard does not exist";
+
+/// [`SHARD_DOES_NOT_EXIST`] as the storage error the engine maps to a
+/// `ResourceNotFoundException`.
+#[must_use]
+pub fn shard_does_not_exist() -> StorageError {
+    StorageError::TableNotFound(SHARD_DOES_NOT_EXIST.to_owned())
+}
+
+#[cfg(test)]
+mod stream_not_found_tests {
+    use super::{
+        SHARD_DOES_NOT_EXIST, STREAM_DOES_NOT_EXIST, shard_does_not_exist, stream_does_not_exist,
+        stream_not_found,
+    };
+    use crate::error::StorageError;
+
+    const ARN: &str =
+        "arn:aws:dynamodb:us-east-1:111111111111:table/T/stream/2026-01-01T00:00:00.000";
+
+    fn message(error: StorageError) -> String {
+        match error {
+            StorageError::TableNotFound(msg) => msg,
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn describe_stream_names_the_arn_and_has_no_trailing_period() {
+        assert_eq!(
+            message(stream_not_found(ARN)),
+            format!("Requested resource not found: Stream: {ARN} not found")
+        );
+    }
+
+    #[test]
+    fn get_shard_iterator_and_get_records_say_the_stream_does_not_exist() {
+        assert_eq!(
+            STREAM_DOES_NOT_EXIST,
+            "Requested resource not found: Stream does not exist"
+        );
+        assert_eq!(message(stream_does_not_exist()), STREAM_DOES_NOT_EXIST);
+    }
+
+    #[test]
+    fn get_shard_iterator_says_a_shard_of_no_stream_of_the_table_does_not_exist() {
+        assert_eq!(
+            SHARD_DOES_NOT_EXIST,
+            "Requested resource not found: Shard does not exist"
+        );
+        assert_eq!(message(shard_does_not_exist()), SHARD_DOES_NOT_EXIST);
+    }
+}
+
 #[cfg(test)]
 mod stream_label_tests {
     use super::format_stream_label;

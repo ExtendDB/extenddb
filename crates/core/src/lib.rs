@@ -8,10 +8,13 @@
 //! validation logic, and error types shared across all other crates.
 
 pub mod arn;
+pub mod backup_format;
 pub mod error;
 pub mod expression;
 pub mod limits;
 pub mod metrics;
+#[cfg(feature = "partiql")]
+pub mod partiql;
 pub mod serde_helpers;
 pub mod settings_keys;
 pub mod throttle;

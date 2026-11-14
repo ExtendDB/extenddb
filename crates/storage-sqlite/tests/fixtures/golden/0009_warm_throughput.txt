@@ -1,0 +1,9 @@
+-- SELECT name, type, "notnull", dflt_value FROM pragma_table_info('tables') WHERE name = 'warm_throughput'
+warm_throughput	TEXT	0	NULL
+-- SELECT name, type, "notnull", dflt_value FROM pragma_table_info('indexes') WHERE name = 'warm_throughput'
+warm_throughput	TEXT	0	NULL
+-- SELECT table_name, warm_throughput FROM tables ORDER BY table_name
+cu_orders	NULL
+-- SELECT index_name, warm_throughput FROM indexes ORDER BY index_name
+by_gpk	NULL
+by_lsk	NULL
