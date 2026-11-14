@@ -25,7 +25,7 @@ This document describes the security architecture of extenddb, including the thr
 ### Out of Scope
 
 - **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
-- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
+- **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)). With the SQLite backend, extenddb creates the database file with mode 0600, and `init`, `migrate --yes`, `settings`, `verify` and `serve` set the database file and its `-wal`, `-shm` and `-journal` files to 0600 if they are wider. They fail if a mode cannot be set (see `cannot set the mode of SQLite file` in `docs/troubleshooting.md`).
 - **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
 
 ## Authentication

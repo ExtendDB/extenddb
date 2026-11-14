@@ -42,6 +42,7 @@ crc32fast = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
 libsqlite3-sys = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 extenddb-storage = { path = "../storage", features = ["test-util"] }
