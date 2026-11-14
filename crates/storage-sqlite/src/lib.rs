@@ -251,8 +251,9 @@ fn sqlite_server_components_factory(
                 })
         };
         // The catalog's status is read before the engine opens the file, so
-        // a server that refuses has written nothing. A dev build migrates
-        // instead, as `migrate --yes` would, copy included.
+        // a server that refuses has written nothing. `serve` has applied a
+        // catalog behind this binary already when its startup policy says
+        // to; a dev build creates a catalog in a missing or empty file.
         let dev = options.bootstrap_if_uninitialized;
         if let Some(lock) = &serve_lock {
             migrations::prepare_for_serve(&db_path, options.release, lock, dev)

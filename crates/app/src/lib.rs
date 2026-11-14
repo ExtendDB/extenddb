@@ -38,6 +38,7 @@ mod cmd_verify;
 mod init_helpers;
 mod manage_http;
 mod manage_types;
+mod serve_catalog;
 mod serve_helpers;
 mod util;
 

@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use extenddb_storage::migrations::{
     CodeBody, Done, HasManagementStore, Kind, LedgerRow, MigrationBackend, MigrationError,
-    MigrationId, Outcome, RunKind, Runner, Step, StoreKind, StoreRef, Target, before_lock, exit,
+    MigrationId, Outcome, RunKind, Runner, Startup, Step, StoreKind, StoreRef, Target, before_lock,
+    exit, prepare_to_serve,
 };
 use extenddb_storage_postgres::migrations::{
     MigrationLock, PostgresCatalogMigrations, PostgresMigrations, PostgresStores, PostgresTarget,
@@ -500,6 +501,7 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
         &PostgresCatalogMigrations,
         &Target::at(location.as_str()),
         RunKind::Migrate,
+        "migrate --yes",
     )
     .await
     .expect_err("migrate --yes refuses before the lock");
@@ -507,6 +509,33 @@ async fn a_role_that_does_not_own_the_tables_is_told_what_to_run() {
     assert!(
         refused.to_string().contains("no lock was taken"),
         "{refused}"
+    );
+    // A server under `catalog_upgrade = "apply"` checks the same notes
+    // before it takes the lock, and refuses with them and the same code,
+    // naming itself.
+    let startup = Startup {
+        apply: true,
+        creates_uninitialized: false,
+        release: "1.0.0-test",
+        lock_timeout: Duration::from_secs(5),
+        heartbeat: Startup::HEARTBEAT,
+    };
+    let refused = prepare_to_serve(
+        &PostgresCatalogMigrations,
+        &Target::at(location.as_str()),
+        &startup,
+        &|_| {},
+    )
+    .await
+    .expect_err("a server under apply refuses before the lock");
+    assert_eq!(refused.exit_code(), exit::ERROR);
+    let shown = refused.to_string();
+    assert!(
+        shown.starts_with(
+            "serve with --migrate or catalog_upgrade = \"apply\" refuses to apply migrations"
+        ) && shown.contains(&format!("the application role {role} does not own"))
+            && shown.contains("no lock was taken"),
+        "{shown}"
     );
     let err = migrate(&target, "test", Duration::from_secs(5))
         .await

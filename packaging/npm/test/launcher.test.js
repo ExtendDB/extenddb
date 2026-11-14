@@ -30,6 +30,9 @@
 //      deadline bounds the version check and the
 //      health wait together. The error names a "binary" option or
 //      EXTENDDB_BINARY path that does not exist.
+//
+// The startup timeout and the reporting of a failed start are tested with a
+// stand-in server in test/start.test.js.
 
 "use strict";
 
@@ -526,10 +529,7 @@ async function main() {
     );
     const took = Date.now() - began;
     assert.ok(took < 2900, `start() took ${took}ms with startupTimeoutMs 2000`);
-    // start() does not stop a server that misses the deadline, so stop the
-    // fake here.
-    const serve = fake.invocations().find((r) => r.args[0] === "serve");
-    process.kill(serve.pid, "SIGKILL");
+    // start() stops the server that missed the deadline before it rejects.
   }
 
   // 11. The launcher skips a "binary" option or EXTENDDB_BINARY that names

@@ -32,6 +32,12 @@ with `init` and removes them at the end.
   and neither 2, which is not convergent, nor 3 and 4, which do not apply on
   Cassandra; migrate --forget 2 and the migrate --yes that applies 2 again
   run, and serve runs;
+- the startup policy on a catalog behind this binary: serve exits 3 and
+  names --migrate, and in daemon mode the invoking process exits 3 with the
+  message on its stderr; while another session holds the migration lock,
+  serve --migrate waits for catalog_upgrade_lock_timeout, 3 s here and not
+  the 60 s default, and exits 6; once the lock is free, serve --migrate
+  applies the migration and serves;
 - with the node paused, a server that cannot renew its registration answers
   503 within 40 s of the pause, before its row can expire (45 s after its
   last renewal, which came up to 5 s before the pause), then tries to
@@ -53,13 +59,16 @@ from catalog_checks import (
     expect_exit,
     finish,
     healthy,
+    kill_daemon,
     report,
     run,
+    run_split,
     start,
     stop,
     watch_lost_registration,
     with_filesystem_store,
 )
+from catalog_checks import pid_file as pid_file_for
 
 ADMIN_USER = os.environ.get("CASSANDRA_ADMIN_USER", "cassandra")
 ADMIN_PASSWORD = os.environ.get("CASSANDRA_ADMIN_PASSWORD", "cassandra")
@@ -173,6 +182,65 @@ def not_a_catalog(binary: str, env: dict, container: str, config: str, stem: str
             env,
             contains="extenddb init",
         )
+
+
+def startup_policy(
+    binary: str, env: dict, container: str, config: str, keyspace: str, port: int, work: str,
+    servers: list,
+) -> None:
+    """`serve`'s startup policy on a catalog behind this binary, in the
+    foreground and in daemon mode."""
+    hint = "or start this server with --migrate"
+    serve = [binary, "serve", "--config", config, "--foreground", "--port", str(port)]
+    daemon = [binary, "serve", "--config", config, "--port", str(port)]
+    code, output = cqlsh(
+        container, f"CONSISTENCY QUORUM;\nDELETE FROM {keyspace}.extenddb_migrations WHERE id = 4;\n"
+    )
+    report(code == 0, "the catalog is behind this binary by migration 4", output)
+    expect_exit(3, "serve on a catalog behind this binary", serve, env, contains=hint)
+    # The parent reads the status before it forks, so the code and the
+    # message reach the invoking shell.
+    code, out, err = run_split(daemon, env)
+    kill_daemon(pid_file_for(config, env, port), binary)
+    report(
+        code == 3 and hint in err,
+        f"exit {code}: serve in daemon mode on a catalog behind this binary, the message on stderr",
+        out + err,
+    )
+    code, output = cqlsh(
+        container,
+        "CONSISTENCY QUORUM;\nSERIAL CONSISTENCY SERIAL;\n"
+        f"INSERT INTO {keyspace}.settings (key, value) VALUES ('migration_lock', "
+        "'held-by-check') IF NOT EXISTS USING TTL 300;\n",
+    )
+    report(code == 0 and "True" in output, "the script holds the migration lock", output)
+    # Under 30 s tells the 3 s set here from the 60 s default.
+    started = time.monotonic()
+    expect_exit(
+        6,
+        "serve --migrate while another session holds the migration lock",
+        serve + ["--migrate"],
+        dict(env, EXTENDDB__SERVER__CATALOG_UPGRADE_LOCK_TIMEOUT="3"),
+        contains="migration lock",
+    )
+    waited = time.monotonic() - started
+    report(3 <= waited < 30, f"serve --migrate waited {waited:.1f} s for the lock, its 3 s timeout")
+    code, output = cqlsh(
+        container,
+        "CONSISTENCY QUORUM;\nSERIAL CONSISTENCY SERIAL;\n"
+        f"DELETE FROM {keyspace}.settings WHERE key = 'migration_lock' IF value = "
+        "'held-by-check';\n",
+    )
+    report(code == 0 and "True" in output, "the script releases the lock", output)
+    log = os.path.join(work, "serve-migrate.log")
+    server = start(serve + ["--migrate"], env, log)
+    servers.append(server)
+    up = healthy(f"https://127.0.0.1:{port}/health", server)
+    stop(server)
+    with open(log, encoding="utf-8") as f:
+        report(up, "serve --migrate applies the pending migration and serves", f.read())
+    expect_exit(0, "verify after serve --migrate", [binary, "verify", "--config", config], env,
+                contains="OK: Current")
 
 
 def main(binary: str, container: str, contact_point: str, port: int) -> int:
@@ -330,6 +398,8 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
             contains="Applied 2 resource_tag_condition_keys",
         )
 
+        startup_policy(binary, env, container, config, keyspace, port, work, servers)
+
         server = start(serve, env, log)
         servers.append(server)
         if not report(healthy(f"https://127.0.0.1:{port}/health", server), "serve once the lock is free"):
@@ -369,6 +439,7 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
             subprocess.run(["docker", "unpause", container], check=False)
         for server in servers:
             stop(server)
+        kill_daemon(pid_file_for(config, env, port), binary)
         cleanup(container, stem)
         shutil.rmtree(work, ignore_errors=True)
     return finish()

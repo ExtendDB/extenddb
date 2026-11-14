@@ -45,3 +45,4 @@ jobs:
           set -euo pipefail
           cd packaging/npm
           node test/launcher.test.js
+          node test/start.test.js

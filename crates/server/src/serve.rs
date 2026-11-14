@@ -183,11 +183,14 @@ impl std::error::Error for CatalogRefusal {}
 /// (`extenddb backup list` and `purge`): the message, with the command that
 /// resolves the status, and the exit code `migrate` and `verify` use for it
 /// (3 for a catalog behind this binary, 6 while a migration runs).
+/// `serving` marks the refusal of `serve` itself, whose message for a catalog
+/// behind this binary also names `serve --migrate`.
 pub async fn catalog_refusal(
     error: &extenddb_storage::migrations::MigrationError,
     release: &'static str,
     app_config: &config::AppConfig,
     config_path: Option<&str>,
+    serving: bool,
 ) -> CatalogRefusal {
     use extenddb_storage::migrations::{Target, advice, installed};
     // A server started without a config file (a dev server configured
@@ -209,6 +212,7 @@ pub async fn catalog_refusal(
         &named,
         config_path,
     );
+    let advice = if serving { advice.for_server() } else { advice };
     CatalogRefusal {
         exit_code: error.exit_code(),
         message: advice::error_message(error, &advice.advice()),
@@ -246,7 +250,7 @@ const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
 ///
 /// Returns the startup error message when the value is outside the accepted
 /// range, so misconfiguration fails fast instead of reaching the listener.
-fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
+pub fn check_request_timeout_secs(secs: u64) -> Result<(), String> {
     if secs == 0 {
         return Err(
             "Invalid [server] configuration: request_timeout_secs must be at least 1 \
@@ -434,6 +438,7 @@ async fn serve_inner(params: ServeParams, port: u16) -> anyhow::Result<()> {
                 build.version,
                 &app_config,
                 config_path.as_deref(),
+                true,
             )
             .await
             .into());

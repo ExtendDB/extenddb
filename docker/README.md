@@ -162,6 +162,18 @@ whether pgvector is available and goes on. A backup taken by a 0.1.x release
 can restore without its secondary indexes, so take a new backup of each table
 after the upgrade.
 
+The serving container refuses a catalog behind its image: `serve` exits 3 and
+prints the pending migrations, what to back up, and the command above.
+`serve --migrate`, or `EXTENDDB__SERVER__CATALOG_UPGRADE=apply` in the serving
+container's environment, makes the server apply the migrations itself before it
+serves, through the same lock the Job takes. It exits 6 when the lock and the
+running servers are not free within `[server] catalog_upgrade_lock_timeout`
+seconds (60 by default), which bounds the whole wait, and when a migration holds
+the lock as it registers. On Kubernetes keep the Job: the
+[upgrade manual](../docs/manuals/07-upgrade-manual.md#deployment-recipes) gives
+the reasons, and lists the
+[exit codes of serve](../docs/manuals/07-upgrade-manual.md#exit-codes-of-serve).
+
 ### Steady state
 
 Run only:
