@@ -1,6 +1,12 @@
-# Admin Guide
+---
+description: "Running an ExtendDB server: lifecycle, the configuration file, IAM administration, the web console, monitoring and troubleshooting."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Administration
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
+
+This guide covers running an ExtendDB server day to day: starting and stopping it, the configuration file, IAM administration (accounts, users, access keys, groups, roles, policies), the web console, monitoring and troubleshooting.
 
 ## Server Lifecycle
 
@@ -10,7 +16,7 @@
 ./target/release/extenddb serve --config extenddb.toml
 ```
 
-extenddb always runs as a daemon. On startup it:
+ExtendDB always runs as a daemon. On startup it:
 
 1. Reads `extenddb.toml` configuration
 2. Binds the TCP socket (port conflicts are reported before forking)
@@ -40,7 +46,7 @@ Or manually:
 kill <pid>
 ```
 
-extenddb handles SIGTERM and SIGINT gracefully: it drains active connections for up to 5 seconds (the TLS listener and the plain-HTTP listener of a dev-mode build alike), then waits up to 30 seconds for its running backup jobs to end (a job the stop cancels runs its failure path, which marks its row FAILED and deletes what it wrote to the store; on a large S3 prefix that takes longer than the other bounds), then up to 10 seconds for its registration supervisor to return, up to 16 seconds to stop its background workers (5 seconds for them to return, 1 second for the ones then aborted, and 10 seconds more behind a stop the supervisor was still running), up to 10 seconds to give up its serving registration (kept, to expire by itself, while a background worker or a backup job may still run), and 5 seconds for its runtime's blocking threads, and exits. With no backup job running the job wait ends at once, and in an ordinary stop the supervisor, the workers and the release each take moments. A `CreateBackup` that is still waiting in its snapshot open or row insert when the stop begins writes no row, and its client sees the connection closed by the drain (measured: 8.2 s after the request was sent): the jobs' token, which turns such a request into `ServiceUnavailable` "The server is shutting down. Retry the request.", is cancelled after the drain, so that answer reaches a client only after a registration loss, when the token is cancelled while the listener still serves. `extenddb stop` waits up to 76 seconds, the sum of these bounds, before it reports that the server did not exit.
+ExtendDB handles SIGTERM and SIGINT gracefully: it drains active connections for up to 5 seconds (the TLS listener and the plain-HTTP listener of a dev-mode build alike), then waits up to 30 seconds for its running backup jobs to end (a job the stop cancels runs its failure path, which marks its row FAILED and deletes what it wrote to the store; on a large S3 prefix that takes longer than the other bounds), then up to 10 seconds for its registration supervisor to return, up to 16 seconds to stop its background workers (5 seconds for them to return, 1 second for the ones then aborted, and 10 seconds more behind a stop the supervisor was still running), up to 10 seconds to give up its serving registration (kept, to expire by itself, while a background worker or a backup job may still run), and 5 seconds for its runtime's blocking threads, and exits. With no backup job running the job wait ends at once, and in an ordinary stop the supervisor, the workers and the release each take moments. A `CreateBackup` that is still waiting in its snapshot open or row insert when the stop begins writes no row, and its client sees the connection closed by the drain (measured: 8.2 s after the request was sent): the jobs' token, which turns such a request into `ServiceUnavailable` "The server is shutting down. Retry the request.", is cancelled after the drain, so that answer reaches a client only after a registration loss, when the token is cancelled while the listener still serves. `extenddb stop` waits up to 76 seconds, the sum of these bounds, before it reports that the server did not exit.
 
 Note that `extenddb stop` reads the PID file, which a server started with
 `serve --foreground` does not write by default. Stop a foreground server through
@@ -83,7 +89,7 @@ run bounded (5 s for a filesystem root, 30 s for a bucket, after which the
 check is abandoned and the store is `unreachable` until a later check
 answers), and the component recovers on its own.
 
-Or without `curl` — useful inside a minimal container image, and what a Docker
+Or without `curl`, useful inside a minimal container image, and what a Docker
 `HEALTHCHECK` should call:
 
 ```bash
@@ -106,7 +112,7 @@ only, and rely on client retries for backend failures.
 
 ## Configuration Reference
 
-### extenddb.toml — Static Configuration
+### extenddb.toml: Static Configuration
 
 These settings require a server restart to take effect.
 
@@ -123,7 +129,7 @@ These settings require a server restart to take effect.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `backend` | `postgres` | Storage backend (only `postgres` supported) |
+| `backend` | `postgres` | Storage backend: `postgres`, `mongodb`, `sqlite` or `cassandra`. Must match the feature the binary was built with; see [Storage backends](../storage-backends.md) |
 
 ExtendDB owns the collections, tables and indexes of its catalog and data databases. A change to them, such as an added index, is not supported and can make a later migration fail.
 
@@ -262,7 +268,7 @@ In-memory stale-while-revalidate caches eliminate the per-request catalog roundt
 | Key | Default | Description |
 |-----|---------|-------------|
 | `enabled` | `true` | Master kill switch. When `false`, all caches operate in pass-through mode. |
-| `ttl_seconds` | `60` | Hard TTL — entries older than this trigger a fresh, request-blocking load. |
+| `ttl_seconds` | `60` | Hard TTL: entries older than this trigger a fresh, request-blocking load. |
 | `soft_ttl_seconds` | `30` | Stale-but-usable threshold; older entries still serve immediately while a background task refreshes them. |
 | `negative_ttl_seconds` | `5` | Negative-cache TTL for "not found" results. |
 | `max_entries` | `10000` | Maximum entries per cache. |
@@ -287,7 +293,7 @@ Statistics are exposed at `/management/auth-cache-metrics` (JSON, admin-authenti
 
 #### [limits]
 
-All defaults match real DynamoDB limits. Override only for testing edge cases.
+All defaults match the DynamoDB service limits. Override only for testing edge cases.
 
 #### [logging]
 
@@ -1009,7 +1015,7 @@ Targets: `extenddb::audit::manage` (some management operations), `extenddb::audi
 curl --cacert ~/.extenddb/tls/cert.pem -u admin:<pw> https://127.0.0.1:18443/metrics
 ```
 
-JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See `docs/design/06-component-server.md` §7.2 for the full schema and metric list.
+JSON metrics endpoint with DynamoDB CloudWatch-style metric names and dimensions. The response shape is `{ metrics, buckets, segments, source }`. See the [server component design](../design/06-component-server.md) section 7.2 for the full schema and metric list.
 
 ### Health Check
 
@@ -1141,7 +1147,7 @@ On a new PostgreSQL server (the old one lost with its databases) create the appl
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.

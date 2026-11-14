@@ -1,6 +1,10 @@
-# Upgrade Manual
+---
+description: "Upgrading an ExtendDB deployment from one version to the next, with the catalog migrations each release requires."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Upgrading
+
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
 ## Current Status
 
@@ -86,7 +90,7 @@ A rollback to the previous binary needs two things: the catalog restored from th
 
 ## Writing a New Migration
 
-Writing a catalog migration is contributor work. The procedure, with a worked example and the tests to run on each backend, is in the [catalog migration section](../../CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` in the repository root. `extenddb migrate --list` prints the migrations the binary carries, with each one's kind on its backend.
+Writing a catalog migration is contributor work. The procedure, with a worked example and the tests to run on each backend, is in the [catalog migration section](https://github.com/ExtendDB/extenddb/blob/main/CONTRIBUTING.md#adding-a-catalog-migration) of `CONTRIBUTING.md` in the repository root. `extenddb migrate --list` prints the migrations the binary carries, with each one's kind on its backend.
 
 ## General Upgrade Procedure
 
@@ -702,7 +706,7 @@ previous paragraph sets up. No catalog migration is required.
 
 ---
 
-### v0.1.14 LeadingKeys now enforced on Query, batch and transaction operations
+### v0.1.14: LeadingKeys enforced on Query, batch and transaction operations
 
 **What changed.** `dynamodb:LeadingKeys` is now evaluated on `Query`,
 `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`.
@@ -863,12 +867,12 @@ Request: BackupArn is not valid" on `DescribeBackup`, `DeleteBackup`, and
 (a listing of backups created under a valid region pages). The server starts
 with such a region and logs a warning naming the consequence at startup.
 
-### v0.1.6 — IAM: bare operators on multivalued condition keys are no-ops (BR-7085)
+### v0.1.6: IAM bare operators on multivalued condition keys are no-ops
 
 **What changed.** A **bare** condition operator (no `ForAnyValue:` / `ForAllValues:`
-qualifier) applied to a *multivalued* condition key — `dynamodb:Attributes` or
-`dynamodb:LeadingKeys` — now **never matches**, matching real AWS IAM exactly. Before
-v0.1.6, extenddb evaluated a bare operator as an implicit AND across the request's values,
+qualifier) applied to a *multivalued* condition key, `dynamodb:Attributes` or
+`dynamodb:LeadingKeys`, now **never matches**, matching AWS IAM exactly. Before
+v0.1.6, ExtendDB evaluated a bare operator as an implicit AND across the request's values,
 so such a condition could match and appear to enforce a restriction.
 
 **Who is affected.** Any deployment with an IAM policy that uses a bare operator (e.g.
@@ -881,7 +885,7 @@ denylist that *appeared* to protect an attribute:
 ```
 
 Under the old behavior this could deny a single-attribute request; after the upgrade it is a
-no-op (as it always was on real AWS). **This is a security-relevant change: policies relying
+no-op (as it always was on the DynamoDB service). **This is a security-relevant change: policies relying
 on the old semantics no longer restrict access.**
 
 **Migration.** Rewrite affected policies to use a set qualifier before upgrading:
@@ -1142,7 +1146,7 @@ DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with t
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.

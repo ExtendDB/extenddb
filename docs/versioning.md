@@ -8,7 +8,7 @@ ExtendDB follows [Semantic Versioning](https://semver.org/). A release number ha
 - A minor release can add operations, configuration keys, CLI flags and catalog migrations. It can deprecate an item. It can carry a breaking catalog migration, and its release notes then say so. A minor release can also raise the minimum Rust version that a build from source needs.
 - A patch release fixes bugs other than the behavior changes under [The DynamoDB API](#what-stays-compatible-within-a-major-version), and it fixes security issues. It adds no configuration key, no breaking catalog migration and no new backup format version. A rollback to an earlier patch release of the same minor release needs only the earlier binary.
 
-The [beta tier](../README.md#storage-backends) adds one exception to these rules. To remove a known limit of a beta backend, a minor release can change the behavior that the README table lists.
+The [beta tier](https://github.com/ExtendDB/extenddb/blob/main/README.md#storage-backends) adds one exception to these rules. To remove a known limit of a beta backend, a minor release can change the behavior that the README table lists.
 
 ## What stays compatible within a major version
 
@@ -44,7 +44,7 @@ A backup in a backup store carries a format version. A release reads each format
 - The APIs of the Rust crates, the `Storage` trait among them: the crates are not published, and the trait still changes.
 - Preview settings, such as `enable_multipart_keys`.
 - The fields of a `/metrics` response.
-- Backends in the experimental [tier](../README.md#storage-backends).
+- Backends in the experimental [tier](https://github.com/ExtendDB/extenddb/blob/main/README.md#storage-backends).
 
 ## Support
 
@@ -55,7 +55,7 @@ Fixes ship in patch releases. A fix for an earlier minor release gets a patch re
 - After 2.0 ships, the last 1.x minor release gets security fixes for 12 months.
 - The 0.1.x releases get no fixes after 1.0 ships.
 
-Support covers the stable and beta backends. An experimental backend gets fixes in the newest minor release only. To report a security issue, follow [SECURITY.md](../SECURITY.md).
+Support covers the stable and beta backends. An experimental backend gets fixes in the newest minor release only. To report a security issue, follow [SECURITY.md](https://github.com/ExtendDB/extenddb/blob/main/SECURITY.md).
 
 ## Deprecation
 

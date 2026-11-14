@@ -232,7 +232,7 @@ root certificates parsed!". An S3-compatible server takes `endpoint`, and an `ht
 `force_path_style = true`
 and a loopback host unless `allow_insecure_endpoint = true`. The S3-compatible material (the request checksums
 some servers reject, TLS trust, conditional writes) is in
-[`crates/backup-store/README.md`](../../crates/backup-store/README.md).
+[`crates/backup-store/README.md`](https://github.com/ExtendDB/extenddb/blob/main/crates/backup-store/README.md).
 
 Defaults: on file-backed SQLite an absent section is a filesystem store at `backups/` beside the database
 file. On PostgreSQL, MongoDB, Cassandra and an in-memory SQLite database there is no default, and without a
@@ -338,7 +338,7 @@ and FUSE mounts refuse `link(2)`, and the server then reports the store as havin
 ### An S3 bucket
 
 The least-privilege IAM policy for the server's role, its actions and the resources each applies to, is in
-[`crates/backup-store/README.md`](../../crates/backup-store/README.md) (the IAM item of its Behavior section).
+[`crates/backup-store/README.md`](https://github.com/ExtendDB/extenddb/blob/main/crates/backup-store/README.md) (the IAM item of its Behavior section).
 The store's check probes each grant the policy lists and names a missing one. On an SSE-KMS bucket it does not
 probe `kms:Decrypt`, which an upload's parts (`UploadPart`) and a restore's download (`GetObject`) use, so a
 role without it passes the check and fails at the first job that needs it. Run the restore drill after any

@@ -1,3 +1,7 @@
+---
+description: "Proposal for an Apache Cassandra storage backend."
+---
+
 # RFC-000X: Apache Cassandra Storage Backend
 
 - Status: Draft

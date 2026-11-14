@@ -1,11 +1,15 @@
-# Deployment Guide
+---
+description: "Running ExtendDB on your own servers: single host, split host, managed PostgreSQL, containers, air-gapped, and the production checklist."
+---
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+# Deployment
 
-This guide covers deploying extenddb in various environments beyond local development.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
+
+This guide covers deploying ExtendDB in various environments beyond local development.
 
 > **Backend-specific sections.** This guide covers deployment concerns common to
-> all storage backends, and uses PostgreSQL — the default and reference backend —
+> all storage backends, and uses PostgreSQL, the default and reference backend,
 > for concrete examples. Sections headed *PostgreSQL* apply only to that backend.
 > For other backends, see their setup docs:
 > [Cassandra setup](../cassandra-setup.md) (experimental; local and production)
@@ -14,11 +18,11 @@ This guide covers deploying extenddb in various environments beyond local develo
 
 ## Architecture Overview
 
-extenddb is a single Rust binary that connects to a storage backend. All durable state lives in the backend; extenddb keeps only short-lived credential, policy, and table-metadata caches in process. This means:
+ExtendDB is a single Rust binary that connects to the storage backend it was built with (PostgreSQL by default; see [Storage backends](../storage-backends.md)). All durable state lives in the backend; ExtendDB keeps only short-lived credential, policy, and table-metadata caches in process. This means:
 
-- Multiple extenddb instances can share one backend catalog (with caveats — see Multi-Instance below)
+- Running more than one ExtendDB instance against one catalog is not supported in this release (see [Multi-Instance Considerations](#multi-instance-considerations))
 - The backend's own HA, backup, and replication tools provide durability; with `[backup.store]` configured (file-backed SQLite has one by default), table backups go to the store on PostgreSQL, SQLite and MongoDB; without one, and always on Cassandra, they are in-catalog backups inside the database; the [Backup and Restore manual](14-backup-and-restore.md) covers both
-- extenddb can run anywhere the storage backend is reachable
+- ExtendDB can run anywhere the storage backend is reachable
 
 ## Deployment Models
 
@@ -95,7 +99,7 @@ CMD ["/usr/local/bin/entrypoint.sh"]
 ```
 
 Run the server with `serve --foreground` (alias `--no-daemon`) so it stays PID 1's
-child and receives `SIGTERM` directly. In foreground mode extenddb writes no PID
+child and receives `SIGTERM` directly. In foreground mode ExtendDB writes no PID
 file and never creates `run_dir`, so the root filesystem can be read-only. Use
 `tini` as PID 1 to reap any stray children and forward signals:
 
@@ -127,7 +131,7 @@ period is shorter (Docker's default is 10 s) kills the process during the job
 drain, and the reconciler resolves the job's row as it does after a crash. The
 repository's compose files set `stop_grace_period: 80s`, above that sum; a
 compose file of your own needs the same. Outside a container, where you may want `stop` to work, add
-`--write-pid-file` — it writes the PID file to the usual `run_dir` path, which
+`--write-pid-file`; it writes the PID file to the usual `run_dir` path, which
 then has to be writable.
 
 `extenddb healthcheck` exits 0 when the server is
@@ -143,7 +147,7 @@ There is no readiness endpoint yet, so do not expect a Kubernetes
 becomes unreachable. Until a readiness endpoint that probes the storage layer
 exists, treat backend failures as something clients retry through.
 
-For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy extenddb as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
+For Kubernetes, run `extenddb init` as an init container or a one-time Job, then deploy ExtendDB as a Deployment with the generated `extenddb.toml` mounted as a ConfigMap or Secret.
 
 ### Air-Gapped
 
@@ -214,19 +218,19 @@ extenddb init \
 
 ### Transport
 
-- [ ] TLS is enabled by default. Verify it is not disabled in `extenddb.toml`
+- [ ] TLS is always on; the server refuses to start with `tls.enabled = false`. Confirm the certificate and key paths in `extenddb.toml`
 - [ ] Replace the self-signed certificate with a CA-signed certificate
-- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string. The Cassandra backend cannot encrypt its connection — place ExtendDB and the Cassandra cluster on a trusted, isolated network instead
+- [ ] Encrypt the connection to the storage backend. For PostgreSQL, use `sslmode=require` or `sslmode=verify-full` in the connection string. The Cassandra backend cannot encrypt its connection; place ExtendDB and the Cassandra cluster on a trusted, isolated network instead
 
 ### Network
 
-- [ ] Set `bind_addr` to the appropriate interface (not `0.0.0.0` unless behind a load balancer)
-- [ ] Firewall: allow only necessary ports (extenddb port, storage backend port)
+- [ ] Set `bind_addr` to the interface your clients reach, not `0.0.0.0`
+- [ ] Firewall: allow only necessary ports (the ExtendDB port, the storage backend port)
 - [ ] Consider a reverse proxy (nginx, HAProxy) for TLS termination, rate limiting, and access logging. Unless the proxy preserves the client address, login limits count the proxy's address as the source for every caller behind it (see the security model manual).
 
 ### Database (PostgreSQL)
 
-- [ ] Use a dedicated PostgreSQL user for extenddb with minimal privileges
+- [ ] Use a dedicated PostgreSQL user for ExtendDB with minimal privileges
 - [ ] Configure PostgreSQL `max_connections` ≥ `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus one per overlapping vector index build and one during a schema migration
 - [ ] Enable PostgreSQL TLS
 - [ ] Set up automated backups that copy the catalog and data databases as one copy: a base backup with WAL archiving or managed service snapshots of the instance (either covers one instance, so only when both databases are on one PostgreSQL instance), or `pg_dump` of both with the server stopped, under `umask 077` (the admin guide's [Data Recovery](05-admin-guide.md#data-recovery) entry)
@@ -238,7 +242,7 @@ extenddb init \
 - [ ] Poll `/metrics` with an admin user's credentials (HTTP Basic auth) for JSON snapshots and forward to your monitoring system (the response is custom JSON, not Prometheus exposition format; convert as needed)
 - [ ] Forward syslog to a log aggregation service
 - [ ] Set up alerts on health check failures (`/health`)
-- [ ] Monitor extenddb process with systemd, supervisord, or equivalent
+- [ ] Monitor ExtendDB process with systemd, supervisord, or equivalent
 
 ### Upgrades
 
@@ -292,7 +296,7 @@ With this unit only the `extenddb` user and root can read export files: the serv
 
 ## Multi-Instance Considerations
 
-Run one extenddb instance per catalog. Multiple instances behind a load balancer are not supported in this release:
+Run one ExtendDB instance per catalog. Multiple instances behind a load balancer are not supported in this release:
 
 - Credentials, policies, and table metadata are cached in each process (see the cache TTLs in the admin guide). Nothing invalidates a cache on another instance, so a key revoked or a policy changed through one instance stays in force on the others until the TTL expires.
 - Every instance runs every background worker (TTL expiry, GSI backfill, stream retention, control-plane transitions). The workers are safe to run twice, but the work is duplicated.
@@ -336,7 +340,7 @@ statement in flight.
 
 ### PostgreSQL Tuning
 
-Key PostgreSQL settings for extenddb workloads:
+Key PostgreSQL settings for ExtendDB workloads:
 
 - `shared_buffers`: 25% of available RAM
 - `effective_cache_size`: 75% of available RAM
@@ -364,7 +368,7 @@ ORDER BY mean_exec_time DESC LIMIT 10;
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.

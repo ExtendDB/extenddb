@@ -1,38 +1,42 @@
+---
+description: "The threat model, SigV4 authentication, IAM policy evaluation, TLS, console security and input validation."
+---
+
 # Security Model
 
-> See [NOTICE](../NOTICE.md) for important disclaimers.
+> See [NOTICE](https://github.com/ExtendDB/extenddb/blob/main/docs/NOTICE.md) for important disclaimers.
 
-This document describes the security architecture of extenddb, including the threat model, authentication and authorization mechanisms, transport security, and operational security controls.
+This document describes the security architecture of ExtendDB, including the threat model, authentication and authorization mechanisms, transport security, and operational security controls.
 
 ## Threat Model
 
-### What extenddb Protects
+### What ExtendDB Protects
 
 - **Data confidentiality**: Items stored in DynamoDB tables are accessible only to authenticated and authorized principals.
 - **Data integrity**: Write operations are atomic (including stream records, index updates, and side effects). Concurrent writes serialize on PostgreSQL row locks.
 - **Access control**: IAM policies enforce least-privilege access. Explicit Deny always takes precedence.
 - **Credential security**: Access key secrets are encrypted at rest (AES-256-GCM). Console passwords are hashed (bcrypt).
-- **Transport security**: TLS encrypts data in transit between clients and extenddb. TLS is mandatory — the server refuses to start without it.
+- **Transport security**: TLS encrypts data in transit between clients and ExtendDB. TLS is mandatory: the server refuses to start without it.
 
 ### Trust Boundaries
 
-1. **Client ↔ extenddb**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
-2. **extenddb ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
+1. **Client ↔ ExtendDB**: Untrusted. All input is validated. SigV4 signatures are verified. IAM policies are evaluated.
+2. **ExtendDB ↔ PostgreSQL**: Trusted network. The PostgreSQL connection string contains credentials. Use TLS for the PostgreSQL connection in production (`sslmode=require` in the connection string).
 3. **Admin ↔ Management API/Console**: Authenticated via admin credentials or IAM user credentials. CSRF tokens protect the web console.
 4. **Catalog database contents**: Credential-equivalent. The AES-256-GCM key that encrypts access key secrets lives in the catalog `settings` table alongside the ciphertext it protects, so read access to the catalog database yields every stored access key secret. On PostgreSQL the same table holds `data_database_connection_string`, the login for the data database; the console, the management API and the `settings` CLI mask it, but a reader of the catalog database gets it in full. Treat catalog read access, and any catalog backup, as equivalent to holding those credentials. See [Credential Storage](#credential-storage).
 5. **Server host**: Credential-equivalent as well. `extenddb.toml` holds the catalog connection string, and a running server keeps the encryption key and recently used decrypted secrets in process memory, so read access to the config file, a core dump of the server, or a read of its memory yields the same credentials.
 
 ### Out of Scope
 
-- **PostgreSQL security**: extenddb relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
+- **PostgreSQL security**: ExtendDB relies on PostgreSQL access controls and network security. Securing the PostgreSQL instance (firewall rules, TLS, authentication) is the operator's responsibility.
 - **Operating system security**: File permissions on `extenddb.toml`, TLS keys, and the PID file are the operator's responsibility. The server sets the modes of the export files and of the import and export directories it creates ([Import and Export Files](#import-and-export-files)).
-- **Key management**: extenddb generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below extenddb, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
+- **Key management**: ExtendDB generates the credential encryption key locally and stores it unwrapped in the catalog database. It does not wrap the key with an external KMS or HSM, derive it from an operator passphrase, or rotate it. Deployments that require any of those must add protection below ExtendDB, for example an encrypted volume, a managed database with a customer-managed KMS key, or a PostgreSQL distribution that adds transparent data encryption. That protects the key at rest but not from a principal that can query the catalog.
 
 ## Authentication
 
 ### Builtin IAM (`auth.provider = "builtin"`)
 
-extenddb uses SigV4 signature verification with a local credential store and IAM policy engine. This is the only supported authentication mode — the server refuses to start without it. The `auth.provider` setting defaults to `"builtin"`. Setting it to `"none"` causes a startup error.
+ExtendDB uses SigV4 signature verification with a local credential store and IAM policy engine. This is the only supported authentication mode; the server refuses to start without it. The `auth.provider` setting defaults to `"builtin"`. Setting it to `"none"` causes a startup error.
 
 #### SigV4 Verification
 
@@ -129,7 +133,7 @@ Flushing a cache does not revoke anything by itself: it only makes the server re
 
 ## Authorization
 
-### Policy Evaluation — 5-Phase IAM Algorithm
+### Policy Evaluation: 5-Phase IAM Algorithm
 
 When `auth.provider = "builtin"`, every authenticated DynamoDB API request is authorized against IAM policies, except these, which get an answer without an IAM decision:
 
@@ -139,13 +143,13 @@ When `auth.provider = "builtin"`, every authenticated DynamoDB API request is au
 - A PartiQL request that is refused before any of its statements is authorized: a member outside its constraints, or a statement that does not parse or breaks a rule of its form. The server authorizes a PartiQL request per statement.
 - A request the server cannot authorize because of a fault, such as a failed key lookup, which gets a server error.
 
-In dev mode no request gets an IAM decision. The evaluation follows the same algorithm as real AWS IAM:
+In dev mode no request gets an IAM decision. The evaluation follows the same algorithm as AWS IAM:
 
-1. **Explicit Deny** — scan all policies (identity, permissions boundary, session). If any Deny statement matches the action, resource, and conditions → **DENY**.
-2. **Permissions Boundary** — if a permissions boundary is set on the user or role, it must contain an Allow statement matching the action, resource, and conditions. If not → **DENY**.
-3. **Session Policy** — if the request uses AssumeRole credentials with a session policy, the session policy must contain a matching Allow. If not → **DENY**.
-4. **Identity Allow** — scan identity policies (user inline policies, group inline policies, role inline policies). If any Allow statement matches → **ALLOW**.
-5. **Implicit Deny** — no matching Allow found → **DENY**.
+1. **Explicit Deny**: scan all policies (identity, permissions boundary, session). If any Deny statement matches the action, resource, and conditions → **DENY**.
+2. **Permissions Boundary**: if a permissions boundary is set on the user or role, it must contain an Allow statement matching the action, resource, and conditions. If not → **DENY**.
+3. **Session Policy**: if the request uses AssumeRole credentials with a session policy, the session policy must contain a matching Allow. If not → **DENY**.
+4. **Identity Allow**: scan identity policies (user inline policies, group inline policies, role inline policies). If any Allow statement matches → **ALLOW**.
+5. **Implicit Deny**: no matching Allow found → **DENY**.
 
 Policy sources collected for evaluation:
 - User inline policies
@@ -198,7 +202,7 @@ Policy variables (e.g., `${aws:PrincipalTag/Team}`) are expanded in condition va
 
 ### Access Control Patterns
 
-extenddb supports the same access control patterns as real AWS IAM:
+ExtendDB supports the same access control patterns as AWS IAM:
 
 **Identity-Based Access Control (IBAC)**: Attach policies directly to IAM users. Each user's policies define what they can do.
 
@@ -246,7 +250,7 @@ Resources are identified by ARN: `arn:aws:dynamodb:<region>:<account-id>:table/<
 
 ### TLS Configuration
 
-TLS is mandatory. The server refuses to start with `tls.enabled = false`. extenddb uses rustls (no OpenSSL dependency).
+TLS is mandatory. The server refuses to start with `tls.enabled = false`. ExtendDB uses rustls (no OpenSSL dependency).
 
 - `extenddb init` generates a self-signed certificate and private key at `~/.extenddb/tls/`
 - Production deployments should replace with CA-signed certificates
@@ -260,7 +264,11 @@ key_path = "/etc/extenddb/tls/key.pem"
 
 ### Certificate Rotation
 
-Replace the certificate and key files, then restart extenddb. There is no hot-reload for TLS certificates.
+Replace the certificate and key files, then restart ExtendDB. There is no hot-reload for TLS certificates.
+
+### Development image
+
+Everything above describes a production build. The [`extenddb/extenddb-dev` image](../dev-image.md) is compiled with the `dev-mode` feature, which exists for local development and CI only. In that build the server listens on plain HTTP, seeds a published example access key on every start, and treats any request signed with a seeded key as authorized; SigV4 signatures are still verified and the standard `AWS_*` variables in the environment are never used as credentials. The feature compiles only with the SQLite backend and the image is published with its port bound to the loopback interface in every example. It must not be reachable from other machines.
 
 ## Web Console Security
 
@@ -303,9 +311,9 @@ A password can be guessed against one user from many addresses at 5 attempts per
 
 ## Provisioned Throughput Throttling
 
-extenddb includes a token bucket rate limiter for provisioned throughput enforcement. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive `ProvisionedThroughputExceededException` (HTTP 400), matching real DynamoDB behavior.
+ExtendDB includes a token bucket rate limiter for provisioned throughput enforcement. When `server.throttling_enabled = true` in `extenddb.toml`, read and write requests are throttled against the table's provisioned RCU/WCU limits. Requests that exceed the limit receive `ProvisionedThroughputExceededException` (HTTP 400), matching the DynamoDB service behavior.
 
-Token buckets are purely in-memory operational state — not cached database state. They are recreated on server restart.
+Token buckets are in-memory operational state, not cached database state. They are recreated on server restart.
 
 ## Input Validation
 
@@ -314,8 +322,8 @@ Token buckets are purely in-memory operational state — not cached database sta
 Input validation is layered:
 
 1. **Server layer**: Request size limits, header validation, content-type checks
-2. **Engine layer**: All user-supplied strings validated before reaching storage — table names, attribute names, expression strings, policy documents
-3. **Storage layer**: Parameterized queries only — no dynamic SQL construction from user input
+2. **Engine layer**: All user-supplied strings validated before reaching storage: table names, attribute names, expression strings, policy documents
+3. **Storage layer**: Parameterized queries only: no dynamic SQL construction from user input
 
 ### Expression Limits
 
@@ -346,7 +354,7 @@ Import/export file paths are validated:
 
 ## Error Message Security
 
-- DynamoDB-fidelity error messages reproduce real DynamoDB exactly (no additional information)
+- DynamoDB-fidelity error messages reproduce the DynamoDB service exactly (no additional information)
 - Internal errors (database connection failures, SQL errors, I/O errors) are logged server-side but return generic messages to clients
 - Stack traces, file paths, and SQL text are never exposed to clients
 
@@ -394,7 +402,7 @@ The encryption key is stored in the catalog database, so a catalog dump contains
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
-See [LICENSE](../../LICENSE) for the full text.
+See [LICENSE](https://github.com/ExtendDB/extenddb/blob/main/LICENSE) for the full text.
 
 This software is provided "as is" without warranty of any kind. ExtendDB is an open
 source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
