@@ -24,6 +24,7 @@ use extenddb_storage::{
 use pgvector::Vector;
 
 use crate::PostgresEngine;
+use crate::catalog_json::from_catalog_json;
 use crate::data::vector_table_name;
 
 /// The SQL scoring expression for one distance function.
@@ -198,11 +199,10 @@ impl VectorSearchEngine for PostgresEngine {
                 row.ok_or_else(|| StorageError::IndexNotFound(index_name.clone()))?;
             // Stored as the serialized `VectorAttribute` rather than a bare name, so
             // it is read back the same way the write path wrote it.
-            let vector_attribute_name = serde_json::from_value::<
-                extenddb_core::types::VectorAttribute,
-            >(vector_attribute_json)
-            .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?
-            .attribute_name;
+            let vector_attribute_name =
+                from_catalog_json::<extenddb_core::types::VectorAttribute>(vector_attribute_json)
+                    .map_err(|e| StorageError::Internal(format!("vector_attribute: {e}")))?
+                    .attribute_name;
             let dimensions = usize::try_from(dimensions).map_err(|_| {
                 StorageError::Internal(format!("vector dimensions out of range: {dimensions}"))
             })?;

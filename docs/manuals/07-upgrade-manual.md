@@ -4,13 +4,44 @@
 
 ## Current Status
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 9, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 12, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
 
 Migration 9, `warm_throughput`, adds a nullable `warm_throughput` column to the `tables` and `indexes` catalog tables on PostgreSQL, SQLite and Cassandra. It holds the `WarmThroughput` a client sets on a table or a global secondary index, which `DescribeTable` reports; nothing acts on the value (see [Differences from DynamoDB](../differences-from-dynamodb.md)). Tables created before the migration report the defaults for their billing mode. On MongoDB it changes nothing, since the catalog collections have no validator, and the ledger records it as not applicable. Migration 9 is breaking: to go back to a release without it, restore the backup taken before the upgrade (see [Rollback Procedure](#rollback-procedure)).
 
-Configure `[backup.store]` before the release that stops creating in-catalog backups. From this release CreateBackup writes to the configured store on PostgreSQL, SQLite and MongoDB, and is asynchronous there as on the service: the response is `CREATING` and the backup becomes `AVAILABLE` once the upload ends, so a client that deletes a backup it just created has to poll DescribeBackup first (the previous release returned `AVAILABLE`). A store-backed backup is listed, described, deleted and restored like any other. `RestoreTableFromBackup` of a backup in the configured store runs the restore job from the store on every backend (PostgreSQL, SQLite, MongoDB and Cassandra); in-catalog backups, those of the previous release included, restore as before. An S3 store needs `spool_path` set (the restore's download area) on PostgreSQL, MongoDB and Cassandra, and that must be a directory of its own, not the database directory; a filesystem store needs no spool. Migration 8 adds the `restore_progress` table to the PostgreSQL data database; run `extenddb migrate --yes` before starting the new binary. The progress rows of a restore in flight live in the data database, so a data database restored from a dump taken before migration 8 has none of them and no `restore_progress` table: the new binary refuses to serve it until `extenddb migrate --yes` has run again, and its reconciler then finds no progress for the restore and resumes it from its first data file into the (empty) target, or `FAILED`s it as `target_not_empty` if the target already holds items, in which case `extenddb backup remove-target --account <account> <table>` (the admin guide's `backup` section) removes the target and its record and the backup restores again. The same `target_not_empty` state is what a server stopped inside a restore's first data file on MongoDB, or inside its first batch of 10,000 items or 32 MiB on Cassandra, leaves on restart, since both record progress after the write; the command is the remedy there too. `backup remove-target` writes the catalog, so on SQLite the server is stopped for it, as for `purge`. The previous binary resumes no restore (a store-backed restore in flight at a rollback is lost with the catalog rows, as the rollback paragraph below says). Quiesce restores before a downgrade. `kind = "disabled"` is no longer needed to keep a deployment able to restore the backups it takes. Without a store CreateBackup writes the in-catalog format and logs a deprecation warning naming `[backup.store]` on each call; a later release's CreateBackup refuses without one. Cassandra writes the in-catalog format with or without a store. `kind = "disabled"` under `[backup.store]` is the opt-out that keeps a deployment on the in-catalog format on purpose and silences the warning. On file-backed SQLite an absent section is a filesystem store at `backups/` beside the database file, created `0700` at startup; that root must be owned by the extenddb user with mode `0700`, under directories owned by root or that user which others cannot write to. A default root that breaks the rule (a database file in a group-writable directory, say), or whose `extenddb-store.json` names another catalog (a catalog re-created by `destroy` and `init` under the old root), is logged at startup as a warning (`backup store: the default root ... failed its check`) and leaves the store unconfigured, not unhealthy, so the upgrade never stops a server that never configured backups and CreateBackup keeps working on it; the same root configured explicitly is a startup error or an unhealthy store. The warning applies only while the catalog has no backup rows for the default root (an upgrade, a fresh deployment, a catalog re-created by `destroy` and `init`): once a server has written rows for it, the default root is handled as a configured one, so its backups never vanish behind a warning (a failed identity check is an unhealthy store, reported on `/health`; a root that can no longer be opened is a startup error naming it). Instances that share a catalog must share one store root, an S3 bucket and prefix or a shared mount: a second instance pointed at a host-local directory under the same configured path starts with the store unhealthy (`/health` reports `backup_store` unhealthy; the admin guide's `[backup.store]` section says what the identity file and the manifest probe check). `extenddb destroy` leaves the store; `extenddb backup purge --confirm` is what deletes its backups, and a catalog re-created with `init` needs the old root's `extenddb-store.json` removed or a new root, since the file names the old catalog.
+Migration 10, `account_metrics`, replaces the catalog's `metrics` table (on MongoDB, collection) with `account_metrics`, whose rows record the account they were recorded for. On SQLite, PostgreSQL and Cassandra the account is part of each row's key. Two accounts that each have a table of the same name now keep their own metrics rows, where before they wrote to one (see [Metrics carry their account](#v0115-metrics-carry-their-account-catalog-migration-required)). The rows of `metrics` are dropped, not copied: they carry no account, and the server keeps metrics for a day, so `/metrics` and the console dashboard show no history from before the upgrade. On Cassandra with `auto_snapshot` on (Cassandra's default), dropping `metrics` keeps a snapshot of it on disk; `nodetool clearsnapshot` removes it. Migration 10 is breaking: a server of an earlier release writes and reads `metrics`, so stop every server of an earlier release before running `extenddb migrate --yes`, and to go back restore the backup taken before the upgrade (see [Rollback Procedure](#rollback-procedure)).
 
-A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only.
+Migration 11 rewrites the attribute names that a PostgreSQL deployment stores in its catalog, so that a name can hold U+0000. It does not apply to the other backends (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)).
+
+Migration 12, `unique_access_key_ids`, gives the MongoDB `access_keys` collection a unique index on the access key ID (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)); it does not apply on the other backends.
+
+Configure `[backup.store]` before the release that stops creating in-catalog backups. The [Backup and Restore manual](14-backup-and-restore.md) covers choosing and securing a store, the recovery figures, the restore drill, catalog-loss recovery and what to do with in-catalog backups. This section says what the upgrade changes. In this release, CreateBackup and RestoreTableFromBackup work as follows:
+
+- On PostgreSQL, SQLite and MongoDB, CreateBackup writes to the configured store. There it is asynchronous, as on the service. The response is `CREATING`, and the backup becomes `AVAILABLE` when the upload ends. So a client that creates a backup and then deletes it has to poll DescribeBackup first. The previous release returned `AVAILABLE`.
+- Without a store, CreateBackup writes the in-catalog format and logs a deprecation warning that names `[backup.store]` on each call. A later major release's CreateBackup refuses without one.
+- Cassandra writes the in-catalog format with or without a store.
+- `kind = "disabled"` under `[backup.store]` keeps a deployment on the in-catalog format on purpose. CreateBackup still logs the deprecation warning on each call. `kind = "disabled"` is no longer needed to keep a deployment able to restore the backups it takes.
+- A store-backed backup is listed, described, deleted and restored like any other. `RestoreTableFromBackup` of a backup in the configured store runs the restore job from the store on every backend (PostgreSQL, SQLite, MongoDB and Cassandra). In-catalog backups, those of the previous release included, restore as before.
+
+`extenddb backup migrate-legacy <arn>` or `--all` carries in-catalog backups into the configured store under their own ARNs (see the Backup and Restore manual's Legacy backups section). On SQLite, stop the server for it. On every backend, each backup and restore job answers `LimitExceededException` while it runs. It refuses a backup whose id has the 13-digit shape a 0.1.x release issued, which is every backup a 0.1.x release took. It also refuses a backup with an item the item check refuses, and a SQLite backup taken before catalog 0.0.4. To carry such a backup forward, restore it and take a new backup of the restored table, which has a new ARN. Run `migrate-legacy --all` again after the last DeleteBackup of an in-catalog backup. It deletes what a stopped migration left under a deleted backup's prefix, and then the deleted backup's record. The release that removes the in-catalog reader refuses its migration while such a record, whose backup id has the 14-digit shape, remains.
+
+An S3 store needs `spool_path` set on every backend except file-backed SQLite, where it defaults to `backup-spool/` beside the database file. The restore downloads into that directory, which must be a directory of its own, not the database directory. A filesystem store needs no spool.
+
+Migration 8 adds the `restore_progress` table to the PostgreSQL data database. Run `extenddb migrate --yes` before you start the new binary. If you restore the PostgreSQL data database from a dump taken before migration 8, run `extenddb migrate --yes` again. That dump has no data table for the target of a store-backed restore that was running. The reconciler marks such a restore `FAILED` and removes its target, so run the restore again.
+
+If a store-backed restore whose server stopped has no recorded progress, the reconciler starts it again from its first data file. It marks the restore `FAILED` as `target_not_empty` only when the target holds more items than the backup. To restore that backup again, run `extenddb backup remove-target --account <account> <table>`. It removes the target and its record (see the admin guide's [`[backup.store]`](05-admin-guide.md#backupstore) section). `backup remove-target` writes the catalog, so on SQLite stop the server for it, as for `purge`.
+
+A rollback restores the catalog from the pre-upgrade backup (see [Migration 6](#migration-6-the-backup-catalog-index)), so a store-backed restore in flight loses its job record. The previous binary resumes no restore. Quiesce restores before a downgrade.
+
+On file-backed SQLite, an absent `[backup.store]` section is a filesystem store at `backups/` beside the database file, created `0700` at startup. That root must be owned by the extenddb user, with mode `0700`. Each directory above it must be owned by root or by that user, with no write access for group or others. A directory that carries the sticky bit can be writable by group or others.
+
+- A default root can break this rule, for example when the database file is in a group-writable directory. Its `extenddb-store.json` can also name another catalog, for example after `destroy` and `init` re-created the catalog under the old root. In both cases the server logs a warning at startup: `backup store: the default root ... failed its check`. It leaves the store unconfigured, not unhealthy. So the upgrade never stops a server that never configured backups, and CreateBackup keeps working on it. `kind = "disabled"` silences this warning. The same root configured explicitly is a startup error or an unhealthy store.
+- The warning applies only while the catalog has no backup rows for the default root. That is the case after an upgrade, on a new deployment, and on a catalog re-created by `destroy` and `init`. Once a server has written rows for it, the default root is handled as a configured one. Its backups then never vanish behind a warning. A failed identity check is then an unhealthy store, reported on `/health`. A root that can no longer be opened is a startup error.
+
+More than one server on one catalog is not supported in 1.0. Instances that share a catalog must still share one store root, as the Backup and Restore manual's [Configuration](14-backup-and-restore.md#configuration) section says. The admin guide's `[backup.store]` section describes the store checks.
+
+`extenddb destroy` leaves the store, and `extenddb backup purge --confirm` deletes its backups. A catalog re-created with `init` finds the old root's `extenddb-store.json` naming the old catalog. The store is then unhealthy until `extenddb backup sync --adopt-store` makes the new catalog its owner. On file-backed SQLite with the default root, the server logs the warning above instead, and the store stays unconfigured. The Backup and Restore manual's [The catalog is lost and re-created](14-backup-and-restore.md#the-catalog-is-lost-and-re-created) section gives the procedure.
+
+A backup that a 0.1.x release took can restore without its global and local secondary indexes: a SQLite backup taken by 0.1.14 records only the table's key schema and attribute definitions, and its restore creates the table with its items and no index. Take a new backup of each table after upgrading to v1.0, and keep the 0.1.x backups for their items only. `extenddb backup migrate-legacy` refuses these backups on their ids, which have the 13-digit shape a 0.1.x release issued, so a restore and a new backup is also their way into the store.
 
 The [general upgrade procedure](#general-upgrade-procedure) gives the sequence. The [version history](#version-history) records the 0.1.x catalog versions and what the 0.1.x binaries print, and [Behavior Changes by Release](#behavior-changes-by-release) what each release changes in behavior.
 
@@ -43,15 +74,15 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ### Migration 6: the backup catalog index
 
-A backup of a table that holds an `N` value the wire did not validate, or an attribute name over the limit, fails on the store-backed path where the previous release backed it up. Four write paths stored such a value (`1E126`, `abc`) unvalidated (#618: BatchWriteItem, TransactWriteItems, UpdateItem on an absent item in the key it creates, ImportTable), UpdateItem and a TransactWriteItems Update of releases before #433 stored an attribute name over 65,535 bytes unchecked, and the store-backed job validates every item with the rule the restore applies, so no backup that no restore can load is reported `AVAILABLE`. This meets file-backed SQLite without a `[backup.store]` section (the defaulted root) and any deployment once a store is configured. The client sees `CREATING` and then `BackupNotFound`; the reason reaches the operator only: `extenddb backup list --failed` prints the FAILED row with the count of refused items and the first one, and the server log names each refused item's key and attribute path beside the backup ARN (up to 1,000 per backup), which a tenant's support case can cite (every tenant-supplied text in the line is written as a JSON string's content, control characters and the Unicode line separators U+0085, U+2028 and U+2029 escaped, so a newline or a line separator in an attribute name or a number value cannot forge a second log record). The way out is to rewrite or delete each named item through the wire, which validates the value (a bad range key cannot be rewritten, since a PutItem with that key is refused; `DeleteItem` removes it); the in-catalog create of a server without a store still backs such a table up.
+A backup of a table that holds an `N` value the wire did not validate, or an attribute name over the limit, fails on the store-backed path where the previous release backed it up. Four write paths stored such a value (`1E126`, `abc`) unvalidated (#618: BatchWriteItem, TransactWriteItems, UpdateItem on an absent item in the key it creates, ImportTable), UpdateItem and a TransactWriteItems Update of releases before #433 stored an attribute name over 65,535 bytes unchecked, and the store-backed job validates every item with the rule the restore applies, so no backup that no restore can load is reported `AVAILABLE`. This meets file-backed SQLite without a `[backup.store]` section (the defaulted root) and any deployment once a store is configured. The client sees `CREATING` and then `BackupNotFound`; the reason reaches the operator only: `extenddb backup list --failed` prints the FAILED row with the count of refused items and the first one, and the server log names each refused item's key and attribute path beside the backup ARN (up to 1,000 per backup), which a tenant's support case can cite (every tenant-supplied text in the line is written as a JSON string's content, control characters and the Unicode line separators U+0085, U+2028 and U+2029 escaped, so a newline or a line separator in an attribute name or a number value cannot forge a second log record). The way out is to rewrite or delete each named item through the wire, which validates the value (an item whose key itself holds such a number cannot be rewritten or deleted through the wire, since a PutItem or a DeleteItem with that key is refused; #982 tracks a way to remove it); the in-catalog create of a server without a store still backs such a table up.
 
 Migration 6 adds the catalog index of backups kept in a backup store, turns each restore registration into a restore job record, adds the maintenance claim record (`backup_maintenance`) and writes the catalog's random id (`settings.catalog_id`). On SQLite and PostgreSQL the index is the `backup_index` table and the job record is new columns of `table_restores`; on MongoDB the index is the `backup_index` collection and the job record a `restore_job` field of each restore target's `tables` document; on Cassandra the index is new columns of `backups_by_arn` and the `backup_index_by_status` table, and the job record new `restore_*` columns of `tables`. Stop every server built before this migration before running `extenddb migrate --yes`: such a server neither reads the index nor marks the restore registrations it writes, so a restore it ran during the upgrade would be owned by nobody. A restore in flight at that stop is left as a RUNNING job record whose owner is dead; the first reconciler pass of the new server (within `backup.reconcile_interval_secs`, default 60 s) marks it FAILED and removes its CREATING target, so the name is free again and the table has to be restored anew. On Cassandra the backfill reads `tables` with a filtered scan and writes each registration with a lightweight transaction, which takes seconds on a catalog of ordinary size. On Cassandra and MongoDB, which have no transaction around a body, every write of the migration is safe to send again: a `migrate --yes` that fails part way leaves migration 6 unrecorded, `serve` keeps refusing the catalog, and the next `migrate --yes` runs the body again and finishes.
 
-A rollback to the previous binary needs two things: the catalog restored from the pre-upgrade backup (the previous binary refuses a catalog carrying migration 6, exit status 4), and the `[backup]` section removed from the configuration file, which the previous binary refuses as an unknown field before it reaches the catalog (`unknown field 'backup'`). The pre-upgrade backup predates every backup this release wrote to the store, so a restored catalog has no `backup_index` row for them while the store keeps their bytes under its root; the previous binary serves neither (it does not read the store), and a later release's `backup sync --adopt-store` re-adopts them (the store's identity file names the pre-rollback catalog, so the re-upgraded catalog finds the store unhealthy until it is adopted; PR 10). In-catalog backups taken after it are lost with the rows, as before.
+A rollback to the previous binary needs two things: the catalog restored from the pre-upgrade backup (the previous binary refuses a catalog carrying migration 6, exit status 4), and the `[backup]` section removed from the configuration file, which the previous binary refuses as an unknown field before it reaches the catalog (`unknown field 'backup'`). The pre-upgrade backup predates every backup this release wrote to the store, so a restored catalog has no `backup_index` row for them while the store keeps their bytes under its root; the previous binary serves neither (it does not read the store). After the upgrade is run again, `extenddb backup sync --adopt-store` gives them rows: the store's identity file names the pre-rollback catalog, so the re-upgraded catalog finds the store owned by another catalog until the command makes it the owner (on SQLite's default root the server instead logs a warning and leaves the store unconfigured, so `/health` has no `backup_store` component until then), and the command then adopts every backup under the root. On SQLite `backup sync`, with or without its options, takes the serve lock as `backup purge` does, so the server is stopped while it runs; on PostgreSQL, MongoDB and Cassandra it runs beside the servers under the maintenance claim. In-catalog backups taken after it are lost with the rows, as before. A backup that `migrate-legacy` carried into the store after the upgrade has its bytes under the root like any other backup this release wrote, and `backup sync --adopt-store` adopts it.
 
 ## Writing a New Migration
 
@@ -70,11 +101,16 @@ extenddb stop --config extenddb.toml
 2. **Back up the databases** (PostgreSQL; for SQLite see [SQLite](#sqlite) below, for Cassandra see the [rollback procedure](#rollback-procedure))
 
 ```bash
-pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
-pg_dump -h <host> -U <admin> <data-db> > data_backup_$(date +%Y%m%d).sql
+umask 077
+d=$(date +%Y%m%d)
+pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$d.sql \
+  && pg_dump -h <host> -U <admin> <data-db> > data_backup_$d.sql \
+  && test -s catalog_backup_$d.sql && test -s data_backup_$d.sql && echo "both dumps written"
 ```
 
-`pg_dump` refuses to dump a server of a newer major version than itself ("aborting because of server version mismatch"); use the client of the server's version.
+The catalog dump holds the encryption key and the application role's password, so `umask 077` creates both files readable by their owner alone.
+
+`pg_dump` refuses to dump a server of a newer major version than itself ("aborting because of server version mismatch"), exits 1 and leaves its file empty; use the client of the server's version. Go on only when the command prints "both dumps written": `psql` restores an empty file without an error.
 
 3. **Build the new version**
 
@@ -105,7 +141,17 @@ A server notices at its next renewal, within 15 s, that the database ended the s
 
 The two transactions that hold the keys, the server's registration and the migration lock, turn off `idle_in_transaction_session_timeout` for themselves, and `transaction_timeout` on PostgreSQL 17 and later, so a role or database setting of either does not end them. PgBouncer's `idle_transaction_timeout` is a setting of PgBouncer, which a transaction cannot change. Each holder runs `SELECT 1` every 15 s, so set `idle_transaction_timeout` to 0, its default, or to 30 s or more. A value under 15 s closes the server's connection between two renewals, and the server then registers again every time. Each time it also stops its background workers and starts a new set, and each worker waits its interval before its first run, so a worker whose interval is longer than the 15 s between two renewals never runs: among them the TTL scan (60 s), the table size refresh (300 s), and the idempotency token and stream record cleanups (600 s and 3600 s).
 
+On PostgreSQL, migration 11, `attribute_name_escape`, rewrites the stored documents that carry attribute names. DynamoDB accepts U+0000 in an attribute name, and PostgreSQL `jsonb` cannot hold it. So a server of this release stores U+0000 in these documents as U+0001 U+0001, and U+0001 as U+0001 U+0002. It reverses the change when it reads them. Earlier releases stored the documents as written. In such a document, a name that holds U+0001 followed by U+0001 or U+0002 would read back as another name. A table keyed on that name would no longer find its items. Migration 11 applies the escape once to each document that holds U+0001 and leaves the others as they are. The documents are `tables.key_schema`, `tables.attribute_definitions`, `indexes.key_schema`, `indexes.projection`, `backups.key_schema`, `backups.attribute_definitions`, `backups.vector_indexes`, `backup_definitions.definition`, `vector_indexes.vector_attribute`, `vector_indexes.search_schema`, `vector_indexes.projection` and `backup_index.source_table_details_json` in the catalog database, and `gsi_pending.index_context` in the data database, which holds the index updates a stopped server left queued. Items are not rewritten. `migrate --yes` prints a note for each column it rewrote, for example `tables.key_schema: 1 document rewritten`, and the ledger keeps the notes. Each database's body commits in one transaction with its ledger row. A second run would change the names written since the first, so migration 11 is not convergent: `migrate --yes --reconverge` skips it. Migration 11 does not apply to SQLite, Cassandra and MongoDB. SQLite and Cassandra store these documents as JSON text, where U+0000 is the six characters `\u0000`, and MongoDB's BSON strings hold U+0000.
+
 On MongoDB, `migrate` connects with the connection string in the config file, which the server uses too. A user with the `readWrite` role on `extenddb_catalog` and on `extenddb_data` and no other role can run `init`, `migrate --yes`, `verify` and `serve`. `migrate --yes` takes the migration lock, a document in the catalog's `settings` collection, and then waits for the registration every running server keeps in the catalog's `extenddb_servers` collection, and after `--lock-timeout` exits 6 naming each server's host and pid. A server renews its registration every 5 s, and every second after a renewal failed, and deletes it when it stops, once every background worker has ended (it leaves it to expire when one could not be stopped); a server that was killed leaves it until it expires, at most 45 s after its last renewal. A server whose registration was deleted, or that has not renewed it for 30 s, for example because the primary stopped answering, answers new requests with `ServiceUnavailable` and registers again, as a PostgreSQL server does after its session ends (above): it serves again once it holds a new registration and the catalog's status is the one it started with, and it stops with exit 1 when a migration holds the lock, when the status changed, or when 30 s pass without a registration. The lock and the registrations expire by the clock of the replica set's primary, so keep the clocks of its members in sync with NTP. Migration 1 deletes the `resource_tag_migration` settings document in the transaction that records its catalog step, so a 0.1.14 server refuses the migrated catalog, and a run that fails before that transaction leaves the document in place. 0.1.12 and 0.1.13 servers read neither that document nor the catalog version, so they start on a migrated catalog and serve it: do not run them against it. To go back to a 0.1.x release, restore the backup taken before `migrate --yes`. A 0.1.x `migrate` on a migrated catalog reports a pending change, and its `--yes` writes the settings document back; this release's status then reports the catalog as written by an older release, and `migrate --yes --reconverge` repairs it.
+
+On MongoDB, migration 12 gives the catalog's `access_keys` collection a unique index on `access_key_id`; PostgreSQL, SQLite and Cassandra key their `access_keys` table by that ID. Before migration 12, every import of an access key stored a document, also under an access key ID that another document held. A credential lookup read the first of those documents its query plan met: the first in the collection's natural order when the plan scans the collection forward, as it does with no index on `access_key_id` and no query settings for the lookup's query. A delete of the key deleted one of them, so a key imported more than once still authenticated after a delete and was still listed among the user's access keys. Where one user holds every document of an ID, the migration keeps the document a credential lookup reads, deletes the others, and records a note that names the ID and the `_id` of each document it kept and deleted, which `verify` prints. To find that document, it asks the server for the lookup's query plan for each such ID. When the plan scans the collection forward, the migration keeps the first document in natural order; with any other plan, such as one through an index on `access_key_id`, it sends the lookup's own query. It also prints a warning with the same names before each delete, because a `migrate --yes` that stops after its deletes and before the index exists records no note when it runs again. A key that was imported twice and then deleted once before the upgrade has one document left, from the later import: no note names it, and it authenticates with the secret of that import. After the upgrade, review each user's access keys and delete any the user had deleted before.
+
+Migration 12 cannot decide what to keep when the documents of an ID belong to more than one user, when two or more documents have no access key ID or share one that is not a string, or when a document's access key ID is an array, which a credential lookup reads for each ID in it. Then the preview, `verify` and `migrate --yes` exit 5, change nothing, and name each document with its `_id`, account, user and creation time, with the `_id` a credential lookup reads for an ID of more than one user. In `mongosh`, delete or correct the documents as the output says, with the command it prints, then run `migrate --yes` again. The index build commits once a majority of the replica set's data-bearing voting members have built it, so it does not wait for a member that is down.
+
+An index that an operator adds to `access_keys`, other than the unique index `access_key_id_1` that the next paragraph creates, can make the index build fail. On `mongo:7` and `mongo:8.0` replica sets, a non-unique index named `access_key_id_1` made `migrate --yes` exit 1 with the server's error. A unique index on `access_key_id` under another name also made it exit 1. When the build fails, the run has already deleted the extra documents of each ID that one user holds. Only its warnings name them, so keep its output. With either index dropped, the next `migrate --yes` applied migration 12.
+
+Migration 12 groups the documents of `access_keys` in one request, and the runner gives each request 10 s. On a local `mongo:7` replica set, the preview took 8 s on a collection of 1 million keys, and on a collection of 2 million the preview, `verify` and `migrate --yes` stopped after 10 s with `no answer within 10 s`. On a collection that large, delete the extra documents and create the index in `mongosh`, which sets no such limit. This command lists each access key ID stored more than once, with its owners: `db.getSiblingDB("extenddb_catalog").access_keys.aggregate([{ $group: { _id: "$access_key_id", n: { $sum: 1 }, owners: { $addToSet: { account: "$account_id", user: "$user_name" } } } }, { $match: { n: { $gt: 1 } } }], { allowDiskUse: true })`. For an ID of more than one user, delete each document that is not the key owner's, as above. For an ID of one user, keep the document that `findOne({ access_key_id: "<ID>" })` returns, which a credential lookup reads, and delete the others. No note records these deletes. Then create the index with `db.getSiblingDB("extenddb_catalog").access_keys.createIndex({ access_key_id: 1 }, { unique: true }, "majority")`, which fails with a duplicate key error that names an ID while one is still stored more than once. Once the index is built, migration 12 reads only the documents whose access key ID is an array. While the build runs, migration 12 groups every document, so run `migrate --yes` after the command returns.
 
 On Cassandra, `migrate` connects as the role the config file names, which the server connects as too. `--cassandra-user <role>` connects as another role, with its password in `EXTENDDB_CASSANDRA_PASSWORD` or `--cassandra-pass`; a wrong password is reported as a connection timeout. Migration 1 adopts a 0.1.x catalog: it keeps every setting except the `resource_tag_migration` row, which it deletes, and records itself in a ledger in the catalog keyspace and in every account keyspace. On a cluster that runs `CassandraAuthorizer`, `init` grants the application role SELECT, MODIFY, CREATE and ALTER on the catalog keyspace, those four and DROP on the default account's keyspace, and CREATE ON ALL KEYSPACES, which CreateAccount needs to create a keyspace per account and which also lets the role create tables in every keyspace on the cluster; a run of `migrate --yes --cassandra-user <role>` that creates a missing account keyspace grants the application role the five permissions on it. A 0.1.x `init` granted the application role nothing, so a deployment created before 1.0 on such a cluster needs the statements below before `migrate`. `migrate --yes` takes the migration lock, a row in the catalog's `settings` table written by lightweight transactions, and then waits for the registration every running server of this release keeps in the catalog's `extenddb_servers` table, and after `--lock-timeout` exits 6 naming each server. A server renews its registration every 5 s, and every second after a renewal failed, and deletes it when it stops, once every background worker has ended (it leaves it to expire when one could not be stopped); a server that was killed leaves it until it expires, at most 45 s after its last renewal. A server tries its renewals for 30 s after the last one that succeeded, so it keeps serving through an outage of 25 to 30 s, depending on when the outage starts, for example while the only replica of the catalog restarts. After that, 30 to 35 s after its last successful renewal, it answers new requests with `ServiceUnavailable` and registers again, as a PostgreSQL server does after its session ends (above), and stops with exit 1 when a migration holds the lock, when the status changed, or when 30 s pass without a registration. A migration needs every replica of the catalog keyspace reachable: the lock is written at `SERIAL`, the registrations are read at `ALL`, and after each schema statement the runner waits until every live node reports the same schema version. `serve` refuses a catalog with pending migrations, exiting 3 under `--foreground` with the pending migrations and the `extenddb migrate --config <config> --yes` command to run. A 0.1.x server refuses a migrated catalog.
 
@@ -169,17 +215,27 @@ SQLite deployments follow the same sequence, backing up the database files as [S
 The upgrade is not reversible in place when it applies a breaking migration, and every migration in this release is breaking (see [The Catalog Status](#the-catalog-status)). If an upgrade fails or must be undone (PostgreSQL; for SQLite see [SQLite](#sqlite) below):
 
 1. Stop the server
-2. Restore the catalog from the backup, connected as `<admin>` to the `postgres` database:
+2. Restore both databases from the backups into new databases, connected as `<admin>` to the `postgres` database, with the upgraded databases renamed aside rather than dropped:
 
 ```bash
-psql -h <host> -U <admin> -d postgres -c "DROP DATABASE <catalog-db>;"
+psql -h <host> -U <admin> -d postgres -c "ALTER DATABASE <catalog-db> RENAME TO <catalog-db>_before_rollback;"
+psql -h <host> -U <admin> -d postgres -c "ALTER DATABASE <data-db> RENAME TO <data-db>_before_rollback;"
 psql -h <host> -U <admin> -d postgres -c "CREATE DATABASE <catalog-db> OWNER <owner>;"
-psql -h <host> -U <admin> -d <catalog-db> -f catalog_backup_YYYYMMDD.sql
+psql -h <host> -U <admin> -d postgres -c "CREATE DATABASE <data-db> OWNER <owner>;"
+psql -h <host> -U <admin> -d <catalog-db> -v ON_ERROR_STOP=1 -f catalog_backup_YYYYMMDD.sql
+psql -h <host> -U <admin> -d <data-db> -v ON_ERROR_STOP=1 -f data_backup_YYYYMMDD.sql
 ```
 
-To discard data written after the upgrade as well, restore `<data-db>` from its dump the same way.
+`-v ON_ERROR_STOP=1` makes `psql` stop at the first error, with exit 3; go on only when both restores exited 0. The catalog and data databases are one copy, so restore both; every write made after the dumps is lost. A catalog restored alone beside the newer data database is a catalog older than the tables; the Backup and Restore manual's [catalog restore](14-backup-and-restore.md#the-catalog-is-restored-from-a-database-backup) section says what that gives.
 
 3. Rebuild the previous version and start it
+4. Once the previous version has read every table, drop the renamed databases:
+
+```bash
+psql -h <host> -U <admin> -d postgres -c "DROP DATABASE <catalog-db>_before_rollback;" -c "DROP DATABASE <data-db>_before_rollback;"
+```
+
+Until then they hold the upgraded copy: if a restore fails, drop the new, partly restored database and rename the old one back.
 
 This manual has no tested rollback for Cassandra. Before migrating, with every server stopped, take a snapshot of the catalog keyspace and every account keyspace on every node with your usual Cassandra tooling; a rollback restores those snapshots, again with every server stopped, before the previous binary starts.
 
@@ -218,6 +274,7 @@ The upgrade is not reversible in place: a 0.0.3 PostgreSQL or SQLite binary refu
 
 ```bash
 extenddb stop --config extenddb.toml
+umask 077
 pg_dump -h <host> -U <admin> <catalog-db> > catalog_backup_$(date +%Y%m%d).sql
 export EXTENDDB_PG_PASSWORD='<admin password>'
 extenddb migrate --config extenddb.toml --pg-user <admin>          # exit 3, prints the plan
@@ -323,9 +380,98 @@ Catalog upgrades change the schema; behavior changes alter how the running serve
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
 
+### v0.1.15: a deleted principal or account leaves nothing behind
+
+**What changed.** Deleting a user, group, role or account now removes
+everything it owns, on every backend:
+
+- A user's access keys, group memberships, tags, inline policies and
+  permissions boundary. Before, SQLite and PostgreSQL kept its inline policies
+  and boundary, and MongoDB and Cassandra kept its boundary and, on MongoDB,
+  its tags.
+- A group's inline policies and memberships. Before, every backend kept its
+  inline policies, and MongoDB and Cassandra kept its memberships.
+- A role's inline policies, boundary, tags and sessions. Before, every backend
+  kept its inline policies and boundary, and MongoDB and Cassandra kept its
+  tags and sessions.
+- On MongoDB and Cassandra, an account's users, groups, roles and all they
+  own. Before, only the account record (and on Cassandra its backups) was
+  removed, and the rest stayed in the catalog.
+- A user's failed login attempts, which the login rate limit counts by
+  sign-in name (`account_id/user_name`), and on an account's delete those of
+  every sign-in name in the account. Before, every backend kept them until they
+  aged out, so a user created with the name within the 15-minute window could
+  be refused with HTTP 429 on its first correct password.
+
+A user, group or role created later with the same name got what the deleted
+one left, and so its permissions. Now creating a user, group or role also
+removes anything stored under its name, and creating an account on MongoDB or
+Cassandra removes anything stored under its id, so records an earlier release
+left behind are cleared when the name or id is used again. On MongoDB and
+Cassandra a user, access key, session or role of an account that no longer
+exists is treated as unknown.
+
+The management API and the console also refuse an inline policy or
+permissions boundary put on a user, group or role that does not exist, with
+HTTP 404 and `IAM user not found` (or `group`, `role`), where they answered
+204 and stored it under the name. On MongoDB, `create-account` refuses an
+account ID that is already in use with `Account already exists`, as the other
+backends do; before, it created a second account with that ID.
+
+**Who is affected.** A script that attaches a policy or boundary before it
+creates the principal now gets HTTP 404 and must create the principal first.
+A deployment that relied on a deleted principal's policies coming back when it
+was created again must attach them again. No catalog migration is required.
+
+---
+
+### v0.1.15: metrics carry their account (catalog migration required)
+
+**What changed.** The metrics of a request (capacity, latency, errors, throttles, returned items and bytes, `RequestCount`), and the TTL metrics of a table, now carry the account they were recorded for. The catalog stores the account with each metrics row (migration 10, `account_metrics`), so two accounts that each have a table of the same name keep their own rows: before this release they wrote to one row, and the counts and latencies `/metrics` reported for that name were the two tables' added together. `/metrics` and the console's `/console/metrics-data` report the account as an `AccountId` dimension, beside `TableName`, `GlobalSecondaryIndexName` and `Operation`, and `/metrics` takes an `account_id` query parameter that returns one account's metrics only. Metrics of the whole deployment, such as the connection pool, worker, storage query and backup job metrics, have no `AccountId` dimension, and the `account_id` filter leaves them out. The filter also applies to the latency `segments` of the response. `AccountId` is ExtendDB's own dimension, not one of CloudWatch's DynamoDB dimensions. The console dashboard still serves admin sessions only and shows every account's metrics: its raw metrics table names each row's account, and its charts add the accounts together.
+
+**Who is affected.** A reader of `/metrics` that groups rows by their dimensions now gets one row per account where it got one row per table name, and a deployment with one account gets an `AccountId` dimension on every request metric. A reader that sums the rows of a table name across accounts gets the same totals as before for tables whose names no other account uses.
+
+**Migration.** Run `extenddb migrate --yes`. Migration 10 drops the `metrics` rows, which carry no account; metrics recorded before the upgrade are not shown afterwards. Stop every server of an earlier release first: such a server writes its metrics to `metrics`, which no longer exists, so they are lost (on MongoDB its first write creates the collection again, and `account_metrics` never sees those rows).
+
+---
+
+### Streams: disabling closes the shards, enabling creates a new stream
+
+**What changed.** `UpdateTable` with `StreamEnabled: false` now closes the
+stream's shards (each gets an `EndingSequenceNumber`), and `StreamEnabled: true`
+afterwards creates a new stream with a new ARN and four new shard ids, as on
+DynamoDB. Before this release a disable left the shards open and a re-enable
+kept the same ARN. Each stream's shard ids carry its identity, so the change
+needs no catalog migration of its own. On MongoDB its one new index comes with
+migration 1 (below).
+
+**Servers of the earlier release.** A server of the earlier release must not
+run against the migrated catalog, because this release carries breaking
+migrations (see [The Catalog Status](#the-catalog-status)). Such a server does
+not know closed shards. It writes records past a shard's
+`EndingSequenceNumber`, and it re-enables a disabled stream under its old ARN
+instead of creating a new one.
+A stream that the earlier release disabled keeps its four shards open under
+the new release. The first `UpdateTable` that sets a `StreamSpecification` on
+the table closes them: an enable, or a disable, which the server refuses as
+before.
+
+**MongoDB.** Migration 1 creates the `{table_id: 1, shard_id: 1}` index on the
+data database's `stream_shards`: `extenddb init` runs it on a new deployment,
+and `extenddb migrate --yes` runs it on a 0.1.x deployment.
+A deployment that a build without the index has already migrated gets it from
+`extenddb migrate --yes --reconverge`, which runs migration 1 again.
+
+**Rollback.** Going back to the earlier release means restoring the
+pre-upgrade database as in [Rollback Procedure](#rollback-procedure); the
+earlier release does not read the closed shards' ending numbers or the labelled
+shard ids the new release writes.
+
+---
+
 ### v0.1.15: Point-in-time recovery is reported as unsupported (catalog migration required)
 
-**What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and `RestoreTableToPointInTime` checks the source table and then returns `PointInTimeRecoveryUnavailableException`. A table that does not exist is `TableNotFoundException` on all three operations, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.
+**What changed.** `UpdateContinuousBackups` no longer accepts an enable request, and `DescribeContinuousBackups` no longer reports point-in-time recovery `ENABLED` with a 35-day window. Point-in-time recovery is reported as unsupported: describe answers `PointInTimeRecoveryStatus: DISABLED`, an enable request returns `ContinuousBackupsUnavailableException`, and every `RestoreTableToPointInTime` returns `PointInTimeRecoveryUnavailableException`. Both carry "Point-in-time recovery is not supported by this storage backend" and come after authentication and before authorization. They read only the operation name and, for `UpdateContinuousBackups`, `PointInTimeRecoveryEnabled`, so every caller gets them, with or without permissions; earlier builds denied a caller with no policy on `dynamodb:RestoreTableToPointInTime` on the source table. An `UpdateContinuousBackups` whose `PointInTimeRecoveryEnabled` is not `true` or `"true"` goes to authorization and the request's checks. A refused request is logged at WARN as "Point-in-time recovery refused" with the request id, the operation and the principal, where a denied one was logged as "Authorization denied". A table that does not exist is `TableNotFoundException` on `DescribeContinuousBackups` and on a disable, where `DescribeContinuousBackups` and `UpdateContinuousBackups` answered `ResourceNotFoundException`, and `UpdateContinuousBackups` without `PointInTimeRecoverySpecification` is a `ValidationException`, where it was taken as disabling. See [Differences from DynamoDB](../differences-from-dynamodb.md) for the full surface. The catalog migration removes the storage of a per-table enable flag that only the description read.
 
 **Who is affected.** Any client or infrastructure template that enables point-in-time recovery (for example a Terraform resource with `point_in_time_recovery = true`) now receives `ContinuousBackupsUnavailableException` and must stop requesting it. A restore attempt now receives `PointInTimeRecoveryUnavailableException` instead of a generic `ValidationException`.
 
@@ -439,6 +585,120 @@ migration is required.
 7. In an `Arn*` operator, a value that contains `${` needs the five `:` that separate an ARN's six fields written in the policy, as in `arn:aws:iam::123456789012:user/${aws:username}`. The IAM policy simulator refuses a `2012-10-17` policy whose value has fewer, such as `${aws:ResourceTag/blockedPrincipal}`, and ExtendDB now fails that condition closed in a document of any `Version`, since IAM checks a value's fields whatever the `Version`. A `Deny` with it applies to every request its action, resource and other conditions match, and an `Allow` with it grants nothing. Before, the substituted ARN was compared as a whole, so such a `Deny` applied only to the principal the tag named, and an `Allow` written with `ArnNotLike` granted every other principal. Only the `ArnLike` `Deny` and the `ArnNotLike` `Allow` in `2012-10-17` documents were sent to the simulator; the `ArnEquals` and `ArnNotEquals` forms, the forms with a set qualifier or `IfExists`, and `2008-10-17` and no-`Version` policies follow the same rule without a measurement. To compare a principal with an ARN stored whole in a tag, use `StringEquals`, which compares the expanded text in a `2012-10-17` document.
 
 **Who is affected.** Any deployment with a stored policy whose condition values contain `${`: user, group and role policies, permissions boundaries, session policies and role trust policies. Search the stored policies for `${` (`extenddb manage list-user-policies`, `list-group-policies` and `list-role-policies` print inline policies, `get-user-boundary` and `get-role-boundary` permissions boundaries, and `list-roles` trust policies) and check each match against the cases above before upgrading. The shapes that change are a variable in a `2008-10-17` or no-`Version` document, an escape, a variable under `StringLike`, `ArnLike` or `ArnEquals`, a string or ARN value with a variable that has no default and whose key a request may not carry, a numeric, date, `Bool` or `Null` value written as a variable, and an `Arn*` value that contains `${` and has fewer than five written `:`. No catalog migration is required.
+
+---
+
+### v0.1.15: IAM policy variable references are checked at write and read quoted defaults as IAM does
+
+**What changed.** Policy writes now refuse a `${...}` reference that IAM refuses, and evaluation reads a quoted default as IAM reads it (issue #834). Both were measured on IAM on 2026-11-09 and 2026-11-10. No catalog migration is required.
+
+- A policy write refuses a reference in a condition value or in a `Resource` or `NotResource` pattern that no `}` closes, such as `a${`, `a$${` or `a${aws:username, '}'`, and one whose text is not an escape, a key name, or a key name, a `,` and one quoted default, such as `a${}`, `a${'x'}`, `a${a,b}`, `a${aws user}`, `a${aws:username, 'x' 'y'}` or `a${a$b, 'x'}`. This covers inline user, group and role policies, user and role permissions boundaries, the console policy form, create role and the console role form. A session policy passed to AssumeRole is not checked. The management API answers 400 and the console forms show the error on the page. The text carries `MalformedPolicyDocument`, IAM's message and the value: `Syntax errors in policy.` for an identity policy with `Version` `2012-10-17`, `Variable declaration is not well-formed.`, `The policy failed legacy parsing`, or a `Resource ... must be in ARN format` or `Partition ... is not valid` message for one with `Version` `2008-10-17`, and `Policy contains one or more invalid variable declarations` for a role trust policy with `Version` `2012-10-17`. A trust policy with `Version` `2008-10-17` or none stores such a value and refuses it in an `Arn*` value only when no `}` follows the `${`, with `value used for ARN condition is incorrect type`, or, with ExtendDB's own message that names the key and the value, when the value does not have the six fields of an ARN. In an identity policy with `Version` `2008-10-17`, an `IpAddress` or `NotIpAddress` value with `${` gets ExtendDB's malformed CIDR message, as before, where IAM answers `The policy failed legacy parsing`. Values IAM accepts are still accepted, including `a${}}` and `a${aws:username, '}x'}`.
+- In a reference that a write accepts, a `}` inside the quotes of a default no longer ends the reference, a doubled `''` in a default stands for one `'`, and an escape with a default is the escape. With no `aws:username` in the request, `StringEquals` with `a${aws:username, '}x'}` now matches `a}x`, and with `aws:username` `bob` it matches `abob`; before, it matched neither. With no `aws:username`, `a${aws:username, 'x''y'}` matches `ax'y`, and `a${*, 'x'}` matches `a*` and not `ax`.
+
+**Who is affected.** A deployment with a stored policy, permissions boundary, session policy or role trust policy whose condition values or `Resource` or `NotResource` patterns contain `${` and either a `'` inside the braces or an escape followed by a `,`.
+
+- A stored value that holds a reference the write now refuses keeps its decision: it is read as before, with each `${` ending at the next `}`. Writing an identity policy, boundary or trust policy with the same text again is now refused.
+- A stored value with a quoted `}`, a doubled `''` in a default, or an escape with a default now decides as IAM does, except an `Arn*` value whose expansion has two to five fields, or six fields and a first field that holds `${`, which fails its condition closed (see the entry on Arn condition values). An `Allow` with `a${aws:username, '}x'}` that granted nothing now grants for `a}x` and for `a` followed by the caller's user name, and a `Deny` with `a${*, 'x'}` that applied to `ax` now applies to `a*` instead.
+
+Before upgrading, search the stored documents for `${` with `extenddb manage list-user-policies`, `list-group-policies`, `list-role-policies`, `get-user-boundary`, `get-role-boundary` and `list-roles`, and check each match that has a `'` after the `${`.
+
+---
+
+### v0.1.15: access key import is refused unless `allow_credential_import` is `true`
+
+**What changed.** `extenddb manage import-access-key`, and the management API
+route it calls, `POST /management/accounts/{id}/users/{name}/access-keys/import`,
+import a key only when the runtime setting `allow_credential_import` is `true`.
+When the catalog has no row for the setting, the server refuses the import with
+HTTP 403 and `Credential import is disabled (allow_credential_import = false)`.
+Before this release the server allowed the import when the row was missing. No
+release writes the row, so every deployment that never set it accepted imports.
+An import stores an access key ID and secret that the caller chooses. With the
+feature off by default, only deployments that turn it on accept caller-chosen
+keys. The console settings page already showed `false` as the default. The
+setting does not affect keys imported before the upgrade, or the credentials a
+dev-mode server seeds at startup.
+
+**Who is affected.** Deployments that import access keys and never set
+`allow_credential_import`. A deployment that set it to `true` or `false` keeps
+its behavior.
+
+**Migration.** Before upgrading, enable the setting on each deployment that
+imports keys:
+
+```bash
+extenddb settings --config extenddb.toml set allow_credential_import true
+```
+
+The command writes the row to the catalog. The server reads the row on each
+import, so the command works with the earlier release and needs no restart. No
+catalog migration is required.
+
+---
+
+### v0.1.15: export files are created 0600 and the import and export directories the server creates 0700
+
+**What changed.** On Unix, `ExportTableToPointInTime` creates its file with
+mode 0600, and the server creates the directories that hold import and export
+files with mode 0700: a configured import or export root that does not exist
+at startup, and the account directory (`<export root>/<account id>`) that the
+first export of an account creates. Missing parent directories of a root are
+created 0755, so no directory the server creates is writable by group or
+others. Before this release these files and directories took their modes from
+the server's umask. Under umask 022, the usual umask of a shell or a container
+running `serve --foreground`, the directories were 0755 and the files 0644, so
+any local user could list the account directories and read every export. A
+server started as a daemon (`serve` without `--foreground`) runs with umask
+027, which gave 0750 and 0640, so the server user's group could. Now only the
+server's user and root can: the umask can only narrow these modes. A directory
+that already exists keeps its mode, and directories and export files created
+before the upgrade keep theirs. At startup the server logs a warning for each
+root that has an existing parent directory writable by group or others without
+the sticky bit, naming that directory and its mode, and starts: a user who can
+write to such a directory can rename the root away and put a directory of their
+own in its place.
+
+**Who is affected.** Anyone who reads export files as another user than the
+server's: a member of the server user's group under the systemd unit in the
+deployment guide (`User=extenddb`, `Group=extenddb`, `Type=forking`), or a host
+user who reads exports through a bind mount while the container runs as uid
+10001 (`Dockerfile`) or 65532 (`Dockerfile.dev`). On the import side, a server
+under umask 002 used to create a missing import root 0775, so members of the
+server user's group could put import files into it. A root the server creates
+is now 0700, so they cannot, unless they can write to a parent directory of the
+root (the startup warning above). An operator who relies on that access creates
+the root before the first start, with the group and mode wanted; an existing
+root keeps its mode.
+
+When the import root is also an export root (the deprecated
+`import_export_root` key, or one path listed under both `[import]` and
+`[export]`), that is not enough. Import files go under `<root>/<account id>`,
+and the first export of an account creates that directory 0700 when it does not
+exist, so the group can no longer put import files into it; before this release
+a server under umask 002 created it 0775. Create each `<root>/<account id>`
+before the account's first export, with the group and mode wanted (a directory
+that already exists keeps its mode), or configure separate import and export
+roots. Export files in such a root are still created 0600.
+
+**Migration.** Nothing is required. To remove group and other access from the
+export files and directories written before the upgrade, run as the server's
+user or as root, for each export root:
+
+```bash
+find <export root> -mindepth 1 -maxdepth 1 -type d \
+  -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' \
+  -exec chmod -R go-rwx {} +
+```
+
+The command clears the group and other bits of each account directory (a
+directory directly under the root whose name is a 12-digit account id) and of
+every directory and file under it, and leaves the owner's (0755 becomes 0700,
+0644 becomes 0600). It leaves alone the root itself and every other entry in
+it: files directly under the root, and directories with other names, such as
+another application's in a shared temporary directory. When the export root is
+also an import root, the command removes group and other access to the import
+files in the account directories as well, including the group access that the
+previous paragraph sets up. No catalog migration is required.
 
 ---
 
@@ -560,9 +820,11 @@ effect where it was previously bypassed.
   the server restarts renews its iterator by calling GetShardIterator instead of
   failing on a non-retryable `ValidationException`. A token that does not decode
   at all still returns `ValidationException` `Invalid ShardIterator`.
-- **Restores.** RestoreTableFromBackup and RestoreTableToPointInTime require the
-  item read and write actions on the target table in addition to the restore
-  action, because a restore writes into the target.
+- **Restores.** RestoreTableFromBackup requires the item read and write actions
+  on the target table in addition to the restore action, because a restore
+  writes into the target. From v0.1.15,
+  RestoreTableToPointInTime is refused before authorization (see the
+  point-in-time recovery entry under v0.1.15).
 - **Export.** `ExportTableToPointInTime` requires `TableArn` to be exactly a
   table ARN. An ARN carrying a sub-resource or an extra `table/` segment is
   rejected with `ValidationException` before authorization.
@@ -768,11 +1030,32 @@ To get the intended behaviour, write the condition on `aws:ResourceTag/<key>`.
 
 - A `Deny` with a wildcarded `ArnEquals` now blocks the callers it names, and an `Allow` gated on one now grants to them.
 - A `Deny` with a wildcarded `ArnNotEquals` now exempts the callers the wildcard matches; before, it applied to every caller.
-- A bare `*` value now matches every ARN. An `Allow` gated on `ArnEquals: "*"` grants, and a `Deny` gated on it applies, whenever the key holds an ARN. A `Deny` gated on `ArnNotEquals: "*"` now applies only when the key is absent, and an `Allow` gated on it grants only then. AWS IAM Access Analyzer reports a bare `*` Arn value as an error, and the IAM policy simulator refuses to evaluate one against an ARN, but ExtendDB accepts it at write. Replace any of these shapes before upgrading if you wrote it by hand.
+- A bare `*` value matches no ARN, as IAM evaluates it. An `Allow` gated on `ArnEquals: "*"` or `ArnLike: "*"` never grants, and a `Deny` gated on it never applies. A `Deny` gated on `ArnNotEquals: "*"` or `ArnNotLike: "*"` applies whenever the key holds an ARN or is absent, and an `Allow` gated on it grants then. Identity policy writes accept a bare `*`, as IAM does; a role trust policy write rejects it. The next section, "IAM: Arn condition values are matched and checked at write as IAM does", describes the other short values.
 - An Arn operator over a key whose value is not an ARN, such as `aws:ResourceTag/<key>`, is now false, so a `Deny` written that way no longer applies and an `Allow` gated on one no longer grants.
-- `dynamodb:LeadingKeys`, `dynamodb:Attributes` and `aws:TagKeys` hold values the caller or the admin chooses: the partition key values in a request (every key in a batch), the attribute names in a projection, and the session tag keys in an AssumeRole call. Each value can be ARN-shaped or not. A `ForAnyValue:` or `ForAllValues:` Arn condition over one of these keys is now false while any value in the set is not an ARN and the policy lists at least one value. A `Deny` gated on `ForAnyValue:ArnNotLike` with `arn:aws:dynamodb:us-east-1:123456789012:table/Z*` on `dynamodb:LeadingKeys` no longer applies to a request whose partition key values include one that is not an ARN, and `ForAnyValue:ArnLike` with `j*` on the same key no longer holds for the partition key value `junk`.
+- `dynamodb:LeadingKeys`, `dynamodb:Attributes` and `aws:TagKeys` hold values the caller or the admin chooses: the partition key values in a request (every key in a batch), the attribute names in a request, and the session tag keys in an AssumeRole call. Each value can be ARN-shaped or not. A `ForAnyValue:` or `ForAllValues:` Arn condition over one of these keys is now false while any value in the set is not an ARN and the policy lists at least one value. A `Deny` gated on `ForAnyValue:ArnNotLike` with `arn:aws:dynamodb:us-east-1:123456789012:table/Z*` on `dynamodb:LeadingKeys` no longer applies to a request whose partition key values include one that is not an ARN, and `ForAnyValue:ArnLike` with `j*` on the same key no longer holds for the partition key value `junk`.
 
 A policy whose Arn values are literal ARNs, applied to a context value that is an ARN, evaluates as before.
+
+### IAM: Arn condition values are matched and checked at write as IAM does
+
+**What changed.** The four Arn operators (`ArnEquals`, `ArnLike`, `ArnNotEquals` and `ArnNotLike`, with their `ForAllValues:`, `ForAnyValue:` and `IfExists` forms) now match a policy value shorter than an ARN as IAM does, and policy writes reject the Arn values IAM rejects. Both rules were measured on IAM on 2026-10-30. No catalog migration is required.
+
+- A value of two to five `:`-separated fields whose first field is `arn` is compared over the fields it has, so `arn:aws:iam:*` and `arn:aws:iam` match every ARN of the `iam` service in the `aws` partition. A one-field value matches nothing, a bare `*` included, and so does a shorter value whose first field is not `arn`. As for every Arn value since v0.1.15, only a `*`, `?` or `:` written in the policy is a wildcard or a field separator; one that comes from a policy variable is matched as that character.
+- An identity policy write (inline user, group and role policies, user and role permissions boundaries, the console policy form, and the session policy of an AssumeRole call) rejects a value whose first field does not match `arn` (for example `""`, `foo:*` or `ARN:aws:iam::123456789012:user/alice`), whose partition or service field is empty (`arn:`, `arn::dynamodb:us-east-1:123456789012:table/t`), whose partition, service, region or account field holds `/` or `${` (`arn:aws:iam:*:role/x`, `arn:aws:iam::${aws:PrincipalAccount}:user/alice`), or whose service field holds an upper-case letter (`arn:aws:IAM::123456789012:root`). The error names the condition key, the value and the field, for example `Arn condition on aws:PrincipalArn holds "": its first field does not match arn`. IAM answers these writes with `MalformedPolicyDocument` and "The policy failed legacy parsing". Values shorter than an ARN that IAM accepts, such as `*`, `*:*` and `arn:aws:iam:*`, are accepted.
+- An identity policy write also rejects a value of two to five fields whose first field holds a wildcard, such as `*:aws:iam:*` or `ar?:aws:iam`, other than `*:*`. IAM accepts these, but how IAM evaluates them was not measured, so ExtendDB does not accept them. This is a deviation from IAM.
+- A role trust policy write (create role on the management API and the console role form) rejects a value that does not split into six fields, a JSON number or boolean included. The error names the key and the value, for example `Arn condition on aws:PrincipalArn holds "*", which does not have the six fields of an ARN`.
+- AssumeRole refuses a session policy that does not load, such as one with a malformed CIDR. It also refuses one that holds an Arn value an identity policy write rejects. For both it answers `400` with `MalformedPolicyDocument` and issues no credentials. Before, it issued credentials for both: every request with them failed for the first, and the second worked. The `Version` and `Sid` checks of a policy write do not apply to a session policy.
+
+**Who is affected.** A deployment with a stored identity policy, permissions boundary, session policy or role trust policy that uses an Arn operator with a value shorter than an ARN. Values IAM accepts now evaluate as IAM evaluates them:
+
+- `ArnEquals` and `ArnLike` with `*` matched every ARN and now match none. `ArnNotEquals` and `ArnNotLike` with `*` now hold for every ARN.
+- A value of two to five fields that starts with `arn`, such as `arn:aws:iam:*`, matched nothing and now matches the ARNs whose leading fields match it. An `Allow` gated on `ArnNotEquals: "arn:aws:iam:*"` granted every IAM principal and now grants none, and a `Deny` gated on `ArnEquals: "arn:aws:iam:*"` now applies to them. An `Allow` gated on `ArnNotEquals: "arn:aws:dynamodb:*"` still grants every IAM principal, as on IAM, because that value names another service.
+
+**A stored value that the write checks now reject.** The write checks do not run when a stored policy loads, so every stored identity policy, boundary and session policy keeps loading after the upgrade, and no principal is locked out by a policy that fails to parse. Most such values evaluate as written, as before the upgrade. That includes the "only me" shape `"ArnEquals": {"aws:PrincipalArn": "arn:aws:iam::${aws:PrincipalAccount}:user/${aws:username}"}`, which keeps matching the caller's own ARN, and values with an empty partition, which match no ARN. A few values fail their condition closed instead: a `Deny` holding one applies to every request its action, resource and other conditions match, and an `Allow` holding one grants nothing. They are a value whose first field holds no `${` and does not match `arn`, `""` included, and a value of two to five fields whose first field holds a wildcard, other than `*:*`. A value with `${` and fewer than five written `:` fails closed as before, `${aws:PrincipalArn}` included. In a `2012-10-17` document, a value with a reference that holds a `}` followed by a `:`, as a quoted default can, also fails closed when its expansion has two to five fields. An example is `arn:aws:iam::${aws:PrincipalAccount, '}:'}`, which expands to `arn:aws:iam::<account id>`. In a `2012-10-17` document, a value whose first field holds `${` also fails closed when its expansion has six fields, as `${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*` has. Its first field then comes from the variable. How IAM evaluates these values was not measured. A value whose references hold every `:`, such as `${x, '}:::::'}`, expands to one field and matches nothing, as the IAM policy simulator answered. To find these values before the upgrade, read the stored policies: `extenddb manage list-user-policies`, `list-group-policies` and `list-role-policies` return each inline policy with its document, and `get-user-boundary` and `get-role-boundary` return the permissions boundaries. A rewrite of a policy goes through the write checks, so a policy that holds the "only me" shape has to change it when it is next written, for example to `"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::<account id>:user/${aws:username}"}`, which puts the variable in the resource field, or to `"StringEquals": {"aws:username": "<user name>"}`.
+
+**Trust policies.** A stored trust policy is evaluated statement by statement, so a value the trust write check rejects fails its own statement closed: a `Deny` holding it blocks every caller and an `Allow` holding it grants no one. A six-field value whose first field holds no `${` and does not match `arn`, such as `ARN:aws:iam::123456789012:user/alice`, is accepted at write. IAM accepted a value of the form `ARN:aws:iam::...` in a trust policy. Its statement fails closed in the same way. So does the statement of a value such as `arn:aws:iam::${aws:PrincipalAccount, '}:'}` or `${aws:PrincipalTag/kind, 'arn'}:aws:iam::123456789012:user/*` in a trust policy with `Version` `2012-10-17`, which the write check accepts. Each AssumeRole call on such a role logs a `WARN` line naming the role, the account, the key and the value. A role created before the upgrade with `"ArnEquals": {"aws:PrincipalArn": "*"}` in its trust policy, which the old matcher matched for every caller, cannot be assumed through that statement after the upgrade. ExtendDB has no route that replaces a stored trust policy, so the only repair is `extenddb manage delete-role` followed by `create-role` with a corrected trust policy. Deleting a role removes its tags and ends its active sessions, so record the tags before deleting it and add them again after. Its inline policies and its permissions boundary stay in the catalog under the role's name and apply to the role created again with that name.
+
+**Custom `AuthorizationStore` implementations.** `AuthorizationStore::fetch_user_group_policies` now returns each policy document with the name of its group, as `(group_name, policy_document)` pairs, so the server can name the group when a group policy fails to load. The SQLite, PostgreSQL, Cassandra and MongoDB stores are updated. An implementation outside this repository has to return the pairs.
 
 ---
 
@@ -822,11 +1105,27 @@ This change needs no catalog migration of its own. Before upgrading a deployment
 
 **Who is affected.** A policy whose pattern uses `?` against a request value with a character outside ASCII. A character up to U+FFFF, such as `é` or `日`, is one unit and now takes one `?`; before this release it took one `?` per byte (two for `é`, three for `日`). A character above U+FFFF, such as an emoji, is two units and takes `??`, where it took four. A pattern written with one `?` per byte stops matching such a value and a pattern with one `?` per unit starts matching it, so a `Deny` or an `Allow` that relies on such a pattern can change its decision. Review policies that use `?` on condition keys that carry caller data, such as `dynamodb:LeadingKeys` and `dynamodb:Attributes`. No catalog migration is required.
 
+### v0.1.15: `dynamodb:Attributes` holds the attributes every item request names
+
+**What changed.** `dynamodb:Attributes` now holds the top-level names of the attributes a request names on `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, `SearchVectors`, `BatchGetItem`, `BatchWriteItem`, `TransactGetItems` and `TransactWriteItems`, as the security model manual lists them per operation. Before this release the key was read from `ProjectionExpression` alone, on single-table requests only, and a projected document path was compared as the whole path: the key was absent on `PutItem`, `UpdateItem` and `DeleteItem`, on reads that use `AttributesToGet`, and on every batch and transaction request, and a projection of `secret.a` held `secret.a` instead of `secret`. The key now also holds the attributes a condition or filter expression reads, the target of each update expression action, the legacy `Expected`, `AttributeUpdates`, `QueryFilter` and `ScanFilter` names, `ExclusiveStartKey`, the attributes in a `Query` key condition, and on every item operation other than `SearchVectors` the key attributes of the table and of the index a `Query` names. The first page of a `Scan` of an index holds the table's key attributes and not the index's (measured on DynamoDB 2026-11-09 for the keys of a global secondary index and the sort key of a local secondary index). A later page carries an `ExclusiveStartKey` that holds the table's and the index's key attributes, and the key holds them. DynamoDB does the same: it refused a later page of a `Scan` of a global and of a local secondary index under an `Allow` whose `ForAllValues` list holds only the table's keys, and under a `Deny` on the global secondary index's partition key or the local secondary index's sort key (measured 2026-11-10). The key does not hold the attributes a `SET` value reads.
+
+**Who is affected.** Any deployment with a policy statement that names `dynamodb:Attributes` in a condition. On a table that exists, every item request other than `SearchVectors` now carries the key, holding at least the table's key attributes, so a `ForAllValues` condition no longer holds vacuously on an absent key, a `ForAnyValue` condition can match, `Null` with value `true` stops matching and `Null` with value `false` starts matching. A `SearchVectors` still holds only the names in its `ProjectionExpression` and leaves the key absent when it has none. Statements of these shapes now decide differently:
+
+- A `Deny` gated on a `ForAnyValue:String*` operator that matches an attribute's name (`StringEquals`, `StringLike`, `StringEqualsIgnoreCase`) now applies to writes that name the attribute, to update actions that target it, to `AttributesToGet` reads, to projections of a path inside it, to conditions and filters that read it, and to batch and transaction requests. It did not apply to them before.
+- A `Deny` gated on a negated `ForAnyValue:String*` operator (`StringNotEquals`, `StringNotLike`, `StringNotEqualsIgnoreCase`) now applies to every item request whose names fall outside its list, the key attributes included, so the list must hold the key attributes of the table and, for a `Query` of an index or a later page of a `Scan` of an index, of every index the statement covers (the `Query` rule measured on DynamoDB 2026-11-09 on a global secondary index, and the later-page rule on 2026-11-10 on a global and a local secondary index). A list that omits them now refuses every `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan`, batch and transaction request on the table.
+- An `Allow` gated on `ForAllValues:StringEquals` used to grant every request that left the key absent, whatever attributes it named, because the absent key satisfied it. It now grants only when every name the request holds is in the list. A list that omits the table's key attributes stops granting `GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query`, `Scan` and the batch and transaction requests (measured on DynamoDB 2026-11-01 for `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `BatchWriteItem` `DeleteRequest`); add the key attributes of the table and, for a `Query` of an index or a later page of a `Scan` of an index, of every index the statement covers. A `Query` of an index holds the index's full key schema, its sort key included, and the first page of a `Scan` of an index holds the table's key attributes only (measured on DynamoDB 2026-11-09 on a global secondary index). A later page of a `Scan` of an index holds the index's key attributes from its `ExclusiveStartKey`, and DynamoDB refused such a page under an `Allow` whose list holds only the table's keys (measured 2026-11-10 on a global and a local secondary index).
+- An `Allow` gated on a `ForAnyValue:String*` operator now grants every item request its `Action` covers that holds a name the list matches. Before, it granted only a single-table request whose `ProjectionExpression` named one. A `BatchWriteItem` is evaluated once per table, with the union of that table's item names, so an `Allow` of `BatchWriteItem` over `["name"]` grants a batch that puts `{pk, name}` and `{pk, ssn}` on one table and writes both items, and refuses a batch that puts `{pk, ssn}` alone, as on DynamoDB (measured 2026-11-01). A list that holds a key attribute grants every item request other than `SearchVectors` that the `Action` covers, because each holds the table's key attributes; DynamoDB puts them in the key on `GetItem`, `Query`, `Scan`, `UpdateItem`, `DeleteItem` and a `BatchWriteItem` `DeleteRequest` (measured 2026-11-01). An `Allow` of `GetItem` over `["pk"]`, on a table keyed on `pk`, grants every `GetItem` on the table, one with no projection included, which returns the whole item.
+- An `Allow` of `PutItem` gated on `ForAnyValue:StringNotEquals` over `["ssn"]` granted no `PutItem` before, and now grants one of `{pk, ssn}`, because `pk` is outside the list. An `Allow` of `PutItem` gated on `ForAllValues:StringNotEquals` over `["ssn"]` granted every `PutItem` before, because the absent key satisfied it, and now refuses one of `{pk, ssn}` and grants one of `{pk, name}`.
+- `Null` with value `true` matched every request that left the key absent before. A statement gated on it no longer matches any item request except a `SearchVectors` with no `ProjectionExpression` and, on a table that does not exist, a `GetItem`, transaction `Get` or `BatchGetItem` that names no attribute outside its keys, a `Query` whose key condition the key condition parser refuses and that names none elsewhere, and a `Scan` that names none. A `Deny` gated on it stops refusing the other item requests and an `Allow` gated on it stops granting them, as on DynamoDB (measured 2026-11-01 on `GetItem` and `Scan`).
+- `Null` with value `false` matched only a single-table request with a `ProjectionExpression` before, and now matches every item request that carries the key. An `Allow` gated on it, written to require that a read names its attributes, now grants each of these requests that its `Action` covers, a read with no projection and its whole item included, and a `Deny` gated on it now refuses them.
+
+A `DeleteItem` and a read with no projection hold only the names the request gives, not those of the stored item, so a `Deny` on an attribute blocks neither deleting an item that holds it nor reading the item with no projection, as on DynamoDB (measured 2026-10-31). Nor does it stop an `UpdateItem` from copying the attribute's value into another attribute through a `SET` value such as `SET #n = ssn`, as on DynamoDB (measured 2026-11-01). No catalog migration is required. Before upgrading, check the policies of each account for the statements above.
+
 ---
 
 ### v0.1.15: the console metrics dashboard is admin only, and admin-only console pages redirect IAM users
 
-**What changed.** The console metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) now serve admin sessions only. An IAM-user session that opens the dashboard is redirected to `/console`, the data feed answers it with HTTP 403 and no metric data, and the navigation bar no longer shows IAM users the Metrics link. Before this release any console session could read the feed. The metrics table has no account column, so the feed held the table names, index names, operations, request counts and latencies of every account. The page put an IAM user's account id in a script variable that no script read, and the server sent every row. The Settings and Cache pages already served admin sessions only. They now redirect an IAM-user session to `/console` instead of answering HTTP 403, and the navigation bar no longer shows IAM users the Settings and Cache links.
+**What changed.** The console metrics dashboard (`/console/metrics`) and its data feed (`/console/metrics-data`) now serve admin sessions only. An IAM-user session that opens the dashboard is redirected to `/console`, the data feed answers it with HTTP 403 and no metric data, and the navigation bar no longer shows IAM users the Metrics link. Before this release any console session could read the feed. The metrics table had no account column then, so the feed held the table names, index names, operations, request counts and latencies of every account. The page put an IAM user's account id in a script variable that no script read, and the server sent every row. The Settings and Cache pages already served admin sessions only. They now redirect an IAM-user session to `/console` instead of answering HTTP 403, and the navigation bar no longer shows IAM users the Settings and Cache links.
 
 **Who is affected.** IAM users who opened the console's metrics dashboard. They lose the dashboard. A client that expected HTTP 403 from the Settings page, the Cache page or the cache form for an IAM-user session now gets a redirect to `/console`. Admin sessions get the same dashboard and data as before, and the admin-authenticated `/metrics` endpoint is unchanged.
 
@@ -845,6 +1144,6 @@ DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with t
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -16,9 +16,14 @@
 #   4. MEMORY MODE DOES NOT PERSIST: the same restart loses the table
 #      (ResourceNotFoundException). This is the negative control for check 3;
 #      if both modes "persist", the mode switch is broken.
-#   5. Labels carry the release identity (version, revision) and --version
+#   5. DISABLE SWITCH: an empty EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL refuses
+#      to start (read through the real environment, not a unit-test stub), and
+#      restarting the file-mode container with the switch and a team pair
+#      removes the example key from the stored database: the example key is
+#      then rejected and the team key still reads the item.
+#   6. Labels carry the release identity (version, revision) and --version
 #      agrees with them.
-#   6. Hardening: runs as 65532 (nonroot), no shell in the runtime image.
+#   7. Hardening: runs as 65532 (nonroot), no shell in the runtime image.
 #
 # Requires: docker, aws, python3. Set EXTENDDB_IMAGE to test a prebuilt image
 # (CI does this); otherwise the image is built from Dockerfile.dev.
@@ -58,10 +63,11 @@ RUN_ID="devsmoke-$$-${RANDOM}"
 FILE_CTR="${RUN_ID}-file"
 MEM_CTR="${RUN_ID}-mem"
 MOVED_CTR="${RUN_ID}-moved"
+SWITCH_CTR="${RUN_ID}-switch"
 VOLUME="${RUN_ID}-data"
 
 cleanup() {
-    docker rm -f "$FILE_CTR" "$MEM_CTR" "$MOVED_CTR" >/dev/null 2>&1 || true
+    docker rm -f "$FILE_CTR" "$MEM_CTR" "$MOVED_CTR" "$SWITCH_CTR" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
     if [[ "$BUILT_IMAGE" == 1 ]]; then
         docker image rm "$EXTENDDB_IMAGE" >/dev/null 2>&1 || true
@@ -145,6 +151,60 @@ GOT=$(ddb "$PORT" get-item --table-name smoke --key '{"pk":{"S":"k1"}}' \
       --query 'Item.v.S' --output text)
 [[ "$GOT" == "persisted" ]] \
     || { echo "error: file mode did NOT persist across restart: '$GOT'" >&2; exit 1; }
+
+# A team pair for the disable-switch checks. Not a real credential.
+TEAM_KEY_ID="AKIADEVSMOKETEAM0001"
+TEAM_SECRET="smoke-team-secret-not-real"
+
+echo "== disable switch: an empty value refuses to start =="
+# `-e NAME=` sets the variable empty, as `-e NAME=$VAR` does with VAR unset.
+docker run -d --name "$SWITCH_CTR" \
+    -e EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL= \
+    -e EXTENDDB_DEV_ACCESS_KEY_ID="$TEAM_KEY_ID" \
+    -e EXTENDDB_DEV_SECRET_ACCESS_KEY="$TEAM_SECRET" \
+    -e EXTENDDB__STORAGE__SQLITE__PATH=:memory: \
+    "$EXTENDDB_IMAGE" >/dev/null
+tries=0
+while [[ "$(docker inspect --format '{{.State.Running}}' "$SWITCH_CTR")" == true ]]; do
+    tries=$((tries + 1))
+    if [[ $tries -gt 30 ]]; then
+        echo "error: the server started with the disable switch set empty" >&2
+        docker logs "$SWITCH_CTR" 2>&1 | tail -20 >&2
+        exit 1
+    fi
+    sleep 1
+done
+EXIT_CODE=$(docker inspect --format '{{.State.ExitCode}}' "$SWITCH_CTR")
+[[ "$EXIT_CODE" != 0 ]] \
+    || { echo "error: the server exited 0 with the disable switch set empty" >&2; exit 1; }
+docker logs "$SWITCH_CTR" 2>&1 | grep -F "EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL is set but empty" >/dev/null \
+    || { echo "error: no 'set but empty' refusal in the logs" >&2; docker logs "$SWITCH_CTR" 2>&1 | tail -20 >&2; exit 1; }
+docker rm -f "$SWITCH_CTR" >/dev/null
+
+echo "== disable switch: a restart with it removes the stored example key =="
+docker rm -f "$FILE_CTR" >/dev/null
+docker run -d --name "$FILE_CTR" -v "$VOLUME":/var/lib/extenddb \
+    -e EXTENDDB_DEV_DISABLE_EXAMPLE_CREDENTIAL=1 \
+    -e EXTENDDB_DEV_ACCESS_KEY_ID="$TEAM_KEY_ID" \
+    -e EXTENDDB_DEV_SECRET_ACCESS_KEY="$TEAM_SECRET" \
+    -p 127.0.0.1:0:18080 "$EXTENDDB_IMAGE" >/dev/null
+wait_for_health "$FILE_CTR"
+PORT=$(host_port "$FILE_CTR")
+# The example key was seeded on this volume by the starts above; it must now
+# be rejected as unknown, not merely fail some other way.
+if OUT=$(ddb "$PORT" list-tables 2>&1); then
+    echo "error: the example key still verifies after a restart with the switch" >&2; exit 1
+fi
+grep -F UnrecognizedClientException <<<"$OUT" >/dev/null \
+    || { echo "error: expected UnrecognizedClientException for the example key, got: $OUT" >&2; exit 1; }
+GOT=$(AWS_ACCESS_KEY_ID="$TEAM_KEY_ID" AWS_SECRET_ACCESS_KEY="$TEAM_SECRET" \
+      ddb "$PORT" get-item --table-name smoke --key '{"pk":{"S":"k1"}}' \
+      --query 'Item.v.S' --output text)
+[[ "$GOT" == "persisted" ]] \
+    || { echo "error: the team key could not read the item after the switch: '$GOT'" >&2; exit 1; }
+if docker logs "$FILE_CTR" 2>&1 | grep -F "$TEAM_SECRET" >/dev/null; then
+    echo "error: the team secret appears in the container logs" >&2; exit 1
+fi
 
 echo "== memory mode: works, and must NOT survive a restart (negative control) =="
 docker run -d --name "$MEM_CTR" \

@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Apache Cassandra storage backend of the ExtendDB server (experimental). Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 extenddb-core = { workspace = true }
@@ -27,6 +30,9 @@ bigdecimal = { workspace = true }
 crc32fast = { workspace = true }
 zeroize = { workspace = true }
 cdrs-tokio = { workspace = true }
+# Not used in the code. It holds cdrs-tokio's protocol crate on 4.0.x. The
+# root Cargo.toml gives the reason.
+cassandra-protocol = { workspace = true }
 chrono = { workspace = true }
 
 [features]
@@ -39,6 +45,12 @@ test-util = ["extenddb-storage/test-util"]
 test-hooks = ["extenddb-storage/test-hooks"]
 
 [dev-dependencies]
-extenddb-storage = { workspace = true, features = ["test-util"] }
+extenddb-storage = { path = "../storage", features = ["test-util"] }
 extenddb-storage-cassandra = { path = ".", features = ["test-util"] }
+# The move's claim test runs the engine's `--move-store` over this backend and
+# a filesystem store (the engine depends on `extenddb-storage`, not on this
+# crate, so the edge is acyclic).
+extenddb-engine = { path = "../engine" }
+extenddb-backup-store = { path = "../backup-store" }
+tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

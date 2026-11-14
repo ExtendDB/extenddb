@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Publish the workspace crates to crates.io, one at a time, in dependency order.
+
+    devtools/publish-crates [--new-crates] [--dry-run] [--no-verify]
+                            [--version X.Y.Z] [--sha256sums FILE]
+                            [--expect-new NAME] [--plan-output FILE]
+                            [--max-wait SECONDS] [--root DIR]
+    devtools/publish-crates --list-packages [--version X.Y.Z] [--root DIR]
+
+This script needs Python 3.11 or later. It reads the members from
+`cargo metadata`. It takes each member that crates.io receives: a member
+without a `publish` field, or one whose `publish` list names crates-io. It
+orders them so that each crate comes after every workspace crate it depends
+on through a normal or build dependency. A cycle stops the run. With
+--version, a crate of another version also stops the run.
+
+The script then reads each crate's file in the crates.io sparse index, and
+it plans one of three actions for each crate:
+
+- skip: the index has the crate's version. crates.io never replaces a
+  version, so a run that stopped part way continues where it stopped.
+- publish: the index has the crate, but not this version.
+- new: the index has no file for the crate.
+
+The script has two modes. The mode --new-crates publishes the first version
+of each crate, and the other mode publishes each later version:
+
+- Without --new-crates, the script publishes the crates of the action
+  publish. The release-crates workflow runs it with a trusted publishing
+  token. It stops before the first new crate, because trusted publishing
+  cannot create a crate. This mode also reads each crate that crates.io has
+  from the crates.io API. It stops when one of them accepts API tokens.
+- With --new-crates, the script publishes the new crates. A maintainer runs
+  it with an API token. It stops before the first crate of the action
+  publish. crates.io refuses a new version published with an API token for
+  a crate that requires trusted publishing, and the release-crates workflow
+  publishes that crate.
+
+A run that stops prints the next steps and exits 1. A first publish has only
+new crates, so the mode --new-crates publishes all of them. A later release
+that adds a crate alternates between the modes. packaging/README.md,
+"Releasing to crates.io", describes the steps.
+
+The script prints the plan and the crate where the run stops. --dry-run
+stops there and exits 0. --plan-output FILE appends two lines to FILE, in
+the format of GITHUB_OUTPUT. publish_count is the number of crates of the
+action publish before the first new crate. first_new is the name of the
+first new crate, or empty when the plan has no new crate. With
+--expect-new NAME, a stop before the new crate NAME exits 0. The workflow
+passes the name that its gate found, and a later job reports the stop. A
+token run can publish NAME in the meantime. The run then does not stop, and
+it prints one line that says so. NAME must be a crate of the release.
+
+Otherwise the script runs `cargo publish -p <crate> --locked` for each crate
+to publish, in order. It adds --no-verify when the caller passes it. Cargo
+waits up to 60 seconds until the index has the new version, so the next
+crate can resolve it. When that wait times out, cargo warns and exits 0.
+
+Pass --no-verify only after `cargo package --workspace --locked` built
+every package from its tarball without the token. A verifying publish runs
+the build scripts and procedural macros of the whole dependency graph while
+the token is in the environment.
+
+--sha256sums FILE takes the SHA-256 list of the verified packages, in the
+format of sha256sum. The list must have a line for each crate that the run
+publishes or skips, or the run stops before the first upload. The run also
+stops there when the index lists the version of a skipped crate with
+another checksum. `cargo publish` writes the package that it uploads into
+`package/tmp-crate` of cargo's build directory, which `cargo metadata`
+names. Only `cargo package` copies the file on into the target directory.
+Before each upload, the script deletes the crate's file in `tmp-crate`.
+After the upload, it hashes the file that cargo wrote there, and it stops
+when the hash differs from the list. --list-packages prints the package
+file name of each crate, in publish order, and reads no index. The
+release-crates workflow hashes those files.
+
+crates.io limits how fast one account publishes (src/rate_limiter.rs). Its
+defaults allow 5 new crates at once and then one every 10 minutes. They
+allow 30 new versions at once and then one a minute. On an answer with
+status 429, the script waits until the time in the answer, plus 5 seconds.
+Then it runs the publish again, and it prints each wait. crates.io also
+limits the versions of one crate in 24 hours, and the script stops at that
+answer. When cargo cannot find a crate that this run published, the index
+lags, and the script runs the publish again after 30 seconds. --max-wait
+caps the total of these waits, not the time of the uploads. The script
+stops when the next wait would take the total past the cap. The default of
+2 hours covers the first publish of 14 new crates, which takes about 90
+minutes.
+
+cargo reads the token from CARGO_REGISTRY_TOKEN or from `cargo login`. The
+script never prints the token or the environment.
+
+Exit 0 when the run published its crates, for a dry run, and for
+--list-packages. Exit 1 when the run stops before a crate that --expect-new
+does not name, and on any error. Exit 2 on a usage error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import email.utils
+import hashlib
+import http.client
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+try:
+    from datetime import UTC
+except ImportError:  # Python 3.10 and older
+    sys.exit("error: devtools/publish-crates needs Python 3.11 or later (for datetime.UTC)")
+
+INDEX = "https://index.crates.io/"
+API = "https://crates.io/api/v1/crates/"
+USER_AGENT = "extenddb-publish-crates (https://github.com/ExtendDB/extenddb)"
+# The Cargo reference, "Registry Index", "Nonexistent Crates": a registry
+# answers 404, 410 or 451 for a crate that it does not have.
+NOT_FOUND = (404, 410, 451)
+TIMEOUT = 30
+# crates.io's data access policy allows at most one API request a second.
+API_INTERVAL = 1
+REGISTRY = "crates-io"
+DEFAULT_MAX_WAIT = 2 * 60 * 60
+RETRY_MARGIN = 5
+# The wait after a 429 answer that gives no time.
+DEFAULT_RETRY_WAIT = 60
+# The wait before the next try when the index does not list a crate that
+# this run published.
+INDEX_RETRY_WAIT = 30
+
+# cargo reports an answer that holds crates.io's JSON errors as "the remote
+# server responded with an error (status 429 Too Many Requests): <detail>",
+# and any other answer as "failed to get a 200 OK response, got 429", with
+# the headers and the body after it.
+TOO_MANY_REQUESTS = re.compile(r"\(status 429\b|\bgot 429\b")
+# crates.io's detail says "Please try again after Tue, 10 Nov 2026 14:30:00
+# GMT", and its Retry-After header holds the same date
+# (src/util/errors/json.rs).
+RETRY_AT = re.compile(
+    r"(?:try again after|retry-after:)\s*(\w{3}, \d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT)",
+    re.IGNORECASE,
+)
+RETRY_SECONDS = re.compile(r"^\s*retry-after:\s*(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
+# crates.io's limit on the versions of one crate (src/controllers/krate/publish.rs).
+DAILY_LIMIT = re.compile(r"too many versions of this crate in the last 24 hours")
+# cargo's resolver errors when the index does not list a dependency yet: a
+# crate that it does not know, or a version that it does not have.
+MISSING_DEPENDENCY = re.compile(
+    r"no matching package named `([^`]+)` found"
+    r"|failed to select a version for the requirement `([^`\s]+) = "
+)
+# A line of sha256sum output for a file name without blanks, which every
+# package file name is.
+SHA256_LINE = re.compile(r"([0-9a-f]{64}) [ *](\S+)")
+
+SKIP = "skip"
+PUBLISH = "publish"
+NEW = "new"
+STATES = {SKIP: "on crates.io", PUBLISH: "new version", NEW: "new crate"}
+
+TOKEN_STEPS = 'packaging/README.md, "Publishing new crates with an API token"'
+AFTER_UPLOAD = 'packaging/README.md, "A failure after the upload"'
+
+FIRST_PUBLISH = """
+crates.io has no crate named {name}, and trusted publishing cannot create a
+crate. A maintainer publishes {name} with an API token of the scope
+publish-new, and runs devtools/publish-crates --new-crates for it. Then the
+maintainer gives {name} its owners and its trusted publisher, requires
+trusted publishing for it, and dispatches release-crates again.
+{steps} gives the steps and the commands.
+"""
+
+TOKEN_STOP = """
+crates.io has {name}, and an API token must not publish it. crates.io
+refuses a new version published with an API token for a crate that
+requires trusted publishing. Revoke the token now, and finish the steps for
+each new crate in {steps}. Then dispatch release-crates again with the tag,
+to publish {name} and the crates after it.
+"""
+
+TOKEN_DONE = """
+Revoke the token now, and finish the steps for each new crate in {steps}.
+Then dispatch release-crates again with the tag, so that its index and smoke
+jobs run on the whole release.
+"""
+
+
+class Failure(Exception):
+    """A problem that stops the run, reported on one line."""
+
+
+def cargo() -> str:
+    return os.environ.get("CARGO", "cargo")
+
+
+def now() -> datetime:
+    return datetime.now(UTC)
+
+
+def sleep(seconds: int) -> None:
+    time.sleep(seconds)
+
+
+def api_pause() -> None:
+    time.sleep(API_INTERVAL)
+
+
+def count(number: int) -> str:
+    return f"{number} crate" if number == 1 else f"{number} crates"
+
+
+def package_file(name: str, version: str) -> str:
+    """The file name of a crate's package, as cargo writes it."""
+    return f"{name}-{version}.crate"
+
+
+def cargo_metadata(root: Path) -> dict:
+    """The workspace as cargo resolves it, without the dependency graph."""
+    try:
+        result = subprocess.run(
+            [cargo(), "metadata", "--no-deps", "--format-version", "1"],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+    except OSError as error:
+        raise Failure(f"cannot run `{cargo()} metadata` in {root}: {error}") from error
+    if result.returncode != 0:
+        raise Failure(f"`cargo metadata` failed in {root}:\n{result.stderr}")
+    return json.loads(result.stdout)
+
+
+def is_published(package: dict) -> bool:
+    """A member that crates.io receives. `publish = false` reaches cargo
+    metadata as an empty list, and a member without the field as null."""
+    registries = package.get("publish")
+    return registries is None or REGISTRY in registries
+
+
+def publish_order(metadata: dict) -> list[dict]:
+    """The members crates.io receives, each after every workspace crate it
+    depends on through a normal or build dependency. Crates that are ready
+    at the same point go in name order."""
+    members = {package["name"]: package for package in metadata["packages"]}
+    published = {name: package for name, package in members.items() if is_published(package)}
+    waits_for: dict[str, set[str]] = {}
+    for name, package in published.items():
+        waits_for[name] = set()
+        for dependency in package["dependencies"]:
+            target = dependency["name"]
+            if dependency.get("kind") == "dev" or target not in members:
+                continue
+            if target not in published:
+                raise Failure(f"{name} depends on {target}, which crates.io does not receive, so crates.io cannot resolve it")
+            waits_for[name].add(target)
+    order: list[dict] = []
+    while waits_for:
+        ready = sorted(name for name, targets in waits_for.items() if not targets)
+        if not ready:
+            raise Failure("the workspace crates depend on each other in a cycle: " + " -> ".join(cycle(waits_for)))
+        order.append(published[ready[0]])
+        del waits_for[ready[0]]
+        for targets in waits_for.values():
+            targets.discard(ready[0])
+    return order
+
+
+def cycle(waits_for: dict[str, set[str]]) -> list[str]:
+    """One cycle among crates that all wait for another one of them, as a
+    path that starts and ends at the same crate."""
+    path = [min(waits_for)]
+    while path.count(path[-1]) < 2:
+        path.append(min(waits_for[path[-1]]))
+    return path[path.index(path[-1]):]
+
+
+def check_versions(order: list[dict], version: str | None) -> None:
+    """Stop when a crate to publish has another version than the release."""
+    if version is None:
+        return
+    other = [f"{package['name']} {package['version']}" for package in order if package["version"] != version]
+    if other:
+        raise Failure(f"the release is {version}, and these crates have another version: {', '.join(other)}")
+
+
+def index_path(name: str) -> str:
+    """The path of a crate's file in the sparse index (the Cargo book,
+    "Registry Index", "Index files")."""
+    name = name.lower()
+    if len(name) <= 2:
+        return f"{len(name)}/{name}"
+    if len(name) == 3:
+        return f"3/{name[0]}/{name}"
+    return f"{name[:2]}/{name[2:4]}/{name}"
+
+
+def fetch(url: str) -> bytes | None:
+    """The body at `url`, or None when the answer says that the crate does
+    not exist."""
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        if error.code in NOT_FOUND:
+            return None
+        raise Failure(f"{url} answered {error.code} {error.reason}") from error
+    except (OSError, http.client.HTTPException) as error:
+        raise Failure(f"cannot read {url}: {error!r}") from error
+
+
+def index_versions(name: str) -> dict[str, str] | None:
+    """The versions of a crate in the crates.io sparse index, yanked ones
+    included, each with the cksum that the index lists for it. None when
+    crates.io has no crate of that name. The cksum of a version is the
+    SHA-256 of the package that crates.io serves."""
+    url = INDEX + index_path(name)
+    body = fetch(url)
+    if body is None:
+        return None
+    try:
+        entries = [json.loads(line) for line in body.decode().splitlines() if line.strip()]
+        return {entry["vers"]: entry["cksum"] for entry in entries}
+    except (ValueError, KeyError, TypeError) as error:
+        raise Failure(f"{url} holds a line that is not an index entry: {error!r}") from error
+
+
+def trusted_publishing_only(name: str) -> bool:
+    """crates.io's trustpub_only flag of a crate. When it is true, crates.io
+    refuses a new version published with an API token."""
+    url = API + name
+    api_pause()
+    body = fetch(url)
+    if body is None:
+        raise Failure(f"{url} has no crate {name}, but the crates.io index lists it")
+    try:
+        flag = json.loads(body)["crate"]["trustpub_only"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise Failure(f"{url} sent no crate.trustpub_only: {error!r}") from error
+    return flag is True
+
+
+def plan(order: list[dict], check_trusted_publishing: bool) -> tuple[list[tuple[str, str, str]], dict[str, str]]:
+    """(name, version, action) for each crate, in publish order, and the
+    index cksum of each skipped package by its file name. With
+    `check_trusted_publishing`, stop when a crate that crates.io has accepts
+    API tokens."""
+    steps = []
+    skipped = {}
+    open_to_tokens = []
+    for package in order:
+        name, version = package["name"], package["version"]
+        versions = index_versions(name)
+        if versions is None:
+            action = NEW
+        else:
+            action = SKIP if version in versions else PUBLISH
+            if action == SKIP:
+                skipped[package_file(name, version)] = versions[version]
+            if check_trusted_publishing and not trusted_publishing_only(name):
+                open_to_tokens.append(name)
+        steps.append((name, version, action))
+    if open_to_tokens:
+        raise Failure(
+            f"crates.io accepts API tokens for {', '.join(open_to_tokens)}. On the Settings tab of each, select "
+            f'"Require trusted publishing for all new versions" ({TOKEN_STEPS}).'
+        )
+    return steps, skipped
+
+
+def stop_at(steps: list[tuple[str, str, str]], new_crates: bool) -> int | None:
+    """The position of the crate where the run stops, or None. Without
+    --new-crates the run publishes the crates of the action publish, and
+    with it the new crates. The first crate of the other action stops it."""
+    wanted = NEW if new_crates else PUBLISH
+    for position, (_, _, action) in enumerate(steps):
+        if action not in (SKIP, wanted):
+            return position
+    return None
+
+
+def plan_facts(steps: list[tuple[str, str, str]]) -> tuple[int, str]:
+    """The number of crates of the action publish before the first new
+    crate, and the name of that crate ("" when there is none)."""
+    before = 0
+    for name, _, action in steps:
+        if action == NEW:
+            return before, name
+        if action == PUBLISH:
+            before += 1
+    return before, ""
+
+
+def print_plan(steps: list[tuple[str, str, str]], stop: int | None, new_crates: bool) -> None:
+    mode = "with an API token, new crates only" if new_crates else "with trusted publishing"
+    print(f"Publish order, {count(len(steps))}, {mode}:")
+    for position, (name, version, action) in enumerate(steps):
+        if stop is not None and position > stop:
+            verdict = "after the stop"
+        elif position == stop:
+            verdict = "stop here"
+        elif action == SKIP:
+            verdict = "skip"
+        else:
+            verdict = "publish"
+        print(f"{position + 1:3}. {name} {version}: {STATES[action]}, {verdict}")
+    planned = sum(1 for _, _, action in steps[:stop] if action != SKIP)
+    if stop is None:
+        print(f"This run publishes {count(planned)}.")
+    else:
+        print(f"This run publishes {count(planned)}, then stops before {steps[stop][0]}.")
+
+
+def write_plan_output(path: Path, steps: list[tuple[str, str, str]]) -> None:
+    before, first_new = plan_facts(steps)
+    try:
+        with path.open("a") as output:
+            output.write(f"publish_count={before}\nfirst_new={first_new}\n")
+    except OSError as error:
+        raise Failure(f"cannot write {path}: {error}") from error
+
+
+def read_sha256sums(path: Path) -> dict[str, str]:
+    """File name to SHA-256, from a list in the format of sha256sum."""
+    try:
+        text = path.read_text()
+    except OSError as error:
+        raise Failure(f"cannot read {path}: {error}") from error
+    sums = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        match = SHA256_LINE.fullmatch(line)
+        if match is None:
+            raise Failure(f"{path}:{number} is not a line of sha256sum output")
+        sums[match.group(2)] = match.group(1)
+    return sums
+
+
+def check_listed(sums: dict[str, str], path: Path, steps: list[tuple[str, str, str]]) -> None:
+    """Stop before the first upload unless the list has a line for each
+    crate of `steps`."""
+    missing = [package_file(name, version) for name, version, _ in steps if package_file(name, version) not in sums]
+    if missing:
+        raise Failure(f"{path} has no SHA-256 for {', '.join(missing)}, so nothing was published")
+
+
+def check_skipped(sums: dict[str, str], path: Path, skipped: dict[str, str]) -> None:
+    """Stop before the first upload when the index lists a version of the
+    release with another checksum than the verified package. crates.io then
+    serves other bytes for that version, for example after an upload that
+    the check after the upload stopped."""
+    other = [crate for crate, cksum in skipped.items() if cksum != sums[crate]]
+    if other:
+        raise Failure(
+            f"the crates.io index lists {', '.join(other)} with another checksum than {path}, so nothing was "
+            f"published. crates.io serves other bytes for that version. Follow {AFTER_UPLOAD}."
+        )
+
+
+def upload_dir(metadata: dict) -> Path:
+    """The directory where `cargo publish` writes the package that it
+    uploads. cargo packages into `package/tmp-crate` of its build directory.
+    Only `cargo package` copies the file on into the target directory
+    (cargo's src/cargo/ops/cargo_package/mod.rs)."""
+    build = metadata.get("build_directory")
+    if not build:
+        raise Failure("cargo metadata names no build_directory, so the script cannot find the packages that cargo "
+                      "uploads. Use the toolchain of release-crates.yml.")
+    return Path(build) / "package" / "tmp-crate"
+
+
+def remove_upload(crate: Path, published: list[str]) -> None:
+    """Delete the file where `cargo publish` writes the package that it
+    uploads. The check after the upload then reads only a file that this
+    publish wrote, and not one that an earlier `cargo package` left."""
+    try:
+        crate.unlink(missing_ok=True)
+    except OSError as error:
+        raise Failure(f"cannot delete {crate} before the upload: {error}. {resume(published)}") from error
+
+
+def check_upload(crate: Path, expected: str, published: list[str]) -> None:
+    """Stop when the package that cargo uploaded is not the verified one."""
+    try:
+        digest = hashlib.sha256(crate.read_bytes()).hexdigest()
+    except OSError as error:
+        raise Failure(f"cannot read {crate}, the package that cargo uploaded: {error}. {resume(published)}") from error
+    if digest != expected:
+        raise Failure(
+            f"cargo uploaded {crate.name} with SHA-256 {digest}, and the verified package has {expected}. "
+            f"crates.io keeps the uploaded bytes. {done(published)} Do not run the script again for "
+            f"this release. Follow {AFTER_UPLOAD}."
+        )
+
+
+def run(command: list[str], root: Path) -> tuple[int, str]:
+    """Run `command` in `root`, echo its output as it arrives, and return
+    the exit code and the output."""
+    print("$ " + " ".join(command), flush=True)
+    try:
+        process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+    except OSError as error:
+        raise Failure(f"cannot run {command[0]}: {error}") from error
+    lines = []
+    with process:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            lines.append(line)
+    return process.returncode, "".join(lines)
+
+
+def retry_wait(output: str, current: datetime) -> int | None:
+    """The seconds to wait before the next try when `output` reports a 429
+    answer, or None for any other failure."""
+    if not TOO_MANY_REQUESTS.search(output):
+        return None
+    match = RETRY_AT.search(output)
+    if match:
+        try:
+            at = email.utils.parsedate_to_datetime(match.group(1))
+        except (TypeError, ValueError):
+            return DEFAULT_RETRY_WAIT
+        return max(0, math.ceil((at - current).total_seconds())) + RETRY_MARGIN
+    match = RETRY_SECONDS.search(output)
+    if match:
+        return int(match.group(1)) + RETRY_MARGIN
+    return DEFAULT_RETRY_WAIT
+
+
+def missing_dependency(output: str, published: list[str]) -> str | None:
+    """A crate that this run published and that cargo did not find in the
+    index, or None."""
+    for match in MISSING_DEPENDENCY.finditer(output):
+        name = match.group(1) or match.group(2)
+        if name in published:
+            return name
+    return None
+
+
+def done(published: list[str]) -> str:
+    return f"Published in this run: {', '.join(published) if published else 'none'}."
+
+
+def resume(published: list[str]) -> str:
+    return (f"{done(published)} Run the script again to continue, or in CI dispatch release-crates again. "
+            "It skips each version that crates.io has.")
+
+
+def publish(root: Path, steps: list[tuple[str, str, str]], no_verify: bool, max_wait: int,
+            sums: dict[str, str] | None, packages: Path | None) -> list[str]:
+    """Publish each crate of `steps` in order, and return the names of the
+    crates published."""
+    published: list[str] = []
+    waited = 0
+    for name, version, _ in steps:
+        command = [cargo(), "publish", "-p", name, "--locked"]
+        if no_verify:
+            command.append("--no-verify")
+        if sums is not None:
+            remove_upload(packages / package_file(name, version), published)
+        while True:
+            code, output = run(command, root)
+            if code == 0:
+                break
+            if DAILY_LIMIT.search(output):
+                raise Failure(f"crates.io refuses more versions of {name} for 24 hours, its limit for one crate. "
+                              f"{resume(published)}")
+            wait = retry_wait(output, now())
+            reason = "crates.io answered 429"
+            if wait is None:
+                missing = missing_dependency(output, published)
+                if missing is None:
+                    raise Failure(f"`cargo publish` failed for {name} {version} with exit code {code}. {resume(published)}")
+                wait = INDEX_RETRY_WAIT
+                reason = f"the crates.io index does not list {missing} yet"
+            if waited + wait > max_wait:
+                raise Failure(
+                    f"{reason}, and a wait of {wait} s before {name} {version} takes the total wait to "
+                    f"{waited + wait} s, over --max-wait {max_wait}. {resume(published)}"
+                )
+            waited += wait
+            print(f"{reason} for {name} {version}: waiting {wait} s, {waited} s of {max_wait} s in total",
+                  flush=True)
+            sleep(wait)
+        published.append(name)
+        if sums is not None:
+            crate = package_file(name, version)
+            check_upload(packages / crate, sums[crate], published)
+    return published
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    parser.add_argument("--new-crates", action="store_true",
+                        help="publish only the crates that crates.io does not have, with an API token")
+    parser.add_argument("--dry-run", action="store_true", help="print the plan and publish nothing")
+    parser.add_argument("--no-verify", action="store_true", help="pass --no-verify to cargo publish")
+    parser.add_argument("--version", metavar="X.Y.Z",
+                        help="the release version: stop when a crate to publish has another version")
+    parser.add_argument("--sha256sums", type=Path, metavar="FILE",
+                        help="the SHA-256 list of the verified packages, in the format of sha256sum")
+    parser.add_argument("--expect-new", metavar="NAME",
+                        help="the first new crate that the gate found: a stop before it exits 0")
+    parser.add_argument("--plan-output", type=Path, metavar="FILE",
+                        help="append publish_count and first_new to FILE, in the format of GITHUB_OUTPUT")
+    parser.add_argument("--list-packages", action="store_true",
+                        help="print the package file name of each crate in publish order, and read no index")
+    parser.add_argument("--max-wait", type=int, default=DEFAULT_MAX_WAIT, metavar="SECONDS",
+                        help=f"cap on the total of the waits after 429 answers and for the index (default: {DEFAULT_MAX_WAIT})")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent, metavar="DIR",
+                        help="workspace root, or a directory in the workspace (default: this repository)")
+    args = parser.parse_args(argv)
+    if args.max_wait < 0:
+        parser.error("--max-wait must not be negative")
+    if args.new_crates and args.expect_new:
+        parser.error("--expect-new applies only without --new-crates")
+    root = args.root.resolve()
+    try:
+        metadata = cargo_metadata(root)
+        order = publish_order(metadata)
+        check_versions(order, args.version)
+        if args.list_packages:
+            for package in order:
+                print(package_file(package["name"], package["version"]))
+            return 0
+        sums = read_sha256sums(args.sha256sums) if args.sha256sums else None
+        steps, skipped = plan(order, check_trusted_publishing=not args.new_crates)
+        stop = stop_at(steps, args.new_crates)
+        to_publish = [step for step in steps[:stop] if step[2] != SKIP]
+        print_plan(steps, stop, args.new_crates)
+        if args.expect_new and args.expect_new not in {name for name, _, _ in steps}:
+            raise Failure(f"--expect-new names {args.expect_new}, which is not a crate of this release")
+        if args.plan_output:
+            write_plan_output(args.plan_output, steps)
+        packages = None
+        if sums is not None:
+            check_listed(sums, args.sha256sums, [step for step in steps if step[2] == SKIP or step in to_publish])
+            check_skipped(sums, args.sha256sums, skipped)
+            packages = upload_dir(metadata)
+        if args.dry_run:
+            print("Dry run: nothing was published.")
+            return 0
+        published = publish(root, to_publish, args.no_verify, args.max_wait, sums, packages)
+    except Failure as failure:
+        sys.stdout.flush()
+        print(f"error: {failure}", file=sys.stderr)
+        return 1
+    skipped = sum(1 for _, _, action in steps[:stop] if action == SKIP)
+    print(f"Published {count(len(published))}, and skipped {count(skipped)} that crates.io has.")
+    if stop is None:
+        if args.new_crates:
+            print(TOKEN_DONE.format(steps=TOKEN_STEPS))
+        elif args.expect_new:
+            print(f"The gate found {args.expect_new} new, but crates.io has it now, so this run did not stop before it.")
+        return 0
+    name = steps[stop][0]
+    if args.new_crates:
+        print(TOKEN_STOP.format(name=name, steps=TOKEN_STEPS))
+        return 1
+    if args.expect_new == name:
+        print(f"Stopped before {name}, the new crate that the gate found.")
+        return 0
+    print(FIRST_PUBLISH.format(name=name, steps=TOKEN_STEPS), flush=True)
+    if args.expect_new:
+        print(f"error: the gate found {args.expect_new} as the first new crate, and this run stops before {name}",
+              file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

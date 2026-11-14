@@ -168,6 +168,24 @@ pub fn migration(id: MigrationId) -> Migration<CassandraStores> {
                 "0009_warm_throughput.cql"
             )],
         },
+        MigrationId::AccountMetrics => Migration::Applies {
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Catalog,
+                "migrations/catalog",
+                "0010_account_metrics.cql"
+            )],
+        },
+        MigrationId::AttributeNameEscape => Migration::NotApplicable(
+            "Cassandra stores the documents that carry attribute names as JSON text in text \
+             columns, where U+0000 is the six-character escape \\u0000, so every name reads back \
+             as it was written",
+        ),
+        MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
+            "access_key_id is the primary key of access_keys, and an import writes with IF NOT \
+             EXISTS, so an ID can be stored once",
+        ),
     }
 }
 
