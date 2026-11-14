@@ -26,15 +26,8 @@ fn main() {
         .filter(|value| !value.trim().is_empty())
         .or_else(packaged_commit)
         .unwrap_or_else(|| {
-            Command::new("git")
-                .args(["rev-parse", "--short", "HEAD"])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map_or_else(
-                    || "unknown".to_owned(),
-                    |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-                )
+            rerun_when_head_moves();
+            git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_owned())
         });
     println!("cargo:rustc-env=EXTENDDB_GIT_HASH={git_hash}");
 
@@ -79,9 +72,47 @@ fn main() {
         });
     println!("cargo:rustc-env=EXTENDDB_BUILD_TIME={build_time}");
 
-    // No file-specific rerun directives: Cargo still re-runs build.rs when any
-    // file in the package changes, while the env directives above make metadata
-    // overrides participate in Cargo's normal rebuild tracking.
+    // Once a build script emits a rerun-if directive, Cargo runs it again only
+    // when one of the named inputs changes, not when other files in the
+    // package do. The inputs are the two variables above and, when the hash
+    // comes from git, the files `rerun_when_head_moves` names.
+}
+
+/// Run `git` with `args` and return its trimmed output, or `None` when git is
+/// not installed or fails, as in a source tree without `.git`.
+fn git(args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Ask Cargo to run this script again when the checked-out commit changes, so
+/// a later build in the same target directory reports its own commit.
+///
+/// With git's default files backend and reflog, git rewrites `HEAD` on a
+/// checkout and appends to `logs/HEAD` on every commit, amend and reset,
+/// including a commit to a branch whose ref is packed. With the reftable
+/// backend, `HEAD` is a stub and every ref update rewrites
+/// `reftable/tables.list`. `git rev-parse --git-path` resolves each path for a
+/// linked worktree too.
+///
+/// A path is named only when it exists, because Cargo treats a missing path as
+/// changed and would run this script on every build. A repository with the
+/// reflog turned off, or a build before the first commit, therefore reruns
+/// only when the variables change, as before. A `git update-ref` run in
+/// another worktree on the branch this one has checked out moves its commit
+/// without touching either of its files.
+fn rerun_when_head_moves() {
+    for name in ["HEAD", "logs/HEAD", "reftable/tables.list"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name])
+            && std::path::Path::new(&path).exists()
+        {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }
 
 /// The commit of a build from the published crate.
