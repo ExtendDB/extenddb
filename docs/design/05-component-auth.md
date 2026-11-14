@@ -501,7 +501,7 @@ pub enum ConditionOperator {
 }
 ```
 
-> **Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`, which grants access to tables matching the caller's own team tag. extenddb expands `${key}` and `${key, 'default'}` in the `Resource` and `NotResource` patterns of a `2012-10-17` document and in condition values, where the default form is read only in a `2012-10-17` document and under a string or ARN operator (`policy/variables.rs`). In a `Resource` or `NotResource` pattern, text that comes from a value or a default is matched literally, so a value cannot add a wildcard, and a variable whose key the request does not carry, with no default, makes the pattern match nothing. With a default, the default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none` when the request has no `team` tag (measured with the IAM policy simulator, issue #533). The full rules are in the security model manual (`docs/manuals/10-security-model.md`); two gaps that remain in condition values are filed as #534. Policy variable support is tracked as REQ-ABAC-006.
+> **Policy Variables.** AWS IAM supports variable substitution in `Resource` ARNs and `Condition` values, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`, which grants access to tables matching the caller's own team tag. extenddb expands `${key}` and `${key, 'default'}` in the `Resource` and `NotResource` patterns and the condition values of a `2012-10-17` document, in condition values only for the string and ARN operators (`policy/variables.rs`). In a `Resource` or `NotResource` pattern, text that comes from a value or a default is matched literally, so a value cannot add a wildcard, and a variable whose key the request does not carry, with no default, makes the pattern match nothing. With a default, the default is used: `table/${aws:PrincipalTag/team, 'none'}` matches `table/none` when the request has no `team` tag (measured with the IAM policy simulator, issue #533). The full rules are in the security model manual (`docs/manuals/10-security-model.md`). Policy variable support is tracked as REQ-ABAC-006.
 
 **JSON deserialization:**
 
@@ -1353,7 +1353,7 @@ The EC2 instance (or IAM role) running extenddb in Mode 3 needs the following pe
 
 3. **Service control policies (SCPs) are not evaluated.** SCPs are an Organizations-level feature. extenddb does not query Organizations APIs.
 
-4. **Policy variables follow the identity-policy rules, with the condition-value gaps of #534.** Fetched policies are evaluated by the same engine, so `${aws:PrincipalTag/key}` in a `Resource`, `NotResource` or condition value expands from the request (REQ-ABAC-006), and the two condition-value gaps filed as #534 apply to them as well.
+4. **Policy variables follow the identity-policy rules.** Fetched policies are evaluated by the same engine, so `${aws:PrincipalTag/key}` in a `Resource`, `NotResource` or condition value expands from the request under the same rules (REQ-ABAC-006).
 
 5. **Cross-account access is not evaluated.** extenddb assumes all callers are in the same account. Cross-account role assumption and resource policies are not supported.
 
@@ -1611,6 +1611,6 @@ pub fn decrypt_secret(encrypted: &[u8], key_b64: &str, aad: &str) -> Result<Stri
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
