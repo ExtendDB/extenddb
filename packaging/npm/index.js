@@ -283,7 +283,8 @@ async function start(options = {}) {
   // above 2^31-1 works because start() compares the deadline with the clock
   // and gives a timer only a clamped delay.
   const timeoutMs = Number(options.startupTimeoutMs ?? 15000);
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   const binary = resolveBinary(options.binary);
   const port = options.port ?? (await freePort());
   const { sqlitePath, description } = resolveStorage(options);
@@ -314,10 +315,11 @@ async function start(options = {}) {
     });
   });
   // A dev server migrates an existing database before it serves; the
-  // timeout restarts at each progress line.
+  // timeout restarts at each progress line. The first wait gets the time
+  // the version check left.
   try {
     await Promise.race([
-      waitForStartup(child, endpoint, timeoutMs, options.onProgress),
+      waitForStartup(child, endpoint, timeoutMs, options.onProgress, startedAt),
       spawned,
     ]);
   } catch (err) {

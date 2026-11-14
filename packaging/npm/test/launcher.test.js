@@ -529,10 +529,7 @@ async function main() {
     );
     const took = Date.now() - began;
     assert.ok(took < 2900, `start() took ${took}ms with startupTimeoutMs 2000`);
-    // start() does not stop a server that misses the deadline, so stop the
-    // fake here.
-    const serve = fake.invocations().find((r) => r.args[0] === "serve");
-    process.kill(serve.pid, "SIGKILL");
+    // start() stops the server that missed the deadline before it rejects.
   }
 
   // 11. The launcher skips a "binary" option or EXTENDDB_BINARY that names

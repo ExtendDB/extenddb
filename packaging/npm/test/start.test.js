@@ -3,9 +3,10 @@
 
 // start() and `extenddb start` against a stand-in for a dev server that
 // migrates its database before it serves: test/fake-server.js, which
-// test/stub-spawn.js runs in place of the extenddb binary. Plain node, and
-// no binary is needed:
-//   node test/start.test.js
+// test/stub-spawn.js runs in place of `extenddb serve`. start() still runs
+// `extenddb version` on the real binary first, so EXTENDDB_BINARY names a
+// dev binary of this release, as for test/launcher.test.js:
+//   EXTENDDB_BINARY=/path/to/extenddb node test/start.test.js
 //
 // What is asserted:
 //   1. With startupTimeoutMs unset, start() waits for a server that prints a
@@ -81,7 +82,7 @@ async function givesUpOnASilentServerAndStopsIt() {
   const error = await startError({ port, memory: true });
   const elapsed = Date.now() - started;
   assert.ok(error, "a server that prints nothing must time out");
-  assert.match(error.message, /did not become healthy within 15000ms$/);
+  assert.match(error.message, /did not become healthy within the 15000ms startup timeout$/);
   assert.ok(
     elapsed >= 15000 && elapsed < 25000,
     `the silent server was given up on after ${elapsed}ms, not at 15 s`

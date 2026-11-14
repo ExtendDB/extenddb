@@ -17,22 +17,25 @@ const PROGRESS_PREFIX = "catalog migration: ";
  *
  * Rejects when the child exits first, with an error that names its exit
  * code or signal and the end of its stderr and carries them as `exitCode`
- * and `signal`, or when `timeoutMs` pass without an answer, counted from the
- * start or from the last migration progress line the child printed on
+ * and `signal`, or when `timeoutMs` pass without an answer, counted from
+ * `startedAt` or from the last migration progress line the child printed on
  * stderr, whichever is later.
  *
  * @param {import("node:child_process").ChildProcess} child  Spawned with a piped stderr.
  * @param {string} endpoint  The server's base URL.
- * @param {number} timeoutMs  How long to wait after the start or the last progress line.
+ * @param {number} timeoutMs  How long to wait after `startedAt` or the last progress line.
  * @param {(line: string) => void} [onProgress]  Called with each progress line,
  *   as the child printed it, until the wait ends.
+ * @param {number} [startedAt]  The Date.now() value the first wait counts
+ *   from: start() passes its own start, so the binary's version check takes
+ *   its time from the same budget.
  * @returns {Promise<void>}
  */
-function waitForStartup(child, endpoint, timeoutMs, onProgress) {
+function waitForStartup(child, endpoint, timeoutMs, onProgress, startedAt = Date.now()) {
   return new Promise((resolve, reject) => {
     let tail = "";
     let partial = "";
-    let lastProgressAt = Date.now();
+    let lastProgressAt = startedAt;
     let progressSeen = false;
     let settled = false;
     let timer = null;
@@ -75,8 +78,10 @@ function waitForStartup(child, endpoint, timeoutMs, onProgress) {
     function retry() {
       if (settled) return;
       if (Date.now() > lastProgressAt + timeoutMs) {
-        const after = progressSeen ? " of its last catalog migration progress line" : "";
-        finish(reject, new Error(`extenddb did not become healthy within ${timeoutMs}ms${after}`));
+        const message = progressSeen
+          ? `extenddb did not become healthy within ${timeoutMs}ms of its last catalog migration progress line`
+          : `extenddb did not become healthy within the ${timeoutMs}ms startup timeout`;
+        finish(reject, new Error(message));
         return;
       }
       timer = setTimeout(probe, 100);
