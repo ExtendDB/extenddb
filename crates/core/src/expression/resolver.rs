@@ -240,21 +240,21 @@ pub fn resolve_element_name<'a>(
 }
 
 /// Reject `ExpressionAttributeNames`/`Values` supplied with no expression that
-/// can reference them. Matches Amazon `DynamoDB`:
+/// can reference them:
 ///
 /// - names: `ExpressionAttributeNames can only be specified when using expressions`
 ///   (no suffix), for every API.
 /// - values: `ExpressionAttributeValues can only be specified when using
-///   expressions: <params> is/are null`, listing the value-capable expression
-///   parameter(s) of the API.
+///   expressions`, followed by `: <param> is null` or `: <a> and <b> are null`
+///   when `value_expr_params` is not empty.
 ///
 /// `name_expr_present` is true when any expression that can carry a `#name` is
 /// present (projection, condition, filter, key condition, update).
 /// `value_expr_present` is true when any expression that can carry a `:value` is
 /// present (condition, filter, key condition, update; not projection).
-/// `value_expr_params` is the API's static list of value-capable expression
-/// parameter kinds, used to build the values suffix. An empty list yields no
-/// suffix (matching Query).
+/// `value_expr_params` lists the expression parameters the values message names
+/// as null. Query and Scan pass an empty list, because the service's message for
+/// them has no suffix.
 ///
 /// # Errors
 ///
