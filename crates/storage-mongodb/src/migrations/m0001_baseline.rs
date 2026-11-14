@@ -13,7 +13,9 @@
 //! after the post-check: a body or post-check that fails leaves the row, so
 //! the 0.1.14 server still serves the catalog. The data body creates the
 //! data database's collections and indexes, which before 1.0 only `init`
-//! created. Every request is safe to
+//! created, and the `{table_id, shard_id}` index on `stream_shards`, which
+//! no release before 1.0 created: a released deployment gets it from the
+//! run that adopts it. Every request is safe to
 //! send again: creating a collection that exists with the same options
 //! succeeds, one that exists with other options fails with NamespaceExists
 //! (code 48), which is accepted by its code and left to the post-check, and
@@ -112,7 +114,9 @@ fn catalog_indexes() -> Vec<Index> {
     ]
 }
 
-/// The data indexes, as every released `init` created them.
+/// The data indexes: those every released `init` created, and the
+/// `{table_id, shard_id}` index on `stream_shards`, which no release before
+/// 1.0 created.
 fn data_indexes() -> Vec<Index> {
     vec![
         // 540 s, so a token is kept for at most 10 minutes with the TTL
@@ -122,6 +126,13 @@ fn data_indexes() -> Vec<Index> {
         unique("idempotency_tokens", doc! { "account_id": 1, "token": 1 }),
         // Two stream enables cannot insert the same shard.
         unique("stream_shards", doc! { "shard_id": 1 }),
+        // A table's shards in shard id order. Every write to a streamed table
+        // selects the table's open shards by `table_id` and sorts them by
+        // `shard_id`, and DescribeStream, GetShardIterator and ListStreams read
+        // a table's shard documents the same way. Without it each of those
+        // reads scans the whole collection, which holds the shards of every
+        // table of every account, and each enable adds four documents to it.
+        plain("stream_shards", doc! { "table_id": 1, "shard_id": 1 }),
         // DynamoDB's 24-hour stream retention.
         expiring("stream_records", doc! { "created_at": 1 }, Duration::from_secs(24 * 3600)),
         plain("stream_records", doc! { "shard_id": 1, "sequence_number": 1 }),

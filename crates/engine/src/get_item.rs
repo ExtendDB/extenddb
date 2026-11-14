@@ -36,6 +36,11 @@ pub async fn handle_get_item(
 ) -> Result<DispatchResult, DynamoDbError> {
     let input: GetItemInput = serde_json::from_value(body).map_err(crate::deserialize_error)?;
 
+    // A number the service cannot read in the key is reported ahead of the
+    // projection checks, the table lookup and the key schema checks
+    // (measured 2026-10-27).
+    extenddb_core::validation::number::operations::get_item(&input)?;
+
     // Validate the projection (and EAN usage) before the existence
     // check, so a missing table returns ValidationException, not
     // ResourceNotFoundException. Key validation stays after existence.

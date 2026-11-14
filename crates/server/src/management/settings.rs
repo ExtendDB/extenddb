@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -33,9 +33,10 @@ fn op_err_to_response(e: extenddb_storage::management_store::OpError) -> Respons
 pub async fn list_settings(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
@@ -63,10 +64,11 @@ pub async fn list_settings(
 pub async fn get_setting(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
@@ -98,11 +100,12 @@ pub struct SetSettingRequest {
 pub async fn set_setting(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(key): Path<String>,
     Json(body): Json<SetSettingRequest>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
