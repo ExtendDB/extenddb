@@ -11,10 +11,11 @@
 //!
 //! In-tree backends are selected by mutually exclusive Cargo features:
 //! `postgres` (the default production backend), `mongodb` (production, built with
-//! `--no-default-features --features mongodb`), `cassandra`, and `sqlite`/`sqlite-memory`
-//! (the dev/CI backend). Exactly one must be enabled: [`set_backend`] installs one
-//! backend per process, so a build with more than one would be ambiguous and is
-//! rejected at compile time.
+//! `--no-default-features --features mongodb`), `cassandra`, and `sqlite`/`sqlite-memory`.
+//! `sqlite` is for production on a single node, and `sqlite-memory` keeps the database
+//! in memory for development and CI. Exactly one must be enabled. [`set_backend`]
+//! installs one backend per process, so a build with more than one would be ambiguous
+//! and is rejected at compile time.
 
 // Exactly one backend feature must be enabled.
 #[cfg(any(
@@ -28,7 +29,7 @@
 compile_error!(
     "the `postgres`, `mongodb`, `sqlite`, and `cassandra` features are mutually exclusive: \
      a thin bin installs exactly one backend (e.g. build the MongoDB binary with \
-     `--no-default-features --features mongodb)"
+     `--no-default-features --features mongodb`)"
 );
 
 #[cfg(not(any(
@@ -42,18 +43,17 @@ compile_error!(
 );
 
 // Developer mode relaxes the security posture (plain HTTP on loopback, open
-// authorization). It is a dev/CI-only profile and must be built only with a
-// dev/CI-suitable backend. Rather than denying each production backend by name
-// (every backend is a production backend unless proven otherwise, so a deny-list
-// would have to grow with each new one), require a known dev backend: dev-mode
-// compiles only when `sqlite` is enabled. `sqlite-memory` enables `sqlite`, so it
-// is covered too; postgres, mongodb — or any future production backend — fail the
-// build, so there is no path by which a production deployment can serve in dev mode.
+// authorization) for development and CI. It compiles only when the build enables
+// `sqlite`. `sqlite-memory` enables `sqlite`, so dev mode also compiles with
+// `sqlite-memory`. The check names the one backend that dev mode allows, because a
+// deny-list of the other backends would have to grow with each new backend. A build
+// of any other backend with `dev-mode` fails. A production `sqlite` build leaves
+// `dev-mode` off.
 #[cfg(all(feature = "dev-mode", not(feature = "sqlite")))]
 compile_error!(
-    "the `dev-mode` feature requires a dev/CI backend such as `sqlite`; it must \
-     not be built with a production backend like `postgres` or `mongodb` (build \
-     with `--no-default-features --features sqlite-memory,dev-mode`)"
+    "the `dev-mode` feature requires the `sqlite` backend and does not build with \
+     `postgres`, `mongodb` or `cassandra` (build with \
+     `--no-default-features --features sqlite-memory,dev-mode`)"
 );
 
 fn main() -> anyhow::Result<()> {
@@ -75,6 +75,8 @@ fn main() -> anyhow::Result<()> {
         version: env!("CARGO_PKG_VERSION"),
         git_hash: env!("EXTENDDB_GIT_HASH"),
         build_time: env!("EXTENDDB_BUILD_TIME"),
+        // The MongoDB hooks; the backup jobs' hooks are `extenddb-app`'s
+        // `backup-test-hooks` feature, which `version` reports itself.
         test_hooks_enabled: cfg!(feature = "mongodb-test-hooks"),
     })
 }

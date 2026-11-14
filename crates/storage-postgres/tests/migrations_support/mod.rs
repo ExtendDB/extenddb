@@ -566,3 +566,28 @@ pub fn note_steps(note: &str) -> Vec<(String, String)> {
     }
     steps
 }
+
+/// Compare `actual` with `tests/fixtures/golden/<name>`, or write the file
+/// when `EXTENDDB_BLESS_EXPECTED=1`.
+pub fn golden(name: &str, actual: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/golden")
+        .join(name);
+    if bless() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, actual).unwrap();
+        return;
+    }
+    let expected =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(actual, expected, "{name} differs from its golden file");
+}
+
+/// The ledger notes of migration `id` in the store `catalog` connects to.
+pub async fn notes(catalog: &PgPool, id: i32) -> String {
+    sqlx::query_scalar("SELECT notes FROM extenddb_migrations WHERE id = $1")
+        .bind(id)
+        .fetch_one(catalog)
+        .await
+        .unwrap()
+}
