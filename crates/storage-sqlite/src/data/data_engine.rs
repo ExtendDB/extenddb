@@ -22,18 +22,27 @@ use crate::store::SqliteEngine;
 /// `DeleteTable` dropped the data table before the statement ran. SQLite
 /// reports the dropped table as `no such table`. DynamoDB answers a request on
 /// a table that is gone with `ResourceNotFoundException`, so the error is
-/// `TableNotFound` here rather than an internal error. A data-plane statement
-/// also names the shared `stream_shards`, `stream_records`, `gsi_pending` and
-/// `vector_index_holds` tables, and an index table a concurrent GSI delete has
-/// just dropped; a missing one of those is reported the same way, so an
-/// unapplied migration shows as `ResourceNotFoundException` on the wire and as
-/// the named table in the server log.
+/// `TableNotFound` here rather than an internal error. Only this backend's data
+/// and index tables, all named `_ddb_<id>`, are matched, as PostgreSQL's
+/// `data_table_missing` matches its own. A data-plane statement also names the
+/// shared `stream_shards`, `stream_records`, `gsi_pending` and
+/// `vector_index_holds` tables; one of those missing is a catalog that lacks a
+/// migration, not a table that is gone, so it stays an internal error and is
+/// logged with its name.
 fn dropped_table_as_not_found(key_info: &TableKeyInfo, e: StorageError) -> StorageError {
-    if super::index::is_no_such_table(&e) {
+    if data_table_missing(&e) {
         StorageError::TableNotFound(key_info.table_name.clone())
     } else {
         e
     }
+}
+
+/// Whether an error is SQLite's `no such table` for a `_ddb_<id>` data or
+/// index table. SQLite names the table as the statement wrote it, with or
+/// without the `main.` schema.
+fn data_table_missing(e: &StorageError) -> bool {
+    matches!(e, StorageError::Internal(msg)
+        if msg.contains("no such table: _ddb_") || msg.contains("no such table: main._ddb_"))
 }
 
 /// The transaction form of [`dropped_table_as_not_found`]: a transaction's
@@ -473,6 +482,52 @@ impl OwnedWriteOp {
                 maps,
                 return_values_on_ccf: *rv,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod dropped_table_tests {
+    use super::*;
+
+    fn key_info() -> TableKeyInfo {
+        TableKeyInfo {
+            table_name: "t".to_owned(),
+            ..TableKeyInfo::default()
+        }
+    }
+
+    /// The table's own data or index table gone: the table is gone.
+    #[test]
+    fn a_missing_ddb_table_is_a_missing_table() {
+        for msg in [
+            "error returned from database: (code: 1) no such table: _ddb_0b0e",
+            "error returned from database: (code: 1) no such table: main._ddb_0b0e",
+        ] {
+            let e = dropped_table_as_not_found(&key_info(), StorageError::Internal(msg.to_owned()));
+            assert!(
+                matches!(e, StorageError::TableNotFound(ref n) if n == "t"),
+                "{msg}: {e:?}"
+            );
+        }
+    }
+
+    /// A shared table missing is a catalog without a migration, not a table
+    /// that is gone: it stays an internal error with the table's name.
+    #[test]
+    fn a_missing_shared_table_stays_internal() {
+        for table in [
+            "stream_shards",
+            "stream_records",
+            "gsi_pending",
+            "vector_index_holds",
+        ] {
+            let msg = format!("error returned from database: (code: 1) no such table: {table}");
+            let e = dropped_table_as_not_found(&key_info(), StorageError::Internal(msg.clone()));
+            assert!(
+                matches!(e, StorageError::Internal(ref m) if m == &msg),
+                "{table}: {e:?}"
+            );
         }
     }
 }

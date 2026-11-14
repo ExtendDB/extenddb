@@ -35,13 +35,41 @@ fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
     !matches!(segs.next(), None | Some("") | Some("stream"))
 }
 
-/// True for a stream ARN, `table/<name>/stream/<label>`. A stream's tags belong
-/// to the stream, which stays describable after its table is deleted, so the
-/// table's `DELETING` refusal does not apply to them.
-fn arn_names_stream(arn: &str) -> bool {
-    extenddb_core::arn::fields(arn)
-        .and_then(|f| f.resource.strip_prefix("table/"))
+/// True for a `table/<name>/stream/<label>` resource.
+fn tag_subresource_is_stream(resource: &str) -> bool {
+    resource
+        .strip_prefix("table/")
         .is_some_and(|tail| tail.split('/').nth(1) == Some("stream"))
+}
+
+/// The refusal for a tag operation's ARN whose partition, service or region is
+/// not this deployment's, or `None` when all three are. The rule is
+/// [`extenddb_core::arn::ArnFields::in_deployment`], the predicate the server's
+/// `StreamArn` scope check uses.
+///
+/// A stream ARN with another partition, service or region reaches this point
+/// for an authorized principal (the server authorizes a tag operation's stream
+/// ARN as sent, and refuses another account before authorization). The service
+/// answers "Invalid StreamArn" here (measured live 2026-10-23,
+/// ListTagsOfResource and TagResource for an admin and for a principal with
+/// Allow * plus a Deny on the canonical ARN). The service's table message
+/// differs (measured live).
+fn deployment_scope_error(
+    fields: &extenddb_core::arn::ArnFields<'_>,
+    arn: &str,
+    region: &str,
+) -> Option<DynamoDbError> {
+    if fields.in_deployment(region) {
+        return None;
+    }
+    if tag_subresource_is_stream(fields.resource) {
+        return Some(DynamoDbError::ValidationException(
+            "Invalid StreamArn".to_owned(),
+        ));
+    }
+    Some(DynamoDbError::ValidationException(format!(
+        "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
+    )))
 }
 
 /// Extract the table name from a `DynamoDB` table ARN, using the one shared
@@ -56,8 +84,64 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
-/// Validate that the ARN refers to an existing table owned by the caller, and
-/// report that table's catalog status so the caller can decide on it.
+/// What [`validate_resource_arn`] answers for a table that is `DELETING`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhileDeleting {
+    /// `ListTagsOfResource`: the table is listed until it is gone.
+    Serve,
+    /// `TagResource` and `UntagResource`: refused as a table still in use.
+    Refuse,
+}
+
+/// Refuse a tag change on a table that is being deleted. The service answers
+/// `TagResource` and `UntagResource` on a `DELETING` table with
+/// `ResourceInUseException` and the sentence `DeleteTable` and `UpdateTable`
+/// give in that window, and serves `ListTagsOfResource` (measured
+/// 2026-11-03). On the table's stream ARN both writes are served in the same
+/// window (measured 2026-10-26), so `resource` decides: a stream's tags belong
+/// to the stream, which stays describable after its table is deleted. The key
+/// info carries no status, and the data plane reads a `DELETING` table as
+/// found on PostgreSQL and SQLite, so the status is read with
+/// `describe_table`. Any other answer from it is left to the existence check
+/// that follows.
+///
+/// Returns whether the table is `DELETING` and the request is served: the
+/// key-info read reports a `DELETING` row as not found on MongoDB and
+/// Cassandra, so such a request skips it and every backend answers the window
+/// the same way.
+async fn refuse_while_deleting(
+    table_name: &str,
+    resource: &str,
+    ctx: &OperationContext,
+    while_deleting: WhileDeleting,
+) -> Result<bool, DynamoDbError> {
+    let Ok(desc) = ctx
+        .storage
+        .describe_table(
+            &ctx.account_id,
+            extenddb_core::types::DescribeTableInput {
+                table_name: table_name.to_owned(),
+            },
+        )
+        .await
+    else {
+        return Ok(false);
+    };
+    if desc.table_status != TableStatus::Deleting {
+        return Ok(false);
+    }
+    if while_deleting == WhileDeleting::Refuse && !tag_subresource_is_stream(resource) {
+        return Err(DynamoDbError::ResourceInUseException(
+            extenddb_core::error::error_message(
+                extenddb_core::error::ErrorMessageKey::TableBeingDeleted,
+                &[table_name],
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// Validate that the ARN refers to an existing table owned by the caller.
 ///
 /// The error classes and messages below match `DynamoDB`, verified against the
 /// service:
@@ -71,17 +155,21 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Table ARN naming an index or other sub-resource | `ValidationException` (only table or stream is accepted) |
 /// | Account differs from the caller's | `AccessDeniedException` |
 /// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
+/// | Stream ARN with a different partition, service, or region | `ValidationException` (`Invalid StreamArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
+/// | Table is `DELETING`, for `TagResource` and `UntagResource` on the table ARN (`while_deleting` is `Refuse`) | `ResourceInUseException` (`Table is being deleted`) |
+/// | Table is `DELETING`, for `ListTagsOfResource` and for the stream ARN | served |
 ///
 /// Account is checked before the partition, service, and region, matching the
 /// service: a cross-account ARN is denied without revealing whether its other
 /// fields are valid. For a table ARN, a no-permissions principal is denied by
 /// authorization before this runs; the partition, service, region, and
 /// existence errors therefore surface only for an authorized principal.
-async fn validate_resource_arn<'a>(
-    arn: &'a str,
+async fn validate_resource_arn(
+    arn: &str,
     ctx: &OperationContext,
-) -> Result<(TableStatus, &'a str), DynamoDbError> {
+    while_deleting: WhileDeleting,
+) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: ARNs must start with 'arn:': {arn}"
@@ -90,25 +178,19 @@ async fn validate_resource_arn<'a>(
 
     // A string that is not shaped like an ARN (fewer than the five
     // colon-separated fields) is denied rather than reported as malformed.
-    let Some(extenddb_core::arn::ArnFields {
-        partition,
-        service,
-        region,
-        account,
-        resource,
-    }) = extenddb_core::arn::fields(arn)
-    else {
+    let Some(fields) = extenddb_core::arn::fields(arn) else {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     };
+    let resource = fields.resource;
 
     if !resource.starts_with("table/") {
         // A DynamoDB ARN whose resource is not a table (a bare index, an
         // export, and so on) is reported as not a DynamoDB resource. An ARN for
         // another service is denied rather than reported as malformed, as the
         // service does.
-        if service == "dynamodb" {
+        if fields.service == "dynamodb" {
             return Err(DynamoDbError::ValidationException(format!(
                 "One or more parameter values were invalid: \
                  Provided Arn is not a DynamoDB resource arn: {arn}"
@@ -135,16 +217,14 @@ async fn validate_resource_arn<'a>(
         )));
     }
 
-    if account != ctx.account_id.as_ref() {
+    if fields.account != ctx.account_id.as_ref() {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
 
-    if partition != "aws" || service != "dynamodb" || region != ctx.region.as_ref() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
-        )));
+    if let Some(err) = deployment_scope_error(&fields, arn, &ctx.region) {
+        return Err(err);
     }
 
     let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
@@ -154,26 +234,18 @@ async fn validate_resource_arn<'a>(
         ))
     })?;
 
-    // The table's status, which TableKeyInfo does not carry and the key-info
-    // read cannot supply for a DELETING row on MongoDB and Cassandra (it
-    // reports one as not found). The status read comes first so every backend
-    // reaches the same answer for the window, for a table ARN and for a stream
-    // ARN alike; every other status is left to the key-info read below, which
-    // already classifies it.
-    let status = crate::table_lifecycle::read_table_status(table_name, ctx)
-        .await
-        .map_err(|e| arn_storage_error(e, arn))?;
-    if status == TableStatus::Deleting {
-        return Ok((status, table_name));
+    // A served request on a DELETING table skips the key-info read, which
+    // reports such a row as not found on MongoDB and Cassandra.
+    if refuse_while_deleting(table_name, resource, ctx, while_deleting).await? {
+        return Ok(());
     }
-
     // Verify the table exists via table_key_info (lightweight check).
     ctx.storage
         .table_key_info(&ctx.account_id, table_name)
         .await
         .map_err(|e| arn_storage_error(e, arn))?;
 
-    Ok((status, table_name))
+    Ok(())
 }
 
 /// Report a storage error from the table lookup behind a resource ARN: a
@@ -188,29 +260,6 @@ fn arn_storage_error(e: extenddb_storage::error::StorageError, arn: &str) -> Dyn
         }
         other => sanitize_storage_error(other),
     }
-}
-
-/// Refuse a tag write on a table ARN while the table is being deleted.
-///
-/// `TagResource` and `UntagResource` on a table ARN during the table's
-/// `DELETING` window answer 400 `ResourceInUseException` with the `Table is
-/// being deleted` sentence, and `ListTagsOfResource` is served with the tags
-/// (measured 2026-10-25). On the table's stream ARN both writes are served in
-/// the same window (measured 2026-10-26), so `arn` decides. A write admitted
-/// on the table ARN in the window would land an unconditioned tag row that can
-/// outlive the table, since the delete removes the ARN's tag rows before the
-/// catalog row. The refusal removes those admissions; a write whose status
-/// read came before the delete can still land after the delete removed the
-/// tag rows, as it could before.
-fn refuse_tag_write_while_deleting(
-    status: TableStatus,
-    table_name: &str,
-    arn: &str,
-) -> Result<(), DynamoDbError> {
-    if status == TableStatus::Deleting && !arn_names_stream(arn) {
-        return Err(crate::table_lifecycle::being_deleted(table_name));
-    }
-    Ok(())
 }
 
 /// Handle `TagResource` — add or overwrite tags on a resource.
@@ -234,8 +283,7 @@ pub async fn handle_tag_resource(
         ));
     }
 
-    let (status, table_name) = validate_resource_arn(&input.resource_arn, ctx).await?;
-    refuse_tag_write_while_deleting(status, table_name, &input.resource_arn)?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Refuse).await?;
 
     ctx.storage
         .tag_resource(&input.resource_arn, &input.tags)
@@ -274,8 +322,7 @@ pub async fn handle_untag_resource(
         ));
     }
 
-    let (status, table_name) = validate_resource_arn(&input.resource_arn, ctx).await?;
-    refuse_tag_write_while_deleting(status, table_name, &input.resource_arn)?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Refuse).await?;
 
     ctx.storage
         .untag_resource(&input.resource_arn, &input.tag_keys)
@@ -312,7 +359,7 @@ pub async fn handle_list_tags_of_resource(
 
     // Served while the table is DELETING, with the tags, as the service serves
     // it (measured 2026-10-25): the read is not a change to the resource.
-    let (_status, _table_name) = validate_resource_arn(&input.resource_arn, ctx).await?;
+    validate_resource_arn(&input.resource_arn, ctx, WhileDeleting::Serve).await?;
 
     let tags = ctx
         .storage
@@ -330,57 +377,11 @@ pub async fn handle_list_tags_of_resource(
 #[cfg(test)]
 mod tests {
     use super::{
-        arn_storage_error, refuse_tag_write_while_deleting, tag_subresource_not_dynamodb_resource,
+        arn_storage_error, deployment_scope_error, tag_subresource_not_dynamodb_resource,
         tag_subresource_not_table_or_stream,
     };
     use extenddb_core::error::DynamoDbError;
-    use extenddb_core::types::TableStatus;
     use extenddb_storage::error::StorageError;
-
-    const TABLE_ARN: &str = "arn:aws:dynamodb:us-east-1:123456789012:table/t";
-    const STREAM_ARN: &str =
-        "arn:aws:dynamodb:us-east-1:123456789012:table/t/stream/2026-10-26T00:13:40.188";
-
-    /// A tag write on the table ARN is refused while the table is DELETING,
-    /// with the service's sentence, and admitted in every other status.
-    #[test]
-    fn a_tag_write_is_refused_only_while_deleting() {
-        match refuse_tag_write_while_deleting(TableStatus::Deleting, "t", TABLE_ARN).unwrap_err() {
-            DynamoDbError::ResourceInUseException(msg) => assert_eq!(
-                msg,
-                "Attempt to change a resource which is still in use: Table is being deleted: t"
-            ),
-            other => panic!("expected ResourceInUseException, got {other:?}"),
-        }
-        for status in [
-            TableStatus::Active,
-            TableStatus::Creating,
-            TableStatus::Updating,
-        ] {
-            assert!(
-                refuse_tag_write_while_deleting(status, "t", TABLE_ARN).is_ok(),
-                "{status:?} must keep its existing answer"
-            );
-        }
-    }
-
-    /// A tag write on the table's stream ARN is admitted in every status,
-    /// DELETING included: the service serves both writes there during the
-    /// window (measured 2026-10-26).
-    #[test]
-    fn a_stream_arn_tag_write_is_admitted_while_deleting() {
-        for status in [
-            TableStatus::Deleting,
-            TableStatus::Active,
-            TableStatus::Creating,
-            TableStatus::Updating,
-        ] {
-            assert!(
-                refuse_tag_write_while_deleting(status, "t", STREAM_ARN).is_ok(),
-                "{status:?} on the stream ARN must be admitted"
-            );
-        }
-    }
 
     /// A missing table behind a resource ARN names the ARN; anything else is a
     /// fault, not a client error.
@@ -398,6 +399,45 @@ mod tests {
             arn_storage_error(StorageError::Internal("boom".to_owned()), arn),
             DynamoDbError::InternalServerError(_)
         ));
+    }
+
+    /// The tag handler refuses exactly the ARNs the shared predicate puts
+    /// outside this deployment, the predicate the server's StreamArn scope
+    /// check uses (`stream_arn_scope_uses_the_shared_predicate` in
+    /// `crates/server/src/authz_resource/stream_scope.rs`), with the
+    /// service's message for a stream and for a table.
+    #[test]
+    fn deployment_scope_uses_the_shared_predicate() {
+        const R: &str = "us-east-1";
+        let stream =
+            "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
+        let table = "arn:aws:dynamodb:us-east-1:444455556666:table/T";
+        for base in [stream, table] {
+            for arn in [
+                base.to_owned(),
+                base.replace("arn:aws:", "arn:aws-cn:"),
+                base.replace("arn:aws:", "arn:aws-us-gov:"),
+                base.replace(":dynamodb:", ":DynamoDB:"),
+                base.replace(":dynamodb:", ":DYNAMODB:"),
+                base.replace("us-east-1", "us-west-2"),
+                base.replace("us-east-1", "US-EAST-1"),
+                base.replace("us-east-1", ""),
+            ] {
+                let fields = extenddb_core::arn::fields(&arn).unwrap();
+                let err = deployment_scope_error(&fields, &arn, R);
+                assert_eq!(err.is_none(), fields.in_deployment(R), "{arn}");
+                let expected = if base == stream {
+                    "Invalid StreamArn".to_owned()
+                } else {
+                    format!("Invalid TableArn: Invalid ResourceArn provided as input {arn}")
+                };
+                match err {
+                    None => assert_eq!(arn, base, "only the canonical ARN passes"),
+                    Some(DynamoDbError::ValidationException(m)) => assert_eq!(m, expected),
+                    Some(_) => panic!("{arn}: expected ValidationException"),
+                }
+            }
+        }
     }
 
     #[test]

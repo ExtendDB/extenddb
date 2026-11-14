@@ -137,10 +137,13 @@ async fn scratch() -> Scratch {
             .expect("apply a shipped migration");
     }
     set_delay(&catalog, "0").await;
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'index_propagation_delay_ms'")
-        .execute(&catalog)
-        .await
-        .expect("pin the propagation delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&catalog)
+    .await
+    .expect("pin the propagation delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -167,12 +170,17 @@ async fn scratch() -> Scratch {
     }
 }
 
+/// Write the control-plane delay. The row is written, not only updated:
+/// migration 1 seeds no setting.
 async fn set_delay(catalog: &PgPool, seconds: &str) {
-    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'control_plane_delay_seconds'")
-        .bind(seconds)
-        .execute(catalog)
-        .await
-        .expect("set the control-plane delay");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(seconds)
+    .execute(catalog)
+    .await
+    .expect("set the control-plane delay");
 }
 
 async fn status_of(catalog: &PgPool, table: &str) -> Option<String> {
@@ -197,6 +205,8 @@ fn update_input(table: &str) -> UpdateTableInput {
         on_demand_throughput: None,
         table_throughput_mode: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     }
 }
 
@@ -536,9 +546,9 @@ async fn a_request_after_the_data_drop_is_table_not_found() {
 
 /// Two concurrent DeleteTable calls on one ACTIVE table: the first locks the
 /// row `FOR UPDATE` and marks it DELETING; the second, blocked on that lock,
-/// re-reads the row after the commit, finds it excluded by the status filter,
-/// and answers TableBeingDeleted from the unfiltered lookup. Ten rounds, a
-/// fresh table each; one row per table, DELETING, and its data table present.
+/// reads the row again after the commit, finds it DELETING, and answers
+/// TableBeingDeleted. Ten rounds, a fresh table each; one row per table,
+/// DELETING, and its data table present.
 #[tokio::test]
 async fn two_concurrent_delete_tables_have_one_winner() {
     if base_conn().is_none() {
@@ -597,5 +607,69 @@ async fn two_concurrent_delete_tables_have_one_winner() {
     }
 
     drop(engine);
+    s.cleanup().await;
+}
+
+/// The backup reconciler removes an abandoned restore target through
+/// `abort_restore`, which marks its row DELETING and then drops its data
+/// table. The target was never served, and the service answers a table it is
+/// still restoring as not found, so the data plane keeps answering it that
+/// way while the drop waits, where a table DeleteTable marked is served. A
+/// transaction holding ACCESS SHARE on the data table keeps the drop waiting.
+#[tokio::test]
+async fn an_abandoned_restore_target_being_removed_is_not_found() {
+    if base_conn().is_none() {
+        return skip("an_abandoned_restore_target_being_removed_is_not_found");
+    }
+    let s = scratch().await;
+    create_table_named(&s, TABLE).await;
+    // A restore target: CREATING with no scheduled transition.
+    let table_id: String = sqlx::query_scalar(
+        "UPDATE tables SET table_status = 'CREATING', status_transition_at = NULL \
+         WHERE account_id = $1 AND table_name = $2 RETURNING table_id",
+    )
+    .bind(ACCOUNT)
+    .bind(TABLE)
+    .fetch_one(&s.catalog)
+    .await
+    .expect("make the table a restore target");
+
+    let mut holder = s.catalog.begin().await.expect("the holder's transaction");
+    sqlx::query(&format!(
+        "LOCK TABLE \"_ddb_{table_id}\" IN ACCESS SHARE MODE"
+    ))
+    .execute(&mut *holder)
+    .await
+    .expect("hold the data table");
+
+    let removal = s.engine.abort_restore(&table_id);
+    let check = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while status_of(&s.catalog, TABLE).await.as_deref() != Some("DELETING") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the removal did not claim the restore target within 30 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let key_info = s.engine.table_key_info(ACCOUNT, TABLE).await;
+        holder.rollback().await.expect("release the data table");
+        key_info
+    };
+    let (claimed, key_info) = tokio::join!(removal, check);
+    assert!(
+        claimed.expect("the removal"),
+        "the removal claimed the target"
+    );
+    assert!(
+        matches!(&key_info, Err(StorageError::TableNotFound(name)) if name == TABLE),
+        "expected TableNotFound({TABLE:?}) while the restore target is removed, got {key_info:?}"
+    );
+    assert_eq!(
+        status_of(&s.catalog, TABLE).await,
+        None,
+        "the removal dropped the row"
+    );
+
     s.cleanup().await;
 }

@@ -20,9 +20,14 @@ use super::auth::authenticate_admin;
 use super::crypto::{
     encrypt_secret, generate_secret_key, generate_session_key_id, generate_session_token,
 };
+use extenddb_auth::policy::arn_value::{
+    fail_closed_trust_arn_value, invalid_trust_arn_value, trust_arn_value_message,
+};
 use extenddb_auth::policy::condition::{ConditionMatch, evaluate_statement_conditions};
 use extenddb_auth::policy::context::AssumeRoleContext;
-use extenddb_auth::policy::document::parse_conditions;
+use extenddb_auth::policy::document::{
+    Condition, PolicyDocument, PolicyParseError, parse_conditions,
+};
 
 #[derive(Deserialize)]
 pub struct AssumeRoleRequest {
@@ -69,14 +74,8 @@ pub async fn assume_role(
     body: axum::body::Bytes,
 ) -> Response {
     // Authenticate via Basic auth — admin only.
-    let source_ip = crate::authorization::condition_source_ip(&addr);
-    if let Err(e) = authenticate_admin(
-        &headers,
-        &*state.catalog_store,
-        &*state.catalog_store,
-        Some(&source_ip),
-    )
-    .await
+    if let Err(e) =
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return e;
     }
@@ -128,6 +127,11 @@ pub async fn assume_role(
         )
             .into_response();
     }
+    if let Some(ref sp) = request.session_policy
+        && let Err(msg) = check_session_policy(sp)
+    {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
 
     // Load the role and its trust policy.
     let trust_policy = match state
@@ -144,6 +148,7 @@ pub async fn assume_role(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    warn_on_stored_trust_arn_value(&trust_policy, &role_name, &account_id);
 
     // Session tags passed on the call require sts:TagSession in the trust
     // policy, so the STS action set the decision checks depends on their
@@ -182,7 +187,7 @@ pub async fn assume_role(
         request_tags,
         &state.region,
         state.secure_transport,
-        Some(source_ip.as_str()),
+        Some(crate::authorization::condition_source_ip(&addr).as_str()),
         user_agent.as_deref(),
         &account_id,
         &*state.catalog_store,
@@ -210,6 +215,69 @@ pub async fn assume_role(
         caller_arn,
     )
     .await
+}
+
+/// Refuse a session policy that does not load, or that holds an Arn condition
+/// value the identity write check refuses
+/// (`PolicyDocument::from_json_for_session_policy`), answering
+/// `MalformedPolicyDocument`, the error the STS API reference lists for a
+/// malformed policy document.
+///
+/// Before this check AssumeRole issued credentials for both. A session policy
+/// that does not load, such as one with a malformed CIDR, made every request
+/// with those credentials fail. A session policy with such an Arn value
+/// worked, and AssumeRole now refuses it for parity with the identity write
+/// check. The `Version` and `Sid` checks of a policy write do not apply, so a
+/// session policy that AssumeRole accepted for those keeps getting
+/// credentials. What STS answers for these session policies was not measured;
+/// the text after the code is ExtendDB's own.
+fn check_session_policy(session_policy: &Value) -> Result<(), String> {
+    PolicyDocument::from_json_for_session_policy(&session_policy.to_string())
+        .map(|_| ())
+        .map_err(|e| format!("MalformedPolicyDocument: {}", e.0))
+}
+
+/// A stored trust policy can hold an Arn condition value that fails its
+/// statement closed at evaluation: one stored before the trust write check,
+/// which that check now rejects, or a value the check accepts that
+/// `arn_value::fails_closed_at_evaluation` reports under the policy's
+/// `Version`. Such a value is a six-field value whose first field holds no
+/// `${` and does not match `arn`, a value with `${` and fewer than five `:`
+/// written outside its references, or, in a `2012-10-17` trust policy, a
+/// value whose expansion has two to five fields, or six fields and a first
+/// field that holds `${`. Log the role so an operator can find the policy and
+/// rewrite it. The value is read as the evaluator reads it
+/// ([`stored_trust_arn_value`]).
+fn warn_on_stored_trust_arn_value(trust_policy: &Value, role_name: &str, account_id: &str) {
+    if let Some((key, value)) = stored_trust_arn_value(trust_policy) {
+        tracing::warn!(
+            "trust policy of role {role_name} in account {account_id} holds Arn condition \
+             value {value:?} on {key}, so its statement fails closed until the policy is \
+             rewritten"
+        );
+    }
+}
+
+/// The first Arn condition value in a stored trust policy that fails its
+/// statement closed at evaluation (`arn_value::fail_closed_trust_arn_value`),
+/// with its key, read statement by statement as [`evaluate_conditions`] reads
+/// it ([`trust_conditions`]) under the policy's `Version`
+/// ([`trust_policy_is_version_2012`]), or `None`.
+fn stored_trust_arn_value(trust_policy: &Value) -> Option<(String, String)> {
+    let version_2012 = trust_policy_is_version_2012(trust_policy);
+    statements_vec(trust_policy)?.iter().find_map(|stmt| {
+        let conds = trust_conditions(&stmt["Condition"]).ok()?;
+        fail_closed_trust_arn_value(&conds, version_2012).map(|(k, v)| (k.to_owned(), v.to_owned()))
+    })
+}
+
+/// A trust policy statement's `Condition` block as the trust evaluator reads
+/// it: each number or boolean as its JSON text
+/// ([`normalize_condition_scalars`]), then `parse_conditions`. The write check,
+/// the evaluator and its guard, and the AssumeRole warning all read Arn
+/// condition values through this.
+fn trust_conditions(condition: &Value) -> Result<Vec<Condition>, PolicyParseError> {
+    parse_conditions(&normalize_condition_scalars(condition))
 }
 
 /// Generate ASIA* credentials, encrypt, store session, and return the response.
@@ -375,7 +443,22 @@ async fn evaluate_trust_policy(
         epoch_time,
     };
 
-    trust_decision(&statements, caller_arn, &context, has_session_tags)
+    trust_decision_for(
+        &statements,
+        caller_arn,
+        &context,
+        has_session_tags,
+        trust_policy_is_version_2012(trust_policy),
+    )
+}
+
+/// Whether a trust policy's `Version` is `2012-10-17`. Only then do its
+/// condition values expand policy variables, as an identity policy's do
+/// (`condition::evaluate_condition_with`); a `2008-10-17` trust policy, or
+/// one with no `Version`, compares `${...}` as literal text (measured with
+/// AssumeRole on fresh roles, issue #534).
+fn trust_policy_is_version_2012(trust_policy: &Value) -> bool {
+    trust_policy.get("Version").and_then(Value::as_str) == Some("2012-10-17")
 }
 
 /// The `aws:PrincipalType` for a caller ARN: `User` for an IAM user ARN,
@@ -410,17 +493,31 @@ fn statements_vec(trust_policy: &Value) -> Option<Vec<Value>> {
     }
 }
 
-/// Decide assumption from resolved statements and context. Split out so the
-/// per-action Deny-over-Allow ordering is unit-testable without a store.
+/// [`trust_decision_for`] for a `2012-10-17` trust policy. The unit tests'
+/// statements stand for such a document.
+#[cfg(test)]
 fn trust_decision(
     statements: &[Value],
     caller_arn: &str,
     context: &AssumeRoleContext,
     has_session_tags: bool,
 ) -> bool {
+    trust_decision_for(statements, caller_arn, context, has_session_tags, true)
+}
+
+/// Decide assumption from resolved statements and context. Split out so the
+/// per-action Deny-over-Allow ordering is unit-testable without a store.
+/// `version_2012` is [`trust_policy_is_version_2012`] for the trust policy.
+fn trust_decision_for(
+    statements: &[Value],
+    caller_arn: &str,
+    context: &AssumeRoleContext,
+    has_session_tags: bool,
+    version_2012: bool,
+) -> bool {
     requested_actions(has_session_tags)
         .iter()
-        .all(|action| action_permitted(statements, caller_arn, context, action))
+        .all(|action| action_permitted(statements, caller_arn, context, action, version_2012))
 }
 
 /// The STS actions an `AssumeRole` request exercises.
@@ -440,17 +537,18 @@ fn action_permitted(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     for stmt in statements {
         if effect_of(stmt).eq_ignore_ascii_case("Deny")
-            && deny_statement_blocks(stmt, caller_arn, context, action)
+            && deny_statement_blocks(stmt, caller_arn, context, action, version_2012)
         {
             return false;
         }
     }
     for stmt in statements {
         if effect_of(stmt).eq_ignore_ascii_case("Allow")
-            && allow_statement_grants(stmt, caller_arn, context, action)
+            && allow_statement_grants(stmt, caller_arn, context, action, version_2012)
         {
             return true;
         }
@@ -471,12 +569,13 @@ fn deny_statement_blocks(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
         return false;
     }
     matches!(
-        evaluate_conditions(stmt, context),
+        evaluate_conditions(stmt, context, version_2012),
         ConditionOutcome::Pass | ConditionOutcome::Unparseable
     )
 }
@@ -488,11 +587,15 @@ fn allow_statement_grants(
     caller_arn: &str,
     context: &AssumeRoleContext,
     action: &str,
+    version_2012: bool,
 ) -> bool {
     if !principal_matches(&stmt["Principal"], caller_arn) || !action_matches(stmt, action) {
         return false;
     }
-    matches!(evaluate_conditions(stmt, context), ConditionOutcome::Pass)
+    matches!(
+        evaluate_conditions(stmt, context, version_2012),
+        ConditionOutcome::Pass
+    )
 }
 
 /// Outcome of a statement's `Condition` block for a given context.
@@ -504,11 +607,19 @@ enum ConditionOutcome {
 
 /// Evaluate a statement's `Condition` block. Scalar condition values (numbers,
 /// booleans) are coerced to strings, matching IAM. An unknown operator or a
-/// structurally invalid block is reported as `Unparseable`.
-fn evaluate_conditions(stmt: &Value, context: &AssumeRoleContext) -> ConditionOutcome {
-    let normalized = normalize_condition_scalars(&stmt["Condition"]);
-    match parse_conditions(&normalized) {
-        Ok(conds) => match evaluate_statement_conditions(&conds, context) {
+/// structurally invalid block is reported as `Unparseable`. `version_2012` is
+/// whether the trust policy's `Version` is `2012-10-17`.
+fn evaluate_conditions(
+    stmt: &Value,
+    context: &AssumeRoleContext,
+    version_2012: bool,
+) -> ConditionOutcome {
+    match trust_conditions(&stmt["Condition"]) {
+        // An Arn condition value the trust write check rejects (fewer than six
+        // fields) can only be a value stored before that check. It fails
+        // closed like an unparseable block.
+        Ok(conds) if invalid_trust_arn_value(&conds).is_some() => ConditionOutcome::Unparseable,
+        Ok(conds) => match evaluate_statement_conditions(&conds, version_2012, context) {
             ConditionMatch::Match => ConditionOutcome::Pass,
             ConditionMatch::NoMatch => ConditionOutcome::Fail,
             // A condition on a key STS populates but ExtendDB cannot resolve
@@ -715,9 +826,12 @@ const STS_TRUST_ACTIONS: [&str; 3] = ["sts:assumerole", "sts:tagsession", "sts:s
 /// `NotPrincipal`; a missing `Principal`; a bare string principal (including
 /// `"*"`); an `AWS` principal ARN containing a wildcard; a missing
 /// `Action`/`NotAction`; an action outside the STS trust set; a
-/// `Resource`/`NotResource` field; and a `Condition` with an unknown operator
-/// or invalid structure. Accepts a missing `Version`, a single-object
-/// `Statement`, numeric condition values and unknown condition keys.
+/// `Resource`/`NotResource` field; a `Condition` with an unknown operator
+/// or invalid structure; and an Arn condition value that does not split into
+/// six ARN fields, a number or boolean read as its text. Accepts a missing
+/// `Version`, a single-object
+/// `Statement`, numeric condition values under other operators and unknown
+/// condition keys.
 pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> {
     let Some(statements) = statements_vec(trust_policy) else {
         return Err("Trust policy must contain a Statement object or array".to_owned());
@@ -736,19 +850,29 @@ pub(crate) fn validate_trust_policy(trust_policy: &Value) -> Result<(), String> 
     if json_has_char_above_latin1(trust_policy) {
         return Err("Trust policy must not contain a character above U+00FF".to_owned());
     }
-    // Measured on live IAM CreateRole: a Sid is accepted only when it is empty
-    // or entirely ASCII letters and digits; a hyphen, underscore, space, dot or
-    // non-ASCII character is rejected with MalformedPolicyDocument. Identity
-    // PutUserPolicy applies the same rule (see validate_statement_sids).
-    for stmt in &statements {
-        if let Some(sid) = stmt.get("Sid").and_then(serde_json::Value::as_str)
-            && !sid.chars().all(|c| c.is_ascii_alphanumeric())
-        {
-            return Err("Trust policy Sid must be ASCII letters and digits only".to_owned());
-        }
-    }
+    trust_variable_order::validate_trust_variables(trust_policy, &statements)?;
+    trust_variable_order::validate_trust_sids(&statements)?;
     for stmt in &statements {
         validate_trust_statement(stmt)?;
+    }
+    // Measured on live IAM CreateRole and UpdateAssumeRolePolicy: an Arn
+    // condition value that does not split into six ARN fields is rejected with
+    // MalformedPolicyDocument and a message naming the value. A number or
+    // boolean is read as its text and rejected the same way. Each operator
+    // entry is read on its own, because this check accepts operators the
+    // evaluator does not parse, and IAM checks the Arn values beside them.
+    for stmt in &statements {
+        let Some(block) = stmt.get("Condition").and_then(Value::as_object) else {
+            continue;
+        };
+        for (op, keys) in block {
+            let entry = Value::Object(serde_json::Map::from_iter([(op.clone(), keys.clone())]));
+            if let Ok(conds) = trust_conditions(&entry)
+                && let Some((key, value)) = invalid_trust_arn_value(&conds)
+            {
+                return Err(trust_arn_value_message(key, value));
+            }
+        }
     }
     Ok(())
 }
@@ -771,33 +895,28 @@ fn non_null(v: Option<&Value>) -> Option<&Value> {
     v.filter(|v| !v.is_null())
 }
 
-fn validate_trust_statement(stmt: &Value) -> Result<(), String> {
+fn validate_trust_effect(stmt: &Value) -> Result<(), String> {
     match stmt.get("Effect").and_then(Value::as_str) {
-        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
-        Some(e) => return Err(format!("invalid Effect: {e}")),
-        None => return Err("statement is missing Effect".to_owned()),
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => Ok(()),
+        Some(e) => Err(format!("invalid Effect: {e}")),
+        None => Err("statement is missing Effect".to_owned()),
     }
+}
+
+fn validate_trust_statement(stmt: &Value) -> Result<(), String> {
+    validate_trust_effect(stmt)?;
 
     if non_null(stmt.get("NotPrincipal")).is_some() {
-        return Err("NotPrincipal is not allowed in a trust policy".to_owned());
+        return Err(trust_variable_order::NOT_PRINCIPAL.to_owned());
     }
     match non_null(stmt.get("Principal")) {
-        None => return Err("statement is missing Principal".to_owned()),
+        None => return Err(trust_variable_order::MISSING_PRINCIPAL.to_owned()),
         Some(p) => validate_trust_principal(p)?,
     }
 
-    match (
-        non_null(stmt.get("Action")),
-        non_null(stmt.get("NotAction")),
-    ) {
-        (None, None) => return Err("statement is missing Action".to_owned()),
-        (Some(_), Some(_)) => return Err("statement has both Action and NotAction".to_owned()),
-        (Some(a), None) | (None, Some(a)) => validate_trust_actions(a)?,
-    }
+    validate_trust_actions(trust_variable_order::trust_action_field(stmt)?)?;
 
-    if non_null(stmt.get("Resource")).is_some() || non_null(stmt.get("NotResource")).is_some() {
-        return Err("Resource is not allowed in a trust policy".to_owned());
-    }
+    trust_variable_order::validate_trust_no_resource(stmt)?;
 
     if let Some(cond) = non_null(stmt.get("Condition")) {
         validate_trust_condition(cond)?;
@@ -1014,6 +1133,17 @@ async fn fetch_caller_created_at(
     }
 }
 
+mod trust_variable_order;
+
+#[cfg(test)]
+mod arn_trust_tests;
+
+#[cfg(test)]
+mod trust_version_tests;
+
+#[cfg(test)]
+mod trust_variable_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,7 +1179,7 @@ mod tests {
         }
     }
 
-    fn ctx() -> AssumeRoleContext {
+    pub(super) fn ctx() -> AssumeRoleContext {
         mk_ctx(HashMap::new(), None, HashMap::new())
     }
 
@@ -1910,5 +2040,52 @@ mod tests {
         let root = "arn:aws:iam::123456789012:root";
         assert_eq!(caller_principal_type(root), None);
         assert_eq!(caller_username(root), None);
+    }
+
+    /// Decide `sts:AssumeRole` for alice under the whole trust policy `doc`,
+    /// with the `Version` it carries.
+    fn trust_document_allows(doc: &Value, context: &AssumeRoleContext) -> bool {
+        let statements = statements_vec(doc).unwrap();
+        trust_decision_for(
+            &statements,
+            CALLER,
+            context,
+            false,
+            trust_policy_is_version_2012(doc),
+        )
+    }
+
+    fn trust_document(version: Option<&str>, statements: &[Value]) -> Value {
+        let mut doc = json!({"Statement": statements});
+        if let Some(version) = version {
+            doc["Version"] = json!(version);
+        }
+        doc
+    }
+
+    #[test]
+    fn trust_policy_reads_the_default_form_only_with_version_2012() {
+        // The identity policy rows V1 to V4 (IAM policy simulator,
+        // 2026-11-03) applied to a trust policy: outside a 2012-10-17
+        // document `${aws:username, 'x'}` is compared as written.
+        let gate = |effect: &str, operator: &str| {
+            json!({"Effect": effect, "Principal": {"AWS": CALLER},
+                "Action": "sts:AssumeRole",
+                "Condition": {operator: {"aws:PrincipalTag/team": "${aws:username, 'x'}"}}})
+        };
+        let alice = ctx_with_tags(&[("team", "alice")]);
+        for version in [None, Some("2008-10-17")] {
+            let allow = trust_document(version, &[gate("Allow", "StringEquals")]);
+            assert!(!trust_document_allows(&allow, &alice), "{version:?}");
+            let deny = trust_document(version, &[allow_alice(), gate("Deny", "StringNotEquals")]);
+            assert!(!trust_document_allows(&deny, &alice), "{version:?}");
+        }
+        let allow = trust_document(Some("2012-10-17"), &[gate("Allow", "StringEquals")]);
+        assert!(trust_document_allows(&allow, &alice));
+        let deny = trust_document(
+            Some("2012-10-17"),
+            &[allow_alice(), gate("Deny", "StringNotEquals")],
+        );
+        assert!(trust_document_allows(&deny, &alice));
     }
 }

@@ -165,14 +165,16 @@ class TestDescribeStream:
             wait_for_deleted(dynamodb_client, name)
 
     def test_describe_stream_invalid_arn(self, streams_client):
-        """DescribeStream with invalid ARN fails."""
+        """DescribeStream with a stream ARN in an account that does not exist
+        (000000000000) is refused before the IAM decision and before the stream
+        is looked up. The service answers AccessDeniedException "Access is
+        denied" for an admin and for a caller with no policy (measured
+        2026-10-23 and 2026-11-03 in us-east-1, issue #450). A missing stream in
+        the caller's own account is covered in tests/test_stream_arn_scope.py."""
         with pytest.raises(ClientError) as exc:
             streams_client.describe_stream(StreamArn="arn:aws:dynamodb:us-east-1:000000000000:table/nonexistent/stream/2026-01-01T00:00:00.000")
-        # Could be ResourceNotFoundException or ValidationException
-        assert exc.value.response["Error"]["Code"] in (
-            "ResourceNotFoundException",
-            "ValidationException",
-        )
+        error = exc.value.response["Error"]
+        assert (error["Code"], error["Message"]) == ("AccessDeniedException", "Access is denied")
 
 
 def _arn_with_another_label(stream_arn: str) -> str:

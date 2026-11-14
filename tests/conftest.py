@@ -24,6 +24,14 @@ from botocore.config import Config
 
 # D4: Suppress InsecureRequestWarning for self-signed TLS certs from ``extenddb init``.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# The message of every refused point-in-time recovery request: a restore and
+# an enable are refused before authorization, because point-in-time recovery
+# is not in this release.
+PITR_REFUSAL = "Point-in-time recovery is not supported by this storage backend"
+RESTORE_REFUSED = ("PointInTimeRecoveryUnavailableException", PITR_REFUSAL)
+ENABLE_REFUSED = ("ContinuousBackupsUnavailableException", PITR_REFUSAL)
+
+
 @pytest.fixture(scope="session")
 def endpoint_url() -> str | None:
     """Return the endpoint URL if targeting extenddb, None for real DynamoDB."""
@@ -177,7 +185,13 @@ def create_and_cleanup_table(dynamodb_client, unique_table_name):
             dynamodb_client.delete_table(TableName=name)
         except dynamodb_client.exceptions.ResourceNotFoundException:
             continue
-        except dynamodb_client.exceptions.ResourceInUseException:
+        except dynamodb_client.exceptions.ResourceInUseException as exc:
+            # The test deleted the table and the delete is still running:
+            # DeleteTable of a DELETING table answers "Table is being deleted".
+            # Wait for it to go.
+            if "Table is being deleted" in exc.response["Error"]["Message"]:
+                wait_for_deleted(dynamodb_client, name)
+                continue
             # Table may be UPDATING (e.g., billing mode switch). Wait for
             # ACTIVE then retry the delete.
             wait_for_active(dynamodb_client, name)
