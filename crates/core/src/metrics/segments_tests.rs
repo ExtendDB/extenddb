@@ -56,8 +56,9 @@ fn bucket_is_64_bytes() {
     assert_eq!(BUCKETS_PER_OPERATION, 1742);
 }
 
-/// Issue #397: five million requests over three simulated days across five
-/// operations allocate exactly the fixed rings and nothing per request.
+/// Issue #397: five million requests over three simulated days across three
+/// accounts and five operations allocate exactly the fixed rings and nothing
+/// per request.
 #[test]
 fn boundedness_five_million_records() {
     let epoch = Instant::now();
