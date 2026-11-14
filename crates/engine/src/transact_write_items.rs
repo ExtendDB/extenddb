@@ -91,10 +91,11 @@ pub async fn handle_transact_write_items(
     // every item before the next phase starts:
     //   1. per item, in order, with no table needed: the attribute name sizes
     //      of the item's expression maps and, for a Put, of its item, the
-    //      numbers of the item's ExpressionAttributeValues and of its key or
-    //      item, the nesting of the item's ExpressionAttributeValues,
-    //      expression grammar, the semantic walk, unused names and values,
-    //      then for a Put the item size and the item nesting (top-level
+    //      numbers of the item's ExpressionAttributeValues (for a Put or
+    //      Delete, only with a ConditionExpression) and of its key or item,
+    //      the nesting of the item's ExpressionAttributeValues, expression
+    //      grammar, the semantic walk, unused names and values, then for a
+    //      Put the item size and the item nesting (top-level
     //      ValidationException),
     //   2. table lookup (ResourceNotFoundException),
     //   3. the 4 MB request total (top-level ValidationException),
