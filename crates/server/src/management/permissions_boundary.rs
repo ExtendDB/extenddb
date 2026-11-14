@@ -138,6 +138,17 @@ async fn set_boundary(
         }
     }
 
+    if let Err(e) = super::iam_policy::require_principal(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
+    {
+        return op_err_to_response(OpError::from_storage(e));
+    }
+
     let result = match principal_type {
         "user" => {
             state

@@ -48,7 +48,7 @@ pub async fn dashboard(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
 
 /// The dashboard page for `session`. An admin session sees `counts`, the
 /// deployment's `(account_count, admin_count)`. An IAM-user session sees a
-/// link to its own account and no count, whatever `counts` holds.
+/// link to its own user page and no count, whatever `counts` holds.
 fn render_dashboard(
     session: &SessionData,
     counts: Option<(i64, i64)>,
@@ -71,13 +71,17 @@ fn render_dashboard(
 </div>"#
             )
         }
-        CallerIdentity::IamUser { account_id, .. } => {
+        CallerIdentity::IamUser {
+            account_id,
+            user_name,
+        } => {
             let eid = html::escape(account_id);
+            let eun = html::escape(user_name);
             format!(
                 r#"<div class="card">
-<h2 style="margin:0">{eid}</h2>
-<p>Your Account</p>
-<a href="/console/accounts/{eid}">View &rarr;</a>
+<h2 style="margin:0">{eun}</h2>
+<p>Your user in account {eid}</p>
+<a href="/console/accounts/{eid}/users/{eun}">Access keys &rarr;</a>
 </div>"#
             )
         }
@@ -106,22 +110,20 @@ pub async fn list_accounts(State(state): State<Arc<ConsoleState>>, headers: Head
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The management API lists accounts to admins only, and every account
+    // page redirects an IAM-user session, so the list would link it nowhere.
+    if !is_admin(&session.identity) {
+        return Redirect::to("/console").into_response();
+    }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
     let crumbs = html::breadcrumb(&[("Dashboard", Some("/console")), ("Accounts", None)]);
 
-    let rows: Vec<(String, String)> = match &session.identity {
-        crate::management::CallerIdentity::Admin(_) => state
-            .catalog_store
-            .list_all_accounts()
-            .await
-            .unwrap_or_default(),
-        crate::management::CallerIdentity::IamUser { account_id, .. } => state
-            .catalog_store
-            .list_accounts_for(account_id)
-            .await
-            .unwrap_or_default(),
-    };
+    let rows: Vec<(String, String)> = state
+        .catalog_store
+        .list_all_accounts()
+        .await
+        .unwrap_or_default();
 
     let mut table = String::from(
         r"<table><thead><tr><th>Account ID</th><th>Name</th><th></th></tr></thead><tbody>",
@@ -162,7 +164,7 @@ pub async fn new_account_form(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to("/console/accounts").into_response();
+        return Redirect::to("/console").into_response();
     }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
@@ -217,7 +219,7 @@ pub async fn create_account(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to("/console/accounts").into_response();
+        return Redirect::to("/console").into_response();
     }
 
     if let Err(r) = require_csrf(&form.csrf, &session) {
@@ -292,6 +294,11 @@ pub async fn account_detail(
         Ok(s) => s,
         Err(r) => return r,
     };
+    // The page lists every user, group and role of the account, which the
+    // management API gives admins only.
+    if !is_admin(&session.identity) {
+        return Redirect::to("/console").into_response();
+    }
 
     let nav = html::nav_bar(&identity_label(&session.identity));
     let eid = html::escape(&account_id);
@@ -412,7 +419,7 @@ pub async fn delete_account(
         Err(r) => return r,
     };
     if !is_admin(&session.identity) {
-        return Redirect::to("/console/accounts").into_response();
+        return Redirect::to("/console").into_response();
     }
     if let Err(r) = require_csrf(&form.csrf, &session) {
         return r;

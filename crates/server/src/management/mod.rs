@@ -21,6 +21,7 @@ mod cache_metrics;
 pub(crate) mod crypto;
 mod iam_group;
 mod iam_policy;
+pub(crate) use iam_policy::require_principal;
 mod iam_role;
 mod iam_user;
 mod iam_user_self;

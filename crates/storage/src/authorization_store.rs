@@ -25,12 +25,14 @@ pub trait AuthorizationStore: Send + Sync {
         user_name: &str,
     ) -> BoxFuture<'_, OpResult<Vec<String>>>;
 
-    /// Fetch all policy documents from groups the user belongs to.
+    /// Fetch all policy documents from groups the user belongs to, each as
+    /// `(group_name, policy_document)`, so a caller can name the group a
+    /// document came from.
     fn fetch_user_group_policies(
         &self,
         account_id: &str,
         user_name: &str,
-    ) -> BoxFuture<'_, OpResult<Vec<String>>>;
+    ) -> BoxFuture<'_, OpResult<Vec<(String, String)>>>;
 
     /// Fetch the permissions boundary policy document for a user, if any.
     fn fetch_user_boundary(

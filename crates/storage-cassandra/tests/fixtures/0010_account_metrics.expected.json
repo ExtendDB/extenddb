@@ -1,0 +1,65 @@
+{
+  "columns": {
+    "account_metrics.account_id": {
+      "kind": "partition_key",
+      "position": 1,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "account_metrics.bucket": {
+      "kind": "partition_key",
+      "position": 0,
+      "clustering_order": "none",
+      "type": "timestamp"
+    },
+    "account_metrics.count": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "bigint"
+    },
+    "account_metrics.index_name": {
+      "kind": "partition_key",
+      "position": 4,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "account_metrics.max": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "account_metrics.metric": {
+      "kind": "partition_key",
+      "position": 2,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "account_metrics.min": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "account_metrics.operation": {
+      "kind": "partition_key",
+      "position": 5,
+      "clustering_order": "none",
+      "type": "text"
+    },
+    "account_metrics.sum": {
+      "kind": "regular",
+      "position": -1,
+      "clustering_order": "none",
+      "type": "double"
+    },
+    "account_metrics.table_name": {
+      "kind": "partition_key",
+      "position": 3,
+      "clustering_order": "none",
+      "type": "text"
+    }
+  },
+  "indexes": {}
+}

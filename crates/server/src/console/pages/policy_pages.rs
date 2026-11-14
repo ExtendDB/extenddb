@@ -329,17 +329,29 @@ async fn put_policy(
         .into_response();
     }
 
-    match state
-        .catalog_store
-        .put_policy(
-            account_id,
-            principal_type,
-            principal_name,
-            &form.policy_name,
-            &doc,
-        )
-        .await
+    let stored = match crate::management::require_principal(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
     {
+        Ok(()) => {
+            state
+                .catalog_store
+                .put_policy(
+                    account_id,
+                    principal_type,
+                    principal_name,
+                    &form.policy_name,
+                    &doc,
+                )
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    match stored {
         Ok(()) => {
             invalidate_policy_caches(state, account_id, principal_type, principal_name).await;
             Redirect::to(redirect_url).into_response()

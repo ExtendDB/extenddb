@@ -193,29 +193,63 @@ impl PolicyDocument {
     /// only when a policy is written.
     ///
     /// Everything [`Self::from_json_with_size_limit`] checks with `max_bytes`,
-    /// the configured `max_policy_document_bytes`, plus the `Version` value
-    /// and the `Sid` charset. Both run at write only, so a policy stored before
-    /// either check existed keeps parsing on the request path rather than
-    /// failing the principal closed: a `Sid` is a label that does not affect
-    /// evaluation, and a stored document with another `Version` matches its
-    /// `Resource` patterns as written, as it did before.
+    /// the configured `max_policy_document_bytes`, plus the `Version` value,
+    /// the `Sid` charset, the `${...}` references ([`super::variable_syntax`])
+    /// and the Arn condition values (`arn_value::validate_statement_arn_values`).
+    /// All four run at write only, so a policy stored before a check existed
+    /// keeps parsing on the request path rather than failing the principal
+    /// closed: a `Sid` is a label that does not affect evaluation, a stored
+    /// document with another `Version` matches its `Resource` patterns as
+    /// written, as it did before, a stored value with such a reference is read
+    /// as before #926, each `${` ending at the next `}`, and a stored Arn value
+    /// evaluates as written unless it is one of the values
+    /// `arn_value::fails_closed_at_evaluation` fails closed.
     ///
     /// # Errors
     ///
     /// Returns `PolicyParseError` if the document exceeds `max_bytes` or does
-    /// not parse, its `Version` is not `2012-10-17` or `2008-10-17`, or a
-    /// statement `Sid` is outside the service's charset.
+    /// not parse, its `Version` is not `2012-10-17` or `2008-10-17`, a
+    /// statement `Sid` is outside the service's charset, a pattern or condition
+    /// value holds a `${...}` reference IAM refuses
+    /// ([`super::variable_syntax`]), or an Arn condition value fails the write
+    /// check.
     pub fn from_json_for_write(json: &str, max_bytes: usize) -> Result<Self, PolicyParseError> {
+        super::variable_syntax::validate_identity_before_parse(json, max_bytes)?;
         let doc = Self::from_json_with_size_limit(json, max_bytes)?;
         super::variables::validate_version(json)?;
+        super::variable_syntax::validate_identity_legacy(&doc)?;
         validate_statement_sids(&doc.statements)?;
+        super::variable_syntax::validate_identity_after_sid(&doc)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
+        Ok(doc)
+    }
+
+    /// Parse the session policy of an AssumeRole call and apply the Arn
+    /// condition value check of a policy write
+    /// (`arn_value::validate_statement_arn_values`).
+    ///
+    /// Everything `from_json` checks, so a session policy that would not load
+    /// on the request path is refused when the session is issued. The
+    /// `Version`, `Sid` and `${...}` reference checks of `from_json_for_write`
+    /// do not run: a session policy with another `Version`, such a `Sid` or
+    /// such a reference loads and evaluates on the request path, and
+    /// AssumeRole accepted one before. What STS answers for these session
+    /// policies was not measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document or an
+    /// Arn condition value fails the write check.
+    pub fn from_json_for_session_policy(json: &str) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json(json)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
         Ok(doc)
     }
 }
 
 /// Unwrap a condition operator to its base, dropping any `ForAllValues:` /
 /// `ForAnyValue:` prefix and `IfExists` suffix.
-fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
+pub(super) fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
     match op {
         ConditionOperator::ForAllValues(inner)
         | ConditionOperator::ForAnyValue(inner)

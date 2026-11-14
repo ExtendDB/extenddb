@@ -23,6 +23,43 @@ struct PolicyEntry {
     created_at: String,
 }
 
+/// `NotFound` unless the principal exists, as IAM answers `NoSuchEntity` for a
+/// policy or boundary put on a principal it does not have.
+///
+/// Inline policies and boundaries are stored by principal name, so a put on a
+/// name with no principal would wait there and belong to the next principal
+/// created with that name. Its create removes such rows too, which covers a
+/// put that races a delete.
+pub(crate) async fn require_principal(
+    store: &dyn extenddb_storage::CatalogStore,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> Result<(), extenddb_storage::management_store::OpError> {
+    let exists = match principal_type {
+        "user" => store
+            .get_user_detail(account_id, principal_name)
+            .await?
+            .is_some(),
+        "group" => store
+            .get_group_detail(account_id, principal_name)
+            .await?
+            .is_some(),
+        "role" => store
+            .get_role_detail(account_id, principal_name)
+            .await?
+            .is_some(),
+        other => unreachable!("principal type {other}"),
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(extenddb_storage::management_store::OpError::NotFound(
+            format!("IAM {principal_type} not found"),
+        ))
+    }
+}
+
 pub async fn put_user_policy(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
@@ -210,6 +247,17 @@ async fn put_policy(
             )
                 .into_response();
         }
+    }
+
+    if let Err(e) = require_principal(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
+    {
+        return op_err_to_response(OpError::from_storage(e));
     }
 
     match state

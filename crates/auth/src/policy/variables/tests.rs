@@ -102,13 +102,33 @@ fn a_write_refuses_a_version_that_is_not_one_of_the_two_values() {
 
 // --- parse_reference ---
 
+/// The reading `parts` gives the text between `${` and `}`: IAM's grammar for
+/// a reference a write accepts, the reading before it for one the write
+/// refuses. `doubled_quotes` is not compared.
+fn parse_reference(inner: &str) -> Reference<'_> {
+    let read = if reference::has_invalid_reference(&format!("${{{inner}}}")) {
+        reference::legacy(inner)
+    } else {
+        reference::parse(inner)
+    };
+    match read {
+        Reference::Key { name, default, .. } => Reference::Key {
+            name,
+            default,
+            doubled_quotes: false,
+        },
+        escape => escape,
+    }
+}
+
 #[test]
 fn parse_plain_key() {
     assert_eq!(
         parse_reference("aws:username"),
         Reference::Key {
             name: "aws:username",
-            default: None
+            default: None,
+            doubled_quotes: false,
         }
     );
 }
@@ -124,7 +144,8 @@ fn parse_default_form_with_and_without_space() {
             parse_reference(inner),
             Reference::Key {
                 name: "aws:username",
-                default: Some("anon")
+                default: Some("anon"),
+                doubled_quotes: false,
             },
             "{inner}"
         );
@@ -139,6 +160,7 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
     let plain = Reference::Key {
         name: "aws:username",
         default: None,
+        doubled_quotes: false,
     };
     for inner in [" aws:username ", "aws:username ", " aws:username"] {
         assert_eq!(parse_reference(inner), plain, "{inner:?}");
@@ -146,6 +168,7 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
     let defaulted = Reference::Key {
         name: "aws:username",
         default: Some("anon"),
+        doubled_quotes: false,
     };
     for inner in [
         " aws:username , 'anon'",
@@ -159,7 +182,8 @@ fn parse_trims_spaces_around_the_key_in_both_forms() {
         parse_reference("aws:username, ' anon '"),
         Reference::Key {
             name: "aws:username",
-            default: Some(" anon ")
+            default: Some(" anon "),
+            doubled_quotes: false,
         }
     );
 }
@@ -174,7 +198,8 @@ fn parse_trims_code_points_up_to_space_and_no_others() {
             parse_reference(&inner),
             Reference::Key {
                 name: "aws:username",
-                default: None
+                default: None,
+                doubled_quotes: false,
             },
             "{c:?}"
         );
@@ -185,7 +210,8 @@ fn parse_trims_code_points_up_to_space_and_no_others() {
             parse_reference(&inner),
             Reference::Key {
                 name: &inner,
-                default: None
+                default: None,
+                doubled_quotes: false,
             },
             "{c:?}"
         );
@@ -206,7 +232,8 @@ fn parse_comma_without_quotes_is_key_text() {
         parse_reference("a, b"),
         Reference::Key {
             name: "a, b",
-            default: None
+            default: None,
+            doubled_quotes: false,
         }
     );
 }
@@ -453,43 +480,123 @@ fn unclosed_brace_is_literal_text() {
 
 // --- expand_condition_value ---
 
+fn text_of(value: &ConditionValue) -> Option<&str> {
+    value.text()
+}
+
 #[test]
 fn condition_value_expands_variable_and_default() {
     let ctx = team_blue();
+    let v = expand_condition_value("team-${aws:PrincipalTag/team}", true, &ctx);
+    assert_eq!(text_of(&v), Some("team-blue"));
+    assert!(matches!(v, ConditionValue::Expanded { .. }));
     assert_eq!(
-        expand_condition_value("team-${aws:PrincipalTag/team}", true, &ctx),
-        "team-blue"
+        text_of(&expand_condition_value(
+            "${aws:username, 'anon'}",
+            true,
+            &ctx
+        )),
+        Some("anon")
     );
     assert_eq!(
-        expand_condition_value("${aws:username, 'anon'}", true, &ctx),
-        "anon"
-    );
-    assert_eq!(
-        expand_condition_value("${aws:PrincipalTag/team, 'none'}", true, &ctx),
-        "blue"
+        text_of(&expand_condition_value(
+            "${aws:PrincipalTag/team, 'none'}",
+            true,
+            &ctx
+        )),
+        Some("blue")
     );
 }
 
 #[test]
-fn condition_value_leaves_unresolved_and_escapes_literal() {
+fn condition_value_unresolved_variable_matches_nothing() {
     let ctx = Ctx::empty();
+    let v = expand_condition_value("${aws:username}", true, &ctx);
+    assert_eq!(v, ConditionValue::Unresolved);
+    assert_eq!(v.text(), None);
+    assert!(!v.wildcard_matches("${aws:username}"));
+    assert!(!v.wildcard_matches("anything"));
+    assert!(!v.arn_matches(BLUE));
+    // One unresolved variable among resolved text is still unresolved.
     assert_eq!(
-        expand_condition_value("${aws:username}", true, &ctx),
-        "${aws:username}"
+        expand_condition_value("a-${aws:username}-b", true, &ctx),
+        ConditionValue::Unresolved
     );
+}
+
+#[test]
+fn condition_value_escapes_expand_to_literal_characters() {
+    let ctx = Ctx::empty();
+    let v = expand_condition_value("a${*}b${?}c${$}", true, &ctx);
+    assert_eq!(text_of(&v), Some("a*b?c$"));
+    // The escaped characters are literal for the Like operators.
+    assert!(v.wildcard_matches("a*b?c$"));
+    assert!(!v.wildcard_matches("aXbYc$"));
+    // The result of an escape is not expanded again.
+    let v = expand_condition_value("a${$}{x}", true, &ctx);
+    assert_eq!(text_of(&v), Some("a${x}"));
+    assert!(matches!(v, ConditionValue::Expanded { .. }));
+}
+
+#[test]
+fn condition_value_written_wildcards_stay_wildcards_when_expanded() {
+    let ctx = team_blue();
+    // `*` written in the policy is a wildcard; `*` from an escape is not.
+    let v = expand_condition_value("${aws:PrincipalTag/team}-*${*}", true, &ctx);
+    assert_eq!(text_of(&v), Some("blue-**"));
+    assert!(v.wildcard_matches("blue-anything*"));
+    assert!(v.wildcard_matches("blue-*"));
+    assert!(!v.wildcard_matches("blue-anything"));
+    // ArnLike: a written `*` in the resource field spans `/`, an escaped one
+    // is the character.
+    let v = expand_condition_value(
+        "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/team}/*${*}",
+        true,
+        &ctx,
+    );
+    assert!(v.arn_matches("arn:aws:dynamodb:us-east-1:1:table/blue/index/x*"));
+    assert!(!v.arn_matches("arn:aws:dynamodb:us-east-1:1:table/blue/index/x"));
+    // A `:` or `*` inside a variable value stays literal in its field.
+    let ctx = Ctx::empty().with(TEAM, &["a*b"]);
+    let v = expand_condition_value("${aws:PrincipalTag/team}", true, &ctx);
+    assert!(v.wildcard_matches("a*b"));
+    assert!(!v.wildcard_matches("aXb"));
+}
+
+#[test]
+fn condition_value_is_literal_without_expansion_or_without_variables() {
+    let ctx = team_blue();
+    // A document that does not expand compares the text as written, and its
+    // `*` and `?` are wildcards.
+    let v = expand_condition_value("${aws:PrincipalTag/team}", false, &ctx);
     assert_eq!(
-        expand_condition_value("a${*}b${?}c${$}", true, &ctx),
-        "a${*}b${?}c${$}"
+        v,
+        ConditionValue::Literal("${aws:PrincipalTag/team}".to_owned())
     );
-    assert_eq!(expand_condition_value("plain", true, &ctx), "plain");
-    assert_eq!(expand_condition_value("${open", true, &ctx), "${open");
+    let v = expand_condition_value("a${*}", false, &ctx);
+    assert_eq!(text_of(&v), Some("a${*}"));
+    assert!(v.wildcard_matches("a${*}"));
+    assert!(v.wildcard_matches("a${anything}"));
+    assert!(!v.wildcard_matches("a*"));
+    // No `${` at all: literal whatever the document.
+    assert_eq!(
+        expand_condition_value("plain", true, &ctx),
+        ConditionValue::Literal("plain".to_owned())
+    );
+    let v = expand_condition_value("a*", true, &ctx);
+    assert!(v.wildcard_matches("abc"));
+    assert!(expand_condition_value("arn:aws:dynamodb:*:*:table/*", true, &ctx).arn_matches(BLUE));
+    // A `${` with no closing brace is plain text.
+    assert_eq!(
+        text_of(&expand_condition_value("${open", true, &ctx)),
+        Some("${open")
+    );
 }
 
 #[test]
 fn variable_key_names_strip_the_default_and_skip_escapes() {
     let names: Vec<&str> = variable_key_names(
         "${aws:PrincipalTag/team}-${aws:RequestTag/env, 'x'}${*}${aws:username,'y'}${open",
-        true,
     )
     .collect();
     assert_eq!(
@@ -502,39 +609,93 @@ fn variable_key_names_strip_the_default_and_skip_escapes() {
     );
     // A comma whose right side is not single-quoted is part of the name, as
     // `expand_condition_value` reads it.
-    let names: Vec<&str> = variable_key_names("${a, b}", true).collect();
+    let names: Vec<&str> = variable_key_names("${a, b}").collect();
     assert_eq!(names, ["a, b"]);
-    assert_eq!(variable_key_names("plain", true).count(), 0);
+    assert_eq!(variable_key_names("plain").count(), 0);
+    // The name is trimmed as `parse_reference` trims it.
+    let names: Vec<&str> =
+        variable_key_names("${aws:RequestTag/env , 'x'}${ aws:username }").collect();
+    assert_eq!(names, ["aws:RequestTag/env", "aws:username"]);
 }
 
-/// Without `iam_syntax`, as in a `2008-10-17` document or under an operator
-/// other than a string or ARN one, the text between the braces is the key
-/// name as written: the default form and a trimmed key are not read, and
-/// `${key}` expands as it did before the default form was read.
+/// Without expansion, as in a `2008-10-17` document or under an operator
+/// other than a string or ARN one, the whole value is compared as written:
+/// the default form, a trimmed key and `${key}` itself are all literal text
+/// (rows V1 to V5 of `evaluator/tests/condition_variable_scope.rs`, and the
+/// no-`Version` `${aws:username}` rows of issue #534).
 #[test]
-fn without_iam_syntax_the_text_between_the_braces_is_the_key_name() {
+fn without_expansion_the_whole_value_is_literal_text() {
     let ctx = Ctx::empty().with("aws:username", &["alice"]);
     for value in [
         "${aws:username, 'anon'}",
         "${aws:PrincipalTag/team, 'none'}",
         "${ aws:username }",
+        "u-${aws:username}",
     ] {
-        assert_eq!(expand_condition_value(value, false, &ctx), value);
+        assert_eq!(
+            expand_condition_value(value, false, &ctx),
+            ConditionValue::Literal(value.to_owned())
+        );
     }
-    assert_eq!(
-        expand_condition_value("u-${aws:username}", false, &ctx),
-        "u-alice"
-    );
-    let names: Vec<&str> =
-        variable_key_names("${aws:RequestTag/env, 'x'}${ aws:username }", false).collect();
-    assert_eq!(names, ["aws:RequestTag/env, 'x'", " aws:username "]);
 }
 
 #[test]
 fn condition_value_present_key_without_values_is_empty() {
     let ctx = Ctx::empty().with(TEAM, &[]);
     assert_eq!(
-        expand_condition_value("x${aws:PrincipalTag/team}y", true, &ctx),
-        "xy"
+        text_of(&expand_condition_value(
+            "x${aws:PrincipalTag/team}y",
+            true,
+            &ctx
+        )),
+        Some("xy")
     );
+}
+
+#[test]
+fn arn_value_lacks_fields_counts_only_colons_written_outside_references() {
+    assert!(arn_value_lacks_fields("${aws:ResourceTag/owner}"));
+    // Four written `:` and one inside the reference.
+    assert!(arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalTag/acct}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::123456789012:user/${aws:username}"
+    ));
+    assert!(!arn_value_lacks_fields(
+        "arn:aws:iam::${aws:PrincipalAccount}:user/alice"
+    ));
+    // No variable: the value is compared as written.
+    assert!(!arn_value_lacks_fields("user/alice"));
+    // Each `${` ends at the next `}`, quoted or not, as IAM counts fields.
+    assert!(!arn_value_lacks_fields("${x, '}:::::'}"));
+    assert!(arn_value_lacks_fields("${x, ':::::}"));
+}
+
+#[test]
+fn expanded_arn_value_is_short_counts_the_colons_the_evaluator_reads() {
+    // A quoted `}` does not end the reference, so the quoted `:` is part of
+    // the default: four written `:` and five fields.
+    assert!(expanded_arn_value_is_short(
+        "arn:aws:iam::${aws:PrincipalAccount, '}:'}"
+    ));
+    assert!(expanded_arn_value_is_short("*:${x, '}::::'}"));
+    // A reference whose text starts with `}` runs to the next `}`.
+    assert!(expanded_arn_value_is_short("arn:aws:iam::${}:}"));
+    // The references hold every `:`: one field, which matches nothing.
+    assert!(!expanded_arn_value_is_short("${x, '}:::::'}"));
+    // Five written `:`: six fields.
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::123456789012:user/${aws:username, '}:'}"
+    ));
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::${aws:PrincipalAccount}:user/alice"
+    ));
+    // A value with a reference the write refuses is read with each `${`
+    // ending at the next `}`, which counts every `:` after the `}`.
+    assert!(!expanded_arn_value_is_short(
+        "arn:aws:iam::${a b, '}:'}:user/x"
+    ));
+    // No variable: the value is compared as written.
+    assert!(!expanded_arn_value_is_short("arn:aws:iam"));
 }

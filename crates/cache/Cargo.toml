@@ -6,7 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "In-memory stale-while-revalidate cache primitive used by the auth and storage layers."
+description = "In-memory stale-while-revalidate cache used by the ExtendDB auth and server layers. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # `test-util` exposes test-only helpers like `SwrCache::run_pending_tasks`
