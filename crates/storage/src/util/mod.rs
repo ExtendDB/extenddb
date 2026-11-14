@@ -10,6 +10,7 @@ mod arn;
 mod backup_id;
 mod catalog_version;
 mod key;
+mod prefix;
 mod shard_stream;
 mod warm_throughput;
 
@@ -30,6 +31,7 @@ pub use key::{
     merge_attribute_definitions, parse_sk, pk_to_text, recover_sort_key_definitions,
     refuse_conditions_beyond_first_range, sk_column, sk_column_n, sk_info,
 };
+pub use prefix::string_prefix_upper_bound;
 pub use shard_stream::shard_in_stream;
 pub use warm_throughput::{
     parse_warm_throughput_record, warm_throughput_record_for_create,
