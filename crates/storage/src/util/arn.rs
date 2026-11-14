@@ -61,48 +61,20 @@ pub fn new_stream_label() -> String {
 /// column is needed.
 ///
 /// Two shapes are accepted: the 23-byte `YYYY-MM-DDThh:mm:ss.sss` this module
-/// writes, and the 19-byte `YYYY-MM-DDThh:mm:ss` that SQLite, PostgreSQL and
-/// MongoDB wrote on v0.1.3 to v0.1.13 and Cassandra up to v0.1.14, which a
-/// stream enabled on those versions and never re-enabled still carries. The
-/// legacy shape names the instant with a `.000` fraction. `None` for any
-/// other shape.
+/// writes, parsed by [`crate::stream_lineage::label_millis`], and the 19-byte
+/// `YYYY-MM-DDThh:mm:ss` that SQLite, PostgreSQL and MongoDB wrote on v0.1.3
+/// to v0.1.13 and Cassandra up to v0.1.14, which a stream enabled on those
+/// versions and never re-enabled still carries. The legacy shape names the
+/// instant with a `.000` fraction. `None` for any other shape.
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // epoch ms fit f64's 53-bit mantissa
 pub fn stream_label_creation_date_time(label: &str) -> Option<f64> {
-    let b = label.as_bytes();
-    let has_fraction = match b.len() {
-        19 => false,
-        23 if b[19] == b'.' => true,
-        _ => return None,
-    };
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| -> Option<u32> {
-        let s = &label[range];
-        if s.bytes().all(|c| c.is_ascii_digit()) {
-            s.parse().ok()
-        } else {
-            None
-        }
-    };
-    let year = i32::try_from(num(0..4)?).ok()?;
-    let month = time::Month::try_from(u8::try_from(num(5..7)?).ok()?).ok()?;
-    let date = time::Date::from_calendar_date(year, month, u8::try_from(num(8..10)?).ok()?).ok()?;
-    let millis = if has_fraction {
-        u16::try_from(num(20..23)?).ok()?
+    let millis = if label.len() == 19 {
+        crate::stream_lineage::label_millis(&format!("{label}.000"))?
     } else {
-        0
+        crate::stream_lineage::label_millis(label)?
     };
-    let clock = time::Time::from_hms_milli(
-        u8::try_from(num(11..13)?).ok()?,
-        u8::try_from(num(14..16)?).ok()?,
-        u8::try_from(num(17..19)?).ok()?,
-        millis,
-    )
-    .ok()?;
-    let secs = date.with_time(clock).assume_utc().unix_timestamp();
-    Some((secs * 1000 + i64::from(millis)) as f64 / 1000.0)
+    Some(millis as f64 / 1000.0)
 }
 
 /// Returns an ARN for the specified `DynamoDB` stream.
