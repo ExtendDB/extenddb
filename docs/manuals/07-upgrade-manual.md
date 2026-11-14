@@ -1139,6 +1139,45 @@ DescribeStream and GetShardIterator now refuse a client-built `StreamArn` with t
 
 ---
 
+### v0.1.15: a `ClientRequestToken` retry compares `ReturnConsumedCapacity` and `ReturnItemCollectionMetrics`
+
+**What changed.** `TransactWriteItems` decides whether a request with a known
+`ClientRequestToken` is a replay. It compares a fingerprint of the request with
+the fingerprint stored for the token. Before this release the fingerprint
+covered `TransactItems` only. It now also covers `ReturnConsumedCapacity` when
+the value is `TOTAL` or `INDEXES`, and `ReturnItemCollectionMetrics` when the
+value is `SIZE`. A retry that keeps the token and the items but changes either
+field now answers `IdempotentParameterMismatchException`, as Amazon DynamoDB
+does (measured 2026-10-24). Earlier releases served it as a replay. A request
+with neither field, or with both set to `NONE`, has the same fingerprint as in
+earlier releases. An `ExecuteTransaction` write uses the same fingerprint with
+the request's `ReturnConsumedCapacity`, and the service answers its retries the
+same way (measured 2026-11-10).
+
+**Who is affected.** Clients that retry a `TransactWriteItems` request with the
+same token across an upgrade or a downgrade. The change affects requests that
+set `ReturnConsumedCapacity` to `TOTAL` or `INDEXES`, or
+`ReturnItemCollectionMetrics` to `SIZE`. v0.1.14 does not serve
+`ExecuteTransaction`, so no token that v0.1.14 stored comes from an
+`ExecuteTransaction` write.
+
+**Impact.** After an upgrade, a token that the earlier release stored for such
+a request answers `IdempotentParameterMismatchException` to an identical retry.
+The server replays a retry without the field. After a downgrade, a token that
+this release stored for such a request answers
+`IdempotentParameterMismatchException` to every retry. This includes an
+identical retry and a retry without the field. A token for a request with
+neither field, or with both set to `NONE`, replays in both directions. Servers
+of both releases can share one database during a rolling upgrade. A retry that
+reaches a server of the other release then gets the same answers. PostgreSQL,
+SQLite and MongoDB keep a token for 10 minutes. On those backends every token
+that the release you upgrade or downgrade from stored expires at most 10
+minutes after its last server stops. The Cassandra backend does not expire
+tokens, so there a later retry with such a token gets these answers at any time.
+No catalog migration is required.
+
+---
+
 ## License
 
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.

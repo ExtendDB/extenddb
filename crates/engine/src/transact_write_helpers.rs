@@ -9,8 +9,8 @@
 use extenddb_core::error::DynamoDbError;
 use extenddb_core::expression::{ExpressionMaps, PathElement, UpdateAction};
 use extenddb_core::types::{
-    ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure, TableKeyInfo,
-    attribute_value_size, extract_key, item_size_bytes,
+    ReturnConsumedCapacity, ReturnItemCollectionMetrics, ReturnValuesOnConditionCheckFailure,
+    TableKeyInfo, attribute_value_size, extract_key, item_size_bytes,
 };
 use extenddb_storage::TransactWriteOp;
 use hmac::{Hmac, Mac};
@@ -260,14 +260,51 @@ pub(crate) fn validate_client_request_token(token: &str) -> Result<(), DynamoDbE
     Ok(())
 }
 
-/// Compute a collision-resistant fingerprint of the transaction operations.
+/// The message of the `IdempotentParameterMismatchException` that a request
+/// answers when its token was used by a different request inside the
+/// idempotency window. `TransactWriteItems` and `ExecuteTransaction` both
+/// answer with it.
+pub(crate) const IDEMPOTENT_MISMATCH_MESSAGE: &str = "Specified idempotent token was used with \
+     different request parameters within the idempotency window";
+
+/// Compute a collision-resistant fingerprint of the transaction request.
 ///
 /// Uses HMAC-SHA256 keyed by the client request token over the JSON-serialized
-/// `TransactItems` array. The keyed hash prevents an attacker from crafting a
+/// `TransactItems` array, followed by the request's `ReturnConsumedCapacity`
+/// and `ReturnItemCollectionMetrics` values. The service compares those two
+/// fields on a token replay and treats an absent field as `NONE`, so each
+/// field contributes to the hash only when it is not `NONE`. An
+/// `ExecuteTransaction` write calls `handle_transact_write_items` with its
+/// `ReturnConsumedCapacity`, so this fingerprint decides its replays too.
+///
+/// Versions before this change hashed the items alone. A retry replays only
+/// when its fingerprint equals the stored one. A token stored before an
+/// upgrade or a downgrade therefore answers as follows while the backend
+/// keeps it:
+/// - A token stored for a request with neither field, or with both set to
+///   `NONE`, has the same fingerprint in both versions. An identical retry
+///   replays in both directions.
+/// - A token that an earlier version stored for a request with `TOTAL`,
+///   `INDEXES` or `SIZE` answers `IdempotentParameterMismatchException` to an
+///   identical retry on this version. A retry without the field replays.
+/// - A token that this version stored for a request with `TOTAL`, `INDEXES`
+///   or `SIZE` answers `IdempotentParameterMismatchException` to every retry
+///   on an earlier version. This includes an identical retry and a retry
+///   without the field.
+///
+/// PostgreSQL, SQLite and MongoDB keep a token for 10 minutes. Cassandra
+/// keeps it with no expiry.
+///
+/// The keyed hash prevents an attacker from crafting a
 /// different request body that produces the same fingerprint for a given token.
 /// The result is truncated to 16 hex chars (64 bits) for storage efficiency
 /// while remaining collision-resistant for the idempotency use case.
-pub(crate) fn compute_fingerprint(body: &Value, token: &str) -> String {
+pub(crate) fn compute_fingerprint(
+    body: &Value,
+    token: &str,
+    return_consumed_capacity: ReturnConsumedCapacity,
+    return_item_collection_metrics: ReturnItemCollectionMetrics,
+) -> String {
     let items = body.get("TransactItems").unwrap_or(&Value::Null);
     // serde_json::to_string on a Value is infallible — all Value variants
     // are representable as JSON. Using unwrap_or_default as a defensive fallback.
@@ -278,6 +315,17 @@ pub(crate) fn compute_fingerprint(body: &Value, token: &str) -> String {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts any key length");
     mac.update(json.as_bytes());
+    // The items JSON is a complete JSON value, so a suffix that is not JSON
+    // cannot coincide with the serialization of another items array.
+    match return_consumed_capacity {
+        ReturnConsumedCapacity::None => {}
+        ReturnConsumedCapacity::Total => mac.update(b"\nReturnConsumedCapacity=TOTAL"),
+        ReturnConsumedCapacity::Indexes => mac.update(b"\nReturnConsumedCapacity=INDEXES"),
+    }
+    match return_item_collection_metrics {
+        ReturnItemCollectionMetrics::None => {}
+        ReturnItemCollectionMetrics::Size => mac.update(b"\nReturnItemCollectionMetrics=SIZE"),
+    }
     let result = mac.finalize().into_bytes();
     hex::encode(&result[..8])
 }
@@ -343,11 +391,18 @@ mod tests {
         assert!(validate_client_request_token("abc!").is_err());
     }
 
+    const NO_RCC: ReturnConsumedCapacity = ReturnConsumedCapacity::None;
+    const NO_RICM: ReturnItemCollectionMetrics = ReturnItemCollectionMetrics::None;
+
+    fn fp(body: &Value, token: &str) -> String {
+        compute_fingerprint(body, token, NO_RCC, NO_RICM)
+    }
+
     #[test]
     fn fingerprint_deterministic() {
         let body: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t"}}]});
-        let a = compute_fingerprint(&body, "tok-1");
-        let b = compute_fingerprint(&body, "tok-1");
+        let a = fp(&body, "tok-1");
+        let b = fp(&body, "tok-1");
         assert_eq!(a, b);
     }
 
@@ -355,18 +410,119 @@ mod tests {
     fn fingerprint_differs_for_different_ops() {
         let a: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t1"}}]});
         let b: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t2"}}]});
-        assert_ne!(
-            compute_fingerprint(&a, "tok-1"),
-            compute_fingerprint(&b, "tok-1")
-        );
+        assert_ne!(fp(&a, "tok-1"), fp(&b, "tok-1"));
+    }
+
+    /// A Return field is added to the hashed items, so a retry that sets the
+    /// field and changes the items is a mismatch, not a replay.
+    #[test]
+    fn fingerprint_differs_for_different_ops_with_total() {
+        let a: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t1"}}]});
+        let b: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t2"}}]});
+        let total =
+            |body| compute_fingerprint(body, "tok-1", ReturnConsumedCapacity::Total, NO_RICM);
+        assert_ne!(total(&a), total(&b));
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_ops_with_size() {
+        let a: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t1"}}]});
+        let b: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t2"}}]});
+        let size =
+            |body| compute_fingerprint(body, "tok-1", NO_RCC, ReturnItemCollectionMetrics::Size);
+        assert_ne!(size(&a), size(&b));
     }
 
     #[test]
     fn fingerprint_differs_for_different_tokens() {
         let body: Value = serde_json::json!({"TransactItems": [{"Put": {"TableName": "t"}}]});
-        assert_ne!(
-            compute_fingerprint(&body, "tok-1"),
-            compute_fingerprint(&body, "tok-2")
+        assert_ne!(fp(&body, "tok-1"), fp(&body, "tok-2"));
+    }
+
+    /// The value stored for this body and token by 744ea291, whose fingerprint
+    /// hashed `TransactItems` alone. A request with neither Return field, or
+    /// with both set to NONE, must keep producing it so tokens stored before
+    /// the upgrade still replay.
+    const PINNED_ITEMS_ONLY: &str = "ef18f4e7c37d6b12";
+
+    /// The values this version stores for this body and token when a Return
+    /// field is set. A later version must keep producing them so these tokens
+    /// replay after an upgrade, which fixes the suffix bytes and their order.
+    const PINNED_TOTAL: &str = "8fa51ffc1314a046";
+    const PINNED_INDEXES: &str = "ee2c3412f0fdbdf1";
+    const PINNED_SIZE: &str = "70eb830c93e9079f";
+    const PINNED_TOTAL_SIZE: &str = "e9957d3c7431e1d4";
+
+    /// Keys are written in sorted order at every level so the serialized
+    /// JSON is the same whether serde_json sorts map keys or preserves
+    /// insertion order (the MongoDB build enables `preserve_order` through
+    /// bson).
+    fn pinned_body() -> Value {
+        serde_json::json!({"TransactItems": [{"Put": {"Item": {"pk": {"S": "a"}}, "TableName": "t"}}]})
+    }
+
+    #[test]
+    fn fingerprint_items_only_keeps_stored_value() {
+        assert_eq!(fp(&pinned_body(), "tok-1"), PINNED_ITEMS_ONLY);
+    }
+
+    #[test]
+    fn fingerprint_with_return_fields_keeps_stored_values() {
+        let body = pinned_body();
+        let f = |rcc, ricm| compute_fingerprint(&body, "tok-1", rcc, ricm);
+        let total = ReturnConsumedCapacity::Total;
+        let indexes = ReturnConsumedCapacity::Indexes;
+        let size = ReturnItemCollectionMetrics::Size;
+        assert_eq!(f(total, NO_RICM), PINNED_TOTAL, "TOTAL");
+        assert_eq!(f(indexes, NO_RICM), PINNED_INDEXES, "INDEXES");
+        assert_eq!(f(NO_RCC, size), PINNED_SIZE, "SIZE");
+        assert_eq!(f(total, size), PINNED_TOTAL_SIZE, "TOTAL with SIZE");
+    }
+
+    #[test]
+    fn fingerprint_none_equals_absent() {
+        let mut body = pinned_body();
+        body["ReturnConsumedCapacity"] = Value::String("NONE".to_owned());
+        body["ReturnItemCollectionMetrics"] = Value::String("NONE".to_owned());
+        assert_eq!(
+            compute_fingerprint(
+                &body,
+                "tok-1",
+                ReturnConsumedCapacity::None,
+                ReturnItemCollectionMetrics::None
+            ),
+            PINNED_ITEMS_ONLY
         );
+    }
+
+    #[test]
+    fn fingerprint_differs_for_return_consumed_capacity() {
+        let body = pinned_body();
+        let total = compute_fingerprint(&body, "tok-1", ReturnConsumedCapacity::Total, NO_RICM);
+        let indexes = compute_fingerprint(&body, "tok-1", ReturnConsumedCapacity::Indexes, NO_RICM);
+        assert_ne!(total, PINNED_ITEMS_ONLY);
+        assert_ne!(indexes, PINNED_ITEMS_ONLY);
+        assert_ne!(total, indexes);
+        assert_eq!(
+            total,
+            compute_fingerprint(&body, "tok-1", ReturnConsumedCapacity::Total, NO_RICM)
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_for_return_item_collection_metrics() {
+        let body = pinned_body();
+        let size = compute_fingerprint(&body, "tok-1", NO_RCC, ReturnItemCollectionMetrics::Size);
+        let both = compute_fingerprint(
+            &body,
+            "tok-1",
+            ReturnConsumedCapacity::Total,
+            ReturnItemCollectionMetrics::Size,
+        );
+        let total = compute_fingerprint(&body, "tok-1", ReturnConsumedCapacity::Total, NO_RICM);
+        assert_ne!(size, PINNED_ITEMS_ONLY);
+        assert_ne!(size, total);
+        assert_ne!(both, total);
+        assert_ne!(both, size);
     }
 }
