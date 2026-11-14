@@ -93,6 +93,8 @@ fn update_input() -> UpdateTableInput {
         on_demand_throughput: None,
         table_throughput_mode: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     }
 }
 

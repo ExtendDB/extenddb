@@ -202,6 +202,8 @@ fn update_input(table: &str) -> UpdateTableInput {
         on_demand_throughput: None,
         table_throughput_mode: None,
         vector_index_updates: None,
+        warm_throughput: None,
+        sse_specification: None,
     }
 }
 
@@ -605,12 +607,12 @@ async fn two_concurrent_delete_tables_have_one_winner() {
     s.cleanup().await;
 }
 
-/// The restore sweep removes an abandoned restore target by marking its row
-/// DELETING and then dropping its data table. The target was never served,
-/// and the service answers a table it is still restoring as not found, so the
-/// data plane keeps answering it that way while the drop waits, where a table
-/// DeleteTable marked is served. A transaction holding ACCESS SHARE on the data
-/// table keeps the drop waiting.
+/// The backup reconciler removes an abandoned restore target through
+/// `abort_restore`, which marks its row DELETING and then drops its data
+/// table. The target was never served, and the service answers a table it is
+/// still restoring as not found, so the data plane keeps answering it that
+/// way while the drop waits, where a table DeleteTable marked is served. A
+/// transaction holding ACCESS SHARE on the data table keeps the drop waiting.
 #[tokio::test]
 async fn an_abandoned_restore_target_being_removed_is_not_found() {
     if base_conn().is_none() {
@@ -618,11 +620,9 @@ async fn an_abandoned_restore_target_being_removed_is_not_found() {
     }
     let s = scratch().await;
     create_table_named(&s, TABLE).await;
-    // A restore target: CREATING with no scheduled transition, older than the
-    // sweep's grace period, and no process holding its restore lock.
+    // A restore target: CREATING with no scheduled transition.
     let table_id: String = sqlx::query_scalar(
-        "UPDATE tables SET table_status = 'CREATING', status_transition_at = NULL, \
-         creation_date_time = NOW() - INTERVAL '1 day' \
+        "UPDATE tables SET table_status = 'CREATING', status_transition_at = NULL \
          WHERE account_id = $1 AND table_name = $2 RETURNING table_id",
     )
     .bind(ACCOUNT)
@@ -639,13 +639,13 @@ async fn an_abandoned_restore_target_being_removed_is_not_found() {
     .await
     .expect("hold the data table");
 
-    let sweep = s.engine.process_control_plane_transitions();
+    let removal = s.engine.abort_restore(&table_id);
     let check = async {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while status_of(&s.catalog, TABLE).await.as_deref() != Some("DELETING") {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the sweep did not claim the restore target within 30 s"
+                "the removal did not claim the restore target within 30 s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -653,8 +653,11 @@ async fn an_abandoned_restore_target_being_removed_is_not_found() {
         holder.rollback().await.expect("release the data table");
         key_info
     };
-    let (swept, key_info) = tokio::join!(sweep, check);
-    swept.expect("the control-plane pass");
+    let (claimed, key_info) = tokio::join!(removal, check);
+    assert!(
+        claimed.expect("the removal"),
+        "the removal claimed the target"
+    );
     assert!(
         matches!(&key_info, Err(StorageError::TableNotFound(name)) if name == TABLE),
         "expected TableNotFound({TABLE:?}) while the restore target is removed, got {key_info:?}"
@@ -662,7 +665,7 @@ async fn an_abandoned_restore_target_being_removed_is_not_found() {
     assert_eq!(
         status_of(&s.catalog, TABLE).await,
         None,
-        "the sweep removed the row"
+        "the removal dropped the row"
     );
 
     s.cleanup().await;
