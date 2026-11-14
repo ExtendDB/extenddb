@@ -8,9 +8,10 @@
 //! (access-key secrets, password hashes), so neither the file nor its `-wal`,
 //! `-shm` and `-journal` files may be readable by other local users. SQLite's
 //! unix VFS creates a database file with mode 0644 less the umask, and creates
-//! each sidecar with the mode of the database file. So every pool on a file
-//! database is opened through [`connect`], which calls [`prepare`] before the
-//! pool's first connection and [`restrict`] after it. The engine pool
+//! each sidecar with the mode of the database file. So the bootstrapper and
+//! catalog pools on a file database are opened through [`connect`], which
+//! calls [`prepare`] before the pool's first connection and [`restrict`]
+//! after it. The engine pool
 //! (`store.rs`) connects with its own connection options, and calls both
 //! around that connect. The migration runner opens its own connection, and
 //! calls both around it when it opens the database for writing; its read-only

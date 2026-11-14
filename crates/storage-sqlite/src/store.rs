@@ -184,12 +184,9 @@ impl SqliteEngine {
             opts = opts.idle_timeout(None).max_lifetime(None);
         }
         let connect = connect_options(&url)?;
-        // The database file stores the AES encryption key alongside the data it
-        // protects (encrypted access-key secrets, password hashes), so the file
-        // and its sidecars are kept to owner read/write; see `file_mode`. The
-        // pool connects with `connect_options` for its row buffer, so it calls
-        // `prepare` and `restrict` around the connect as `file_mode::connect`
-        // does.
+        // Owner-only modes for the file and its sidecars (`file_mode`). The pool
+        // connects with `connect_options` for its row buffer, so it calls
+        // `prepare` and `restrict` itself instead of `file_mode::connect`.
         crate::file_mode::prepare(path_or_url).map_err(StorageError::Connection)?;
         let pool = opts
             .after_connect(|conn, _| {
