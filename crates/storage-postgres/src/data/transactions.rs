@@ -13,14 +13,15 @@ use extenddb_core::types::{
 use extenddb_core::validation;
 use extenddb_storage::error::StorageError;
 use extenddb_storage::util::pk_to_text;
-use extenddb_storage::{IdempotencyKey, TransactGetOp, TransactWriteOp};
+use extenddb_storage::{IdempotencyKey, StreamCapture, TransactGetOp, TransactWriteOp};
 
 use super::index::{
     IndexMeta, db_error, enqueue_async_indexes, fetch_write_path_indexes, sync_indexes,
 };
 use super::tx_helpers::{
     check_idempotency_token_in_tx, delete_item_in_tx, fetch_item_for_update, fetch_item_in_tx,
-    insert_item_if_absent_in_tx, upsert_item_in_tx, write_stream_record_in_tx,
+    insert_item_if_absent_in_tx, stream_record_shard_in_tx, upsert_item_in_tx,
+    write_stream_record_to_shard_in_tx,
 };
 use crate::PostgresEngine;
 use crate::pg_util::is_conflict_abort;
@@ -150,9 +151,32 @@ impl PostgresEngine {
         // M-3: Collect old/new items from each op for async GSI enqueue after commit.
         let mut op_items: Vec<(Option<Item>, Option<Item>)> = vec![(None, None); ops.len()];
         let mut any_failed = false;
-        let mut first_invalid: Option<(usize, String)> = None;
         let mut failed_op: Option<(usize, StorageError)> = None;
-        let mut ran = vec![false; ops.len()];
+
+        // Key checks first, for every member, before any row is locked. They
+        // need only the request and the table metadata, and a fault among them
+        // decides the request under the service's precedence (a wrong-typed
+        // key on any member, else an empty index key on any member), so a
+        // request that is already decided never waits on a row another
+        // transaction holds.
+        {
+            let mut key_reasons: Vec<CancellationReason> =
+                vec![CancellationReason::none(); ops.len()];
+            let mut any_key_fault = false;
+            for (i, op) in ops.iter().enumerate() {
+                let indexes = &table_indexes[transact_op_table_name(op)];
+                if let Err(r) = transact_op_key_checks(op, indexes) {
+                    any_key_fault = true;
+                    key_reasons[i] = r;
+                }
+            }
+            if any_key_fault {
+                return Err(match CancellationReason::resolve_key_faults(key_reasons) {
+                    Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                    Err(message) => StorageError::Validation(message),
+                });
+            }
+        }
 
         // Run the ops in key order, not request order, so every transaction
         // locks its items in one global order and two cannot deadlock on each
@@ -174,39 +198,15 @@ impl PostgresEngine {
                     any_failed = true;
                     reasons[i] = r;
                 }
-                Err(TxnOpError::Validation(msg)) => {
-                    // Up-front input validation (e.g. empty secondary-index key)
-                    // fails the request with a top-level ValidationException.
-                    // Report the earliest invalid op in request order.
-                    if first_invalid.as_ref().is_none_or(|(j, _)| i < *j) {
-                        first_invalid = Some((i, msg));
-                    }
-                }
                 Err(TxnOpError::Storage(e)) => {
                     // Infrastructure error, or PostgreSQL aborted the
-                    // transaction: run no further ops. A request-earlier op
-                    // that sorts later is then not validated.
+                    // transaction: run no further ops.
                     failed_op = Some((i, e));
                     break;
                 }
             }
-            ran[i] = true;
-            // Once every op before the earliest invalid one has run, the
-            // answer is fixed: stop instead of locking the rest.
-            if let Some((j, _)) = &first_invalid
-                && ran[..*j].iter().all(|r| *r)
-            {
-                break;
-            }
         }
 
-        // An invalid request fails validation even if a storage error or a
-        // conflict abort ended the loop. After an early break, a request-earlier
-        // op that sorts later was never checked, so the op named is the earliest
-        // invalid one that ran.
-        if let Some((_, msg)) = first_invalid {
-            return Err(StorageError::Validation(msg));
-        }
         if let Some((i, e)) = failed_op {
             if is_conflict_abort(&e) {
                 // PostgreSQL broke a lock conflict by aborting this transaction.
@@ -220,29 +220,55 @@ impl PostgresEngine {
         }
 
         if any_failed {
-            return Err(StorageError::TransactionCanceled(reasons));
+            // Key faults left the members as internal reasons; the shared
+            // resolver applies the service's cross-member precedence and
+            // decides between a cancellation and a top-level
+            // ValidationException. Every member has run, so the first
+            // wrong-typed key in request order is the one named.
+            return Err(match CancellationReason::resolve_key_faults(reasons) {
+                Ok(reasons) => StorageError::TransactionCanceled(reasons),
+                Err(message) => StorageError::Validation(message),
+            });
         }
 
-        // Write stream records atomically within the transaction (BLOCKER #1 fix).
-        for (op, (old_item, new_item)) in ops.iter().zip(op_items.iter()) {
-            let capture = match op {
-                TransactWriteOp::Put { stream, .. }
-                | TransactWriteOp::Delete { stream, .. }
-                | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
-                TransactWriteOp::ConditionCheck { .. } => None,
-            };
-            if let Some(capture) = capture {
-                write_stream_record_in_tx(
+        // Write stream records atomically within the transaction (BLOCKER #1 fix),
+        // in shard id order. Each record locks its shard's row FOR KEY SHARE,
+        // and a disable locks the stream's open rows FOR UPDATE in shard id
+        // order (`close_stream_shards`). In request order, a transaction with
+        // items on shard 2 and then shard 0 would hold shard 2 and wait for
+        // shard 0. A close that held shard 0 would wait for shard 2. This code
+        // chooses the shard of every record first. It then sorts the records
+        // by shard id, byte by byte, as the close sorts the rows. Two records
+        // on one shard keep their request order.
+        let mut records: Vec<(String, usize)> = Vec::new();
+        for (i, (op, (old_item, new_item))) in ops.iter().zip(op_items.iter()).enumerate() {
+            if transact_op_stream(op).is_none() {
+                continue;
+            }
+            let shard = stream_record_shard_in_tx(
+                &mut tx,
+                transact_op_key_info(op),
+                old_item.as_ref(),
+                new_item.as_ref(),
+            )
+            .await
+            .map_err(cancel_all)?;
+            if let Some(shard) = shard {
+                records.push((shard, i));
+            }
+        }
+        records.sort();
+        for (shard, i) in &records {
+            let op = &ops[*i];
+            let (old_item, new_item) = &op_items[*i];
+            if let Some(capture) = transact_op_stream(op) {
+                write_stream_record_to_shard_in_tx(
                     &mut tx,
-                    match op {
-                        TransactWriteOp::Put { key_info, .. }
-                        | TransactWriteOp::Delete { key_info, .. }
-                        | TransactWriteOp::Update { key_info, .. }
-                        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
-                    },
+                    transact_op_key_info(op),
                     capture,
                     old_item.as_ref(),
                     new_item.as_ref(),
+                    shard,
                 )
                 .await
                 .map_err(cancel_all)?;
@@ -412,6 +438,27 @@ fn transact_op_table_id<'a>(op: &'a TransactWriteOp<'_>) -> &'a str {
     }
 }
 
+/// The table metadata of a transactional write operation.
+fn transact_op_key_info<'a>(op: &'a TransactWriteOp<'_>) -> &'a TableKeyInfo {
+    match op {
+        TransactWriteOp::Put { key_info, .. }
+        | TransactWriteOp::Delete { key_info, .. }
+        | TransactWriteOp::Update { key_info, .. }
+        | TransactWriteOp::ConditionCheck { key_info, .. } => key_info,
+    }
+}
+
+/// The stream capture of a transactional write operation, if its table has an
+/// enabled stream. A `ConditionCheck` writes nothing and records nothing.
+fn transact_op_stream<'a>(op: &'a TransactWriteOp<'_>) -> Option<&'a StreamCapture> {
+    match op {
+        TransactWriteOp::Put { stream, .. }
+        | TransactWriteOp::Delete { stream, .. }
+        | TransactWriteOp::Update { stream, .. } => stream.as_ref(),
+        TransactWriteOp::ConditionCheck { .. } => None,
+    }
+}
+
 /// Error type for individual transactional write operations.
 ///
 /// Separates user-driven cancellations (condition failures, validation errors)
@@ -430,12 +477,74 @@ pub(super) fn index_key_refs(indexes: &[IndexMeta]) -> Vec<validation::IndexKeyR
         .collect()
 }
 
+/// The key checks a transaction member can fail before any row is read or
+/// locked: the table key's shape and types, and the secondary-index keys the
+/// member supplies in the request itself (a Put item's attributes, an Update
+/// statement's literal operands). Faults carry the internal reasons that
+/// `CancellationReason::resolve_key_faults` ranks. Values computed from the
+/// existing item are checked later, once the row is read.
+fn transact_op_key_checks(
+    op: &TransactWriteOp<'_>,
+    indexes: &[IndexMeta],
+) -> Result<(), CancellationReason> {
+    match op {
+        TransactWriteOp::Put { key_info, item, .. } => {
+            validation::validate_item_keys(
+                item,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            let idx_refs = index_key_refs(indexes);
+            validation::validate_index_key_types(
+                item,
+                &idx_refs,
+                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            validation::validate_index_key_not_empty(
+                item,
+                &idx_refs,
+                validation::SecondaryIndexEmptyContext::Item,
+            )
+            .map_err(|e| CancellationReason::index_key_empty_abort(e.to_string()))
+        }
+        TransactWriteOp::Update {
+            key_info,
+            key,
+            actions,
+            maps,
+            ..
+        } => {
+            validation::validate_batch_key_only(
+                key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))?;
+            validation::validate_index_key_literal_operands(
+                actions,
+                &index_key_refs(indexes),
+                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
+                maps,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
+        }
+        TransactWriteOp::Delete { key_info, key, .. }
+        | TransactWriteOp::ConditionCheck { key_info, key, .. } => {
+            validation::validate_batch_key_only(
+                key,
+                &key_info.key_schema,
+                &key_info.attribute_definitions,
+            )
+            .map_err(|e| CancellationReason::key_type_mismatch(e.to_string()))
+        }
+    }
+}
+
 enum TxnOpError {
     /// User-driven failure — becomes a per-item cancellation reason.
     Cancel(CancellationReason),
-    /// Up-front input validation failure — aborts the whole transaction with a
-    /// top-level `ValidationException` (not a per-item cancellation reason).
-    Validation(String),
     /// Infrastructure failure — bubbles up as `StorageError::Internal`.
     Storage(StorageError),
 }
@@ -471,28 +580,9 @@ async fn execute_transact_write_op(
             // Key type validation inside the transaction so mismatches produce
             // TransactionCanceledException with ValidationError cancellation
             // reasons, matching real DynamoDB behavior.
-            validation::validate_item_keys(
-                item,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            // Secondary-index key faults split by kind: a type mismatch is a
-            // per-item cancellation reason; an empty index key is up-front input
-            // validation (a top-level ValidationException).
-            let idx_refs = index_key_refs(indexes);
-            validation::validate_index_key_types(
-                item,
-                &idx_refs,
-                super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
-            validation::validate_index_key_not_empty(
-                item,
-                &idx_refs,
-                validation::SecondaryIndexEmptyContext::Item,
-            )
-            .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+            // Key checks ran in the pre-pass; repeated so the arm stays
+            // correct if called on its own.
+            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
             let mut existing = fetch_item_for_update(tx, key_info, item)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -590,7 +680,9 @@ async fn execute_transact_write_op(
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
             )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+            })?;
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
@@ -635,21 +727,25 @@ async fn execute_transact_write_op(
             return_values_on_ccf,
             ..
         } => {
-            validation::validate_batch_key_only(
-                key,
-                &key_info.key_schema,
-                &key_info.attribute_definitions,
-            )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            transact_op_key_checks(op, indexes).map_err(TxnOpError::Cancel)?;
+            let idx_refs = index_key_refs(indexes);
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;
+            // A removal-only update on a key that holds no row writes nothing
+            // (issue #510), which makes it the same shape as deleting a missing
+            // item: reserve the key so a concurrent create cannot commit
+            // between the condition check and the end of this transaction. The
+            // reservation returns the winner's item when a create raced in, and
+            // the normal write path below then runs against it.
+            if existing.is_none() && expression::removes_only(actions) {
+                existing = reserve_missing_item(tx, key_info, key).await?;
+            }
             // Compute and validate the post-update item from a given base.
             // Runs once on the fast path, and again when a create race is
             // lost and the loser's expression must re-apply on top of the
             // winner's committed item (the merge semantics measured against
             // the real service on the non-transactional UpdateItem path).
-            let idx_refs = index_key_refs(indexes);
             let compute_item = |base: Option<&Item>| -> Result<Item, TxnOpError> {
                 let mut item = base.cloned().unwrap_or_else(|| (*key).clone());
                 expression::apply_update_validated(
@@ -662,27 +758,32 @@ async fn execute_transact_write_op(
                 .map_err(|e| {
                     TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
                 })?;
-                // Validate post-update item size
-                validation::validate_item_size(&item, max_item_size_bytes).map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
-                })?;
-                // Secondary-index key validation on the post-update item: a type
-                // mismatch is a cancellation reason; setting an index key to an
-                // empty value is a top-level ValidationException.
-                validation::validate_index_key_types(
+                // A transacted Update is sized on the finished item, with the
+                // update wording in the cancellation reason.
+                validation::validate_transact_update_item_size(&item, max_item_size_bytes)
+                    .map_err(|e| {
+                        TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    })?;
+                // Secondary-index keys on the written item: a value computed from
+                // the existing item (an attribute reference, the fallback of
+                // if_not_exists) of the wrong type, reported with the service's
+                // computed-value wording, and a key left empty.
+                validation::validate_index_key_types_after_update(
                     &item,
                     &idx_refs,
                     super::index::fresh_attr_defs(indexes, &key_info.attribute_definitions),
                 )
                 .map_err(|e| {
-                    TxnOpError::Cancel(CancellationReason::validation_error(e.to_string()))
+                    TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
                 })?;
                 validation::validate_index_key_not_empty(
                     &item,
                     &idx_refs,
                     validation::SecondaryIndexEmptyContext::UpdateExpression,
                 )
-                .map_err(|e| TxnOpError::Validation(e.to_string()))?;
+                .map_err(|e| {
+                    TxnOpError::Cancel(CancellationReason::index_key_empty_abort(e.to_string()))
+                })?;
                 Ok(item)
             };
             // Evaluate condition against empty item if non-existent (DynamoDB semantics)
@@ -695,6 +796,12 @@ async fn execute_transact_write_op(
                 existing.as_ref(),
             )?;
             let mut item = compute_item(existing.as_ref())?;
+            if existing.is_none() && expression::removes_only(actions) {
+                // The key was reserved above and the actions ran for their
+                // validation errors only. Nothing is written, so no stream
+                // record and no index work follow from this op.
+                return Ok((None, None));
+            }
             if existing.is_some() {
                 // The locking read above holds the row: no concurrent writer can
                 // slip between the condition check and this write.
@@ -771,7 +878,9 @@ async fn execute_transact_write_op(
                 &key_info.key_schema,
                 &key_info.attribute_definitions,
             )
-            .map_err(|e| TxnOpError::Cancel(CancellationReason::validation_error(e.to_string())))?;
+            .map_err(|e| {
+                TxnOpError::Cancel(CancellationReason::key_type_mismatch(e.to_string()))
+            })?;
             let mut existing = fetch_item_for_update(tx, key_info, key)
                 .await
                 .map_err(TxnOpError::Storage)?;

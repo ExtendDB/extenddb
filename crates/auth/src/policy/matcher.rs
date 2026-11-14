@@ -4,7 +4,8 @@
 //! Wildcard and ARN matching for IAM policy evaluation.
 //!
 //! `wildcard_match` supports `*` (zero or more characters) and `?` (exactly one
-//! character). `arn_match` splits an ARN into its first five fields plus the
+//! character), counting characters in UTF-16 code units as IAM does. `arn_match`
+//! splits an ARN into its first five fields plus the
 //! resource field (everything after the fifth `:`) as one field, and matches
 //! each field with `wildcard_match`, so `*` and `?` in the resource field span
 //! `:` and `/`.
@@ -12,7 +13,8 @@
 /// Match a pattern against a value. Supports `*` and `?` wildcards.
 /// Comparison is case-sensitive.
 ///
-/// Uses a greedy algorithm with O(1) heap allocation.
+/// Uses a greedy algorithm. ASCII input is matched without allocating; other
+/// input is converted to UTF-16 first.
 ///
 /// Used for `StringLike` condition evaluation (case-sensitive per AWS IAM).
 ///
@@ -27,7 +29,7 @@
 /// ```
 #[must_use]
 pub fn wildcard_match(pattern: &str, value: &str) -> bool {
-    wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), false)
+    wildcard_match_impl(pattern, value, false)
 }
 
 /// Match a pattern against a value with case-insensitive comparison.
@@ -45,10 +47,49 @@ pub fn wildcard_match(pattern: &str, value: &str) -> bool {
 /// ```
 #[must_use]
 pub fn wildcard_match_ignore_case(pattern: &str, value: &str) -> bool {
-    wildcard_match_impl(pattern.as_bytes(), value.as_bytes(), true)
+    wildcard_match_impl(pattern, value, true)
 }
 
-fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
+/// IAM counts what `?` and `*` match in UTF-16 code units, measured with the
+/// IAM policy simulator: a character outside the Basic Multilingual Plane,
+/// such as an emoji, is two units and takes `??`. An ASCII byte is one unit,
+/// so ASCII input is matched as bytes, with no conversion.
+fn wildcard_match_impl(pattern: &str, value: &str, ignore_case: bool) -> bool {
+    if pattern.is_ascii() && value.is_ascii() {
+        return match_units(pattern.as_bytes(), value.as_bytes(), ignore_case);
+    }
+    let p: Vec<u16> = pattern.encode_utf16().collect();
+    let v: Vec<u16> = value.encode_utf16().collect();
+    match_units(&p, &v, ignore_case)
+}
+
+/// One unit of a pattern or a value: an ASCII byte or a UTF-16 code unit.
+trait Unit: Copy + Eq {
+    const STAR: Self;
+    const QUESTION: Self;
+    fn eq_folding_ascii(self, other: Self) -> bool;
+}
+
+impl Unit for u8 {
+    const STAR: Self = b'*';
+    const QUESTION: Self = b'?';
+    fn eq_folding_ascii(self, other: Self) -> bool {
+        self.eq_ignore_ascii_case(&other)
+    }
+}
+
+impl Unit for u16 {
+    const STAR: Self = 0x2A; // '*'
+    const QUESTION: Self = 0x3F; // '?'
+    fn eq_folding_ascii(self, other: Self) -> bool {
+        match (u8::try_from(self), u8::try_from(other)) {
+            (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(&b),
+            _ => self == other,
+        }
+    }
+}
+
+fn match_units<T: Unit>(p: &[T], v: &[T], ignore_case: bool) -> bool {
     let (plen, vlen) = (p.len(), v.len());
 
     let mut pi = 0; // pattern index
@@ -57,14 +98,14 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     let mut match_from = 0; // value index when last '*' was hit
 
     while vi < vlen {
-        if pi < plen && p[pi] == b'*' {
+        if pi < plen && p[pi] == T::STAR {
             last_star = pi + 1;
             match_from = vi;
             pi += 1;
         } else if pi < plen
-            && (p[pi] == b'?'
+            && (p[pi] == T::QUESTION
                 || if ignore_case {
-                    p[pi].eq_ignore_ascii_case(&v[vi])
+                    p[pi].eq_folding_ascii(v[vi])
                 } else {
                     p[pi] == v[vi]
                 })
@@ -72,7 +113,7 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
             pi += 1;
             vi += 1;
         } else if last_star != usize::MAX {
-            // Backtrack: let the last '*' consume one more character.
+            // Backtrack: let the last '*' consume one more unit.
             match_from += 1;
             vi = match_from;
             pi = last_star;
@@ -82,7 +123,7 @@ fn wildcard_match_impl(p: &[u8], v: &[u8], ignore_case: bool) -> bool {
     }
 
     // Consume trailing '*' in pattern.
-    while pi < plen && p[pi] == b'*' {
+    while pi < plen && p[pi] == T::STAR {
         pi += 1;
     }
 
@@ -287,6 +328,9 @@ pub fn ip_in_cidr(cidr: &str, addr: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod utf16_tests;
 
 #[cfg(test)]
 mod tests {

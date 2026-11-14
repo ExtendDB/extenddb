@@ -38,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
 use crate::gsi_rotation::process_batch;
 
 /// Number of worker tasks consuming from the persistent queue.
@@ -342,8 +343,10 @@ pub(crate) async fn enqueue_gsi_pending(
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context_json =
-        serde_json::to_value(context).map_err(|e| StorageError::Internal(e.to_string()))?;
+    // The context carries attribute names, so it is stored in the form of the
+    // catalog documents it was read from (`catalog_json`); the item images
+    // are item data and are not.
+    let context_json = to_catalog_json(context)?;
 
     // Route all updates for a given base item to one worker.
     // The base key is immutable over an item's lifetime; `new_item` carries it
@@ -501,8 +504,7 @@ pub(crate) fn decode_row(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|e| StorageError::Internal(e.to_string()))?;
-    let context: PendingApplyContext =
-        serde_json::from_value(ctx_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+    let context: PendingApplyContext = from_catalog_json(ctx_json)?;
     Ok((old_item, new_item, context))
 }
 

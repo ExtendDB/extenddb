@@ -1,6 +1,6 @@
-# ADR-0009: Logical backup and restore for Cassandra
+# ADR-0019: Logical backup and restore for Cassandra
 
-**Status:** Accepted
+**Status:** Superseded in part by [the backup and restore design](../design/15-backup-restore.md) (section 10)
 **Date:** 2026-08-03
 
 ## Context
@@ -49,3 +49,14 @@ The first implementation restores base table schema and items, matching the Post
 * Backup and restore execute synchronously in the request task for parity with the current backends. A production-scale iteration should persist jobs and move payload copying, retries, and reconciliation into background workers.
 * Interrupted `CREATING`/`DELETING` operations need a future reconciliation worker for guaranteed orphan cleanup.
 * Restoring secondary-index and other table-adjacent configuration requires a future schema extension.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
