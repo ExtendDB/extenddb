@@ -59,6 +59,8 @@ fn gsi(name: &str, read: i64, write: i64) -> GsiDescription {
         index_size_bytes: 0,
         item_count: 0,
         index_arn: String::new(),
+        warm_throughput: None,
+        warm_throughput_record: None,
     }
 }
 
