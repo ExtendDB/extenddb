@@ -219,7 +219,16 @@ pub async fn handle_update_table(
     // A switch to PAY_PER_REQUEST stores the on-demand minimum as the warm
     // throughput of a provisioned table that is below it, so it needs the table.
     let switches_to_on_demand = matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
-    if projects_attributes || touches_warm || bare_update || switches_to_on_demand {
+    // The provisioned-capacity maxima are checked against what the table holds
+    // now, so they need the table too. One read serves every check below.
+    let raises_capacity =
+        extenddb_core::validation::provisioned_limits::changes_provisioned_capacity(&input);
+    if projects_attributes
+        || touches_warm
+        || bare_update
+        || switches_to_on_demand
+        || raises_capacity
+    {
         let existing = ctx
             .storage
             .describe_table(
@@ -253,21 +262,9 @@ pub async fn handle_update_table(
             input.warm_throughput =
                 crate::warm_throughput::on_demand_switch_warm_throughput(&existing);
         }
-    }
-
-    // The provisioned-capacity maxima, checked against what the table holds now.
-    if extenddb_core::validation::provisioned_limits::changes_provisioned_capacity(&input) {
-        let existing = ctx
-            .storage
-            .describe_table(
-                &ctx.account_id,
-                extenddb_core::types::DescribeTableInput {
-                    table_name: input.table_name.clone(),
-                },
-            )
-            .await
-            .map_err(|e| update_table_err_to_dynamo(e, &input.table_name))?;
-        crate::table_limits::enforce_update_table(ctx, &input, &existing).await?;
+        if raises_capacity {
+            crate::table_limits::enforce_update_table(ctx, &input, &existing).await?;
+        }
     }
 
     let table_name = input.table_name.clone();

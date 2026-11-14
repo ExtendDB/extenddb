@@ -149,8 +149,9 @@ impl PolicyDocument {
     /// limit ([`DEFAULT_MAX_POLICY_DOCUMENT_BYTES`]).
     ///
     /// The server parses with the configured `max_policy_document_bytes`
-    /// instead, through [`Self::from_json_with_size_limit`] on the read path
-    /// and [`Self::from_json_for_write`] on the write path.
+    /// instead, through [`Self::from_json_with_size_limit`] on the read path,
+    /// [`Self::from_json_for_write`] on the write path and
+    /// [`Self::from_json_for_session_policy`] at AssumeRole.
     ///
     /// # Errors
     ///
