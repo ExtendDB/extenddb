@@ -19,7 +19,7 @@ use extenddb_core::types::{
 };
 use extenddb_storage::error::StorageError;
 use extenddb_storage::{
-    BackupEngine, DataEngine, RestoreTableOverrides, TableEngine, TransactWriteOp,
+    DataEngine, JobPermit, LegacyBackupReader, RestoreTableOverrides, TableEngine, TransactWriteOp,
 };
 use extenddb_storage_cassandra::CassandraEngine;
 
@@ -123,6 +123,7 @@ pub(crate) async fn restored_indexed_table(
                     non_key_attributes: Some(vec!["value".to_owned()]),
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             local_secondary_indexes: Some(vec![LsiInput {
                 index_name: "ByLocal".to_owned(),
@@ -139,7 +140,12 @@ pub(crate) async fn restored_indexed_table(
     make_gsis_synchronous(engine, &source.table_id, &["ByGroup"]).await;
     put_all(engine, &source, items).await;
     let backup = engine
-        .create_backup(&account_id, &source.table_name, "restore-write")
+        .create(
+            &account_id,
+            &source.table_name,
+            "restore-write",
+            JobPermit::detached(),
+        )
         .await
         .expect("create backup");
     let initial = restore(
@@ -474,7 +480,12 @@ async fn test_restored_pk_only_rows_take_later_writes() {
     )
     .await;
     let backup = engine
-        .create_backup(&account_id, "RestoreWritePlainSource", "plain")
+        .create(
+            &account_id,
+            "RestoreWritePlainSource",
+            "plain",
+            JobPermit::detached(),
+        )
         .await
         .expect("create backup");
     let target = "RestoreWritePlain";

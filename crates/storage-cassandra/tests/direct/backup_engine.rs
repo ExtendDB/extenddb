@@ -1320,7 +1320,8 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
     // register_restore does, so the registration is held for as long as the
     // test wants it (a real copy of b2 is over before a second target's
     // schema is created). Four restores of b2 fired at once are all turned
-    // away as BackupInUse naming that target, and none creates a target.
+    // away as BackupInUse on b2 (the message names the backup; the holding
+    // target is logged), and none creates a target.
     // Once the registration is released, a restore of b2 is admitted.
     let held_id = uuid::Uuid::new_v4().to_string();
     let catalog = engine.catalog_keyspace();
@@ -1379,7 +1380,7 @@ async fn test_a_restore_is_refused_while_a_target_of_its_backup_is_creating() {
     .await;
     for (i, result) in results.iter().enumerate() {
         assert!(
-            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains("HeldTarget")),
+            matches!(result, Err(StorageError::BackupInUse(m)) if m.contains(&b2)),
             "restore {i} against the held registration: {result:?}"
         );
         let gone = engine

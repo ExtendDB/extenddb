@@ -23,7 +23,9 @@ use extenddb_core::types::{
     AttributeValue, BillingMode, CreateTableInput, GsiInput, KeyType, LsiInput, Projection,
     ProjectionType, ScalarAttributeType, TableKeyInfo, TableStatus,
 };
-use extenddb_storage::{BackupEngine, DataEngine, RestoreTableOverrides, TableEngine};
+use extenddb_storage::{
+    DataEngine, JobPermit, LegacyBackupReader, RestoreTableOverrides, TableEngine,
+};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::backup_engine::{
@@ -77,7 +79,7 @@ async fn scan_all(engine: &CassandraEngine, key_info: &TableKeyInfo) -> BTreeMap
 async fn back_up(engine: &CassandraEngine, account_id: &str, name: &str) -> String {
     let started = Instant::now();
     let backup = engine
-        .create_backup(account_id, name, "timing")
+        .create(account_id, name, "timing", JobPermit::detached())
         .await
         .expect("create backup");
     println!("  CreateBackup of {name}: {:?}", started.elapsed());
@@ -191,6 +193,7 @@ async fn restore_timing_20k_indexed() {
                     non_key_attributes: Some(vec!["value".to_owned()]),
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             local_secondary_indexes: Some(vec![LsiInput {
                 index_name: "ByLocal".to_owned(),

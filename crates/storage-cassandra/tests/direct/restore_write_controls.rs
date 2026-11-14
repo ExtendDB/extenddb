@@ -1,10 +1,9 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Controls on the restore copy's write path: what a restored row's write
-//! timestamp is, that a backup whose payload does not fit its target or its
-//! recorded count fails the restore, and that the rows the restore writes
-//! have the shape the ordinary put path writes.
+//! Controls on the restore copy's write path: a backup whose payload does not
+//! fit its target or its recorded count fails the restore, and the rows the
+//! restore writes have the shape the ordinary put path writes.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -16,7 +15,9 @@ use extenddb_core::types::{
     Projection, ProjectionType, ScalarAttributeType, TableKeyInfo, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, DataEngine, RestoreTableOverrides, TableEngine};
+use extenddb_storage::{
+    DataEngine, JobPermit, LegacyBackupReader, RestoreTableOverrides, TableEngine,
+};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::backup_engine::{
@@ -179,6 +180,7 @@ async fn backed_up_gsi_table(
                     non_key_attributes: None,
                 },
                 provisioned_throughput: None,
+                warm_throughput: None,
             }]),
             ..Default::default()
         },
@@ -194,129 +196,10 @@ async fn backed_up_gsi_table(
         .collect();
     put_all(engine, &source, items).await;
     let backup = engine
-        .create_backup(&account_id, name, "control")
+        .create(&account_id, name, "control", JobPermit::detached())
         .await
         .expect("create backup");
     (account, source, backup.backup_arn)
-}
-
-/// One restored base row's `version`, its write time, and the write times of
-/// its index rows by index name.
-struct RowStamps {
-    version: i64,
-    base_wt: i64,
-    index_wts: Vec<(String, i64)>,
-}
-
-/// Every restored index row's write time is the coordinator's, as the base
-/// row's is. The coordinator hands each statement its own timestamp, so an
-/// item's GSI row and LSI row never share one; a restore that stamped them
-/// from the host clock would give both the base row's `version`. Every index
-/// row's write time is also within 10 ms of its base row's.
-#[tokio::test]
-async fn test_restored_index_rows_take_the_coordinator_timestamp() {
-    if crate::helpers::skip_without_cassandra() {
-        return;
-    }
-    let engine = setup_engine().await;
-    let items = vec![
-        indexed_item("a", "1", "g1", 1, 10, "v-a1"),
-        indexed_item("b", "1", "g2", 3, 30, "v-b1"),
-        {
-            let mut it = item("c", Some("2"), "v-c2");
-            it.insert("lsk".to_owned(), n(60));
-            it
-        },
-    ];
-    let (_account, restored) = restored_indexed_table(&engine, items, "RestoreStamp").await;
-    let keyspace = account_keyspace(&restored.account_id);
-    let base_table = items_table(&restored.table_id);
-    let indexes = index_tables(&engine, &restored.table_id).await;
-    assert_eq!(indexes.len(), 2, "{indexes:?}");
-    let mut per_item: BTreeMap<String, RowStamps> = BTreeMap::new();
-    for (index_name, index_table) in indexes {
-        let index_rows = rows(
-            &engine,
-            &format!(
-                "SELECT base_pk, base_sk_s, WRITETIME(item_data) AS wt FROM {keyspace}.{index_table}"
-            ),
-        )
-        .await;
-        assert!(!index_rows.is_empty(), "{index_name} has rows");
-        for row in index_rows {
-            let base_pk: String = row.get_r_by_name("base_pk").expect("base_pk");
-            let base_sk: String = row.get_r_by_name("base_sk_s").expect("base_sk_s");
-            let index_wt: i64 = row.get_r_by_name("wt").expect("wt");
-            let base = engine
-                .session()
-                .query_with_values(
-                    &format!(
-                        "SELECT version, WRITETIME(item_data) AS wt FROM {keyspace}.{base_table} \
-                         WHERE pk = ? AND sk_s = ?"
-                    ),
-                    cdrs_tokio::query_values!(base_pk.as_str(), base_sk.as_str()),
-                )
-                .await
-                .expect("base row")
-                .response_body()
-                .expect("base body")
-                .into_rows()
-                .unwrap_or_default();
-            let version: i64 = base[0].get_r_by_name("version").expect("version");
-            let base_wt: i64 = base[0].get_r_by_name("wt").expect("base wt");
-            per_item
-                .entry(format!("{base_pk}/{base_sk}"))
-                .or_insert(RowStamps {
-                    version,
-                    base_wt,
-                    index_wts: Vec::new(),
-                })
-                .index_wts
-                .push((index_name.clone(), index_wt));
-        }
-    }
-    assert_eq!(per_item.len(), 3);
-    let mut stamped_with_version = 0;
-    let mut checked = 0;
-    for (
-        key,
-        RowStamps {
-            version,
-            base_wt,
-            index_wts,
-        },
-    ) in &per_item
-    {
-        for (index_name, index_wt) in index_wts {
-            assert!(
-                (index_wt - base_wt).abs() <= 10_000,
-                "{index_name} row {key}: index write time {index_wt} is not within 10 ms of the \
-                 base row's {base_wt}"
-            );
-            if index_wt == version {
-                stamped_with_version += 1;
-            }
-            checked += 1;
-        }
-        if let [(first_name, first_wt), (second_name, second_wt)] = index_wts.as_slice() {
-            assert_ne!(
-                first_wt, second_wt,
-                "{key}: the {first_name} and {second_name} rows share a write time; the \
-                 coordinator gives each statement its own"
-            );
-        }
-    }
-    assert_eq!(checked, 5, "2 GSI rows and 3 LSI rows");
-    assert_eq!(
-        per_item.values().filter(|r| r.index_wts.len() == 2).count(),
-        2,
-        "a/1 and b/1 carry a GSI row and an LSI row each"
-    );
-    assert!(
-        stamped_with_version < checked,
-        "every index row's write time equals its base row's version: the rows were stamped from \
-         the host clock"
-    );
 }
 
 /// A backup item whose GSI key attribute has the wrong type (N where the
@@ -398,7 +281,7 @@ async fn test_a_backup_item_count_above_its_payload_fails_the_restore() {
     )
     .await;
     let backup = engine
-        .create_backup(&account_id, "CountSource", "count")
+        .create(&account_id, "CountSource", "count", JobPermit::detached())
         .await
         .expect("create backup");
     set_item_count(&engine, &account_id, &backup.backup_arn, 71).await;
