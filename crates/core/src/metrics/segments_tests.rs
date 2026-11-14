@@ -9,6 +9,7 @@ use super::*;
 
 const OPS: [&str; 5] = ["GetItem", "PutItem", "Query", "Scan", "UpdateItem"];
 const ACCOUNT: &str = "111111111111";
+const ACCOUNTS: [&str; 3] = ["111111111111", "222222222222", "333333333333"];
 
 fn segs(v: f64) -> LatencySegments {
     LatencySegments {
@@ -63,21 +64,25 @@ fn boundedness_five_million_records() {
     let mut store = SegmentStore::new(epoch);
     let total: u64 = 5_000_000;
     // 52 ms apart: 260 000 s, three days, so every ring laps many times.
+    // 3 and 5 are coprime, so every account records every operation.
     for i in 0..total {
         let now = epoch + Duration::from_millis(i * 52);
         #[allow(clippy::cast_possible_truncation)]
+        let account = ACCOUNTS[(i % 3) as usize];
+        #[allow(clippy::cast_possible_truncation)]
         let op = OPS[(i % 5) as usize];
-        store.record(ACCOUNT, op, &segs(1.0), now);
+        store.record(account, op, &segs(1.0), now);
     }
-    let bound = OPS.len() * BUCKETS_PER_OPERATION;
-    assert_eq!(store.ring_pair_count(), OPS.len());
+    let bound = ACCOUNTS.len() * OPS.len() * BUCKETS_PER_OPERATION;
+    assert_eq!(store.ring_pair_count(), ACCOUNTS.len() * OPS.len());
     assert!(
         store.bucket_count() <= bound,
         "bucket count {} exceeds bound {bound}",
         store.bucket_count()
     );
     assert!(store.bucket_count() * SegmentStore::bucket_size() <= bound * 64);
-    // The rings are allocated once per operation, so the bound is also exact.
+    // The rings are allocated once per account and operation, so the bound
+    // is also exact.
     assert_eq!(store.bucket_count(), bound);
     // The whole-ring query still answers, with at most 1441 minutes of data.
     let now = epoch + Duration::from_millis(total * 52);
@@ -86,28 +91,51 @@ fn boundedness_five_million_records() {
     assert!(in_day > 0 && in_day <= 86_460_000 / 52 + OPS.len() as u64);
 }
 
+/// One request of the random workload: the index of its account, the index
+/// of its operation, its time in milliseconds after the epoch and its
+/// segments.
+struct Point {
+    account: usize,
+    op: usize,
+    t_ms: u64,
+    segs: LatencySegments,
+}
+
 /// Naive reference: for a window of `w` seconds read from `b`-second buckets,
 /// the store returns every point whose bucket starts at or after the bucket
 /// that contains `now - w`. That set contains the exact last `w` seconds and
-/// is contained in the exact last `w + b` seconds.
+/// is contained in the exact last `w + b` seconds. Without an account filter
+/// the reference is every account's points; with one, that account's points.
 #[test]
 fn random_workload_matches_naive_reference() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let mut points: Vec<(usize, u64, LatencySegments)> = Vec::new();
+    let mut points: Vec<Point> = Vec::new();
     let mut t_ms: u64 = 0;
     // 300 000 points, 0 to 40 ms apart: about 6 000 s, so the hour and the
     // minute windows both cut inside the data.
     for _ in 0..300_000 {
         t_ms += rng.below(41);
         #[allow(clippy::cast_possible_truncation)]
+        let account = rng.below(ACCOUNTS.len() as u64) as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let op = rng.below(OPS.len() as u64) as usize;
         #[allow(clippy::cast_precision_loss)]
         let v = rng.below(10_000) as f64 / 7.0;
-        let s = segs(v);
-        store.record(ACCOUNT, OPS[op], &s, epoch + Duration::from_millis(t_ms));
-        points.push((op, t_ms, s));
+        let segs = segs(v);
+        store.record(
+            ACCOUNTS[account],
+            OPS[op],
+            &segs,
+            epoch + Duration::from_millis(t_ms),
+        );
+        points.push(Point {
+            account,
+            op,
+            t_ms,
+            segs,
+        });
     }
     let windows = [
         (TimeWindow::LastMinute, 60, 1),
@@ -115,80 +143,97 @@ fn random_workload_matches_naive_reference() {
         (TimeWindow::LastHour, 3600, 60),
         (TimeWindow::LastDay, 86400, 60),
     ];
+    let filters = [None, Some(0), Some(1), Some(2)];
     for now_ms in [t_ms, t_ms + 500, t_ms + 59_500, t_ms + 61_000] {
         let now = epoch + Duration::from_millis(now_ms);
         let now_secs = now_ms / 1000;
         for (window, w, b) in windows {
-            let out = store.query(window, None, now);
             let first_slot = now_secs.saturating_sub(w) / b;
-            for (i, op) in OPS.iter().enumerate() {
-                let mut count = 0u64;
-                let mut sum = LatencySegments::default();
-                let mut exact_w = 0u64;
-                let mut exact_w_plus_b = 0u64;
-                for (p_op, p_ms, s) in &points {
-                    if *p_op != i {
-                        continue;
-                    }
-                    if *p_ms + w * 1000 >= now_ms {
-                        exact_w += 1;
-                    }
-                    if *p_ms + (w + b) * 1000 >= now_ms {
-                        exact_w_plus_b += 1;
-                    }
-                    if (*p_ms / 1000) / b >= first_slot {
-                        count += 1;
-                        sum.auth_us += s.auth_us;
-                        sum.authz_us += s.authz_us;
-                        sum.throttle_us += s.throttle_us;
-                        sum.dispatch_us += s.dispatch_us;
-                        sum.response_us += s.response_us;
-                        sum.total_us += s.total_us;
-                    }
-                }
-                let got = out.iter().find(|o| &o.operation == op);
-                if count == 0 {
-                    assert!(
-                        got.is_none(),
-                        "{op} {window:?} at {now_ms}: expected absent"
-                    );
-                    continue;
-                }
-                let got = got.unwrap_or_else(|| panic!("{op} {window:?} at {now_ms}: missing"));
-                assert_eq!(got.count, count, "{op} {window:?} at {now_ms}: count");
-                assert!(
-                    exact_w <= count && count <= exact_w_plus_b,
-                    "{op} {window:?} at {now_ms}: {exact_w} <= {count} <= {exact_w_plus_b}"
-                );
-                #[allow(clippy::cast_precision_loss)]
-                let c = count as f64;
-                let close = |a: f64, b: f64| ((a - b) / b).abs() < 1e-9;
-                assert!(
-                    close(got.avg.auth_us, sum.auth_us / c),
-                    "{op} {window:?} auth"
-                );
-                assert!(
-                    close(got.avg.authz_us, sum.authz_us / c),
-                    "{op} {window:?} authz"
-                );
-                assert!(
-                    close(got.avg.throttle_us, sum.throttle_us / c),
-                    "{op} {window:?} throttle"
-                );
-                assert!(
-                    close(got.avg.dispatch_us, sum.dispatch_us / c),
-                    "{op} {window:?} dispatch"
-                );
-                assert!(
-                    close(got.avg.response_us, sum.response_us / c),
-                    "{op} {window:?} response"
-                );
-                assert!(
-                    close(got.avg.total_us, sum.total_us / c),
-                    "{op} {window:?} total"
+            for account in filters {
+                let out = store.query(window, account.map(|a| ACCOUNTS[a]), now);
+                assert_matches_reference(
+                    &out,
+                    &points,
+                    account,
+                    (window, w, b),
+                    now_ms,
+                    first_slot,
                 );
             }
         }
+    }
+}
+
+/// Checks `out`, the store's answer for the window `(window, w, b)` at
+/// `now_ms`, against the points of `account` (every account when `None`)
+/// summed by hand: the count is exact, the means agree to 1e-9, and the
+/// count lies between the exact `w` and `w + b` second windows.
+fn assert_matches_reference(
+    out: &[OperationSegments],
+    points: &[Point],
+    account: Option<usize>,
+    (window, w, b): (TimeWindow, u64, u64),
+    now_ms: u64,
+    first_slot: u64,
+) {
+    for (i, op) in OPS.iter().enumerate() {
+        let label = format!(
+            "{op} {window:?} at {now_ms} ms, account filter {}",
+            account.map_or("none", |a| ACCOUNTS[a])
+        );
+        let mut count = 0u64;
+        let mut sum = LatencySegments::default();
+        let mut exact_w = 0u64;
+        let mut exact_w_plus_b = 0u64;
+        for p in points {
+            if p.op != i || account.is_some_and(|a| p.account != a) {
+                continue;
+            }
+            if p.t_ms + w * 1000 >= now_ms {
+                exact_w += 1;
+            }
+            if p.t_ms + (w + b) * 1000 >= now_ms {
+                exact_w_plus_b += 1;
+            }
+            if (p.t_ms / 1000) / b >= first_slot {
+                count += 1;
+                sum.auth_us += p.segs.auth_us;
+                sum.authz_us += p.segs.authz_us;
+                sum.throttle_us += p.segs.throttle_us;
+                sum.dispatch_us += p.segs.dispatch_us;
+                sum.response_us += p.segs.response_us;
+                sum.total_us += p.segs.total_us;
+            }
+        }
+        let got = out.iter().find(|o| &o.operation == op);
+        if count == 0 {
+            assert!(got.is_none(), "{label}: expected absent");
+            continue;
+        }
+        let got = got.unwrap_or_else(|| panic!("{label}: missing"));
+        assert_eq!(got.count, count, "{label}: count");
+        assert!(
+            exact_w <= count && count <= exact_w_plus_b,
+            "{label}: {exact_w} <= {count} <= {exact_w_plus_b}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let c = count as f64;
+        let close = |a: f64, b: f64| ((a - b) / b).abs() < 1e-9;
+        assert!(close(got.avg.auth_us, sum.auth_us / c), "{label}: auth");
+        assert!(close(got.avg.authz_us, sum.authz_us / c), "{label}: authz");
+        assert!(
+            close(got.avg.throttle_us, sum.throttle_us / c),
+            "{label}: throttle"
+        );
+        assert!(
+            close(got.avg.dispatch_us, sum.dispatch_us / c),
+            "{label}: dispatch"
+        );
+        assert!(
+            close(got.avg.response_us, sum.response_us / c),
+            "{label}: response"
+        );
+        assert!(close(got.avg.total_us, sum.total_us / c), "{label}: total");
     }
 }
 
@@ -449,6 +494,12 @@ fn operations_sorted_and_zero_count_absent() {
     let out = store.query(TimeWindow::AllTime, None, at(epoch, 1000));
     let names: Vec<&str> = out.iter().map(|o| o.operation.as_str()).collect();
     assert_eq!(names, ["GetItem", "PutItem", "Scan"]);
+    // An account that sent nothing has no buckets to read.
+    assert!(
+        store
+            .query(TimeWindow::AllTime, Some(ACCOUNTS[1]), at(epoch, 1000))
+            .is_empty()
+    );
 }
 
 /// Write-path and read-path cost of the previous one-point-per-request
