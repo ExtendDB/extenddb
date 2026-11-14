@@ -8,8 +8,8 @@
 //! window with `ResourceInUseException` and the sentence `Attempt to change a
 //! resource which is still in use: Table is being deleted: <name>` (measured
 //! 2026-10-24). On this backend `DeleteTable` drops the data and the catalog
-//! row in one call and never sets `DELETING` itself; the abandoned-restore
-//! sweep does. The window is produced here by setting the row's status
+//! row in one call and never sets `DELETING` itself; the removal of a restore
+//! target does. The window is produced here by setting the row's status
 //! directly.
 //!
 //! The catalog keyspace is shared by every test in this binary, and the

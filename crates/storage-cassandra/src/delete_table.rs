@@ -79,7 +79,7 @@ impl CassandraEngine {
         match caller {
             DeleteTableCaller::Client => {
                 // A DELETING row belongs to the deletion already under way
-                // (the abandoned-restore sweep sets it on this backend). The
+                // (the removal of a restore target sets it on this backend). The
                 // service refuses a second DeleteTable in that window as a
                 // table still in use (measured 2026-10-24); checked before
                 // deletion protection, as the SQL backends order it.

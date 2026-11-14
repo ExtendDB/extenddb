@@ -31,12 +31,13 @@ use crate::catalog_json::from_catalog_json;
 /// predicates carry the collation explicitly; only the index use differs.
 const TEXT_KEY: &str = "TEXT COLLATE \"C\"";
 
-/// The status the data plane classifies a `tables` row by. The restore sweep
-/// claims an abandoned restore target by marking it `DELETING` with the epoch
-/// as its transition time (`abort_restore`), a time no `DeleteTable` mark
-/// carries. That row is read as the `CREATING` restore target it was, which
-/// the data plane answers as not found, as the service answers a table it is
-/// still restoring; a row `DeleteTable` marked is served until it is gone.
+/// The status the data plane classifies a `tables` row by. `abort_restore`
+/// claims a restore target under removal (the backup reconciler's, or a failed
+/// restore's own) by marking it `DELETING` with the epoch as its transition
+/// time, a time no `DeleteTable` mark carries. That row is read as the
+/// `CREATING` restore target it was, which the data plane answers as not
+/// found, as the service answers a table it is still restoring; a row
+/// `DeleteTable` marked is served until it is gone.
 const DATA_PLANE_STATUS: &str = "CASE WHEN table_status = 'DELETING' \
      AND status_transition_at = 'epoch' THEN 'CREATING' ELSE table_status END";
 use crate::PostgresEngine;
