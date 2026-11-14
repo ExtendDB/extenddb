@@ -409,7 +409,7 @@ def test_update_item_condition_only_deep_eav_rejected(
     ExpressionAttributeValues map on the single-item write paths, not just the
     values a SET action stores.
 
-    Measured 2026-08-24 (us-east-1, acct 964157134968): a 33-level
+    Measured 2026-08-24 (us-east-1, acct 444455556666): a 33-level
     condition-only EAV is rejected on PutItem, DeleteItem, and UpdateItem
     alike, and 31 levels is accepted. An earlier version of this test asserted
     acceptance, citing a live check; re-measuring on all three operations

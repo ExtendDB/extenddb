@@ -49,7 +49,7 @@ pub(crate) async fn poll_control_plane_transitions<S: SettingsStore + ?Sized>(
             .flatten()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|&v| v >= 0.0)
-            .unwrap_or(0.25);
+            .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(delay + MARGIN_SECS);
         loop {
             match storage.process_control_plane_transitions().await {
@@ -289,12 +289,12 @@ async fn sweep_expired_items(
                 Err(e) => tracing::warn!("TTL worker: delete failed for {table_name}: {e}"),
                 Ok(_) => {
                     deleted += 1;
-                    metrics.record_ttl_deletion(table_name);
+                    metrics.record_ttl_deletion(account_id, table_name);
                     if let Some(s) = staleness {
                         // Staleness seconds are small and well within f64's
                         // exact-integer range; used only for telemetry.
                         #[allow(clippy::cast_precision_loss)]
-                        metrics.record_ttl_staleness(table_name, s as f64);
+                        metrics.record_ttl_staleness(account_id, table_name, s as f64);
                     }
                 }
             }
@@ -680,7 +680,7 @@ mod poison_row_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         // A row whose context parses but whose target index is gone is
         // applied-as-skip (Ok), so on the SECOND pass it drains cleanly.
@@ -738,7 +738,7 @@ mod poison_row_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         // Poison row: malformed index_context. ready_at defaults to now (due).
         sqlx::query(
@@ -780,7 +780,7 @@ mod poison_row_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         // Poison row (bad context) + a second poison row: both must drain.
         sqlx::query(
@@ -841,7 +841,7 @@ mod vector_propagation_tests {
         let engine = SqliteEngine::new(db, 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)

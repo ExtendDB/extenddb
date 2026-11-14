@@ -82,3 +82,53 @@ pub enum UpdateAction {
     /// `DELETE path value` — removes elements from a set.
     Delete { path: Vec<PathElement>, value: Expr },
 }
+
+impl UpdateAction {
+    /// Whether this action can only take data away: `REMOVE` or `DELETE`.
+    #[must_use]
+    pub fn removes_only(&self) -> bool {
+        matches!(self, Self::Remove { .. } | Self::Delete { .. })
+    }
+}
+
+/// Whether an update made of these actions writes nothing when the item does
+/// not exist.
+///
+/// Amazon DynamoDB creates the item for `SET`, `ADD`, and for an update with
+/// no actions at all (a key-only item), but an update whose actions are all
+/// `REMOVE` or `DELETE` on a missing key leaves the table unchanged: no item,
+/// no stream record, no `Attributes` in the response for any `ReturnValues`
+/// (measured 2026-10-24, us-east-1, hash and hash-plus-range tables).
+#[must_use]
+pub fn removes_only(actions: &[UpdateAction]) -> bool {
+    !actions.is_empty() && actions.iter().all(UpdateAction::removes_only)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::removes_only;
+    use crate::expression::tokenizer::tokenize;
+    use crate::expression::update_parser::parse_update;
+
+    fn actions(expr: &str) -> Vec<super::UpdateAction> {
+        parse_update(&tokenize(expr).expect("tokens")).expect("actions")
+    }
+
+    #[test]
+    fn remove_and_delete_actions_remove_only() {
+        assert!(removes_only(&actions("REMOVE a")));
+        assert!(removes_only(&actions("REMOVE a, b")));
+        assert!(removes_only(&actions("REMOVE a.b[0]")));
+        assert!(removes_only(&actions("DELETE s :v")));
+        assert!(removes_only(&actions("REMOVE a DELETE s :v")));
+    }
+
+    #[test]
+    fn set_add_or_no_actions_create_the_item() {
+        assert!(!removes_only(&[]));
+        assert!(!removes_only(&actions("SET a = :v")));
+        assert!(!removes_only(&actions("ADD n :v")));
+        assert!(!removes_only(&actions("REMOVE a SET b = :v")));
+        assert!(!removes_only(&actions("DELETE s :v ADD n :w")));
+    }
+}
