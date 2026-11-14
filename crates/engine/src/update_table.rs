@@ -281,8 +281,8 @@ pub async fn handle_update_table(
 }
 
 /// Enabling a stream requires a view type. The sentence is the service's
-/// (measured 2026-10-24 on a never-streamed table and on a table whose stream
-/// is enabled). The service reports a defective index Create and a missing
+/// ([`extenddb_storage::stream_lineage::STREAM_VIEW_TYPE_REQUIRED`]). The
+/// service reports a defective index Create and a missing
 /// ProvisionedThroughput before this (measured 2026-10-25), and this before
 /// the table lookup, so the call sits after the billing and index rules and
 /// before the backend call, where it also precedes the already-enabled
@@ -293,7 +293,7 @@ fn validate_stream_specification(input: &UpdateTableInput) -> Result<(), DynamoD
         && spec.stream_view_type.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required".to_owned(),
+            extenddb_storage::stream_lineage::STREAM_VIEW_TYPE_REQUIRED.to_owned(),
         ));
     }
     Ok(())

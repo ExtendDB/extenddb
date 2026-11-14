@@ -34,6 +34,13 @@ use crate::util::{
 /// Fixed shards per stream (hash-based partition-key assignment).
 pub const SHARDS_PER_STREAM: u32 = 4;
 
+/// The service's refusal of an `UpdateTable` that enables a stream without a
+/// `StreamViewType` (measured 2026-10-24 on a never-streamed table and on a
+/// table whose stream is enabled). The engine answers it before storage is
+/// called; [`stream_change`] answers it for a caller that reaches storage
+/// without that check.
+pub const STREAM_VIEW_TYPE_REQUIRED: &str = "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required";
+
 /// A `CreateTable` request with a disabled `StreamSpecification` dropped.
 ///
 /// The service does not store `{StreamEnabled: false}`: `DescribeTable` on
@@ -87,15 +94,11 @@ pub fn stream_change(
         ))),
         // Unreachable through the engine, whose `validate_stream_specification`
         // refuses an enable without a view type before storage with this same
-        // sentence (measured 2026-10-24), and before the already-enabled check.
+        // sentence, and before the already-enabled check.
         (true, false) => requested
             .stream_view_type
             .map(StreamChange::Enable)
-            .ok_or_else(|| {
-                StorageError::Validation(
-                    "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required".to_owned(),
-                )
-            }),
+            .ok_or_else(|| StorageError::Validation(STREAM_VIEW_TYPE_REQUIRED.to_owned())),
         (false, true) => Ok(StreamChange::Disable),
     }
 }
