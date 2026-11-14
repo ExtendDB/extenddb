@@ -7,6 +7,7 @@
 //! inputs, dispatches operations by name, and translates storage errors into
 //! `DynamoDB`-format error responses.
 
+mod attribute_updates;
 mod backup;
 pub use backup::{
     BackupRuntime, ConfiguredStore, HeldClaim, JobSettings, KillPoint, LOCAL_CHECK_TIMEOUT,
@@ -37,6 +38,7 @@ mod legacy_filter;
 mod list_tables;
 #[cfg(feature = "partiql")]
 mod partiql;
+mod per_table_capacity;
 pub mod private_fs;
 mod put_item;
 mod query;

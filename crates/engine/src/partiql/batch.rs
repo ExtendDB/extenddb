@@ -791,13 +791,11 @@ mod tests {
 
     #[test]
     fn a_refusal_of_the_translated_request_is_the_statements_own() {
-        // The statement checks refuse a call in a SET value and an empty bag
-        // before the translation. Without them, `update_refusal` refuses the
-        // call when the classic parser reads the update expression, and the
-        // bag when it reads back the values of the request. `insert_refusal`
-        // refuses the bag when it reads back the item.
+        // The statement checks refuse an empty bag before the translation.
+        // Without them, `update_refusal` refuses the bag when it reads back
+        // the values of the request, and `insert_refusal` when it reads back
+        // the item.
         for sql in [
-            "UPDATE \"t\" SET a = size(m) WHERE pk = 'k'",
             "UPDATE \"t\" SET v = <<>> WHERE pk = 'k'",
             "INSERT INTO \"t\" VALUE {'pk': 'k', 'v': <<>>}",
         ] {
@@ -808,9 +806,19 @@ mod tests {
                 Err(error) => panic!("{sql}: the request failed with {error:?}"),
             }
         }
-        assert!(matches!(
-            translated("UPDATE \"t\" SET a = 1 WHERE pk = 'k'"),
-            Ok(Translation::Runs { key: Some(_) })
-        ));
+        // An update expression the classic grammar accepts translates, also
+        // when the semantic pass refuses it: UpdateItem refuses it when the
+        // statement runs, after the condition (see `write::update_refusal`).
+        // The statement checks refuse a call such as `size(m)` in a SET value
+        // before the translation.
+        for sql in [
+            "UPDATE \"t\" SET a = 1 WHERE pk = 'k'",
+            "UPDATE \"t\" SET a = list_append(l, 1) WHERE pk = 'k'",
+        ] {
+            assert!(
+                matches!(translated(sql), Ok(Translation::Runs { key: Some(_) })),
+                "{sql}"
+            );
+        }
     }
 }

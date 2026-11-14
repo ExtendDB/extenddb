@@ -395,7 +395,11 @@ pub(crate) fn check_table_name(stmt: &Statement) -> Result<(), String> {
 /// The messages the update evaluation raises ("The document path provided in
 /// the update expression is invalid for update", "An operand in the update
 /// expression has an incorrect data type") carry no prefix on either side, and
-/// no other prefixed message was measured.
+/// no other prefixed message was measured. The `1 validation error detected: `
+/// that PutItem, UpdateItem and DeleteItem put in front of their
+/// expression-stage messages goes first (see
+/// `expression_helpers::single_item_write_prefix`): a statement names no
+/// expression, and the dual-target PartiQL suites pin those messages bare.
 pub(crate) fn bare_expression_error(err: DynamoDbError) -> DynamoDbError {
     const PREFIXES: [&str; 5] = [
         "Invalid FilterExpression: ",
@@ -404,7 +408,7 @@ pub(crate) fn bare_expression_error(err: DynamoDbError) -> DynamoDbError {
         "Invalid UpdateExpression: ",
         "Invalid ProjectionExpression: ",
     ];
-    match err {
+    match crate::expression_helpers::strip_single_item_write_prefix(err) {
         DynamoDbError::ValidationException(message) => {
             let bare = PREFIXES
                 .iter()
@@ -473,6 +477,31 @@ mod tests {
             let err = DynamoDbError::ValidationException(format!("Invalid {kind}: {sentence}"));
             assert_eq!(message(bare_expression_error(err)), sentence, "{kind}");
         }
+    }
+
+    #[test]
+    fn the_single_item_write_wrapper_is_dropped_with_the_prefix() {
+        let sentence = "Two document paths overlap with each other; must remove or rewrite \
+                        one of these paths; path one: [a], path two: [a]";
+        let wrapped = crate::expression_helpers::single_item_write_prefix(
+            DynamoDbError::ValidationException(format!("Invalid UpdateExpression: {sentence}")),
+        );
+        assert_eq!(
+            message(wrapped.clone()),
+            format!("1 validation error detected: Invalid UpdateExpression: {sentence}")
+        );
+        assert_eq!(message(bare_expression_error(wrapped)), sentence);
+        // A message the wrapper did not add keeps its `1 validation error
+        // detected: `.
+        let enum_refusal = "1 validation error detected: Value 'X' at 'returnValues' failed to \
+                            satisfy constraint: Member must satisfy enum value set: [NONE, \
+                            ALL_OLD]";
+        assert_eq!(
+            message(bare_expression_error(DynamoDbError::ValidationException(
+                enum_refusal.to_owned()
+            ))),
+            enum_refusal
+        );
     }
 
     #[test]

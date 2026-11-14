@@ -149,6 +149,7 @@ async fn stream_table_in(
         global_secondary_indexes: Vec::new(),
         local_secondary_indexes: Vec::new(),
         stream_specification: desc.stream_specification,
+        creation_date_time: 0.0,
     }
 }
 

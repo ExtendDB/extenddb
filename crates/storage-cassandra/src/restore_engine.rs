@@ -152,6 +152,9 @@ impl CassandraEngine {
             local_secondary_indexes: Vec::new(),
             stream_specification: None,
             vector_indexes: Vec::new(),
+            // Only the transaction capacity order reads the creation time,
+            // and a restore runs no transaction.
+            creation_date_time: 0.0,
         })
     }
 

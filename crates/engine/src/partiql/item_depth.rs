@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use extenddb_core::error::DynamoDbError;
-use extenddb_core::expression::{Expr, ExpressionMaps, apply_update_validated, evaluate_condition};
+use extenddb_core::expression::{
+    Expr, ExpressionKind, ExpressionMaps, apply_update_validated, evaluate_condition,
+};
 use extenddb_core::partiql::Statement;
 use extenddb_core::partiql::ast::{Operand, UpdateStatement};
 use extenddb_core::partiql::params::NESTING_MESSAGE;
@@ -41,7 +43,9 @@ use super::common;
 use super::write::{UpdateParts, build_update_parts};
 use crate::OperationContext;
 use crate::create_table::{storage_err_to_dynamo, storage_err_to_dynamo_with_ccf};
-use crate::expression_helpers::{build_expression_maps, parse_condition_expr, parse_update_expr};
+use crate::expression_helpers::{
+    build_expression_maps, parse_condition_checked, parse_update_expr_checked,
+};
 use crate::transact_write_helpers::validate_no_key_updates;
 
 /// The item check's message on a PartiQL write (measured 2026-11-02).
@@ -143,9 +147,17 @@ async fn evaluate_without_writing(
     let names: HashMap<String, String> = from_wire(&parts.names)?;
     let values: HashMap<String, AttributeValue> = from_wire(&parts.values)?;
     let maps = build_expression_maps(Some(&names), Some(&values));
-    let actions = parse_update_expr(&parts.update_expression, &ctx.limits)?;
+    // `update_item` checks the whole condition, syntax then semantics, before
+    // the update expression, and both before the key-update refusal.
+    let condition = parse_condition_checked(
+        &parts.condition,
+        &maps,
+        &ctx.limits,
+        true,
+        ExpressionKind::Condition,
+    )?;
+    let actions = parse_update_expr_checked(&parts.update_expression, &maps, &ctx.limits)?;
     validate_no_key_updates(&actions, &key_info, &maps)?;
-    let condition = parse_condition_expr(&parts.condition, &ctx.limits)?;
 
     // The condition is evaluated against the stored item, or an empty one, and
     // the update applied to the stored item, as `update_item` does.
@@ -356,7 +368,8 @@ impl MemberTarget {
             return Ok(None);
         };
         let maps = build_expression_maps(Some(&self.names), Some(&self.values));
-        let condition = parse_condition_expr(text, &ctx.limits)?;
+        let condition =
+            parse_condition_checked(text, &maps, &ctx.limits, true, ExpressionKind::Condition)?;
         match stored_item_if_condition_holds(
             ctx,
             &self.key_info,

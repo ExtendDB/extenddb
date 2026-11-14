@@ -5,8 +5,11 @@
 
 Amazon DynamoDB rejects a request that provides ExpressionAttributeNames or
 ExpressionAttributeValues when there is no expression parameter that could
-reference them. The names message is always suffix-free; the values message
-names the null value-capable expression parameter(s) for that API.
+reference them. The names message is always suffix-free. On the read APIs the
+values message names the null value-capable expression parameter(s) for that
+API (Scan: "FilterExpression is null"; Query: none). PutItem, UpdateItem, and
+DeleteItem give both messages suffix-free and wrapped in
+"1 validation error detected: " (measured 2026-10-14).
 
 Dual-target against Amazon DynamoDB and extenddb.
 """
@@ -19,6 +22,7 @@ from botocore.exceptions import ClientError
 from conftest import scoped_table
 
 NAMES_MSG = "ExpressionAttributeNames can only be specified when using expressions"
+SINGLE_ITEM = "1 validation error detected: "
 VALUES_PREFIX = "ExpressionAttributeValues can only be specified when using expressions"
 
 
@@ -92,7 +96,7 @@ class TestExpressionParamsWithoutExpression:
                 Key={"pk": {"S": "k1"}},
                 ExpressionAttributeNames={"#a": "foo"},
             ),
-            NAMES_MSG,
+            SINGLE_ITEM + NAMES_MSG,
         )
 
     def test_delete_item_values_no_expression(self, dynamodb_client, hash_table):
@@ -102,7 +106,7 @@ class TestExpressionParamsWithoutExpression:
                 Key={"pk": {"S": "k1"}},
                 ExpressionAttributeValues={":v": {"S": "x"}},
             ),
-            f"{VALUES_PREFIX}: ConditionExpression is null",
+            SINGLE_ITEM + VALUES_PREFIX,
         )
 
     def test_update_item_names_no_expression(self, dynamodb_client, hash_table):
@@ -112,7 +116,7 @@ class TestExpressionParamsWithoutExpression:
                 Key={"pk": {"S": "k1"}},
                 ExpressionAttributeNames={"#a": "foo"},
             ),
-            NAMES_MSG,
+            SINGLE_ITEM + NAMES_MSG,
         )
 
     def test_update_item_values_no_expression(self, dynamodb_client, hash_table):
@@ -122,7 +126,7 @@ class TestExpressionParamsWithoutExpression:
                 Key={"pk": {"S": "k1"}},
                 ExpressionAttributeValues={":v": {"S": "x"}},
             ),
-            f"{VALUES_PREFIX}: UpdateExpression and ConditionExpression are null",
+            SINGLE_ITEM + VALUES_PREFIX,
         )
 
     def test_put_item_names_no_expression(self, dynamodb_client, hash_table):
@@ -132,7 +136,7 @@ class TestExpressionParamsWithoutExpression:
                 Item={"pk": {"S": "k2"}},
                 ExpressionAttributeNames={"#a": "foo"},
             ),
-            NAMES_MSG,
+            SINGLE_ITEM + NAMES_MSG,
         )
 
     def test_put_item_values_no_expression(self, dynamodb_client, hash_table):
@@ -142,7 +146,7 @@ class TestExpressionParamsWithoutExpression:
                 Item={"pk": {"S": "k2"}},
                 ExpressionAttributeValues={":v": {"S": "x"}},
             ),
-            f"{VALUES_PREFIX}: ConditionExpression is null",
+            SINGLE_ITEM + VALUES_PREFIX,
         )
 
     def test_query_names_no_expression(self, dynamodb_client, hash_table):
