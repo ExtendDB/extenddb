@@ -1,57 +1,1265 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backup and point-in-time recovery implementation for `PostgreSQL` storage.
+//! The in-catalog backup format on `PostgreSQL`: the create, describe, list,
+//! delete, restore-source and restore paths of [`LegacyBackupReader`], frozen
+//! apart from the restore's registration, which writes the restore job
+//! fields and holds the job claim ([`ClaimSession`]) the catalog index's jobs
+//! hold too (`backup_catalog.rs`). `extenddb backup migrate-legacy` reads a
+//! backup through `items` (a copy of the restore's snapshot read) and ends
+//! with `replace_with_index_row`, which inserts the catalog index row and
+//! deletes the `backups` row (its items and definition with it) in one
+//! transaction under the row lock the delete and the registration take, so
+//! a DELETED `backups` row is always a DeleteBackup's.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use extenddb_core::types::{
-    BackupDescription, BackupDetails, BackupSummary, ContinuousBackupsDescription,
-    PointInTimeRecoveryDescription, SourceTableDetails, TableDescription,
+    AttributeDefinition, BackupDescription, BackupDetails, BackupSummary, GsiInput, Item,
+    KeySchemaElement, LsiInput, Projection, RestoreSummary, ScalarAttributeType,
+    SourceTableDetails, StreamSpecification, TableDescription,
 };
-use extenddb_storage::BackupEngine;
+use extenddb_storage::backup_catalog::{
+    AbandonedLegacyBackup, BackupRow, BackupStatus, JOB_HEARTBEAT_INTERVAL, JobBound,
+    LegacyBackupItems, LegacyBackupKey, Replaced, StoreIdentity, limit_exceeded_message,
+    new_generation,
+};
+use extenddb_storage::backup_definition::{
+    BACKUP_DEFINITION_VERSION, BackupTableDefinition, COPY_BATCH_BYTES, COPY_BATCH_ITEMS,
+    LegacyVectorState, throughput_from_catalog,
+};
 use extenddb_storage::error::StorageError;
+use extenddb_storage::util::{
+    SortKeyValue, backup_arn, backup_id_epoch_millis, composite_pk_to_text, new_backup_id,
+    parse_sk, sk_column_n,
+};
+use extenddb_storage::{BackupRestoreSource, JobPermit, LegacyBackupReader, RestoreRequest};
 use futures::future::BoxFuture;
 
 use crate::PostgresEngine;
-use crate::data::data_table_name;
+use crate::catalog_json::{escape_json, from_catalog_json, to_catalog_json, unescape_json};
+use crate::create_table::{RestoreRegistration, RestoreSource};
+use crate::data::{
+    all_sort_key_info, data_table_name, index_table_name, insert_index_rows_multi,
+    item_has_index_keys, project_item_for_index, table_storage_relations,
+};
 
-/// Current epoch milliseconds, used as the leading component of a backup id.
-fn epoch_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-/// Build the trailing `backup/<id>` component of a backup ARN.
+/// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`, keeping the
+/// sub-second part.
 ///
-/// `DynamoDB` formats this as `<epoch_millis>-<8 hex chars>` (for example
-/// `01489602797149-73d8d5bc`). The random component is part of the identifier,
-/// not decoration: a timestamp alone makes a backup id derivable by anyone who
-/// knows roughly when the backup ran, so the id is only a usable handle for a
-/// caller that was given it.
-fn backup_id() -> String {
-    use rand::Rng;
-    let suffix: u32 = rand::rng().random();
-    format!("{ts}-{suffix:08x}", ts = epoch_millis())
-}
-
-/// Convert a `PostgreSQL` `TIMESTAMPTZ` to epoch seconds as `f64`.
-#[allow(clippy::cast_precision_loss)]
+/// A whole-millisecond instant (every backup created since the shared backup
+/// id) is converted as `millis / 1000`, the same expression
+/// `util::backup_creation_date_time` uses on the id, so the time reported for
+/// a backup and the time embedded in its ARN are the same `f64`.
+#[allow(clippy::cast_precision_loss)] // epoch ns/ms fit f64 to well under a microsecond
 fn pg_timestamp_to_epoch(ts: time::OffsetDateTime) -> f64 {
-    ts.unix_timestamp() as f64
+    let nanos = ts.unix_timestamp_nanos();
+    if nanos % 1_000_000 == 0 {
+        (nanos / 1_000_000) as f64 / 1000.0
+    } else {
+        nanos as f64 / 1e9
+    }
 }
 
-impl BackupEngine for PostgresEngine {
-    fn create_backup(
+/// Seed for the 64-bit job lock keys: a restore's lock on its target name
+/// and a backup job's lock on its backup id share this one key space. The
+/// locks use the single-`bigint` advisory lock form, which PostgreSQL keeps
+/// in a key space separate from the two-`int4` form the migration and
+/// vector-build locks use, so they cannot meet; the seed keeps this key
+/// space distinct from any other `bigint` user. Public for the tests that
+/// hold or look up a lock; not an interface.
+#[doc(hidden)]
+pub const RESTORE_LOCK_SEED: i64 = 0x0045_4452; // 'E', 'D', 'R'
+
+/// A secondary index of a restore target, as the copy needs it.
+pub(crate) struct RestoreIndex {
+    pub(crate) table: String,
+    pub(crate) key_schema: Vec<KeySchemaElement>,
+    pub(crate) projection: Projection,
+}
+
+/// The secondary indexes of `table_id` as the catalog records them, each
+/// with the data table its rows go into.
+pub(crate) async fn restore_indexes(
+    pool: &sqlx::PgPool,
+    table_id: &str,
+) -> Result<Vec<RestoreIndex>, StorageError> {
+    let index_rows: Vec<(String, serde_json::Value, serde_json::Value)> =
+        sqlx::query_as("SELECT index_id, key_schema, projection FROM indexes WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?;
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for (index_id, ks, proj) in index_rows {
+        indexes.push(RestoreIndex {
+            table: index_table_name(&index_id),
+            key_schema: from_catalog_json(ks)
+                .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?,
+            projection: from_catalog_json(proj)
+                .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?,
+        });
+    }
+    Ok(indexes)
+}
+
+/// Why [`insert_restore_rows`] stopped: the base table refused a key it
+/// already holds (the backup carries a key twice), or anything else. The
+/// legacy copy reports both as the database error ([`From`]); the
+/// store-backed load names the data file for the first.
+pub(crate) enum RowInsertError {
+    DuplicateKey(sqlx::Error),
+    Storage(StorageError),
+}
+
+impl From<StorageError> for RowInsertError {
+    fn from(e: StorageError) -> Self {
+        Self::Storage(e)
+    }
+}
+
+impl From<RowInsertError> for StorageError {
+    fn from(e: RowInsertError) -> Self {
+        match e {
+            RowInsertError::DuplicateKey(e) => db_err(e),
+            RowInsertError::Storage(e) => e,
+        }
+    }
+}
+
+/// SQLSTATE `unique_violation`.
+const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
+
+/// A restore target as the row writes need it, built once per restore: the
+/// base data table, the key shape, and the secondary indexes with their
+/// data tables. `source` names the backup or data file in errors.
+pub(crate) struct RestoreTarget<'a> {
+    pub(crate) ddb_table: String,
+    pub(crate) key_schema: &'a [KeySchemaElement],
+    pub(crate) attribute_definitions: &'a [extenddb_core::types::AttributeDefinition],
+    pub(crate) sort_keys: Vec<(&'a str, ScalarAttributeType)>,
+    pub(crate) indexes: Vec<RestoreIndex>,
+    pub(crate) source: String,
+}
+
+impl<'a> RestoreTarget<'a> {
+    /// The target `table_id` with `key_schema` and `attribute_definitions`,
+    /// its indexes read from the catalog.
+    pub(crate) async fn load(
+        pool: &sqlx::PgPool,
+        table_id: &str,
+        key_schema: &'a [KeySchemaElement],
+        attribute_definitions: &'a [extenddb_core::types::AttributeDefinition],
+        source: String,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            ddb_table: data_table_name(table_id),
+            key_schema,
+            attribute_definitions,
+            sort_keys: all_sort_key_info(key_schema, attribute_definitions),
+            indexes: restore_indexes(pool, table_id).await?,
+            source,
+        })
+    }
+}
+
+/// Write one batch of restored items inside `tx`: one multi-row INSERT into
+/// the base table, then one multi-row INSERT into each secondary index for
+/// the batch's items that carry that index's keys. Plain INSERTs: two rows
+/// for one key fail the statement rather than collapsing into one item.
+pub(crate) async fn insert_restore_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    target: &RestoreTarget<'_>,
+    batch: &[(Item, String)],
+) -> Result<(), RowInsertError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let RestoreTarget {
+        ddb_table,
+        key_schema,
+        attribute_definitions,
+        sort_keys,
+        indexes,
+        source,
+    } = target;
+    let mut cols = vec!["pk".to_owned()];
+    cols.extend(
+        sort_keys
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, t))| sk_column_n(i, t)),
+    );
+    cols.push("item_data".to_owned());
+    let width = cols.len();
+    // The last column is the item, bound as text and cast in SQL.
+    let tuples: Vec<String> = (0..batch.len())
+        .map(|r| {
+            let ps: Vec<String> = (1..=width)
+                .map(|c| {
+                    if c == width {
+                        format!("${}::jsonb", r * width + c)
+                    } else {
+                        format!("${}", r * width + c)
+                    }
+                })
+                .collect();
+            format!("({})", ps.join(", "))
+        })
+        .collect();
+    let sql = format!(
+        "INSERT INTO {ddb_table} ({}) VALUES {}",
+        cols.join(", "),
+        tuples.join(", ")
+    );
+    let mut query = sqlx::query(&sql);
+    for (item, item_json) in batch {
+        query = query.bind(composite_pk_to_text(item, key_schema)?);
+        for &(name, sk_type) in sort_keys {
+            let value = item.get(name).ok_or_else(|| {
+                StorageError::Internal(format!("{source} has an item without sort key {name}"))
+            })?;
+            query = match parse_sk(value, sk_type)? {
+                SortKeyValue::S(v) => query.bind(v),
+                SortKeyValue::N(v) => query.bind(v),
+                SortKeyValue::B(v) => query.bind(v),
+            };
+        }
+        query = query.bind(item_json.as_str());
+    }
+    query.execute(&mut **tx).await.map_err(|e| {
+        let duplicate = e
+            .as_database_error()
+            .and_then(|d| d.code())
+            .is_some_and(|code| code == SQLSTATE_UNIQUE_VIOLATION);
+        if duplicate {
+            RowInsertError::DuplicateKey(e)
+        } else {
+            RowInsertError::Storage(db_err(e))
+        }
+    })?;
+
+    for idx in indexes {
+        let idx_sks = all_sort_key_info(&idx.key_schema, attribute_definitions);
+        let projected: Vec<(&Item, Item)> = batch
+            .iter()
+            .filter(|(item, _)| item_has_index_keys(item, &idx.key_schema))
+            .map(|(item, _)| {
+                (
+                    item,
+                    project_item_for_index(item, &idx.key_schema, key_schema, &idx.projection),
+                )
+            })
+            .collect();
+        let rows: Vec<(&Item, &Item)> = projected.iter().map(|(i, p)| (*i, p)).collect();
+        insert_index_rows_multi(
+            tx,
+            &idx.table,
+            &rows,
+            &idx.key_schema,
+            key_schema,
+            &idx_sks,
+            sort_keys,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Session-scoped ownership of one job, held for the job's life: a
+/// session-level `pg_try_advisory_lock` on a dedicated, non-pooled connection
+/// to the catalog database, the job's `owner_generation`, and the job permit
+/// the engine handed it.
+///
+/// The lock dies with the session, so a crashed process's claim disappears on
+/// its own. This needs the connection to be one server session for its whole
+/// life: a direct connection to the catalog database, or one through a
+/// session-mode pooler. Behind a transaction-mode pooler (PgBouncer
+/// `pool_mode = transaction`) the lock stays on whichever server session ran
+/// the statement, is not released when this connection closes, and can be
+/// observed as free on that same session; jobs are not supported there.
+///
+/// The connection would otherwise sit idle for the whole job, and some
+/// servers end idle sessions (`idle_session_timeout`, or a managed service's
+/// own reaping). The job's heartbeats go through this connection every
+/// [`JOB_HEARTBEAT_INTERVAL`] (shorter than the idle-session timeouts managed
+/// services apply, and a small fraction of the stale window the reconciler
+/// waits): each refreshes the record's `heartbeat_at`
+/// conditioned on the generation, so a session the server dropped, or a
+/// record a successor took over, surfaces as a lost heartbeat and the job
+/// stops rather than continuing unowned. A free lock shows that the owner's
+/// catalog session ended, not that its process stopped, so the reconciler
+/// acts on a record only once its heartbeat is older than the stale window.
+pub(crate) struct ClaimSession {
+    conn: sqlx::PgConnection,
+    generation: u64,
+    _permit: Option<JobPermit>,
+}
+
+impl ClaimSession {
+    /// The fencing token this claim was taken with.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The claim connection, for the job's conditional writes.
+    pub(crate) fn connection(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.conn
+    }
+
+    /// End the session, releasing its advisory lock; a close that fails is
+    /// logged (the server reaps the connection either way).
+    pub(crate) async fn close(self) {
+        if let Err(e) = <sqlx::PgConnection as sqlx::Connection>::close(self.conn).await {
+            tracing::warn!("closing a claim session: {e}");
+        }
+    }
+
+    /// Run `statement`, bound with the record's key and this generation, on
+    /// the claim connection and report whether it refreshed exactly one row.
+    pub(crate) async fn confirm(
+        &mut self,
+        statement: &str,
+        key: &[&str],
+    ) -> Result<bool, sqlx::Error> {
+        let mut query = sqlx::query(statement);
+        for part in key {
+            query = query.bind(*part);
+        }
+        let affected = query
+            .bind(generation_column(self.generation))
+            .execute(&mut self.conn)
+            .await?
+            .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Heartbeat the record every [`JOB_HEARTBEAT_INTERVAL`] with
+    /// `statement` (as [`Self::confirm`] runs it) until a heartbeat fails or
+    /// refreshes no row; returns why. Never returns while the claim is
+    /// confirmed.
+    async fn heartbeat_loop(&mut self, statement: &str, key: &[&str]) -> StorageError {
+        let period = JOB_HEARTBEAT_INTERVAL;
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match self.confirm(statement, key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return StorageError::Internal(
+                        "the job record no longer carries this claim's generation".to_owned(),
+                    );
+                }
+                Err(e) => return StorageError::Internal(format!("claim session: {e}")),
+            }
+        }
+    }
+}
+
+/// An `owner_generation` as the catalog stores it (`BIGINT`); generations
+/// are minted below `i64::MAX`.
+pub(crate) fn generation_column(generation: u64) -> i64 {
+    i64::try_from(generation).unwrap_or(i64::MAX)
+}
+
+/// The heartbeat of a restore: refresh its job record while it is RUNNING
+/// under this generation.
+pub(crate) const RESTORE_HEARTBEAT: &str = "UPDATE table_restores SET heartbeat_at = now() \
+     WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2";
+
+/// The advisory-lock key for a restore into `table_name` in `account_id`.
+///
+/// Keyed by name rather than table id so the restore can hold it before the
+/// target exists: nothing must ever see an unowned target, including in the
+/// window while `create_table_impl` is still running DDL. The key is a 64-bit
+/// `hashtextextended`, so a collision is negligible, and one would only make
+/// a second restore into the other name wait, never remove a table it should
+/// not.
+pub(crate) fn restore_lock_key(account_id: &str, table_name: &str) -> String {
+    format!("{account_id}/{table_name}")
+}
+
+/// The advisory-lock key of a backup job's claim on `backup_id`.
+pub(crate) fn backup_lock_key(backup_id: &str) -> String {
+    format!("backup:{backup_id}")
+}
+
+/// The TCP keepalive settings a claim session asks the server for, as
+/// `(setting, seconds)`: idle 30 s before the first probe, then probes 10 s
+/// apart, three unanswered before the connection is dropped. Public for the
+/// test that reads them back with `SHOW`.
+#[doc(hidden)]
+pub const CLAIM_KEEPALIVES: [(&str, u32); 3] = [
+    ("tcp_keepalives_idle", 30),
+    ("tcp_keepalives_interval", 10),
+    ("tcp_keepalives_count", 3),
+];
+
+/// Take the lock `key` on a new dedicated connection, with a fresh
+/// generation. `Ok(None)`: another session holds it.
+///
+/// A connection the server refuses for lack of connection slots is reported
+/// as `LimitExceeded`; any other failure to open it is `Internal` (see
+/// [`lock_connection_error`]).
+pub(crate) async fn try_claim(
+    pool: &sqlx::PgPool,
+    key: &str,
+    permit: Option<JobPermit>,
+) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim_with(pool, key, permit, 1, Duration::ZERO).await
+}
+
+/// [`try_claim`] trying the lock up to `tries` times on the one connection,
+/// `pause` apart, before answering `Ok(None)`.
+pub(crate) async fn try_claim_with(
+    pool: &sqlx::PgPool,
+    key: &str,
+    permit: Option<JobPermit>,
+    tries: u32,
+    pause: Duration,
+) -> Result<Option<ClaimSession>, StorageError> {
+    let options = pool.connect_options();
+    let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect_with(&options)
+        .await
+        .map_err(|e| {
+            tracing::warn!("could not open the claim connection for {key}: {e}");
+            lock_connection_error(&e)
+        })?;
+    // A server-side idle_session_timeout would end this session between
+    // heartbeats if it were shorter than the heartbeat period; disable it for
+    // this session when the server permits. Some managed PostgreSQL services
+    // reject this SET; there the heartbeat is what keeps the session from
+    // sitting idle.
+    if let Err(e) = sqlx::query("SET idle_session_timeout = 0")
+        .execute(&mut conn)
+        .await
+    {
+        tracing::warn!(
+            "could not disable idle_session_timeout for the claim session; continuing with \
+             the server setting: {e}"
+        );
+    }
+    // The server's TCP keepalive probes toward this process, so the
+    // advisory lock of a claim whose host vanished (no FIN, no RST) is
+    // released about a minute after the loss (30 s idle, then three probes
+    // 10 s apart) instead of after the kernel's default two hours, and the
+    // row's successor can take the lock once the row's heartbeat is stale.
+    // The owner's own liveness check is the heartbeat, not these. Each is a
+    // session setting a managed service may refuse; a refusal is a warning
+    // and the server's defaults stay.
+    for (name, value) in CLAIM_KEEPALIVES {
+        if let Err(e) = sqlx::query(&format!("SET {name} = {value}"))
+            .execute(&mut conn)
+            .await
+        {
+            tracing::warn!(
+                "could not set {name} for the claim session; continuing with the server \
+                 setting: {e}"
+            );
+        }
+    }
+    let mut taken = false;
+    for attempt in 1..=tries.max(1) {
+        taken = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, $2))")
+            .bind(key)
+            .bind(RESTORE_LOCK_SEED)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| StorageError::Internal(format!("claim lock: {e}")))?;
+        if taken || attempt == tries {
+            break;
+        }
+        tokio::time::sleep(pause).await;
+    }
+    Ok(taken.then(|| ClaimSession {
+        conn,
+        generation: new_generation(),
+        _permit: permit,
+    }))
+}
+
+/// Open a claim session on `key` as a job would and read `settings` back
+/// from it with `SHOW`, then end the session: for the test that checks the
+/// session settings [`try_claim`] applies. `None` when another session holds
+/// the lock.
+///
+/// # Errors
+///
+/// The claim's own errors, and `Internal` when a `SHOW` fails.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub async fn claim_session_settings(
+    pool: &sqlx::PgPool,
+    key: &str,
+    settings: &[&str],
+) -> Result<Option<Vec<String>>, StorageError> {
+    let Some(mut session) = try_claim(pool, key, None).await? else {
+        return Ok(None);
+    };
+    let mut values = Vec::with_capacity(settings.len());
+    for name in settings {
+        let value: String = sqlx::query_scalar(&format!("SHOW {name}"))
+            .fetch_one(session.connection())
+            .await
+            .map_err(|e| StorageError::Internal(format!("SHOW {name}: {e}")))?;
+        values.push(value);
+    }
+    session.close().await;
+    Ok(Some(values))
+}
+
+/// Take the restore lock for `table_name` on a new dedicated connection.
+async fn try_restore_lock(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    table_name: &str,
+    permit: JobPermit,
+) -> Result<Option<ClaimSession>, StorageError> {
+    try_claim(
+        pool,
+        &restore_lock_key(account_id, table_name),
+        Some(permit),
+    )
+    .await
+}
+
+/// SQLSTATE `too_many_connections`: the server (or the role or database)
+/// has no connection slot left.
+const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+
+/// Map a failure to open a claim connection. Only the server's
+/// `too_many_connections` refusal is `LimitExceeded` (a client should back
+/// off and retry), in the one job-refusal text
+/// ([`limit_exceeded_message`]) naming the server's connection slots as the
+/// bound; authentication, TLS, DNS, network, and every other failure,
+/// including one that carries no SQLSTATE, is `Internal`.
+fn lock_connection_error(e: &sqlx::Error) -> StorageError {
+    let code = e.as_database_error().and_then(|d| d.code());
+    if code.as_deref() == Some(SQLSTATE_TOO_MANY_CONNECTIONS) {
+        StorageError::LimitExceeded(limit_exceeded_message(JobBound::ServerConnections))
+    } else {
+        StorageError::Internal(format!("claim connection: {e}"))
+    }
+}
+
+/// Insert one buffered batch of backup rows in one statement and clear the
+/// buffers. Returns the number written.
+async fn insert_backup_batch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    backup_arn: &str,
+    pks: &mut Vec<String>,
+    datas: &mut Vec<String>,
+) -> Result<i64, StorageError> {
+    if pks.is_empty() {
+        return Ok(0);
+    }
+    let n = i64::try_from(pks.len()).unwrap_or(i64::MAX);
+    sqlx::query(
+        "INSERT INTO backup_items (backup_arn, pk, item_data) \
+         SELECT $1, pk, item_data::jsonb FROM UNNEST($2::text[], $3::text[]) AS t(pk, item_data)",
+    )
+    .bind(backup_arn)
+    .bind(&*pks)
+    .bind(&*datas)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    pks.clear();
+    datas.clear();
+    Ok(n)
+}
+
+fn db_err(e: sqlx::Error) -> StorageError {
+    StorageError::Internal(format!("Database error: {e}"))
+}
+
+/// Map a failed read as [`db_err`] does, except that a failure to reach the
+/// database is [`StorageError::Transient`]: an I/O or TLS error, a pool that
+/// timed out, closed, or lost its worker, and a server reply of class 08
+/// (connection exception), 57P01-57P03 (admin shutdown, crash shutdown,
+/// cannot connect now) or 53300 (too many connections). DescribeBackup
+/// answers without feature details when the definition read fails with
+/// `Internal`; a failover or a pool timeout is not a damaged definition and
+/// must reach the client as a retryable error instead.
+fn read_err(e: sqlx::Error) -> StorageError {
+    let unreachable = match &e {
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(d) => d.code().is_some_and(|code| {
+            code.starts_with("08")
+                || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                || code == SQLSTATE_TOO_MANY_CONNECTIONS
+        }),
+        _ => false,
+    };
+    if unreachable {
+        StorageError::Transient(format!("Database error: {e}"))
+    } else {
+        db_err(e)
+    }
+}
+
+impl PostgresEngine {
+    /// Read the parts of a table's definition a restore recreates.
+    async fn capture_table_definition(
+        conn: &mut sqlx::PgConnection,
+        table_id: &str,
+    ) -> Result<(BackupTableDefinition, Vec<(String, String)>), StorageError> {
+        #[allow(clippy::type_complexity)]
+        let (billing_mode, pt, table_class, sse, on_demand, stream, ttl_attr, ttl_ready): (
+            String,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<bool>,
+        ) = sqlx::query_as(
+            "SELECT billing_mode, provisioned_throughput, table_class, sse_specification, \
+             on_demand_throughput, stream_specification, ttl_attribute, ttl_index_ready \
+             FROM tables WHERE table_id = $1",
+        )
+        .bind(table_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            Option<serde_json::Value>,
+        )> = sqlx::query_as(
+            "SELECT index_name, index_id, index_type, key_schema, projection, provisioned_throughput \
+                 FROM indexes WHERE table_id = $1 ORDER BY index_name",
+        )
+        .bind(table_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        let mut gsis = Vec::new();
+        let mut lsis = Vec::new();
+        let mut gsi_ids = Vec::new();
+        for (index_name, index_id, index_type, ks, proj, ipt) in rows {
+            let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks)
+                .map_err(|e| StorageError::Internal(format!("index key schema: {e}")))?;
+            let projection: Projection = from_catalog_json(proj)
+                .map_err(|e| StorageError::Internal(format!("index projection: {e}")))?;
+            if index_type == "LSI" {
+                lsis.push(LsiInput {
+                    index_name,
+                    key_schema,
+                    projection,
+                });
+            } else {
+                gsi_ids.push((index_name.clone(), index_id));
+                gsis.push(GsiInput {
+                    index_name,
+                    key_schema,
+                    projection,
+                    provisioned_throughput: throughput_from_catalog(ipt.as_ref()),
+                    warm_throughput: None,
+                });
+            }
+        }
+
+        let vector_index_names: Vec<String> = sqlx::query_scalar(
+            "SELECT index_name FROM vector_indexes WHERE table_id = $1 ORDER BY index_name",
+        )
+        .bind(table_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+
+        Ok((
+            BackupTableDefinition {
+                version: BACKUP_DEFINITION_VERSION,
+                billing_mode,
+                provisioned_throughput: throughput_from_catalog(pt.as_ref()),
+                global_secondary_indexes: gsis,
+                local_secondary_indexes: lsis,
+                table_class,
+                sse_specification: sse,
+                on_demand_throughput: on_demand
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(format!("on-demand throughput: {e}")))?,
+                vector_index_names,
+                // As DescribeTimeToLive and DescribeTable report them, read
+                // under the same row lock as the rest of the definition.
+                time_to_live: Some(crate::metadata_engine::ttl_description(ttl_attr, ttl_ready)),
+                stream_specification: stream
+                    .map(serde_json::from_value::<StreamSpecification>)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(format!("stream specification: {e}")))?,
+            },
+            gsi_ids,
+        ))
+    }
+
+    /// Copy a backup's items into a freshly created restore target, populate
+    /// its secondary indexes, and mark it ACTIVE, which marks the job record
+    /// DONE in the same catalog transaction, conditioned on `generation`.
+    ///
+    /// Every key column is derived from the item itself, so the copy does not
+    /// depend on how the source table's columns were laid out. Rows are plain
+    /// INSERTs: two backup rows for one key are a corrupt backup and fail the
+    /// restore rather than silently collapsing into one item. Items are read
+    /// as a stream and written in batches of at most `COPY_BATCH_ITEMS` items
+    /// or `COPY_BATCH_BYTES` of item text: per batch, one multi-row INSERT
+    /// into the base table and one into each secondary index, committed as
+    /// one data transaction. Committing per batch rather than once at the end
+    /// keeps no data-side transaction open across the copy. The catalog side
+    /// does keep one read-only REPEATABLE READ transaction open from the
+    /// first item read until the last full batch is written (see below), so
+    /// the copy holds one catalog pool connection and the catalog's xmin for
+    /// that long. A failure
+    /// part-way leaves some batches committed, which is harmless because the
+    /// target is CREATING throughout (every data-plane request is refused)
+    /// and the failure path drops it whole.
+    async fn copy_backup_items(
+        &self,
+        desc: &TableDescription,
+        backup_arn: &str,
+        generation: u64,
+    ) -> Result<(), StorageError> {
+        use futures::TryStreamExt;
+
+        let ddb_table = data_table_name(&desc.table_id);
+        let target = RestoreTarget::load(
+            &self.pool,
+            &desc.table_id,
+            &desc.key_schema,
+            &desc.attribute_definitions,
+            format!("backup {backup_arn}"),
+        )
+        .await?;
+
+        // The backup's rows are read from one catalog snapshot in which the
+        // backup is still AVAILABLE. DeleteBackup refuses while this restore
+        // is registered and CREATING; the snapshot keeps the read whole even
+        // so: DeleteBackup removes the rows and marks the backup DELETED in
+        // one transaction, so a delete is either wholly visible here (the
+        // restore fails) or not at all (the restore copies every row).
+        let mut snapshot = self
+            .pool
+            .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .await
+            .map_err(db_err)?;
+        let available: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM backups WHERE backup_arn = $1 \
+             AND backup_status = 'AVAILABLE')",
+        )
+        .bind(backup_arn)
+        .fetch_one(&mut *snapshot)
+        .await
+        .map_err(db_err)?;
+        if !available {
+            return Err(StorageError::Validation(format!(
+                "Backup not found: {backup_arn}"
+            )));
+        }
+        let mut rows = sqlx::query_scalar::<_, String>(
+            "SELECT item_data::text FROM backup_items WHERE backup_arn = $1",
+        )
+        .bind(backup_arn)
+        .fetch(&mut *snapshot);
+        let mut batch: Vec<(Item, String)> = Vec::with_capacity(COPY_BATCH_ITEMS);
+        let mut batch_bytes: usize = 0;
+        let mut item_count: i64 = 0;
+        while let Some(item_json) = rows.try_next().await.map_err(db_err)? {
+            let item: Item = serde_json::from_str(&item_json)
+                .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")))?;
+            // The parsed item is kept for its keys and index projections; the
+            // budget counts its stored text, which bounds both forms.
+            batch_bytes += item_json.len();
+            batch.push((item, item_json));
+            if batch.len() == COPY_BATCH_ITEMS || batch_bytes >= COPY_BATCH_BYTES {
+                self.write_restore_batch(&target, &batch).await?;
+                item_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
+                batch.clear();
+                batch_bytes = 0;
+            }
+        }
+        drop(rows);
+        snapshot.commit().await.map_err(db_err)?;
+        if !batch.is_empty() {
+            self.write_restore_batch(&target, &batch).await?;
+            item_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
+        }
+
+        let (table_size,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COALESCE(pg_total_relation_size('{ddb_table}'), 0)"
+        ))
+        .fetch_one(&self.data_pool)
+        .await
+        .map_err(db_err)?;
+
+        // Mark the restored table ACTIVE now that every batch has committed,
+        // and its job record DONE, in one catalog transaction. The table was
+        // created with the transition deferred, so this is the first point it
+        // can become ACTIVE, by ordering rather than by timing.
+        if !self
+            .activate_restore_target(&desc.table_id, generation, item_count, table_size)
+            .await?
+        {
+            // The target was claimed for removal while the copy ran, or the
+            // job record passed to another claim; the copy's rows go with it.
+            return Err(StorageError::TableNotFound(format!(
+                "restore of {backup_arn} into {} did not complete: the table was deleted \
+                 while it was being restored",
+                desc.table_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// The end of a restore in one catalog transaction: the job record
+    /// RUNNING to DONE under `generation`, the table CREATING to ACTIVE with
+    /// its counts, and every secondary and vector index of the table ACTIVE
+    /// (the indexes are created ACTIVE with a restore target, so this is the
+    /// rule stated once rather than a change). `Ok(false)`, with nothing
+    /// written, when the record is not RUNNING under `generation` or the
+    /// table is not CREATING.
+    ///
+    /// Only from CREATING, and only while the job record is RUNNING under
+    /// this generation. DeleteTable refuses a restore target, but the
+    /// reconciler can claim one whose owner it found dead (moving it to
+    /// DELETING); that claim wins, and flipping the row back to ACTIVE
+    /// would leave a table whose data tables are being dropped.
+    pub(crate) async fn activate_restore_target(
+        &self,
+        table_id: &str,
+        generation: u64,
+        item_count: i64,
+        table_size: i64,
+    ) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let done = sqlx::query(
+            "UPDATE table_restores SET status = 'DONE', completed_at = now() \
+             WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2",
+        )
+        .bind(table_id)
+        .bind(generation_column(generation))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        let activated = if done == 1 {
+            sqlx::query(
+                "UPDATE tables SET item_count = $1, table_size_bytes = $2, \
+                 table_status = 'ACTIVE', status_transition_at = NULL \
+                 WHERE table_id = $3 AND table_status = 'CREATING'",
+            )
+            .bind(item_count)
+            .bind(table_size)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+        } else {
+            0
+        };
+        if activated == 0 {
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE indexes SET index_status = 'ACTIVE' \
+             WHERE table_id = $1 AND index_status <> 'ACTIVE'",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE vector_indexes SET index_status = 'ACTIVE', backfilling = NULL \
+             WHERE table_id = $1 AND index_status <> 'ACTIVE'",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// RUNNING to FAILED on the job record of `table_id`, conditioned on
+    /// `generation`: the write a failing job makes before it removes its
+    /// target. `Ok(false)` when the record is not RUNNING under that
+    /// generation.
+    async fn fail_restore_job_as(
+        &self,
+        table_id: &str,
+        generation: u64,
+        reason: &str,
+    ) -> Result<bool, StorageError> {
+        let affected = sqlx::query(
+            "UPDATE table_restores SET status = 'FAILED', failure_reason = $3, \
+             completed_at = now() \
+             WHERE table_id = $1 AND status = 'RUNNING' AND owner_generation = $2",
+        )
+        .bind(table_id)
+        .bind(generation_column(generation))
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(affected == 1)
+    }
+
+    /// Write and commit one batch of restored items ([`insert_restore_rows`]
+    /// in one data transaction).
+    async fn write_restore_batch(
+        &self,
+        target: &RestoreTarget<'_>,
+        batch: &[(Item, String)],
+    ) -> Result<(), StorageError> {
+        let mut tx = self.data_pool.begin().await.map_err(db_err)?;
+        insert_restore_rows(&mut tx, target, batch).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Remove a restore target whose copy failed or was abandoned.
+    ///
+    /// Keyed by table id, not name, so it can only ever remove the table that
+    /// restore created, and synchronous regardless of the control-plane
+    /// delay: the ordinary DeleteTable path would leave the name held in
+    /// DELETING for that long.
+    ///
+    /// The target is first claimed by moving it from CREATING to DELETING in
+    /// one statement. That is what makes the removal and the restore's own
+    /// flip to ACTIVE mutually exclusive: both are conditional on CREATING, so
+    /// exactly one wins. The claim also schedules the row for the ordinary
+    /// DELETING removal, so if a drop below fails, the row stays DELETING with
+    /// its index rows and the control plane finishes the job later.
+    ///
+    /// The relations dropped are the ones `DeleteTable` drops
+    /// (`table_storage_relations`): the data table, every secondary index's
+    /// table and every vector index's table, their ids read in the claiming
+    /// transaction while the catalog rows still exist (the `tables` row's
+    /// deletion cascades them away).
+    ///
+    /// Public for the test that runs it against an ACTIVE table; not an
+    /// interface.
+    #[doc(hidden)]
+    pub async fn abort_restore(&self, table_id: &str) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let claimed = sqlx::query(
+            "UPDATE tables SET table_status = 'DELETING', status_transition_at = NOW() \
+             WHERE table_id = $1 AND table_status = 'CREATING' AND status_transition_at IS NULL",
+        )
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected()
+            > 0;
+        let index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM indexes WHERE table_id = $1")
+                .bind(table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let vector_index_ids: Vec<String> =
+            sqlx::query_scalar("SELECT index_id FROM vector_indexes WHERE table_id = $1")
+                .bind(table_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        if !claimed {
+            return Ok(false);
+        }
+        for t in table_storage_relations(table_id, &index_ids, &vector_index_ids) {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {t}"))
+                .execute(&self.data_pool)
+                .await
+                .map_err(db_err)?;
+        }
+        sqlx::query("DELETE FROM tables WHERE table_id = $1 AND table_status = 'DELETING'")
+            .bind(table_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// The body of `remove_restore_target` once its caller holds the target
+    /// name's advisory lock (`restore_lock_key`): the CREATING-target check,
+    /// the progress-row delete on the data pool (migration 8; a data
+    /// database from before it has no `restore_progress`), and the claim and
+    /// drop through [`Self::abort_restore`].
+    pub async fn remove_restore_target_locked(
+        &self,
+        key: &extenddb_storage::backup_catalog::RestoreTargetKey,
+    ) -> Result<bool, StorageError> {
+        let is_target: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tables t JOIN table_restores r \
+             ON r.table_id = t.table_id WHERE t.table_id = $1 AND t.account_id = $2 \
+             AND t.table_name = $3 AND t.table_status = 'CREATING')",
+        )
+        .bind(&key.table_id)
+        .bind(&key.account_id)
+        .bind(&key.table_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if !is_target {
+            return Ok(false);
+        }
+        let has_progress: bool =
+            sqlx::query_scalar("SELECT to_regclass('restore_progress') IS NOT NULL")
+                .fetch_one(&self.data_pool)
+                .await
+                .map_err(db_err)?;
+        if has_progress {
+            sqlx::query("DELETE FROM restore_progress WHERE table_id = $1")
+                .bind(&key.table_id)
+                .execute(&self.data_pool)
+                .await
+                .map_err(db_err)?;
+        }
+        self.abort_restore(&key.table_id).await
+    }
+
+    /// The detached task of RestoreTableFromBackup: take the restore lock,
+    /// register the CREATING target with its job record, report the
+    /// registration to the request (which may be gone), then copy. `permit`
+    /// is the job slot the engine took, held by the claim until the copy
+    /// ends.
+    async fn run_restore(
+        self,
+        account_id: String,
+        request: RestoreRequest,
+        permit: JobPermit,
+        registered: tokio::sync::oneshot::Sender<Result<TableDescription, StorageError>>,
+    ) {
+        let RestoreRequest {
+            backup_arn,
+            source_table_arn,
+            restore_date_time,
+            input,
+        } = request;
+        let target = input.table_name.clone();
+        // A refusal the request is no longer there to receive (its client
+        // went away) would otherwise vanish, so it is logged. A refused restore
+        // removes what it created; a cleanup that failed is logged on its own,
+        // and the reconciler finishes it (the FAILED-target duty, once the
+        // record is stale).
+        let refuse = |registered: tokio::sync::oneshot::Sender<_>, e: StorageError| {
+            if let Err(Err(e)) = registered.send(Err(e)) {
+                tracing::warn!(
+                    "restore of {backup_arn} into {target} (account {account_id}) was refused \
+                     after its request ended: {e}"
+                );
+            }
+        };
+        // The name first, unfenced, as on the other backends: a restore into
+        // a name that is a CREATING restore target is refused as the name
+        // (TableBeingRestored, the service's TableInUseException) at once,
+        // whatever state the backup is in and whether or not that target's
+        // restore is still running (an abandoned target holds no restore
+        // lock until the reconciler removes it). The restore lock and the
+        // target insert stay the fence.
+        if let Some(source_backup_arn) = self.restoring_into(&account_id, &target).await {
+            refuse(
+                registered,
+                StorageError::TableBeingRestored {
+                    table_name: target.clone(),
+                    backup_arn: source_backup_arn,
+                },
+            );
+            return;
+        }
+        // Ownership first, before the target exists, so nothing ever sees
+        // this target without an owner, including while the DDL runs. It is
+        // held until the copy ends; a crash anywhere releases it with the
+        // connection, and the reconciler removes the target once the job
+        // record's heartbeat is stale. A lock already held means another
+        // restore into this name is in flight right now: TableBeingRestored
+        // naming its source backup once its CREATING row is visible, else
+        // the name is taken as CreateTable would report it.
+        let owner = match try_restore_lock(&self.pool, &account_id, &target, permit).await {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                let error = self.name_taken_error(&account_id, &target, true).await;
+                refuse(registered, error);
+                return;
+            }
+            Err(e) => {
+                refuse(registered, e);
+                return;
+            }
+        };
+        // Create the table and register its source backup in one catalog
+        // transaction. The transaction holds the AVAILABLE backup row FOR
+        // SHARE until the CREATING target and its table_restores row commit,
+        // so DeleteBackup can neither remove the source between those rows
+        // nor observe an unregistered target.
+        let registration = RestoreRegistration {
+            backup_arn: &backup_arn,
+            source_table_arn: &source_table_arn,
+            restore_date_time,
+            owner_generation: owner.generation(),
+        };
+        let mut desc = match self
+            .create_table_for_restore(&account_id, input, RestoreSource::Legacy(&registration))
+            .await
+        {
+            Ok(desc) => desc,
+            Err(e) => {
+                refuse(registered, e);
+                return;
+            }
+        };
+        desc.restore_summary = Some(RestoreSummary {
+            source_backup_arn: Some(backup_arn.clone()),
+            source_table_arn: Some(source_table_arn.clone()),
+            restore_date_time,
+            restore_in_progress: true,
+        });
+        if registered.send(Ok(desc.clone())).is_err() {
+            tracing::info!(
+                "restore of {backup_arn} into {target} (account {account_id}): the request \
+                 ended before the CREATING response was sent; the restore continues"
+            );
+        }
+        self.run_restore_copy(owner, account_id, desc, backup_arn)
+            .await;
+    }
+
+    /// The detached half of RestoreTableFromBackup: copy the backup into the
+    /// registered CREATING target while heartbeating the job record through
+    /// the claim session, then flip the target ACTIVE (which marks the job
+    /// record DONE, conditioned on the generation), or remove it on failure.
+    /// Owns everything it uses; the request that spawned it may be gone.
+    async fn run_restore_copy(
+        self,
+        mut owner: ClaimSession,
+        account_id: String,
+        desc: TableDescription,
+        backup_arn: String,
+    ) {
+        let table_name = desc.table_name.clone();
+        let outcome = {
+            let key = [desc.table_id.as_str()];
+            let copy = self.copy_backup_items(&desc, &backup_arn, owner.generation());
+            let heartbeat = owner.heartbeat_loop(RESTORE_HEARTBEAT, &key);
+            tokio::select! {
+                copied = copy => copied,
+                lost = heartbeat => {
+                    tracing::error!(
+                        "restore of {backup_arn} into {table_name} (account {account_id}): the \
+                         claim session failed its heartbeat ({lost}); stopping the copy"
+                    );
+                    Err(StorageError::Internal(format!(
+                        "claim session lost: {lost}"
+                    )))
+                }
+            }
+        };
+        let e = match outcome {
+            Ok(()) => {
+                tracing::info!(
+                    "restore of {backup_arn} into {table_name} (account {account_id}) completed"
+                );
+                return;
+            }
+            Err(e) => e,
+        };
+        // The target must not stay behind: it is CREATING with no scheduled
+        // transition, so nothing else would move it on, and the name would
+        // stay taken. The job record is marked FAILED first, conditioned on
+        // the generation and on RUNNING; only if that matched is the target
+        // removed (which cascades the record). A record another generation
+        // owns, or a failed FAILED write (on a pooled connection, not the
+        // claim's), means the claim holder owns the target, and nothing
+        // further is touched.
+        let failed = self
+            .fail_restore_job_as(&desc.table_id, owner.generation(), &e.to_string())
+            .await;
+        match failed {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "restore of {backup_arn} into {table_name} (account {account_id}) ended \
+                     with \"{e}\"; its job record was no longer RUNNING under this claim, so \
+                     the target ({}) was left to its owner",
+                    desc.table_id
+                );
+                drop(owner);
+                return;
+            }
+            Err(write) => {
+                tracing::error!(
+                    "restore of {backup_arn} into {table_name} (account {account_id}) failed \
+                     ({e}), and its job record could not be marked FAILED ({write}); the \
+                     reconciler removes the target once its heartbeat is stale"
+                );
+                drop(owner);
+                return;
+            }
+        }
+        match self.abort_restore(&desc.table_id).await {
+            Ok(true) => tracing::error!(
+                "restore of {backup_arn} into {table_name} (account {account_id}) failed and \
+                 the partial table was removed: {e}"
+            ),
+            // Already claimed by the reconciler (whose own removal is logged),
+            // or the activation committed before the copy was stopped.
+            Ok(false) => tracing::warn!(
+                "restore of {backup_arn} into {table_name} (account {account_id}) ended with \
+                 \"{e}\"; the target ({}) was no longer CREATING, so it was left to its \
+                 current owner",
+                desc.table_id
+            ),
+            Err(cleanup) => tracing::error!(
+                "restore of {backup_arn} into {table_name} (account {account_id}) failed ({e}), \
+                 and the partial table ({}) could not be removed yet; the control plane (if it \
+                 reached DELETING) or the reconciler (if still CREATING, once the FAILED record \
+                 is older than stale_job_after_secs) finishes the removal: {cleanup}",
+                desc.table_id
+            ),
+        }
+        drop(owner);
+    }
+}
+
+impl LegacyBackupReader for PostgresEngine {
+    fn create(
         &self,
         account_id: &str,
         table_name: &str,
         backup_name: &str,
+        permit: JobPermit,
     ) -> BoxFuture<'_, Result<BackupDetails, StorageError>> {
         let account_id = account_id.to_string();
         let table_name = table_name.to_string();
         let backup_name = backup_name.to_string();
         Box::pin(async move {
+            // The slot is the create's for its whole run; the copy is
+            // synchronous, so it is given back when this returns.
+            let _permit = permit;
+            // The table's definition and its items must describe one instant.
+            // They live in different databases, so no single snapshot covers
+            // both. Instead the table row is held FOR SHARE from the first
+            // catalog read until the data snapshot has been taken: UpdateTable
+            // and DeleteTable both take it FOR UPDATE, so no definition change
+            // can commit in between, and the definition read here is the one
+            // in force when the data snapshot starts.
+            let mut meta = self.pool.begin().await.map_err(db_err)?;
             // Verify table exists and get metadata.
             let row: (
                 String,
@@ -66,11 +1274,12 @@ impl BackupEngine for PostgresEngine {
                 "SELECT table_id, table_arn, key_schema, attribute_definitions, \
                  billing_mode, table_size_bytes, item_count, \
                  COALESCE(provisioned_throughput::text, '{}') \
-                 FROM tables WHERE account_id = $1 AND table_name = $2 AND table_status = 'ACTIVE'",
+                 FROM tables WHERE account_id = $1 AND table_name = $2 AND table_status = 'ACTIVE' \
+                 FOR SHARE",
             )
             .bind(&account_id)
             .bind(&table_name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *meta)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
             .ok_or_else(|| StorageError::TableNotFound(format!("Table not found: {table_name}")))?;
@@ -79,50 +1288,25 @@ impl BackupEngine for PostgresEngine {
                 table_id,
                 _table_arn,
                 key_schema,
-                attr_defs,
+                mut attr_defs,
                 billing_mode,
-                size_bytes,
+                _size_bytes,
                 _item_count,
                 _prov,
             ) = row;
 
-            let backup_arn = format!(
-                "arn:aws:dynamodb:{region}:{account_id}:table/{table_name}/backup/{id}",
-                region = self.region,
-                id = backup_id()
-            );
-
-            // Snapshot items from the data table.
-            let ddb_table = data_table_name(&table_id);
-            let ddb_table_unquoted = ddb_table.trim_matches('"');
-            let has_sk: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
-             WHERE table_name = $1 AND column_name = 'sk')",
+            // The id embeds the creation instant to the millisecond; that
+            // instant is stored as created_at, so the ARN, the reported
+            // BackupCreationDateTime, and the ListBackups cursor agree.
+            let backup_id = new_backup_id();
+            let backup_arn = backup_arn(&self.region, &account_id, &table_name, &backup_id);
+            let created_millis = backup_id_epoch_millis(&backup_id).ok_or_else(|| {
+                StorageError::Internal(format!("backup id {backup_id} has no creation time"))
+            })?;
+            let created_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(created_millis) * 1_000_000,
             )
-            .bind(ddb_table_unquoted)
-            .fetch_one(&self.data_pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let items: Vec<(String, Option<String>, serde_json::Value)> = if has_sk {
-                sqlx::query_as(&format!("SELECT pk, sk, item_data FROM {ddb_table}"))
-                    .fetch_all(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
-            } else {
-                sqlx::query_as::<_, (String, serde_json::Value)>(&format!(
-                    "SELECT pk, item_data FROM {ddb_table}"
-                ))
-                .fetch_all(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
-                .into_iter()
-                .map(|(pk, data)| (pk, None, data))
-                .collect()
-            };
-
-            #[allow(clippy::cast_possible_wrap)]
-            let actual_count = items.len() as i64;
+            .map_err(|e| StorageError::Internal(format!("backup creation time: {e}")))?;
 
             // Snapshot the source table's vector index configuration alongside
             // its key schema. Restore refuses a backup whose snapshot is
@@ -149,60 +1333,193 @@ impl BackupEngine for PostgresEngine {
                  FROM vector_indexes WHERE table_id = $1",
             )
             .bind(&table_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *meta)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
-            // Wrap all catalog-side writes in a single transaction so a crash
-            // cannot leave a backup marked AVAILABLE with partial items.
-            let mut tx = self
-                .pool
-                .begin()
+            let (mut definition, gsi_ids) =
+                Self::capture_table_definition(&mut meta, &table_id).await?;
+
+            // Begin the data transaction and hold ACCESS SHARE while the
+            // catalog barrier still blocks UpdateTable and DeleteTable. LOCK
+            // TABLE is a utility statement and does not establish a
+            // REPEATABLE READ snapshot, so the real relation SELECT must run
+            // before meta.commit(). This fixes the data snapshot at the same
+            // instant as the captured definition; the lock then keeps a DROP
+            // from removing the relation while its rows are read. A
+            // DeleteTable that finds this lock leaves its row DELETING, and
+            // the control-plane poller drops the tables under a short lock
+            // timeout, retrying while the lock is held; the guard wakes it
+            // when this transaction ends (commit, error or cancellation), as
+            // the table snapshot's does, and the active poller waits on that
+            // wake as well as on its timer, so the drop follows the backup at
+            // once.
+            let ddb_table = data_table_name(&table_id);
+            let mut held = crate::snapshot_engine::HeldSnapshot::new(
+                self.data_pool
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await
+                    .map_err(db_err)?,
+                Arc::clone(&self.control_plane_notify),
+            );
+            let snapshot = held.open_conn()?;
+            sqlx::query(&format!("LOCK TABLE {ddb_table} IN ACCESS SHARE MODE"))
+                .execute(&mut *snapshot)
                 .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+                .map_err(db_err)?;
+            let _: Option<i32> = sqlx::query_scalar(&format!("SELECT 1 FROM {ddb_table} LIMIT 1"))
+                .fetch_optional(&mut *snapshot)
+                .await
+                .map_err(db_err)?;
+            meta.commit().await.map_err(db_err)?;
+
+            // Since #401 UpdateTable creates a new GSI's data table before it
+            // commits the catalog row, so a GSI row without a data table is
+            // not expected: it is what an index whose table was dropped out
+            // from under the catalog, or a crash in a pre-#401 build, leaves.
+            // Such an index is not part of the table as of this snapshot;
+            // leave it out rather than record an index a restore cannot
+            // rebuild. The probe is the table snapshot's
+            // (`snapshot_engine::index_data_table_exists`).
+            let gsi_ids_len = gsi_ids.len();
+            // The ids were read under the catalog barrier, so this probes
+            // exactly the indexes the captured definition describes. The
+            // to_regclass lookup reads pg_class rather than the pinned data
+            // snapshot and can see later committed DDL; that remains consistent:
+            // a GSI's data table exists from before its catalog row commits
+            // (#401), and restore rebuilds its rows from the captured base
+            // items.
+            let mut present = Vec::with_capacity(definition.global_secondary_indexes.len());
+            for (gsi, (name, index_id)) in std::mem::take(&mut definition.global_secondary_indexes)
+                .into_iter()
+                .zip(gsi_ids)
+            {
+                debug_assert_eq!(gsi.index_name, name);
+                let exists =
+                    crate::snapshot_engine::index_data_table_exists(&mut *snapshot, &index_id)
+                        .await
+                        .map_err(db_err)?;
+                if exists {
+                    present.push(gsi);
+                }
+            }
+            let omitted = present.len() < gsi_ids_len;
+            definition.global_secondary_indexes = present;
+            // Leaving an index out can leave an attribute definition no key
+            // uses, which CreateTable would refuse on the service; drop those.
+            if omitted {
+                let mut used: std::collections::HashSet<String> =
+                    from_catalog_json::<Vec<KeySchemaElement>>(key_schema.clone())
+                        .map_err(|e| StorageError::Internal(format!("key schema: {e}")))?
+                        .into_iter()
+                        .map(|k| k.attribute_name)
+                        .collect();
+                for k in definition
+                    .global_secondary_indexes
+                    .iter()
+                    .flat_map(|g| &g.key_schema)
+                    .chain(
+                        definition
+                            .local_secondary_indexes
+                            .iter()
+                            .flat_map(|l| &l.key_schema),
+                    )
+                {
+                    used.insert(k.attribute_name.clone());
+                }
+                // The names are compared decoded: the stored column holds the
+                // escaped form (`catalog_json`), and the index names above
+                // were decoded with the captured definition.
+                let mut defs: Vec<AttributeDefinition> = from_catalog_json(attr_defs)
+                    .map_err(|e| StorageError::Internal(format!("attribute definitions: {e}")))?;
+                defs.retain(|d| used.contains(&d.attribute_name));
+                attr_defs = to_catalog_json(&defs)?;
+            }
+            // The definition carries attribute names, so it is stored in the
+            // form of the catalog columns it was read from.
+            let definition = escape_json(definition.to_json()?);
+
+            // All catalog-side writes are one transaction, so a crash cannot
+            // leave a backup AVAILABLE with partial items. The items are read
+            // from one REPEATABLE READ snapshot of the data table, streamed,
+            // and written in batches, so the backup is consistent as of one
+            // instant and memory is bounded by the batch size.
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
 
             sqlx::query(
                 "INSERT INTO backups (backup_arn, backup_name, table_id, table_name, account_id, \
              backup_status, backup_size_bytes, item_count, key_schema, attribute_definitions, \
-             billing_mode, vector_indexes) \
-             VALUES ($1, $2, $3, $4, $5, 'AVAILABLE', $6, $7, $8, $9, $10, $11)",
+             billing_mode, vector_indexes, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'AVAILABLE', 0, 0, $6, $7, $8, $9, $10)",
             )
             .bind(&backup_arn)
             .bind(&backup_name)
             .bind(&table_id)
             .bind(&table_name)
             .bind(&account_id)
-            .bind(size_bytes)
-            .bind(actual_count)
             .bind(&key_schema)
             .bind(&attr_defs)
             .bind(&billing_mode)
             .bind(&vector_indexes)
+            .bind(created_at)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            for (pk, sk, item_data) in &items {
-                sqlx::query(
-                    "INSERT INTO backup_items (backup_arn, pk, sk, item_data) \
-                 VALUES ($1, $2, $3, $4)",
-                )
+            .map_err(db_err)?;
+            sqlx::query("INSERT INTO backup_definitions (backup_arn, definition) VALUES ($1, $2)")
                 .bind(&backup_arn)
-                .bind(pk)
-                .bind(sk.as_deref())
-                .bind(item_data)
+                .bind(&definition)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-            }
+                .map_err(db_err)?;
 
-            // Read back the creation timestamp assigned by the database.
-            let created_at: time::OffsetDateTime =
-                sqlx::query_scalar("SELECT created_at FROM backups WHERE backup_arn = $1")
-                    .bind(&backup_arn)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+            // `backup_items.sk` stays NULL: `item_data` is the whole item, key
+            // attributes included, and restore derives every key column from
+            // it. Reading the typed columns here instead would tie the backup
+            // to this table's physical layout.
+            let (actual_count, size_bytes) = {
+                use futures::TryStreamExt;
+                let mut count: i64 = 0;
+                let mut size: i64 = 0;
+                let mut pks: Vec<String> = Vec::with_capacity(COPY_BATCH_ITEMS);
+                let mut datas: Vec<String> = Vec::with_capacity(COPY_BATCH_ITEMS);
+                let mut batch_bytes: usize = 0;
+                // Rows come back as JSON text and are buffered as text, so the
+                // batch budget counts what is actually held. Each item is
+                // parsed only long enough to size it.
+                let select_sql = format!("SELECT pk, item_data::text FROM {ddb_table}");
+                {
+                    let mut rows =
+                        sqlx::query_as::<_, (String, String)>(&select_sql).fetch(&mut *snapshot);
+                    while let Some((pk, data)) = rows.try_next().await.map_err(db_err)? {
+                        let item: Item = serde_json::from_str(&data)
+                            .map_err(|e| StorageError::Internal(format!("Parse item: {e}")))?;
+                        let item_bytes = extenddb_core::types::item_size_bytes(&item);
+                        drop(item);
+                        size += i64::try_from(item_bytes).unwrap_or(i64::MAX);
+                        batch_bytes += data.len();
+                        pks.push(pk);
+                        datas.push(data);
+                        if pks.len() == COPY_BATCH_ITEMS || batch_bytes >= COPY_BATCH_BYTES {
+                            batch_bytes = 0;
+                            count +=
+                                insert_backup_batch(&mut tx, &backup_arn, &mut pks, &mut datas)
+                                    .await?;
+                        }
+                    }
+                }
+                count += insert_backup_batch(&mut tx, &backup_arn, &mut pks, &mut datas).await?;
+                held.finish().await.map_err(db_err)?;
+                (count, size)
+            };
+            sqlx::query(
+                "UPDATE backups SET item_count = $1, backup_size_bytes = $2 WHERE backup_arn = $3",
+            )
+            .bind(actual_count)
+            .bind(size_bytes)
+            .bind(&backup_arn)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
 
             tx.commit()
                 .await
@@ -219,7 +1536,7 @@ impl BackupEngine for PostgresEngine {
         })
     }
 
-    fn describe_backup(
+    fn describe(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -275,7 +1592,7 @@ impl BackupEngine for PostgresEngine {
             ) = row;
 
             let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-                serde_json::from_value(ks_json)
+                from_catalog_json(ks_json)
                     .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?;
 
             Ok(BackupDescription {
@@ -296,12 +1613,14 @@ impl BackupEngine for PostgresEngine {
                     table_size_bytes: size,
                     billing_mode: Some(billing),
                     table_creation_date_time: pg_timestamp_to_epoch(table_created_at),
+                    ..Default::default()
                 },
+                source_table_feature_details: None,
             })
         })
     }
 
-    fn list_backups(
+    fn list(
         &self,
         account_id: &str,
         table_name: Option<&str>,
@@ -309,7 +1628,9 @@ impl BackupEngine for PostgresEngine {
         let account_id = account_id.to_string();
         let table_name = table_name.map(std::string::ToString::to_string);
         Box::pin(async move {
+            #[allow(clippy::type_complexity)]
             let rows: Vec<(
+                String,
                 String,
                 String,
                 String,
@@ -319,8 +1640,8 @@ impl BackupEngine for PostgresEngine {
                 time::OffsetDateTime,
             )> = if let Some(tn) = table_name {
                 sqlx::query_as(
-                    "SELECT b.backup_arn, b.backup_name, b.table_name, b.backup_status, \
-                     b.backup_size_bytes, \
+                    "SELECT b.backup_arn, b.backup_name, b.table_name, b.table_id, \
+                     b.backup_status, b.backup_size_bytes, \
                      COALESCE(t.table_arn, \
                        'arn:aws:dynamodb:' || $3 || ':' || b.account_id || ':table/' || b.table_name), \
                      b.created_at \
@@ -337,8 +1658,8 @@ impl BackupEngine for PostgresEngine {
                 .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
             } else {
                 sqlx::query_as(
-                    "SELECT b.backup_arn, b.backup_name, b.table_name, b.backup_status, \
-                     b.backup_size_bytes, \
+                    "SELECT b.backup_arn, b.backup_name, b.table_name, b.table_id, \
+                     b.backup_status, b.backup_size_bytes, \
                      COALESCE(t.table_arn, \
                        'arn:aws:dynamodb:' || $2 || ':' || b.account_id || ':table/' || b.table_name), \
                      b.created_at \
@@ -357,22 +1678,25 @@ impl BackupEngine for PostgresEngine {
             Ok(rows
                 .into_iter()
                 .map(
-                    |(arn, name, tn, status, size, table_arn, created_at)| BackupSummary {
-                        backup_arn: arn,
-                        backup_name: name,
-                        table_name: tn,
-                        table_arn,
-                        backup_status: status,
-                        backup_type: "USER".to_owned(),
-                        backup_size_bytes: size,
-                        backup_creation_date_time: pg_timestamp_to_epoch(created_at),
+                    |(arn, name, tn, table_id, status, size, table_arn, created_at)| {
+                        BackupSummary {
+                            backup_arn: arn,
+                            backup_name: name,
+                            table_name: tn,
+                            table_id,
+                            table_arn,
+                            backup_status: status,
+                            backup_type: "USER".to_owned(),
+                            backup_size_bytes: size,
+                            backup_creation_date_time: pg_timestamp_to_epoch(created_at),
+                        }
                     },
                 )
                 .collect())
         })
     }
 
-    fn delete_backup(
+    fn delete(
         &self,
         account_id: &str,
         backup_arn: &str,
@@ -382,18 +1706,59 @@ impl BackupEngine for PostgresEngine {
         Box::pin(async move {
             // Resolves account-scoped, so a backup owned by another account is
             // reported missing here and the writes below never run.
-            let desc = self.describe_backup(&account_id, &backup_arn).await?;
+            let desc = self.describe(&account_id, &backup_arn).await?;
 
-            // The account predicate is repeated on both writes rather than
-            // relying on the lookup above, so the statements are correct on
-            // their own terms.
+            // One transaction, so a restore reading its snapshot sees either
+            // the whole backup or a DELETED one, never AVAILABLE with its rows
+            // gone. The account predicate is repeated on every write rather
+            // than relying on the lookup above, so the statements are correct
+            // on their own terms.
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+            // Refuse while a restore from this backup is still running, as the
+            // service does. The backup row is locked first; a restore records
+            // itself in `table_restores` while holding the same row FOR UPDATE,
+            // so one of the two always sees the other. The status is read
+            // under the lock too: a `replace_with_index_row` that committed
+            // after the lookup above has deleted the row (and a concurrent
+            // DeleteBackup leaves it DELETED); either way this delete answers
+            // not found, and never DELETED for a backup that now lives in
+            // the store.
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 FOR UPDATE",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if status.as_deref() != Some("AVAILABLE") {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            }
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, &backup_arn).await?
+            {
+                return Err(crate::backup_catalog::backup_in_use(&table, &backup_arn));
+            }
             sqlx::query(
                 "DELETE FROM backup_items WHERE backup_arn = $1 AND EXISTS (\
                  SELECT 1 FROM backups b WHERE b.backup_arn = $1 AND b.account_id = $2)",
             )
             .bind(&backup_arn)
             .bind(&account_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+
+            sqlx::query(
+                "DELETE FROM backup_definitions WHERE backup_arn = $1 AND EXISTS (\
+                 SELECT 1 FROM backups b WHERE b.backup_arn = $1 AND b.account_id = $2)",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
 
@@ -403,80 +1768,99 @@ impl BackupEngine for PostgresEngine {
             )
             .bind(&backup_arn)
             .bind(&account_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
+
+            tx.commit().await.map_err(db_err)?;
 
             Ok(BackupDescription {
                 backup_details: BackupDetails {
                     backup_status: "DELETED".to_owned(),
                     ..desc.backup_details
                 },
-                source_table_details: desc.source_table_details,
+                ..desc
             })
         })
     }
 
-    fn restore_table_from_backup(
+    fn restore_source(
         &self,
         account_id: &str,
-        target_table_name: &str,
         backup_arn: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
+    ) -> BoxFuture<'_, Result<BackupRestoreSource, StorageError>> {
         let account_id = account_id.to_string();
-        let target_table_name = target_table_name.to_string();
         let backup_arn = backup_arn.to_string();
         Box::pin(async move {
-            let backup_row: (
+            #[allow(clippy::type_complexity)]
+            let row: Option<(
+                String,
+                String,
                 String,
                 serde_json::Value,
                 serde_json::Value,
                 String,
                 Option<serde_json::Value>,
+                i64,
+                i64,
+                time::OffsetDateTime,
+                time::OffsetDateTime,
                 Option<serde_json::Value>,
-            ) = sqlx::query_as(
-                "SELECT table_name, key_schema, attribute_definitions, billing_mode, \
-                 provisioned_throughput, vector_indexes \
-                 FROM backups \
-                 WHERE backup_arn = $1 AND account_id = $2 AND backup_status = 'AVAILABLE'",
+                Option<serde_json::Value>,
+            )> = sqlx::query_as(
+                "SELECT b.table_name, b.table_id, \
+                 COALESCE(t.table_arn, \
+                   'arn:aws:dynamodb:' || $3 || ':' || b.account_id || ':table/' || b.table_name), \
+                 b.key_schema, b.attribute_definitions, b.billing_mode, \
+                 b.provisioned_throughput, b.item_count, b.backup_size_bytes, b.created_at, \
+                 COALESCE(t.creation_date_time, b.created_at), b.vector_indexes, d.definition \
+                 FROM backups b \
+                 LEFT JOIN tables t ON t.table_id = b.table_id \
+                 LEFT JOIN backup_definitions d ON d.backup_arn = b.backup_arn \
+                 WHERE b.backup_arn = $1 AND b.account_id = $2 AND b.backup_status = 'AVAILABLE'",
             )
             .bind(&backup_arn)
             .bind(&account_id)
+            .bind(&self.region)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?
-            .ok_or_else(|| StorageError::Validation(format!("Backup not found: {backup_arn}")))?;
+            .map_err(read_err)?;
+            let Some((
+                source_table_name,
+                source_table_id,
+                source_table_arn,
+                ks_json,
+                ad_json,
+                billing_mode,
+                row_throughput,
+                item_count,
+                size_bytes,
+                created_at,
+                table_created_at,
+                vector_indexes,
+                definition,
+            )) = row
+            else {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            };
 
-            let (_orig_table, ks_json, ad_json, billing, _prov, vector_indexes) = backup_row;
-
-            // Restore rebuilds the target from the snapshot's key schema,
-            // attribute definitions and billing mode, and does not carry indexes
-            // across. For a source table that had vector indexes that would be
-            // silent loss of a declared index: the restored table would answer
-            // every request except a search, and the client would only find out
-            // on the first one. The service preserves vector indexes through
-            // backup and restore (measured 2026-08-19), so the conformant end
-            // state is to restore them; until then this refuses, because a typed
-            // refusal is recoverable and silent loss is not.
-            //
-            // A NULL snapshot is a backup taken before the column existed, which
-            // cannot have carried vector indexes: this backend could not create
-            // them then. An unrecognised version is refused rather than guessed
-            // at, for the same reason a declared index must not be dropped
-            // silently.
-            let vector_index_count = match vector_indexes.as_ref() {
-                None => 0,
-                Some(snapshot) => {
+            let definition = definition
+                .map(|d| BackupTableDefinition::from_json(unescape_json(d), &backup_arn))
+                .transpose()?;
+            // A backup taken before catalog 0.0.4 has no definition; its
+            // vector indexes are known only from the `backups.vector_indexes`
+            // snapshot. A NULL snapshot is a backup taken before that column
+            // existed, which cannot have carried vector indexes: this backend
+            // could not create them then. An unrecognised version is refused
+            // rather than guessed at, so a declared index is never dropped
+            // silently. The engine refuses a non-zero count.
+            let legacy_vector_index_count = match (&definition, vector_indexes.as_ref()) {
+                (Some(_), _) | (None, None) => 0,
+                (None, Some(snapshot)) => {
                     let version = snapshot.get("Version").and_then(serde_json::Value::as_u64);
                     if version != Some(1) {
-                        // Version skew, not a fault: a newer build wrote a shape
-                        // this one does not know. Reported the same way as the
-                        // refusal below, so a client gets a reason rather than a
-                        // 500 and the operator gets no error-level noise. Nearly
-                        // unreachable, because a shape change would normally come
-                        // with a catalog version bump that the startup gate
-                        // refuses first; the gap is a future build adding a member
-                        // without any schema change.
                         return Err(StorageError::Unsupported(format!(
                             "backup {backup_arn} carries a vector index snapshot this build \
                              cannot read (version {version:?})"
@@ -488,255 +1872,519 @@ impl BackupEngine for PostgresEngine {
                         .map_or(0, Vec::len)
                 }
             };
-            if vector_index_count > 0 {
-                return Err(StorageError::Unsupported(format!(
-                    "backup {backup_arn} has {vector_index_count} vector index(es); \
-                     restoring a table with vector indexes is not supported by this \
-                     storage backend"
-                )));
-            }
-
-            let key_schema: Vec<extenddb_core::types::KeySchemaElement> =
-                serde_json::from_value(ks_json)
-                    .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?;
-            let attr_defs: Vec<extenddb_core::types::AttributeDefinition> =
-                serde_json::from_value(ad_json)
-                    .map_err(|e| StorageError::Internal(format!("Parse attr defs: {e}")))?;
-
-            let billing_mode = if billing == "PAY_PER_REQUEST" {
-                Some(extenddb_core::types::BillingMode::PayPerRequest)
-            } else {
-                Some(extenddb_core::types::BillingMode::Provisioned)
+            let provisioned_throughput = match &definition {
+                Some(d) => d.provisioned_throughput.clone(),
+                None => throughput_from_catalog(row_throughput.as_ref()),
             };
 
-            let create_input = extenddb_core::types::CreateTableInput {
-                table_name: target_table_name.clone(),
-                key_schema,
-                attribute_definitions: attr_defs,
+            Ok(BackupRestoreSource {
+                backup_arn: backup_arn.clone(),
+                backup_creation_date_time: pg_timestamp_to_epoch(created_at),
+                source_table_name,
+                source_table_arn,
+                source_table_id,
+                key_schema: from_catalog_json(ks_json)
+                    .map_err(|e| StorageError::Internal(format!("Parse key schema: {e}")))?,
+                attribute_definitions: from_catalog_json(ad_json)
+                    .map_err(|e| StorageError::Internal(format!("Parse attr defs: {e}")))?,
                 billing_mode,
-                provisioned_throughput: Some(extenddb_core::types::ProvisionedThroughput {
-                    read_capacity_units: 5,
-                    write_capacity_units: 5,
-                }),
-                global_secondary_indexes: None,
-                local_secondary_indexes: None,
-                stream_specification: None,
-                tags: None,
-                deletion_protection_enabled: None,
-                sse_specification: None,
-                table_class: None,
-                on_demand_throughput: None,
-                ..Default::default()
-            };
-
-            // Create the table with the ACTIVE transition deferred: it enters
-            // CREATING with no scheduled flip, so the control-plane worker
-            // cannot mark it ACTIVE while the item copy below is still
-            // running. The explicit ACTIVE update after the copy is the only
-            // way this table leaves CREATING, so ACTIVE implies the restored
-            // data is fully present.
-            let desc = self
-                .create_table_impl(&account_id, create_input, true)
-                .await?;
-
-            let new_table_id = &desc.table_id;
-            let ddb_table = data_table_name(new_table_id);
-            let ddb_table_unquoted = ddb_table.trim_matches('"');
-
-            let has_sk: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
-             WHERE table_name = $1 AND column_name = 'sk')",
-            )
-            .bind(ddb_table_unquoted)
-            .fetch_one(&self.data_pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let items: Vec<(String, Option<String>, serde_json::Value)> =
-                sqlx::query_as("SELECT pk, sk, item_data FROM backup_items WHERE backup_arn = $1")
-                    .bind(&backup_arn)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            for (pk, sk, item_data) in &items {
-                if has_sk {
-                    sqlx::query(&format!(
-                        "INSERT INTO {ddb_table} (pk, sk, item_data) VALUES ($1, $2, $3)"
-                    ))
-                    .bind(pk)
-                    .bind(sk.as_deref())
-                    .bind(item_data)
-                    .execute(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-                } else {
-                    sqlx::query(&format!(
-                        "INSERT INTO {ddb_table} (pk, item_data) VALUES ($1, $2)"
-                    ))
-                    .bind(pk)
-                    .bind(item_data)
-                    .execute(&self.data_pool)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-                }
-            }
-
-            #[allow(clippy::cast_possible_wrap)]
-            let item_count = items.len() as i64;
-
-            sqlx::query(
-                "UPDATE tables SET item_count = $1 WHERE account_id = $2 AND table_name = $3",
-            )
-            .bind(item_count)
-            .bind(&account_id)
-            .bind(&target_table_name)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            // Mark the restored table ACTIVE now that the copy has fully
-            // drained. The table was created with the transition deferred, so
-            // this is the first point it can become ACTIVE, by ordering rather
-            // than by timing.
-            sqlx::query(
-                "UPDATE tables SET table_status = 'ACTIVE', status_transition_at = NULL \
-             WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(&account_id)
-            .bind(&target_table_name)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            // Return CREATING — the API response shows the initial status,
-            // but the table is already ACTIVE by the time the caller polls.
-            Ok(desc)
-        })
-    }
-
-    fn describe_continuous_backups(
-        &self,
-        account_id: &str,
-        table_name: &str,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
-        Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            let pitr_row: Option<(bool,)> = sqlx::query_as(
-                "SELECT pitr_enabled FROM continuous_backups \
-             WHERE account_id = $1 AND table_name = $2",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            let pitr_enabled = pitr_row.is_some_and(|r| r.0);
-
-            #[allow(clippy::cast_precision_loss)]
-            let now_epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as f64;
-
-            Ok(ContinuousBackupsDescription {
-                continuous_backups_status: "ENABLED".to_owned(),
-                point_in_time_recovery_description: Some(PointInTimeRecoveryDescription {
-                    point_in_time_recovery_status: if pitr_enabled {
-                        "ENABLED".to_owned()
-                    } else {
-                        "DISABLED".to_owned()
-                    },
-                    earliest_restorable_date_time: if pitr_enabled {
-                        Some(now_epoch - 35.0 * 24.0 * 3600.0)
-                    } else {
-                        None
-                    },
-                    latest_restorable_date_time: if pitr_enabled { Some(now_epoch) } else { None },
-                }),
+                provisioned_throughput,
+                item_count,
+                table_size_bytes: size_bytes,
+                table_creation_date_time: pg_timestamp_to_epoch(table_created_at),
+                definition,
+                legacy_vector_index_count,
             })
         })
     }
 
-    fn update_continuous_backups(
+    /// Register the CREATING target and return its description; the copy
+    /// runs in a detached task.
+    ///
+    /// The request hands everything to a `tokio::spawn`ed task that owns its
+    /// own clones: take the restore lock, create the target and its
+    /// `table_restores` row (the job record, RUNNING under the claim's
+    /// generation) in one catalog transaction (which re-checks the backup is
+    /// AVAILABLE and owned by the account, holding it FOR UPDATE), report
+    /// that result back through a channel, then copy. Dropping the request
+    /// future at any point therefore changes nothing: the registration still
+    /// commits or fails on its own, and a registered target is still copied
+    /// and flipped ACTIVE, or removed on failure.
+    fn restore(
         &self,
         account_id: &str,
-        table_name: &str,
-        pitr_enabled: bool,
-    ) -> BoxFuture<'_, Result<ContinuousBackupsDescription, StorageError>> {
+        request: RestoreRequest,
+        permit: JobPermit,
+    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
         let account_id = account_id.to_string();
-        let table_name = table_name.to_string();
         Box::pin(async move {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM tables WHERE account_id = $1 AND table_name = $2)",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            if !exists {
-                return Err(StorageError::TableNotFound(format!(
-                    "Table not found: {table_name}"
-                )));
-            }
-
-            sqlx::query(
-                "INSERT INTO continuous_backups (account_id, table_name, pitr_enabled) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (account_id, table_name) DO UPDATE SET pitr_enabled = $3",
-            )
-            .bind(&account_id)
-            .bind(&table_name)
-            .bind(pitr_enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("Database error: {e}")))?;
-
-            self.describe_continuous_backups(&account_id, &table_name)
-                .await
+            let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+            let engine = self.clone();
+            tokio::spawn(engine.run_restore(account_id, request, permit, registered_tx));
+            registered_rx.await.map_err(|_| {
+                StorageError::Internal("the restore task ended before registering".to_owned())
+            })?
         })
     }
 
-    // TODO(cleanup): This method is unreachable — the engine handler returns
-    // ValidationException("not yet supported") before calling storage. Remove
-    // when real PITR is implemented or during the next storage trait cleanup.
-    fn restore_table_to_point_in_time(
+    /// The in-catalog create commits its row AVAILABLE in one transaction
+    /// with the items, so it never leaves a CREATING row.
+    fn abandoned_creating_backups(
+        &self,
+        _stale_after: Duration,
+    ) -> BoxFuture<'_, Result<Vec<AbandonedLegacyBackup>, StorageError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys("backup_status <> 'DELETED'"))
+    }
+
+    /// A replacement deletes the `backups` row, so every DELETED row is a
+    /// DeleteBackup's.
+    fn list_deleted(&self) -> BoxFuture<'_, Result<Vec<LegacyBackupKey>, StorageError>> {
+        Box::pin(self.legacy_keys("backup_status = 'DELETED'"))
+    }
+
+    fn holder_status<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupStatus>, StorageError>> {
+        Box::pin(async move {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = $1 AND account_id = $2",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(read_err)?;
+            status.as_deref().map(BackupStatus::parse).transpose()
+        })
+    }
+
+    /// The DELETED `backups` row goes (the DeleteBackup removed its items
+    /// and definition); a row in any other status is left.
+    fn remove_deleted<'a>(
+        &'a self,
+        account_id: &'a str,
+        backup_arn: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StorageError>> {
+        Box::pin(async move {
+            let removed = sqlx::query(
+                "DELETE FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 AND backup_status = 'DELETED'",
+            )
+            .bind(backup_arn)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+            Ok(removed == 1)
+        })
+    }
+
+    /// The source as `restore_source` reads it, then one `REPEATABLE READ
+    /// READ ONLY` catalog transaction whose first statement re-checks
+    /// AVAILABLE and pins the snapshot the items are read in, as the
+    /// restore's copy reads them (`copy_backup_items`). `backup_items` has no
+    /// key to page by, so the transaction is held, on one pooled
+    /// connection, until the stream ends or is dropped; it holds the
+    /// catalog's xmin for that long. A task owns the transaction and hands
+    /// the items over one at a time.
+    fn items(
         &self,
         account_id: &str,
-        source_table_name: &str,
-        target_table_name: &str,
-    ) -> BoxFuture<'_, Result<TableDescription, StorageError>> {
-        let account_id = account_id.to_string();
-        let source_table_name = source_table_name.to_string();
-        let target_table_name = target_table_name.to_string();
+        backup_arn: &str,
+    ) -> BoxFuture<'_, Result<LegacyBackupItems, StorageError>> {
+        let account_id = account_id.to_owned();
+        let backup_arn = backup_arn.to_owned();
         Box::pin(async move {
-            let backup = self
-                .create_backup(&account_id, &source_table_name, "__pitr_restore__")
-                .await?;
-            let desc = self
-                .restore_table_from_backup(&account_id, &target_table_name, &backup.backup_arn)
-                .await?;
-            let _ = self.delete_backup(&account_id, &backup.backup_arn).await;
-            Ok(desc)
+            let source = self.restore_source(&account_id, &backup_arn).await?;
+            let mut snapshot = self
+                .pool
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await
+                .map_err(db_err)?;
+            let backup_name: Option<String> = sqlx::query_scalar(
+                "SELECT backup_name FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 AND backup_status = 'AVAILABLE'",
+            )
+            .bind(&backup_arn)
+            .bind(&account_id)
+            .fetch_optional(&mut *snapshot)
+            .await
+            .map_err(read_err)?;
+            let Some(backup_name) = backup_name else {
+                return Err(StorageError::Validation(format!(
+                    "Backup not found: {backup_arn}"
+                )));
+            };
+            #[cfg(feature = "test-hooks")]
+            legacy_items_pause::maybe_pause(&backup_arn).await;
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(send_legacy_items(snapshot, backup_arn, sender));
+            Ok(LegacyBackupItems {
+                backup_name,
+                source,
+                // A definition's vector index names, or the snapshot's count
+                // for a backup without one, are what `ensure_restorable`
+                // refuses; a backup it accepts had none.
+                vector_state: LegacyVectorState::NoneRecorded,
+                items: Box::pin(futures::stream::unfold(
+                    receiver,
+                    |mut receiver| async move { receiver.recv().await.map(|item| (item, receiver)) },
+                )),
+            })
         })
+    }
+
+    /// One catalog transaction: the `backups` row FOR UPDATE (the lock
+    /// DeleteBackup and a restore's registration take), the in-use rule,
+    /// `insert_backup_row`'s insert, then the items, the definition and the
+    /// `backups` row deleted.
+    fn replace_with_index_row<'a>(
+        &'a self,
+        row: &'a BackupRow,
+    ) -> BoxFuture<'a, Result<Replaced, StorageError>> {
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await.map_err(db_err)?;
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT backup_status FROM backups WHERE backup_arn = $1 AND account_id = $2 \
+                 FOR UPDATE",
+            )
+            .bind(&row.backup_arn)
+            .bind(&row.account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let same = |held: &Option<(String, String, StoreIdentity)>| {
+                held.as_ref().is_some_and(|(account_id, arn, store)| {
+                    *account_id == row.account_id && *arn == row.backup_arn && *store == row.store
+                })
+            };
+            let held_elsewhere = |arn: &str, store: &StoreIdentity| {
+                StorageError::AlreadyExists(format!(
+                    "backup id {} has a row under {arn} in the {} store at {:?} ({})",
+                    row.backup_id, store.store_kind, store.store_root, store.store_id
+                ))
+            };
+            if status.as_deref() != Some("AVAILABLE") {
+                let held =
+                    crate::backup_catalog::index_row_holding(&mut *tx, &row.backup_id).await?;
+                tx.rollback().await.map_err(db_err)?;
+                // Another row of the id is answered as such whatever the
+                // in-catalog backup's status, as on the AVAILABLE path: the
+                // caller keeps the copy, which may be that row's prefix.
+                return match held {
+                    _ if same(&held) => Ok(Replaced::AlreadyReplaced),
+                    Some((_, arn, store)) => Err(held_elsewhere(&arn, &store)),
+                    None => Ok(Replaced::NotAvailable(match status {
+                        Some(status) => format!("the in-catalog backup is {status}"),
+                        None => format!("Backup not found: {}", row.backup_arn),
+                    })),
+                };
+            }
+            if let Some(table) =
+                crate::backup_catalog::creating_restore_target(&mut *tx, &row.backup_arn).await?
+            {
+                tx.rollback().await.map_err(db_err)?;
+                return Ok(Replaced::InUse(table));
+            }
+            let outcome = if crate::backup_catalog::insert_unowned_row(&mut *tx, row).await? {
+                Replaced::Replaced
+            } else {
+                let held =
+                    crate::backup_catalog::index_row_holding(&mut *tx, &row.backup_id).await?;
+                if !same(&held) {
+                    tx.rollback().await.map_err(db_err)?;
+                    return Err(match held {
+                        Some((_, arn, store)) => held_elsewhere(&arn, &store),
+                        None => StorageError::Internal(format!(
+                            "the insert of backup {} met a conflict and no row",
+                            row.backup_arn
+                        )),
+                    });
+                }
+                Replaced::AlreadyReplaced
+            };
+            for statement in [
+                "DELETE FROM backup_items WHERE backup_arn = $1",
+                "DELETE FROM backup_definitions WHERE backup_arn = $1",
+            ] {
+                sqlx::query(statement)
+                    .bind(&row.backup_arn)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+            // The row itself goes, not to DELETED: a DELETED `backups` row
+            // is then always a DeleteBackup's, whose prefix `backup sync`
+            // never adopts.
+            sqlx::query("DELETE FROM backups WHERE backup_arn = $1 AND account_id = $2")
+                .bind(&row.backup_arn)
+                .bind(&row.account_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            Ok(outcome)
+        })
+    }
+}
+
+impl PostgresEngine {
+    /// The `backups` rows `filter` keeps, of every account, by creation
+    /// time and then ARN.
+    async fn legacy_keys(&self, filter: &str) -> Result<Vec<LegacyBackupKey>, StorageError> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+            "SELECT account_id, backup_arn, backup_status FROM backups WHERE {filter} \
+             ORDER BY created_at, backup_arn"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(read_err)?;
+        rows.into_iter()
+            .map(|(account_id, backup_arn, status)| {
+                Ok(LegacyBackupKey {
+                    account_id,
+                    backup_arn,
+                    status: BackupStatus::parse(&status)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Pause the legacy reader's `items` of one backup after its AVAILABLE
+/// re-check pinned the snapshot and before the item read, so a test can
+/// commit a DeleteBackup in between and see the snapshot hold.
+#[cfg(feature = "test-hooks")]
+pub mod legacy_items_pause {
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use tokio::sync::Notify;
+
+    struct Rendezvous {
+        backup_arn: String,
+        arrived: Arc<Notify>,
+        proceed: Arc<Notify>,
+    }
+
+    static PAUSE: LazyLock<Mutex<Option<Rendezvous>>> = LazyLock::new(|| Mutex::new(None));
+
+    /// Arm the pause once, for `backup_arn`. Returns `(arrived, proceed)`:
+    /// `items` notifies `arrived` when it reaches the point and waits on
+    /// `proceed`.
+    #[must_use]
+    pub fn arm(backup_arn: &str) -> (Arc<Notify>, Arc<Notify>) {
+        let arrived = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        *PAUSE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Rendezvous {
+            backup_arn: backup_arn.to_owned(),
+            arrived: Arc::clone(&arrived),
+            proceed: Arc::clone(&proceed),
+        });
+        (arrived, proceed)
+    }
+
+    pub(crate) async fn maybe_pause(backup_arn: &str) {
+        let armed = {
+            let mut slot = PAUSE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.as_ref().is_some_and(|r| r.backup_arn == backup_arn) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(r) = armed {
+            r.arrived.notify_one();
+            r.proceed.notified().await;
+        }
+    }
+}
+
+/// The task half of `items`: read the backup's items in `snapshot` and send
+/// each, parsed, to `sender`; the first error is sent last. Ends, rolling
+/// the transaction back, when the read ends or the stream is dropped.
+async fn send_legacy_items(
+    mut snapshot: sqlx::Transaction<'static, sqlx::Postgres>,
+    backup_arn: String,
+    sender: tokio::sync::mpsc::Sender<Result<Item, StorageError>>,
+) {
+    use futures::TryStreamExt;
+
+    let failure = {
+        let mut rows = sqlx::query_scalar::<_, String>(
+            "SELECT item_data::text FROM backup_items WHERE backup_arn = $1",
+        )
+        .bind(&backup_arn)
+        .fetch(&mut *snapshot);
+        loop {
+            match rows.try_next().await {
+                Ok(Some(item_json)) => {
+                    let item = serde_json::from_str::<Item>(&item_json)
+                        .map_err(|e| StorageError::Internal(format!("Parse backup item: {e}")));
+                    let parsed = item.is_ok();
+                    if sender.send(item).await.is_err() || !parsed {
+                        break None;
+                    }
+                }
+                Ok(None) => break None,
+                Err(e) => break Some(read_err(e)),
+            }
+        }
+    };
+    if let Some(error) = failure {
+        let _ = sender.send(Err(error)).await;
+    }
+    let _ = snapshot.rollback().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::*;
+
+    /// A server error reply carrying `code` as its SQLSTATE.
+    #[derive(Debug)]
+    struct Reply {
+        code: Option<&'static str>,
+    }
+
+    impl std::fmt::Display for Reply {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "server reply {:?}", self.code)
+        }
+    }
+
+    impl std::error::Error for Reply {}
+
+    impl sqlx::error::DatabaseError for Reply {
+        fn message(&self) -> &str {
+            "server reply"
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.map(Cow::Borrowed)
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn reply(code: Option<&'static str>) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(Reply { code }))
+    }
+
+    #[test]
+    fn only_too_many_connections_is_limit_exceeded() {
+        match lock_connection_error(&reply(Some("53300"))) {
+            StorageError::LimitExceeded(m) => assert_eq!(
+                m,
+                limit_exceeded_message(JobBound::ServerConnections),
+                "the one job-refusal text, naming the server's connection slots"
+            ),
+            other => panic!("too_many_connections is LimitExceeded: {other:?}"),
+        }
+        // invalid_password, invalid_catalog_name, cannot_connect_now,
+        // insufficient_resources (53000, same class), and no SQLSTATE.
+        for code in [
+            Some("28P01"),
+            Some("3D000"),
+            Some("57P03"),
+            Some("53000"),
+            None,
+        ] {
+            assert!(
+                matches!(
+                    lock_connection_error(&reply(code)),
+                    StorageError::Internal(_)
+                ),
+                "{code:?} must be Internal"
+            );
+        }
+        for e in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "refused",
+            )),
+            sqlx::Error::Tls("bad certificate".into()),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::Protocol("unexpected".to_owned()),
+        ] {
+            assert!(
+                matches!(lock_connection_error(&e), StorageError::Internal(_)),
+                "{e} must be Internal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_that_cannot_reach_the_database_is_transient() {
+        // connection_failure, admin_shutdown, crash_shutdown,
+        // cannot_connect_now, too_many_connections, connection_exception.
+        for code in ["08006", "57P01", "57P02", "57P03", "53300", "08000"] {
+            assert!(
+                matches!(read_err(reply(Some(code))), StorageError::Transient(_)),
+                "{code} must be Transient"
+            );
+        }
+        for e in [
+            sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+            sqlx::Error::Tls("bad record".into()),
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+        ] {
+            let what = e.to_string();
+            assert!(
+                matches!(read_err(e), StorageError::Transient(_)),
+                "{what} must be Transient"
+            );
+        }
+        // undefined_column, insufficient_privilege, query_canceled,
+        // insufficient_resources (53000), no SQLSTATE, a protocol error,
+        // and a decode error stay Internal.
+        for code in [
+            Some("42703"),
+            Some("42501"),
+            Some("57014"),
+            Some("53000"),
+            None,
+        ] {
+            assert!(
+                matches!(read_err(reply(code)), StorageError::Internal(_)),
+                "{code:?} must be Internal"
+            );
+        }
+        for e in [
+            sqlx::Error::Protocol("unexpected".to_owned()),
+            sqlx::Error::ColumnNotFound("definition".to_owned()),
+        ] {
+            let what = e.to_string();
+            assert!(
+                matches!(read_err(e), StorageError::Internal(_)),
+                "{what} must be Internal"
+            );
+        }
     }
 }

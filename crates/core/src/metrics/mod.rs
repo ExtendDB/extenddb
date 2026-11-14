@@ -15,12 +15,13 @@
 mod accumulator;
 mod collector;
 mod collector_query;
+mod collector_record;
 mod segments;
 mod types;
 
 pub use collector::MetricsCollector;
 pub use types::{
-    Dimension, FlushBucket, LatencySegments, MetricName, MetricSnapshot, MetricsBucket,
-    MetricsQuery, MetricsResponse, OperationSegments, Percentiles, QueryCategory, QuerySource,
-    TimeWindow, auto_granularity, parse_granularity, window_duration_secs,
+    BackupJobOutcome, Dimension, FlushBucket, LatencySegments, MetricName, MetricSnapshot,
+    MetricsBucket, MetricsQuery, MetricsResponse, OperationSegments, Percentiles, QueryCategory,
+    QuerySource, TimeWindow, auto_granularity, parse_granularity, window_duration_secs,
 };

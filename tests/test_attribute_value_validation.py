@@ -7,8 +7,8 @@ The AWS Java SDK omits explicitly-null fields from the JSON it puts on the
 wire, so call patterns like ``attrVal.setBOOL(null)`` and ``attrVal.setM(null)``
 emit a literal ``{}`` AttributeValue. Real DynamoDB rejects these with a
 ``ValidationException`` whose message starts with
-``"Supplied AttributeValue is empty"`` (error code ``EMPTY_ATTRIBUTE_VALUE`` in
-the BigBird parity tests). The same shape is expected for AttributeValues
+``"Supplied AttributeValue is empty"`` (error code ``EMPTY_ATTRIBUTE_VALUE``).
+The same shape is expected for AttributeValues
 that contain more than one type-key (``MULTI_ATTRIBUTE_VALUE``) and for
 ``SS``/``NS``/``BS`` arrays whose elements include a JSON null.
 
@@ -148,9 +148,8 @@ def _assert_empty_attribute_value(resp: requests.Response) -> None:
 def _assert_ss_with_null_specific_message(resp: requests.Response) -> None:
     """Assert the SS-with-null-element response uses the exact DDB wording.
 
-    BigBird parity tests (``putItemTestListWithNullStringSet``,
-    ``putItemTestMapWithNullStringSet``) check for the specific
-    ``INVALID_PARAMETER_VALUE`` prefix plus
+    An SS array containing a JSON null (directly, or nested inside a list or a
+    map) is rejected with the ``INVALID_PARAMETER_VALUE`` prefix plus
     ``"An string set may not have a null string as a member"`` (the awkward
     "An string set" wording is verbatim from real DDB).
     """
@@ -518,12 +517,11 @@ class TestScanAttributeValueValidation:
 #
 # Real DynamoDB returns a type-specific INVALID_PARAMETER_VALUE message for
 # the ``{"SS":[..., null]}`` case rather than the generic
-# EMPTY_ATTRIBUTE_VALUE wording. BigBird parity tests
-# (``putItemTestListWithNullStringSet``, ``putItemTestMapWithNullStringSet``)
-# match on the suffix verbatim, so we lock the wording in here on a few
-# representative APIs. Other APIs route through the same deserializer so
-# they automatically inherit the fix; the broader EMPTY_AV_SCENARIOS suite
-# above covers them under the more permissive helper.
+# EMPTY_ATTRIBUTE_VALUE wording. We lock that exact wording in here on a few
+# representative APIs (top-level, inside a list, inside a map). Other APIs route
+# through the same deserializer so they automatically inherit the fix; the
+# broader EMPTY_AV_SCENARIOS suite above covers them under the more permissive
+# helper.
 # ---------------------------------------------------------------------------
 
 
@@ -541,7 +539,7 @@ class TestStringSetWithNullSpecificMessage:
         _assert_ss_with_null_specific_message(_signed_post("PutItem", body))
 
     def test_put_item_ss_with_null_inside_list(self, hash_table):
-        # Mirrors BigBird ``putItemTestListWithNullStringSet`` shape.
+        # A string set with a null element nested inside a list.
         body = {
             "TableName": hash_table,
             "Item": {
@@ -552,7 +550,7 @@ class TestStringSetWithNullSpecificMessage:
         _assert_ss_with_null_specific_message(_signed_post("PutItem", body))
 
     def test_put_item_ss_with_null_inside_map(self, hash_table):
-        # Mirrors BigBird ``putItemTestMapWithNullStringSet`` shape.
+        # A string set with a null element nested inside a map.
         body = {
             "TableName": hash_table,
             "Item": {

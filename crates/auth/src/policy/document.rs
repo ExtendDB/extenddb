@@ -13,8 +13,10 @@ use std::fmt;
 /// A parsed IAM policy document.
 #[derive(Debug, Clone)]
 pub struct PolicyDocument {
-    /// Policy version string (e.g., "2012-10-17").
-    pub version: String,
+    /// The `Version` string (e.g., "2012-10-17"); `None` when the document has
+    /// no `Version` or its value is not a string. Writes accept only
+    /// `2012-10-17` and `2008-10-17`; a stored document may hold any value.
+    pub version: Option<String>,
     /// The policy statements.
     pub statements: Vec<Statement>,
 }
@@ -93,6 +95,7 @@ pub enum ConditionOperator {
     StringEquals,
     StringNotEquals,
     StringEqualsIgnoreCase,
+    StringNotEqualsIgnoreCase,
     StringLike,
     StringNotLike,
     // Numeric
@@ -118,6 +121,9 @@ pub enum ConditionOperator {
     ArnNotEquals,
     ArnLike,
     ArnNotLike,
+    // IP address (CIDR membership, IPv4 and IPv6)
+    IpAddress,
+    NotIpAddress,
     // Set operators (prefix applied to any of the above)
     ForAllValues(Box<ConditionOperator>),
     ForAnyValue(Box<ConditionOperator>),
@@ -137,6 +143,9 @@ impl fmt::Display for PolicyParseError {
 
 impl std::error::Error for PolicyParseError {}
 
+/// The size limit `from_json` applies to every document it parses.
+pub(super) const MAX_POLICY_BYTES: usize = 6_144;
+
 impl PolicyDocument {
     /// Parse a policy document from a JSON string.
     ///
@@ -150,7 +159,7 @@ impl PolicyDocument {
     /// Returns `PolicyParseError` if the JSON is malformed or contains
     /// invalid policy constructs (e.g., both Action and `NotAction`).
     pub fn from_json(json: &str) -> Result<Self, PolicyParseError> {
-        Self::from_json_with_size_limit(json, 6_144)
+        Self::from_json_with_size_limit(json, MAX_POLICY_BYTES)
     }
 
     /// Parse a policy document with an explicit size limit.
@@ -168,13 +177,134 @@ impl PolicyDocument {
             )));
         }
         let raw: Value = serde_json::from_str(json).map_err(|e| PolicyParseError(e.to_string()))?;
-        let version = raw["Version"].as_str().unwrap_or("2012-10-17").to_owned();
+        let version = raw["Version"].as_str().map(ToOwned::to_owned);
         let statements = parse_statements(&raw["Statement"])?;
+        validate_statement_cidrs(&statements)?;
         Ok(Self {
             version,
             statements,
         })
     }
+
+    /// Parse a policy document for a write (`PutUserPolicy`, `PutRolePolicy`,
+    /// a managed or boundary policy) and apply the checks the service applies
+    /// only when a policy is written.
+    ///
+    /// Everything `from_json` checks, plus the `Version` value, the `Sid`
+    /// charset, the `${...}` references ([`super::variable_syntax`]) and the
+    /// Arn condition values (`arn_value::validate_statement_arn_values`). All
+    /// four run at write only, so a policy stored before a check existed keeps
+    /// parsing on the request path rather than failing the principal closed:
+    /// a `Sid` is a label that does not affect evaluation, a stored document
+    /// with another `Version` matches its `Resource` patterns as written, as
+    /// it did before, a stored value with such a reference is read as
+    /// before #926, each `${` ending at the next `}`, and a stored Arn value
+    /// evaluates as written unless it is one of the values
+    /// `arn_value::fails_closed_at_evaluation` fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document, its
+    /// `Version` is not `2012-10-17` or `2008-10-17`, a statement `Sid` is
+    /// outside the service's charset, a pattern or condition value holds a
+    /// `${...}` reference IAM refuses ([`super::variable_syntax`]), or an Arn
+    /// condition value fails the write check.
+    pub fn from_json_for_write(json: &str) -> Result<Self, PolicyParseError> {
+        super::variable_syntax::validate_identity_before_parse(json, MAX_POLICY_BYTES)?;
+        let doc = Self::from_json(json)?;
+        super::variables::validate_version(json)?;
+        super::variable_syntax::validate_identity_legacy(&doc)?;
+        validate_statement_sids(&doc.statements)?;
+        super::variable_syntax::validate_identity_after_sid(&doc)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
+        Ok(doc)
+    }
+
+    /// Parse the session policy of an AssumeRole call and apply the Arn
+    /// condition value check of a policy write
+    /// (`arn_value::validate_statement_arn_values`).
+    ///
+    /// Everything `from_json` checks, so a session policy that would not load
+    /// on the request path is refused when the session is issued. The
+    /// `Version`, `Sid` and `${...}` reference checks of `from_json_for_write`
+    /// do not run: a session policy with another `Version`, such a `Sid` or
+    /// such a reference loads and evaluates on the request path, and
+    /// AssumeRole accepted one before. What STS answers for these session
+    /// policies was not measured.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyParseError` if `from_json` rejects the document or an
+    /// Arn condition value fails the write check.
+    pub fn from_json_for_session_policy(json: &str) -> Result<Self, PolicyParseError> {
+        let doc = Self::from_json(json)?;
+        super::arn_value::validate_statement_arn_values(&doc.statements)?;
+        Ok(doc)
+    }
+}
+
+/// Unwrap a condition operator to its base, dropping any `ForAllValues:` /
+/// `ForAnyValue:` prefix and `IfExists` suffix.
+pub(super) fn base_operator(op: &ConditionOperator) -> &ConditionOperator {
+    match op {
+        ConditionOperator::ForAllValues(inner)
+        | ConditionOperator::ForAnyValue(inner)
+        | ConditionOperator::IfExists(inner) => base_operator(inner),
+        other => other,
+    }
+}
+
+/// Reject a malformed CIDR in an `IpAddress` or `NotIpAddress` condition value.
+///
+/// The live service validates these values when an identity or managed policy
+/// is written ("legacy parsing") and rejects a malformed one with
+/// `MalformedPolicyDocument`. `PolicyDocument::from_json` is the identity-policy
+/// write and read path, so this rejects a malformed value at write and fails a
+/// stored identity policy closed at read (it no longer parses, so the request
+/// is denied). The trust-policy path does not use `from_json`: the live trust
+/// write accepts a malformed CIDR and the trust evaluator drops the statement,
+/// which ExtendDB already matches, so trust policies are intentionally not
+/// validated here.
+fn validate_statement_cidrs(statements: &[Statement]) -> Result<(), PolicyParseError> {
+    for stmt in statements {
+        for cond in &stmt.conditions {
+            if matches!(
+                base_operator(&cond.operator),
+                ConditionOperator::IpAddress | ConditionOperator::NotIpAddress
+            ) {
+                for v in &cond.values {
+                    if !super::matcher::is_valid_cidr(v) {
+                        return Err(PolicyParseError(format!(
+                            "malformed CIDR in condition {}: {v}",
+                            cond.key
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a `Sid` outside the service's charset.
+///
+/// Measured on live IAM (`PutUserPolicy` and `CreateRole`): a `Sid` is accepted
+/// only when it is empty or entirely ASCII letters and digits (`[A-Za-z0-9]`),
+/// regardless of length; a hyphen, underscore, space, dot or any non-ASCII
+/// character (including Latin-1 such as an accented letter) is rejected with
+/// `MalformedPolicyDocument`. Applied by `from_json_for_write` only, never on
+/// the request path, so a stored policy with such a `Sid` keeps evaluating.
+fn validate_statement_sids(statements: &[Statement]) -> Result<(), PolicyParseError> {
+    for stmt in statements {
+        if let Some(sid) = &stmt.sid
+            && !sid.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(PolicyParseError(format!(
+                "invalid Sid (must be ASCII letters and digits only): {sid}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse the Statement field — may be a single object or an array.
@@ -357,6 +487,7 @@ fn parse_base_operator(name: &str) -> Result<ConditionOperator, PolicyParseError
         "StringEquals" => Ok(ConditionOperator::StringEquals),
         "StringNotEquals" => Ok(ConditionOperator::StringNotEquals),
         "StringEqualsIgnoreCase" => Ok(ConditionOperator::StringEqualsIgnoreCase),
+        "StringNotEqualsIgnoreCase" => Ok(ConditionOperator::StringNotEqualsIgnoreCase),
         "StringLike" => Ok(ConditionOperator::StringLike),
         "StringNotLike" => Ok(ConditionOperator::StringNotLike),
         "NumericEquals" => Ok(ConditionOperator::NumericEquals),
@@ -377,6 +508,8 @@ fn parse_base_operator(name: &str) -> Result<ConditionOperator, PolicyParseError
         "ArnNotEquals" => Ok(ConditionOperator::ArnNotEquals),
         "ArnLike" => Ok(ConditionOperator::ArnLike),
         "ArnNotLike" => Ok(ConditionOperator::ArnNotLike),
+        "IpAddress" => Ok(ConditionOperator::IpAddress),
+        "NotIpAddress" => Ok(ConditionOperator::NotIpAddress),
         _ => Err(PolicyParseError(format!("unknown operator: {name}"))),
     }
 }
@@ -412,7 +545,7 @@ mod tests {
             }]
         }"#;
         let doc = PolicyDocument::from_json(json).unwrap();
-        assert_eq!(doc.version, "2012-10-17");
+        assert_eq!(doc.version.as_deref(), Some("2012-10-17"));
         assert_eq!(doc.statements.len(), 1);
         assert_eq!(doc.statements[0].effect, Effect::Allow);
         assert!(matches!(
@@ -548,5 +681,114 @@ mod tests {
             &doc.statements[0].principal_match,
             Some(PrincipalMatch::Principals(p)) if p == &["*"]
         ));
+    }
+
+    #[test]
+    fn reject_malformed_cidr_in_ipaddress() {
+        // The live service rejects these at identity-policy write with
+        // MalformedPolicyDocument; from_json is the write and read path.
+        for cidr in ["10.0.0.0/33", "999.0.0.0/8", "not-a-cidr", "10.0.0.0/"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"IpAddress":{{"aws:SourceIp":"{cidr}"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_err(),
+                "should reject malformed CIDR {cidr}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_malformed_cidr_in_notipaddress_and_set_operator() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny",
+            "Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"ForAnyValue:NotIpAddress":{"aws:SourceIp":"10.0.0.0/33"}}}]}"#;
+        assert!(PolicyDocument::from_json(json).is_err());
+    }
+
+    #[test]
+    fn accept_well_formed_cidr() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Action":"dynamodb:GetItem","Resource":"*",
+            "Condition":{"IpAddress":{"aws:SourceIp":["10.0.0.0/8","2001:db8::/32"]}}}]}"#;
+        assert!(PolicyDocument::from_json(json).is_ok());
+    }
+
+    #[test]
+    fn reject_non_alphanumeric_sid() {
+        for sid in ["Sid-X", "Sid_X", "Sid X", "Sid.X", "Sid\u{00e9}"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json_for_write(&json).is_err(),
+                "should reject Sid {sid:?} at write"
+            );
+            // A policy stored before the check existed still parses on the
+            // request path, so its principal is not locked out.
+            assert!(
+                PolicyDocument::from_json(&json).is_ok(),
+                "stored policy with Sid {sid:?} must still parse"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_alphanumeric_or_empty_sid() {
+        for sid in ["Abc123", "", "aaaaaaaaaaaaaaaaaaaa"] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Action":"dynamodb:GetItem","Resource":"*"}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json_for_write(&json).is_ok(),
+                "should accept Sid {sid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_miscased_operator_names() {
+        // The live service treats operator names, set qualifiers and the
+        // IfExists suffix as case-sensitive and rejects a miscased one with
+        // MalformedPolicyDocument (measured). ExtendDB rejects the same
+        // at parse (identity-policy write and read).
+        for op in [
+            "stringequals",
+            "STRINGEQUALS",
+            "bool",
+            "forallvalues:StringEquals",
+            "ForAllValues:stringequals",
+            "StringEqualsifexists",
+            "StringEqualsIfexists",
+        ] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{op}":{{"aws:PrincipalType":"User"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_err(),
+                "miscased operator {op} must be rejected"
+            );
+        }
+        // Canonical operators, qualifier and suffix are accepted.
+        for op in [
+            "StringEquals",
+            "Bool",
+            "ForAllValues:StringEquals",
+            "StringEqualsIfExists",
+        ] {
+            let json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                "Action":"dynamodb:GetItem","Resource":"*",
+                "Condition":{{"{op}":{{"aws:PrincipalType":"User"}}}}}}]}}"#
+            );
+            assert!(
+                PolicyDocument::from_json(&json).is_ok(),
+                "canonical operator {op} must be accepted"
+            );
+        }
     }
 }

@@ -48,14 +48,15 @@ pub enum BackendError {
     /// Failed to connect to backend database
     ConnectionFailed { backend: String, details: String },
 
-    /// Catalog schema version mismatch
-    CatalogVersionMismatch { expected: String, found: String },
-
     /// Encryption key not found in settings table
     MissingEncryptionKey,
 
     /// Generic initialization failure
     InitializationFailed(String),
+
+    /// The catalog's status refuses this server, or a migration the factory
+    /// ran failed; carries the exit code `serve` ends with.
+    Catalog(crate::migrations::MigrationError),
 }
 
 impl std::fmt::Display for BackendError {
@@ -70,15 +71,12 @@ impl std::fmt::Display for BackendError {
             Self::ConnectionFailed { backend, details } => {
                 write!(f, "Failed to connect to {backend}: {details}")
             }
-            Self::CatalogVersionMismatch { expected, found } => write!(
-                f,
-                "Catalog version mismatch: expected {expected}, found {found}. Run 'extenddb migrate'"
-            ),
             Self::MissingEncryptionKey => write!(
                 f,
                 "Encryption key not found in settings table. Run 'extenddb init'"
             ),
             Self::InitializationFailed(msg) => write!(f, "Backend initialization failed: {msg}"),
+            Self::Catalog(e) => write!(f, "{e}"),
         }
     }
 }
@@ -86,7 +84,7 @@ impl std::fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// Options for server-component creation, beyond the storage config itself.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ServerComponentsOptions {
     /// Bootstrap the catalog at serve time when it is not initialized,
@@ -95,6 +93,59 @@ pub struct ServerComponentsOptions {
     /// Backends whose bootstrap requires operator input ignore this and fail
     /// as usual; backends with a self-contained bootstrap (SQLite) honor it.
     pub bootstrap_if_uninitialized: bool,
+    /// The item size limit the storage layer applies to the finished item of
+    /// an update, standalone or transacted. Comes from `limits.max_item_size_bytes`
+    /// so the storage layer and the engine's put path enforce one figure.
+    pub max_item_size_bytes: usize,
+    /// The ExtendDB release that is starting, recorded in the ledger rows of
+    /// migrations the factory runs (a dev build, an in-memory database).
+    pub release: &'static str,
+    /// `backup.max_concurrent_jobs`: the backup and restore jobs the
+    /// instance runs at once. A backend whose pool has to admit every job
+    /// sizes it from this ([`crate::backup_catalog::pool_size_for_jobs`]);
+    /// `0` (the default outside a server) asks for no job capacity.
+    pub max_concurrent_jobs: usize,
+    /// The caller is a command that reads the catalog beside a running
+    /// server (`extenddb backup list`), not a server: no serve lock is taken
+    /// (on SQLite the file is opened as another reader of a served
+    /// database) and none of the startup recovery a server runs (see
+    /// `startup_recovery`, which this implies off), since the server that
+    /// owns the catalog does that. A command that writes (`backup purge`)
+    /// leaves this `false`: on SQLite it takes the serve lock, as a server
+    /// does.
+    pub beside_server: bool,
+    /// Whether the factory runs the startup recovery a server runs
+    /// (interrupted control-plane transitions, incomplete indexes,
+    /// PostgreSQL's GSI queue workers, MongoDB's repair of documents stored
+    /// without their key, SQLite's expiry of interrupted restores and of a
+    /// left-behind maintenance claim). `true` for a server; a command that
+    /// writes (`backup purge`) sets it `false` beside `beside_server =
+    /// false`, so on PostgreSQL, MongoDB and Cassandra it runs none of that
+    /// work beside the live servers and exits with none of it half done,
+    /// and on SQLite it holds the serve lock and resolves what it needs
+    /// itself. Read only when `beside_server` is `false`.
+    pub startup_recovery: bool,
+    /// The command that opens the catalog, when it is not `serve`
+    /// (`extenddb backup list`, `extenddb backup purge`). A backend whose
+    /// factory takes a serving registration names it after the command
+    /// (PostgreSQL's session `application_name`, MongoDB's and Cassandra's
+    /// `extenddb_servers` entry), which a migration waiting for the
+    /// registrations prints; `None` is `extenddb serve`.
+    pub command: Option<&'static str>,
+}
+
+impl Default for ServerComponentsOptions {
+    fn default() -> Self {
+        Self {
+            bootstrap_if_uninitialized: false,
+            max_item_size_bytes: extenddb_core::limits::LimitsConfig::default().max_item_size_bytes,
+            release: "",
+            max_concurrent_jobs: 0,
+            beside_server: false,
+            startup_recovery: true,
+            command: None,
+        }
+    }
 }
 
 /// Factory function type for creating server components.
@@ -121,11 +172,101 @@ pub type ServerComponentsFactory =
 /// Calls the factory of the [`Backend`](crate::Backend) installed via
 /// [`set_backend`](crate::set_backend). Returns `BackendNotInstalled` if no
 /// backend has been installed.
+///
+/// A `region` the `BackupArn` parser would refuse is logged at warn first
+/// ([`crate::config::server_region_warning`]): the server still starts, but
+/// the operator is told `CreateBackup` is refused under it.
 pub async fn create_server_components(
     config: &(dyn StorageConfig + 'static),
     region: &str,
     options: ServerComponentsOptions,
 ) -> Result<ServerComponents, BackendError> {
+    if let Some(warning) = crate::config::server_region_warning(region) {
+        tracing::warn!("{}", warning.log_message());
+    }
     let backend = crate::backend::try_backend().ok_or(BackendError::BackendNotInstalled)?;
     (backend.server_components)(config, region, options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::*;
+
+    /// Collects the message of every warn-level event.
+    #[derive(Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    struct Message(String);
+
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for Warnings {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            if *event.metadata().level() == Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoConfig;
+
+    impl StorageConfig for NoConfig {
+        fn connection_config(&self) -> &str {
+            ""
+        }
+        fn max_connections(&self) -> u32 {
+            1
+        }
+        fn max_catalog_connections(&self) -> u32 {
+            1
+        }
+        fn clone_box(&self) -> Box<dyn StorageConfig> {
+            Box::new(NoConfig)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// No backend is installed in this crate's tests, so the call fails
+    /// after the region check; the warning is what is under test.
+    async fn warnings_for(region: &str) -> Vec<String> {
+        let warnings = Warnings::default();
+        let collected = Arc::clone(&warnings.0);
+        let subscriber = tracing_subscriber::registry().with(warnings);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result =
+            create_server_components(&NoConfig, region, ServerComponentsOptions::default()).await;
+        assert!(matches!(result, Err(BackendError::BackendNotInstalled)));
+        collected.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_region_outside_the_backup_arn_class_is_warned_about_at_startup() {
+        let warnings = warnings_for("LOCAL").await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("server.region"), "{warnings:?}");
+        assert!(warnings[0].contains("LOCAL"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("BackupArn is not valid"),
+            "{warnings:?}"
+        );
+        assert!(warnings_for("us-east-1").await.is_empty());
+    }
 }

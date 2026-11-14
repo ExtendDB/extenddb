@@ -29,7 +29,8 @@ pub async fn handle_describe_table(
     // populated; the first search would silently undercount.
     table_desc.validate_vector_index_readiness()?;
 
-    table_desc.populate_table_throughput_mode_summary();
+    // Includes the RestoreSummary lifetime (dropped once not CREATING).
+    table_desc.prepare_for_response();
     let output = DescribeTableOutput { table: table_desc };
     serialize_output(&output)
 }

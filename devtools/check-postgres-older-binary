@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""A PostgreSQL catalog this binary migrated, against the last 0.1.x image:
+
+    devtools/check-postgres-older-binary <extenddb binary> <admin URL> \\
+        <released fixture directory> [image] [port]
+
+<admin URL> is a superuser's URL without a database, reachable from this host
+and from a container on the host network, for example
+postgresql://postgres:devpass@127.0.0.1:5432. The fixture directory holds
+catalog.sql and data.sql (crates/storage-postgres/tests/fixtures/released/).
+
+Two deployments: a fresh one from this binary's `init`, and the fixture
+loaded into new databases and upgraded with this binary's `migrate --yes`.
+On each, the image runs `verify`, then `migrate --yes`, then `serve`, and
+each must end as the last 0.1.x release does on a v1.0 catalog: `verify`
+exits 1 and writes nothing, `migrate --yes` exits 0 and writes the catalog,
+and `serve` refuses and exits 1 by itself. For every run
+the script prints what changed in the settings rows, the ledgers and the
+schema, and checks what this binary then reports: after a run that wrote the
+catalog, `migrate` and `verify` exit 5 naming WrittenByOlderRelease, `serve`
+refuses with 5, and `migrate --yes --reconverge` restores Current with the
+schema it had before; after a run that changed nothing, the catalog is still
+Current.
+
+The image's containers are named "$CONTAINER" (default
+extenddb-older-binary), use the host network, run as the caller's uid, and
+are removed at the end, with the role, the databases and the temporary
+directory. The servers bind 127.0.0.1 only.
+"""
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+import psycopg2
+
+from catalog_checks import finish, report, run
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+class Deployment:
+    """A role and two databases on the admin URL's server."""
+
+    def __init__(self, admin_url: str, stem: str) -> None:
+        self.admin_url = admin_url.rstrip("/")
+        parts = urllib.parse.urlsplit(self.admin_url)
+        self.host = parts.hostname
+        self.port = parts.port or 5432
+        self.role = stem
+        self.password = f"App{secrets.token_hex(8)}"
+        self.catalog = f"{stem}_catalog"
+        self.data = stem
+
+    def url(self, database: str) -> str:
+        return f"postgresql://{self.role}:{self.password}@{self.host}:{self.port}/{database}"
+
+    def admin(self, database: str = "postgres"):
+        conn = psycopg2.connect(f"{self.admin_url}/{database}")
+        conn.autocommit = True
+        return conn
+
+    def create_from(self, fixture: str) -> None:
+        conn = self.admin()
+        with conn.cursor() as cur:
+            cur.execute(f"CREATE ROLE \"{self.role}\" LOGIN PASSWORD '{self.password}'")
+            for database in (self.catalog, self.data):
+                cur.execute(f'CREATE DATABASE "{database}" OWNER "{self.role}"')
+        conn.close()
+        for database, dump in ((self.catalog, "catalog.sql"), (self.data, "data.sql")):
+            load = psycopg2.connect(self.url(database))
+            load.autocommit = True
+            with load.cursor() as cur, open(os.path.join(fixture, dump), encoding="utf-8") as f:
+                cur.execute(f.read())
+            load.close()
+        conn = psycopg2.connect(self.url(self.catalog))
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            for key, value in (
+                ("data_database_connection_string", self.url(self.data)),
+                ("data_database_name", self.data),
+            ):
+                cur.execute("UPDATE settings SET value = %s WHERE key = %s", (value, key))
+        conn.close()
+
+    def snapshot(self) -> list[str]:
+        """Settings rows, ledger rows and the schema of both databases."""
+        lines = []
+        for store, database in (("catalog", self.catalog), ("data", self.data)):
+            conn = psycopg2.connect(self.url(database))
+            conn.set_session(readonly=True, autocommit=True)
+            with conn.cursor() as cur:
+                if store == "catalog":
+                    cur.execute("SELECT key, value FROM settings ORDER BY key")
+                    for key, value in cur.fetchall():
+                        if key == "encryption_key" or "connection_string" in key:
+                            value = "<redacted>"
+                        lines.append(f"setting {key} = {value}")
+                for table, columns in (
+                    ("extenddb_migrations", "id, name, outcome"),
+                    ("schema_history", "filename"),
+                ):
+                    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{table}",))
+                    if cur.fetchone()[0]:
+                        cur.execute(f"SELECT {columns} FROM {table} ORDER BY 1")
+                        lines.extend(f"{store} {table}: {row}" for row in cur.fetchall())
+            conn.close()
+        return lines + self.schema()
+
+    def schema(self) -> list[str]:
+        base = f"postgresql://{self.role}:{self.password}@{self.host}:{self.port}"
+        out = subprocess.run(
+            [sys.executable, os.path.join(HERE, "schema-dump"), "postgres", base, self.catalog, self.data],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return out.splitlines()
+
+    def drop(self) -> None:
+        conn = self.admin()
+        with conn.cursor() as cur:
+            for database in (self.catalog, self.data):
+                cur.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            cur.execute(f'DROP ROLE IF EXISTS "{self.role}"')
+        conn.close()
+
+
+def diff(before: list[str], after: list[str]) -> list[str]:
+    removed = [f"- {line}" for line in before if line not in after]
+    added = [f"+ {line}" for line in after if line not in before]
+    return removed + added
+
+
+def write_config(path: str, deployment: Deployment, work: str, port: int) -> None:
+    tls = os.path.join(work, "home", ".extenddb", "tls")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(
+            f'[server]\nbind_addr = "127.0.0.1"\nport = {port}\n\n'
+            f'[server.tls]\ncert_path = "{tls}/cert.pem"\nkey_path = "{tls}/key.pem"\n\n'
+            f'[storage]\nbackend = "postgres"\n\n'
+            f'[storage.postgres]\nconnection_string = "{deployment.url(deployment.catalog)}"\n'
+        )
+    os.chmod(path, 0o600)
+
+
+def image_run(
+    image: str, name: str, work: str, args: list[str], password: str, wait: float = 60
+) -> tuple[str, str]:
+    """Run the image with `args`; returns how it ended and its output. A
+    command still running after `wait` seconds (a server that serves) is
+    stopped."""
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+    started = subprocess.run(
+        [
+            "docker", "run", "-d", "--name", name, "--network", "host",
+            "--user", f"{os.getuid()}:{os.getgid()}", "-v", f"{work}:{work}",
+            "-e", f"HOME={work}/home", "-e", f"EXTENDDB_PG_PASSWORD={password}", image, *args,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if started.returncode != 0:
+        return "did not start", started.stderr
+    deadline = time.monotonic() + wait
+    ended = None
+    while time.monotonic() < deadline:
+        state = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", name],
+            capture_output=True, text=True, check=False,
+        ).stdout.split()
+        if state and state[0] == "false":
+            ended = f"exit {state[1]}"
+            break
+        time.sleep(0.5)
+    if ended is None:
+        subprocess.run(["docker", "stop", "-t", "20", name], capture_output=True, check=False)
+        ended = f"still running after {wait:.0f} s, stopped"
+    logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True, check=False)
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+    return ended, logs.stdout + logs.stderr
+
+
+def check_case(label: str, d: Deployment, binary: str, image: str, name: str, work: str, port: int) -> None:
+    config = os.path.join(work, f"{d.role}.toml")
+    write_config(config, d, work, port)
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    code, output = run([binary, "verify", "--config", config], env)
+    report(code == 0, f"exit {code}: {label}: this binary's verify before the image runs", output)
+    admin = urllib.parse.urlsplit(d.admin_url)
+    admin_user = urllib.parse.unquote(admin.username or "postgres")
+    admin_password = urllib.parse.unquote(admin.password or "")
+    # The release's migrate connects as an admin role, as its manual says.
+    for command in (
+        ["verify"],
+        ["migrate", "--yes", "--pg-user", admin_user],
+        ["serve", "--foreground"],
+    ):
+        what = " ".join(command[:2])
+        before = d.snapshot()
+        ended, output = image_run(
+            image, name, work, [command[0], "--config", config, *command[1:]], admin_password
+        )
+        after = d.snapshot()
+        changes = diff(before, after)
+        print(f"     {label}: the image's {what}: {ended}; {len(changes)} change(s)")
+        for line in changes:
+            print(f"     |   {line}")
+        for line in output.strip().splitlines()[-3:]:
+            print(f"     | > {line}")
+        # What the image did, so an image that cannot reach the database or
+        # does not start fails here instead of passing with nothing checked.
+        if command[0] == "verify":
+            report(
+                ended == "exit 1" and not changes,
+                f"{ended}: {label}: the image's verify runs, fails its version check and writes nothing",
+                output,
+            )
+        elif command[0] == "migrate":
+            report(
+                ended == "exit 0" and bool(changes),
+                f"{ended}: {label}: the image's migrate --yes runs and writes the catalog",
+                output,
+            )
+        else:
+            report(
+                ended == "exit 1",
+                f"{ended}: {label}: the image's serve refuses the catalog and exits 1 by itself",
+                output,
+            )
+        if not changes:
+            code, out = run([binary, "migrate", "--config", config], env)
+            report(code == 0, f"exit {code}: {label}: after the image's {what}, the catalog is Current", out)
+            continue
+        code, out = run([binary, "migrate", "--config", config], env)
+        report(
+            code == 5 and "a release before 1.0 wrote to this catalog" in out,
+            f"exit {code}: {label}: after the image's {what}, migrate reports WrittenByOlderRelease",
+            out,
+        )
+        code, out = run([binary, "verify", "--config", config], env)
+        report(code == 5, f"exit {code}: {label}: after the image's {what}, verify exits 5", out)
+        code, out = run([binary, "serve", "--config", config, "--foreground", "--port", str(port)], env, timeout=60)
+        report(code == 5, f"exit {code}: {label}: after the image's {what}, serve refuses", out)
+        code, out = run([binary, "migrate", "--config", config, "--yes", "--reconverge"], env)
+        report(code == 0, f"exit {code}: {label}: migrate --yes --reconverge", out)
+        code, out = run([binary, "verify", "--config", config], env)
+        report(code == 0 and "OK: Current" in out, f"exit {code}: {label}: verify reports Current", out)
+        report(d.schema() == [l for l in before if not l.startswith(("setting ", "catalog ", "data "))],
+               f"{label}: the schema is the one it had before the image's {what}")
+
+
+def main(binary: str, admin_url: str, fixture: str, image: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    name = os.environ.get("CONTAINER", "extenddb-older-binary")
+    work = tempfile.mkdtemp(prefix="eddb-older.")
+    os.chmod(work, 0o755)
+    env = dict(os.environ, HOME=os.path.join(work, "home"))
+    fresh = Deployment(admin_url, f"eddb_old_{secrets.token_hex(4)}")
+    upgraded = Deployment(admin_url, f"eddb_old_{secrets.token_hex(4)}")
+    try:
+        parts = urllib.parse.urlsplit(admin_url)
+        code, output = run(
+            [
+                binary, "init", "--config", os.path.join(work, "init.toml"),
+                "--pg-host", parts.hostname, "--pg-port", str(parts.port or 5432),
+                "--pg-user", urllib.parse.unquote(parts.username or "postgres"),
+                "--catalog-db", fresh.catalog, "--data-db", fresh.data,
+                "--extenddb-user", fresh.role, "--bind-addr", "127.0.0.1",
+            ],
+            dict(
+                env,
+                EXTENDDB_PG_PASSWORD=urllib.parse.unquote(parts.password or ""),
+                EXTENDDB_APP_PASSWORD=fresh.password,
+            ),
+        )
+        report(code == 0, f"exit {code}: init a fresh catalog", output)
+
+        upgraded.create_from(fixture)
+        config = os.path.join(work, "upgrade.toml")
+        write_config(config, upgraded, work, port)
+        code, output = run([binary, "migrate", "--config", config, "--yes"], env)
+        report(code == 0, f"exit {code}: migrate --yes the fixture {os.path.basename(fixture.rstrip('/'))}", output)
+
+        for label, d in (("fresh", fresh), ("upgraded", upgraded)):
+            check_case(label, d, binary, image, name, work, port)
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
+        for d in (fresh, upgraded):
+            d.drop()
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (4, 5, 6):
+        sys.exit(__doc__)
+    sys.exit(
+        main(
+            sys.argv[1],
+            sys.argv[2],
+            sys.argv[3],
+            sys.argv[4] if len(sys.argv) > 4 else "extenddb/extenddb-postgres:0.1.14",
+            int(sys.argv[5]) if len(sys.argv) > 5 else 18453,
+        )
+    )

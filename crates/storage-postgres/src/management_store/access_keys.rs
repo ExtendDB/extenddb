@@ -4,7 +4,9 @@
 //! Access key, session, and caller-tag operations for `PostgresCatalogStore`.
 
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
+use extenddb_storage::secret_cipher::encrypt_secret;
 
+use super::database_error;
 use crate::catalog_store::PostgresCatalogStore;
 use crate::pg_util::{is_fk_violation, is_unique_violation};
 
@@ -200,6 +202,48 @@ impl PostgresCatalogStore {
         Ok(())
     }
 
+    /// List stored session policies for the resource-tag migration.
+    pub(crate) async fn list_session_policies_impl(
+        &self,
+    ) -> OpResult<Vec<extenddb_storage::management_store::SessionPolicyEntry>> {
+        let rows: Vec<(String, String, String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT session_token, account_id, role_name, session_name, session_policy \
+             FROM iam_sessions WHERE session_policy IS NOT NULL",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| database_error("list_session_policies", &e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_token, account_id, role_name, session_name, policy)| {
+                    extenddb_storage::management_store::SessionPolicyEntry {
+                        session_token,
+                        account_id,
+                        role_name,
+                        session_name,
+                        policy,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Replace a stored session's policy for the resource-tag migration.
+    pub(crate) async fn update_session_policy_impl(
+        &self,
+        session_token: &str,
+        document: &serde_json::Value,
+    ) -> OpResult<()> {
+        sqlx::query("UPDATE iam_sessions SET session_policy = $1 WHERE session_token = $2")
+            .bind(document)
+            .bind(session_token)
+            .execute(self.pool())
+            .await
+            .map_err(|e| database_error("update_session_policy", &e))?;
+        Ok(())
+    }
+
     // ── Caller tags ────────────────────────────────────────────────
 
     pub(crate) async fn fetch_caller_tags_impl(
@@ -274,35 +318,4 @@ fn generate_secret_key() -> String {
         .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
         .collect();
     format!("extenddb{suffix}")
-}
-
-fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
-    use aes_gcm::Aes256Gcm;
-    use aes_gcm::KeyInit;
-    use aes_gcm::aead::Aead;
-    use aes_gcm::aead::Payload;
-    use base64::Engine;
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-
-    let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
-
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-
-    let payload = Payload {
-        msg: plaintext.as_bytes(),
-        aad: aad.as_bytes(),
-    };
-    let ciphertext = cipher
-        .encrypt(nonce, payload)
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
 }

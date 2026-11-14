@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            echo "usage: devtools/generate-software-license-notices [--check] [--backend postgres|mongodb]" >&2
+            echo "usage: devtools/generate-software-license-notices [--check] [--backend postgres|mongodb|cassandra]" >&2
             exit 2
             ;;
     esac
@@ -36,8 +36,9 @@ done
 case "$BACKEND" in
     postgres) OUTPUT="SOFTWARE-LICENSE-NOTICES.html" ;;
     mongodb) OUTPUT="SOFTWARE-LICENSE-NOTICES-MONGODB.html" ;;
+    cassandra) OUTPUT="SOFTWARE-LICENSE-NOTICES-CASSANDRA.html" ;;
     *)
-        echo "error: --backend must be 'postgres' or 'mongodb'" >&2
+        echo "error: --backend must be 'postgres', 'mongodb', or 'cassandra'" >&2
         exit 2
         ;;
 esac

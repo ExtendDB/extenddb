@@ -125,7 +125,37 @@ impl MongoEngine {
         input: CreateTableInput,
         defer_active: bool,
     ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, defer_active, None)
+            .await
+    }
+
+    /// Create a restore target with its provenance and its RUNNING job
+    /// record in its first catalog document, so nothing ever observes an
+    /// unregistered or unowned target. When the registration carries a
+    /// session, the document is inserted in that session's transaction and
+    /// the transaction is committed right after the insert, before the
+    /// target's collections and indexes are created; a transaction the
+    /// server aborted for a write conflict is reported as `Transient`, with
+    /// nothing created, so the caller re-runs it.
+    pub(crate) async fn create_table_for_restore(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        registration: &mut crate::backup_engine::RestoreRegistration<'_>,
+    ) -> Result<TableDescription, StorageError> {
+        self.create_table_impl_inner(account_id, input, true, Some(registration))
+            .await
+    }
+
+    async fn create_table_impl_inner(
+        &self,
+        account_id: &str,
+        input: CreateTableInput,
+        defer_active: bool,
+        restore: Option<&mut crate::backup_engine::RestoreRegistration<'_>>,
+    ) -> Result<TableDescription, StorageError> {
         Self::validate_account_id(account_id)?;
+        let input = extenddb_storage::stream_lineage::without_disabled_specification(input);
 
         let table_id = uuid::Uuid::new_v4().to_string();
         let table_arn_val = table_arn(&self.region, account_id, &input.table_name);
@@ -195,6 +225,12 @@ impl MongoEngine {
         // table return ResourceNotFound, matching DynamoDB and the postgres
         // backend.
         let delay_secs = self.control_plane_delay_seconds().await;
+        // WarmThroughput as sent, reported back and acted on by nothing.
+        // UPDATING for the same delay the CREATING to ACTIVE flip takes.
+        let (warm_record, warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+            input.warm_throughput.as_ref(),
+            delay_secs,
+        )?;
         let (table_status, status_transition_at): (&str, bson::Bson) = if defer_active {
             // Restore path: enter CREATING with no scheduled transition. The
             // caller flips the table to ACTIVE (or schedules the transition)
@@ -211,7 +247,7 @@ impl MongoEngine {
             )
         };
 
-        let table_doc = doc! {
+        let mut table_doc = doc! {
             "_id": { "account_id": account_id, "table_name": &input.table_name },
             "key_schema": key_schema_bson,
             "attribute_definitions": attr_defs_bson,
@@ -231,16 +267,103 @@ impl MongoEngine {
             "table_class": table_class_bson,
             "sse_specification": sse_spec_bson,
             "on_demand_throughput": on_demand_bson,
+            "warm_throughput": warm_bson,
         };
+        if let Some(registration) = restore.as_deref() {
+            registration.insert_into(&mut table_doc);
+        }
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
-        tables_coll.insert_one(table_doc).await.map_err(|e| {
-            if e.to_string().contains("E11000") {
-                StorageError::TableAlreadyExists(input.table_name.clone())
-            } else {
-                StorageError::Internal(e.to_string())
+        let for_restore = restore.is_some();
+        let mut restore = restore;
+        let inserted = match restore
+            .as_deref_mut()
+            .and_then(|registration| registration.session.as_deref_mut())
+        {
+            Some(session) => tables_coll.insert_one(table_doc).session(session).await,
+            None => tables_coll.insert_one(table_doc).await,
+        };
+        // A manifest record's first heartbeat is rewritten with the server's
+        // clock in the same transaction (nothing for a legacy one).
+        let inserted = match inserted {
+            Ok(_) => match restore.as_deref_mut() {
+                Some(registration) => {
+                    registration
+                        .stamp_server_clock(&tables_coll, &table_id)
+                        .await
+                }
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        };
+        let mut session = restore.and_then(|registration| registration.session.as_deref_mut());
+        if let Err(e) = inserted {
+            if let Some(session) = session {
+                let _ = session.abort_transaction().await;
             }
-        })?;
+            if crate::data_engine::is_duplicate_key(&e) {
+                return Err(self
+                    .name_taken_error(&tables_coll, account_id, &input.table_name, for_restore)
+                    .await);
+            }
+            if crate::data_engine::is_transient_write_conflict(&e) {
+                return Err(StorageError::Transient(format!(
+                    "the registration of {} lost a write conflict: {e}",
+                    input.table_name
+                )));
+            }
+            return Err(StorageError::Internal(e.to_string()));
+        }
+        // The registration's first heartbeat on the server's clock: an insert
+        // cannot carry `$$NOW`, so the inserted record holds the process's
+        // clock for the length of this transaction and this pipeline update,
+        // in the same transaction, replaces it before anything commits. Every
+        // heartbeat the reconciler ever reads is therefore on the database's
+        // clock, and a host whose clock is behind the server's by more than
+        // `stale_job_after_secs` cannot make another server list its new
+        // restore dead.
+        if for_restore {
+            let stamped = {
+                let update = tables_coll.update_one(
+                    doc! {
+                        "_id": { "account_id": account_id, "table_name": &input.table_name },
+                        "table_id": &table_id,
+                    },
+                    vec![doc! { "$set": {
+                        crate::backup_catalog::RESTORE_JOB_HEARTBEAT: "$$NOW",
+                    } }],
+                );
+                match session.as_deref_mut() {
+                    Some(session) => update.session(session).await,
+                    None => update.await,
+                }
+            };
+            if let Err(e) = stamped {
+                if let Some(session) = session {
+                    let _ = session.abort_transaction().await;
+                }
+                if crate::data_engine::is_transient_write_conflict(&e) {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} lost a write conflict: {e}",
+                        input.table_name
+                    )));
+                }
+                return Err(StorageError::Internal(e.to_string()));
+            }
+        }
+        // The registration's transaction ends here, before any collection is
+        // created, so an aborted one leaves nothing behind.
+        if let Some(session) = session {
+            match self.commit_write_transaction(session, None).await? {
+                crate::data_engine::CommitOutcome::Committed => {}
+                crate::data_engine::CommitOutcome::RerunBody(_) => {
+                    return Err(StorageError::Transient(format!(
+                        "the registration of {} was aborted at commit",
+                        input.table_name
+                    )));
+                }
+            }
+        }
 
         // Create the data collection with appropriate indexes
         let coll_name = data_collection_name(&table_id);
@@ -286,10 +409,16 @@ impl MongoEngine {
         }
 
         // Initialize stream shards if streaming is enabled. shard_id is
-        // derived from table_id (UUID), never table_name — see
-        // stream_engine::build_shard_id for the security rationale.
-        if stream_label_opt.is_some() {
-            self.init_stream_shards(&table_id).await?;
+        // derived from table_id (UUID), never table_name, and names the
+        // stream's label and view type (`extenddb_storage::stream_lineage`).
+        if let (Some(label), Some(view_type)) = (
+            stream_label_opt.as_deref(),
+            input
+                .stream_specification
+                .as_ref()
+                .and_then(|s| s.stream_view_type),
+        ) {
+            self.init_stream_shards(&table_id, label, view_type).await?;
         }
 
         // Handle GSI creation
@@ -314,6 +443,11 @@ impl MongoEngine {
 
                 let index_status = if defer_active { "CREATING" } else { "ACTIVE" };
                 let backfill_mode = if defer_active { Some("restore") } else { None };
+                let (gsi_warm_record, gsi_warm_bson) =
+                    crate::warm_throughput::warm_record_bson_for_create(
+                        gsi.warm_throughput.as_ref(),
+                        delay_secs,
+                    )?;
                 let mut index_doc = doc! {
                     "_id": { "table_id": &table_id, "index_name": &gsi.index_name },
                     "index_id": &index_id,
@@ -322,6 +456,7 @@ impl MongoEngine {
                     "projection": projection_bson,
                     "index_status": index_status,
                     "provisioned_throughput": index_pt_bson.unwrap_or(bson::Bson::Null),
+                    "warm_throughput": gsi_warm_bson,
                 };
                 if let Some(mode) = backfill_mode {
                     index_doc.insert("backfill_mode", mode);
@@ -358,6 +493,8 @@ impl MongoEngine {
                     index_size_bytes: 0,
                     item_count: 0,
                     index_arn: index_arn_val,
+                    warm_throughput: None,
+                    warm_throughput_record: gsi_warm_record,
                 });
             }
             Some(descs)
@@ -467,6 +604,24 @@ impl MongoEngine {
             }
         }
 
+        // A restore target's DDL is complete here: the data collection, its
+        // unique key index and every GSI and LSI metadata document and data
+        // collection exist. The record was committed before any of them (the
+        // registration's transaction ends at the catalog insert), so the
+        // record carries `restore_job.ddl_done = false` until this write,
+        // and the reconciler's resume refuses a record left unmarked by an
+        // owner that died in between (`restore_target_ready`), rather than
+        // resuming into a target that is missing its indexes.
+        if for_restore {
+            tables_coll
+                .update_one(
+                    doc! { "table_id": &table_id },
+                    doc! { "$set": { crate::backup_catalog::RESTORE_JOB_DDL_DONE: true } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+        }
+
         // Derive the SSEDescription from the SSESpecification, mirroring the
         // postgres backend (table_helpers.rs:329-346). The specification's
         // `Enabled: true` becomes a KMS-status ENABLED description with a
@@ -520,6 +675,7 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput: input.on_demand_throughput,
+            warm_throughput_record: warm_record,
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.
@@ -542,6 +698,17 @@ impl MongoEngine {
         // Check deletion protection
         if desc.deletion_protection_enabled {
             return Err(StorageError::DeletionProtected(input.table_name.clone()));
+        }
+
+        // Restore targets have no ordinary timed CREATING transition: the
+        // restore worker owns the name until the item and index copy completes.
+        // Deleting one mid-copy can leave orphaned physical collections, so
+        // match the SQL backends and DynamoDB by refusing it while CREATING.
+        if desc.table_status == TableStatus::Creating && desc.restore_summary.is_some() {
+            return Err(StorageError::IndexesInUse(format!(
+                "Attempt to change a resource which is still in use: Table is being restored: {}",
+                input.table_name
+            )));
         }
 
         // Mark as DELETING
@@ -684,6 +851,22 @@ impl MongoEngine {
         Self::validate_account_id(account_id)?;
 
         let tables_coll = self.catalog_db.collection::<Document>("tables");
+        let table_filter =
+            doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } };
+
+        // Refuse a table that is not ACTIVE, as the other three backends do
+        // under their row lock. Without this a CREATING restore target
+        // accepted billing-mode, GSI, stream and deletion-protection changes
+        // mid-copy and the finished table was not what the backup described.
+        // This backend has no transaction around UpdateTable, so the check is
+        // repeated as an ACTIVE filter on the two catalog writes to the table
+        // document below (the metadata `$set` and the attribute-definitions
+        // `$set`): a table that leaves ACTIVE between this read and either
+        // write is refused there. The index inserts, the index collection
+        // creation and the stream shard creation are not conditioned on the
+        // table's status; only this first check guards them.
+        self.require_active_table(&tables_coll, &table_filter, &input.table_name)
+            .await?;
 
         // Reject ProvisionedThroughput when the effective billing mode is
         // PAY_PER_REQUEST. The effective mode is the requested billing_mode
@@ -721,12 +904,17 @@ impl MongoEngine {
         // Build update document
         let mut update_doc = Document::new();
 
+        let clear_provisioned_throughput =
+            matches!(input.billing_mode, Some(BillingMode::PayPerRequest));
         if let Some(billing_mode) = &input.billing_mode {
             let billing_str = match billing_mode {
                 BillingMode::Provisioned => "PROVISIONED",
                 BillingMode::PayPerRequest => "PAY_PER_REQUEST",
             };
             update_doc.insert("billing_mode", billing_str);
+            if clear_provisioned_throughput {
+                update_doc.insert("provisioned_throughput", bson::Bson::Null);
+            }
         }
 
         if let Some(pt) = &input.provisioned_throughput {
@@ -747,58 +935,97 @@ impl MongoEngine {
             update_doc.insert("on_demand_throughput", odt_bson);
         }
 
+        // A stream change is decided on the specification and label the table
+        // document carries, and written only if they are still those values:
+        // this backend has no transaction around UpdateTable, so of two
+        // overlapping stream changes the one whose write finds the document
+        // changed re-reads it and is refused by `stream_change` as a request
+        // arriving after the other's commit would be.
+        let mut pending_stream = None;
+        let mut stream_guard = Document::new();
         if let Some(ss) = &input.stream_specification {
-            let ss_bson = bson::to_bson(ss).map_err(|e| StorageError::Internal(e.to_string()))?;
-            update_doc.insert("stream_specification", ss_bson);
-            if ss.stream_enabled {
-                let table_doc = tables_coll
-                    .find_one(doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } })
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?
-                    .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
-                let table_id = table_doc
-                    .get_str("table_id")
-                    .map_err(|_| StorageError::Internal("missing table_id".to_string()))?;
-
-                // Idempotent re-enable: if shards already exist for this
-                // table, reuse them and preserve the existing
-                // stream_label. Otherwise a repeat UpdateTable would
-                // insert duplicate shards (DescribeStream would then
-                // report N × k) and rotate stream_label, invalidating
-                // stream ARNs previously handed out to consumers.
-                let shards_coll = self.data_db.collection::<Document>("stream_shards");
-                let existing_shard = shards_coll
-                    .find_one(doc! { "table_id": table_id })
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if existing_shard.is_none() {
-                    let label = extenddb_storage::util::format_stream_label(
-                        time::OffsetDateTime::now_utc(),
-                    );
-                    update_doc.insert("stream_label", &label);
-                    self.init_stream_shards(table_id).await?;
-                } else if table_doc
-                    .get_str("stream_label")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
-                {
-                    // Shards exist but the label was cleared by a
-                    // previous disable — restore a fresh label so the
-                    // ARN resolves again.
-                    let label = extenddb_storage::util::format_stream_label(
-                        time::OffsetDateTime::now_utc(),
-                    );
-                    update_doc.insert("stream_label", &label);
-                }
+            let table_doc = tables_coll
+                .find_one(
+                    doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                )
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+            pending_stream = Some(
+                self.prepare_stream_update_or_close(
+                    &mut update_doc,
+                    &table_doc,
+                    &input.table_name,
+                    ss,
+                )
+                .await?,
+            );
+            for field in ["stream_specification", "stream_label"] {
+                stream_guard.insert(
+                    field,
+                    table_doc.get(field).cloned().unwrap_or(bson::Bson::Null),
+                );
             }
         }
 
         if !update_doc.is_empty() {
-            tables_coll
-                .update_one(
-                    doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
-                    doc! { "$set": &update_doc },
+            let mut filter = active_table_filter(&table_filter);
+            filter.extend(stream_guard);
+            let result = tables_coll
+                .update_one(filter, doc! { "$set": &update_doc })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            if result.matched_count == 0 {
+                // Deleted or left ACTIVE since the check above, or the stream
+                // fields changed under a stream change; report which. A stream
+                // change the re-read state would still accept (a disable that
+                // overlapped an enable) is reported as not ACTIVE, the nearest
+                // of ExtendDB's answers to the service's in-progress refusal.
+                self.require_active_table(&tables_coll, &table_filter, &input.table_name)
+                    .await?;
+                if let Some(ss) = &input.stream_specification {
+                    let table_doc = tables_coll
+                        .find_one(doc! {
+                            "_id": { "account_id": account_id, "table_name": &input.table_name }
+                        })
+                        .await
+                        .map_err(|e| StorageError::Internal(e.to_string()))?
+                        .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+                    let _would_apply = Self::prepare_stream_update(
+                        &mut Document::new(),
+                        &table_doc,
+                        &input.table_name,
+                        ss,
+                    )?;
+                }
+                return Err(StorageError::TableNotActive(input.table_name.clone()));
+            }
+        }
+        if let Some(pending) = pending_stream {
+            pending.apply(self, account_id, &input.table_name).await?;
+        }
+
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        self.store_warm_throughput_updates(account_id, &input)
+            .await?;
+
+        if clear_provisioned_throughput {
+            let table_doc = tables_coll
+                .find_one(doc! {
+                    "_id": { "account_id": account_id, "table_name": &input.table_name },
+                })
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .ok_or_else(|| StorageError::TableNotFound(input.table_name.clone()))?;
+            let table_id = table_doc
+                .get_str("table_id")
+                .map_err(|_| StorageError::Internal("missing table_id".to_owned()))?;
+            self.catalog_db
+                .collection::<Document>("indexes")
+                .update_many(
+                    doc! { "_id.table_id": table_id, "index_type": "GSI" },
+                    doc! { "$set": { "provisioned_throughput": bson::Bson::Null } },
                 )
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -837,13 +1064,20 @@ impl MongoEngine {
                 let merged = merge_attribute_definitions(&current_defs, new_attr_defs);
                 let merged_bson =
                     bson::to_bson(&merged).map_err(|e| StorageError::Internal(e.to_string()))?;
-                tables_coll
+                let result = tables_coll
                     .update_one(
-                        doc! { "_id": { "account_id": account_id, "table_name": &input.table_name } },
+                        active_table_filter(&table_filter),
                         doc! { "$set": { "attribute_definitions": merged_bson } },
                     )
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                if result.matched_count == 0 {
+                    // Deleted or left ACTIVE since the first check; report
+                    // which, before any index is inserted.
+                    self.require_active_table(&tables_coll, &table_filter, &input.table_name)
+                        .await?;
+                    return Err(StorageError::TableNotActive(input.table_name.clone()));
+                }
                 Some(merged)
             } else {
                 None
@@ -874,6 +1108,10 @@ impl MongoEngine {
                     // Live writes during the backfill window sync through
                     // sync_indexes (upserts) so the eventual state is
                     // convergent regardless of interleaving.
+                    let (_, gsi_warm_bson) = crate::warm_throughput::warm_record_bson_for_create(
+                        create.warm_throughput.as_ref(),
+                        self.control_plane_delay_seconds().await,
+                    )?;
                     let index_doc = doc! {
                         "_id": { "table_id": &desc.table_id, "index_name": &create.index_name },
                         "index_id": &index_id,
@@ -882,6 +1120,7 @@ impl MongoEngine {
                         "projection": projection_bson,
                         "index_status": "CREATING",
                         "provisioned_throughput": pt_bson.unwrap_or(bson::Bson::Null),
+                        "warm_throughput": gsi_warm_bson,
                     };
 
                     self.catalog_db
@@ -997,6 +1236,56 @@ impl MongoEngine {
 
         self.describe_table_impl(account_id, &input.table_name)
             .await
+    }
+
+    /// The error for a CreateTable or restore whose catalog insert hit the
+    /// name's unique index. A restore (`for_restore`) into a name that is a
+    /// CREATING restore target is `TableBeingRestored`, naming that target's
+    /// source backup (the service: `TableInUseException`); any other taken
+    /// name is `TableAlreadyExists`.
+    async fn name_taken_error(
+        &self,
+        tables_coll: &mongodb::Collection<Document>,
+        account_id: &str,
+        table_name: &str,
+        for_restore: bool,
+    ) -> StorageError {
+        if for_restore {
+            let existing = tables_coll
+                .find_one(doc! { "_id": { "account_id": account_id, "table_name": table_name } })
+                .await;
+            if let Ok(Some(existing)) = existing
+                && existing.get_str("table_status") == Ok("CREATING")
+                && let Ok(backup_arn) = existing.get_str("restore_source_backup_arn")
+            {
+                return StorageError::TableBeingRestored {
+                    table_name: table_name.to_owned(),
+                    backup_arn: backup_arn.to_owned(),
+                };
+            }
+        }
+        StorageError::TableAlreadyExists(table_name.to_owned())
+    }
+
+    /// `TableNotFound` when no catalog document matches `filter`,
+    /// `TableNotActive` when one does but its `table_status` is not
+    /// `ACTIVE`. UpdateTable's guard; also used after a conditional write
+    /// matched nothing to report which of the two happened.
+    async fn require_active_table(
+        &self,
+        tables_coll: &mongodb::Collection<Document>,
+        filter: &Document,
+        table_name: &str,
+    ) -> Result<(), StorageError> {
+        let table_doc = tables_coll
+            .find_one(filter.clone())
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?
+            .ok_or_else(|| StorageError::TableNotFound(table_name.to_owned()))?;
+        if table_doc.get_str("table_status").unwrap_or("ACTIVE") != "ACTIVE" {
+            return Err(StorageError::TableNotActive(table_name.to_owned()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn table_key_info_impl(
@@ -1209,6 +1498,20 @@ impl MongoEngine {
         &self,
         doc: &Document,
     ) -> Result<TableDescription, StorageError> {
+        self.doc_to_table_description_in(doc, None).await
+    }
+
+    /// Build the description from a `tables` document. When `session` is a
+    /// snapshot session (see `snapshot_engine`), the index documents are read
+    /// through it so they come from the same snapshot as `doc`. (The body is
+    /// the former `doc_to_table_description`, long before the session
+    /// parameter; splitting it is not part of the snapshot change.)
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn doc_to_table_description_in(
+        &self,
+        doc: &Document,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<TableDescription, StorageError> {
         let id_doc = doc
             .get_document("_id")
             .map_err(|_| StorageError::Internal("missing _id".to_string()))?;
@@ -1313,14 +1616,34 @@ impl MongoEngine {
         // Fetch indexes
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
         use futures::TryStreamExt;
-        let index_cursor = indexes_coll
-            .find(doc! { "_id.table_id": &table_id })
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let index_docs: Vec<Document> = index_cursor
-            .try_collect()
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let index_filter = doc! { "_id.table_id": &table_id };
+        let index_docs: Vec<Document> = match session {
+            Some(session) => {
+                let mut cursor = indexes_coll
+                    .find(index_filter)
+                    .read_concern(mongodb::options::ReadConcern::snapshot())
+                    .session(&mut *session)
+                    .await
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?;
+                let mut docs = Vec::new();
+                while let Some(d) = cursor
+                    .next(&mut *session)
+                    .await
+                    .transpose()
+                    .map_err(|e| crate::snapshot_engine::map_mongo_error(&e))?
+                {
+                    docs.push(d);
+                }
+                docs
+            }
+            None => indexes_coll
+                .find(index_filter)
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?,
+        };
 
         let mut gsis = Vec::new();
         let mut lsis = Vec::new();
@@ -1371,7 +1694,17 @@ impl MongoEngine {
                             number_of_decreases_today: 0,
                             last_increase_date_time: None,
                             last_decrease_date_time: None,
-                        });
+                        })
+                        // The service reports ProvisionedThroughput on every
+                        // index, 0/0 for an on-demand table, and so does the
+                        // PostgreSQL backend.
+                        .or(Some(ProvisionedThroughputDescription {
+                            read_capacity_units: 0,
+                            write_capacity_units: 0,
+                            number_of_decreases_today: 0,
+                            last_increase_date_time: None,
+                            last_decrease_date_time: None,
+                        }));
 
                     gsis.push(GsiDescription {
                         index_name: idx_name,
@@ -1385,6 +1718,10 @@ impl MongoEngine {
                         index_size_bytes: 0,
                         item_count: 0,
                         index_arn: idx_arn,
+                        warm_throughput: None,
+                        warm_throughput_record: crate::warm_throughput::warm_record_from_doc(
+                            idx_doc,
+                        ),
                     });
                 }
                 "LSI" => {
@@ -1439,6 +1776,24 @@ impl MongoEngine {
         let on_demand_throughput: Option<OnDemandThroughput> = doc
             .get("on_demand_throughput")
             .and_then(|b| bson::from_bson(b.clone()).ok());
+        // Set on a table created by RestoreTableFromBackup; in progress until
+        // the table is ACTIVE (the restore's index backfill runs while it is
+        // CREATING).
+        #[allow(clippy::cast_precision_loss)]
+        let restore_summary = doc.get_str("restore_source_backup_arn").ok().map(|arn| {
+            extenddb_core::types::RestoreSummary {
+                source_backup_arn: Some(arn.to_owned()),
+                source_table_arn: doc
+                    .get_str("restore_source_table_arn")
+                    .ok()
+                    .map(str::to_owned),
+                restore_date_time: doc
+                    .get_datetime("restore_date_time")
+                    .map(|d| d.timestamp_millis() as f64 / 1000.0)
+                    .unwrap_or(0.0),
+                restore_in_progress: table_status == TableStatus::Creating,
+            }
+        });
 
         Ok(TableDescription {
             table_name,
@@ -1462,6 +1817,8 @@ impl MongoEngine {
             sse_description,
             table_class_summary,
             on_demand_throughput,
+            restore_summary,
+            warm_throughput_record: crate::warm_throughput::warm_record_from_doc(doc),
             // Fields for features this backend does not implement, vector
             // indexes today, take their defaults. Adding one to
             // TableDescription then does not break this build.
@@ -1540,7 +1897,10 @@ impl MongoEngine {
 
     /// Drop a physical collection, treating an already-missing namespace as
     /// successful so lifecycle retries can continue their cleanup.
-    async fn drop_collection_if_exists(&self, coll_name: &str) -> Result<(), StorageError> {
+    pub(crate) async fn drop_collection_if_exists(
+        &self,
+        coll_name: &str,
+    ) -> Result<(), StorageError> {
         match self.data_db.collection::<Document>(coll_name).drop().await {
             Ok(()) => {}
             Err(e) if matches!(*e.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == 26) =>
@@ -1553,7 +1913,10 @@ impl MongoEngine {
 
     /// Drop all physical secondary-index collections for a table before its
     /// catalog index documents are removed.
-    async fn drop_index_collections_for_table(&self, table_id: &str) -> Result<(), StorageError> {
+    pub(crate) async fn drop_index_collections_for_table(
+        &self,
+        table_id: &str,
+    ) -> Result<(), StorageError> {
         use futures::TryStreamExt;
 
         let indexes_coll = self.catalog_db.collection::<Document>("indexes");
@@ -1628,4 +1991,28 @@ fn index_info_from_doc(index_doc: &Document) -> Result<IndexInfo, StorageError> 
         key_schema,
         projection,
     })
+}
+
+/// `filter` narrowed to a table that is `ACTIVE`: the predicate UpdateTable's
+/// writes to the table document use, so a write matches nothing when the
+/// table left ACTIVE after the first check.
+fn active_table_filter(filter: &Document) -> Document {
+    let mut active = filter.clone();
+    active.insert("table_status", "ACTIVE");
+    active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_table_filter;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn update_table_writes_match_only_an_active_table() {
+        let filter = doc! { "_id": { "account_id": "123456789012", "table_name": "t" } };
+        let active = active_table_filter(&filter);
+        assert_eq!(active.get_str("table_status"), Ok("ACTIVE"));
+        assert_eq!(active.get_document("_id"), filter.get_document("_id"));
+        assert_eq!(active.len(), 2);
+    }
 }

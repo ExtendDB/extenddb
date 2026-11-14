@@ -13,25 +13,73 @@ use crate::OperationContext;
 use crate::sanitize_storage_error;
 use crate::serialize_output;
 
-/// Split a `DynamoDB` resource ARN into `(region, account, resource)`.
-///
-/// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
-fn split_dynamodb_arn(arn: &str) -> Option<(&str, &str, &str)> {
-    let rest = arn.strip_prefix("arn:aws:dynamodb:")?;
-    let mut parts = rest.splitn(3, ':');
-    let region = parts.next()?;
-    let account = parts.next()?;
-    let resource = parts.next()?;
-    Some((region, account, resource))
+/// True for a table ARN naming a backup, export, or import. The service reports
+/// these as not a `DynamoDB` resource ARN on a tag operation (measured live).
+fn tag_subresource_not_dynamodb_resource(resource: &str) -> bool {
+    resource
+        .strip_prefix("table/")
+        .is_some_and(|tail| matches!(tail.split('/').nth(1), Some("backup" | "export" | "import")))
 }
 
-/// Extract the table name from a `DynamoDB` table ARN.
+/// True for a `table/...` resource whose sub-resource is anything other than a
+/// stream (an index or an unknown kind; a backup, export or import is refused
+/// earlier by `tag_subresource_not_dynamodb_resource`). Tags are accepted only
+/// on a table or a stream.
+fn tag_subresource_not_table_or_stream(resource: &str) -> bool {
+    let Some(tail) = resource.strip_prefix("table/") else {
+        return false;
+    };
+    let mut segs = tail.split('/');
+    let _table = segs.next();
+    !matches!(segs.next(), None | Some("") | Some("stream"))
+}
+
+/// True for a `table/<name>/stream/<label>` resource.
+fn tag_subresource_is_stream(resource: &str) -> bool {
+    resource
+        .strip_prefix("table/")
+        .is_some_and(|tail| tail.split('/').nth(1) == Some("stream"))
+}
+
+/// The refusal for a tag operation's ARN whose partition, service or region is
+/// not this deployment's, or `None` when all three are. The rule is
+/// [`extenddb_core::arn::ArnFields::in_deployment`], the predicate the server's
+/// `StreamArn` scope check uses.
+///
+/// A stream ARN with another partition, service or region reaches this point
+/// for an authorized principal (the server authorizes a tag operation's stream
+/// ARN as sent, and refuses another account before authorization). The service
+/// answers "Invalid StreamArn" here (measured live 2026-10-23,
+/// ListTagsOfResource and TagResource for an admin and for a principal with
+/// Allow * plus a Deny on the canonical ARN). The service's table message
+/// differs (measured live).
+fn deployment_scope_error(
+    fields: &extenddb_core::arn::ArnFields<'_>,
+    arn: &str,
+    region: &str,
+) -> Option<DynamoDbError> {
+    if fields.in_deployment(region) {
+        return None;
+    }
+    if tag_subresource_is_stream(fields.resource) {
+        return Some(DynamoDbError::ValidationException(
+            "Invalid StreamArn".to_owned(),
+        ));
+    }
+    Some(DynamoDbError::ValidationException(format!(
+        "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
+    )))
+}
+
+/// Extract the table name from a `DynamoDB` table ARN, using the one shared
+/// resource parser ([`extenddb_core::arn::fields`]) so this layer splits an ARN
+/// the same way authorization and the engine stream resolver do.
 ///
 /// Expected format: `arn:aws:dynamodb:{region}:{account}:table/{name}[/...]`
 fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
-    let (_, _, resource) = split_dynamodb_arn(arn)?;
+    let resource = extenddb_core::arn::fields(arn)?.resource;
     let table_name = resource.strip_prefix("table/")?;
-    // Strip any sub-resource (e.g. /index/foo, /stream/label)
+    // Strip any sub-resource (e.g. /index/foo, /stream/label).
     Some(table_name.split('/').next().unwrap_or(table_name))
 }
 
@@ -43,14 +91,20 @@ fn extract_table_name_from_arn(arn: &str) -> Option<&str> {
 /// | Input | Result |
 /// |---|---|
 /// | Does not start with `arn:` | `ValidationException` (ARNs must start with `arn:`) |
-/// | Valid ARN for another service | `AccessDeniedException` |
-/// | `DynamoDB` ARN naming a non-table resource | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | `DynamoDB` ARN whose resource is not a table | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | Non-`DynamoDB`-service ARN whose resource is not a table | `AccessDeniedException` |
+/// | Table ARN naming a backup, export, or import | `ValidationException` (not a `DynamoDB` resource arn) |
+/// | Table ARN naming an index or other sub-resource | `ValidationException` (only table or stream is accepted) |
 /// | Account differs from the caller's | `AccessDeniedException` |
-/// | Region differs from this deployment's | `ValidationException` (invalid `TableArn`) |
+/// | Table ARN with a different partition, service, or region | `ValidationException` (invalid `TableArn`) |
+/// | Stream ARN with a different partition, service, or region | `ValidationException` (`Invalid StreamArn`) |
 /// | Table does not exist | `ResourceNotFoundException` |
 ///
-/// Account is checked before region, matching the service: a cross-account ARN
-/// is denied without revealing whether its region is valid.
+/// Account is checked before the partition, service, and region, matching the
+/// service: a cross-account ARN is denied without revealing whether its other
+/// fields are valid. For a table ARN, a no-permissions principal is denied by
+/// authorization before this runs; the partition, service, region, and
+/// existence errors therefore surface only for an authorized principal.
 async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), DynamoDbError> {
     if !arn.starts_with("arn:") {
         return Err(DynamoDbError::ValidationException(format!(
@@ -58,32 +112,55 @@ async fn validate_resource_arn(arn: &str, ctx: &OperationContext) -> Result<(), 
         )));
     }
 
-    // An ARN for another service is denied rather than reported as malformed:
-    // authorization is evaluated against the resource before its shape is
-    // inspected further.
-    let Some((arn_region, arn_account, resource)) = split_dynamodb_arn(arn) else {
+    // A string that is not shaped like an ARN (fewer than the five
+    // colon-separated fields) is denied rather than reported as malformed.
+    let Some(fields) = extenddb_core::arn::fields(arn) else {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     };
+    let resource = fields.resource;
 
     if !resource.starts_with("table/") {
+        // A DynamoDB ARN whose resource is not a table (a bare index, an
+        // export, and so on) is reported as not a DynamoDB resource. An ARN for
+        // another service is denied rather than reported as malformed, as the
+        // service does.
+        if fields.service == "dynamodb" {
+            return Err(DynamoDbError::ValidationException(format!(
+                "One or more parameter values were invalid: \
+                 Provided Arn is not a DynamoDB resource arn: {arn}"
+            )));
+        }
+        return Err(DynamoDbError::AccessDeniedException(
+            "Access is denied".to_owned(),
+        ));
+    }
+
+    if tag_subresource_not_dynamodb_resource(resource) {
         return Err(DynamoDbError::ValidationException(format!(
             "One or more parameter values were invalid: \
              Provided Arn is not a DynamoDB resource arn: {arn}"
         )));
     }
 
-    if arn_account != ctx.account_id.as_ref() {
+    // Tags are accepted only on a table or a stream; an index or other
+    // sub-resource is rejected.
+    if tag_subresource_not_table_or_stream(resource) {
+        return Err(DynamoDbError::ValidationException(format!(
+            "One or more parameter values were invalid: Invalid resource arn \
+             provided, only table or stream is accepted. Provided resource arn: {arn}"
+        )));
+    }
+
+    if fields.account != ctx.account_id.as_ref() {
         return Err(DynamoDbError::AccessDeniedException(
             "Access is denied".to_owned(),
         ));
     }
 
-    if arn_region != ctx.region.as_ref() {
-        return Err(DynamoDbError::ValidationException(format!(
-            "Invalid TableArn: Invalid ResourceArn provided as input {arn}"
-        )));
+    if let Some(err) = deployment_scope_error(&fields, arn, &ctx.region) {
+        return Err(err);
     }
 
     let table_name = extract_table_name_from_arn(arn).ok_or_else(|| {
@@ -213,4 +290,75 @@ pub async fn handle_list_tags_of_resource(
         next_token: None, // All tags returned in one page.
     };
     serialize_output(&output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        deployment_scope_error, tag_subresource_not_dynamodb_resource,
+        tag_subresource_not_table_or_stream,
+    };
+    use extenddb_core::error::DynamoDbError;
+
+    /// The tag handler refuses exactly the ARNs the shared predicate puts
+    /// outside this deployment, the predicate the server's StreamArn scope
+    /// check uses (`stream_arn_scope_uses_the_shared_predicate` in
+    /// `crates/server/src/authz_resource/stream_scope.rs`), with the
+    /// service's message for a stream and for a table.
+    #[test]
+    fn deployment_scope_uses_the_shared_predicate() {
+        const R: &str = "us-east-1";
+        let stream =
+            "arn:aws:dynamodb:us-east-1:444455556666:table/T/stream/2026-10-20T16:17:40.188";
+        let table = "arn:aws:dynamodb:us-east-1:444455556666:table/T";
+        for base in [stream, table] {
+            for arn in [
+                base.to_owned(),
+                base.replace("arn:aws:", "arn:aws-cn:"),
+                base.replace("arn:aws:", "arn:aws-us-gov:"),
+                base.replace(":dynamodb:", ":DynamoDB:"),
+                base.replace(":dynamodb:", ":DYNAMODB:"),
+                base.replace("us-east-1", "us-west-2"),
+                base.replace("us-east-1", "US-EAST-1"),
+                base.replace("us-east-1", ""),
+            ] {
+                let fields = extenddb_core::arn::fields(&arn).unwrap();
+                let err = deployment_scope_error(&fields, &arn, R);
+                assert_eq!(err.is_none(), fields.in_deployment(R), "{arn}");
+                let expected = if base == stream {
+                    "Invalid StreamArn".to_owned()
+                } else {
+                    format!("Invalid TableArn: Invalid ResourceArn provided as input {arn}")
+                };
+                match err {
+                    None => assert_eq!(arn, base, "only the canonical ARN passes"),
+                    Some(DynamoDbError::ValidationException(m)) => assert_eq!(m, expected),
+                    Some(_) => panic!("{arn}: expected ValidationException"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tag_subresource_classification() {
+        for r in [
+            "table/t/backup/01-ab",
+            "table/t/export/01-ab",
+            "table/t/import/01-ab",
+        ] {
+            assert!(tag_subresource_not_dynamodb_resource(r), "{r}");
+        }
+        for r in [
+            "table/t",
+            "table/t/stream/2026-10-20T16:17:40.188",
+            "table/t/index/g",
+        ] {
+            assert!(!tag_subresource_not_dynamodb_resource(r), "{r}");
+        }
+        assert!(tag_subresource_not_table_or_stream("table/t/index/g"));
+        assert!(!tag_subresource_not_table_or_stream("table/t"));
+        assert!(!tag_subresource_not_table_or_stream(
+            "table/t/stream/2026-10-20T16:17:40.188"
+        ));
+    }
 }

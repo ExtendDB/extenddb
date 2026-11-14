@@ -362,7 +362,7 @@ Any SQL statement that acquires locks (`SELECT ... FOR UPDATE`) routes to primar
 
 - **The `propagation_delay_ms` setting determines GSI consistency class.** A GSI with `propagation_delay_ms = 0` (or a future explicit `strongly_consistent = true` flag) commits synchronously. The HA design does not need to distinguish between "regular" and "strongly consistent" GSIs for routing purposes — the distinction is in the write path (sync vs. async commit), not the read path.
 
-- **Async GSIs (non-zero propagation delay) have weaker replica guarantees.** An async GSI update is enqueued after the base table transaction commits. The GSI row is written in a separate transaction (by the GSI worker). On a replica, the base row and the async GSI row may appear at different times (different transactions, different WAL positions). A strongly consistent read on an async GSI would need to route to primary AND wait for the GSI worker to process the queue — which is impractical. Therefore: **strongly consistent reads are only supported on strongly consistent GSIs (zero propagation delay).** Attempting a strongly consistent read on an async GSI returns a `ValidationException` with message "Strongly consistent reads are not supported on eventually consistent indexes." This matches DynamoDB's approach of rejecting invalid consistency requests at the API layer rather than silently degrading. The caller explicitly asked for strong consistency; silently returning stale data would violate the principle of least surprise.
+- **Async GSIs (non-zero propagation delay) have weaker replica guarantees.** An async GSI update is enqueued after the base table transaction commits. The GSI row is written in a separate transaction (by the GSI worker). On a replica, the base row and the async GSI row may appear at different times (different transactions, different WAL positions). A strongly consistent read on an async GSI would need to route to primary AND wait for the GSI worker to process the queue — which is impractical. Therefore: **strongly consistent reads are only supported on strongly consistent GSIs (zero propagation delay).** Attempting a strongly consistent read on an async GSI returns a `ValidationException` with message "Strongly cstonsistent reads are not supported on eventually consistent indexes." This matches DynamoDB's approach of rejecting invalid consistency requests at the API layer rather than silently degrading. The caller explicitly asked for strong consistency; silently returning stale data would violate the principle of least surprise.
 
 - **Stage 1 compatibility:** The `consistent_read: bool` parameter added in Stage 1 is sufficient. No additional parameters are needed for strongly consistent GSI support. The storage adapter's routing decision is the same: `true` → primary, `false` → replica.
 
@@ -656,3 +656,14 @@ New metrics for HA monitoring:
 - [Cassandra Consistency Levels](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html)
 - [MongoDB Read Preference](https://www.mongodb.com/docs/manual/core/read-preference/)
 - [FoundationDB Layer Concept](https://apple.github.io/foundationdb/layer-concept.html) — inspiration for storage-agnostic design
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

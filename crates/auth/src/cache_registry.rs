@@ -72,6 +72,12 @@ pub trait AuthzCacheInvalidator: Send + Sync {
         user_name: &'a str,
     ) -> BoxFuture<'a, ()>;
 
+    fn invalidate_user_created_at<'a>(
+        &'a self,
+        account_id: &'a str,
+        user_name: &'a str,
+    ) -> BoxFuture<'a, ()>;
+
     fn invalidate_role_policies<'a>(
         &'a self,
         account_id: &'a str,
@@ -85,6 +91,12 @@ pub trait AuthzCacheInvalidator: Send + Sync {
     ) -> BoxFuture<'a, ()>;
 
     fn invalidate_role_tags<'a>(
+        &'a self,
+        account_id: &'a str,
+        role_name: &'a str,
+    ) -> BoxFuture<'a, ()>;
+
+    fn invalidate_role_created_at<'a>(
         &'a self,
         account_id: &'a str,
         role_name: &'a str,
@@ -228,6 +240,12 @@ impl AuthCacheRegistry {
         }
     }
 
+    pub async fn invalidate_user_created_at(&self, account_id: &str, user_name: &str) {
+        if let Some(c) = &self.authz {
+            c.invalidate_user_created_at(account_id, user_name).await;
+        }
+    }
+
     pub async fn invalidate_role_policies(&self, account_id: &str, role_name: &str) {
         if let Some(c) = &self.authz {
             c.invalidate_role_policies(account_id, role_name).await;
@@ -243,6 +261,12 @@ impl AuthCacheRegistry {
     pub async fn invalidate_role_tags(&self, account_id: &str, role_name: &str) {
         if let Some(c) = &self.authz {
             c.invalidate_role_tags(account_id, role_name).await;
+        }
+    }
+
+    pub async fn invalidate_role_created_at(&self, account_id: &str, role_name: &str) {
+        if let Some(c) = &self.authz {
+            c.invalidate_role_created_at(account_id, role_name).await;
         }
     }
 

@@ -40,14 +40,25 @@ INCREMENTS_PER_THREAD = 100
 # pool, causing transient InternalServerError from pool-acquire timeouts.
 _MAX_RETRIES = 20
 _RETRY_BASE_SLEEP = 0.05
+_RETRYABLE_CODES = {"InternalServerError", "TransactionConflictException", "ServiceUnavailable"}
+
 def _retry_on_internal_error(fn, max_retries: int = _MAX_RETRIES):
-    """Call *fn*; retry on InternalServerError with exponential backoff + jitter."""
+    """Call *fn*; retry on transient errors with exponential backoff + jitter.
+
+    Retries InternalServerError (connection-pool exhaustion),
+    TransactionConflictException (OCC contention under high concurrency,
+    more likely on Cassandra where Paxos latency is higher than on
+    PostgreSQL/SQLite) and ServiceUnavailable (a MongoDB write on a table with
+    a stream or an index that could not commit in the server's 50 attempts).
+    The SDK retries a 503 only once under this client's max_attempts, so the
+    harness retries it as well.
+    """
     for attempt in range(max_retries + 1):
         try:
             return fn()
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
-            if code == "InternalServerError" and attempt < max_retries:
+            if code in _RETRYABLE_CODES and attempt < max_retries:
                 sleep = _RETRY_BASE_SLEEP * (2 ** min(attempt, 6))
                 time.sleep(sleep + random.random() * sleep)
                 continue

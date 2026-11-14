@@ -32,6 +32,13 @@ impl MetricsCollector {
 
         let mut results = Vec::new();
         for (key, acc) in map.iter() {
+            // Filter by account if specified; an empty string is no filter,
+            // as in the stores.
+            if let Some(account) = params.account_id.as_deref().filter(|a| !a.is_empty())
+                && key.account_id.as_deref() != Some(account)
+            {
+                continue;
+            }
             // Filter by table name if specified.
             if let Some(ref tn) = params.table_name
                 && key.table_name.as_deref() != Some(tn.as_str())
@@ -50,6 +57,9 @@ impl MetricsCollector {
             };
 
             let mut dimensions = Vec::new();
+            if let Some(ref account) = key.account_id {
+                dimensions.push(Dimension::AccountId(account.clone()));
+            }
             if let Some(ref tn) = key.table_name {
                 dimensions.push(Dimension::TableName(tn.clone()));
             }
@@ -140,17 +150,24 @@ impl MetricsCollector {
     /// Query average latency segments for the console deep-dive.
     ///
     /// Returns per-operation averages over the given time window, sorted by
-    /// operation name. `LastMinute` and `Last5Minutes` read 1-second buckets,
-    /// the longer windows read 1-minute buckets: a window of `W` seconds covers
-    /// at least the last `W` seconds and at most the last `W` plus one bucket
-    /// width. `AllTime` is the whole 24-hour ring.
+    /// operation name, of the requests of `account_id` only when it is given
+    /// (an empty string is no filter); without it, every account's requests
+    /// are summed per operation. `LastMinute` and `Last5Minutes` read
+    /// 1-second buckets, the longer windows read 1-minute buckets: a window of
+    /// `W` seconds covers at least the last `W` seconds and at most the last
+    /// `W` plus one bucket width. `AllTime` is the whole 24-hour ring.
     #[must_use]
-    pub fn query_segments(&self, window: TimeWindow) -> Vec<OperationSegments> {
+    pub fn query_segments(
+        &self,
+        window: TimeWindow,
+        account_id: Option<&str>,
+    ) -> Vec<OperationSegments> {
+        let account_id = account_id.filter(|a| !a.is_empty());
         // Clock read under the lock, paired with `record_segments`.
         let Ok(store) = self.segments.read() else {
             return Vec::new();
         };
-        store.query(window, Instant::now())
+        store.query(window, account_id, Instant::now())
     }
 
     /// `query_segments` with an injected clock, for tests.
@@ -158,12 +175,13 @@ impl MetricsCollector {
     pub(super) fn query_segments_at(
         &self,
         window: TimeWindow,
+        account_id: Option<&str>,
         now: Instant,
     ) -> Vec<OperationSegments> {
         let Ok(store) = self.segments.read() else {
             return Vec::new();
         };
-        store.query(window, now)
+        store.query(window, account_id, now)
     }
 }
 
@@ -259,6 +277,7 @@ pub(super) fn aggregate(drained: Drained) -> Vec<FlushBucket> {
                     bucket: SystemTime::UNIX_EPOCH
                         + Duration::from_secs(u64::try_from(minute).unwrap_or(0)),
                     metric: key.metric,
+                    account_id: key.account_id.clone().unwrap_or_default(),
                     table_name: key.table_name.clone().unwrap_or_default(),
                     index_name: key.index_name.clone().unwrap_or_default(),
                     operation: key.operation.clone().unwrap_or_default(),

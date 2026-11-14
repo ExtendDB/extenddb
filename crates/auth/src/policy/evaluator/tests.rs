@@ -9,25 +9,37 @@ use crate::policy::document::PolicyDocument;
 use std::collections::HashMap;
 
 /// Simple test context.
-struct Ctx(HashMap<String, Vec<String>>);
+struct Ctx {
+    values: HashMap<String, Vec<String>>,
+    unresolvable: std::collections::HashSet<String>,
+}
 
 impl Ctx {
     fn empty() -> Self {
-        Self(HashMap::new())
+        Self {
+            values: HashMap::new(),
+            unresolvable: std::collections::HashSet::new(),
+        }
     }
 
     fn with(mut self, key: &str, values: Vec<&str>) -> Self {
-        self.0.insert(
+        self.values.insert(
             key.to_owned(),
             values.into_iter().map(ToOwned::to_owned).collect(),
         );
+        self
+    }
+
+    /// Mark `key` as service-populated but unresolvable (case 3).
+    fn unresolvable(mut self, key: &str) -> Self {
+        self.unresolvable.insert(key.to_owned());
         self
     }
 }
 
 impl ConditionContext for Ctx {
     fn resolve_key(&self, key: &str) -> Option<Vec<&str>> {
-        self.0
+        self.values
             .get(key)
             .map(|v| v.iter().map(|s| s.as_str()).collect())
     }
@@ -35,11 +47,29 @@ impl ConditionContext for Ctx {
     fn is_multivalued_key(&self, key: &str) -> bool {
         matches!(key, "dynamodb:LeadingKeys" | "dynamodb:Attributes")
     }
+
+    fn is_unresolvable_key(&self, key: &str) -> bool {
+        self.unresolvable.contains(key)
+    }
 }
 
 fn parse(json: &str) -> PolicyDocument {
     PolicyDocument::from_json(json).unwrap()
 }
 
+mod arn_value_tokens;
+mod case_three;
 mod combined;
+mod condition_variable_scope;
+mod condition_variables;
+mod condition_variables_arn;
+mod condition_variables_arn_context;
+mod condition_variables_operators;
 mod core;
+mod empty_values;
+mod quoted_defaults;
+mod resource_variables;
+mod resource_variables_fields;
+mod stored_unterminated;
+mod variable_spelling;
+mod variable_values;

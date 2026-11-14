@@ -8,6 +8,7 @@
 
 mod admin_store;
 mod authorization_store;
+mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
 mod catalog_store;
@@ -18,12 +19,19 @@ mod data;
 mod data_engine;
 mod management_store;
 mod metadata_engine;
+pub mod migrations;
 mod operations;
+mod password_hash_store;
 pub mod pushdown;
+mod restore_engine;
+mod snapshot_engine;
 mod stream_engine;
+mod stream_lifecycle;
 mod table_engine;
 mod ttl_worker;
+mod warm_throughput;
 mod worker_store;
+mod write_conflict;
 
 pub use bootstrapper::MongoBootstrapper;
 pub use catalog_store::MongoCatalogStore;
@@ -38,33 +46,42 @@ use extenddb_storage::error::StorageError;
 // Backend registration
 // ============================================================================
 
-use extenddb_storage::hooks::{ServerRuntimeHooks, WorkerContext};
+use extenddb_storage::hooks::{ServerRuntimeHooks, ServingRegistrar, WorkerContext};
 use extenddb_storage::server_components::{BackendError, ServerComponents};
 
 /// Backend-specific runtime hooks for `MongoDB`.
 struct MongoRuntimeHooks {
     engine: Arc<MongoEngine>,
+    /// The serving registration, which the server takes again when it is
+    /// lost and releases after its workers stop.
+    registration: Arc<migrations::ServerRegistration>,
 }
 
 #[async_trait::async_trait]
 impl ServerRuntimeHooks for MongoRuntimeHooks {
+    /// Each worker returns once `ctx.shutdown` fires, and its handle is
+    /// returned so `serve` can drain it.
     async fn spawn_workers(&self, ctx: &WorkerContext) -> Vec<tokio::task::JoinHandle<()>> {
         let storage_for_ttl = self.engine.clone();
         let metrics = ctx.metrics.clone();
+        let token = ctx.shutdown.clone();
         let ttl = tokio::spawn(async move {
-            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics).await;
+            ttl_worker::ttl_cleanup_worker(storage_for_ttl, metrics, token).await;
         });
         let storage_for_stream = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let stream = tokio::spawn(async move {
-            ttl_worker::stream_record_cleanup_worker(storage_for_stream).await;
+            ttl_worker::stream_record_cleanup_worker(storage_for_stream, token).await;
         });
         let storage_for_backfill = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let backfill = tokio::spawn(async move {
-            ttl_worker::gsi_backfill_worker(storage_for_backfill).await;
+            ttl_worker::gsi_backfill_worker(storage_for_backfill, token).await;
         });
         let storage_for_control_plane = self.engine.clone();
+        let token = ctx.shutdown.clone();
         let control_plane = tokio::spawn(async move {
-            ttl_worker::control_plane_worker(storage_for_control_plane).await;
+            ttl_worker::control_plane_worker(storage_for_control_plane, token).await;
         });
         tracing::info!(
             "MongoDB backend: TTL, stream cleanup, GSI backfill, and control-plane workers spawned"
@@ -75,6 +92,12 @@ impl ServerRuntimeHooks for MongoRuntimeHooks {
     fn backend_info(&self) -> Option<String> {
         Some("mongodb".to_string())
     }
+
+    /// The registration is lost when its document is deleted or cannot be
+    /// renewed for 30 s; the server then registers again or stops.
+    fn serving_registrar(&self) -> Option<Arc<dyn ServingRegistrar>> {
+        Some(self.registration.clone() as Arc<dyn ServingRegistrar>)
+    }
 }
 
 /// Build the assembled server components for the mongo backend (`serve`).
@@ -84,7 +107,7 @@ fn server_components_factory(
     // MongoDB bootstrap needs operator input (databases, admin credentials), so
     // `bootstrap_if_uninitialized` is not honored here: an uninitialized catalog
     // fails with the explicit-`init` guidance, matching the PostgreSQL backend.
-    _options: extenddb_storage::server_components::ServerComponentsOptions,
+    options: extenddb_storage::server_components::ServerComponentsOptions,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
@@ -111,68 +134,135 @@ fn server_components_factory(
         let tx_read_concern = config::parse_transaction_read_concern(&raw_read_concern)
             .map_err(BackendError::InitializationFailed)?;
 
-        // Create MongoEngine
-        let engine = MongoEngine::new(
+        // Register as the catalog's server, then read the migration lock and
+        // the catalog's status, before the engine writes anything: a server
+        // that refuses has deleted its registration and written nothing else.
+        // Every caller registers, a command too, so a migration does not run
+        // under one; a command's registration carries its own name.
+        let registration = migrations::register_and_check_as(
+            &migrations::MongoTarget::new(&connection_string),
+            options.release,
+            options.command.unwrap_or(migrations::SERVE_COMMAND),
+            migrations::Timing::PRODUCTION,
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
+        let registration = Arc::new(registration);
+        let built = build_components(
             &connection_string,
             &region,
             max_connections,
+            max_catalog_connections,
             tx_read_concern,
+            Arc::clone(&registration),
+            &options,
         )
+        .await;
+        if built.is_err() {
+            ServingRegistrar::release(registration.as_ref()).await;
+        }
+        built
+    })
+}
+
+/// Start the startup key repair, for a server only; returns its task.
+///
+/// An UpdateItem on a build before the fix for issue #436 could create
+/// an item whose document has no key. The repair rewrites any such
+/// document, so that reads return the key and PutItem on it succeeds (see
+/// `data_engine::key_repair`). It runs in the background: the pass costs
+/// time in proportion to the number of affected documents, and the
+/// listener must not wait for it. A key the pass has not reached yet
+/// answers as it did before the repair existed, and each batch is its own
+/// transaction, so running it while another process serves the same data
+/// is safe.
+///
+/// The repair is a server's: a command that opens the catalog beside a
+/// server (`options.beside_server`: `extenddb backup list` and the purge's
+/// dry run), or one that writes beside the live servers with
+/// `options.startup_recovery` off (`purge --confirm`), starts none, as on
+/// PostgreSQL, where such a command runs none of the startup recovery; it
+/// would otherwise start a write pass over the data and exit while the pass
+/// may be mid-batch.
+fn start_key_repair(
+    engine: &Arc<MongoEngine>,
+    options: &extenddb_storage::server_components::ServerComponentsOptions,
+) -> Option<tokio::task::JoinHandle<()>> {
+    (!options.beside_server && options.startup_recovery)
+        .then(|| data_engine::key_repair::spawn_key_repair(engine.clone()))
+}
+
+/// The engine and stores `serve` runs on, built once the server holds its
+/// registration.
+async fn build_components(
+    connection_string: &str,
+    region: &str,
+    max_connections: Option<u32>,
+    max_catalog_connections: Option<u32>,
+    tx_read_concern: mongodb::options::ReadConcern,
+    registration: Arc<migrations::ServerRegistration>,
+    options: &extenddb_storage::server_components::ServerComponentsOptions,
+) -> Result<ServerComponents, BackendError> {
+    // Create MongoEngine
+    let engine = MongoEngine::new(connection_string, region, max_connections, tx_read_concern)
         .await
         .map_err(|e| BackendError::ConnectionFailed {
             backend: "mongodb".to_string(),
             details: e.to_string(),
         })?;
 
-        let engine = Arc::new(engine);
+    let engine = Arc::new(engine);
 
-        // Create one shared catalog/management client. MongoDB Client clones
-        // share the underlying pool, so max_catalog_connections limits the
-        // combined catalog and auth traffic rather than creating two
-        // independent pools with twice the configured ceiling.
-        let catalog_client = connect_guarded(&connection_string, max_catalog_connections, false)
-            .await
-            .map_err(|e| BackendError::ConnectionFailed {
-                backend: "mongodb".to_string(),
-                details: format!("Failed to create catalog client: {e}"),
-            })?;
+    start_key_repair(&engine, options);
 
-        // Load encryption key from settings collection. A missing key must be
-        // a hard failure: an empty key would base64-decode to zero bytes and
-        // panic in aes_gcm (`Key::from_slice` requires 32 bytes). Refuse to
-        // start instead, matching the postgres backend.
-        let catalog_db = catalog_client.database("extenddb_catalog");
-        let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
-        let enc_key = settings_coll
-            .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
-            .await
-            .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
-            .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
-            .ok_or(BackendError::MissingEncryptionKey)?;
+    // Create one shared catalog/management client. MongoDB Client clones
+    // share the underlying pool, so max_catalog_connections limits the
+    // combined catalog and auth traffic rather than creating two
+    // independent pools with twice the configured ceiling.
+    let catalog_client = connect_guarded(connection_string, max_catalog_connections, false)
+        .await
+        .map_err(|e| BackendError::ConnectionFailed {
+            backend: "mongodb".to_string(),
+            details: format!("Failed to create catalog client: {e}"),
+        })?;
 
-        let auth_client = catalog_client.clone();
-        let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
-            catalog_client,
-            enc_key.clone(),
-        )) as Arc<dyn extenddb_storage::CatalogStore>;
+    // Load encryption key from settings collection. A missing key must be
+    // a hard failure: an empty key would base64-decode to zero bytes, and
+    // the secret cipher refuses any key that is not 32 bytes, so every
+    // credential lookup would fail. Refuse to start instead, matching the
+    // postgres backend.
+    let catalog_db = catalog_client.database("extenddb_catalog");
+    let settings_coll = catalog_db.collection::<mongodb::bson::Document>("settings");
+    let enc_key = settings_coll
+        .find_one(mongodb::bson::doc! { "_id": "encryption_key" })
+        .await
+        .map_err(|e| BackendError::InitializationFailed(format!("Load encryption key: {e}")))?
+        .and_then(|d| d.get_str("value").ok().map(std::borrow::ToOwned::to_owned))
+        .ok_or(BackendError::MissingEncryptionKey)?;
 
-        // Create credential store. The bin layer wraps this in
-        // CachedCredentialStore using the operator-configured TTL
-        // before constructing the auth provider.
-        let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
-            Arc::new(MongoCredentialStore::new(auth_client, enc_key));
+    let auth_client = catalog_client.clone();
+    let catalog_store = Arc::new(MongoCatalogStore::with_encryption_key(
+        catalog_client,
+        enc_key.clone(),
+    )) as Arc<dyn extenddb_storage::CatalogStore>;
 
-        // Create runtime hooks
-        let runtime_hooks = Box::new(MongoRuntimeHooks {
-            engine: engine.clone(),
-        });
+    // Create credential store. The bin layer wraps this in
+    // CachedCredentialStore using the operator-configured TTL
+    // before constructing the auth provider.
+    let cred_store: Arc<dyn extenddb_auth::CredentialStore> =
+        Arc::new(MongoCredentialStore::new(auth_client, enc_key));
 
-        Ok(ServerComponents {
-            engine,
-            catalog_store,
-            credential_store: cred_store,
-            runtime_hooks: Some(runtime_hooks),
-        })
+    // Create runtime hooks
+    let runtime_hooks = Box::new(MongoRuntimeHooks {
+        engine: engine.clone(),
+        registration,
+    });
+
+    Ok(ServerComponents {
+        engine,
+        catalog_store,
+        credential_store: cred_store,
+        runtime_hooks: Some(runtime_hooks),
     })
 }
 
@@ -211,6 +301,22 @@ pub fn backend() -> extenddb_storage::Backend {
                     >)
             })
         },
+        management_store: |connection_string| {
+            let connection_string = connection_string.to_string();
+            Box::pin(async move {
+                let client = connect_guarded(&connection_string, None, false)
+                    .await
+                    .map_err(|e| {
+                        extenddb_storage::management_store_factory::ManagementStoreError::ConnectionFailed(
+                            e.to_string(),
+                        )
+                    })?;
+                Ok(Box::new(MongoCatalogStore::new(client))
+                    as Box<
+                        dyn extenddb_storage::management_store::ManagementStore,
+                    >)
+            })
+        },
         diagnostics_store: |connection_string| {
             let connection_string = connection_string.to_string();
             Box::pin(async move {
@@ -226,6 +332,7 @@ pub fn backend() -> extenddb_storage::Backend {
             })
         },
         server_components: server_components_factory,
+        catalog_migrations: &migrations::MongoCatalogMigrations,
     }
 }
 
@@ -306,6 +413,10 @@ impl GsiCache {
 }
 
 /// `MongoDB` storage backend.
+///
+/// Cloning is cheap and shares the connection pool and the GSI cache; a
+/// detached restore copy owns a clone so it outlives the request future.
+#[derive(Clone)]
 pub struct MongoEngine {
     client: mongodb::Client,
     pub(crate) catalog_db: mongodb::Database,
@@ -316,18 +427,21 @@ pub struct MongoEngine {
     /// [`GSI_CACHE_TTL`] are treated as misses and re-read from the catalog,
     /// so GSI additions/removals on other ExtendDB instances converge within
     /// the TTL window.
-    gsi_cache: GsiCache,
+    gsi_cache: Arc<GsiCache>,
     /// Read concern applied to every multi-document transaction this engine
     /// opens. Defaults to `snapshot` (real MongoDB); configurable via
     /// [`crate::config::MongoStorageConfig::transaction_read_concern`] for
     /// MongoDB-wire-compatible backends that don't support snapshot reads.
     tx_read_concern: mongodb::options::ReadConcern,
+    /// Heartbeat timing of a restore's job record (see [`backup_engine`]).
+    pub(crate) backup_liveness: backup_engine::BackupLiveness,
 }
 
 /// Build a MongoDB client from a connection string, applying the shared
 /// connection guards so every client in the backend is protected, not just the
 /// data client: reject non-primary read preferences (they route reads to
-/// replicas and silently break `ConsistentRead=true`).
+/// replicas and silently break `ConsistentRead=true`), and reject a write
+/// concern other than `majority` (see [`check_write_concern`]).
 ///
 /// `max_pool_size` is applied when provided. The long-lived data, catalog, and
 /// authentication clients pass their explicitly configured pool limits;
@@ -344,6 +458,18 @@ pub(crate) async fn connect_guarded(
     max_pool_size: Option<u32>,
     warn_on_no_tls: bool,
 ) -> Result<mongodb::Client, StorageError> {
+    let options = guarded_client_options(connection_string, max_pool_size, warn_on_no_tls).await?;
+    mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
+}
+
+/// The checked [`mongodb::options::ClientOptions`] behind [`connect_guarded`],
+/// for a caller that needs to read an effective option (the pool size) before
+/// building the client.
+pub(crate) async fn guarded_client_options(
+    connection_string: &str,
+    max_pool_size: Option<u32>,
+    warn_on_no_tls: bool,
+) -> Result<mongodb::options::ClientOptions, StorageError> {
     let options = client_options_with_pool_size(connection_string, max_pool_size).await?;
 
     if let Some(sel) = options.selection_criteria.as_ref() {
@@ -363,6 +489,8 @@ pub(crate) async fn connect_guarded(
         }
     }
 
+    check_write_concern(options.write_concern.as_ref())?;
+
     if warn_on_no_tls && !matches!(options.tls, Some(mongodb::options::Tls::Enabled(_))) {
         tracing::warn!(
             "MongoDB connection is not using TLS; credentials and data will \
@@ -371,7 +499,7 @@ pub(crate) async fn connect_guarded(
         );
     }
 
-    mongodb::Client::with_options(options).map_err(|e| StorageError::Connection(e.to_string()))
+    Ok(options)
 }
 
 async fn client_options_with_pool_size(
@@ -392,6 +520,96 @@ fn apply_max_pool_size(options: &mut mongodb::options::ClientOptions, max_pool_s
     }
 }
 
+/// Refuse a connection-string write concern weaker than `majority`.
+///
+/// The backup protocol (DeleteBackup's DELETING write, a restore's CREATING
+/// target and its job record, the catalog index's claims, see
+/// [`backup_engine`] and [`backup_catalog`]) treats an acknowledged write as
+/// permanent. A write acknowledged under `w=1` (or any node count or
+/// tag, whose relation to a majority this cannot see) can be rolled back when
+/// the primary fails over, and `journal=false` lets a majority acknowledge a
+/// write none of them has journaled. Accepted: no write concern (the server
+/// default, `majority` on a replica set without arbiters), `w=majority`,
+/// either with `wtimeoutMS`, and `journal=true`.
+///
+/// The catalog and the backup and restore copies use `majority` whatever the
+/// connection string or the server default say (see
+/// [`majority_write_concern`]); this check keeps a weaker setting in the
+/// connection string from being silently overridden there and honoured
+/// everywhere else.
+fn check_write_concern(wc: Option<&mongodb::options::WriteConcern>) -> Result<(), StorageError> {
+    use mongodb::options::Acknowledgment;
+    let Some(wc) = wc else {
+        return Ok(());
+    };
+    let weak = match &wc.w {
+        None | Some(Acknowledgment::Majority) => None,
+        Some(Acknowledgment::Nodes(n)) => Some(format!("w={n}")),
+        Some(Acknowledgment::Custom(tag)) => Some(format!("w={tag}")),
+        Some(other) => Some(format!("w={other:?}")),
+    }
+    .or_else(|| (wc.journal == Some(false)).then(|| "journal=false".to_owned()));
+    match weak {
+        None => Ok(()),
+        Some(found) => Err(StorageError::Connection(format!(
+            "MongoDB connection string must leave the write concern at the server \
+             default or set w=majority (found {found}). Backup rows and restore \
+             targets assume an acknowledged write survives a primary failover, \
+             which a weaker write concern does not guarantee."
+        ))),
+    }
+}
+
+/// `w: majority`, keeping the client's `wtimeout` and `journal`.
+///
+/// Set on the catalog database and on the backup and restore `$out` copies so
+/// they do not follow a weaker server default (`setDefaultRWConcern`, or the
+/// implicit `w: 1` of a replica set with arbiters). [`check_write_concern`]
+/// has already refused a connection string whose `journal` is `false`.
+pub(crate) fn majority_write_concern(
+    client: Option<&mongodb::options::WriteConcern>,
+) -> mongodb::options::WriteConcern {
+    let mut wc = client.cloned().unwrap_or_default();
+    wc.w = Some(mongodb::options::Acknowledgment::Majority);
+    wc
+}
+
+/// The engine's handle on the catalog database, with read preference
+/// `primary`, read concern `local` and write concern `majority` set on the
+/// database, so they apply to every catalog operation outside a transaction
+/// whatever the client's options or the server default say (inside a
+/// transaction the transaction's own options apply).
+///
+/// The backup protocol depends on this: DeleteBackup and a restore's
+/// registration each check for the other's CREATING target or status write
+/// (under their transactions, and DeleteBackup's unlocked first check
+/// before), and the reconciler reads the job records' heartbeats; every such
+/// read must see what the primary has acknowledged. A secondary can lag, and a `majority`
+/// or `snapshot` read can miss a write acknowledged with `w: 1`; a write
+/// acknowledged with `w: 1` can also be rolled back on failover, after the
+/// other side has acted on it.
+/// `connect_guarded` also refuses a non-primary read preference and a write
+/// concern other than `majority` in the connection string; this does not rely
+/// on it.
+fn catalog_database(client: &mongodb::Client) -> mongodb::Database {
+    catalog_database_named(client, migrations::CATALOG_DATABASE)
+}
+
+/// [`catalog_database`] for the database `name`: the migration runner uses
+/// the same options on both databases, and the migration and snapshot test
+/// fixtures run the production option set on databases of other names.
+pub(crate) fn catalog_database_named(client: &mongodb::Client, name: &str) -> mongodb::Database {
+    use mongodb::options::{DatabaseOptions, ReadConcern, ReadPreference, SelectionCriteria};
+    client.database_with_options(
+        name,
+        DatabaseOptions::builder()
+            .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            .read_concern(ReadConcern::local())
+            .write_concern(majority_write_concern(client.write_concern()))
+            .build(),
+    )
+}
+
 impl MongoEngine {
     pub async fn new(
         connection_string: &str,
@@ -399,9 +617,11 @@ impl MongoEngine {
         max_connections: Option<u32>,
         tx_read_concern: mongodb::options::ReadConcern,
     ) -> Result<Self, StorageError> {
-        let client = connect_guarded(connection_string, max_connections, true).await?;
+        let options = guarded_client_options(connection_string, max_connections, true).await?;
+        let client = mongodb::Client::with_options(options)
+            .map_err(|e| StorageError::Connection(e.to_string()))?;
 
-        let catalog_db = client.database("extenddb_catalog");
+        let catalog_db = catalog_database(&client);
         let data_db = client.database("extenddb_data");
 
         Ok(Self {
@@ -409,8 +629,9 @@ impl MongoEngine {
             catalog_db,
             data_db,
             region: region.to_owned(),
-            gsi_cache: GsiCache::default(),
+            gsi_cache: Arc::default(),
             tx_read_concern,
+            backup_liveness: backup_engine::BackupLiveness::default(),
         })
     }
 
@@ -475,6 +696,7 @@ impl MongoEngine {
 mod tests {
     use super::GsiCache;
     use super::client_options_with_pool_size;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn absent_pool_override_preserves_uri_max_pool_size() {
@@ -517,5 +739,141 @@ mod tests {
 
         assert!(!cache.set_if_generation("table-1", observed_generation, true));
         assert_eq!(cache.get_fresh("table-1"), None);
+    }
+
+    fn assert_primary_local(db: &mongodb::Database, from: &str) {
+        use mongodb::options::{ReadConcernLevel, ReadPreference, SelectionCriteria};
+        assert!(
+            matches!(
+                db.selection_criteria(),
+                Some(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+            ),
+            "{from}: catalog read preference {:?}",
+            db.selection_criteria()
+        );
+        assert_eq!(
+            db.read_concern().map(|rc| rc.level.clone()),
+            Some(ReadConcernLevel::Local),
+            "{from}: catalog read concern"
+        );
+    }
+
+    /// R4B-3: the catalog database reads from the primary with read concern
+    /// `local` whatever the client's options say. The client here is built
+    /// without `connect_guarded`, so its secondary read preference is not
+    /// refused first. No server is contacted.
+    #[tokio::test]
+    async fn the_catalog_database_pins_primary_reads_over_the_client_options() {
+        let options = mongodb::options::ClientOptions::parse(
+            "mongodb://127.0.0.1:1/?readPreference=secondaryPreferred&readConcernLevel=majority",
+        )
+        .await
+        .expect("MongoDB URI must parse");
+        let client = mongodb::Client::with_options(options).expect("client");
+        assert!(
+            client.selection_criteria().is_some(),
+            "the client must carry the URI's read preference for this test to mean anything"
+        );
+        assert_primary_local(&super::catalog_database(&client), "catalog_database");
+    }
+
+    /// R4B-3: `MongoEngine::new` uses that database handle for the catalog.
+    #[tokio::test]
+    async fn the_engine_catalog_database_reads_from_the_primary() {
+        let engine = super::MongoEngine::new(
+            "mongodb://127.0.0.1:1/?readConcernLevel=majority",
+            "us-east-1",
+            None,
+            mongodb::options::ReadConcern::snapshot(),
+        )
+        .await
+        .expect("engine (no server is contacted)");
+        assert_primary_local(&engine.catalog_db, "MongoEngine::new");
+        assert_majority(&engine.catalog_db, None, "MongoEngine::new");
+    }
+
+    fn assert_majority(db: &mongodb::Database, w_timeout: Option<Duration>, from: &str) {
+        let wc = db.write_concern().expect("catalog write concern set");
+        assert_eq!(
+            wc.w,
+            Some(mongodb::options::Acknowledgment::Majority),
+            "{from}: catalog w"
+        );
+        assert_eq!(wc.w_timeout, w_timeout, "{from}: catalog wtimeout");
+        assert_eq!(wc.journal, None, "{from}: catalog journal");
+    }
+
+    /// Every client goes through `connect_guarded`, which
+    /// accepts only the server default or `w=majority` and refuses anything
+    /// weaker, as it refuses a non-primary read preference. No server is
+    /// contacted.
+    #[tokio::test]
+    async fn connect_guarded_refuses_a_write_concern_weaker_than_majority() {
+        let base = "mongodb://127.0.0.1:1/?replicaSet=rs0";
+        for accepted in [
+            "",
+            "&w=majority",
+            "&w=majority&wtimeoutMS=5000",
+            "&wtimeoutMS=5000",
+            "&journal=true",
+            "&w=majority&journal=true",
+        ] {
+            let uri = format!("{base}{accepted}");
+            if let Err(e) = super::connect_guarded(&uri, None, false).await {
+                panic!("{uri}: refused: {e}");
+            }
+        }
+        for (refused, found) in [
+            ("&w=0", "w=0"),
+            ("&w=1", "w=1"),
+            ("&w=2", "w=2"),
+            ("&w=dc", "w=dc"),
+            ("&journal=false", "journal=false"),
+            ("&w=majority&journal=false", "journal=false"),
+            ("&w=1&wtimeoutMS=5000", "w=1"),
+        ] {
+            let uri = format!("{base}{refused}");
+            match super::connect_guarded(&uri, None, false).await {
+                Ok(_) => panic!("{uri}: accepted"),
+                Err(super::StorageError::Connection(msg)) => {
+                    assert!(
+                        msg.contains(&format!("(found {found})")) && msg.contains("w=majority"),
+                        "{uri}: {msg}"
+                    );
+                }
+                Err(e) => panic!("{uri}: unexpected error {e:?}"),
+            }
+        }
+    }
+
+    /// The catalog writes with `w: majority` even when the client's own write
+    /// concern is weaker (built here without `connect_guarded`, standing for a
+    /// weaker server default), keeping the client's `wtimeout`.
+    #[tokio::test]
+    async fn the_catalog_database_pins_majority_writes_over_the_client_options() {
+        let options =
+            mongodb::options::ClientOptions::parse("mongodb://127.0.0.1:1/?w=1&wtimeoutMS=2500")
+                .await
+                .expect("MongoDB URI must parse");
+        let client = mongodb::Client::with_options(options).expect("client");
+        assert_eq!(
+            client.write_concern().and_then(|wc| wc.w.clone()),
+            Some(mongodb::options::Acknowledgment::Nodes(1)),
+            "the client must carry the URI's w=1 for this test to mean anything"
+        );
+        assert_majority(
+            &super::catalog_database(&client),
+            Some(Duration::from_millis(2500)),
+            "catalog_database",
+        );
+        // No client write concern at all: majority, no timeout.
+        let bare = mongodb::Client::with_options(
+            mongodb::options::ClientOptions::parse("mongodb://127.0.0.1:1/")
+                .await
+                .expect("MongoDB URI must parse"),
+        )
+        .expect("client");
+        assert!(bare.write_concern().is_none());
+        assert_majority(&super::catalog_database(&bare), None, "catalog_database");
     }
 }

@@ -6,18 +6,24 @@
 //! The console shows, per operation, the request count and the mean of each
 //! latency segment over a time window. Those are sums, so a request does not
 //! need to be stored: it is added into a time bucket at record time. Each
-//! operation owns two fixed rings of buckets, one of 1-second buckets covering
-//! the last 5 minutes and one of 1-minute buckets covering the last 24 hours.
-//! A bucket holds the count and six running sums, 64 bytes, and is overwritten
-//! in place when its ring position comes around again, so the memory per
-//! process is at most `operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes.
-//! The server only records operations that pass `is_known_operation`, which
-//! caps `operations` at the size of the dispatch table.
+//! operation of each account owns two fixed rings of buckets, one of 1-second
+//! buckets covering the last 5 minutes and one of 1-minute buckets covering
+//! the last 24 hours. A bucket holds the count and six running sums, 64 bytes,
+//! and is overwritten in place when its ring position comes around again, so
+//! the memory per process is at most
+//! `accounts * operations * (FINE_SLOTS + COARSE_SLOTS) * 64` bytes. The
+//! server only records operations that pass `is_known_operation`, which caps
+//! `operations` at the size of the dispatch table, and only for a request
+//! that authenticated, so `accounts` is the number of accounts in the catalog
+//! that sent a request, which operators create.
+//!
+//! The account is a key because `/metrics` filters the segments by account.
+//! A query without the filter sums every account's buckets per operation.
 //!
 //! Issue #397: one `SegmentPoint` per request grew to about 4.3 GiB in a day at
 //! 274 requests per second.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use super::types::{LatencySegments, OperationSegments, TimeWindow};
@@ -33,7 +39,8 @@ pub(super) const COARSE_WIDTH_SECS: u64 = 60;
 /// that contains the window cutoff.
 pub(super) const COARSE_SLOTS: usize = 1441;
 
-/// Buckets held per operation, the constant in the memory bound.
+/// Buckets held per operation of one account, the constant in the memory
+/// bound.
 #[cfg(test)]
 pub(super) const BUCKETS_PER_OPERATION: usize = FINE_SLOTS + COARSE_SLOTS;
 
@@ -165,19 +172,24 @@ fn ring_for(window: TimeWindow) -> (bool, Option<u64>) {
     }
 }
 
-/// Per-operation segment buckets. Lives behind the collector's lock.
+/// Per-account, per-operation segment buckets. Lives behind the collector's
+/// lock.
 #[derive(Debug)]
 pub(super) struct SegmentStore {
     /// Time zero for slot arithmetic.
     epoch: Instant,
-    by_operation: HashMap<String, OperationRings>,
+    /// The rings of each operation, under the account that sent the request.
+    /// Two maps rather than one keyed by the pair, so a record probes with
+    /// the borrowed names and allocates nothing after the first request of an
+    /// account's operation.
+    by_account: HashMap<String, HashMap<String, OperationRings>>,
 }
 
 impl SegmentStore {
     pub(super) fn new(epoch: Instant) -> Self {
         Self {
             epoch,
-            by_operation: HashMap::new(),
+            by_account: HashMap::new(),
         }
     }
 
@@ -190,69 +202,93 @@ impl SegmentStore {
         now.saturating_duration_since(self.epoch).as_secs()
     }
 
-    /// Adds one request. Steady state is one hash lookup and two bucket
-    /// updates; the only allocation is the rings of an operation seen for the
-    /// first time.
-    pub(super) fn record(&mut self, operation: &str, segments: &LatencySegments, now: Instant) {
+    /// Adds one request of `account_id`. Steady state is two hash lookups and
+    /// two bucket updates; the only allocation is the rings of an account's
+    /// operation seen for the first time.
+    pub(super) fn record(
+        &mut self,
+        account_id: &str,
+        operation: &str,
+        segments: &LatencySegments,
+        now: Instant,
+    ) {
         let elapsed = self.elapsed_secs(now);
-        if let Some(rings) = self.by_operation.get_mut(operation) {
+        if let Some(rings) = self
+            .by_account
+            .get_mut(account_id)
+            .and_then(|operations| operations.get_mut(operation))
+        {
             rings.record(elapsed, segments);
             return;
         }
-        self.by_operation
+        self.by_account
+            .entry(account_id.to_owned())
+            .or_default()
             .entry(operation.to_owned())
             .or_insert_with(OperationRings::new)
             .record(elapsed, segments);
     }
 
     /// Per-operation count and mean segments over `window`, sorted by
-    /// operation name. Operations with no request in the window are omitted.
+    /// operation name: the requests of `account_id` when it is given, every
+    /// account's requests summed per operation when it is not. Operations
+    /// with no request in the window are omitted.
     ///
     /// A window of `W` seconds read from a ring of `b`-second buckets covers
     /// at least the last `W` seconds and at most the last `W + b` seconds.
-    pub(super) fn query(&self, window: TimeWindow, now: Instant) -> Vec<OperationSegments> {
+    pub(super) fn query(
+        &self,
+        window: TimeWindow,
+        account_id: Option<&str>,
+        now: Instant,
+    ) -> Vec<OperationSegments> {
         let elapsed = self.elapsed_secs(now);
         let (fine, window_secs) = ring_for(window);
-        let mut out: Vec<OperationSegments> = self
-            .by_operation
-            .iter()
-            .filter_map(|(operation, rings)| {
+        let mut by_operation: BTreeMap<&str, Bucket> = BTreeMap::new();
+        for (account, operations) in &self.by_account {
+            if account_id.is_some_and(|a| a != account) {
+                continue;
+            }
+            for (operation, rings) in operations {
                 let ring = if fine { &rings.fine } else { &rings.coarse };
-                let mut acc = Bucket::default();
-                ring.sum_from(ring.first_slot(elapsed, window_secs), &mut acc);
-                (acc.count > 0).then(|| {
-                    #[allow(clippy::cast_precision_loss)]
-                    let c = acc.count as f64;
-                    OperationSegments {
-                        operation: operation.clone(),
-                        count: acc.count,
-                        avg: LatencySegments {
-                            auth_us: acc.auth_us / c,
-                            authz_us: acc.authz_us / c,
-                            throttle_us: acc.throttle_us / c,
-                            dispatch_us: acc.dispatch_us / c,
-                            response_us: acc.response_us / c,
-                            total_us: acc.total_us / c,
-                        },
-                    }
-                })
+                let acc = by_operation.entry(operation).or_default();
+                ring.sum_from(ring.first_slot(elapsed, window_secs), acc);
+            }
+        }
+        by_operation
+            .into_iter()
+            .filter(|(_, acc)| acc.count > 0)
+            .map(|(operation, acc)| {
+                #[allow(clippy::cast_precision_loss)]
+                let c = acc.count as f64;
+                OperationSegments {
+                    operation: operation.to_owned(),
+                    count: acc.count,
+                    avg: LatencySegments {
+                        auth_us: acc.auth_us / c,
+                        authz_us: acc.authz_us / c,
+                        throttle_us: acc.throttle_us / c,
+                        dispatch_us: acc.dispatch_us / c,
+                        response_us: acc.response_us / c,
+                        total_us: acc.total_us / c,
+                    },
+                }
             })
-            .collect();
-        out.sort_by(|a, b| a.operation.cmp(&b.operation));
-        out
+            .collect()
     }
 
-    /// Number of operations with rings allocated.
+    /// Number of (account, operation) pairs with rings allocated.
     #[cfg(test)]
-    pub(super) fn operation_count(&self) -> usize {
-        self.by_operation.len()
+    pub(super) fn ring_pair_count(&self) -> usize {
+        self.by_account.values().map(HashMap::len).sum()
     }
 
     /// Number of buckets allocated, the quantity the memory bound is stated in.
     #[cfg(test)]
     pub(super) fn bucket_count(&self) -> usize {
-        self.by_operation
+        self.by_account
             .values()
+            .flat_map(HashMap::values)
             .map(|r| r.fine.buckets.len() + r.coarse.buckets.len())
             .sum()
     }

@@ -144,12 +144,19 @@ for container_id in "$BOOTSTRAP_CONTAINER" "$APP_CONTAINER"; do
 done
 
 docker exec "$APP_CONTAINER" /bin/sh -ec '
-    ! command -v mongod >/dev/null 2>&1
-    ! command -v mongosh >/dev/null 2>&1
+    for tool in mongod mongosh; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            echo "error: the image contains $tool" >&2
+            exit 1
+        fi
+    done
     test "$(stat -c %u:%g /var/lib/extenddb)" = 10001:10001
     test "$(stat -c %a /var/lib/extenddb/extenddb.toml)" = 600
     test "$(stat -c %a /var/lib/extenddb/.extenddb/tls/key.pem)" = 600
 '
+
+docker run --rm --user 0:0 --entrypoint /bin/sh "$EXTENDDB_MONGODB_IMAGE" \
+    -ec 'test -z "$(find / -xdev -type f -perm /6000 -print -quit)"'
 
 echo "=== Provisioning API credentials and exercising DynamoDB operations ==="
 export EXTENDDB_PASSWORD="$EXTENDDB_ADMIN_PASSWORD"

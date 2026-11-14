@@ -59,7 +59,7 @@ Backends released under the ExtendDB organization must adhere to a trait-based c
 
 3. **All-or-nothing per trait.** The trait is the finest-grained unit of conformance. Backends cannot claim partial support for a trait (example: "Streams partially works but records are incomplete" is not allowed). Either the trait is fully implemented and conformant, or it is not implemented.
 
-4. **Maintain semantic correctness.** Where a backend implements an operation, it must match DynamoDB behavior including error responses, pagination, isolation guarantees, atomicity guarantees, and consistency models.
+4. **Maintain semantic correctness.** Where a backend implements an operation, it must match DynamoDB behavior including error responses, pagination, isolation guarantees, atomicity guarantees, and consistency models. The concrete, per-operation invariants that define this behavioral match are enumerated in [Backend Acceptance Criteria](0003-backend-acceptance-criteria.md).
 
 5. **Clear documentation.** Backends must document in their README which optional traits they implement and which they do not. Conformance test results (per-trait pass rates) must be published and tracked in CI.
 
@@ -224,6 +224,7 @@ External contributors may propose new backends or maintain existing ones. The pr
 3. **Implementation.** Contributor develops the backend in `crates/storage-{backend}/` following the `Storage` trait contract. The contributor owns their backend directory but ExtendDB maintainers retain override authority for repository-wide concerns.
 
 4. **Acceptance criteria:**
+   - All applicable [Backend Acceptance Criteria](0003-backend-acceptance-criteria.md) invariants are satisfied.
    - Conformance tests pass for all required traits and for any implemented, optional traits.
    - Documentation includes setup guide, architecture notes, troubleshooting
    - Integration tests run successfully in CI (contributor may need to provide sandbox credentials for cloud-based backends via GitHub Secrets)
@@ -344,6 +345,6 @@ Fork entire ExtendDB repo for each backend. Each fork contains frontend + one ba
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

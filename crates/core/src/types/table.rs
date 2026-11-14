@@ -197,6 +197,32 @@ pub struct SseDescription {
     pub kms_master_key_arn: Option<String>,
 }
 
+impl SseDescription {
+    /// The description ExtendDB reports for a stored `SSESpecification`.
+    ///
+    /// ExtendDB records SSE settings as metadata and does not encrypt with
+    /// KMS, so an enabled specification is reported as `ENABLED`/`KMS` with a
+    /// placeholder key ARN, and anything else as no description. This is the
+    /// shape the SQL backends already build in their table descriptions; it
+    /// lives here so `DescribeBackup` and the backends report one shape.
+    #[must_use]
+    pub fn from_specification(
+        spec: Option<&serde_json::Value>,
+        region: &str,
+        account_id: &str,
+    ) -> Option<Self> {
+        let enabled = spec?
+            .get("Enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        enabled.then(|| Self {
+            status: "ENABLED".to_owned(),
+            sse_type: Some(SseType::KMS),
+            kms_master_key_arn: Some(format!("arn:aws:kms:{region}:{account_id}:key/default")),
+        })
+    }
+}
+
 /// On-demand throughput settings for a table or index.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnDemandThroughput {
@@ -277,6 +303,14 @@ pub struct GsiDescription {
     pub item_count: i64,
     #[serde(rename = "IndexArn")]
     pub index_arn: String,
+    /// Derived by `TableDescription::prepare_for_response` from
+    /// `warm_throughput_record`; backends leave this `None`.
+    #[serde(rename = "WarmThroughput", skip_serializing_if = "Option::is_none")]
+    pub warm_throughput: Option<super::WarmThroughputDescription>,
+    /// What the backend stored for this index, if a client ever set it. Not a
+    /// wire member; see [`super::WarmThroughputRecord`]. Nothing acts on it.
+    #[serde(skip)]
+    pub warm_throughput_record: Option<super::WarmThroughputRecord>,
 }
 
 /// Local secondary index description returned in responses.
@@ -310,6 +344,12 @@ pub struct GsiInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    #[serde(
+        rename = "WarmThroughput",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// Local secondary index definition for `CreateTable` requests.
@@ -589,6 +629,15 @@ pub const VECTOR_TABLE_REQUIRES_PAY_PER_REQUEST_MODE: &str = "One or more parame
 pub const VECTOR_INDEX_COUNT_LIMIT_CREATE: &str =
     "One or more parameter values were invalid: VectorIndex count exceeds the per-table limit of 5";
 
+/// A second online GSI change while one is still being built.
+///
+/// The service answers an UpdateTable that creates a GSI, or deletes a GSI other
+/// than the one building, while a GSI on the table is `CREATING` with this
+/// LimitExceededException; the same sentence it uses for two index actions in
+/// one request.
+pub const ONLINE_INDEX_LIMIT: &str = "Subscriber limit exceeded: Only 1 online index can be \
+     created or deleted simultaneously per table";
+
 /// Per-table vector index limit exceeded on `UpdateTable`.
 ///
 /// Measured 2026-08-13: reported as a `LimitExceededException`, not a
@@ -769,13 +818,81 @@ impl TableDescription {
         Ok(())
     }
 
-    /// Populate `TableThroughputModeSummary` as an exact mirror of
-    /// `BillingModeSummary`.
+    /// Apply the rules every description handed to a client obeys. Called on
+    /// every path that does so (CreateTable, UpdateTable, DeleteTable,
+    /// DescribeTable, RestoreTableFromBackup), so each rule holds centrally
+    /// rather than in each response path or backend:
     ///
-    /// Called on every path that hands a description to a client, so the
-    /// measured invariant (both members together, always agreeing) holds
-    /// centrally instead of each backend assembling the mirror itself.
-    pub fn populate_table_throughput_mode_summary(&mut self) {
+    /// - `TableThroughputModeSummary` mirrors `BillingModeSummary`.
+    /// - `RestoreSummary` is reported only while the table is CREATING, and
+    ///   then with `RestoreInProgress: true`. The service drops it once the
+    ///   table is ACTIVE (measured on DynamoDB, and still absent 30 s later).
+    ///   Backends report the summary whenever the table has a registered
+    ///   restore.
+    /// - A disabled `StreamSpecification` is omitted: the service carries the
+    ///   member only while a stream is enabled (measured 2026-10-24 on the
+    ///   disable response and on `DescribeTable` afterwards). Backends keep
+    ///   the disabled specification stored, with the closed stream's view
+    ///   type, so `DescribeStream` of that stream can still report it.
+    pub fn prepare_for_response(&mut self) {
+        self.populate_table_throughput_mode_summary();
+        if self
+            .stream_specification
+            .as_ref()
+            .is_some_and(|s| !s.stream_enabled)
+        {
+            self.stream_specification = None;
+        }
+        if self.table_status != TableStatus::Creating {
+            self.restore_summary = None;
+        } else if let Some(summary) = self.restore_summary.as_mut() {
+            summary.restore_in_progress = true;
+        }
+        self.populate_warm_throughput(super::epoch_seconds_now());
+    }
+
+    /// Derive the `WarmThroughput` member of the table and of each global
+    /// secondary index from the stored records (see
+    /// [`super::WarmThroughputRecord::describe_for`] for the measured rules).
+    /// Local secondary indexes carry none. Reached through
+    /// [`Self::prepare_for_response`]; `now` is epoch seconds.
+    pub fn populate_warm_throughput(&mut self, now: f64) {
+        let pay_per_request = self
+            .billing_mode_summary
+            .as_ref()
+            .is_some_and(|s| s.billing_mode == BillingMode::PayPerRequest);
+        let table_defaults = super::WarmThroughputDefaults::for_billing(
+            pay_per_request,
+            self.provisioned_throughput.read_capacity_units,
+            self.provisioned_throughput.write_capacity_units,
+        );
+        self.warm_throughput = super::WarmThroughputRecord::describe_for(
+            self.warm_throughput_record.as_ref(),
+            self.table_status == TableStatus::Creating,
+            table_defaults,
+            now,
+        );
+        for gsi in self.global_secondary_indexes.iter_mut().flatten() {
+            let (rcu, wcu) = gsi.provisioned_throughput.as_ref().map_or((0, 0), |pt| {
+                (pt.read_capacity_units, pt.write_capacity_units)
+            });
+            let defaults = super::WarmThroughputDefaults::for_billing(pay_per_request, rcu, wcu);
+            // An index created with its table is CREATING while the table is;
+            // one added by UpdateTable is CREATING while it backfills.
+            let creating =
+                self.table_status == TableStatus::Creating || gsi.index_status == "CREATING";
+            gsi.warm_throughput = super::WarmThroughputRecord::describe_for(
+                gsi.warm_throughput_record.as_ref(),
+                creating,
+                defaults,
+                now,
+            );
+        }
+    }
+
+    /// Populate `TableThroughputModeSummary` as an exact mirror of
+    /// `BillingModeSummary`. Reached through [`Self::prepare_for_response`].
+    fn populate_table_throughput_mode_summary(&mut self) {
         self.table_throughput_mode_summary = self.billing_mode_summary.as_ref().map(Into::into);
     }
 }
@@ -811,8 +928,8 @@ pub struct TableDescription {
     pub provisioned_throughput: ProvisionedThroughputDescription,
     #[serde(rename = "BillingModeSummary", skip_serializing_if = "Option::is_none")]
     pub billing_mode_summary: Option<BillingModeSummary>,
-    /// Populated by the engine via `populate_table_throughput_mode_summary()`
-    /// on every path that emits a description. Backends leave this `None` and
+    /// Populated by the engine via `prepare_for_response()` on every path
+    /// that emits a description. Backends leave this `None` and
     /// must not assemble it independently.
     #[serde(
         rename = "TableThroughputModeSummary",
@@ -850,6 +967,14 @@ pub struct TableDescription {
     pub on_demand_throughput: Option<OnDemandThroughput>,
     #[serde(rename = "RestoreSummary", skip_serializing_if = "Option::is_none")]
     pub restore_summary: Option<RestoreSummary>,
+    /// Derived by [`Self::prepare_for_response`] from `warm_throughput_record`,
+    /// the billing mode and the provisioned units; backends leave this `None`.
+    #[serde(rename = "WarmThroughput", skip_serializing_if = "Option::is_none")]
+    pub warm_throughput: Option<super::WarmThroughputDescription>,
+    /// What the backend stored for the table, if a client ever set it. Not a
+    /// wire member; see [`super::WarmThroughputRecord`]. Nothing acts on it.
+    #[serde(skip)]
+    pub warm_throughput_record: Option<super::WarmThroughputRecord>,
 }
 
 /// Details of a restore reported on the restored table's description.
@@ -857,11 +982,22 @@ pub struct TableDescription {
 /// `RestoreTableFromBackup` reports the source backup and an in-progress flag
 /// on its response's `TableDescription`; the ground-truth runs of 2026-08-24
 /// (us-east-1 and eu-west-2) pin `SourceBackupArn` and
-/// `RestoreInProgress: true` there.
+/// `RestoreInProgress: true` there. Measured on DynamoDB: `SourceTableArn`
+/// is set, `RestoreDateTime` equals the source backup's
+/// `BackupCreationDateTime` (not the moment the restore ran), and
+/// DescribeTable stops reporting the member once the table is ACTIVE
+/// (applied to every description by `TableDescription::prepare_for_response`).
+/// Member names from botocore 1.33.13 `service-2.json` shape `RestoreSummary`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RestoreSummary {
     #[serde(rename = "SourceBackupArn", skip_serializing_if = "Option::is_none")]
     pub source_backup_arn: Option<String>,
+    #[serde(
+        rename = "SourceTableArn",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_table_arn: Option<String>,
     #[serde(rename = "RestoreDateTime")]
     pub restore_date_time: f64,
     #[serde(rename = "RestoreInProgress")]
@@ -901,6 +1037,8 @@ pub struct CreateTableInput {
     pub table_class: Option<String>,
     #[serde(rename = "OnDemandThroughput")]
     pub on_demand_throughput: Option<OnDemandThroughput>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// `CreateTable` response body.
@@ -1001,6 +1139,8 @@ pub struct CreateGsiAction {
         skip_serializing_if = "Option::is_none"
     )]
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
 }
 
 /// Delete an existing GSI from a table.
@@ -1010,14 +1150,33 @@ pub struct DeleteGsiAction {
     pub index_name: String,
 }
 
-/// Update provisioned throughput on an existing GSI.
+/// Update an existing GSI.
 ///
-/// Recognized by the deserializer but not yet implemented — the engine
-/// returns a clear "not yet supported" error.
+/// `WarmThroughput` is stored and reported (see [`super::WarmThroughputRecord`]).
+/// `ProvisionedThroughput` and `OnDemandThroughput` are recognized by the
+/// deserializer but an update of either is not yet implemented: they are read
+/// as opaque values only so that the engine refuses an `Update` carrying
+/// either, with or without `WarmThroughput`, instead of accepting it and
+/// dropping the member.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UpdateGsiAction {
     #[serde(rename = "IndexName")]
     pub index_name: String,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
+    #[serde(rename = "ProvisionedThroughput", default)]
+    pub provisioned_throughput: Option<serde_json::Value>,
+    #[serde(rename = "OnDemandThroughput", default)]
+    pub on_demand_throughput: Option<serde_json::Value>,
+}
+
+impl UpdateGsiAction {
+    /// Whether the action carries `ProvisionedThroughput` or
+    /// `OnDemandThroughput`, which ExtendDB does not apply to an index.
+    #[must_use]
+    pub fn carries_throughput(&self) -> bool {
+        self.provisioned_throughput.is_some() || self.on_demand_throughput.is_some()
+    }
 }
 
 /// `UpdateTable` request body.
@@ -1048,6 +1207,13 @@ pub struct UpdateTableInput {
     /// unaffected.
     #[serde(rename = "VectorIndexUpdates", default)]
     pub vector_index_updates: Option<Vec<VectorIndexUpdate>>,
+    #[serde(rename = "WarmThroughput", default)]
+    pub warm_throughput: Option<super::WarmThroughput>,
+    /// Accepted so that a request carrying it is recognised: `UpdateTable`
+    /// does not act on it (as before), but a table-level `WarmThroughput`
+    /// beside it is refused with the service's sentence.
+    #[serde(rename = "SSESpecification", default)]
+    pub sse_specification: Option<serde_json::Value>,
 }
 
 /// `UpdateTable` response body.
@@ -1075,14 +1241,24 @@ impl UpdateTableInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TimeToLiveStatus {
-    /// TTL is enabled.
+    /// TTL is enabled and the expiration queue covers every item.
     Enabled,
+    /// TTL has been requested and the queue backfill has not yet finished.
+    /// Writes made in this state are TTL-tracked; pre-existing items are
+    /// still being registered.
+    Enabling,
     /// TTL is disabled.
     Disabled,
+    /// TTL has been disabled and the old expiration queue is still being
+    /// drained. No further expirations happen in this state.
+    Disabling,
 }
 
 /// TTL description returned by `DescribeTimeToLive` and `UpdateTimeToLive`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+///
+/// Deserializable because a backup records it (`BackupTableDefinition`) for
+/// `DescribeBackup`'s `SourceTableFeatureDetails.TimeToLiveDescription`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeToLiveDescription {
     #[serde(rename = "TimeToLiveStatus")]
     pub time_to_live_status: TimeToLiveStatus,
@@ -1306,6 +1482,40 @@ mod tests {
         desc.billing_mode_summary = None;
         desc.populate_table_throughput_mode_summary();
         assert_eq!(desc.table_throughput_mode_summary, None);
+    }
+
+    /// `RestoreSummary` survives only while CREATING, with
+    /// `RestoreInProgress: true`; every other status drops it, whichever
+    /// operation returns the description.
+    #[test]
+    fn restore_summary_is_reported_only_while_creating() {
+        let restored = |status| TableDescription {
+            table_status: status,
+            restore_summary: Some(RestoreSummary {
+                source_backup_arn: Some("b".to_owned()),
+                source_table_arn: Some("t".to_owned()),
+                restore_date_time: 1.0,
+                restore_in_progress: false,
+            }),
+            ..Default::default()
+        };
+        let mut creating = restored(TableStatus::Creating);
+        creating.prepare_for_response();
+        let summary = creating.restore_summary.expect("kept while CREATING");
+        assert!(summary.restore_in_progress);
+        assert_eq!(summary.source_table_arn.as_deref(), Some("t"));
+
+        for status in [
+            TableStatus::Active,
+            TableStatus::Updating,
+            TableStatus::Deleting,
+        ] {
+            let mut done = restored(status);
+            done.prepare_for_response();
+            assert!(done.restore_summary.is_none(), "{status:?}");
+            let json = serde_json::to_value(&done).unwrap();
+            assert!(json.get("RestoreSummary").is_none(), "{status:?}");
+        }
     }
 
     /// Wire shape: the timestamp member is omitted, not null, when absent,

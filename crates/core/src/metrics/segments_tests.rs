@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::*;
 
 const OPS: [&str; 5] = ["GetItem", "PutItem", "Query", "Scan", "UpdateItem"];
+const ACCOUNT: &str = "111111111111";
 
 fn segs(v: f64) -> LatencySegments {
     LatencySegments {
@@ -66,10 +67,10 @@ fn boundedness_five_million_records() {
         let now = epoch + Duration::from_millis(i * 52);
         #[allow(clippy::cast_possible_truncation)]
         let op = OPS[(i % 5) as usize];
-        store.record(op, &segs(1.0), now);
+        store.record(ACCOUNT, op, &segs(1.0), now);
     }
     let bound = OPS.len() * BUCKETS_PER_OPERATION;
-    assert_eq!(store.operation_count(), OPS.len());
+    assert_eq!(store.ring_pair_count(), OPS.len());
     assert!(
         store.bucket_count() <= bound,
         "bucket count {} exceeds bound {bound}",
@@ -80,7 +81,7 @@ fn boundedness_five_million_records() {
     assert_eq!(store.bucket_count(), bound);
     // The whole-ring query still answers, with at most 1441 minutes of data.
     let now = epoch + Duration::from_millis(total * 52);
-    let out = store.query(TimeWindow::AllTime, now);
+    let out = store.query(TimeWindow::AllTime, None, now);
     let in_day: u64 = out.iter().map(|o| o.count).sum();
     assert!(in_day > 0 && in_day <= 86_460_000 / 52 + OPS.len() as u64);
 }
@@ -105,7 +106,7 @@ fn random_workload_matches_naive_reference() {
         #[allow(clippy::cast_precision_loss)]
         let v = rng.below(10_000) as f64 / 7.0;
         let s = segs(v);
-        store.record(OPS[op], &s, epoch + Duration::from_millis(t_ms));
+        store.record(ACCOUNT, OPS[op], &s, epoch + Duration::from_millis(t_ms));
         points.push((op, t_ms, s));
     }
     let windows = [
@@ -118,7 +119,7 @@ fn random_workload_matches_naive_reference() {
         let now = epoch + Duration::from_millis(now_ms);
         let now_secs = now_ms / 1000;
         for (window, w, b) in windows {
-            let out = store.query(window, now);
+            let out = store.query(window, None, now);
             let first_slot = now_secs.saturating_sub(w) / b;
             for (i, op) in OPS.iter().enumerate() {
                 let mut count = 0u64;
@@ -199,28 +200,28 @@ fn window_filter_at_minute_boundary() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     for t in [0, 59, 60] {
-        store.record("GetItem", &segs(1.0), at(epoch, t));
+        store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, t));
     }
     // The fine ring cuts at the second: 119 s keeps 59 s and 60 s, 120 s drops 59 s.
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastMinute, at(epoch, 119)),
+            &store.query(TimeWindow::LastMinute, None, at(epoch, 119)),
             "GetItem"
         ),
         2
     );
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastMinute, at(epoch, 120)),
+            &store.query(TimeWindow::LastMinute, None, at(epoch, 120)),
             "GetItem"
         ),
         1
     );
     // 3659 s: cutoff 59 s lies in minute 0, so minute 0 is included.
-    store.record("GetItem", &segs(1.0), at(epoch, 3659));
+    store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, 3659));
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastHour, at(epoch, 3659)),
+            &store.query(TimeWindow::LastHour, None, at(epoch, 3659)),
             "GetItem"
         ),
         4
@@ -229,7 +230,7 @@ fn window_filter_at_minute_boundary() {
     // 3660 s: cutoff 60 s starts minute 1, so minute 0 is excluded.
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastHour, at(epoch, 3660)),
+            &store.query(TimeWindow::LastHour, None, at(epoch, 3660)),
             "GetItem"
         ),
         2
@@ -243,12 +244,12 @@ fn fine_windows_cut_at_the_second() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     for t in [0, 1, 2, 300, 301] {
-        store.record("Query", &segs(1.0), at(epoch, t));
+        store.record(ACCOUNT, "Query", &segs(1.0), at(epoch, t));
     }
     // 301 s: cutoff 1 s, buckets 1, 2, 300, 301.
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::Last5Minutes, at(epoch, 301)),
+            &store.query(TimeWindow::Last5Minutes, None, at(epoch, 301)),
             "Query"
         ),
         4
@@ -256,7 +257,7 @@ fn fine_windows_cut_at_the_second() {
     // 302 s: cutoff 2 s.
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::Last5Minutes, at(epoch, 302)),
+            &store.query(TimeWindow::Last5Minutes, None, at(epoch, 302)),
             "Query"
         ),
         3
@@ -264,21 +265,21 @@ fn fine_windows_cut_at_the_second() {
     // 361 s: cutoff 301 s for the minute window.
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastMinute, at(epoch, 361)),
+            &store.query(TimeWindow::LastMinute, None, at(epoch, 361)),
             "Query"
         ),
         1
     );
     assert_eq!(
         count_of(
-            &store.query(TimeWindow::LastMinute, at(epoch, 362)),
+            &store.query(TimeWindow::LastMinute, None, at(epoch, 362)),
             "Query"
         ),
         0
     );
     assert!(
         store
-            .query(TimeWindow::LastMinute, at(epoch, 362))
+            .query(TimeWindow::LastMinute, None, at(epoch, 362))
             .is_empty()
     );
 }
@@ -290,30 +291,36 @@ fn fine_windows_cut_at_the_second() {
 fn ring_lap_and_stale_slots() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
-    store.record("Scan", &segs(1.0), at(epoch, 0));
+    store.record(ACCOUNT, "Scan", &segs(1.0), at(epoch, 0));
     // One day minus a second later minute 0 is still inside the ring.
     assert_eq!(
-        count_of(&store.query(TimeWindow::AllTime, at(epoch, 86_459)), "Scan"),
+        count_of(
+            &store.query(TimeWindow::AllTime, None, at(epoch, 86_459)),
+            "Scan"
+        ),
         1
     );
     assert_eq!(
-        count_of(&store.query(TimeWindow::LastDay, at(epoch, 86_459)), "Scan"),
+        count_of(
+            &store.query(TimeWindow::LastDay, None, at(epoch, 86_459)),
+            "Scan"
+        ),
         1
     );
     // At 1441 minutes the ring has moved past minute 0 without overwriting it.
     assert!(
         store
-            .query(TimeWindow::AllTime, at(epoch, 86_460))
+            .query(TimeWindow::AllTime, None, at(epoch, 86_460))
             .is_empty()
     );
     assert!(
         store
-            .query(TimeWindow::LastDay, at(epoch, 86_460))
+            .query(TimeWindow::LastDay, None, at(epoch, 86_460))
             .is_empty()
     );
     // A record one full lap later lands on position 0 and resets it.
-    store.record("Scan", &segs(5.0), at(epoch, 1441 * 60));
-    let out = store.query(TimeWindow::AllTime, at(epoch, 1441 * 60));
+    store.record(ACCOUNT, "Scan", &segs(5.0), at(epoch, 1441 * 60));
+    let out = store.query(TimeWindow::AllTime, None, at(epoch, 1441 * 60));
     assert_eq!(count_of(&out, "Scan"), 1);
     assert!((out[0].avg.auth_us - 5.0).abs() < f64::EPSILON);
     assert_eq!(store.bucket_count(), BUCKETS_PER_OPERATION);
@@ -386,6 +393,7 @@ fn continuous_load_three_coarse_laps_exact_count_and_mean() {
         #[allow(clippy::cast_precision_loss)]
         let v = t as f64;
         store.record(
+            ACCOUNT,
             "Scan",
             &LatencySegments {
                 auth_us: v,
@@ -406,7 +414,7 @@ fn continuous_load_three_coarse_laps_exact_count_and_mean() {
             let first = t.saturating_sub(w) / b * b;
             let want_count = t - first + 1;
             let want_sum = (first + t) * want_count / 2;
-            let out = store.query(window, at(epoch, t));
+            let out = store.query(window, None, at(epoch, t));
             let Some(o) = out.iter().find(|o| o.operation == "Scan") else {
                 panic!("{window:?} t={t}: Scan absent");
             };
@@ -432,13 +440,13 @@ fn continuous_load_three_coarse_laps_exact_count_and_mean() {
 fn operations_sorted_and_zero_count_absent() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
-    store.record("Scan", &segs(1.0), at(epoch, 10));
-    store.record("GetItem", &segs(1.0), at(epoch, 10));
-    store.record("PutItem", &segs(1.0), at(epoch, 1000));
-    let out = store.query(TimeWindow::LastMinute, at(epoch, 1000));
+    store.record(ACCOUNT, "Scan", &segs(1.0), at(epoch, 10));
+    store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, 10));
+    store.record(ACCOUNT, "PutItem", &segs(1.0), at(epoch, 1000));
+    let out = store.query(TimeWindow::LastMinute, None, at(epoch, 1000));
     let names: Vec<&str> = out.iter().map(|o| o.operation.as_str()).collect();
     assert_eq!(names, ["PutItem"]);
-    let out = store.query(TimeWindow::AllTime, at(epoch, 1000));
+    let out = store.query(TimeWindow::AllTime, None, at(epoch, 1000));
     let names: Vec<&str> = out.iter().map(|o| o.operation.as_str()).collect();
     assert_eq!(names, ["GetItem", "PutItem", "Scan"]);
 }
@@ -493,7 +501,7 @@ fn bench_old_push_vs_new_record() {
         #[allow(clippy::cast_possible_truncation)]
         let op = OPS[(i % 5) as usize];
         if let Ok(mut s) = new.write() {
-            s.record(op, &segs(1.0), Instant::now());
+            s.record(ACCOUNT, op, &segs(1.0), Instant::now());
         }
     }
     let new_ns = start.elapsed().as_nanos() / u128::from(N);
@@ -515,7 +523,7 @@ fn bench_old_push_vs_new_record() {
     let start = Instant::now();
     let out = new
         .read()
-        .map(|s| s.query(TimeWindow::AllTime, Instant::now()))
+        .map(|s| s.query(TimeWindow::AllTime, None, Instant::now()))
         .unwrap_or_default();
     let new_query_us = start.elapsed().as_micros();
 
