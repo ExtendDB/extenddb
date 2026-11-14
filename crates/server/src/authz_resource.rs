@@ -26,6 +26,7 @@
 //! | `ExportTableToPointInTime` | same | the `TableArn` |
 //! | `ImportTable` | same | the new table ARN |
 //! | `Query`/`Scan` (with `IndexName`) | same | `table/<T>/index/<I>` |
+//! | `SearchVectors` | same | `table/<T>/index/<I>` |
 //! | `ListTables` | `ListTables` | `table/*` |
 //! | item/table ops | same | the table ARN (from `TableName`, name or ARN) |
 //!
@@ -760,12 +761,14 @@ pub(crate) fn authz_targets(
             v.extend(restore);
             v
         }
-        // Query and Scan on an index authorize the index ARN. With a table ARN
-        // in TableName the denial names that ARN with the index appended; any
-        // other ARN in TableName (an index ARN, a malformed resource) names
-        // the canonical index ARN, so the denial never names a resource the
-        // caller did not write.
-        "Query" | "Scan" => {
+        // Query and Scan on an index, and SearchVectors, authorize the index
+        // ARN. SearchVectors always names a vector index, and the service
+        // documents `table/<T>/index/<I>` as the resource for
+        // dynamodb:SearchVectors. With a table ARN in TableName the denial
+        // names that ARN with the index appended; any other ARN in TableName
+        // (an index ARN, a malformed resource) names the canonical index ARN,
+        // so the denial never names a resource the caller did not write.
+        "Query" | "Scan" | "SearchVectors" => {
             let base = table_resource_arn(&table_name, region, account_id);
             match str_field(input, "IndexName") {
                 Some(idx) if !idx.is_empty() => {
@@ -1543,3 +1546,7 @@ mod supplied_resource_tests;
 /// A point-in-time restore authorizes its target before its source (issue #446).
 #[cfg(test)]
 mod restore_order_tests;
+
+/// SearchVectors authorizes the vector index it searches.
+#[cfg(test)]
+mod search_vectors_tests;
