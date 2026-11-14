@@ -603,6 +603,14 @@ jobs:
           digest: ${{ steps.push.outputs.digest }}
           release-tag: v${{ needs.gate.outputs.version }}
 
+      # Docker Hub lists repositories by last push, newest first, so the pushes
+      # above moved this image to the top. ci/dockerhub-order.py puts the list
+      # back in its fixed order by pushing existing manifests again: no tag
+      # changes digest. A failure here only warns.
+      - name: Restore the Docker Hub listing order
+        continue-on-error: true
+        run: python3 ci/dockerhub-order.py --apply --warn-only
+
       - name: Summarise for the release checklist
         if: always()
         run: |
