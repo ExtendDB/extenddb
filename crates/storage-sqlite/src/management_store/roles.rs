@@ -11,6 +11,8 @@ use extenddb_storage::management_store::{OpError, OpResult, RoleDetail, RoleList
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_fk_violation, is_unique_violation, parse_timestamp};
 
+use super::policies::{begin_write, delete_principal_attachments, finish};
+
 /// Parse a stored JSON-text column into a `serde_json::Value`.
 fn parse_json(s: &str, ctx: &str) -> OpResult<serde_json::Value> {
     serde_json::from_str(s).map_err(|e| OpError::Internal(format!("{ctx} parse json: {e}")))
@@ -28,45 +30,60 @@ impl SqliteCatalogStore {
             .map_err(|e| OpError::Internal(format!("serialize trust policy: {e}")))?;
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
-        sqlx::query(
-            "INSERT INTO iam_roles (account_id, role_name, role_arn, trust_policy) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(account_id)
-        .bind(role_name)
-        .bind(&role_arn)
-        .bind(&trust)
-        .execute(self.pool())
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            if is_unique_violation(&e) {
-                OpError::AlreadyExists("IAM role already exists".to_owned())
-            } else if is_fk_violation(&e) {
-                OpError::NotFound("Account not found".to_owned())
-            } else {
-                tracing::error!("create_role: {e}");
-                OpError::Internal("Database error".to_owned())
-            }
-        })
+        let mut tx = begin_write(self.pool(), "create_role").await?;
+        let result: OpResult<()> = async {
+            sqlx::query(
+                "INSERT INTO iam_roles (account_id, role_name, role_arn, trust_policy) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(role_name)
+            .bind(&role_arn)
+            .bind(&trust)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    OpError::AlreadyExists("IAM role already exists".to_owned())
+                } else if is_fk_violation(&e) {
+                    OpError::NotFound("Account not found".to_owned())
+                } else {
+                    tracing::error!("create_role: {e}");
+                    OpError::Internal("Database error".to_owned())
+                }
+            })?;
+            // A role deleted before deletes removed them could have left its
+            // inline policies and boundary under this name.
+            delete_principal_attachments(&mut tx, account_id, "role", role_name).await
+        }
+        .await;
+        finish(tx, result, "create_role").await
     }
 
     pub(crate) async fn delete_role_impl(&self, account_id: &str, role_name: &str) -> OpResult<()> {
         // D1: every writer holds the write lock.
         let _writer = self.lock_writes().await;
-        let result = sqlx::query("DELETE FROM iam_roles WHERE account_id = ? AND role_name = ?")
-            .bind(account_id)
-            .bind(role_name)
-            .execute(self.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_role: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        if result.rows_affected() == 0 {
-            return Err(OpError::NotFound("IAM role not found".to_owned()));
+        let mut tx = begin_write(self.pool(), "delete_role").await?;
+        let result: OpResult<()> = async {
+            // The foreign keys remove the role's tags and sessions. Its
+            // inline policies and boundary have none.
+            let deleted =
+                sqlx::query("DELETE FROM iam_roles WHERE account_id = ? AND role_name = ?")
+                    .bind(account_id)
+                    .bind(role_name)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("delete_role: {e}");
+                        OpError::Internal("Database error".to_owned())
+                    })?;
+            if deleted.rows_affected() == 0 {
+                return Err(OpError::NotFound("IAM role not found".to_owned()));
+            }
+            delete_principal_attachments(&mut tx, account_id, "role", role_name).await
         }
-        Ok(())
+        .await;
+        finish(tx, result, "delete_role").await
     }
 
     pub(crate) async fn list_roles_impl(&self, account_id: &str) -> OpResult<Vec<RoleListEntry>> {

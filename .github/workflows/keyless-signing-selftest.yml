@@ -1,0 +1,130 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Proves the keyless signing path end to end on every change to the signing
+# composite actions, so a regression is caught here and not in a release. It
+# builds a throwaway image, pushes it to a GHCR scratch repo, signs it with
+# the real .github/actions/sign-image action (keyless, via this workflow's
+# GitHub OIDC identity), confirms the legacy .sig tag appeared, copies the
+# image and its signature to a second repo the way promotion does, and
+# verifies the copy by Fulcio identity through its Rekor entry.
+#
+# No AWS, no KMS, no Docker Hub: only GHCR via the run's GITHUB_TOKEN. It
+# proves the MECHANISM and prints the exact certificate identity cosign
+# records; the release workflows use the same identity shape with their own
+# workflow names (release-image, release-dev-image, sign-image) on main.
+
+name: keyless signing selftest
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/actions/sign-image/**'
+      - '.github/actions/promote-registry/**'
+      - '.github/workflows/keyless-signing-selftest.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keyless-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    # Fork PRs get a read-only token and no OIDC identity, so keyless signing
+    # cannot run there; skip rather than fail. workflow_dispatch and same-repo
+    # PRs run normally.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write   # GHCR scratch repo
+      id-token: write   # keyless signing (Sigstore/Fulcio) via OIDC
+    env:
+      REPO: ghcr.io/extenddb/keyless-selftest
+      TAG: run-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out (the composite actions live in-repo)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Log in to GHCR (docker + skopeo)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u x-access-token --password-stdin
+          echo "$GHCR_TOKEN" | skopeo login ghcr.io -u x-access-token --password-stdin
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build and push a throwaway image, capture its digest
+        id: build
+        run: |
+          set -euo pipefail
+          printf 'FROM alpine:3.20\nRUN echo keyless-selftest > /selftest.txt\n' > Dockerfile.selftest
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false --sbom=false \
+            -f Dockerfile.selftest \
+            -t "${REPO}:${TAG}" \
+            --push \
+            --metadata-file meta.json \
+            .
+          DIGEST=$(jq -r '."containerimage.digest"' meta.json)
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest: $DIGEST"; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Sign with the real composite action (keyless)
+        id: sign
+        uses: ./.github/actions/sign-image
+        with:
+          image-repo: ${{ env.REPO }}
+          digest: ${{ steps.build.outputs.digest }}
+          release-tag: v0.0.0-selftest
+
+      - name: Promote-style roundtrip (copy image + signature, verify the copy)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SIG_TAG: ${{ steps.sign.outputs.sig-tag }}
+        run: |
+          set -euo pipefail
+          DST="${REPO}-promoted"
+          skopeo copy --all --preserve-digests "docker://${REPO}@${DIGEST}" "docker://${DST}:${TAG}"
+          skopeo copy --preserve-digests "docker://${REPO}:${SIG_TAG}" "docker://${DST}:${SIG_TAG}"
+          # Verify the COPY by Fulcio identity + Rekor, the way promote-registry
+          # does for the real release workflows (here matched to this selftest
+          # workflow's own identity, which is what signed above).
+          IDENTITY_RE="^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/keyless-signing-selftest\.yml@"
+          cosign verify \
+            --certificate-identity-regexp "$IDENTITY_RE" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-github-workflow-trigger "$GITHUB_EVENT_NAME" \
+            "${DST}@${DIGEST}" >/dev/null
+          echo "Roundtrip keyless verify of the copied signature: OK"
+          # Informational: record the exact certificate identity cosign saw.
+          # Best effort; never fails the job.
+          ( cosign verify \
+              --certificate-identity-regexp "$IDENTITY_RE" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --output json "${REPO}@${DIGEST}" 2>/dev/null \
+            | jq -r '.[0].optional.Subject // .[0].critical.identity // "unknown"' \
+            | sed 's/^/signed by: /' >> "$GITHUB_STEP_SUMMARY" ) || true
+
+      - name: Clean up the GHCR scratch tags (best effort)
+        if: always()
+        env:
+          SIG_TAG: ${{ steps.sign.outputs.sig-tag }}
+        run: |
+          set +e
+          # Keep the scratch repo from accumulating; a failure here must never
+          # fail the selftest. The .sig tags are removed too, best effort.
+          for ref in "${REPO}:${TAG}" "${REPO}:${SIG_TAG}" \
+                     "${REPO}-promoted:${TAG}" "${REPO}-promoted:${SIG_TAG}"; do
+            [[ "$ref" == *: ]] && continue
+            skopeo delete "docker://${ref}" 2>/dev/null
+          done
+          true

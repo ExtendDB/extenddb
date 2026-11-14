@@ -124,13 +124,17 @@ only) — identical to Postgres, no change needed.
   `write_lock`) and a separate catalog pool (catalog + credential stores) so
   catalog reads don't contend with the data write lock. Only `:memory:` uses a
   single pinned connection (see D4).
-- **Schema** is one authoritative migration mirroring Postgres `001_schema.sql`
-  semantics: accounts, tables, indexes, tags, settings (seeded `catalog_version`
-  = the compiled `CATALOG_VERSION`), stream_shards/records, seq_counters,
-  admin_users, full IAM (users/groups/roles/policies/boundaries/sessions),
-  access_keys, idempotency_tokens, metrics, login_attempts, backups/backup_items,
-  continuous_backups. Per-DynamoDB-table data tables (`_ddb_<id>`) are created
-  dynamically by `create_table`, same as Postgres.
+- **Schema** is migration 1 (`migrations/0001_baseline.sql`) and the numbered
+  migrations after it, the same list as Postgres: accounts, tables, indexes,
+  vector_indexes, tags, schema_history, settings, stream_shards/records,
+  seq_counters, admin_users, full IAM
+  (users/groups/roles/policies/boundaries/sessions), access_keys,
+  idempotency_tokens, metrics, login_attempts, backups/backup_items,
+  backup_definitions, table_restores, gsi_pending. Migration 5 drops the
+  `continuous_backups` table that migration 1 creates. The runner writes the
+  highest applied migration id to the `catalog_version` setting.
+  Per-DynamoDB-table data tables (`_ddb_<id>`) are created dynamically by
+  `create_table`, same as Postgres.
 - **Contract drift already identified to honour:** `ServerComponents` uses
   `credential_store` (not PR #109's `auth_provider`); `StorageConfig` requires
   `as_any`; `TableKeyInfo` now carries `base_key_schema`.

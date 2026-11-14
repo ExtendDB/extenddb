@@ -1,0 +1,9 @@
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[resolver]
+# Prefer dependency versions whose declared rust-version fits the workspace
+# rust-version (1.88, tested in CI), so `cargo update` on a newer toolchain
+# does not pull in crates that no longer build on 1.88. Only applies when a
+# newer version would be incompatible; everything else updates as usual.
+incompatible-rust-versions = "fallback"

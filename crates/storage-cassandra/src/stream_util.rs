@@ -58,8 +58,30 @@ impl HybridClock {
     /// Returns a 23-digit zero-padded string. Lexicographic ordering matches
     /// temporal ordering.
     pub fn generate(&mut self) -> String {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.generate_with_created_at().0
+    }
 
+    /// Generate the next sequence number and the wall-clock reading taken by
+    /// this call, as `(sequence_number, created_at_ms)`.
+    ///
+    /// The sequence prefix is that reading or a later clamped value, so a
+    /// record's stored creation time never exceeds the timestamp prefix of
+    /// its own sequence number (`created_at_ms <= hlc_ms`). A reading at or
+    /// below the last prefix keeps the last prefix; when the counter
+    /// overflows, the prefix moves to the later of a fresh reading and the
+    /// last prefix plus one.
+    pub fn generate_with_created_at(&mut self) -> (String, i64) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.generate_from(now_ms, || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            chrono::Utc::now().timestamp_millis()
+        })
+    }
+
+    /// One clock step for the reading `now_ms`. `reread` is called only when
+    /// the counter overflows and returns the reading taken after the wait;
+    /// tests pass both readings in.
+    fn generate_from(&mut self, now_ms: i64, reread: impl FnOnce() -> i64) -> (String, i64) {
         if now_ms > self.last_timestamp_ms {
             self.last_timestamp_ms = now_ms;
             self.logical_counter = 0;
@@ -72,19 +94,29 @@ impl HybridClock {
                 );
             }
             self.logical_counter += 1;
-            // Counter exhausted: wait for next millisecond.
-            // Requires ~1B writes/sec/node — will never occur in practice.
+            // Counter exhausted. On an unclamped clock this needs a million
+            // writes inside one millisecond. Under a forward clamp the counter
+            // accumulates for the whole clamp interval, so a backwards clock
+            // step of D ms reaches this branch at a million writes per D ms.
+            // The sleep lets an unclamped wall clock move on so the physical
+            // component stays close to real time; ordering is carried by the
+            // floor below, not by the sleep.
             if self.logical_counter > 999_999 {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                self.last_timestamp_ms = chrono::Utc::now().timestamp_millis();
+                // The re-read can sit below the last prefix, after a backwards
+                // step during the wait or under a forward clamp, so the prefix
+                // moves at least one past the last one. It stays above every
+                // earlier reading, and the sequence number sorts after every
+                // earlier one.
+                self.last_timestamp_ms = reread().max(self.last_timestamp_ms + 1);
                 self.logical_counter = 0;
             }
         }
 
-        format!(
+        let seq = format!(
             "{:013}{:06}{:04}",
             self.last_timestamp_ms, self.logical_counter, self.node_id
-        )
+        );
+        (seq, now_ms)
     }
 }
 
@@ -150,13 +182,14 @@ pub fn stream_record_statement(
     hlc: &Arc<Mutex<HybridClock>>,
     retention_seconds: u32,
 ) -> Option<String> {
+    let (sequence_number, created_at_ms) = hlc
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .generate_with_created_at();
     let identity = StreamRecordIdentity {
         event_id: uuid::Uuid::new_v4().to_string(),
-        sequence_number: hlc
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generate(),
-        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        sequence_number,
+        created_at_ms,
     };
     stream_record_statement_with_identity(
         account_keyspace,
@@ -276,6 +309,146 @@ mod tests {
         assert!(b < c, "sequence numbers must be ordered: {b} < {c}");
     }
 
+    /// The stored creation time never exceeds the millisecond prefix of the
+    /// record's own sequence number, including when the clock is clamped to
+    /// an earlier read (same-millisecond bursts and backwards steps both take
+    /// the clamp branch). On the clamp branch the returned value is the
+    /// call's own wall-clock reading, not the clamped prefix.
+    #[test]
+    fn created_at_never_exceeds_sequence_prefix() {
+        let mut clock = HybridClock::new(7);
+        // Force the clamp branch: pretend the last read was far in the future.
+        clock.last_timestamp_ms = chrono::Utc::now().timestamp_millis() + 5_000;
+        for _ in 0..1_000 {
+            let before = chrono::Utc::now().timestamp_millis();
+            let (seq, created_at_ms) = clock.generate_with_created_at();
+            let after = chrono::Utc::now().timestamp_millis();
+            let hlc_ms: i64 = seq[..13].parse().unwrap();
+            assert!(
+                created_at_ms <= hlc_ms,
+                "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+            );
+            assert!(
+                (before..=after).contains(&created_at_ms),
+                "created_at_ms {created_at_ms} must be the reading between {before} and \
+                 {after}, below the clamped prefix {hlc_ms}"
+            );
+        }
+        // On the normal branch the prefix is the reading itself.
+        let mut fresh = HybridClock::new(7);
+        let before = chrono::Utc::now().timestamp_millis();
+        let (seq, created_at_ms) = fresh.generate_with_created_at();
+        let after = chrono::Utc::now().timestamp_millis();
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert_eq!(created_at_ms, hlc_ms);
+        assert!(
+            (before..=after).contains(&created_at_ms),
+            "created_at_ms {created_at_ms} is the wall clock read between {before} and {after}"
+        );
+    }
+
+    /// The counter-overflow branch re-reads the clock for the sequence
+    /// prefix. The readings are injected, so the branch runs on every run.
+    /// The returned `created_at_ms` is still the call's own reading, at or
+    /// below the new prefix.
+    #[test]
+    fn created_at_holds_across_counter_overflow() {
+        let now_ms: i64 = 1_800_000_000_000;
+        let mut clock = HybridClock::new(42);
+        let (first, _) =
+            clock.generate_from(now_ms, || unreachable!("no overflow on a fresh clock"));
+        clock.logical_counter = 999_999;
+        let mut reread = false;
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || {
+            reread = true;
+            now_ms + 1
+        });
+        assert!(reread, "the call takes the overflow branch");
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert_eq!(
+            created_at_ms, now_ms,
+            "created_at_ms is the call's own reading"
+        );
+        assert_eq!(hlc_ms, now_ms + 1, "the prefix moves to the re-read");
+        assert!(
+            created_at_ms <= hlc_ms,
+            "overflow branch: created_at_ms {created_at_ms} exceeds prefix {hlc_ms} in {seq}"
+        );
+        assert_eq!(
+            clock.logical_counter, 0,
+            "the counter resets after overflow"
+        );
+        assert_eq!(
+            &seq[13..19],
+            "000000",
+            "the counter field resets in the sequence"
+        );
+        assert!(
+            seq > first,
+            "the overflow sequence follows the previous one: {first} < {seq}"
+        );
+    }
+
+    /// When the wall clock steps back during the overflow wait, the re-read
+    /// lands below the call's own reading. The prefix still stays at or
+    /// above that reading, and the sequence still follows the previous one.
+    #[test]
+    fn overflow_prefix_stays_above_the_reading_when_the_reread_steps_back() {
+        let now_ms: i64 = 1_800_000_000_000;
+        let mut clock = HybridClock::new(3);
+        clock.last_timestamp_ms = now_ms;
+        clock.logical_counter = 999_999;
+        let previous = format!("{now_ms:013}{:06}{:04}", 999_999, 3);
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || now_ms - 10);
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+        );
+        assert!(
+            seq > previous,
+            "the overflow sequence follows the previous one: {previous} < {seq}"
+        );
+    }
+
+    /// Overflow under a forward clamp: the last prefix sits 5 s ahead of the
+    /// call's reading and the re-read lands a further 5 s back. The prefix
+    /// moves to the last prefix plus one, not to the reading plus one, so the
+    /// sequence still follows the previous one and `created_at_ms` stays at
+    /// or below the prefix.
+    #[test]
+    fn overflow_under_a_forward_clamp_moves_the_prefix_past_the_last_one() {
+        let now_ms: i64 = 1_800_000_000_000;
+        let mut clock = HybridClock::new(5);
+        clock.last_timestamp_ms = now_ms + 5_000;
+        clock.logical_counter = 999_999;
+        let previous = format!("{:013}{:06}{:04}", now_ms + 5_000, 999_999, 5);
+        let mut reread_called = false;
+        let (seq, created_at_ms) = clock.generate_from(now_ms, || {
+            reread_called = true;
+            now_ms - 5_000
+        });
+        let hlc_ms: i64 = seq[..13].parse().unwrap();
+        assert!(reread_called, "the call takes the overflow branch");
+        assert_eq!(
+            created_at_ms, now_ms,
+            "created_at_ms is the call's own reading"
+        );
+        assert!(
+            created_at_ms <= hlc_ms,
+            "created_at_ms {created_at_ms} exceeds sequence prefix {hlc_ms} in {seq}"
+        );
+        assert!(
+            seq > previous,
+            "the overflow sequence follows the previous one: {previous} < {seq}"
+        );
+        assert_eq!(
+            hlc_ms,
+            now_ms + 5_001,
+            "the prefix moves to the last prefix plus one: {seq}"
+        );
+    }
+
     #[test]
     fn test_sequence_length() {
         let mut clock = HybridClock::new(1);
@@ -325,5 +498,50 @@ mod tests {
             s.starts_with("shardId-my-table-id-"),
             "unexpected format: {s}"
         );
+    }
+
+    /// Counter overflow under a forward clamp. The clock was clamped 5 s ahead
+    /// of the wall clock by an earlier backwards step; the counter is driven to
+    /// the limit so the next call takes the overflow branch. The re-read inside
+    /// that branch is still behind the clamp, and the sequence issued after the
+    /// overflow must sort after the one issued before it.
+    #[test]
+    fn sequence_advances_across_overflow_under_forward_clamp() {
+        let mut clock = HybridClock::new(3);
+        let clamp_ms = chrono::Utc::now().timestamp_millis() + 5_000;
+        clock.last_timestamp_ms = clamp_ms;
+        clock.logical_counter = 999_998;
+
+        let before = clock.generate();
+        assert_eq!(
+            &before[13..19],
+            "999999",
+            "the call before overflow issues the last counter value: {before}"
+        );
+        let before_prefix: i64 = before[..13].parse().unwrap();
+        assert_eq!(before_prefix, clamp_ms, "the clamp is still in force");
+
+        let after = clock.generate();
+        let after_prefix: i64 = after[..13].parse().unwrap();
+        assert!(
+            after > before,
+            "the sequence after overflow sorts after the one before it: {before} < {after}"
+        );
+        assert_eq!(
+            after_prefix,
+            clamp_ms + 1,
+            "the physical component moves one millisecond past the clamped value"
+        );
+        assert_eq!(
+            &after[13..19],
+            "000000",
+            "the counter resets after overflow"
+        );
+        assert_eq!(clock.logical_counter, 0);
+
+        // The clamp stays in force for the next call as well.
+        let next = clock.generate();
+        assert!(next > after, "{after} < {next}");
+        assert_eq!(&next[..13], &after[..13]);
     }
 }

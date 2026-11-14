@@ -8,10 +8,11 @@ use extenddb_core::types::{
     ProvisionedThroughputDescription, SseDescription, SseType, TableDescription, TableStatus,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{index_arn, stream_arn};
+use extenddb_storage::util::{index_arn, parse_warm_throughput_record, stream_arn};
 use extenddb_storage::vector_catalog::{VectorIndexCatalogRow, vector_index_descriptions};
 
 use crate::PostgresEngine;
+use crate::catalog_json::{from_catalog_json, unescape_json};
 use crate::data;
 
 /// Row type for table metadata queries.
@@ -34,6 +35,7 @@ pub(crate) struct TableRow {
     pub table_class: Option<String>,
     pub sse_specification: Option<serde_json::Value>,
     pub on_demand_throughput: Option<serde_json::Value>,
+    pub warm_throughput: Option<serde_json::Value>,
 }
 
 /// Row type for index metadata queries.
@@ -46,6 +48,7 @@ pub(crate) struct IndexRow {
     pub projection: serde_json::Value,
     pub index_status: String,
     pub provisioned_throughput: Option<serde_json::Value>,
+    pub warm_throughput: Option<serde_json::Value>,
 }
 
 /// A `vector_indexes` catalog row, in `FromRow` field order.
@@ -68,14 +71,16 @@ pub(crate) struct VectorIndexRow {
 }
 
 impl From<VectorIndexRow> for VectorIndexCatalogRow {
+    /// The three documents carry attribute names, stored through the
+    /// escape of `catalog_json`; they are handed on decoded.
     fn from(row: VectorIndexRow) -> Self {
         Self {
             index_name: row.index_name,
             dimensions: i64::from(row.dimensions),
             distance_function: row.distance_function,
-            vector_attribute: row.vector_attribute,
-            search_schema: row.search_schema,
-            projection: row.projection,
+            vector_attribute: unescape_json(row.vector_attribute),
+            search_schema: row.search_schema.map(unescape_json),
+            projection: unescape_json(row.projection),
             index_status: row.index_status,
             backfilling: row.backfilling,
         }
@@ -97,12 +102,37 @@ impl PostgresEngine {
         data::index_table_name(index_id)
     }
 
-    // TODO(fidelity): These two queries are not in a transaction. Under concurrent
-    // UpdateTable (future phase), the table row and index rows could be read at
-    // different points in time, producing an inconsistent snapshot. Wrap in a
-    // transaction or use SELECT ... FOR SHARE when concurrent DDL is supported.
+    /// `DescribeTable`'s read of the definition, on a connection taken for the
+    /// four statements and nothing else: the table row and its index rows are
+    /// not read in one transaction, so a concurrent `UpdateTable` committing
+    /// between them can show a row with an index set from a moment later. That
+    /// is what the service's eventually consistent `DescribeTable` also allows.
+    /// The snapshot engine (`snapshot_engine.rs`) is the caller that needs one
+    /// instant and gets it: it calls [`Self::build_table_description_on`] on
+    /// the connection that holds the `tables` row `FOR SHARE` (separate data
+    /// database) or inside its `REPEATABLE READ` transaction (one shared
+    /// database). The end of `update_table` calls this one, after its own
+    /// transaction has committed.
     pub(crate) async fn build_table_description(
         &self,
+        account_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        self.build_table_description_on(&mut conn, account_id, table_name)
+            .await
+    }
+
+    /// Build the description through one catalog connection, so a caller
+    /// that already holds one (the snapshot engine, with the `tables` row
+    /// `FOR SHARE`) does not need a second from the pool while it waits.
+    pub(crate) async fn build_table_description_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
         account_id: &str,
         table_name: &str,
     ) -> Result<TableDescription, StorageError> {
@@ -112,12 +142,13 @@ impl PostgresEngine {
                       EXTRACT(EPOCH FROM creation_date_time)::FLOAT8 as creation_epoch,
                       table_size_bytes, item_count, table_arn, table_id,
                       deletion_protection_enabled, stream_label,
-                      table_class, sse_specification, on_demand_throughput
+                      table_class, sse_specification, on_demand_throughput,
+                      warm_throughput
                FROM tables WHERE account_id = $1 AND table_name = $2",
         )
         .bind(account_id)
         .bind(table_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -125,11 +156,11 @@ impl PostgresEngine {
 
         let index_rows: Vec<IndexRow> = sqlx::query_as(
             r"SELECT index_name, index_id, index_type, key_schema, projection,
-                      index_status, provisioned_throughput
+                      index_status, provisioned_throughput, warm_throughput
                FROM indexes WHERE table_id = $1",
         )
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
@@ -138,14 +169,15 @@ impl PostgresEngine {
              ORDER BY index_name"
         ))
         .bind(&row.table_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
         let table_name_owned = row.table_name.clone();
         let table_id = row.table_id.clone();
         let mut desc = self.build_table_description_from_row(account_id, row, index_rows)?;
-        desc.restore_summary = self.restore_summary(&table_id, &desc.table_status).await?;
+        desc.restore_summary =
+            Self::restore_summary_on(conn, &table_id, &desc.table_status).await?;
         desc.vector_indexes = vector_index_descriptions(
             &self.region,
             account_id,
@@ -165,10 +197,8 @@ impl PostgresEngine {
         let mut lsis: Vec<LsiDescription> = Vec::new();
 
         for idx in index_rows {
-            let ks = serde_json::from_value(idx.key_schema)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let proj = serde_json::from_value(idx.projection)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let ks = from_catalog_json(idx.key_schema)?;
+            let proj = from_catalog_json(idx.projection)?;
 
             if idx.index_type == "GSI" {
                 // F-1 fallback: old data may be stored as ProvisionedThroughput
@@ -193,6 +223,10 @@ impl PostgresEngine {
                     .transpose()
                     .map_err(|e: serde_json::Error| StorageError::Internal(e.to_string()))?;
 
+                let warm_json = idx
+                    .warm_throughput
+                    .as_ref()
+                    .map(serde_json::Value::to_string);
                 gsis.push(GsiDescription {
                     index_name: idx.index_name.clone(),
                     key_schema: ks,
@@ -213,6 +247,8 @@ impl PostgresEngine {
                         &row.table_name,
                         &idx.index_name,
                     ),
+                    warm_throughput: None,
+                    warm_throughput_record: parse_warm_throughput_record(warm_json.as_deref()),
                 });
             } else {
                 lsis.push(LsiDescription {
@@ -231,10 +267,8 @@ impl PostgresEngine {
             }
         }
 
-        let key_schema = serde_json::from_value(row.key_schema)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attr_defs = serde_json::from_value(row.attribute_definitions)
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema = from_catalog_json(row.key_schema)?;
+        let attr_defs = from_catalog_json(row.attribute_definitions)?;
         let stream_spec = row
             .stream_specification
             .map(serde_json::from_value)
@@ -330,6 +364,9 @@ impl PostgresEngine {
             on_demand_throughput: row
                 .on_demand_throughput
                 .and_then(|v| serde_json::from_value(v).ok()),
+            warm_throughput_record: parse_warm_throughput_record(
+                row.warm_throughput.map(|v| v.to_string()).as_deref(),
+            ),
             // Vector indexes are read separately and applied by the caller: this
             // builder takes `index_rows` only, and the two callers differ in
             // whether they need them. `build_table_description` fills them in;
@@ -342,9 +379,10 @@ impl PostgresEngine {
     /// The RestoreSummary of a table created by RestoreTableFromBackup, or
     /// `None` for any other table. In progress until the table is ACTIVE; the
     /// engine drops the summary from DescribeTable once the table is not
-    /// CREATING.
-    pub(crate) async fn restore_summary(
-        &self,
+    /// CREATING. Takes the connection so a caller holding the catalog barrier
+    /// reads it there.
+    pub(crate) async fn restore_summary_on(
+        conn: &mut sqlx::PgConnection,
         table_id: &str,
         status: &extenddb_core::types::TableStatus,
     ) -> Result<Option<extenddb_core::types::RestoreSummary>, StorageError> {
@@ -356,7 +394,7 @@ impl PostgresEngine {
              FROM table_restores WHERE table_id = $1",
         )
         .bind(table_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?;
         Ok(row.map(

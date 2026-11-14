@@ -87,7 +87,7 @@ function fakeGithub({ pages, workflows = [], failUpdates = 0, linkedById = {}, f
   };
 }
 
-const OPTIONS = ['Todo', 'In Progress', 'Review', 'Done'].map((name) => ({ id: `OPT_${name}`, name }));
+const OPTIONS = ['Todo', 'In Progress', 'Needs review', 'Review', 'Done'].map((name) => ({ id: `OPT_${name}`, name }));
 
 const boardPage = (nodes, { hasNextPage = false, remaining = 4000, field = { id: 'F', options: OPTIONS } } = {}) => ({
   rateLimit: { cost: 9, remaining },
@@ -119,8 +119,8 @@ const run = (gh, opts = {}) => {
 
 // ---- PR rules -----------------------------------------------------------------
 
-test('PR with no reviews is In Progress', () => {
-  assert.equal(prStatus(pr()), 'In Progress');
+test('ready PR with no reviews Needs review', () => {
+  assert.equal(prStatus(pr()), 'Needs review');
 });
 
 test('draft PR stays In Progress even when approved', () => {
@@ -132,7 +132,7 @@ test('a human comment review moves a PR to Review', () => {
 });
 
 test("the author's own replies do not count as review", () => {
-  assert.equal(prStatus(pr({ reviews: { nodes: [review(user('alice'), 'COMMENTED')] } })), 'In Progress');
+  assert.equal(prStatus(pr({ reviews: { nodes: [review(user('alice'), 'COMMENTED')] } })), 'Needs review');
 });
 
 test('bot and code-scanning reviews do not count', () => {
@@ -140,11 +140,11 @@ test('bot and code-scanning reviews do not count', () => {
     reviews: { nodes: [review(bot('github-advanced-security'), 'COMMENTED')] },
     verdicts: { nodes: [verdict(bot('some-bot'), 'CHANGES_REQUESTED')] },
   });
-  assert.equal(prStatus(p), 'In Progress');
+  assert.equal(prStatus(p), 'Needs review');
 });
 
 test('pending (unsubmitted) reviews do not count', () => {
-  assert.equal(prStatus(pr({ reviews: { nodes: [review(user('bob'), 'PENDING', null)] } })), 'In Progress');
+  assert.equal(prStatus(pr({ reviews: { nodes: [review(user('bob'), 'PENDING', null)] } })), 'Needs review');
 });
 
 test('an approval moves a PR to Review', () => {
@@ -164,12 +164,24 @@ test('one approval does not outweigh another reviewer requesting changes', () =>
   assert.equal(prStatus(p), 'In Progress');
 });
 
-test('re-requesting review from the reviewer who asked for changes moves it to Review', () => {
+test('re-requesting review from the reviewer who asked for changes moves it to Needs review', () => {
   const p = pr({
     verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED')] },
     reviewRequests: { nodes: [request('bob')] },
   });
-  assert.equal(prStatus(p), 'Review');
+  assert.equal(prStatus(p), 'Needs review');
+});
+
+test('re-requested changes still Needs review even when someone else approved', () => {
+  const p = pr({
+    verdicts: { nodes: [verdict(user('bob'), 'CHANGES_REQUESTED'), verdict(user('cat'), 'APPROVED')] },
+    reviewRequests: { nodes: [request('bob')] },
+  });
+  assert.equal(prStatus(p), 'Needs review');
+});
+
+test('a draft PR with no reviews stays In Progress', () => {
+  assert.equal(prStatus(pr({ isDraft: true })), 'In Progress');
 });
 
 test('re-requesting only some blocking reviewers keeps In Progress', () => {
@@ -215,7 +227,21 @@ test("an outside contributor's Closes #N does not move the issue", () => {
 test('an outside PR a maintainer linked from the sidebar is followed', () => {
   const outside = pr({ authorAssociation: 'CONTRIBUTOR' });
   const i = issue({ linked: linked(outside), manual: { totalCount: 1, nodes: [{ id: outside.id }] } });
-  assert.equal(issueStatus(i), 'In Progress');
+  assert.equal(issueStatus(i), 'Needs review');
+});
+
+test('issue follows its trusted linked PR into Needs review', () => {
+  assert.equal(issueStatus(issue({ assignees: { totalCount: 1 }, linked: linked(pr()) })), 'Needs review');
+});
+
+test('issue with a draft linked PR stays In Progress', () => {
+  assert.equal(issueStatus(issue({ linked: linked(pr({ isDraft: true })) })), 'In Progress');
+});
+
+test('an issue takes the furthest of its linked PRs', () => {
+  const reviewed = pr({ id: 'PR_2', verdicts: { nodes: [verdict(user('bob'), 'APPROVED')] } });
+  const i = issue({ linked: { totalCount: 2, nodes: [pr(), reviewed] } });
+  assert.equal(issueStatus(i), 'Review');
 });
 
 test('a merged or closed linked PR is ignored', () => {
@@ -241,7 +267,8 @@ test('never touches a card with Auto status = Off', () => {
 });
 
 test('moves a PR card out of Todo', () => {
-  assert.deepEqual(decide(item(pr(), 'Todo')), { target: 'In Progress' });
+  assert.deepEqual(decide(item(pr(), 'Todo')), { target: 'Needs review' });
+  assert.deepEqual(decide(item(pr({ isDraft: true }), 'Todo')), { target: 'In Progress' });
 });
 
 test('keeps a hand move until the PR changes', () => {
@@ -251,17 +278,17 @@ test('keeps a hand move until the PR changes', () => {
 
 test('releases a hand move once the PR changes again', () => {
   const p = pr({ updatedAt: '2026-10-27T12:00:00Z', moves: { nodes: [move('User', '2026-10-27T11:00:00Z')] } });
-  assert.deepEqual(decide(item(p, 'Review')), { target: 'In Progress' });
+  assert.deepEqual(decide(item(p, 'Review')), { target: 'Needs review' });
 });
 
 test('a hand move on another board does not count', () => {
   const p = pr({ moves: { nodes: [move('User', '2026-10-27T11:00:00Z', 2)] } });
-  assert.deepEqual(decide(item(p, 'Review')), { target: 'In Progress' });
+  assert.deepEqual(decide(item(p, 'Review')), { target: 'Needs review' });
 });
 
 test('a later bot move (the sweep itself) is not a hand move', () => {
   const p = pr({ moves: { nodes: [move('User', '2026-10-27T08:00:00Z'), move('Bot', '2026-10-27T11:00:00Z')] } });
-  assert.deepEqual(decide(item(p, 'Review')), { target: 'In Progress' });
+  assert.deepEqual(decide(item(p, 'Review')), { target: 'Needs review' });
 });
 
 test("an issue's hand move is released when its trusted linked PR changes", () => {
@@ -290,7 +317,7 @@ test('a clean run moves cards, writes the health card and reports ok', async () 
   const gh = fakeGithub({ pages: [boardPage([item(pr({ number: 5 }), 'Todo')])] });
   const { result, core } = await run(gh);
   assert.equal(result.outcome, 'ok');
-  assert.deepEqual(gh.writes[0], { kind: 'status', item: 'ITEM_5', option: 'OPT_In Progress' });
+  assert.deepEqual(gh.writes[0], { kind: 'status', item: 'ITEM_5', option: 'OPT_Needs review' });
   assert.equal(gh.writes[1].kind, 'heartbeat-add');
   assert.match(gh.writes[1].title, /^Board sweep: OK, last run 2026-10-28 03:20 UTC$/);
   assert.equal(core.failed.length, 0);
@@ -320,7 +347,7 @@ test('a dry run changes no Status, and lists its plan on the health card only', 
   const { result } = await run(gh, { dryRun: true });
   assert.deepEqual(gh.writes.map((w) => w.kind), ['heartbeat-add']);
   assert.match(gh.writes[0].title, /^Board sweep: DRY RUN, last run /);
-  assert.match(gh.writes[0].body, /PR #5: Todo -> In Progress/);
+  assert.match(gh.writes[0].body, /PR #5: Todo -> Needs review/);
   assert.equal(result.moves.length, 1);
 });
 
@@ -342,11 +369,11 @@ test('the public log names no issue, PR, status or draft; the private card has t
   });
   const { core } = await run(gh);
   const publicLog = [...core.info, ...core.warning, ...core.failed].join('\n');
-  for (const leak of ['#501', '#602', '#703', 'Todo', 'In Progress', 'Review', 'draft', 'Secret', 'linked to issue', 'inaccessible', 'boom']) {
+  for (const leak of ['#501', '#602', '#703', 'Todo', 'In Progress', 'Needs review', 'Review', 'review', 'draft', 'Secret', 'linked to issue', 'inaccessible', 'boom']) {
     assert.ok(!publicLog.includes(leak), `public log leaked "${leak}": ${publicLog}`);
   }
   const card = gh.writes.find((w) => w.kind === 'heartbeat-add');
-  for (const detail of ['PR #501', 'issue #602', 'PR #703: Todo -> In Progress', 'Pull request linked to issue', 'draft item 1', 'boom']) {
+  for (const detail of ['PR #501', 'issue #602', 'PR #703: Todo -> Needs review', 'Pull request linked to issue', 'draft item 1', 'boom']) {
     assert.ok(card.body.includes(detail), `card is missing "${detail}"`);
   }
 });
@@ -433,7 +460,7 @@ test('a truncated linked-PR list is fetched in full', async () => {
     linkedById: { I_1: { linked: { totalCount: 7, nodes: many }, manual: { totalCount: 0, nodes: [] } } },
   });
   const { result } = await run(gh);
-  assert.deepEqual(result.changes.map((c) => [c.label, c.to]), [['issue #6', 'In Progress']]);
+  assert.deepEqual(result.changes.map((c) => [c.label, c.to]), [['issue #6', 'Needs review']]);
 });
 
 test('an issue whose linked PRs cannot be read is left as is', async () => {

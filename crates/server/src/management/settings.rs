@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -15,19 +15,9 @@ use super::ManagementState;
 use super::auth::authenticate_admin;
 use super::ops_settings;
 
-/// Keys whose values must be redacted in API responses.
-const REDACTED_KEYS: &[&str] = &[
-    "connection_string",
-    "encryption_key",
-    "password",
-    "secret",
-    "token",
-];
-
-fn should_redact(key: &str) -> bool {
-    let lower = key.to_lowercase();
-    REDACTED_KEYS.iter().any(|&pattern| lower.contains(pattern))
-}
+// Redaction patterns and the mask live in one place, `extenddb_config`, so the
+// API, the console and the `settings` CLI mask the same keys with the same text.
+use extenddb_config::{MASK, should_redact};
 
 #[derive(Serialize)]
 struct SettingEntry {
@@ -43,9 +33,10 @@ fn op_err_to_response(e: extenddb_storage::management_store::OpError) -> Respons
 pub async fn list_settings(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
@@ -56,7 +47,7 @@ pub async fn list_settings(
                 .into_iter()
                 .map(|(key, value)| SettingEntry {
                     value: if should_redact(&key) {
-                        "••••••••".to_owned()
+                        MASK.to_owned()
                     } else {
                         value
                     },
@@ -73,10 +64,11 @@ pub async fn list_settings(
 pub async fn get_setting(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(key): Path<String>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
@@ -84,7 +76,7 @@ pub async fn get_setting(
     match state.catalog_store.get_setting(&key).await {
         Ok(Some(value)) => {
             let display_value = if should_redact(&key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 value
             };
@@ -108,11 +100,12 @@ pub struct SetSettingRequest {
 pub async fn set_setting(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(key): Path<String>,
     Json(body): Json<SetSettingRequest>,
 ) -> Response {
     if let Err(r) =
-        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(&headers, &*state.catalog_store, &*state.catalog_store, addr).await
     {
         return r;
     }
@@ -120,7 +113,7 @@ pub async fn set_setting(
     match ops_settings::set_setting(&*state.catalog_store, &key, &body.value).await {
         Ok(()) => {
             let display_value = if should_redact(&key) {
-                "••••••••".to_owned()
+                MASK.to_owned()
             } else {
                 body.value
             };
