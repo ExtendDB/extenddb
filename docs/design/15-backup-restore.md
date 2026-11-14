@@ -545,7 +545,7 @@ Phase 3, later (v1.x):
 
 - Backups are asynchronous where the current implementation is synchronous; clients that assumed AVAILABLE on return must poll, which is what they do against DynamoDB.
 - Long snapshot transactions on PostgreSQL delay vacuum for the backup duration; MongoDB snapshot windows bound backup duration by server configuration.
-- A new dependency on the AWS S3 SDK (its lock entries pinned to the versions that build on the workspace's 1.88 toolchain, which also holds `crc` at 3.3.0 for the server; the licence notices change when PR 7 links the crate into the server) and an S3 mock in CI.
+- A new dependency on the AWS S3 SDK (its lock entries pinned to the versions that build on the workspace's 1.91.1 toolchain, which also holds `crc` at 3.3.0 for the server; the licence notices change when PR 7 links the crate into the server) and an S3 mock in CI.
 - A restore from an S3 store spools the whole compressed backup to local disk before loading any of it.
 - One core at full utilization for the duration of a backup on compression; `max_concurrent_jobs` and `spawn_blocking` keep it off the request threads but do not make it free on a 2-vCPU host.
 - Two code paths for one release while legacy backups remain readable.

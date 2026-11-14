@@ -212,7 +212,7 @@ pub(crate) fn stopped(left: Option<&std::sync::atomic::AtomicUsize>) -> bool {
         return false;
     };
     // A compare-exchange loop: `fetch_update` is deprecated on current
-    // stable and its replacement does not exist on 1.88.
+    // stable and its replacement is unstable on 1.91.1.
     let mut n = left.load(Ordering::SeqCst);
     loop {
         let Some(next) = n.checked_sub(1) else {
