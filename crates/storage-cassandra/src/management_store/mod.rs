@@ -7,7 +7,7 @@
 //! file under the 500-line limit.
 
 use extenddb_storage::management_store::{
-    AccessKeyCreated, AccountDetail, GroupDetail, OpResult, RoleDetail, UserDetail,
+    AccessKeyCreated, AccountDetail, GroupDetail, OpResult, RoleDetail, StoredDocument, UserDetail,
 };
 use futures::future::BoxFuture;
 
@@ -15,6 +15,7 @@ use super::catalog_store::CassandraCatalogStore;
 
 mod access_keys;
 mod accounts;
+mod dependents;
 mod groups;
 mod policies;
 mod roles;
@@ -356,6 +357,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let policy_name = policy_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.put_policy_impl(
                 &account_id,
                 &principal_type,
@@ -399,6 +401,21 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         })
     }
 
+    fn list_policy_documents(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Vec<(String, StoredDocument)>>> {
+        let account_id = account_id.to_string();
+        let principal_type = principal_type.to_string();
+        let principal_name = principal_name.to_string();
+        Box::pin(async move {
+            self.list_policy_documents_impl(&account_id, &principal_type, &principal_name)
+                .await
+        })
+    }
+
     // ── Permissions boundaries ─────────────────────────────────────
 
     fn set_user_boundary(
@@ -411,6 +428,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let user_name = user_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.set_boundary_impl(&account_id, "user", &user_name, &document)
                 .await
         })
@@ -452,6 +470,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let role_name = role_name.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.set_boundary_impl(&account_id, "role", &role_name, &document)
                 .await
         })
@@ -466,6 +485,21 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let role_name = role_name.to_string();
         Box::pin(async move {
             self.get_boundary_impl(&account_id, "role", &role_name)
+                .await
+        })
+    }
+
+    fn boundary_document(
+        &self,
+        account_id: &str,
+        principal_type: &str,
+        principal_name: &str,
+    ) -> BoxFuture<'_, OpResult<Option<StoredDocument>>> {
+        let account_id = account_id.to_string();
+        let principal_type = principal_type.to_string();
+        let principal_name = principal_name.to_string();
+        Box::pin(async move {
+            self.boundary_document_impl(&account_id, &principal_type, &principal_name)
                 .await
         })
     }
@@ -592,6 +626,7 @@ impl extenddb_storage::management_store::ManagementStore for CassandraCatalogSto
         let session_token = session_token.to_string();
         let document = document.clone();
         Box::pin(async move {
+            self.test_stop()?;
             self.update_session_policy_impl(&session_token, &document)
                 .await
         })

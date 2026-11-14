@@ -217,12 +217,17 @@ pub(super) async fn write_stream_record_in_tx(
         })
         .unwrap_or_default();
 
-    let shards: Vec<(String,)> =
-        sqlx::query_as("SELECT shard_id FROM stream_shards WHERE table_id = ? ORDER BY shard_id")
-            .bind(&key_info.table_id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+    // Only the open shards: they belong to the table's enabled stream. A
+    // disabled stream's shards are closed and take no new records, so a write
+    // that read the table's key info before a disable records nothing.
+    let shards: Vec<(String,)> = sqlx::query_as(
+        "SELECT shard_id FROM stream_shards \
+         WHERE table_id = ? AND ending_sequence_number IS NULL ORDER BY shard_id",
+    )
+    .bind(&key_info.table_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| StorageError::Internal(e.to_string()))?;
     if shards.is_empty() {
         return Ok(()); // Streams not enabled for this table.
     }
@@ -404,11 +409,14 @@ mod stream_clock_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        // The migrations seed no settings, so the row is written, not updated.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0')",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(ACCOUNT)
             .execute(&engine.pool)

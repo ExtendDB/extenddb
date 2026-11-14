@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+"""A catalog this binary migrated, against the last 0.1.x dev image:
+
+    devtools/check-sqlite-older-binary <extenddb binary> <released fixture dump> \\
+        [image] [port]
+
+With DEV_BIN set to a dev-mode build of this binary (features
+sqlite,dev-mode), each catalog the image wrote to is also given to that
+build's serve with no config file, only EXTENDDB__STORAGE__SQLITE__PATH: it
+must refuse with 5 and advise a migrate command without --config that sets
+EXTENDDB__STORAGE__SQLITE__PATH to the database's path, and that command,
+run as printed in a directory whose extenddb.toml names another database,
+must bring the catalog back to Current. The same build's serve, started
+beside an extenddb.toml naming a current catalog with the variable naming
+the changed one, must advise a command with the variable and the config
+file's absolute path, which, run as printed from another directory, brings
+the changed catalog back to Current and leaves the current one unchanged.
+
+Two catalogs: a fresh one from `init`, and the fixture dump upgraded with
+`migrate --yes`. On a copy of each, the image's `serve` (a dev build) runs
+until it is healthy and is stopped; on another copy, the image runs
+`migrate --yes`. For each run the script prints what changed, as a diff of
+devtools/sqlite-dump before and after, and checks what this binary then
+reports: after a run that wrote the catalog, `migrate` and `verify` exit 5
+naming WrittenByOlderRelease, `serve` refuses with 5 within 60 s, and
+`migrate --yes --reconverge` restores Current with the schema it had before.
+The image's `migrate --yes` must exit 0 and change the catalog, so an image
+that cannot run fails the check; after an image `serve` that changed
+nothing, the catalog must still be Current.
+
+The image's container is named "$CONTAINER", by default
+extenddb-older-binary, publishes only on 127.0.0.1:<port>, runs as the
+caller's uid, and is removed at the end, with the temporary directory.
+"""
+import difflib
+import glob
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+from catalog_checks import expect_exit, finish, report, run
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def dump(database: str) -> list[str]:
+    """devtools/sqlite-dump of `database`, one line per object or row."""
+    out = subprocess.run(
+        [sys.executable, os.path.join(HERE, "sqlite-dump"), database],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return out.splitlines()
+
+
+def schema(database: str) -> list[str]:
+    return [line for line in dump(database) if not line.startswith("row ")]
+
+
+def with_path(config: str, database: str, out: str) -> None:
+    """Write `config` to `out` with its `path = ` line naming `database`."""
+    with open(config, encoding="utf-8") as f:
+        text = f.read()
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(re.sub(r"(?m)^path = .*$", f'path = "{database}"', text))
+
+
+def changed_lines(diff: list[str]) -> list[str]:
+    """The removed and added lines of a unified diff, without its headers."""
+    return [line for line in diff if len(line) > 1 and line[0] in "+-" and line[1] not in "+-"]
+
+
+def docker(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker", *args], capture_output=True, text=True, check=False)
+
+
+class Image:
+    """The released dev image, run as the caller on one catalog directory."""
+
+    def __init__(self, image: str, name: str, port: int, init_config: str) -> None:
+        self.image = image
+        self.name = name
+        self.port = port
+        self.init_config = init_config
+        self.user = f"{os.getuid()}:{os.getgid()}"
+
+    def serve(self, directory: str) -> bool:
+        """Run the image's server on `directory` until it is healthy, then
+        stop it; whether it became healthy. Its log goes to image-serve.log."""
+        docker(
+            "run", "-d", "--name", self.name, "--user", self.user,
+            "-p", f"127.0.0.1:{self.port}:18080", "-v", f"{directory}:/var/lib/extenddb", self.image,
+        )
+        up = False
+        for _ in range(120):
+            probe = subprocess.run(
+                ["curl", "-s", f"http://127.0.0.1:{self.port}/health"],
+                capture_output=True, text=True, check=False,
+            )
+            if "healthy" in probe.stdout:
+                up = True
+                break
+            time.sleep(0.5)
+        docker("stop", "-t", "20", self.name)
+        logs = docker("logs", self.name)
+        with open(os.path.join(directory, "image-serve.log"), "w", encoding="utf-8") as f:
+            f.write(logs.stdout + logs.stderr)
+        docker("rm", "-f", self.name)
+        return up
+
+    def migrate(self, directory: str) -> tuple[int, str]:
+        """The image's migrate --yes on `directory`, with init's config
+        pointing at the database's path in the container."""
+        with_path(self.init_config, "/var/lib/extenddb/extenddb.sqlite",
+                  os.path.join(directory, "extenddb.toml"))
+        done = docker(
+            "run", "--rm", "--name", self.name, "--user", self.user,
+            "-v", f"{directory}:/var/lib/extenddb", self.image,
+            "migrate", "--config", "/var/lib/extenddb/extenddb.toml", "--yes",
+        )
+        output = done.stdout + done.stderr
+        with open(os.path.join(directory, "image-migrate.log"), "w", encoding="utf-8") as f:
+            f.write(output)
+        return done.returncode, output
+
+
+def check(label: str, kind: str, source: str, binary: str, image: Image, work: str, port: int) -> None:
+    """The image's `kind` run (serve or migrate) on a copy of `source`, and
+    what this binary reports afterwards."""
+    directory = os.path.join(work, f"{label}-{kind}")
+    os.makedirs(directory)
+    # Fold the WAL into the file, so the copy is the whole catalog.
+    conn = sqlite3.connect(source)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    database = os.path.join(directory, "extenddb.sqlite")
+    shutil.copyfile(source, database)
+    os.chmod(database, 0o600)
+    config = os.path.join(directory, "v1.toml")
+    with_path(image.init_config, database, config)
+    before = dump(database)
+
+    print(f"--- {label} catalog, the image's {kind}", flush=True)
+    if kind == "serve":
+        if image.serve(directory):
+            print("ok   the image served the catalog", flush=True)
+        else:
+            with open(os.path.join(directory, "image-serve.log"), encoding="utf-8") as f:
+                report(False, "the image did not serve the catalog", f.read())
+    else:
+        code, output = image.migrate(directory)
+        print(f"     the image's migrate --yes exited {code}")
+        for line in output.splitlines()[-5:]:
+            print(f"     | {line}")
+        if code != 0:
+            report(False, f"the image's migrate --yes exited {code}, expected 0")
+    after = dump(database)
+    changes = changed_lines(list(difflib.unified_diff(before, after, lineterm="")))
+    if not changes:
+        print("     it changed nothing")
+        if kind == "migrate":
+            report(False, "the image's migrate --yes changed nothing in the catalog")
+        expect_exit(0, "still Current", [binary, "verify", "--config", config])
+        return
+    print("     what it changed:")
+    for line in changes:
+        print(f"     | {line}")
+    output = expect_exit(
+        5, "migrate reports a catalog a release before 1.0 wrote to",
+        [binary, "migrate", "--config", config],
+    )
+    if "a release before 1.0 wrote to this catalog" not in output:
+        report(False, "the preview does not name WrittenByOlderRelease", output)
+    expect_exit(5, "verify reports it", [binary, "verify", "--config", config])
+    dev_bin = os.environ.get("DEV_BIN", "")
+    if dev_bin:
+        dev_server_repair(directory, source, dev_bin, port)
+    expect_exit(
+        5, "serve refuses it",
+        [binary, "serve", "--config", config, "--foreground", "--port", str(port)],
+        timeout=60,
+    )
+    expect_exit(0, "migrate --yes --reconverge", [binary, "migrate", "--config", config, "--yes", "--reconverge"])
+    expect_exit(0, "Current after the reconverge", [binary, "verify", "--config", config])
+    was, now = schema(source), schema(database)
+    if was == now:
+        print("ok   the schema is the one it had before the image ran", flush=True)
+    else:
+        report(
+            False,
+            "the schema differs from the one before the image ran:",
+            "\n".join(difflib.unified_diff(was, now, lineterm="")),
+        )
+
+
+def advised_command(output: str) -> tuple[str, list[str], list[str]]:
+    """The migrate command a refusal advises: the line, its words, and the
+    assignments before `extenddb`."""
+    advised = next(
+        (line for line in output.splitlines() if line.startswith("  ") and " extenddb migrate " in line), ""
+    )
+    words = shlex.split(advised)
+    assignments = [w for w in words[: words.index("extenddb")] if "=" in w] if "extenddb" in words else []
+    return advised, words, assignments
+
+
+def run_as_printed(label: str, dev_bin: str, words: list[str], assignments: list[str], cwd: str) -> None:
+    """Run an advised command as it is printed, in `cwd`, with no variable
+    of the caller's: the command itself names the database it acts on."""
+    command_env = {k: v for k, v in os.environ.items() if k != "EXTENDDB__STORAGE__SQLITE__PATH"}
+    command_env.update(a.split("=", 1) for a in assignments)
+    rest = words[words.index("extenddb") + 1 :]
+    expect_exit(0, label, [dev_bin, *rest], command_env, cwd=cwd)
+
+
+def dev_server_repair(directory: str, source: str, dev_bin: str, port: int) -> None:
+    """A dev build's serve, started with no config file on a copy of the
+    catalog, refuses it; the command it advises, run as it is printed,
+    repairs the copy. Then a dev server started beside an extenddb.toml
+    naming a current catalog, with the variable naming another copy, refuses
+    that copy and advises a command that carries the variable and the config
+    file's absolute path: run as printed from another directory, it repairs
+    the copy and leaves the config file's catalog as it was."""
+    dev = os.path.join(directory, "dev")
+    os.makedirs(dev)
+    database = os.path.join(dev, "extenddb.sqlite")
+    shutil.copyfile(os.path.join(directory, "extenddb.sqlite"), database)
+    os.chmod(database, 0o600)
+    env = dict(os.environ, EXTENDDB__STORAGE__SQLITE__PATH=database)
+    output = expect_exit(
+        5, "a dev server with no config file refuses it",
+        [dev_bin, "serve", "--foreground", "--port", str(port)], env, timeout=60, cwd=dev,
+    )
+    advised, words, assignments = advised_command(output)
+    if not advised:
+        report(False, "the dev server advised no migrate command", output)
+    elif "--config" in advised:
+        report(False, f"the dev server advised a config file it does not have: {advised}")
+    elif assignments != [f"EXTENDDB__STORAGE__SQLITE__PATH={database}"]:
+        report(False, f"the advised command does not name the database: {advised}")
+    else:
+        # In the case's directory, whose extenddb.toml names another database.
+        run_as_printed(f"the advised command, beside another extenddb.toml:{advised}", dev_bin, words,
+                       assignments, directory)
+        expect_exit(0, "Current after the advised command", [dev_bin, "verify"], env, cwd=dev)
+
+    configured = os.path.join(directory, "dev-config")
+    os.makedirs(configured)
+    current = os.path.join(configured, "current.sqlite")
+    shutil.copyfile(source, current)
+    os.chmod(current, 0o600)
+    with_path(os.path.join(directory, "v1.toml"), current, os.path.join(configured, "extenddb.toml"))
+    changed = os.path.join(configured, "changed.sqlite")
+    shutil.copyfile(os.path.join(directory, "extenddb.sqlite"), changed)
+    os.chmod(changed, 0o600)
+    with open(current, "rb") as f:
+        current_bytes = f.read()
+    env = dict(os.environ, EXTENDDB__STORAGE__SQLITE__PATH=changed)
+    output = expect_exit(
+        5, "a dev server whose variable overrides ./extenddb.toml refuses the variable's database",
+        [dev_bin, "serve", "--foreground", "--port", str(port)], env, timeout=60, cwd=configured,
+    )
+    advised, words, assignments = advised_command(output)
+    config = os.path.join(configured, "extenddb.toml")
+    given = words[words.index("--config") + 1] if "--config" in words[:-1] else ""
+    if not advised:
+        report(False, "the dev server advised no migrate command", output)
+    elif assignments != [f"EXTENDDB__STORAGE__SQLITE__PATH={changed}"] or given != config:
+        report(False, f"the advised command does not reproduce the variable and the config file: {advised}")
+    else:
+        run_as_printed(f"the advised command, from another directory:{advised}", dev_bin, words, assignments,
+                       directory)
+        expect_exit(0, "the variable's database is Current after it", [dev_bin, "verify"], env, cwd=configured)
+        with open(current, "rb") as f:
+            same = f.read() == current_bytes
+        report(same, "the config file's database is unchanged")
+
+
+def main(binary: str, fixture: str, image_name: str, port: int) -> int:
+    binary = os.path.realpath(binary)
+    fixture = os.path.realpath(fixture)
+    name = os.environ.get("CONTAINER", "extenddb-older-binary")
+    work = tempfile.mkdtemp()
+    try:
+        init_dir = os.path.join(work, "init")
+        released_dir = os.path.join(work, "released")
+        os.makedirs(init_dir)
+        os.makedirs(released_dir)
+        fresh = os.path.join(init_dir, "fresh.sqlite")
+        code, output = run(
+            [binary, "init", "--backend", "sqlite", "--config", "extenddb.toml", "--sqlite-path", fresh],
+            dict(os.environ, HOME=os.path.join(work, "home")),
+            cwd=init_dir,
+        )
+        if code != 0:
+            report(False, f"exit {code}: init", output)
+            return finish()
+        image = Image(image_name, name, port, os.path.join(init_dir, "extenddb.toml"))
+
+        released = os.path.join(released_dir, "released.sqlite")
+        os.close(os.open(released, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        conn = sqlite3.connect(released)
+        with open(fixture, encoding="utf-8") as f:
+            conn.executescript(f.read())
+        conn.commit()
+        conn.close()
+        config = os.path.join(released_dir, "v1.toml")
+        with_path(image.init_config, released, config)
+        code, output = run([binary, "migrate", "--config", config, "--yes"])
+        if code != 0:
+            report(False, f"exit {code}: migrate --yes the fixture", output)
+            return finish()
+        expect_exit(0, "the released catalog is Current after migrate --yes", [binary, "verify", "--config", config])
+        # The copy migrate --yes took holds the released catalog; it is not
+        # part of what the image is given.
+        for copy in glob.glob(released + ".pre-migration-*"):
+            os.remove(copy)
+        # The fixture's dev access key is encrypted under the key the fixture
+        # replaced, so a dev build cannot read it; remove it, and the image
+        # seeds its own, as it does in a fresh catalog.
+        conn = sqlite3.connect(released)
+        conn.execute("DELETE FROM access_keys WHERE access_key_id = ?", ("AKIAIOSFODNN7EXAMPLE",))
+        conn.commit()
+        conn.close()
+
+        for kind in ("serve", "migrate"):
+            check("fresh", kind, fresh, binary, image, work, port)
+            check("upgraded", kind, released, binary, image, work, port)
+    finally:
+        docker("rm", "-f", name)
+        shutil.rmtree(work, ignore_errors=True)
+    return finish()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) not in (3, 4, 5):
+        sys.exit(__doc__)
+    sys.exit(
+        main(
+            sys.argv[1],
+            sys.argv[2],
+            sys.argv[3] if len(sys.argv) > 3 else "extenddb/extenddb-dev:0.1.14",
+            int(sys.argv[4]) if len(sys.argv) > 4 else 18451,
+        )
+    )
