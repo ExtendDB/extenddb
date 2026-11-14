@@ -25,8 +25,8 @@ const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// `DELETING` row there; once the test's account keyspace is dropped, the
 /// control-plane sweep that next reaches the row fails on the missing
 /// keyspace, inside whichever test ran it. Each row goes by its table id,
-/// with the condition `DeleteTable` uses, together with its index rows, its
-/// tags and the account's continuous-backup rows.
+/// with the condition `DeleteTable` uses, together with its index rows and
+/// its tags.
 pub(crate) async fn removing_rows_after<F>(engine: &CassandraEngine, account_id: &str, body: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -87,13 +87,6 @@ async fn remove_account_rows(engine: &CassandraEngine, account_id: &str) {
         )
         .await;
     }
-    let _ = engine
-        .session()
-        .query_with_values(
-            &format!("DELETE FROM {catalog}.continuous_backups WHERE account_id = ?"),
-            cdrs_tokio::query_values!(account_id),
-        )
-        .await;
 }
 
 /// Activates a `CREATING` row as the activation sweep does, scoped to this
@@ -323,31 +316,6 @@ pub(crate) async fn row_column(
         .unwrap_or_default();
     rows.first()
         .map(|row| row.get_r_by_name(column).expect("column"))
-}
-
-/// The PITR flag the `continuous_backups` row stores for the name, or `None`
-/// when there is no row.
-pub(crate) async fn pitr_row(
-    engine: &CassandraEngine,
-    account_id: &str,
-    name: &str,
-) -> Option<bool> {
-    use cdrs_tokio::types::IntoRustByName;
-    let query = format!(
-        "SELECT pitr_enabled FROM {}.continuous_backups WHERE account_id = ? AND table_name = ?",
-        engine.catalog_keyspace()
-    );
-    let rows = engine
-        .session()
-        .query_with_values(&query, cdrs_tokio::query_values!(account_id, name))
-        .await
-        .expect("read continuous_backups")
-        .response_body()
-        .expect("response body")
-        .into_rows()
-        .unwrap_or_default();
-    rows.first()
-        .map(|row| row.get_r_by_name("pitr_enabled").expect("pitr_enabled"))
 }
 
 /// How many rows a catalog query returns.

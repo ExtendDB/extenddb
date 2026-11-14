@@ -6,11 +6,11 @@
 //! A `DeleteTable` claims the catalog row as `DELETING` with a deadline five
 //! minutes ahead. The control-plane sweep takes a row whose deadline has
 //! passed with a compare-and-set on that deadline, and the actor that holds
-//! the row renews it with the same swap before the two deletes keyed on the
-//! name (the `continuous_backups` row and the tags), which run last, then
-//! deletes the row on its table id. These tests put a second actor beside the
-//! one that holds the row, and a table created into the name in between, and
-//! check that the newer table keeps its catalog row, its PITR row and its tags.
+//! the row renews it with the same swap before the delete keyed on the name
+//! (the tags), which runs last, then deletes the row on its table id. These
+//! tests put a second actor beside the one that holds the row, and a table
+//! created into the name in between, and check that the newer table keeps its
+//! catalog row and its tags.
 //!
 //! Rows with a deadline in the past are visible to every sweep in this binary,
 //! so the tests wait on the state they expect rather than on the sweep they
@@ -19,16 +19,14 @@
 
 use std::time::Duration;
 
-use extenddb_core::types::{AttributeValue, Tag};
-use extenddb_storage::{
-    BackupEngine, DataEngine, MetadataEngine, RestoreRequest, RestoreTableOverrides, TableEngine,
-};
+use extenddb_core::types::Tag;
+use extenddb_storage::{MetadataEngine, TableEngine};
 use extenddb_storage_cassandra::CassandraEngine;
 
 use crate::delete_table_support::{
     activate, catalog_rows, create_input, create_one, data_table_exists, delete_input, gsi_input,
-    move_deadline_into_the_past, pitr_row, removing_rows_after, row_deadline_ms, row_status,
-    row_table_id, tags_of, wait_for_data_table_gone, wait_for_row_gone, wait_for_status,
+    move_deadline_into_the_past, removing_rows_after, row_deadline_ms, row_status, row_table_id,
+    tags_of, wait_for_data_table_gone, wait_for_row_gone, wait_for_status,
 };
 use crate::helpers::{TestAccount, setup_engine, test_config};
 
@@ -36,7 +34,7 @@ use crate::helpers::{TestAccount, setup_engine, test_config};
 /// started 300 ms apart. The first sweep takes the row by moving its deadline,
 /// so the second one's select no longer returns it, and the first holds the
 /// row until it has deleted it. A table created into the name once the row is
-/// gone keeps its catalog row, its PITR row and its data table.
+/// gone keeps its catalog row, its tag and its data table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_sweeps_over_a_stopped_claim_leave_a_newer_table_alone() {
     if crate::helpers::skip_without_cassandra() {
@@ -55,10 +53,6 @@ async fn two_sweeps_over_a_stopped_claim_leave_a_newer_table_alone() {
                 .await
                 .expect("create the first table");
             activate(&engine, &id, name).await;
-            engine
-                .update_continuous_backups(&id, name, true)
-                .await
-                .expect("enable PITR");
             assert!(
                 engine
                     .claim_table_for_delete(&id, name, &first.table_id)
@@ -78,10 +72,7 @@ async fn two_sweeps_over_a_stopped_claim_leave_a_newer_table_alone() {
 
             wait_for_row_gone(&engine, &id, name).await;
             let second = create_one(&engine, &id, name).await;
-            engine
-                .update_continuous_backups(&id, name, true)
-                .await
-                .expect("enable PITR on the new table");
+            tag_second(&engine, &second.table_arn).await;
             sweep_a.await.expect("task").expect("first sweep");
             sweep_b.await.expect("task").expect("second sweep");
 
@@ -91,9 +82,9 @@ async fn two_sweeps_over_a_stopped_claim_leave_a_newer_table_alone() {
                 "the new table keeps its catalog row"
             );
             assert_eq!(
-                pitr_row(&engine, &id, name).await,
-                Some(true),
-                "the new table keeps its PITR row"
+                tags_of(&engine, &second.table_arn).await,
+                second_tag(),
+                "the new table keeps its tag"
             );
             assert!(data_table_exists(&engine, &id, &second.table_id).await);
             assert!(!data_table_exists(&engine, &id, &first.table_id).await);
@@ -110,8 +101,8 @@ async fn two_sweeps_over_a_stopped_claim_leave_a_newer_table_alone() {
 /// the row is removed and the name created again (here the row delete is run
 /// by hand, the last statement of whichever actor finished first). The sweep's
 /// renewal then finds the row holding another table id, so it stops before the
-/// deletes keyed on the name and the row delete, and does not report the
-/// table as removed.
+/// delete keyed on the name and the row delete, and does not report the
+/// table as removed; the newer table keeps its catalog row and its tag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sweep_whose_row_was_replaced_leaves_the_newer_table_alone() {
     if crate::helpers::skip_without_cassandra() {
@@ -129,10 +120,6 @@ async fn a_sweep_whose_row_was_replaced_leaves_the_newer_table_alone() {
                 .await
                 .expect("create the first table");
             activate(&engine, &id, name).await;
-            engine
-                .update_continuous_backups(&id, name, true)
-                .await
-                .expect("enable PITR");
             assert!(
                 engine
                     .claim_table_for_delete(&id, name, &first.table_id)
@@ -179,10 +166,7 @@ async fn a_sweep_whose_row_was_replaced_leaves_the_newer_table_alone() {
             .await
             .expect("remove the row");
             let second = create_one(&engine, &id, name).await;
-            engine
-                .update_continuous_backups(&id, name, true)
-                .await
-                .expect("enable PITR on the new table");
+            tag_second(&engine, &second.table_arn).await;
 
             let swept = sweep.await.expect("task").expect("the sweep");
             assert_eq!(
@@ -191,9 +175,9 @@ async fn a_sweep_whose_row_was_replaced_leaves_the_newer_table_alone() {
                 "the new table keeps its catalog row"
             );
             assert_eq!(
-                pitr_row(&engine, &id, name).await,
-                Some(true),
-                "the new table keeps its PITR row"
+                tags_of(&engine, &second.table_arn).await,
+                second_tag(),
+                "the new table keeps its tag"
             );
             assert!(data_table_exists(&engine, &id, &second.table_id).await);
             assert!(
@@ -217,117 +201,36 @@ async fn row_deadline_ahead(engine: &CassandraEngine, id: &str, name: &str) -> b
         .is_some_and(|deadline| deadline > chrono::Utc::now().timestamp_millis() + 240_000)
 }
 
-/// A restored table keeps its restore registration columns after activation,
-/// and its heartbeat stops there. A `DeleteTable` claim on it makes a
-/// `DELETING` row with a registration and a stale heartbeat, the row the
-/// abandoned-restore sweep removes. The sweep skips it because the claim
-/// wrote a deadline, so the claim stays with its call. The heartbeat is moved
-/// two minutes back, the state the row reaches two minutes after the restore,
-/// and the sweep runs with the production threshold of 60 s, so the test
-/// reaches no other test's restore.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_restore_sweep_leaves_a_claimed_restored_table_to_its_delete() {
-    if crate::helpers::skip_without_cassandra() {
-        return;
-    }
-    let engine = setup_engine().await;
-    let account = TestAccount::new(&engine, &test_config().keyspace_prefix).await;
-    let id = account.account_id.clone();
-    let test = {
-        let (engine, id) = (engine.clone(), id.clone());
-        async move {
-            create_one(&engine, &id, "RestoreSource").await;
-            activate(&engine, &id, "RestoreSource").await;
-            let key_info = engine
-                .table_key_info(&id, "RestoreSource")
-                .await
-                .expect("key info");
-            let item = [("pk".to_owned(), AttributeValue::S("k0".to_owned()))].into();
-            engine
-                .put_item(&key_info, item, false, None, &Default::default(), None)
-                .await
-                .expect("put an item");
-            let backup = engine
-                .create_backup(&id, "RestoreSource", "lease")
-                .await
-                .expect("create a backup");
-            let source = engine
-                .backup_restore_source(&id, &backup.backup_arn)
-                .await
-                .expect("restore source");
-            let input = source.restore_input("Restored", &RestoreTableOverrides::default());
-            let restored = engine
-                .restore_table_from_backup(
-                    &id,
-                    RestoreRequest {
-                        backup_arn: backup.backup_arn.clone(),
-                        source_table_arn: source.source_table_arn.clone(),
-                        restore_date_time: source.backup_creation_date_time,
-                        input,
-                    },
-                )
-                .await
-                .expect("restore");
-            wait_for_status(&engine, &id, "Restored", "ACTIVE").await;
+/// The tag of the table created into a deleted table's name. The tags are the
+/// one delete keyed on the name rather than the table id, so a stale actor
+/// that runs its name-keyed delete after this table exists takes them away.
+const SECOND_TAG: (&str, &str) = ("owner", "second");
 
-            let stale = extenddb_storage_cassandra::cassandra_util::now_millis() - 120_000;
-            let age_heartbeat = format!(
-                "UPDATE {}.tables SET restore_heartbeat = ? WHERE account_id = ? \
-                 AND table_name = ? IF table_id = ? AND table_status = 'ACTIVE'",
-                engine.catalog_keyspace()
-            );
-            let result = extenddb_storage_cassandra::cassandra_util::query_lwt(
-                engine.session(),
-                &age_heartbeat,
-                cdrs_tokio::query_values!(
-                    stale,
-                    id.as_str(),
-                    "Restored",
-                    restored.table_id.as_str()
-                ),
-            )
-            .await
-            .expect("age the heartbeat");
-            assert!(
-                extenddb_storage_cassandra::cassandra_util::lwt_applied(&result)
-                    .expect("read the answer"),
-                "the restored table is ACTIVE"
-            );
-            assert!(
-                engine
-                    .claim_table_for_delete(&id, "Restored", &restored.table_id)
-                    .await
-                    .expect("claim"),
-                "the claim applies"
-            );
+async fn tag_second(engine: &CassandraEngine, arn: &str) {
+    engine
+        .tag_resource(
+            arn,
+            &[Tag {
+                key: SECOND_TAG.0.to_owned(),
+                value: SECOND_TAG.1.to_owned(),
+            }],
+        )
+        .await
+        .expect("tag the new table");
+}
 
-            let removed = engine
-                .sweep_abandoned_restores(Duration::from_secs(60))
-                .await
-                .expect("restore sweep");
-            assert!(
-                !removed.iter().any(|table| table == "Restored"),
-                "the restore sweep left the claimed table alone: {removed:?}"
-            );
-            assert_eq!(
-                row_status(&engine, &id, "Restored").await.as_deref(),
-                Some("DELETING")
-            );
-            assert!(data_table_exists(&engine, &id, &restored.table_id).await);
-        }
-    };
-    removing_rows_after(&engine, &id, test).await;
+/// [`SECOND_TAG`] as [`tags_of`] reads it back.
+fn second_tag() -> Vec<(String, String)> {
+    vec![(SECOND_TAG.0.to_owned(), SECOND_TAG.1.to_owned())]
 }
 
 /// A `DeleteTable` of a table with eight indexes, and, once its base data
-/// table is gone and while it drops the index tables, an
-/// `UpdateContinuousBackups` (the storage call the engine makes; nothing
-/// refuses it during `DELETING`, as the service serves it) and a tag written
-/// at the storage layer, below the engine's validation. The deletes keyed on
-/// the name run after the drops, so both rows go with the table, and a table
-/// created into the name afterwards has no PITR row and no tags.
+/// table is gone and while it drops the index tables, a tag written at the
+/// storage layer, below the engine's validation. The delete keyed on the name
+/// runs after the drops, so the row goes with the table, and a table created
+/// into the name afterwards has no tags.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pitr_and_tags_written_during_the_drops_go_with_the_table() {
+async fn a_tag_written_during_the_drops_goes_with_the_table() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
@@ -350,10 +253,6 @@ async fn pitr_and_tags_written_during_the_drops_go_with_the_table() {
             wait_for_status(&engine, &id, name, "DELETING").await;
             wait_for_data_table_gone(&engine, &id, &first.table_id).await;
             engine
-                .update_continuous_backups(&id, name, true)
-                .await
-                .expect("UpdateContinuousBackups is served during DELETING");
-            engine
                 .tag_resource(
                     &first.table_arn,
                     &[Tag {
@@ -369,11 +268,6 @@ async fn pitr_and_tags_written_during_the_drops_go_with_the_table() {
                 .create_table(&id, create_input(name))
                 .await
                 .expect("create the name again");
-            assert_eq!(
-                pitr_row(&engine, &id, name).await,
-                None,
-                "the new table has no PITR row"
-            );
             assert_eq!(
                 tags_of(&engine, &second.table_arn).await,
                 Vec::<(String, String)>::new(),
@@ -448,13 +342,13 @@ async fn a_row_the_sweep_cannot_remove_does_not_stop_the_others() {
     removing_rows_after(&engine, &broken.account_id, test).await;
 }
 
-/// The order of a `DeleteTable`: the deletes keyed on the name run after the
-/// drops. Eight rounds, each a tagged, PITR-enabled table with one index;
-/// while the call runs, the moment its base data table is gone the table's
-/// tag rows and its continuous-backup row are still there (the index table is
-/// dropped between the two), and once the call returns both are gone.
+/// The order of a `DeleteTable`: the delete keyed on the name runs after the
+/// drops. Eight rounds, each a tagged table with one index; while the call
+/// runs, the moment its base data table is gone the table's tag row is still
+/// there (the index table is dropped between the two), and once the call
+/// returns it is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_name_keyed_rows_outlive_the_drops_and_go_with_the_row() {
+async fn the_tag_rows_outlive_the_drops_and_go_with_the_row() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
@@ -481,30 +375,19 @@ async fn the_name_keyed_rows_outlive_the_drops_and_go_with_the_row() {
                     )
                     .await
                     .expect("tag the table");
-                engine
-                    .update_continuous_backups(&id, &name, true)
-                    .await
-                    .expect("enable PITR");
                 let call = {
                     let (engine, id, name) = (engine.clone(), id.clone(), name.clone());
                     tokio::spawn(async move { engine.delete_table(&id, delete_input(&name)).await })
                 };
                 wait_for_data_table_gone(&engine, &id, &table.table_id).await;
-                let during = (
-                    tag_rows(&engine, &table.table_arn).await,
-                    pitr_row(&engine, &id, &name).await,
-                );
+                let during = tag_rows(&engine, &table.table_arn).await;
                 call.await.expect("task").expect("DeleteTable");
-                let after = (
-                    tag_rows(&engine, &table.table_arn).await,
-                    pitr_row(&engine, &id, &name).await,
-                );
+                let after = tag_rows(&engine, &table.table_arn).await;
                 assert_eq!(
-                    during,
-                    (1, Some(true)),
-                    "round {round}: the tag and PITR rows are there once the data table is gone"
+                    during, 1,
+                    "round {round}: the tag row is there once the data table is gone"
                 );
-                assert_eq!(after, (0, None), "round {round}: both go with the table");
+                assert_eq!(after, 0, "round {round}: it goes with the table");
             }
         }
     };

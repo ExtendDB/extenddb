@@ -29,12 +29,12 @@ use std::time::Duration;
 
 use extenddb_core::types::{TableStatus, Tag};
 use extenddb_storage::error::StorageError;
-use extenddb_storage::{BackupEngine, MetadataEngine, TableEngine};
+use extenddb_storage::{MetadataEngine, TableEngine};
 
 use crate::delete_table_support::{
     activate, catalog_rows, create_input, create_one, data_table_exists, delete_input,
-    move_deadline_into_the_past, pitr_row, removing_rows_after, row_deadline_ms, row_status,
-    row_table_id, wait_for_row_gone,
+    move_deadline_into_the_past, removing_rows_after, row_deadline_ms, row_status, row_table_id,
+    wait_for_row_gone,
 };
 use crate::helpers::{TestAccount, setup_engine, test_config};
 
@@ -112,20 +112,13 @@ async fn two_concurrent_delete_tables_have_one_winner() {
     removing_rows_after(&engine, &id, test).await;
 }
 
-/// The second half of #553. The deleted table's continuous-backup row is keyed
-/// on the table name and its tags on the table ARN, and a table created into
-/// the same name holds both under the same keys. Here a `CreateTable` takes the
-/// name back as soon as the winner releases it and tags the new table at once,
-/// while a second `DeleteTable` is still in flight; the new table keeps its
-/// tags and its PITR row, because the second call is refused at the claim and
-/// runs none of the deletes.
-///
-/// The PITR flag is read from the stored row as well as through
-/// `describe_continuous_backups`, whose `continuous_backups_status` is the
-/// constant `ENABLED`. The new table enables PITR on even rounds, which a
-/// missing row fails, and leaves it off on odd rounds, which a row inherited
-/// from the first table fails; its tags must not include the first table's
-/// `first-only` key.
+/// The second half of #553. The deleted table's tags are keyed on the table
+/// ARN, and a table created into the same name holds its tags under the same
+/// key. Here a `CreateTable` takes the name back as soon as the winner releases
+/// it and tags the new table at once, while a second `DeleteTable` is still in
+/// flight; the new table keeps its tags, because the second call is refused at
+/// the claim and runs none of the deletes. Its tags must not include the first
+/// table's `first-only` key.
 ///
 /// The second call is started a little behind the first so that it meets a
 /// delete already under way; under the create loop's load either of the two
@@ -134,7 +127,7 @@ async fn two_concurrent_delete_tables_have_one_winner() {
 /// meets the claim and `TableNotFound` when the other one had already
 /// finished, and both mean it ran no deletes of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_table_created_during_a_delete_keeps_its_tags_and_pitr_row() {
+async fn a_table_created_during_a_delete_keeps_its_tags() {
     if crate::helpers::skip_without_cassandra() {
         return;
     }
@@ -153,7 +146,7 @@ async fn a_table_created_during_a_delete_keeps_its_tags_and_pitr_row() {
     removing_rows_after(&engine, &id, test).await;
 }
 
-/// One round of `a_table_created_during_a_delete_keeps_its_tags_and_pitr_row`.
+/// One round of `a_table_created_during_a_delete_keeps_its_tags`.
 async fn recreate_during_a_delete(
     shared: &Arc<extenddb_storage_cassandra::CassandraEngine>,
     account_id: &str,
@@ -179,10 +172,6 @@ async fn recreate_during_a_delete(
         )
         .await
         .expect("tag the first table");
-    engine
-        .update_continuous_backups(account_id, &name, true)
-        .await
-        .expect("enable PITR on the first table");
 
     let deletes: Vec<_> = (0..2)
         .map(|index| {
@@ -200,8 +189,8 @@ async fn recreate_during_a_delete(
         })
         .collect();
     // Takes the name back the moment the winner releases it, and writes the
-    // new table's tags and PITR row while the second call may still be
-    // running. A delete that is not fenced takes both away from here.
+    // new table's tags while the second call may still be running. A delete
+    // that is not fenced takes them away from here.
     let creator = {
         let engine = Arc::clone(shared);
         let account_id = account_id.to_owned();
@@ -220,12 +209,6 @@ async fn recreate_during_a_delete(
                             )
                             .await
                             .expect("tag the new table");
-                        if round.is_multiple_of(2) {
-                            engine
-                                .update_continuous_backups(&account_id, &name, true)
-                                .await
-                                .expect("enable PITR on the new table");
-                        }
                         return Some(description);
                     }
                     Err(StorageError::TableAlreadyExists(_)) => {
@@ -273,27 +256,6 @@ async fn recreate_during_a_delete(
         vec![("owner", "second")],
         "round {round}: the new table keeps its tags"
     );
-    let backups = engine
-        .describe_continuous_backups(account_id, &name)
-        .await
-        .expect("read the new table's continuous backups");
-    let pitr_status = backups
-        .point_in_time_recovery_description
-        .map(|pitr| pitr.point_in_time_recovery_status);
-    let stored = pitr_row(engine, account_id, &name).await;
-    if round.is_multiple_of(2) {
-        assert_eq!(
-            (pitr_status.as_deref(), stored),
-            (Some("ENABLED"), Some(true)),
-            "round {round}: the new table keeps its PITR row"
-        );
-    } else {
-        assert_eq!(
-            (pitr_status.as_deref(), stored),
-            (Some("DISABLED"), None),
-            "round {round}: the new table inherits no PITR row"
-        );
-    }
     assert_eq!(
         row_table_id(engine, account_id, &name).await.as_deref(),
         Some(recreated.table_id.as_str()),
@@ -407,10 +369,10 @@ async fn a_renewal_against_a_stale_deadline_does_not_apply() {
 /// statement after the claim fails, leaves the row `DELETING` with the claim's
 /// deadline ahead of it. Until that deadline the control-plane sweep leaves the
 /// row alone, so it does not run the removal beside a call that is still
-/// dropping; once it has passed, the sweep removes the row, the data table, the
-/// tags and the continuous-backup row, and the name can be created again. The
-/// test claims the row and stops there, moves the deadline into the past rather
-/// than waiting five minutes, and runs the sweep itself.
+/// dropping; once it has passed, the sweep removes the row, the data table and
+/// the tags, and the name can be created again. The test claims the row and
+/// stops there, moves the deadline into the past rather than waiting five
+/// minutes, and runs the sweep itself.
 #[tokio::test]
 async fn a_claim_left_by_a_stopped_call_is_swept_after_its_deadline() {
     if crate::helpers::skip_without_cassandra() {
@@ -441,10 +403,6 @@ async fn claim_then_sweep(engine: &extenddb_storage_cassandra::CassandraEngine, 
         )
         .await
         .expect("tag the table");
-    engine
-        .update_continuous_backups(account_id, name, true)
-        .await
-        .expect("enable PITR");
 
     let claimed_at_ms = chrono::Utc::now().timestamp_millis();
     assert!(
@@ -510,19 +468,6 @@ async fn claim_then_sweep(engine: &extenddb_storage_cassandra::CassandraEngine, 
         .await,
         0,
         "the tags are gone"
-    );
-    assert_eq!(
-        catalog_rows(
-            engine,
-            &format!(
-                "SELECT table_name FROM {catalog}.continuous_backups \
-                 WHERE account_id = ? AND table_name = ?"
-            ),
-            cdrs_tokio::query_values!(account_id, name),
-        )
-        .await,
-        0,
-        "the continuous-backup row is gone"
     );
 
     let again = create_one(engine, account_id, name).await;
