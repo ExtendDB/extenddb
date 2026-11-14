@@ -254,6 +254,7 @@ async fn console(identity: CallerIdentity) -> (Arc<ConsoleState>, Arc<CountingSt
         docs_store: None,
         auth_cache: extenddb_auth::AuthCacheRegistry::empty(),
         metrics: Arc::new(MetricsCollector::new()),
+        max_policy_document_bytes: extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
         secure_cookies: false,
     });
     let stamp = CredentialStamp::of(&session_hash());

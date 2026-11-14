@@ -21,6 +21,7 @@ use super::{
 };
 use extenddb_auth::policy::context::AssumeRoleContext;
 use extenddb_auth::policy::document::PolicyDocument;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
@@ -312,7 +313,10 @@ fn assume_role_accepts_a_session_policy_whose_sid_a_policy_write_refuses() {
     // check, so it keeps issuing it.
     let mut sp = read_session_policy();
     sp["Statement"][0]["Sid"] = json!("Read-Only");
-    assert!(PolicyDocument::from_json_for_write(&sp.to_string()).is_err());
+    assert!(
+        PolicyDocument::from_json_for_write(&sp.to_string(), DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+            .is_err()
+    );
     assert!(PolicyDocument::from_json(&sp.to_string()).is_ok());
     assert_eq!(check_session_policy(&sp), Ok(()));
 }
@@ -321,7 +325,10 @@ fn assume_role_accepts_a_session_policy_whose_sid_a_policy_write_refuses() {
 fn assume_role_accepts_a_session_policy_whose_version_a_policy_write_refuses() {
     let mut sp = read_session_policy();
     sp["Version"] = json!("2020-01-01");
-    assert!(PolicyDocument::from_json_for_write(&sp.to_string()).is_err());
+    assert!(
+        PolicyDocument::from_json_for_write(&sp.to_string(), DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
+            .is_err()
+    );
     assert!(PolicyDocument::from_json(&sp.to_string()).is_ok());
     assert_eq!(check_session_policy(&sp), Ok(()));
 }

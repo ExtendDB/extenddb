@@ -6,6 +6,7 @@ use serde_json::json;
 use super::*;
 use crate::policy::document::{PolicyDocument, parse_conditions};
 use crate::policy::variables::arn_value_lacks_fields;
+use extenddb_core::limits::DEFAULT_MAX_POLICY_DOCUMENT_BYTES;
 
 /// Accepted by `CreatePolicy` (twice under each of `ArnEquals`, `ArnNotEquals`,
 /// `ArnLike`, `ArnNotLike`, `ForAnyValue:ArnLike`, `ArnNotLikeIfExists`) or
@@ -302,7 +303,7 @@ fn the_write_check_rejects_a_bad_value_under_every_operator_form_and_effect() {
     ] {
         for effect in ["Allow", "Deny"] {
             let doc = identity_doc(effect, op, &json!(""));
-            let err = PolicyDocument::from_json_for_write(&doc)
+            let err = PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
                 .expect_err("empty value must not be written");
             assert_eq!(
                 err.0,
@@ -319,7 +320,7 @@ fn the_write_check_rejects_a_bad_value_under_every_operator_form_and_effect() {
 fn the_write_check_rejects_a_list_holding_one_bad_value() {
     let value = json!(["arn:aws:iam::123456789012:user/alice", "foo:*"]);
     let doc = identity_doc("Allow", "ArnNotEquals", &value);
-    let err = PolicyDocument::from_json_for_write(&doc)
+    let err = PolicyDocument::from_json_for_write(&doc, DEFAULT_MAX_POLICY_DOCUMENT_BYTES)
         .expect_err("list with a bad value must not be written");
     assert!(err.0.contains("\"foo:*\""), "{err}");
     assert!(PolicyDocument::from_json(&doc).is_ok());
@@ -376,8 +377,11 @@ fn a_short_pattern_with_a_wildcard_first_field_is_refused_at_write() {
     for v in UNMEASURED_SHORT {
         assert!(is_valid_identity_arn_value(v), "the service accepts {v:?}");
         assert!(is_unmeasured_short_pattern(v), "{v:?}");
-        let err = PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
-            .expect_err("refused at write");
+        let err = PolicyDocument::from_json_for_write(
+            &identity_doc("Deny", "ArnLike", &json!(v)),
+            DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
+        )
+        .expect_err("refused at write");
         assert_eq!(
             err.0,
             format!(
@@ -391,8 +395,11 @@ fn a_short_pattern_with_a_wildcard_first_field_is_refused_at_write() {
     for v in ["*:*", "*", "a*", "*:*:*:*:*:*", "arn:*"] {
         assert!(!is_unmeasured_short_pattern(v), "{v:?}");
         assert!(
-            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
-                .is_ok(),
+            PolicyDocument::from_json_for_write(
+                &identity_doc("Deny", "ArnLike", &json!(v)),
+                DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
+            )
+            .is_ok(),
             "{v:?}"
         );
     }
@@ -415,8 +422,11 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         }
         // Each is one the write check refuses.
         assert!(
-            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
-                .is_err(),
+            PolicyDocument::from_json_for_write(
+                &identity_doc("Deny", "ArnLike", &json!(v)),
+                DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
+            )
+            .is_err(),
             "{v:?}"
         );
     }
@@ -434,8 +444,11 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
         assert!(fails_closed_at_evaluation(v, true), "{v:?}");
         assert!(!fails_closed_at_evaluation(v, false), "{v:?}");
         assert!(
-            PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &json!(v)))
-                .is_err(),
+            PolicyDocument::from_json_for_write(
+                &identity_doc("Deny", "ArnLike", &json!(v)),
+                DEFAULT_MAX_POLICY_DOCUMENT_BYTES,
+            )
+            .is_err(),
             "{v:?}"
         );
     }
@@ -463,7 +476,13 @@ fn only_values_with_no_meaning_or_no_measurement_fail_closed() {
 fn from_json_accepts_values_the_service_accepts() {
     let value = json!(["*", "arn:aws:iam:*", "arn:aws:iam::123456789012:user/alice"]);
     assert!(PolicyDocument::from_json(&identity_doc("Allow", "ArnNotEquals", &value)).is_ok());
-    assert!(PolicyDocument::from_json_for_write(&identity_doc("Deny", "ArnLike", &value)).is_ok());
+    assert!(
+        PolicyDocument::from_json_for_write(
+            &identity_doc("Deny", "ArnLike", &value),
+            DEFAULT_MAX_POLICY_DOCUMENT_BYTES
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -504,7 +523,9 @@ fn the_session_policy_check_runs_the_arn_check_and_not_the_version_or_sid_check(
         .to_string()
     };
     let other = doc("2020-01-01", "Read-Only", "arn:aws:iam:*");
-    assert!(PolicyDocument::from_json_for_write(&other).is_err());
+    assert!(
+        PolicyDocument::from_json_for_write(&other, DEFAULT_MAX_POLICY_DOCUMENT_BYTES).is_err()
+    );
     assert!(PolicyDocument::from_json_for_session_policy(&other).is_ok());
     let err = PolicyDocument::from_json_for_session_policy(&doc("2012-10-17", "", ""))
         .expect_err("an empty Arn value is refused");
