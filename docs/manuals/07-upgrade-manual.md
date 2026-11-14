@@ -404,11 +404,6 @@ in the data database. Apply it with the usual sequence: stop the servers,
 queued rows on a development host the build is a pause of that length inside the
 maintenance window, and `CREATE INDEX IF NOT EXISTS` makes a repeated run harmless.
 
-**If the migrate step is skipped.** A server of this release refuses a
-deployment where migration 13 is pending, as for every pending migration, and
-prints the `extenddb migrate --yes` command that applies it (see
-[The Catalog Status](#the-catalog-status)).
-
 ---
 
 ### v0.1.15: a deleted principal or account leaves nothing behind
