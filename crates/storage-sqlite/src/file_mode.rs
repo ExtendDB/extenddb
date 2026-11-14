@@ -10,13 +10,14 @@
 //! unix VFS creates a database file with mode 0644 less the umask, and creates
 //! each sidecar with the mode of the database file. So every pool on a file
 //! database is opened through [`connect`], which calls [`prepare`] before the
-//! pool's first connection and [`restrict`] after it. The migration runner
-//! opens its own connection, and calls both around it when it opens the
-//! database for writing; its read-only connection for the catalog status
-//! changes no mode. `prepare` creates the database file with mode 0600
-//! (or narrows an existing one to 0600) before the connection can create a
-//! sidecar from it; `restrict` narrows the file and every sidecar present to
-//! 0600 whoever created them.
+//! pool's first connection and [`restrict`] after it. The engine pool
+//! (`store.rs`) connects with its own connection options, and calls both
+//! around that connect. The migration runner opens its own connection, and
+//! calls both around it when it opens the database for writing; its read-only
+//! connection for the catalog status changes no mode. `prepare` creates the
+//! database file with mode 0600 (or narrows an existing one to 0600) before
+//! the connection can create a sidecar from it; `restrict` narrows the file
+//! and every sidecar present to 0600 whoever created them.
 //!
 //! Only a regular file with a permission bit outside 0600 is changed, and it is
 //! set to 0600. Anything else at one of those names is left alone: a symlink
