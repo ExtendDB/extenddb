@@ -11,6 +11,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
 use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_name};
+use crate::catalog_json::from_catalog_json;
 
 /// Column type for every text key column (`pk`, `sk_s`, `base_pk`,
 /// `base_sk_s`, and their numbered variants).
@@ -397,10 +398,8 @@ impl PostgresEngine {
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
         }
 
-        let key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attribute_definitions: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let attribute_definitions: Vec<AttributeDefinition> = from_catalog_json(ad_json)?;
 
         let stream_specification: Option<StreamSpecification> = stream_spec_json
             .map(serde_json::from_value)
@@ -497,10 +496,8 @@ impl PostgresEngine {
                     )));
                 }
             };
-            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let projection: Projection = serde_json::from_value(proj_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+            let projection: Projection = from_catalog_json(proj_json)?;
             let info = IndexInfo {
                 index_name,
                 index_id,
@@ -593,10 +590,8 @@ impl PostgresEngine {
             }
         };
 
-        let key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let projection: Projection =
-            serde_json::from_value(proj_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let projection: Projection = from_catalog_json(proj_json)?;
 
         Ok(IndexInfo {
             index_name: index_name.to_owned(),

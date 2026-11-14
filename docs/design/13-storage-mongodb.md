@@ -373,7 +373,9 @@ Simple collation is used whenever the tuple contains a string component.
 }
 ```
 
-Unique index on `shard_id`. Four shards per stream-enabled table.
+Unique index on `shard_id`, and an index on `(table_id, shard_id)`, by which
+every streamed write and every stream read finds a table's shards in shard id
+order. Four shards per stream-enabled table.
 
 `shard_id` embeds `table_id` (a UUID) rather than `table_name`. Table
 names are only unique per-account; a name-derived scheme would let one
@@ -732,17 +734,29 @@ second-precision form.
 ### 5.6 Write conflict handling
 
 **Transient-conflict detection.** `is_transient_write_conflict` returns
-true for any of: the `TransientTransactionError` label, the
-`UnknownTransactionCommitResult` label, or a raw `WriteConflict` (code
-112). Under snapshot isolation these all mean "your write lost to a
-concurrent writer; retry the whole transaction."
+true for the `TransientTransactionError` label or a raw `WriteConflict`
+(code 112). Under snapshot isolation both mean nothing was applied and the
+transaction may be re-run; a conflict with a concurrent writer is the
+usual cause. It does not match the `UnknownTransactionCommitResult` label:
+under that label the commit may already have applied, so the body is never
+re-run, and `classify_commit_error` retries `commitTransaction` in place,
+which is idempotent.
 
 **Retry loop.** Session-scoped writes (Put / Delete / Update / TWI) wrap
 the transaction body in a `for attempt in 0..TRANSIENT_RETRY_ATTEMPTS`
 loop (50 attempts). Each attempt starts a fresh transaction, runs the
 body, and either commits, aborts and retries (transient), or aborts and
-returns (fatal). Retries sleep with jittered exponential backoff
-(`backoff_sleep`, base 50 µs).
+returns (fatal). Retries sleep with jittered exponential backoff:
+`backoff_sleep` waits a uniform 0 to 50 µs × 2^min(attempt, 8), which is at
+most 12.8 ms from the ninth attempt on and sums to at most about 550 ms
+over the 50 attempts (275 ms expected). Tokio's timer ticks every
+millisecond and rounds a sleep up to the next tick, so for the first five
+attempts (longest jitter under 1 ms) the wait is set by the tick, not by
+the jitter. The helpers that run inside the transaction (index entry
+writes, the stream shard lookup, the stream sequence counter draw and the
+stream record insert) map a transient conflict to `StorageError::Transient`
+through `write_conflict::transaction_error`, and the transaction body
+turns that into a re-run like a conflict on the data collection.
 
 **UpdateItem's OCC guard on top.** `UpdateItem` uses a `_v` version filter.
 In snapshot mode, the transaction supplies the point-in-time view used to
@@ -753,9 +767,15 @@ signal from `Transient`) and the loop restarts. The native fast path always
 emits `$inc: {_v: 1}` so a concurrent slow-path update racing against a stale
 read fails its filter and retries.
 
-**Exhaustion behavior.** Single-item retry exhaustion returns
-`StorageError::Internal` (rare in practice; the retry ceiling is high).
-`TransactWriteItems` exhaustion surfaces as
+**Exhaustion behavior.** Single-item retry exhaustion (PutItem,
+DeleteItem, UpdateItem) returns `StorageError::Transient`, built by
+`write_conflict::retry_budget_exhausted`. Its message reads
+`<operation>: could not commit in <N> attempts: <last error>` and carries
+the last error that ended an attempt: the driver's text, or a fixed
+sentence after an UpdateItem version miss. The engine logs it and answers
+HTTP 503 `ServiceUnavailable`, which the SDKs retry. The server counts
+that 503 as a system error, not under
+`TransactionConflict`. `TransactWriteItems` exhaustion surfaces as
 `StorageError::TransactionCanceled` with a synthetic per-op
 `TransactionConflict` reason so wire consumers see the DDB-canonical
 error string instead of a bare HTTP 500.
@@ -836,6 +856,13 @@ status from both ledgers through the shared migration runner before it
 opens the engine, and refuses a catalog with pending migrations or with a
 breaking migration this binary does not know, as on every backend.
 [ADR-0023](../adr/0023-catalog-migrations.md) records the design.
+
+The factory registers and reads the status before it builds the engine
+or starts the startup key repair, so a server that refuses has written
+nothing but its registration, which it deletes. A command that opens
+the catalog beside a server (`ServerComponentsOptions::beside_server`:
+`extenddb backup list`, the purge's dry run) starts no repair; the
+server does.
 
 ## 6. Crate Structure
 
@@ -994,7 +1021,6 @@ uuid.workspace = true
 base64.workspace = true
 rand.workspace = true
 bcrypt.workspace = true
-aes-gcm.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -1144,3 +1170,14 @@ uses the compound `(shard_id, sequence_number)` index.
 configured `transaction_read_concern` (default `"snapshot"`) and
 majority write concern; up to 100 operations
 per the DDB spec. Retried on transient conflicts with jittered backoff.
+
+---
+
+## License
+
+Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
+See [LICENSE](../../LICENSE) for the full text.
+
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -19,9 +19,19 @@ use crate::util::is_process_alive;
 #[cfg(unix)]
 use extenddb_config as config;
 
-/// Maximum time to wait for the process to exit after SIGTERM.
+/// Maximum time to wait for the process to exit after SIGTERM: the sum of
+/// the server's shutdown bounds, in the order it runs them (the listener's
+/// drain of active connections, the backup jobs' failure paths, the
+/// registration supervisor's return with the background workers' stop and
+/// the serving registration's release, the runtime's blocking threads), so
+/// `stop` does not give up on a server that is still inside one of them.
 #[cfg(unix)]
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(
+    extenddb_server::CONNECTION_DRAIN_TIMEOUT.as_secs()
+        + extenddb_server::JOB_DRAIN_TIMEOUT.as_secs()
+        + extenddb_server::WORKER_STOP_TIMEOUT.as_secs()
+        + crate::RUNTIME_SHUTDOWN_TIMEOUT.as_secs(),
+);
 
 /// Poll interval when waiting for process exit.
 #[cfg(unix)]
@@ -177,8 +187,15 @@ pub fn run(args: &StopArgs) {
         }
         if Instant::now() >= deadline {
             eprintln!(
-                "extenddb (pid {pid}) did not exit within {}s after SIGTERM",
+                "extenddb (pid {pid}) did not exit within {}s after SIGTERM (the server \
+                 drains connections for up to {}s, waits up to {}s for its backup jobs to end, \
+                 then up to {}s to stop its background workers and release its serving \
+                 registration, and {}s for its runtime)",
                 SHUTDOWN_TIMEOUT.as_secs(),
+                extenddb_server::CONNECTION_DRAIN_TIMEOUT.as_secs(),
+                extenddb_server::JOB_DRAIN_TIMEOUT.as_secs(),
+                extenddb_server::WORKER_STOP_TIMEOUT.as_secs(),
+                crate::RUNTIME_SHUTDOWN_TIMEOUT.as_secs(),
             );
             std::process::exit(1);
         }
@@ -219,8 +236,9 @@ fn is_listening(addr: &std::net::SocketAddr) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use std::net::SocketAddr;
+    use std::time::Duration;
 
-    use super::listen_probe_addrs;
+    use super::{SHUTDOWN_TIMEOUT, listen_probe_addrs};
 
     fn addrs(list: &[&str]) -> Vec<SocketAddr> {
         let mut v: Vec<SocketAddr> = list.iter().map(|a| a.parse().unwrap()).collect();
@@ -259,6 +277,28 @@ mod tests {
         assert_eq!(
             listen_probe_addrs("127.0.0.1", 18443),
             addrs(&["127.0.0.1:18443"])
+        );
+    }
+
+    /// `stop` waits at least as long as the server's shutdown can take with
+    /// a backup job in its failure path: 5 s of connection drain, 30 s of
+    /// job drain, 36 s after it (10 s for the supervisor's return, 16 s for
+    /// the workers' stop: 5 s of drain, 1 s of abort and 10 s behind a
+    /// supervisor still stopping them, and 10 s for the registration's
+    /// release) and 5 s for the runtime.
+    #[test]
+    fn stop_waits_for_every_shutdown_bound() {
+        assert_eq!(
+            extenddb_server::WORKER_STOP_TIMEOUT,
+            Duration::from_secs(36)
+        );
+        assert_eq!(SHUTDOWN_TIMEOUT, Duration::from_secs(76));
+        assert!(
+            SHUTDOWN_TIMEOUT
+                >= extenddb_server::JOB_DRAIN_TIMEOUT
+                    + extenddb_server::WORKER_STOP_TIMEOUT
+                    + crate::RUNTIME_SHUTDOWN_TIMEOUT
+                    + extenddb_server::CONNECTION_DRAIN_TIMEOUT
         );
     }
 }

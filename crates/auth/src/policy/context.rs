@@ -128,6 +128,17 @@ fn strip_prefix_ci<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// IAM absent-key semantics. The slice stays so a future global key the service
 /// begins populating before ExtendDB resolves it can be made to fail closed by
 /// listing it.
+///
+/// Two places read the set, through `is_unresolvable_key`. A condition fails
+/// closed when its key is listed, or when one of its values names a listed key
+/// through a `${key}` or `${key, 'default'}` variable in a `2012-10-17`
+/// document under a string or ARN operator, where the value is expanded
+/// (`condition::evaluate_condition_match`); a value that is not expanded
+/// reads no key. A `Resource` or `NotResource` pattern whose variable names a
+/// listed key fails closed in the same way
+/// (`variables::resource_pattern_is_unresolvable`). In both, a default written
+/// beside a listed key is not used, because the service would have a value
+/// for the key.
 const FAIL_CLOSED_GLOBAL_KEYS: &[&str] = &[];
 
 /// Whether an unresolved condition key must fail closed for the context that
@@ -174,6 +185,10 @@ pub struct RequestParams {
     pub return_consumed_capacity: Option<String>,
     /// The enclosing operation for batch/transact sub-operations.
     pub enclosing_operation: Option<String>,
+    /// `dynamodb:FullTableScan` for a request that is not a scan
+    /// (`RequestContext::build` sets it to `true` for one). `None` leaves the
+    /// key absent; a PartiQL read by key sets `false`.
+    pub full_table_scan: Option<bool>,
     /// The caller ARN (`aws:PrincipalArn`), when known.
     pub principal_arn: Option<String>,
     /// The caller's account id (`aws:PrincipalAccount`), when known.
@@ -290,7 +305,8 @@ impl RequestContext {
     /// Build context for a `DynamoDB` operation.
     ///
     /// `principal_tags` and `resource_tags` come from the identity and target
-    /// table respectively. `is_scan` should be true for Scan operations.
+    /// table respectively. `is_scan` should be true for Scan operations; for
+    /// any other request `params.full_table_scan` gives the key.
     /// `params` carries operation-specific request parameters.
     #[must_use]
     pub fn build(
@@ -308,7 +324,11 @@ impl RequestContext {
             select: params.select,
             return_values: params.return_values,
             return_consumed_capacity: params.return_consumed_capacity,
-            full_table_scan: if is_scan { Some(true) } else { None },
+            full_table_scan: if is_scan {
+                Some(true)
+            } else {
+                params.full_table_scan
+            },
             enclosing_operation: params.enclosing_operation,
             principal_arn: params.principal_arn,
             principal_account: params.principal_account,
@@ -442,10 +462,10 @@ impl ConditionContext for RequestContext {
         // A request tag key the request names under two or more spellings that
         // fold to one name and do not all carry one value cannot be read as one
         // value: the statement fails closed (a Deny blocks, an Allow does not
-        // grant). Every other unresolved aws: global key that is neither a tag
-        // sub-key nor on the absent-ok allowlist is one the service populates
-        // but this context has no value for (for example aws:PrincipalOrgID,
-        // aws:SourceIp): it fails closed. Keys resolved above never reach here.
+        // grant). Any other key is unresolvable only when it is listed in
+        // FAIL_CLOSED_GLOBAL_KEYS, which is empty in this build, so every other
+        // unresolved key, aws:PrincipalOrgID and aws:SourceIp among them, keeps
+        // absent-key semantics. Keys resolved above never reach here.
         if let Some(sub) = strip_prefix_ci(key, "aws:RequestTag/") {
             return self.request_tag_values(sub) == RequestTagLookup::Ambiguous;
         }
@@ -457,13 +477,19 @@ impl ConditionContext for RequestContext {
         // ExtendDB applies that only to `aws:TagKeys`, which it populates on
         // exactly the three operations the AWS service authorization reference
         // lists it for (TagResource, UntagResource, CreateTable with Tags), so
-        // its absence here is the service's absence. `dynamodb:Attributes` is
-        // left absent on writes, on reads that project with `AttributesToGet`
-        // and on batch and transaction targets, and `dynamodb:LeadingKeys` on
-        // query shapes the extractor cannot pin to a partition value, where the
-        // service populates both; for those two an absent key keeps the
-        // no-match rule, so an Allow gated on a bare negated operator over them
-        // grants nothing, as the service grants nothing for the present key.
+        // its absence here is the service's absence. `dynamodb:LeadingKeys` is
+        // left absent on query shapes the extractor cannot pin to a partition
+        // value, where the service populates it. `dynamodb:Attributes` is
+        // absent only on a `SearchVectors` with no `ProjectionExpression`
+        // (#729) and, on a table that does not exist, on a `GetItem`,
+        // transaction `Get` or `BatchGetItem` that names no attribute outside
+        // its keys, a `Query` whose key condition the key condition parser
+        // refuses and that names none elsewhere, and a `Scan` that names none.
+        // On the service the key is present on a `Scan` that names no
+        // attribute, and an Allow gated on a bare `StringNotEquals` over it
+        // grants no `Scan` (measured 2026-11-01).
+        // For those two keys an absent key keeps the no-match rule, so an
+        // Allow gated on a bare negated operator over them grants nothing.
         super::casefold::case_fold(key) == "aws:tagkeys"
     }
 }
@@ -476,11 +502,11 @@ impl ConditionContext for RequestContext {
 /// `aws:RequestTag/*` / `aws:TagKeys`, and the request-wide keys
 /// `aws:SecureTransport`, `aws:RequestedRegion`, `aws:CurrentTime`,
 /// `aws:EpochTime`, `aws:ViaAWSService` and `aws:PrincipalIsAWSService`, all of
-/// which this context resolves. A global key STS populates that this context
-/// cannot resolve (for example `aws:PrincipalOrgID` or `aws:SourceIp`, neither
-/// on the absent-ok allowlist) is reported as unresolvable (fail closed). Keys
-/// that are legitimately absent for this caller model keep absent-key
-/// semantics. `DynamoDB`-specific keys are not applicable.
+/// which this context resolves. Another key is reported as unresolvable (fail
+/// closed) only when it is listed in `FAIL_CLOSED_GLOBAL_KEYS`, which is
+/// empty in this build; every other key this context does not resolve, such
+/// as `aws:PrincipalOrgID` or `aws:SourceIp`, keeps absent-key semantics.
+/// `DynamoDB`-specific keys are not applicable.
 #[derive(Debug)]
 pub struct AssumeRoleContext {
     /// Tags on the calling principal.
@@ -584,10 +610,10 @@ impl ConditionContext for AssumeRoleContext {
     fn is_unresolvable_key(&self, key: &str) -> bool {
         // Keys this context resolves (tags, external id, principal ARN and
         // account, region, secure transport, time, principal type, user name)
-        // never reach here. Any other unresolved aws: global key that is not on
-        // the absent-ok allowlist is one STS populates but this context has no
-        // value for, so a Deny gated on it fails closed and an Allow does not
-        // grant.
+        // never reach here. Another key is unresolvable only when it is listed
+        // in FAIL_CLOSED_GLOBAL_KEYS, which is empty in this build: a Deny gated
+        // on a listed key fails closed and an Allow does not grant, and every
+        // other unresolved key keeps absent-key semantics.
         aws_key_is_unresolvable(key)
     }
 }
@@ -985,6 +1011,25 @@ mod tests {
         assert_eq!(
             ctx.resolve_key("dynamodb:FullTableScan"),
             Some(vec!["true"])
+        );
+    }
+
+    #[test]
+    fn request_context_full_table_scan_set_by_the_request() {
+        // A PartiQL read by key carries "false" (measured 2026-11-03); a
+        // request that sets nothing leaves the key absent unless it is a scan.
+        let ctx = RequestContext::build(
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            RequestParams {
+                full_table_scan: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.resolve_key("dynamodb:FullTableScan"),
+            Some(vec!["false"])
         );
     }
 

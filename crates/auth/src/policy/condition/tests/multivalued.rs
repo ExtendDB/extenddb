@@ -284,12 +284,22 @@ fn policy_variable_no_expansion_needed() {
 }
 
 #[test]
-fn policy_variable_unresolvable_left_literal() {
+fn policy_variable_unresolvable_matches_nothing() {
     let ctx = TestContext::new().with("k", vec!["${aws:PrincipalTag/Missing}"]);
-    // Unresolvable variable stays literal — matches if context has the literal
-    assert!(evaluate_condition(
+    // A variable whose key the request does not carry matches nothing, even
+    // the literal text of the variable (measured, issue #534 cell E9).
+    assert!(!evaluate_condition(
         &cond(
             ConditionOperator::StringEquals,
+            "k",
+            vec!["${aws:PrincipalTag/Missing}"]
+        ),
+        &ctx
+    ));
+    // The negated operator holds against it (cell E9b).
+    assert!(evaluate_condition(
+        &cond(
+            ConditionOperator::StringNotEquals,
             "k",
             vec!["${aws:PrincipalTag/Missing}"]
         ),
@@ -298,12 +308,11 @@ fn policy_variable_unresolvable_left_literal() {
 }
 
 #[test]
-fn policy_variable_naming_aws_tagkeys_is_left_literal() {
-    // A multivalued key has no single value to expand to. The condition value
-    // ${aws:TagKeys} is text that no tag key equals, so a Deny comparing
-    // aws:ResourceTag/team with it applies to no request, whichever tag key the
-    // request lists first. IAM answers the same (SimulateCustomPolicy,
-    // 2026-10-27).
+fn policy_variable_naming_aws_tagkeys_has_no_value() {
+    // A multivalued key has no single value to expand to, so a Deny comparing
+    // aws:ResourceTag/team with ${aws:TagKeys} applies to no request, whichever
+    // tag key the request lists first. IAM answers the same
+    // (SimulateCustomPolicy, 2026-10-27).
     let team_is_tag_keys = cond(
         ConditionOperator::StringEquals,
         "aws:ResourceTag/team",
@@ -318,15 +327,39 @@ fn policy_variable_naming_aws_tagkeys_is_left_literal() {
             "${{aws:TagKeys}} expanded for the keys {keys:?}"
         );
     }
-    // The variable is text, so it equals the same text.
-    let ctx = TestContext::new()
-        .with("aws:ResourceTag/team", vec!["${aws:TagKeys}"])
-        .with("aws:TagKeys", vec!["env", "owner"]);
-    assert!(evaluate_condition(&team_is_tag_keys, &ctx));
+    // The variable has no value whether aws:TagKeys holds two values, one or
+    // none, and its text is not compared: the positive operators are false
+    // against it and the negated ones true, even for a request value equal to
+    // the text. These are the rows measured with SimulateCustomPolicy on
+    // 2026-10-31 (in the description of PR #541).
+    for (tag_keys, env) in [
+        (Some(vec!["a", "b"]), "a"),
+        (Some(vec!["a", "b"]), "${aws:TagKeys}"),
+        (Some(vec!["a"]), "a"),
+        (None, "${aws:TagKeys}"),
+    ] {
+        let mut ctx = TestContext::new().with("aws:PrincipalTag/env", vec![env]);
+        if let Some(keys) = &tag_keys {
+            ctx = ctx.with("aws:TagKeys", keys.clone());
+        }
+        for (op, holds) in [
+            (ConditionOperator::StringEquals, false),
+            (ConditionOperator::StringLike, false),
+            (ConditionOperator::StringNotEquals, true),
+            (ConditionOperator::StringNotLike, true),
+        ] {
+            let c = cond(op.clone(), "aws:PrincipalTag/env", vec!["${aws:TagKeys}"]);
+            assert_eq!(
+                evaluate_condition(&c, &ctx),
+                holds,
+                "{op:?}, aws:TagKeys {tag_keys:?}, env {env}"
+            );
+        }
+    }
 }
 
 #[test]
-fn policy_variables_naming_the_dynamodb_multivalued_keys_are_left_literal() {
+fn policy_variables_naming_the_dynamodb_multivalued_keys_have_no_value() {
     for key in ["dynamodb:LeadingKeys", "dynamodb:Attributes"] {
         let variable = format!("${{{key}}}");
         let ctx = TestContext::new()
@@ -459,12 +492,19 @@ fn bare_negated_op_absent_tagkeys_matches() {
 #[test]
 fn bare_negated_op_absent_dynamodb_keys_do_not_match() {
     // IAM matches a bare negated operator on absent dynamodb:Attributes and
-    // dynamodb:LeadingKeys too, but ExtendDB leaves both absent on requests
-    // where the service populates them (Attributes on writes, AttributesToGet
-    // reads and batch and transaction targets; LeadingKeys on query shapes the
-    // extractor cannot pin). Matching there would grant an Allow the service
-    // refuses for the present key, so for these two keys an absent key keeps
-    // the no-match rule (BR-7085).
+    // dynamodb:LeadingKeys too. ExtendDB leaves dynamodb:LeadingKeys absent on
+    // query shapes it cannot pin to a partition value, where the service
+    // populates it. It leaves dynamodb:Attributes absent only on a
+    // SearchVectors with no ProjectionExpression (#729) and, on a table that
+    // does not exist, on a GetItem, transaction Get or BatchGetItem that names
+    // no attribute outside its keys, a Query whose key condition the key
+    // condition parser refuses and that names none elsewhere, and a Scan that
+    // names none. On the service the key holds the table's key attributes on
+    // every item request measured, a Scan that names no attribute included,
+    // and an Allow gated on a bare StringNotEquals over it grants no Scan
+    // (measured 2026-11-01). Matching on those absent keys could grant an
+    // Allow the service refuses, so for these two keys an absent key keeps the
+    // no-match rule (BR-7085).
     let ctx = TestContext::new();
     for key in ["dynamodb:Attributes", "dynamodb:LeadingKeys"] {
         for op in [

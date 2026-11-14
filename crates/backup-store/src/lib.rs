@@ -33,8 +33,11 @@ mod s3;
 
 pub use config::{BackupStoreConfig, BackupStoreKind, FilesystemStoreConfig, S3StoreConfig};
 pub use error::StoreError;
-pub use fs::FilesystemStore;
-pub use s3::{MAX_PART_SIZE_BYTES, MAX_STORE_PREFIX_LEN, MIN_PART_SIZE_BYTES, S3Store};
+pub use fs::{FilesystemStore, check_private_directory};
+pub use s3::{
+    ATTEMPT_TIMEOUT as S3_ATTEMPT_TIMEOUT, MAX_PART_SIZE_BYTES, MAX_STORE_PREFIX_LEN,
+    MIN_PART_SIZE_BYTES, S3Store,
+};
 
 /// Byte stream flowing into and out of a store.
 ///
@@ -64,6 +67,17 @@ pub struct ObjectMeta {
     /// `ETag` carries a `-<parts>` suffix and is not an MD5). The filesystem
     /// store has no equivalent and reports `None`.
     pub etag: Option<String>,
+}
+
+/// What one [`BackupStore::delete_prefix_before`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixDeletion {
+    /// The objects removed, counted as [`BackupStore::delete_prefix`]
+    /// counts them.
+    pub deleted: u64,
+    /// Whether the deletion ran to its end; `false` when it stopped at the
+    /// deadline, with the rest of the prefix left.
+    pub finished: bool,
 }
 
 /// A destination for backup objects.
@@ -105,6 +119,31 @@ pub trait BackupStore: Send + Sync {
         key: &'a str,
         body: ByteStream,
     ) -> BoxFuture<'a, Result<ObjectMeta, StoreError>>;
+
+    /// Store `body` under `key` only if no object is there, and return the
+    /// stored object's metadata; return `None`, leaving the existing object
+    /// untouched and reading none of `body` the store did not already read,
+    /// if one is. Of two concurrent calls on one key exactly one stores its
+    /// body. The object appears under its key complete or not at all, as
+    /// with [`BackupStore::put`], and a call that is dropped or fails before
+    /// the object is in place leaves nothing (the same guards as `put`); a
+    /// filesystem call whose `link` succeeded and whose parent-directory
+    /// sync then fails returns `Err` with the object in place, as `put`
+    /// does after its `rename`. Written for the store identity file; the
+    /// mechanics are the stores': S3 sends `PutObject` (or, for a body over
+    /// one part, `CompleteMultipartUpload`) with `If-None-Match: *`, where a
+    /// 412 means the key is present and a 409 `ConditionalRequestConflict`
+    /// from a concurrent conditional write is retried; the filesystem store
+    /// writes and syncs its temporary as `put` does, created
+    /// `O_CREAT | O_EXCL`, then `link`s it to the key, which fails if the
+    /// key exists. An S3-compatible server that ignores `If-None-Match` on
+    /// `PutObject` makes this a plain put, last writer wins; the README
+    /// names it, and the caller's re-read is what catches it.
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: ByteStream,
+    ) -> BoxFuture<'a, Result<Option<ObjectMeta>, StoreError>>;
 
     /// Stream the object stored under `key`.
     ///
@@ -161,6 +200,87 @@ pub trait BackupStore: Send + Sync {
     /// the dropped future sets).
     fn delete_prefix<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<u64, StoreError>>;
 
+    /// Delete the object under `written.key` only while it is the object a
+    /// put of this store answered with `written`, and leave any other.
+    /// Returns `true` when nothing `written` describes is left under the
+    /// key (this call removed it, or it was already gone), `false` when an
+    /// object the call does not match is there, untouched. Written for a
+    /// writer that deletes only what it wrote under a prefix another writer
+    /// may since have written to under the same keys.
+    ///
+    /// The S3 store sends `DeleteObject` with `If-Match` on `written.etag`
+    /// (a 412 is `false`, a missing key `true`); it tells objects apart by
+    /// their entity tags, so another object with the same bytes (the same
+    /// `ETag`) is deleted, and a server that ignores `If-Match` deletes
+    /// whatever is under the key. With no `etag` the delete is
+    /// unconditional. The filesystem store renames the file at the key to a
+    /// hidden temporary name in its directory (one step), removes it if its
+    /// size and modification time are `written`'s, and otherwise links it
+    /// back under the key; a process stopped between the rename and the
+    /// link leaves the other object under the hidden name, which listings do
+    /// not report. The filesystem store leaves the key's directories in
+    /// place.
+    ///
+    /// The default, for a store with no way to tell objects apart and no
+    /// single-key delete (a test double), is unconditional and uses
+    /// `delete_prefix` of the key only when a listing of the key finds that
+    /// object alone: an object under `key/`, which the prefix deletion would
+    /// also remove, makes it answer `false` with nothing deleted.
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            use futures::StreamExt as _;
+            let mut listed = self.list(&written.key);
+            while let Some(meta) = listed.next().await {
+                if meta?.key != written.key {
+                    return Ok(false);
+                }
+            }
+            drop(listed);
+            self.delete_prefix(&written.key).await.map(|_| true)
+        })
+    }
+
+    /// [`BackupStore::delete_prefix`] that starts no removal at or after
+    /// `deadline`: the filesystem store's walk checks the deadline beside its
+    /// cancel flag before each removal, the S3 store before each
+    /// `ListObjectsV2`, `DeleteObjects`, `ListMultipartUploads` and
+    /// `AbortMultipartUpload`. A call that reaches the deadline returns what
+    /// it removed so far with [`PrefixDeletion::finished`] false; what
+    /// remains is the step in flight at the deadline (one removal on a
+    /// filesystem root, one request on S3, up to 1,000 keys for a
+    /// `DeleteObjects`). The check reads the clock in the process, so it
+    /// bounds a process that keeps running; one paused between a check and
+    /// the step it admits (a stopped process, a frozen VM) runs that step
+    /// when it resumes. The caller still bounds the call with a timeout for
+    /// a step that never answers.
+    ///
+    /// The default checks the deadline once and then runs `delete_prefix`
+    /// whole: for a store whose deletion is one step (an in-memory test
+    /// store), the same rule.
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        Box::pin(async move {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(PrefixDeletion {
+                    deleted: 0,
+                    finished: false,
+                });
+            }
+            self.delete_prefix(prefix)
+                .await
+                .map(|deleted| PrefixDeletion {
+                    deleted,
+                    finished: true,
+                })
+        })
+    }
+
     /// Startup validation. The filesystem store applies the owner-only rule
     /// to the root and the ancestor rule to the directories above it (the
     /// `fs` module doc states both), checks that the root is still where
@@ -183,13 +303,37 @@ pub trait BackupStore: Send + Sync {
 ///
 /// # Errors
 ///
-/// Returns an error when the section matching the selected store kind is
+/// Returns an error when `kind` is `disabled` (no store to open; the caller
+/// checks the kind first), when the section matching the selected store kind
+/// is
 /// absent, a value fails validation (an empty bucket, an S3 Express bucket
 /// name, a part size outside 5 MiB to 5 GiB, zero concurrency, a malformed
 /// prefix, an endpoint setting that breaks the rules in the `config` module
 /// doc, the SDK's own and its credential providers' and IMDS client's
 /// included), or the filesystem root is unusable.
 pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, StoreError> {
+    open_described(config).await.map(|opened| opened.store)
+}
+
+/// A store [`open_described`] built, with the two facts a catalog row records
+/// about it.
+pub struct OpenedStore {
+    /// The store.
+    pub store: Arc<dyn BackupStore>,
+    /// Which kind it is (never [`BackupStoreKind::Disabled`]).
+    pub kind: BackupStoreKind,
+    /// The root label: the canonical directory of a filesystem store
+    /// ([`FilesystemStore::store_root`]), `s3://<bucket>/<prefix>` with an
+    /// optional `?endpoint=<url>` for an S3 store ([`S3Store::store_root`]).
+    pub root: String,
+}
+
+/// [`open`], also returning the store's kind and root label.
+///
+/// # Errors
+///
+/// As [`open`].
+pub async fn open_described(config: &BackupStoreConfig) -> Result<OpenedStore, StoreError> {
     match config.kind {
         BackupStoreKind::Filesystem => {
             let fs_config = config.filesystem.as_ref().ok_or_else(|| {
@@ -198,7 +342,13 @@ pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, St
                         .to_owned(),
                 )
             })?;
-            Ok(Arc::new(FilesystemStore::open(&fs_config.path).await?))
+            let store = FilesystemStore::open(&fs_config.path).await?;
+            let root = store.store_root();
+            Ok(OpenedStore {
+                store: Arc::new(store),
+                kind: BackupStoreKind::Filesystem,
+                root,
+            })
         }
         BackupStoreKind::S3 => {
             let s3_config = config.s3.as_ref().ok_or_else(|| {
@@ -206,7 +356,16 @@ pub async fn open(config: &BackupStoreConfig) -> Result<Arc<dyn BackupStore>, St
                     "[backup.store.s3] with a bucket is required when kind = \"s3\"".to_owned(),
                 )
             })?;
-            Ok(Arc::new(S3Store::open(s3_config).await?))
+            let store = S3Store::open(s3_config).await?;
+            let root = store.store_root().to_owned();
+            Ok(OpenedStore {
+                store: Arc::new(store),
+                kind: BackupStoreKind::S3,
+                root,
+            })
         }
+        BackupStoreKind::Disabled => Err(StoreError::Other(
+            "[backup.store] kind = \"disabled\" configures no store; nothing to open".to_owned(),
+        )),
     }
 }
