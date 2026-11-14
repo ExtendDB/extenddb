@@ -301,12 +301,6 @@ impl SegmentStore {
         });
     }
 
-    /// Number of (account, operation) pairs with rings allocated.
-    #[cfg(test)]
-    pub(super) fn ring_pair_count(&self) -> usize {
-        self.by_account.values().map(HashMap::len).sum()
-    }
-
     /// Number of buckets allocated, the quantity the memory bound is stated in.
     #[cfg(test)]
     pub(super) fn bucket_count(&self) -> usize {

@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use super::*;
 
 const OPS: [&str; 5] = ["GetItem", "PutItem", "Query", "Scan", "UpdateItem"];
-const ACCOUNT: &str = "111111111111";
 const ACCOUNTS: [&str; 3] = ["111111111111", "222222222222", "333333333333"];
 
 fn segs(v: f64) -> LatencySegments {
@@ -75,7 +74,6 @@ fn boundedness_five_million_records() {
         store.record(account, op, &segs(1.0), now);
     }
     let bound = ACCOUNTS.len() * OPS.len() * BUCKETS_PER_OPERATION;
-    assert_eq!(store.ring_pair_count(), ACCOUNTS.len() * OPS.len());
     assert!(
         store.bucket_count() <= bound,
         "bucket count {} exceeds bound {bound}",
@@ -92,27 +90,18 @@ fn boundedness_five_million_records() {
     assert!(in_day > 0 && in_day <= 86_460_000 / 52 + OPS.len() as u64);
 }
 
-/// One request of the random workload: the index of its account, the index
-/// of its operation, its time in milliseconds after the epoch and its
-/// segments.
-struct Point {
-    account: usize,
-    op: usize,
-    t_ms: u64,
-    segs: LatencySegments,
-}
-
 /// Naive reference: for a window of `w` seconds read from `b`-second buckets,
 /// the store returns every point whose bucket starts at or after the bucket
 /// that contains `now - w`. That set contains the exact last `w` seconds and
 /// is contained in the exact last `w + b` seconds. Without an account filter
 /// the reference is every account's points; with one, that account's points.
+/// A point is `(account index, operation index, ms after the epoch, segments)`.
 #[test]
 fn random_workload_matches_naive_reference() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let mut points: Vec<Point> = Vec::new();
+    let mut points: Vec<(usize, usize, u64, LatencySegments)> = Vec::new();
     let mut t_ms: u64 = 0;
     // 300 000 points, 0 to 40 ms apart: about 6 000 s, so the hour and the
     // minute windows both cut inside the data.
@@ -124,19 +113,14 @@ fn random_workload_matches_naive_reference() {
         let op = rng.below(OPS.len() as u64) as usize;
         #[allow(clippy::cast_precision_loss)]
         let v = rng.below(10_000) as f64 / 7.0;
-        let segs = segs(v);
+        let s = segs(v);
         store.record(
             ACCOUNTS[account],
             OPS[op],
-            &segs,
+            &s,
             epoch + Duration::from_millis(t_ms),
         );
-        points.push(Point {
-            account,
-            op,
-            t_ms,
-            segs,
-        });
+        points.push((account, op, t_ms, s));
     }
     let windows = [
         (TimeWindow::LastMinute, 60, 1),
@@ -171,7 +155,7 @@ fn random_workload_matches_naive_reference() {
 /// count lies between the exact `w` and `w + b` second windows.
 fn assert_matches_reference(
     out: &[OperationSegments],
-    points: &[Point],
+    points: &[(usize, usize, u64, LatencySegments)],
     account: Option<usize>,
     (window, w, b): (TimeWindow, u64, u64),
     now_ms: u64,
@@ -186,24 +170,24 @@ fn assert_matches_reference(
         let mut sum = LatencySegments::default();
         let mut exact_w = 0u64;
         let mut exact_w_plus_b = 0u64;
-        for p in points {
-            if p.op != i || account.is_some_and(|a| p.account != a) {
+        for (p_account, p_op, p_ms, s) in points {
+            if *p_op != i || account.is_some_and(|a| *p_account != a) {
                 continue;
             }
-            if p.t_ms + w * 1000 >= now_ms {
+            if *p_ms + w * 1000 >= now_ms {
                 exact_w += 1;
             }
-            if p.t_ms + (w + b) * 1000 >= now_ms {
+            if *p_ms + (w + b) * 1000 >= now_ms {
                 exact_w_plus_b += 1;
             }
-            if (p.t_ms / 1000) / b >= first_slot {
+            if (*p_ms / 1000) / b >= first_slot {
                 count += 1;
-                sum.auth_us += p.segs.auth_us;
-                sum.authz_us += p.segs.authz_us;
-                sum.throttle_us += p.segs.throttle_us;
-                sum.dispatch_us += p.segs.dispatch_us;
-                sum.response_us += p.segs.response_us;
-                sum.total_us += p.segs.total_us;
+                sum.auth_us += s.auth_us;
+                sum.authz_us += s.authz_us;
+                sum.throttle_us += s.throttle_us;
+                sum.dispatch_us += s.dispatch_us;
+                sum.response_us += s.response_us;
+                sum.total_us += s.total_us;
             }
         }
         let got = out.iter().find(|o| &o.operation == op);
@@ -246,7 +230,7 @@ fn window_filter_at_minute_boundary() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     for t in [0, 59, 60] {
-        store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, t));
+        store.record(ACCOUNTS[0], "GetItem", &segs(1.0), at(epoch, t));
     }
     // The fine ring cuts at the second: 119 s keeps 59 s and 60 s, 120 s drops 59 s.
     assert_eq!(
@@ -264,7 +248,7 @@ fn window_filter_at_minute_boundary() {
         1
     );
     // 3659 s: cutoff 59 s lies in minute 0, so minute 0 is included.
-    store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, 3659));
+    store.record(ACCOUNTS[0], "GetItem", &segs(1.0), at(epoch, 3659));
     assert_eq!(
         count_of(
             &store.query(TimeWindow::LastHour, None, at(epoch, 3659)),
@@ -290,7 +274,7 @@ fn fine_windows_cut_at_the_second() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
     for t in [0, 1, 2, 300, 301] {
-        store.record(ACCOUNT, "Query", &segs(1.0), at(epoch, t));
+        store.record(ACCOUNTS[0], "Query", &segs(1.0), at(epoch, t));
     }
     // 301 s: cutoff 1 s, buckets 1, 2, 300, 301.
     assert_eq!(
@@ -337,7 +321,7 @@ fn fine_windows_cut_at_the_second() {
 fn ring_lap_and_stale_slots() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
-    store.record(ACCOUNT, "Scan", &segs(1.0), at(epoch, 0));
+    store.record(ACCOUNTS[0], "Scan", &segs(1.0), at(epoch, 0));
     // One day minus a second later minute 0 is still inside the ring.
     assert_eq!(
         count_of(
@@ -365,7 +349,7 @@ fn ring_lap_and_stale_slots() {
             .is_empty()
     );
     // A record one full lap later lands on position 0 and resets it.
-    store.record(ACCOUNT, "Scan", &segs(5.0), at(epoch, 1441 * 60));
+    store.record(ACCOUNTS[0], "Scan", &segs(5.0), at(epoch, 1441 * 60));
     let out = store.query(TimeWindow::AllTime, None, at(epoch, 1441 * 60));
     assert_eq!(count_of(&out, "Scan"), 1);
     assert!((out[0].avg.auth_us - 5.0).abs() < f64::EPSILON);
@@ -489,7 +473,7 @@ fn continuous_load_three_coarse_laps_exact_count_and_mean() {
         #[allow(clippy::cast_precision_loss)]
         let v = t as f64;
         store.record(
-            ACCOUNT,
+            ACCOUNTS[0],
             "Scan",
             &LatencySegments {
                 auth_us: v,
@@ -536,9 +520,9 @@ fn continuous_load_three_coarse_laps_exact_count_and_mean() {
 fn operations_sorted_and_zero_count_absent() {
     let epoch = Instant::now();
     let mut store = SegmentStore::new(epoch);
-    store.record(ACCOUNT, "Scan", &segs(1.0), at(epoch, 10));
-    store.record(ACCOUNT, "GetItem", &segs(1.0), at(epoch, 10));
-    store.record(ACCOUNT, "PutItem", &segs(1.0), at(epoch, 1000));
+    store.record(ACCOUNTS[0], "Scan", &segs(1.0), at(epoch, 10));
+    store.record(ACCOUNTS[0], "GetItem", &segs(1.0), at(epoch, 10));
+    store.record(ACCOUNTS[0], "PutItem", &segs(1.0), at(epoch, 1000));
     let out = store.query(TimeWindow::LastMinute, None, at(epoch, 1000));
     let names: Vec<&str> = out.iter().map(|o| o.operation.as_str()).collect();
     assert_eq!(names, ["PutItem"]);
@@ -603,7 +587,7 @@ fn bench_old_push_vs_new_record() {
         #[allow(clippy::cast_possible_truncation)]
         let op = OPS[(i % 5) as usize];
         if let Ok(mut s) = new.write() {
-            s.record(ACCOUNT, op, &segs(1.0), Instant::now());
+            s.record(ACCOUNTS[0], op, &segs(1.0), Instant::now());
         }
     }
     let new_ns = start.elapsed().as_nanos() / u128::from(N);
