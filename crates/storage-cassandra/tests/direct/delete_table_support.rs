@@ -12,8 +12,6 @@ use extenddb_core::types::{
 use extenddb_storage::{MetadataEngine, TableEngine};
 use extenddb_storage_cassandra::CassandraEngine;
 
-use crate::helpers::test_config;
-
 /// How long the waits below poll before they fail the test.
 const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -259,22 +257,8 @@ pub(crate) async fn data_table_exists(
     account_id: &str,
     table_id: &str,
 ) -> bool {
-    let keyspace = format!("{}_account_{account_id}", test_config().keyspace_prefix);
     let data_table = format!("items_{}", table_id.replace('-', "_"));
-    let rows = engine
-        .session()
-        .query_with_values(
-            "SELECT table_name FROM system_schema.tables \
-             WHERE keyspace_name = ? AND table_name = ?",
-            cdrs_tokio::query_values!(keyspace.as_str(), data_table.as_str()),
-        )
-        .await
-        .expect("read system_schema.tables")
-        .response_body()
-        .expect("response body")
-        .into_rows()
-        .unwrap_or_default();
-    !rows.is_empty()
+    crate::backup_engine::data_table_exists(engine, account_id, &data_table).await
 }
 
 pub(crate) async fn row_status(
