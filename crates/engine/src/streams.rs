@@ -48,11 +48,10 @@ pub async fn handle_describe_stream(
     // raw responses are quoted in streams/describe_limit_tests.rs).
     if let Some(limit) = input.limit {
         if limit < 1 {
-            return Err(DynamoDbError::ValidationException(
-                "1 validation error detected: Value at 'limit' failed to satisfy \
-                 constraint: Member must have value greater than or equal to 1"
-                    .to_owned(),
-            ));
+            return Err(DynamoDbError::ValidationException(constraint(
+                "limit",
+                "have value greater than or equal to 1",
+            )));
         }
         if limit > DESCRIBE_STREAM_LIMIT_MAX {
             return Err(DynamoDbError::ValidationException(format!(
