@@ -346,14 +346,23 @@ ExtendDB's own `AccountId` dimension.
   (omitted in the in-memory fallback path).
 - `segments` (`Vec<OperationSegments>`): per-operation latency breakdown
   (auth / authz / throttle / dispatch / response in microseconds), in-memory only.
-  Requests are summed at record time into fixed per-operation time buckets
-  (1-second buckets for the last 5 minutes, 1-minute buckets for the last
-  24 hours), so a window covers at least its length and at most one bucket
+  Requests are summed at record time into fixed time buckets per account and
+  operation (1-second buckets for the last 5 minutes, 1-minute buckets for the
+  last 24 hours), so a window covers at least its length and at most one bucket
   width more, and memory does not grow with the request count. `LastMinute`
   and `Last5Minutes` read the 1-second buckets; `LastHour` and `LastDay` read
-  the 1-minute buckets; `AllTime` returns the whole 24-hour ring. The table is
-  not a dimension of this breakdown. Operations with no request in the window
-  are omitted; results are sorted by operation name.
+  the 1-minute buckets; `AllTime` returns the whole 24-hour ring. With the
+  `account_id` filter the breakdown reads that account's buckets; without it,
+  every account's buckets are summed per operation. The table is not a
+  dimension of this breakdown. Operations with no request in the window are
+  omitted; results are sorted by operation name.
+  Each account's operation holds 301 one-second and 1,441 one-minute buckets
+  of 64 bytes, 111,488 bytes, so the breakdown holds at most
+  `accounts x operations x 111,488` bytes: with the 40 operations the server
+  dispatches, 4,459,520 bytes (4.25 MiB) per account that has sent a
+  request. The segments are recorded only for authenticated requests, so
+  `accounts` is bounded by the accounts in the catalog, which operators
+  create.
 - `source`: `"database"` when served from the persistent `MetricsStore`,
   `"memory"` when served from the in-process `MetricsCollector` fallback.
 
