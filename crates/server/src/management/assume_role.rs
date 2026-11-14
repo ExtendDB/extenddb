@@ -1799,23 +1799,28 @@ mod tests {
     }
 
     /// A trust policy `Condition` with two unknown operators reports the one
-    /// whose name sorts first, in either order of the document (#780).
+    /// whose name sorts first, in either order of the document (#780). The
+    /// same holds when the values also hold a `${...}` reference IAM refuses:
+    /// that check runs the operator check of `trust_variable_order` first.
     /// `cargo test --workspace` builds `serde_json` with `preserve_order`,
     /// which keeps the written order, so there the test tells the two apart.
     #[test]
     fn validate_reports_the_first_bad_operator_in_name_order() {
-        for (first, second) in [("BadA", "BadB"), ("BadB", "BadA")] {
-            let doc: Value = serde_json::from_str(&format!(
-                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
-                "Principal":{{"AWS":"{CALLER}"}},"Action":"sts:AssumeRole",
-                "Condition":{{"{first}":{{"aws:k":"v"}},"{second}":{{"aws:k":"v"}}}}}}]}}"#
-            ))
-            .unwrap();
-            assert_eq!(
-                validate_trust_policy(&doc).unwrap_err(),
-                "invalid Condition operator: BadA",
-                "{first} before {second}"
-            );
+        for value in ["v", "a${"] {
+            for (first, second) in [("BadA", "BadB"), ("BadB", "BadA")] {
+                let doc: Value = serde_json::from_str(&format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",
+                    "Principal":{{"AWS":"{CALLER}"}},"Action":"sts:AssumeRole",
+                    "Condition":{{"{first}":{{"aws:k":"{value}"}},
+                    "{second}":{{"aws:k":"{value}"}}}}}}]}}"#
+                ))
+                .unwrap();
+                assert_eq!(
+                    validate_trust_policy(&doc).unwrap_err(),
+                    "invalid Condition operator: BadA",
+                    "{value}: {first} before {second}"
+                );
+            }
         }
     }
 
