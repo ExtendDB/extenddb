@@ -2472,6 +2472,8 @@ impl MongoEngine {
         let contention_started = contention_clock_start();
 
         let mut last_cause = String::new();
+        // The attempts the loop ran: every one, unless the deadline ended it.
+        let mut attempts_run = CONTENTION_RETRY_ATTEMPTS;
         for attempt in 0..CONTENTION_RETRY_ATTEMPTS {
             // A transaction that reaches the deadline stops retrying and
             // falls through to the give-up after the loop, which answers
@@ -2480,6 +2482,7 @@ impl MongoEngine {
             // transaction that loses to contention. Only the single-item
             // writes answer the deadline with HTTP 503.
             if contention_deadline_passed(attempt, contention_started, self.contention_deadline) {
+                attempts_run = attempt;
                 break;
             }
             let idempotency = idem_owned.as_ref().map(|(a, t, f)| IdempotencyKey {
@@ -2679,7 +2682,7 @@ impl MongoEngine {
         // TransactionCanceled to TransactionCanceledException; the
         // reason codes are echoed back in the message.
         tracing::warn!(
-            attempts = CONTENTION_RETRY_ATTEMPTS,
+            attempts = attempts_run,
             error = %last_cause,
             "TransactWriteItems: could not commit; answering TransactionCanceled"
         );
