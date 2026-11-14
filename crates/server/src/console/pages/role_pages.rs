@@ -342,6 +342,12 @@ pub async fn delete_role(
                 .auth_cache
                 .invalidate_role_sessions(&account_id, &role_name)
                 .await;
+            // The creation time is an input to the role's aws:userid (#787),
+            // as in management::iam_role::delete_role.
+            state
+                .auth_cache
+                .invalidate_role_created_at(&account_id, &role_name)
+                .await;
             Redirect::to(&format!("/console/accounts/{account_id}")).into_response()
         }
         Err(e) => {
