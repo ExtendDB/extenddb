@@ -8,12 +8,16 @@ raw expression text (before #name / :value substitution). Over the limit it
 returns ``Invalid <Param>: Expression size has exceeded the maximum allowed
 size;``.
 
-A captured quirk: FilterExpression and ConditionExpression append
-`` expression size: <N>`` (N = raw byte length); ProjectionExpression,
-UpdateExpression, and KeyConditionExpression do not.
+A captured quirk: the `` expression size: <N>`` suffix (N = raw byte length)
+depends on the operation, not only on the expression. A Scan FilterExpression
+and a ConditionExpression inside TransactWriteItems carry it; a Query
+FilterExpression, a ConditionExpression on PutItem, UpdateItem, or DeleteItem,
+ProjectionExpression, UpdateExpression, and KeyConditionExpression do not.
+PutItem, UpdateItem, and DeleteItem also wrap the message in
+``1 validation error detected: ``.
 
-Messages captured directly from Amazon DynamoDB (asomasun-admin, us-east-1).
-Dual-target against Amazon DynamoDB and extenddb.
+Messages captured directly from Amazon DynamoDB (us-east-1, re-measured
+2026-10-14). Dual-target against Amazon DynamoDB and extenddb.
 """
 
 from __future__ import annotations
@@ -83,7 +87,7 @@ class TestExpressionSizeLimit:
             f"Invalid FilterExpression: {PREFIX} expression size: {len(expr)}"
         )
 
-    def test_condition_over_limit_has_size_suffix(self, dynamodb_client, hash_table):
+    def test_put_condition_over_limit_no_suffix_with_prefix(self, dynamodb_client, hash_table):
         path = _name_of_len(MAX + 1)
         expr = f"attribute_not_exists({path})"
         with pytest.raises(ClientError) as exc_info:
@@ -91,6 +95,27 @@ class TestExpressionSizeLimit:
                 TableName=hash_table,
                 Item={"pk": {"S": "sztest"}},
                 ConditionExpression=expr,
+            )
+        err = exc_info.value.response["Error"]
+        assert err["Code"] == "ValidationException"
+        assert err["Message"] == (
+            f"1 validation error detected: Invalid ConditionExpression: {PREFIX}"
+        )
+
+    def test_transact_condition_over_limit_has_size_suffix(self, dynamodb_client, hash_table):
+        path = _name_of_len(MAX + 1)
+        expr = f"attribute_not_exists({path})"
+        with pytest.raises(ClientError) as exc_info:
+            dynamodb_client.transact_write_items(
+                TransactItems=[
+                    {
+                        "ConditionCheck": {
+                            "TableName": hash_table,
+                            "Key": {"pk": {"S": "k1"}},
+                            "ConditionExpression": expr,
+                        }
+                    }
+                ]
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
@@ -123,7 +148,9 @@ class TestExpressionSizeLimit:
             )
         err = exc_info.value.response["Error"]
         assert err["Code"] == "ValidationException"
-        assert err["Message"] == f"Invalid UpdateExpression: {PREFIX}"
+        assert err["Message"] == (
+            f"1 validation error detected: Invalid UpdateExpression: {PREFIX}"
+        )
 
     def test_size_measured_on_raw_text_not_substituted(self, dynamodb_client, hash_table):
         # 686 short #aN placeholders => raw ~4005 bytes (under limit) even though

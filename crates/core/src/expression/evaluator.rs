@@ -141,6 +141,23 @@ fn placeholder_numeric<'a>(expr: &Expr, maps: &'a ExpressionMaps) -> Option<Pars
     }
 }
 
+/// Order two values of the same orderable type: `S` and `B` bytewise, `N`
+/// numerically. Returns `None` for any other pair (different types, or a type
+/// with no order), and for an `N` that is not a number the service can store.
+#[must_use]
+pub fn compare_orderable(left: &AttributeValue, right: &AttributeValue) -> Option<Ordering> {
+    match (left, right) {
+        (AttributeValue::S(l), AttributeValue::S(r)) => Some(l.cmp(r)),
+        (AttributeValue::B(l), AttributeValue::B(r)) => Some(l.cmp(r)),
+        (AttributeValue::N(l), AttributeValue::N(r)) => {
+            let l = number_value(l)?;
+            let r = number_value(r)?;
+            Some(l.cmp(&r))
+        }
+        _ => None,
+    }
+}
+
 /// One side of a numeric comparison as a decimal: the placeholder's
 /// pre-parsed value when there is one, else `n` read with [`number_value`].
 /// `None` when the number is not one the service can store.
