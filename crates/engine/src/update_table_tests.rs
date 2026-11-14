@@ -1,7 +1,7 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for `update_table`.
+//! Unit tests for the `UpdateTable` request checks.
 
 use super::*;
 use extenddb_storage::error::StorageError;
@@ -33,86 +33,62 @@ fn enabling_a_stream_without_a_view_type_is_refused() {
     validate_stream_specification(&input(serde_json::json!({ "StreamEnabled": false }))).unwrap();
 }
 
-/// A created index whose key attribute is not in AttributeDefinitions is
-/// refused with the sentence the service picks by the member's shape
-/// (measured 2026-10-25): absent names the index, present but lacking the
-/// key lists the key and the definitions, empty has its own sentence.
+/// Measured 2026-10-24: a stream change beside a billing or throughput
+/// change, beside an index create or delete, or beside a deletion protection
+/// change is refused with its own sentence; alone it is not.
 #[test]
-fn a_created_gsi_on_an_undefined_key_attribute_is_refused_by_member_shape() {
-    let input = |defs: Option<Value>| -> UpdateTableInput {
-        let mut v = serde_json::json!({
+fn a_stream_change_travels_alone() {
+    let with = |extra: Value| -> UpdateTableInput {
+        let mut body = serde_json::json!({
             "TableName": "t",
-            "GlobalSecondaryIndexUpdates": [{ "Create": {
-                "IndexName": "gix",
-                "KeySchema": [
-                    { "AttributeName": "g", "KeyType": "HASH" },
-                    { "AttributeName": "r", "KeyType": "RANGE" },
-                ],
-                "Projection": { "ProjectionType": "ALL" },
-            }}],
+            "StreamSpecification": {"StreamEnabled": false},
         });
-        if let Some(d) = defs {
-            v["AttributeDefinitions"] = d;
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
         }
-        serde_json::from_value(v).unwrap()
+        serde_json::from_value(body).unwrap()
     };
-    let message = |defs: Option<Value>| match validate_gsi_updates(&input(defs)).unwrap_err() {
-        DynamoDbError::ValidationException(m) => m,
-        other => panic!("{other:?}"),
-    };
+    let iops = "One or more parameter values were invalid: You cannot modify stream status while updating table IOPS";
+    let index = "One or more parameter values were invalid: You cannot create or delete index while changing stream status";
     assert_eq!(
-        message(None),
-        "One or more parameter values were invalid: AttributeDefinitions is not specified for index: gix"
+        stream_change_companion(&with(serde_json::json!({"BillingMode": "PROVISIONED"}))),
+        Some(iops)
     );
     assert_eq!(
-        message(Some(serde_json::json!([]))),
-        "Invalid KeySchema: Some index key attribute have no definition"
+        stream_change_companion(&with(serde_json::json!({
+            "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}
+        }))),
+        Some(iops)
     );
     assert_eq!(
-        message(Some(
-            serde_json::json!([{ "AttributeName": "g", "AttributeType": "S" }])
+        stream_change_companion(&with(serde_json::json!({
+            "GlobalSecondaryIndexUpdates": [{"Delete": {"IndexName": "g"}}]
+        }))),
+        Some(index)
+    );
+    assert_eq!(
+        stream_change_companion(&with(serde_json::json!({
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "g",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }))),
+        Some(index)
+    );
+    assert_eq!(stream_change_companion(&with(serde_json::json!({}))), None);
+    assert_eq!(
+        stream_change_companion(&with(
+            serde_json::json!({"DeletionProtectionEnabled": true})
         )),
-        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [r], AttributeDefinitions: [g]"
+        Some(
+            "One or more parameter values were invalid: DeletionProtection modification must be the only operation in the request"
+        )
     );
-    assert_eq!(
-        message(Some(
-            serde_json::json!([{ "AttributeName": "other", "AttributeType": "S" }])
-        )),
-        "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [g], AttributeDefinitions: [other]"
-    );
-    validate_gsi_updates(&input(Some(serde_json::json!([
-        { "AttributeName": "g", "AttributeType": "S" },
-        { "AttributeName": "r", "AttributeType": "S" },
-    ]))))
-    .unwrap();
-}
-
-#[test]
-fn a_created_gsi_throughput_below_one_is_refused() {
-    let input = |pt: Value| -> UpdateTableInput {
-        serde_json::from_value(serde_json::json!({
-            "TableName": "t",
-            "AttributeDefinitions": [{ "AttributeName": "g", "AttributeType": "S" }],
-            "GlobalSecondaryIndexUpdates": [{ "Create": {
-                "IndexName": "gix",
-                "KeySchema": [{ "AttributeName": "g", "KeyType": "HASH" }],
-                "Projection": { "ProjectionType": "ALL" },
-                "ProvisionedThroughput": pt,
-            }}],
-        }))
-        .unwrap()
-    };
-    for (read, write) in [(0, 0), (0, 1), (1, 0), (-1, 5)] {
-        let pt = serde_json::json!({ "ReadCapacityUnits": read, "WriteCapacityUnits": write });
-        match validate_gsi_updates(&input(pt)).unwrap_err() {
-            DynamoDbError::ValidationException(m) => {
-                assert!(m.ends_with("for index: gix"), "{m}");
-            }
-            other => panic!("({read}, {write}): {other:?}"),
-        }
-    }
-    let ok = serde_json::json!({ "ReadCapacityUnits": 1, "WriteCapacityUnits": 1 });
-    validate_gsi_updates(&input(ok)).unwrap();
+    let no_stream: UpdateTableInput =
+        serde_json::from_value(serde_json::json!({"TableName": "t", "BillingMode": "PROVISIONED"}))
+            .unwrap();
+    assert_eq!(stream_change_companion(&no_stream), None);
 }
 
 #[test]
@@ -136,6 +112,8 @@ fn projected_total_counts_kept_indexes_and_created_ones() {
                 index_size_bytes: 0,
                 item_count: 0,
                 index_arn: String::new(),
+                warm_throughput: None,
+                warm_throughput_record: None,
             },
             GsiDescription {
                 index_name: "dropped".to_owned(),
@@ -146,6 +124,8 @@ fn projected_total_counts_kept_indexes_and_created_ones() {
                 index_size_bytes: 0,
                 item_count: 0,
                 index_arn: String::new(),
+                warm_throughput: None,
+                warm_throughput_record: None,
             },
         ]),
         local_secondary_indexes: Some(vec![LsiDescription {
@@ -235,4 +215,42 @@ fn the_allocation_phase_refusal_is_the_measured_whole_string() {
 fn an_internal_failure_is_still_an_internal_server_error() {
     let err = update_table_err_to_dynamo(StorageError::Internal("disk on fire".to_owned()), "t");
     assert!(matches!(err, DynamoDbError::InternalServerError(_)));
+}
+
+/// Measured 2026-10-24: a `StreamSpecification` object without `StreamEnabled`
+/// gets the null-member sentence. A member that is not an object (a string, a
+/// number, an array) is not that case: it is left to deserialisation, which
+/// refuses it as a `SerializationException`, as before the member check.
+#[test]
+fn a_stream_specification_that_is_not_an_object_is_a_serialization_error() {
+    let null_member = "1 validation error detected: Value null at 'streamSpecification.streamEnabled' failed to satisfy constraint: Member must not be null";
+    for spec in [
+        serde_json::json!({}),
+        serde_json::json!({"StreamViewType": "KEYS_ONLY"}),
+        serde_json::json!({"StreamEnabled": null}),
+    ] {
+        let body = serde_json::json!({"TableName": "t", "StreamSpecification": spec});
+        match crate::require_stream_enabled_member(&body) {
+            Err(DynamoDbError::ValidationException(m)) => assert_eq!(m, null_member),
+            other => panic!("{other:?}"),
+        }
+    }
+    for spec in [
+        serde_json::json!("x"),
+        serde_json::json!(1),
+        serde_json::json!([]),
+        serde_json::json!(true),
+    ] {
+        let body = serde_json::json!({"TableName": "t", "StreamSpecification": spec});
+        crate::require_stream_enabled_member(&body).expect("not the member check's case");
+        let err = serde_json::from_value::<UpdateTableInput>(body)
+            .map_err(crate::deserialize_error)
+            .expect_err("a non-object specification does not deserialise");
+        assert!(
+            matches!(err, DynamoDbError::SerializationException(_)),
+            "{err:?}"
+        );
+    }
+    let body = serde_json::json!({"TableName": "t", "StreamSpecification": null});
+    crate::require_stream_enabled_member(&body).expect("an absent member");
 }

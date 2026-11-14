@@ -170,20 +170,23 @@ pub fn stream_does_not_exist() -> StorageError {
 }
 
 /// What `GetShardIterator` answers for a shard that is not one of the named
-/// stream's shards: the stream-not-found sentence with a trailing period. The
-/// service answers "Requested resource not found: Shard does not exist"
-/// (measured 2026-10-24), so this text differs from it.
+/// stream's shards. Measured 2026-10-24 for a shard id of the table's other
+/// stream, on the old and on the new stream ARN, and for a well-formed shard id
+/// the account never had.
+pub const SHARD_DOES_NOT_EXIST: &str = "Requested resource not found: Shard does not exist";
+
+/// [`SHARD_DOES_NOT_EXIST`] as the storage error the engine maps to a
+/// `ResourceNotFoundException`.
 #[must_use]
-pub fn shard_not_in_stream(stream_arn: &str) -> StorageError {
-    StorageError::TableNotFound(format!(
-        "Requested resource not found: Stream: {stream_arn} not found."
-    ))
+pub fn shard_does_not_exist() -> StorageError {
+    StorageError::TableNotFound(SHARD_DOES_NOT_EXIST.to_owned())
 }
 
 #[cfg(test)]
 mod stream_not_found_tests {
     use super::{
-        STREAM_DOES_NOT_EXIST, shard_not_in_stream, stream_does_not_exist, stream_not_found,
+        SHARD_DOES_NOT_EXIST, STREAM_DOES_NOT_EXIST, shard_does_not_exist, stream_does_not_exist,
+        stream_not_found,
     };
     use crate::error::StorageError;
 
@@ -215,11 +218,12 @@ mod stream_not_found_tests {
     }
 
     #[test]
-    fn a_shard_of_no_stream_of_the_table_keeps_the_sentence_with_the_period() {
+    fn get_shard_iterator_says_a_shard_of_no_stream_of_the_table_does_not_exist() {
         assert_eq!(
-            message(shard_not_in_stream(ARN)),
-            format!("Requested resource not found: Stream: {ARN} not found.")
+            SHARD_DOES_NOT_EXIST,
+            "Requested resource not found: Shard does not exist"
         );
+        assert_eq!(message(shard_does_not_exist()), SHARD_DOES_NOT_EXIST);
     }
 }
 
