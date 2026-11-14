@@ -84,7 +84,7 @@ If `python3 --version` reports older than 3.10, upgrade via the same package man
 
 ## Version parsing
 
-`rustc --version` prints `rustc 1.91.1 (abcdef0 2025-01-01)`. Extract the version field with `awk`:
+`rustc --version` prints `rustc 1.91.1 (ed61e7d7e 2025-11-07)`. Extract the version field with `awk`:
 
 ```bash
 rustc --version | awk '{print $2}'
