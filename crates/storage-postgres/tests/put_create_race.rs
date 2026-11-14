@@ -847,6 +847,12 @@ async fn a_lost_create_race_gives_the_lsi_and_the_stream_the_winner() {
     .expect("read c");
     assert_eq!(v, "loser");
 
+    // A write leaves its stream record in stream_pending until a read or the
+    // numbering worker numbers it (#808). This test stands in for the worker.
+    s.engine
+        .number_pending_stream_records_for_tests()
+        .await
+        .expect("number the pending stream records");
     let records: Vec<(serde_json::Value,)> = sqlx::query_as(
         "SELECT record_data FROM stream_records WHERE table_id = $1 ORDER BY sequence_number",
     )

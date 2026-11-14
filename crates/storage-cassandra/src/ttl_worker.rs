@@ -1279,8 +1279,9 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                     match outcome {
                         Ok(true) => {
                             deleted += 1;
-                            metrics.record_ttl_deletion(table_name);
+                            metrics.record_ttl_deletion(account_id, table_name);
                             metrics.record_ttl_staleness(
+                                account_id,
                                 table_name,
                                 now_epoch.saturating_sub(expires_at) as f64,
                             );
@@ -1289,7 +1290,7 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                         // One row's failure must not abandon the wave or the
                         // table: its durable queue state drives its own retry.
                         Err(error) => {
-                            metrics.record_ttl_sweep_row_error(table_name);
+                            metrics.record_ttl_sweep_row_error(account_id, table_name);
                             tracing::warn!("TTL worker: row failed in {table_name}: {error}");
                         }
                     }

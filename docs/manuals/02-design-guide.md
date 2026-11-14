@@ -11,9 +11,9 @@ examples below name the PostgreSQL databases; other backends map the same two
 roles onto their own structures (see backend-specific documentation).
 
 - **Catalog** (e.g., the `extenddb_catalog` PostgreSQL database): All metadata — table definitions, indexes, accounts, IAM entities, settings, stream metadata, and schema history.
-- **Data** (e.g., the `extenddb_catalog_data` PostgreSQL database): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
+- **Data** (the `extenddb` PostgreSQL database for the default catalog `extenddb_catalog`): User item data. Each DynamoDB table maps to a PostgreSQL table. GSI and LSI data are stored in separate PostgreSQL tables.
 
-On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_url`. This allows the catalog and data databases to live on different PostgreSQL instances.
+On PostgreSQL, the data database connection string is stored in the catalog's `settings` table under the key `data_database_connection_string`, and its name under `data_database_name`. This allows the catalog and data databases to live on different PostgreSQL instances.
 
 ### Catalog Tables
 
@@ -23,7 +23,7 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `tables` | DynamoDB table metadata. Composite PK: `(account_id, table_name)`. Stores key schema, attribute definitions, billing mode, stream spec, status, ARN, and TTL config. |
 | `indexes` | GSI/LSI metadata. FK on `table_id` (UUID) with CASCADE delete. |
 | `tags` | Resource tags. PK: `(resource_arn, tag_key)`. |
-| `settings` | Key-value store for catalog version, data DB URL, and runtime settings. |
+| `settings` | Key-value store for catalog version, data DB URL, the AES-256-GCM key that encrypts access key secrets (`encryption_key`), and runtime settings. |
 | `schema_history` | Migration tracking. Records which SQL files have been applied. |
 | `admin_users` | Admin credentials (bcrypt-hashed passwords). |
 | `iam_users` | IAM users scoped to accounts. Optional console password. |
@@ -37,9 +37,9 @@ On PostgreSQL, the data database connection string is stored in the catalog's `s
 | `iam_user_tags` | Tags on IAM users. |
 | `iam_role_tags` | Tags on IAM roles. |
 | `permissions_boundaries` | Permissions boundaries for users and roles. |
-| `encryption_keys` | AES-256-GCM key used to encrypt access key secrets. |
 | `stream_shards` | Stream shard metadata (parent shard, sequence range). |
 | `stream_records` | Stream change records with 24-hour retention. |
+| `stream_pending` | Stream records that wait for their sequence number. A write stores its record here, and the record moves to `stream_records` once the write has committed. |
 
 ### Data Tables
 
@@ -126,15 +126,17 @@ Policy conditions support all IAM condition operators: `StringEquals`, `StringNo
 
 ### Credential Storage
 
-Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `encryption_keys` table. Each access key record stores the encrypted secret and a unique nonce.
+Access key secrets are encrypted at rest using AES-256-GCM. The encryption key is generated during `extenddb init` and stored in the `settings` table under the key `encryption_key`. Each access key record stores the encrypted secret and a unique nonce.
 
-Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The encryption key used to decrypt secrets is cached at startup because it is immutable after `extenddb init` (see Caching Design below).
+Credential lookups (access key ID → decrypted secret) go through each server's in-memory credential cache; a miss reads the database. See Credential and Policy Caching in the Security Model. The server reads the encryption key that decrypts secrets once, at startup. extenddb never changes the key. A change made by hand in the `settings` table takes effect at the next restart. See Credential Storage in the Security Model, and Caching Design below.
 
 ## DynamoDB Streams Internals
 
 ### Record Capture
 
 Stream records are captured atomically with data writes. The engine constructs a `StreamCapture` struct with metadata (stream ARN, view type, shard ID, sequence number, keys). The storage backend persists the stream record in the same PostgreSQL transaction as the data write.
+
+On PostgreSQL the record waits in `stream_pending`, with no sequence number, until the write commits. GetRecords and a `LATEST` shard iterator first number one batch of the committed records of the shard they read, in the order the writes stored them: 1,000 records, or fewer once the records hold 1 MiB of JSON text. Every 250 ms a background worker numbers up to 10,000 committed records of each shard that has some, and skips a shard that another transaction numbers, so the records of a shard that nobody reads are numbered too. A number drawn inside the write's transaction could commit after a higher number that a consumer had already read past, and that consumer would never receive the record. A read returns the records whose writes committed before it started, except in three cases: more records of the shard wait for their numbers than one batch takes, another transaction numbers the shard for longer than one second, or the read's numbering fails, which the server logs as a warning. The records left waiting get higher numbers than any the read returned, from a later read or the worker, and a later read returns them. In the same three cases a `LATEST` iterator can return records whose writes committed before it was taken. The order needs `stream_seq` and `stream_pending_id_seq` to keep a cache of one value per session, which migration 7 sets; a larger cache lets a record take a number below one a consumer has read.
 
 For UpdateItem, the `new_image` is not known until after `apply_update` runs inside the transaction, so the storage backend constructs the full `StreamRecord` after the update.
 
@@ -188,7 +190,7 @@ extenddb caches a small set of operational settings in memory to avoid per-reque
 | Setting | Mechanism | Refresh | Justification |
 |---------|-----------|---------|---------------|
 | `index_propagation_delay_ms` | `AtomicU64` | Background poller every 30s | Write-path hot path; briefly-stale value only affects GSI propagation timing |
-| `encryption_key` | `Arc<str>` loaded at startup | Never (immutable after `extenddb init`) | Decryption key for access key secrets; generated once, never changes |
+| `encryption_key` | `Arc<str>` loaded at startup | Never: read at startup, so a change made by hand takes a restart | Decryption key for access key secrets. extenddb generates it once and never changes it |
 | `log_level` / `log_destination` | Tracing filter reload | Background poller every 30s | Observability tuning; stale value only delays log level changes |
 | `throttling_enabled` | `AtomicBool` | Background poller every 30s | Capacity management toggle; briefly-stale is safe |
 
@@ -231,6 +233,6 @@ Caching of operational settings is currently unconditional. If issues arise (e.g
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

@@ -66,7 +66,11 @@ pub enum CallerIdentity {
 /// Extract and verify credentials from the `Authorization: Basic ...` header.
 ///
 /// Tries admin auth first (`name:password`). If the admin name is not found,
-/// tries IAM user auth (`account_id/user_name:password`).
+/// tries IAM user auth (`account_id/user_name:password`). An admitted
+/// attempt runs one bcrypt check whatever the name. When an admin has the
+/// name, the check is against the admin's hash. Otherwise the IAM user step
+/// runs it, against the user's hash, or against a fixed hash when no IAM user
+/// with a console password has the name.
 ///
 /// Returns the caller identity on success, or an error response on failure.
 ///
@@ -220,8 +224,12 @@ async fn try_admin_auth(
 }
 
 /// Check `password` for IAM user `account_id/user_name`. `Ok(None)` is a
-/// wrong password or an unknown user; `Err` is the 500 answered to a storage
-/// error.
+/// wrong password, an unknown user or a name without `/`; `Err` is the 500
+/// answered to a storage error, including a timed-out wait for a bcrypt slot.
+///
+/// A name without `/` names no IAM user. It is checked against a fixed hash,
+/// so that it runs one bcrypt check, as a login for an existing admin or IAM
+/// user does.
 #[allow(clippy::similar_names)]
 #[allow(clippy::result_large_err)] // axum Response as rejection is this module's idiom
 async fn try_iam_user_auth(
@@ -229,37 +237,240 @@ async fn try_iam_user_auth(
     password: &str,
     store: &dyn extenddb_storage::CatalogStore,
 ) -> Result<Option<CallerIdentity>, Response> {
-    let Some((acct_id, uname)) = username.split_once('/') else {
-        return Ok(None);
+    let user = username.split_once('/');
+    let checked = match user {
+        Some((acct_id, uname)) => {
+            store
+                .verify_iam_user_password(acct_id, uname, password)
+                .await
+        }
+        None => extenddb_storage::password::verify_stored_password(password.to_owned(), None).await,
     };
+    let valid = checked.map_err(|e| {
+        log_password_check_error("Management API: DB error during IAM user auth", &e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
-    let valid = store
-        .verify_iam_user_password(acct_id, uname, password)
-        .await
-        .map_err(|e| {
-            log_password_check_error("Management API: DB error during IAM user auth", &e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
-
-    if valid {
-        Ok(Some(CallerIdentity::IamUser {
+    Ok(match user {
+        Some((acct_id, uname)) if valid => Some(CallerIdentity::IamUser {
             account_id: acct_id.to_owned(),
             user_name: uname.to_owned(),
-        }))
-    } else {
-        Ok(None)
-    }
+        }),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use extenddb_storage::management_store::{AdminEntry, OpResult};
-    use extenddb_storage::password::VERIFY_OVERLOADED;
+    use extenddb_storage::management_store::{AdminEntry, ManagementStore, OpResult};
+    use extenddb_storage::password::{VERIFY_OVERLOADED, count_verifications};
     use futures::future::BoxFuture;
 
     use super::*;
     use crate::rate_limit::PRINCIPAL_LIMITED;
-    use crate::rate_limit::tests::capture_logs;
+    use crate::rate_limit::tests::{MemoryStore, capture_logs, peer};
+
+    /// The password of every principal in [`login_catalog`].
+    const PASSWORD: &str = "correct horse";
+
+    /// A password no principal in [`login_catalog`] has.
+    const WRONG: &str = "battery staple";
+
+    /// bcrypt's lowest cost, for the hashes in [`login_catalog`]. It keeps the
+    /// tests fast and tells a check against a stored hash apart from one
+    /// against the fixed hash, which is at the default cost.
+    const TEST_COST: u32 = 4;
+
+    /// An in-memory SQLite catalog with the admins `alice` and `team/root`,
+    /// and in account 123456789012 the IAM user `bob`, who has a console
+    /// password, and `carol`, who has none. Every password is [`PASSWORD`],
+    /// hashed at [`TEST_COST`].
+    pub(crate) async fn login_catalog() -> extenddb_storage_sqlite::SqliteCatalogStore {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        let migrations = extenddb_storage_sqlite::migrations::SqliteMigrations::on_pool(
+            pool.clone(),
+            ":memory:",
+        )
+        .expect("one connection");
+        extenddb_storage::migrations::Runner::new(&migrations, "test")
+            .migrate()
+            .await
+            .expect("migrate the catalog");
+        let catalog = extenddb_storage_sqlite::SqliteCatalogStore::new(pool);
+        let hash = bcrypt::hash(PASSWORD, TEST_COST).unwrap();
+        for admin in ["alice", "team/root"] {
+            catalog.create_admin(admin, &hash).await.unwrap();
+        }
+        catalog
+            .create_account("123456789012", "logins")
+            .await
+            .unwrap();
+        catalog
+            .create_user("123456789012", "bob", Some(&hash))
+            .await
+            .unwrap();
+        catalog
+            .create_user("123456789012", "carol", None)
+            .await
+            .unwrap();
+        catalog
+    }
+
+    /// How a login attempt in [`LOGIN_CASES`] ends.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Outcome {
+        Admin,
+        IamUser,
+        Refused,
+    }
+
+    impl Outcome {
+        pub(crate) fn of(identity: Option<&CallerIdentity>) -> Self {
+            match identity {
+                Some(CallerIdentity::Admin(_)) => Self::Admin,
+                Some(CallerIdentity::IamUser { .. }) => Self::IamUser,
+                None => Self::Refused,
+            }
+        }
+    }
+
+    /// A login attempt against [`login_catalog`].
+    pub(crate) struct LoginCase {
+        pub(crate) case: &'static str,
+        pub(crate) username: &'static str,
+        pub(crate) password: &'static str,
+        pub(crate) outcome: Outcome,
+        /// The bcrypt cost of the one check the login runs: [`TEST_COST`]
+        /// against a stored hash, bcrypt's default cost against the fixed
+        /// hash.
+        pub(crate) cost: u32,
+    }
+
+    /// One login attempt for each path through the admin and IAM user checks.
+    pub(crate) const LOGIN_CASES: &[LoginCase] = &[
+        LoginCase {
+            case: "admin, right password",
+            username: "alice",
+            password: PASSWORD,
+            outcome: Outcome::Admin,
+            cost: TEST_COST,
+        },
+        LoginCase {
+            case: "admin, wrong password",
+            username: "alice",
+            password: WRONG,
+            outcome: Outcome::Refused,
+            cost: TEST_COST,
+        },
+        LoginCase {
+            case: "unknown name without a slash",
+            username: "nobody",
+            password: PASSWORD,
+            outcome: Outcome::Refused,
+            cost: bcrypt::DEFAULT_COST,
+        },
+        LoginCase {
+            case: "IAM user, right password",
+            username: "123456789012/bob",
+            password: PASSWORD,
+            outcome: Outcome::IamUser,
+            cost: TEST_COST,
+        },
+        LoginCase {
+            case: "IAM user, wrong password",
+            username: "123456789012/bob",
+            password: WRONG,
+            outcome: Outcome::Refused,
+            cost: TEST_COST,
+        },
+        LoginCase {
+            case: "IAM user without a console password",
+            username: "123456789012/carol",
+            password: PASSWORD,
+            outcome: Outcome::Refused,
+            cost: bcrypt::DEFAULT_COST,
+        },
+        LoginCase {
+            case: "unknown IAM user",
+            username: "123456789012/nobody",
+            password: PASSWORD,
+            outcome: Outcome::Refused,
+            cost: bcrypt::DEFAULT_COST,
+        },
+        LoginCase {
+            case: "unknown account",
+            username: "111122223333/bob",
+            password: PASSWORD,
+            outcome: Outcome::Refused,
+            cost: bcrypt::DEFAULT_COST,
+        },
+        LoginCase {
+            case: "admin named with a slash, wrong password",
+            username: "team/root",
+            password: WRONG,
+            outcome: Outcome::Refused,
+            cost: TEST_COST,
+        },
+    ];
+
+    /// An `Authorization: Basic` header for `username` and `password`.
+    fn basic_auth(username: &str, password: &str) -> HeaderMap {
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Basic {token}").parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn every_login_path_runs_one_bcrypt_check() {
+        let catalog = login_catalog().await;
+        let attempts = MemoryStore::default();
+        // Each case uses its own source address: the in-flight registry is
+        // process-wide.
+        for (n, login) in (1..).zip(LOGIN_CASES) {
+            let ip = format!("192.0.2.{n}");
+            let headers = basic_auth(login.username, login.password);
+            let (result, costs) =
+                count_verifications(authenticate(&headers, &catalog, &attempts, peer(&ip))).await;
+            assert_eq!(
+                costs,
+                [login.cost],
+                "{}: bcrypt checks and their cost",
+                login.case
+            );
+            let identity = match result {
+                Ok(identity) => Some(identity),
+                Err(response) => {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "{}",
+                        login.case
+                    );
+                    None
+                }
+            };
+            assert_eq!(
+                Outcome::of(identity.as_ref()),
+                login.outcome,
+                "{}",
+                login.case
+            );
+            let failures = i64::from(login.outcome == Outcome::Refused);
+            assert_eq!(
+                attempts.rows_for(login.username, &ip),
+                failures,
+                "{}: failures recorded",
+                login.case
+            );
+        }
+    }
 
     /// An admin store whose password check fails with `OpError::Internal`
     /// carrying `message`. Logins call nothing else on it.

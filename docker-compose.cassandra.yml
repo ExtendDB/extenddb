@@ -253,7 +253,7 @@ services:
       - "127.0.0.1:${EXTENDDB_PORT:-18443}:18443"
     volumes:
       - extenddb-state:/var/lib/extenddb
-    stop_grace_period: 15s
+    stop_grace_period: 80s
     restart: unless-stopped
 
 volumes:
