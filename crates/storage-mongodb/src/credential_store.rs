@@ -36,6 +36,24 @@ impl MongoCredentialStore {
         self.client.database("extenddb_catalog")
     }
 
+    /// Whether `account_id` has a document in `accounts`. Before account
+    /// deletes removed them, a deleted account's access keys and role
+    /// sessions stayed in the catalog; a credential of an account that no
+    /// longer exists is unknown.
+    async fn account_exists(&self, account_id: &str) -> Result<bool, DynamoDbError> {
+        self.catalog_db()
+            .collection::<Document>("accounts")
+            .find_one(doc! { "account_id": account_id })
+            .await
+            .map(|d| d.is_some())
+            .map_err(|e| {
+                tracing::error!("Account lookup failed for account {account_id}: {e}");
+                DynamoDbError::InternalServerError(
+                    "Internal error during authentication".to_owned(),
+                )
+            })
+    }
+
     async fn lookup_user_credential(
         &self,
         access_key_id: &str,
@@ -65,6 +83,9 @@ impl MongoCredentialStore {
         // a corrupted or partially written access-key record cannot silently
         // authenticate.
         let is_active = key_doc.get_bool("is_active").unwrap_or(false);
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let secret_key =
             decrypt_secret(&encrypted, &self.encryption_key, access_key_id).map_err(|e| {
@@ -127,6 +148,9 @@ impl MongoCredentialStore {
             .get_str("session_token")
             .unwrap_or_default()
             .to_owned();
+        if !self.account_exists(&account_id).await? {
+            return Ok(None);
+        }
 
         let expires_at = session_doc.get_datetime("expires_at").map_err(|_| {
             DynamoDbError::InternalServerError("Internal error during authentication".to_owned())

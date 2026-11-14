@@ -78,6 +78,12 @@ pub struct ServerConfig {
     /// Enable provisioned throughput throttling via token buckets.
     /// When `None` or `false`, all requests are allowed regardless of capacity.
     pub throttling_enabled: Option<bool>,
+    /// Seconds a connection may take to deliver its request headers, and
+    /// seconds a request body may go without delivering data, before the
+    /// server closes the connection. Bounds how long a stalled or malicious
+    /// client can hold a connection open. Default 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     /// What `serve` does with a catalog that is behind this binary: refuse
     /// it, or apply its pending migrations before it serves. `refuse` by
     /// default, `apply` in a dev-mode build. `serve --migrate` sets `apply`
@@ -91,6 +97,10 @@ pub struct ServerConfig {
     pub catalog_upgrade_lock_timeout: u64,
 }
 
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -100,6 +110,7 @@ impl Default for ServerConfig {
             run_dir: default_run_dir(),
             tls: TlsConfig::default(),
             throttling_enabled: None,
+            request_timeout_secs: default_request_timeout_secs(),
             catalog_upgrade: catalog_upgrade::default_catalog_upgrade(),
             catalog_upgrade_lock_timeout: catalog_upgrade::default_catalog_upgrade_lock_timeout(),
         }
@@ -190,6 +201,23 @@ impl StorageConfig {
     /// Get operator-facing warnings for non-default storage settings.
     pub fn startup_warnings(&self) -> Vec<extenddb_storage::config::StartupWarning> {
         self.config.startup_warnings()
+    }
+
+    /// The local file the database lives in, when the backend's database is
+    /// one file on this host ([`extenddb_storage::config::StorageConfig::database_file`]).
+    #[must_use]
+    pub fn database_file(&self) -> Option<PathBuf> {
+        self.config.database_file()
+    }
+
+    /// [`Self::database_file`] with the reason a location names no usable
+    /// file ([`extenddb_storage::config::StorageConfig::database_location`]).
+    ///
+    /// # Errors
+    ///
+    /// The backend's reason the location is not usable.
+    pub fn database_location(&self) -> Result<Option<PathBuf>, String> {
+        self.config.database_location()
     }
 
     /// Get a reference to the underlying trait object for factory calls.
@@ -419,7 +447,14 @@ fn default_log_format() -> String {
 /// in dev-mode builds.
 #[must_use]
 pub fn is_tls_enabled(config: &AppConfig) -> bool {
-    config.server.tls.enabled && !cfg!(feature = "dev-mode")
+    serves_tls(&config.server.tls)
+}
+
+/// [`is_tls_enabled`] for the TLS section alone: whether a server with this
+/// section loads its certificate and key.
+#[must_use]
+pub fn serves_tls(tls: &TlsConfig) -> bool {
+    tls.enabled && !cfg!(feature = "dev-mode")
 }
 
 /// Load `AppConfig` from a config file (optional) and environment variables.
@@ -436,9 +471,13 @@ pub fn load(config_path: &str) -> anyhow::Result<AppConfig> {
     validated(config.try_deserialize()?)
 }
 
-/// The cross-field checks a deserialized config still has to pass.
-fn validated(config: AppConfig) -> anyhow::Result<AppConfig> {
+/// The cross-field checks a deserialized config still has to pass, and the
+/// paths made absolute while the working directory is still the shell's.
+fn validated(mut config: AppConfig) -> anyhow::Result<AppConfig> {
     config.backup.validate().map_err(|e| anyhow::anyhow!(e))?;
+    if let Ok(cwd) = std::env::current_dir() {
+        config.backup.make_paths_absolute(&cwd);
+    }
     Ok(config)
 }
 

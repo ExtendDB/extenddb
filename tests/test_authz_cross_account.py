@@ -11,6 +11,16 @@ exists (measured 2026-11-03 in us-east-1 with an account that exists and with
 999999999999, which does not). Here an account exists when the deployment's
 catalog holds it: the tests create one and use another that is never created.
 
+A StreamArn, and a stream ARN in a tag operation's ResourceArn, were measured
+the same way on 2026-11-05 (tabled in the module docstring of
+tests/test_stream_arn_scope.py). A StreamArn that is not a stream ARN, or has
+an empty partition or service field, is "Invalid StreamArn" in every account.
+One with another partition, service or region is "Invalid StreamArn" in an
+account that exists and "Access is denied" in one that does not. A tag
+operation's stream ARN gets the answers above whatever its partition, service
+and region are, except that for an empty region in an account that exists the
+service's denial has no reason clause, which ExtendDB does not match.
+
 The tag operations match their policies against the ResourceArn as written,
 as the service does: a caller allowed only on the canonical table ARN is denied
 the aws-cn, s3 and us-west-2 spellings of it (measured 2026-11-03).
@@ -33,7 +43,7 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED, wait_for_active
 from management_helpers import ManagementClient
 
 ALLOW_ALL = {
@@ -57,7 +67,9 @@ MIXED_ACCOUNTS = (
     "ValidationException",
     "Invalid request! All tables in the request must be from a single account.",
 )
+INVALID_STREAM_ARN = ("ValidationException", "Invalid StreamArn")
 KEY = {"pk": {"S": "p1"}}
+SHARD_ID = "shardId-00000001700000000000-00000000"
 
 
 def _client(endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb") -> Any:
@@ -164,7 +176,10 @@ def _requests(t: str, table: dict) -> list[tuple[str, str, str, str, Any]]:
     that exists and "Access is denied" for one that does not; "item" answers
     the same denial and "The caller is not authorized ..."; "owner" answers
     the owner-only ValidationException and "Access is denied"; "pitr" answers
-    the owner-only ValidationException for both.
+    the point-in-time recovery refusal for both, which ExtendDB gives before
+    authorization (the service answers the owner-only ValidationException);
+    "enable" is an UpdateContinuousBackups enable, which ExtendDB refuses the
+    same way.
     """
     stream = f"{t}/stream/{table['stream_label']}"
     backup = f"{t}/backup/{table['backup_id']}"
@@ -238,6 +253,14 @@ def _requests(t: str, table: dict) -> list[tuple[str, str, str, str, Any]]:
         ("RestoreTableToPointInTime", "pitr", "", "",
          lambda c: c["dynamodb"].restore_table_to_point_in_time(
              SourceTableArn=t, TargetTableName=f"p{uuid.uuid4().hex[:8]}")),
+        ("UpdateContinuousBackups disable", "owner", "", "",
+         lambda c: c["dynamodb"].update_continuous_backups(
+             TableName=t,
+             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": False})),
+        ("UpdateContinuousBackups enable", "enable", "", "",
+         lambda c: c["dynamodb"].update_continuous_backups(
+             TableName=t,
+             PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})),
     ]
 
 
@@ -250,7 +273,11 @@ def test_other_account_answer_depends_on_operation_and_account(env, table, polic
         for label, family, action, resource, call in _requests(t, table):
             code, msg = _error(lambda: call(clients))
             where = (label, "known" if known else "unknown", code, msg)
-            if family == "pitr" or (family == "owner" and known):
+            if family == "pitr":
+                assert (code, msg) == RESTORE_REFUSED, where
+            elif family == "enable":
+                assert (code, msg) == ENABLE_REFUSED, where
+            elif family == "owner" and known:
                 assert (code, msg) == OWNER_ONLY, where
             elif known:
                 assert code == "AccessDeniedException", where
@@ -289,11 +316,10 @@ def test_tables_in_more_than_one_account_are_refused(env, table, policy):
 def test_shape_checks_run_before_a_known_accounts_denial(env, table):
     # Measured 2026-11-03: an index or backup ARN in ResourceArn gets the
     # shape ValidationException in an account that exists and "Access is
-    # denied" in one that does not. The service answers a StreamArn in another
-    # partition or region the same way; ExtendDB does not check that yet
-    # (#451), so the StreamArn case below uses a table ARN, which its
-    # StreamArn check refuses. That input was not sent to the service with
-    # another account's ARN.
+    # denied" in one that does not. Measured 2026-11-05: a table ARN in
+    # StreamArn is "Invalid StreamArn" in both, so that check runs before the
+    # account is looked at. The other StreamArn cells measured that day are in
+    # the tests below.
     clients = _principal(env, NO_POLICY)
     d, streams = clients["dynamodb"], clients["dynamodbstreams"]
     region = env["region"]
@@ -307,9 +333,126 @@ def test_shape_checks_run_before_a_known_accounts_denial(env, table):
     for arn in (f"{unknown}/index/gsi1", f"{unknown}/backup/{table['backup_id']}"):
         assert _error(lambda a=arn: d.list_tags_of_resource(ResourceArn=a)) == ACCESS_IS_DENIED, arn
     # A table ARN where a stream ARN belongs.
-    assert _error(lambda: streams.describe_stream(StreamArn=known)) == (
-        "ValidationException", "Invalid StreamArn")
-    assert _error(lambda: streams.describe_stream(StreamArn=unknown)) == ACCESS_IS_DENIED
+    assert _error(lambda: streams.describe_stream(StreamArn=known)) == INVALID_STREAM_ARN
+    assert _error(lambda: streams.describe_stream(StreamArn=unknown)) == INVALID_STREAM_ARN
+
+
+def _stream_arn(env: dict, account: str, table: dict) -> str:
+    return (f"arn:aws:dynamodb:{env['region']}:{account}:table/{table['name']}"
+            f"/stream/{table['stream_label']}")
+
+
+def _respelled_stream_arns(env: dict, account: str, table: dict) -> dict[str, str]:
+    """The stream ARN spellings measured on 2026-11-05, keyed by name."""
+    arn = _stream_arn(env, account, table)
+    region = env["region"]
+    other_region = "us-west-2" if region != "us-west-2" else "us-east-1"
+    return {
+        "aws-cn": arn.replace("arn:aws:", "arn:aws-cn:", 1),
+        "aws-us-gov": arn.replace("arn:aws:", "arn:aws-us-gov:", 1),
+        "DynamoDB": arn.replace(":dynamodb:", ":DynamoDB:", 1),
+        "DYNAMODB": arn.replace(":dynamodb:", ":DYNAMODB:", 1),
+        "s3": arn.replace(":dynamodb:", ":s3:", 1),
+        "other-region": arn.replace(f":{region}:", f":{other_region}:", 1),
+        "upper-case-region": arn.replace(f":{region}:", f":{region.upper()}:", 1),
+        "empty-region": arn.replace(f":{region}:", "::", 1),
+        "empty-partition": arn.replace("arn:aws:", "arn::", 1),
+        "empty-service": arn.replace(":dynamodb:", "::", 1),
+    }
+
+
+def _stream_calls(clients: dict, arn: str) -> dict:
+    s = clients["dynamodbstreams"]
+    return {
+        "DescribeStream": lambda: s.describe_stream(StreamArn=arn),
+        "GetShardIterator": lambda: s.get_shard_iterator(
+            StreamArn=arn, ShardId=SHARD_ID, ShardIteratorType="TRIM_HORIZON"),
+    }
+
+
+def _tag_calls(clients: dict, arn: str) -> dict:
+    d = clients["dynamodb"]
+    return {
+        "ListTagsOfResource": lambda: d.list_tags_of_resource(ResourceArn=arn),
+        "TagResource": lambda: d.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]),
+        "UntagResource": lambda: d.untag_resource(ResourceArn=arn, TagKeys=["k"]),
+    }
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["account-exists", "no-such-account"])
+@pytest.mark.parametrize("policy", [NO_POLICY, ALLOW_ALL], ids=["no-policy", "admin"])
+def test_stream_arn_holding_another_kind_of_arn_is_invalid(env, table, policy, known):
+    """A table, index or backup ARN in StreamArn is ValidationException "Invalid
+    StreamArn" on DescribeStream and GetShardIterator, in an account that exists
+    and in one that does not, for an admin and a no-policy caller alike: the
+    service checks the kind of ARN before its account (measured 2026-11-05)."""
+    clients = _principal(env, policy)
+    account = env["known"] if known else env["unknown"]
+    t = f"arn:aws:dynamodb:{env['region']}:{account}:table/{table['name']}"
+    for kind, arn in (
+        ("table", t),
+        ("index", f"{t}/index/gsi1"),
+        ("backup", f"{t}/backup/{table['backup_id']}"),
+    ):
+        for op, call in _stream_calls(clients, arn).items():
+            assert _error(call) == INVALID_STREAM_ARN, (kind, op, arn)
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["account-exists", "no-such-account"])
+@pytest.mark.parametrize("policy", [NO_POLICY, ALLOW_ALL], ids=["no-policy", "admin"])
+def test_respelled_stream_arn_in_another_account(env, table, policy, known):
+    """A stream ARN in another account in StreamArn, on DescribeStream and
+    GetShardIterator, with another partition (aws-cn, aws-us-gov), service
+    (DynamoDB, DYNAMODB, s3) or region (another one, upper case, empty):
+    ValidationException "Invalid StreamArn" in an account that exists and
+    "Access is denied" in one that does not. An empty partition or service is
+    "Invalid StreamArn" in both. The same for an admin and a no-policy caller
+    (measured 2026-11-05). The canonical spelling is asserted in
+    test_other_account_answer_depends_on_operation_and_account."""
+    clients = _principal(env, policy)
+    account = env["known"] if known else env["unknown"]
+    for label, arn in _respelled_stream_arns(env, account, table).items():
+        if known or label in ("empty-partition", "empty-service"):
+            expected = INVALID_STREAM_ARN
+        else:
+            expected = ACCESS_IS_DENIED
+        for op, call in _stream_calls(clients, arn).items():
+            assert _error(call) == expected, (label, op, arn)
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["account-exists", "no-such-account"])
+@pytest.mark.parametrize("policy", [NO_POLICY, ALLOW_ALL], ids=["no-policy", "admin"])
+def test_stream_arn_in_another_account_in_a_tag_operation(env, table, policy, known):
+    """A stream ARN in another account in the ResourceArn of ListTagsOfResource,
+    TagResource and UntagResource, canonical or with another partition, service
+    or region: in an account that exists, the AccessDeniedException that names
+    the ARN as written and says no resource-based policy allows the action; in
+    one that does not, "Access is denied". The same for an admin and a no-policy
+    caller (measured 2026-11-05). An empty region is "Access is denied" in an
+    account that does not exist. In one that exists the service's denial for it
+    has no reason clause, which ExtendDB does not match, so that cell is not
+    asserted."""
+    clients = _principal(env, policy)
+    account = env["known"] if known else env["unknown"]
+    respelled = _respelled_stream_arns(env, account, table)
+    cells = {"canonical": _stream_arn(env, account, table)}
+    cells.update({label: arn for label, arn in respelled.items()
+                  if label not in ("empty-partition", "empty-service", "empty-region")})
+    if not known:
+        cells["empty-region"] = respelled["empty-region"]
+    for label, arn in cells.items():
+        for op, call in _tag_calls(clients, arn).items():
+            code, msg = _error(call)
+            where = (label, op, code, msg)
+            if not known:
+                assert (code, msg) == ACCESS_IS_DENIED, where
+                continue
+            assert code == "AccessDeniedException", where
+            assert msg.startswith(f"User: arn:aws:iam::{env['caller']}:user/"), where
+            assert msg.endswith(
+                f" is not authorized to perform: dynamodb:{op} on resource: {arn} "
+                f"because no resource-based policy allows the dynamodb:{op} action"
+            ), where
 
 
 def test_tag_operations_match_the_arn_as_written(env, table):

@@ -56,8 +56,17 @@ import time
 import tomllib
 
 from catalog_checks import (
-    expect_exit, finish, healthy, kill_daemon, report, run, run_split, start, stop,
+    expect_exit,
+    finish,
+    healthy,
+    kill_daemon,
+    report,
+    run,
+    run_split,
+    start,
+    stop,
     watch_lost_registration,
+    with_filesystem_store,
 )
 from catalog_checks import pid_file as pid_file_for
 
@@ -298,6 +307,47 @@ def main(binary: str, container: str, contact_point: str, port: int) -> int:
             env,
         )
         report(time.monotonic() - started < 30, "the stopped server's registration was removed")
+
+        # The backup commands register as a server does and release the
+        # registration when they exit, whatever the outcome, so a migration
+        # right after them does not wait for the row's TTL. With no store
+        # configured the command releases on its no-store path before it
+        # prints; with a filesystem store (a root under the work directory)
+        # it opens the store, runs, and releases when it closes the catalog,
+        # the path a store-backed deployment takes.
+        backup = [binary, "backup", "--config", config]
+        expect_exit(0, "backup list with no server running", backup + ["list"], env, contains="none (")
+        expect_exit(
+            0,
+            "backup purge's dry run with no server running",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted",
+        )
+        store_config, root = with_filesystem_store(config, work)
+        backup = [binary, "backup", "--config", store_config]
+        expect_exit(
+            0,
+            "backup list with a filesystem store configured",
+            backup + ["list"],
+            env,
+            contains=f"=== backups in the filesystem store {root}",
+        )
+        expect_exit(
+            0,
+            "backup purge's dry run with a filesystem store configured",
+            backup + ["purge"],
+            env,
+            contains="Dry run: nothing was deleted. Run again with --confirm",
+        )
+        started = time.monotonic()
+        expect_exit(
+            0,
+            "migrate --yes right after the backup commands, without waiting for a registration's TTL",
+            migrate + ["--yes", "--lock-timeout", "5"],
+            env,
+        )
+        report(time.monotonic() - started < 30, "the backup commands' registration was removed")
 
         keyspace = f"{stem}_catalog"
         code, output = cqlsh(

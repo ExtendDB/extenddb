@@ -54,7 +54,9 @@
 //! blocking pool, where dropping the future does not stop it; a guard in
 //! the future sets a flag when it is dropped, and the walk checks the flag
 //! before each removal, so a dropped `delete_prefix` stops at its next
-//! entry.
+//! entry. `delete_prefix_before` checks its deadline at the same point, so a
+//! walk that reaches the deadline stops before its next removal, whatever
+//! the caller's timer has done by then.
 //!
 //! Writes go to a temporary sibling file and rename into place, so a crash
 //! never leaves a truncated file under its final name. The temporary is
@@ -79,6 +81,16 @@
 //! prefix removes them. (An earlier revision removed them; doing so raced a
 //! concurrent put into the same new directory, and could not cover a
 //! failure inside the creation walk itself.)
+//!
+//! `put_if_absent` writes and syncs its temporary the same way, created
+//! `O_CREAT | O_EXCL` as every temporary is, and then `link`s it to the key
+//! instead of renaming: `link(2)` fails with `EEXIST` when anything is at
+//! the new path, so of two concurrent calls on one key exactly one links and
+//! the other reads `None`, the first body stays, and the object appears
+//! under its key complete or not at all. The temporary is unlinked after the
+//! link on every path (the two names are one inode, so the object stays). A
+//! regular file already at the destination is reported `None` before the
+//! body is read.
 //!
 //! Where this store narrows the shared key space (temporary names, a file
 //! and a directory at one path, the filesystem's own name limit and case
@@ -116,7 +128,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use crate::key::{normalize_prefix, validate_key, validate_prefix};
-use crate::{BackupStore, ByteStream, ObjectMeta, StoreError};
+use crate::{BackupStore, ByteStream, ObjectMeta, PrefixDeletion, StoreError};
 
 /// Prefix and suffix marking in-flight temporary files, hidden from listings.
 const TEMP_PREFIX: &str = ".put-";
@@ -142,10 +154,15 @@ impl FilesystemStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the root does not exist, cannot be resolved, or
-    /// is not a directory.
+    /// Returns an error when the root path is empty, the root does not exist,
+    /// cannot be resolved, or is not a directory.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref();
+        if root.as_os_str().is_empty() {
+            return Err(StoreError::Other(
+                "the backup root path is empty; name the directory".to_owned(),
+            ));
+        }
         let canonical = tokio::fs::canonicalize(root).await.map_err(|e| {
             StoreError::io(format!("backup root {} is not usable", root.display()), e)
         })?;
@@ -163,6 +180,14 @@ impl FilesystemStore {
             root: canonical,
             removal_hook: None,
         })
+    }
+
+    /// The root label a catalog row records for this store: the canonical
+    /// root directory. Two servers configured for one directory (by any
+    /// path that resolves to it) spell the same label.
+    #[must_use]
+    pub fn store_root(&self) -> String {
+        self.root.display().to_string()
     }
 
     /// Run `hook` on the blocking thread of every `delete_prefix` walk
@@ -313,7 +338,14 @@ impl FilesystemStore {
         Ok(current)
     }
 
-    async fn put_impl(&self, key: &str, mut body: ByteStream) -> Result<ObjectMeta, StoreError> {
+    /// Resolve `key` to the directory its object is written into and the
+    /// object's final path, creating the directories (`prepare_parent`) and
+    /// refusing a symlink or a directory at the destination: a put never
+    /// resolves through a link, and a directory there is a key-space
+    /// collision (`a/b` exists, `a` is put), refused before the body is read
+    /// rather than after the rename or link fails. Reports whether a regular
+    /// file is already at the destination, which `put_if_absent` reads.
+    async fn destination(&self, key: &str) -> Result<Destination, StoreError> {
         validate_key(key)?;
         let components: Vec<&str> = key.split('/').collect();
         let (file_name, parent_components) = components
@@ -321,12 +353,7 @@ impl FilesystemStore {
             .expect("a validated key has at least one component");
         let parent = self.prepare_parent(parent_components).await?;
         let final_path = parent.join(file_name);
-
-        // A symlink at the destination, in-root or escaping, is refused: a
-        // put never resolves through a link. A directory there is a key-space
-        // collision (`a/b` exists, `a` is put), refused before the body is
-        // read rather than after the rename fails.
-        match tokio::fs::symlink_metadata(&final_path).await {
+        let exists = match tokio::fs::symlink_metadata(&final_path).await {
             Ok(meta) if meta.is_symlink() => {
                 return Err(symlink_refused(&final_path));
             }
@@ -339,13 +366,101 @@ impl FilesystemStore {
                     ),
                 ));
             }
-            Ok(_) | Err(_) => {}
-        }
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        Ok(Destination {
+            parent,
+            final_path,
+            exists,
+        })
+    }
 
+    /// Write `body` to a new temporary sibling of `final_path`, flushed and
+    /// synced, and return its path, the guard that removes it, and the
+    /// number of bytes written. The temporary is created `O_CREAT | O_EXCL`
+    /// with mode `0600` (`create_private_file`).
+    ///
+    /// The temporary and its guard come back together. The guard removes
+    /// the temporary on every exit the caller does not disarm it for: an
+    /// error, the put's future dropped (a caller's timeout, a cancelled
+    /// job), including while the open itself is in flight on the blocking
+    /// pool, or a body that panics.
+    async fn write_temporary(
+        parent: &Path,
+        mut body: ByteStream,
+    ) -> Result<(PathBuf, RemoveOnDrop, u64), StoreError> {
         let temp_path = parent.join(format!(
             "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
             uuid::Uuid::new_v4()
         ));
+        let (mut file, temp_guard) = create_private_file(&temp_path).await?;
+        let mut size: u64 = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| StoreError::io(format!("write {}", temp_path.display()), e))?;
+            size += chunk.len() as u64;
+        }
+        // tokio's `File` hands each write to a background task and
+        // reports its error on the next operation. `sync_all` waits for
+        // the last background write but does not return its error (tokio
+        // keeps only its kind for a later write or flush), so without a
+        // flush before the drop a short file would be renamed into place
+        // on a full disk (or past RLIMIT_FSIZE). `flush` returns it.
+        file.flush()
+            .await
+            .map_err(|e| StoreError::io(format!("write {}", temp_path.display()), e))?;
+        // Defence in depth, no test: the fsync of the temporary matters
+        // only across a crash or power loss, which the suite cannot
+        // inject.
+        file.sync_all()
+            .await
+            .map_err(|e| StoreError::io(format!("sync {}", temp_path.display()), e))?;
+        drop(file);
+        Ok((temp_path, temp_guard, size))
+    }
+
+    /// Sync `parent` and every directory between it and the root, so the
+    /// entry a rename or link just made, and the directories a put created
+    /// on the way, are durable. Syncing every ancestor is a few extra
+    /// fsyncs per put (one per path component) against a bounded depth;
+    /// cheaper than tracking which ones this put created, and correct when a
+    /// concurrent put created them. Defence in depth, no test: it matters
+    /// only across a crash.
+    async fn sync_parent_chain(&self, parent: &Path) -> Result<(), StoreError> {
+        sync_dir(parent).await?;
+        let mut dir = parent.to_path_buf();
+        while let Some(p) = dir.parent() {
+            if !p.starts_with(&self.root) || p == self.root {
+                sync_dir(&self.root).await?;
+                break;
+            }
+            sync_dir(p).await?;
+            dir = p.to_path_buf();
+        }
+        Ok(())
+    }
+
+    /// The metadata of the object now at `final_path`.
+    async fn stored_meta(key: &str, final_path: &Path, size: u64) -> ObjectMeta {
+        let last_modified = tokio::fs::symlink_metadata(final_path)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+        ObjectMeta {
+            key: key.to_owned(),
+            size,
+            last_modified,
+            etag: None,
+        }
+    }
+
+    async fn put_impl(&self, key: &str, body: ByteStream) -> Result<ObjectMeta, StoreError> {
+        let Destination {
+            parent, final_path, ..
+        } = self.destination(key).await?;
 
         // Durability contract: the temp file is synced before the rename and
         // the parent directory is synced after it, so an Ok return means both
@@ -353,37 +468,9 @@ impl FilesystemStore {
         // directory sync the rename itself could be lost on power failure
         // even though the file data had been written.
         async {
-            // The temporary and its guard come back together. The guard
-            // removes it on every exit but the rename: an error (`?` below),
-            // the put's future dropped (a caller's timeout, a cancelled
-            // job), including while the open itself is in flight on the
-            // blocking pool, or a body that panics. It lives inside this
-            // block so dropping the block's future drops it.
-            let (mut file, mut temp_guard) = create_private_file(&temp_path).await?;
-            let mut size: u64 = 0;
-            while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| StoreError::io(format!("write {}", temp_path.display()), e))?;
-                size += chunk.len() as u64;
-            }
-            // tokio's `File` hands each write to a background task and
-            // reports its error on the next operation. `sync_all` waits for
-            // the last background write but does not return its error (tokio
-            // keeps only its kind for a later write or flush), so without a
-            // flush before the drop a short file would be renamed into place
-            // on a full disk (or past RLIMIT_FSIZE). `flush` returns it.
-            file.flush()
-                .await
-                .map_err(|e| StoreError::io(format!("write {}", temp_path.display()), e))?;
-            // Defence in depth, no test: the fsync of the temporary matters
-            // only across a crash or power loss, which the suite cannot
-            // inject.
-            file.sync_all()
-                .await
-                .map_err(|e| StoreError::io(format!("sync {}", temp_path.display()), e))?;
-            drop(file);
+            // The guard lives inside this block so dropping the block's
+            // future drops it (`write_temporary`).
+            let (temp_path, mut temp_guard, size) = Self::write_temporary(&parent, body).await?;
             tokio::fs::rename(&temp_path, &final_path)
                 .await
                 .map_err(|e| {
@@ -400,34 +487,125 @@ impl FilesystemStore {
             // before the put into one that holds nothing, which is worse
             // than either complete object (the trait contract is "no partial
             // object", not "no object").
-            sync_dir(&parent).await?;
-            // The directories between the root and the parent are durable
-            // only once their parents' entries are synced too. Syncing every
-            // ancestor is a few extra fsyncs per put (one per path component)
-            // against a bounded depth; cheaper than tracking which ones this
-            // put created, and correct when a concurrent put created them.
-            // Defence in depth, no test: it matters only across a crash.
-            let mut dir = parent.clone();
-            while let Some(p) = dir.parent() {
-                if !p.starts_with(&self.root) || p == self.root {
-                    sync_dir(&self.root).await?;
-                    break;
-                }
-                sync_dir(p).await?;
-                dir = p.to_path_buf();
-            }
-            let last_modified = tokio::fs::symlink_metadata(&final_path)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok());
-            Ok(ObjectMeta {
-                key: key.to_owned(),
-                size,
-                last_modified,
-                etag: None,
-            })
+            self.sync_parent_chain(&parent).await?;
+            Ok(Self::stored_meta(key, &final_path, size).await)
         }
         .await
+    }
+
+    /// `put_if_absent`: the temporary is written and synced as `put` writes
+    /// it, then `link`ed to the key. `link(2)` fails with `EEXIST` when
+    /// anything is at the new path (a file, a directory, a symlink, whatever
+    /// it points at), so the object appears under its key complete or not at
+    /// all, and an object that was there first is untouched. A regular file
+    /// already at the destination skips the body: the link would fail, and
+    /// writing the body first would only cost disk. The temporary is removed
+    /// after the link on every path; the link and the temporary are one
+    /// inode, so the object stays.
+    async fn put_if_absent_impl(
+        &self,
+        key: &str,
+        body: ByteStream,
+    ) -> Result<Option<ObjectMeta>, StoreError> {
+        let Destination {
+            parent,
+            final_path,
+            exists,
+        } = self.destination(key).await?;
+        if exists {
+            return Ok(None);
+        }
+        async {
+            let (temp_path, temp_guard, size) = Self::write_temporary(&parent, body).await?;
+            let linked = tokio::fs::hard_link(&temp_path, &final_path).await;
+            // The temporary's name is surplus from here on whether the
+            // link landed or not; the guard removes it when it drops at the
+            // end of this block (and on every early return below).
+            match linked {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    drop(temp_guard);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(StoreError::io(
+                        format!("link {} to {}", temp_path.display(), final_path.display()),
+                        e,
+                    ));
+                }
+            }
+            drop(temp_guard);
+            self.sync_parent_chain(&parent).await?;
+            Ok(Some(Self::stored_meta(key, &final_path, size).await))
+        }
+        .await
+    }
+
+    /// `delete_written` (the trait's doc): the file at the key renamed to a
+    /// hidden temporary in its directory, then removed if it is the file
+    /// `written` describes (its size, and its modification time where
+    /// `written` has one) or linked back under the key otherwise. The rename
+    /// is the one step another writer's file can be caught in: what it moved
+    /// is either removed as this caller's or put back.
+    async fn delete_written_impl(&self, written: &ObjectMeta) -> Result<bool, StoreError> {
+        let (path, meta) = match self.resolve_no_follow(&written.key).await {
+            Ok(found) => found,
+            Err(StoreError::NotFound) => return Ok(true),
+            Err(e) => return Err(e),
+        };
+        if !meta.is_file() {
+            return Ok(false);
+        }
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+            return Ok(false);
+        };
+        let size = written.size;
+        let modified = written.last_modified;
+        tokio::task::spawn_blocking(move || {
+            let aside = parent.join(format!(
+                "{TEMP_PREFIX}{}{TEMP_SUFFIX}",
+                uuid::Uuid::new_v4()
+            ));
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(e) => {
+                    return Err(StoreError::io(
+                        format!("rename {} to {}", path.display(), aside.display()),
+                        e,
+                    ));
+                }
+            }
+            let moved = std::fs::symlink_metadata(&aside)
+                .map_err(|e| StoreError::io(format!("stat {}", aside.display()), e))?;
+            let same = moved.is_file()
+                && moved.len() == size
+                && modified.is_none_or(|at| moved.modified().ok() == Some(at));
+            if same {
+                std::fs::remove_file(&aside)
+                    .map_err(|e| StoreError::io(format!("remove {}", aside.display()), e))?;
+                return Ok(true);
+            }
+            // Another writer's file: back under the key. `link` refuses a
+            // key something took meanwhile, and the file then stays under
+            // the hidden name, which the error names.
+            std::fs::hard_link(&aside, &path).map_err(|e| {
+                StoreError::io(
+                    format!(
+                        "link {} back to {} (the file under the key is not the one this \
+                         caller wrote)",
+                        aside.display(),
+                        path.display()
+                    ),
+                    e,
+                )
+            })?;
+            std::fs::remove_file(&aside)
+                .map_err(|e| StoreError::io(format!("remove {}", aside.display()), e))?;
+            Ok(false)
+        })
+        .await
+        .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
     }
 
     async fn get_impl(&self, key: &str) -> Result<ByteStream, StoreError> {
@@ -491,6 +669,19 @@ impl FilesystemStore {
     }
 
     async fn delete_prefix_impl(&self, prefix: &str) -> Result<u64, StoreError> {
+        self.delete_walk(prefix, None)
+            .await
+            .map(|done| done.deleted)
+    }
+
+    /// The walk of `delete_prefix` and `delete_prefix_before`: with a
+    /// `deadline`, the walk starts no removal at or after it and returns
+    /// what it removed with `finished` false.
+    async fn delete_walk(
+        &self,
+        prefix: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<PrefixDeletion, StoreError> {
         validate_prefix(prefix)?;
         let normalized = normalize_prefix(prefix).to_owned();
         let root = self.root.clone();
@@ -505,22 +696,44 @@ impl FilesystemStore {
             cancel: cancel.0.clone(),
             removal_hook: self.removal_hook.clone(),
             removals: std::sync::atomic::AtomicU64::new(0),
+            deadline,
+            out_of_time: std::sync::atomic::AtomicBool::new(false),
+            removed: std::sync::atomic::AtomicU64::new(0),
         };
-        tokio::task::spawn_blocking(move || delete_objects(&root, &normalized, &walk))
-            .await
-            .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let outcome = delete_objects(&root, &normalized, &walk);
+            if walk.out_of_time.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(PrefixDeletion {
+                    deleted: walk.removed.load(std::sync::atomic::Ordering::Acquire),
+                    finished: false,
+                });
+            }
+            outcome.map(|deleted| PrefixDeletion {
+                deleted,
+                finished: true,
+            })
+        })
+        .await
+        .map_err(|e| StoreError::Other(format!("deletion task failed: {e}")))?
     }
 
     async fn validate_impl(&self) -> Result<(), StoreError> {
-        let meta = tokio::fs::symlink_metadata(&self.root).await.map_err(|e| {
-            StoreError::io(
-                format!("backup root {} is not usable", self.root.display()),
-                e,
-            )
-        })?;
-        check_root_is_directory(&self.root, &meta)?;
-        check_root_location(&self.root)?;
-        check_root_ownership(&self.root, &meta)?;
+        // The root's own checks are synchronous filesystem calls (`lstat` of
+        // the root and each ancestor, `realpath`); they run on the blocking
+        // pool so a root on a mount that has stopped answering parks a
+        // blocking thread and not the runtime, and a caller's timeout on
+        // this future can fire.
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let meta = std::fs::symlink_metadata(&root).map_err(|e| {
+                StoreError::io(format!("backup root {} is not usable", root.display()), e)
+            })?;
+            check_root_is_directory(&root, &meta)?;
+            check_root_location(&root)?;
+            check_root_ownership(&root, &meta)
+        })
+        .await
+        .map_err(|e| StoreError::Other(format!("root check task failed: {e}")))??;
         let probe = self.root.join(format!(
             "{TEMP_PREFIX}validate-{}{TEMP_SUFFIX}",
             uuid::Uuid::new_v4()
@@ -574,6 +787,15 @@ impl FilesystemStore {
     }
 }
 
+/// Where a put writes: the directory the object goes into (created and
+/// checked by `prepare_parent`), the object's final path, and whether a
+/// regular file is already there.
+struct Destination {
+    parent: PathBuf,
+    final_path: PathBuf,
+    exists: bool,
+}
+
 impl BackupStore for FilesystemStore {
     fn put<'a>(
         &'a self,
@@ -581,6 +803,14 @@ impl BackupStore for FilesystemStore {
         body: ByteStream,
     ) -> BoxFuture<'a, Result<ObjectMeta, StoreError>> {
         self.put_impl(key, body).boxed()
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        body: ByteStream,
+    ) -> BoxFuture<'a, Result<Option<ObjectMeta>, StoreError>> {
+        self.put_if_absent_impl(key, body).boxed()
     }
 
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<ByteStream, StoreError>> {
@@ -609,6 +839,21 @@ impl BackupStore for FilesystemStore {
         self.delete_prefix_impl(prefix).boxed()
     }
 
+    fn delete_written<'a>(
+        &'a self,
+        written: &'a ObjectMeta,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        self.delete_written_impl(written).boxed()
+    }
+
+    fn delete_prefix_before<'a>(
+        &'a self,
+        prefix: &'a str,
+        deadline: tokio::time::Instant,
+    ) -> BoxFuture<'a, Result<PrefixDeletion, StoreError>> {
+        self.delete_walk(prefix, Some(deadline)).boxed()
+    }
+
     fn validate(&self) -> BoxFuture<'_, Result<(), StoreError>> {
         self.validate_impl().boxed()
     }
@@ -624,6 +869,28 @@ impl BackupStore for FilesystemStore {
 /// cannot detect. Messages name the path and the fix. No check is made on
 /// other platforms.
 fn check_root_ownership(root: &Path, meta: &std::fs::Metadata) -> Result<(), StoreError> {
+    check_private_tree(root, meta, "backup root")
+}
+
+/// The owner-only rule of a directory the server keeps private, by its
+/// canonical path: `check_root_ownership`'s rule (the directory owned by
+/// the effective user with no group or other permission bits; every ancestor
+/// a directory owned by the effective user or by root, not writable by group
+/// or others unless sticky) for a directory that is not a store root, named
+/// `what` in the messages (the server's restore spool). No check is made on
+/// other platforms.
+///
+/// # Errors
+///
+/// `PermissionDenied` naming the directory or ancestor and the mode it
+/// needs; `Io` when a directory on the way cannot be read.
+pub fn check_private_directory(dir: &Path, what: &str) -> Result<(), StoreError> {
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| StoreError::io(format!("stat {}", dir.display()), e))?;
+    check_private_tree(dir, &meta, what)
+}
+
+fn check_private_tree(root: &Path, meta: &std::fs::Metadata, what: &str) -> Result<(), StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -637,8 +904,8 @@ fn check_root_ownership(root: &Path, meta: &std::fs::Metadata) -> Result<(), Sto
             // only a swap between the two reaches this (module doc).
             if m.is_symlink() {
                 return Err(StoreError::PermissionDenied(format!(
-                    "{} (an ancestor of the backup root) is a symlink; configure the backup \
-                     root by its resolved path",
+                    "{} (an ancestor of the {what}) is a symlink; configure the {what} by its \
+                     resolved path",
                     dir.display()
                 )));
             }
@@ -646,17 +913,17 @@ fn check_root_ownership(root: &Path, meta: &std::fs::Metadata) -> Result<(), Sto
             let sticky = mode & 0o1000 != 0;
             if m.uid() != euid && m.uid() != 0 {
                 return Err(StoreError::PermissionDenied(format!(
-                    "{} (an ancestor of the backup root) is owned by uid {}; the backup root \
-                     must sit under directories owned by root or by the extenddb user",
+                    "{} (an ancestor of the {what}) is owned by uid {}; the {what} must sit \
+                     under directories owned by root or by the extenddb user",
                     dir.display(),
                     m.uid()
                 )));
             }
             if mode & 0o022 != 0 && !sticky {
                 return Err(StoreError::PermissionDenied(format!(
-                    "{} (an ancestor of the backup root) has mode {mode:04o} and is writable by \
-                     group or others without the sticky bit; another user could replace the \
-                     root. chmod it to remove group and world write, or move the backup root",
+                    "{} (an ancestor of the {what}) has mode {mode:04o} and is writable by group \
+                     or others without the sticky bit; another user could replace the {what}. \
+                     chmod it to remove group and world write, or move the {what}",
                     dir.display()
                 )));
             }
@@ -665,7 +932,7 @@ fn check_root_ownership(root: &Path, meta: &std::fs::Metadata) -> Result<(), Sto
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, meta);
+        let _ = (root, meta, what);
     }
     Ok(())
 }
@@ -1099,21 +1366,38 @@ impl Drop for CancelOnDrop {
 }
 
 /// What one `delete_prefix` walk carries down the tree: the flag its
-/// `CancelOnDrop` sets, and the store's removal hook (set only in the
-/// crate's own tests) with the count it is called with.
+/// `CancelOnDrop` sets, the store's removal hook (set only in the crate's
+/// own tests) with the count it is called with, and for
+/// `delete_prefix_before` the deadline, whether the walk reached it, and
+/// the files it removed.
 struct DeleteWalk {
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     removal_hook: Option<RemovalHook>,
     removals: std::sync::atomic::AtomicU64,
+    deadline: Option<tokio::time::Instant>,
+    out_of_time: std::sync::atomic::AtomicBool,
+    removed: std::sync::atomic::AtomicU64,
 }
 
 impl DeleteWalk {
-    /// The error a cancelled walk ends with; nobody receives it, since the
-    /// caller's future is gone.
+    /// The error a cancelled walk, or one past its deadline, ends with;
+    /// nobody receives the first, since the caller's future is gone, and
+    /// `delete_walk` turns the second into an unfinished deletion. Called
+    /// before each removal.
     fn check_cancel(&self) -> Result<(), StoreError> {
         if self.cancel.load(std::sync::atomic::Ordering::Acquire) {
             return Err(StoreError::Other(
                 "delete_prefix was dropped before it finished".to_owned(),
+            ));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.out_of_time
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(StoreError::Other(
+                "delete_prefix_before reached its deadline".to_owned(),
             ));
         }
         Ok(())
@@ -1213,7 +1497,11 @@ fn check_tree(dir: &Path, dir_meta: &std::fs::Metadata) -> Result<(), StoreError
 fn remove_file_counted(path: &Path, walk: &DeleteWalk) -> Result<u64, StoreError> {
     walk.before_removal();
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(1),
+        Ok(()) => {
+            walk.removed
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(1)
+        }
         Err(e) if vanished(&e) => Ok(0),
         Err(e) => Err(StoreError::io(format!("remove {}", path.display()), e)),
     }
