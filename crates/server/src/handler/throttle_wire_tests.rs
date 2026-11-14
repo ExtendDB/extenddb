@@ -395,8 +395,8 @@ async fn half_capped_table_reports_the_cap_for_its_direction_only() {
 
 /// The account bucket can refuse a request whose table the engine has never
 /// seen. An ARN naming a table in this account is reduced to the bare name
-/// before the resource is formed, and a name the engine would refuse carries
-/// no reasons list at all.
+/// before the resource is formed. A name outside the table name pattern is
+/// refused before the throttle, so it never carries a reasons list.
 #[tokio::test]
 async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
     let (state, account_id) = build_state().await;
@@ -425,9 +425,10 @@ async fn account_throttle_reduces_an_arn_name_and_omits_an_invalid_one() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
+    // The table name check refuses this name before the throttle segment.
     assert_eq!(
         body["__type"],
-        "com.amazonaws.dynamodb.v20120810#RequestLimitExceeded"
+        "com.amazon.coral.validate#ValidationException"
     );
     assert!(body.get("ThrottlingReasons").is_none(), "{body}");
 }
