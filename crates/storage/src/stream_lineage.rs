@@ -85,19 +85,15 @@ pub fn stream_change(
         (false, false) => Err(StorageError::Validation(format!(
             "Table has no stream to disable: TableName: {table_name}"
         ))),
-        // Unreachable through the engine, which refuses an enable without a
-        // view type before storage with this same sentence. The service's
-        // sentence for that case, measured 2026-10-24, is "One or more
-        // parameter values were invalid: If stream is being enabled then
-        // UpdateViewType is required", and it precedes the already-enabled
-        // check; the engine's sentence pre-dates this change and is not
-        // changed here.
+        // Unreachable through the engine, whose `validate_stream_specification`
+        // refuses an enable without a view type before storage with this same
+        // sentence (measured 2026-10-24), and before the already-enabled check.
         (true, false) => requested
             .stream_view_type
             .map(StreamChange::Enable)
             .ok_or_else(|| {
                 StorageError::Validation(
-                    "StreamViewType must be specified when StreamEnabled is true".to_owned(),
+                    "One or more parameter values were invalid: If stream is being enabled then UpdateViewType is required".to_owned(),
                 )
             }),
         (false, true) => Ok(StreamChange::Disable),
