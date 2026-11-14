@@ -341,34 +341,79 @@ fn apply_add(
     Ok(())
 }
 
+/// Target container for a DELETE action.
+enum DeleteTarget<'a> {
+    Map {
+        map: &'a mut BTreeMap<String, AttributeValue>,
+        attr_name: String,
+    },
+    List {
+        list: &'a mut Vec<AttributeValue>,
+        index: usize,
+    },
+}
+
+impl<'a> DeleteTarget<'a> {
+    fn get(&self) -> Option<&AttributeValue> {
+        match self {
+            DeleteTarget::Map { map, attr_name } => map.get(attr_name),
+            DeleteTarget::List { list, index } => list.get(*index),
+        }
+    }
+
+    fn insert(&mut self, new_value: AttributeValue) {
+        match self {
+            DeleteTarget::Map { map, attr_name } => {
+                map.insert(attr_name.clone(), new_value);
+            }
+            DeleteTarget::List { list, index } => {
+                if *index < list.len() {
+                    list[*index] = new_value;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self) {
+        match self {
+            DeleteTarget::Map { map, attr_name } => {
+                map.remove(attr_name);
+            }
+            DeleteTarget::List { .. } => {
+                // Note: Issue #812 explicitly marks the case where DELETE removes ALL members
+                // from a set inside a list element as "not sent" / unmeasured against DynamoDB.
+                // In DynamoDB, attributes holding sets that become empty are removed from maps,
+                // but removing or retaining a list index element when its inner set empties
+                // is an unmeasured edge case. For now, ExtendDB leaves the list length unchanged;
+                // maintainer review / wire measurements are needed for this edge.
+            }
+        }
+    }
+}
+
 /// Apply a DELETE action to an item.
 ///
 /// `DynamoDB` DELETE semantics: removes elements from a set.
 /// The value must be a set of the same type as the existing attribute.
-/// Supports nested paths (e.g. `DELETE myMap.tags :removeTags`).
+/// Supports nested paths (e.g. `DELETE myMap.tags :removeTags`, `DELETE l[0] :removeTags`).
 fn apply_delete(
     item: &mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     value: &AttributeValue,
     maps: &ExpressionMaps,
 ) -> Result<(), DynamoDbError> {
-    let Some(target) = navigate_to_parent_map(item, path, maps)? else {
+    let Some(mut target) = navigate_to_delete_target(item, path, maps)? else {
         return Ok(()); // Parent path doesn't exist — no-op
     };
-    let attr_name = resolve_attr_name(
-        path.last()
-            .ok_or_else(|| DynamoDbError::ValidationException("Empty path in DELETE".to_owned()))?,
-        maps,
-    )?;
-    let Some(existing) = target.get(&attr_name) else {
+    let Some(existing) = target.get().cloned() else {
         return Ok(()); // No-op if attribute doesn't exist
     };
 
-    let new_value = match (existing, value) {
+    let new_value = match (&existing, value) {
         (AttributeValue::SS(existing_set), AttributeValue::SS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::SS(remaining)
@@ -376,7 +421,7 @@ fn apply_delete(
         (AttributeValue::NS(existing_set), AttributeValue::NS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::NS(remaining)
@@ -384,7 +429,7 @@ fn apply_delete(
         (AttributeValue::BS(existing_set), AttributeValue::BS(remove_set)) => {
             let remaining: BTreeSet<_> = existing_set.difference(remove_set).cloned().collect();
             if remaining.is_empty() {
-                target.remove(&attr_name);
+                target.remove();
                 return Ok(());
             }
             AttributeValue::BS(remaining)
@@ -396,7 +441,7 @@ fn apply_delete(
         }
     };
 
-    target.insert(attr_name, new_value);
+    target.insert(new_value);
     Ok(())
 }
 
@@ -458,17 +503,35 @@ fn navigate_to_parent_map_or_create<'a>(
     }
 }
 
-/// Navigate a document path to the parent map of the leaf element without
+/// Navigate a document path to the target container of the leaf element without
 /// creating intermediate maps. Returns `None` if the path doesn't exist.
-/// Used by DELETE which is a no-op when the path is absent.
-fn navigate_to_parent_map<'a>(
+/// Used by DELETE which is a no-op when the path is absent in ExtendDB.
+fn navigate_to_delete_target<'a>(
     item: &'a mut BTreeMap<String, AttributeValue>,
     path: &[PathElement],
     maps: &ExpressionMaps,
-) -> Result<Option<&'a mut BTreeMap<String, AttributeValue>>, DynamoDbError> {
-    if path.len() <= 1 {
-        return Ok(Some(item));
+) -> Result<Option<DeleteTarget<'a>>, DynamoDbError> {
+    let last = path
+        .last()
+        .ok_or_else(|| DynamoDbError::ValidationException("Empty path in DELETE".to_owned()))?;
+
+    if path.len() == 1 {
+        match last {
+            PathElement::Attribute(_) => {
+                let attr_name = resolve_attr_name(last, maps)?;
+                return Ok(Some(DeleteTarget::Map {
+                    map: item,
+                    attr_name,
+                }));
+            }
+            PathElement::Index(_) => {
+                return Err(DynamoDbError::ValidationException(
+                    "Invalid expression: path cannot start with an index".to_owned(),
+                ));
+            }
+        }
     }
+
     let first_name = resolve_attr_name(&path[0], maps)?;
     let Some(mut current) = item.get_mut(&first_name) else {
         return Ok(None);
@@ -499,8 +562,19 @@ fn navigate_to_parent_map<'a>(
             }
         }
     }
-    match current {
-        AttributeValue::M(map) => Ok(Some(map)),
+
+    match (last, current) {
+        (PathElement::Attribute(_), AttributeValue::M(map)) => {
+            let attr_name = resolve_attr_name(last, maps)?;
+            Ok(Some(DeleteTarget::Map { map, attr_name }))
+        }
+        (PathElement::Index(idx), AttributeValue::L(list)) => {
+            if *idx < list.len() {
+                Ok(Some(DeleteTarget::List { list, index: *idx }))
+            } else {
+                Ok(None)
+            }
+        }
         _ => Ok(None),
     }
 }
