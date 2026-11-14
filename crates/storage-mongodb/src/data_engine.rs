@@ -3943,7 +3943,8 @@ const CONTENTION_RETRY_ATTEMPTS: u32 = 1000;
 /// spent attempt budget, with `TransactionCanceledException`. A loop measures
 /// the deadline from the start of its request (see `contention_clock_start`):
 /// the write requests of one `BatchWriteItem` share one deadline, and the
-/// handler returns a request that reaches it in UnprocessedItems. The TTL
+/// handler returns a request that reaches it in UnprocessedItems when another
+/// request of the batch applied, and answers 503 when none did. The TTL
 /// worker's conditional delete runs the delete loop too, outside any request,
 /// so an expired item that stays contended holds the sweep until the deadline
 /// or the attempt budget ends that loop, where 50 attempts ended it before

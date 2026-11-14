@@ -190,7 +190,10 @@ async fn write_batch(
     // retry with backoff, so a client's UnprocessedItems loop cannot spin on a
     // batch that makes no progress. Each failed request spends its own retry
     // budget first, so a batch of 25 contended requests can spend 25 budgets
-    // before it answers.
+    // before it answers. On MongoDB the requests also share one contention
+    // deadline, measured from the start of the batch (the request clock scope
+    // `handle_batch_write_item` opens), and no transaction retry starts once
+    // it has passed.
     //
     // The request faults the same page lists reject the whole batch before
     // anything is written. `check_batch` finds a missing table, a key that
