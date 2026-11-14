@@ -205,6 +205,10 @@ pub fn migration(id: MigrationId) -> Migration<MongoStores> {
                 m0012_unique_access_key_ids::SOURCE,
             )],
         },
+        MigrationId::GsiPendingTableClaim => Migration::NotApplicable(
+            "the index is on the PostgreSQL data database's gsi_pending, for the per-table claim \
+             of the PostgreSQL queue workers",
+        ),
     }
 }
 

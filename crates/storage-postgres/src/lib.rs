@@ -21,6 +21,7 @@ mod credential_store;
 mod data;
 mod delete_table;
 pub(crate) mod gsi_queue;
+mod gsi_rotation;
 mod management_store;
 mod metadata_engine;
 pub mod migrations;

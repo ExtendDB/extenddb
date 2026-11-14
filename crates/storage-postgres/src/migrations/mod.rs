@@ -204,6 +204,18 @@ pub fn migration(id: MigrationId) -> Migration<PostgresStores> {
         MigrationId::UniqueAccessKeyIds => Migration::NotApplicable(
             "access_key_id is the primary key of access_keys, so an ID can be stored once",
         ),
+        MigrationId::GsiPendingTableClaim => Migration::Applies {
+            // A non-unique index can be additive by CONTRIBUTING's step 4, but
+            // declaring `Kind::Additive` needs the old-binary job, which does
+            // not exist yet.
+            kind: Kind::Breaking,
+            convergent: true,
+            bodies: vec![file_body!(
+                StoreKind::Data,
+                "data_migrations",
+                "0013_gsi_pending_table_claim.sql"
+            )],
+        },
     }
 }
 
@@ -232,7 +244,8 @@ pub(crate) const fn runs_in(id: MigrationId) -> RunsIn {
         | MigrationId::WarmThroughput
         | MigrationId::AccountMetrics
         | MigrationId::AttributeNameEscape
-        | MigrationId::UniqueAccessKeyIds => RunsIn::Transaction,
+        | MigrationId::UniqueAccessKeyIds
+        | MigrationId::GsiPendingTableClaim => RunsIn::Transaction,
         MigrationId::IndexTableBaseKey => RunsIn::Autocommit,
     }
 }

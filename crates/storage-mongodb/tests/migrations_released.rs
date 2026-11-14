@@ -163,7 +163,7 @@ async fn every_released_catalog_upgrades_to_the_definitions_of_a_fresh_install()
             panic!("{state} is not behind");
         };
         assert_eq!(version, None, "{state} has no ledger");
-        assert_eq!(pending.len(), 13, "{state}");
+        assert_eq!(pending.len(), 14, "{state}");
         let report = d.migrate().await.expect("migrate");
         assert_eq!(
             (report.from, report.to),

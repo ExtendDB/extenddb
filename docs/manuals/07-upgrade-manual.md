@@ -4,7 +4,7 @@
 
 ## Current Status
 
-This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 12, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
+This release versions the PostgreSQL, SQLite, Cassandra and MongoDB catalogs by a migration ledger and carries catalog migrations 1 to 13, which `extenddb migrate --list` prints. **Every deployment created by a 0.1.x release runs `extenddb migrate --yes` once** before a server of this release starts on it: the server refuses a catalog with pending migrations. Migration 1 brings the catalog of every 0.1.x release to the v1.0 schema, migration 5 drops `continuous_backups`, a table and on MongoDB a collection (see [Catalog 0.0.5](#catalog-005)), and migration 6 adds the backup catalog index and the restore job records ([below](#migration-6-the-backup-catalog-index)). Migration 7 adds the `stream_pending` table to the PostgreSQL data database, where a write stores its stream record until the record gets its sequence number after the write commits; it does not apply to the other backends. Migration 8 adds the `restore_progress` table to the PostgreSQL data database, where a store-backed restore records each data file it applied; it does not apply on the other backends either.
 
 Migration 9, `warm_throughput`, adds a nullable `warm_throughput` column to the `tables` and `indexes` catalog tables on PostgreSQL, SQLite and Cassandra. It holds the `WarmThroughput` a client sets on a table or a global secondary index, which `DescribeTable` reports; nothing acts on the value (see [Differences from DynamoDB](../differences-from-dynamodb.md)). Tables created before the migration report the defaults for their billing mode. On MongoDB it changes nothing, since the catalog collections have no validator, and the ledger records it as not applicable. Migration 9 is breaking: to go back to a release without it, restore the backup taken before the upgrade (see [Rollback Procedure](#rollback-procedure)).
 
@@ -13,6 +13,8 @@ Migration 10, `account_metrics`, replaces the catalog's `metrics` table (on Mong
 Migration 11 rewrites the attribute names that a PostgreSQL deployment stores in its catalog, so that a name can hold U+0000. It does not apply to the other backends (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)).
 
 Migration 12, `unique_access_key_ids`, gives the MongoDB `access_keys` collection a unique index on the access key ID (see step 4 of the [general upgrade procedure](#general-upgrade-procedure)); it does not apply on the other backends.
+
+Migration 13, `gsi_pending_table_claim`, adds the index `idx_gsi_pending_table_claim` to the `gsi_pending` table of the PostgreSQL data database, which the GSI propagation queue's per-table claim reads (see [the GSI propagation queue entry](#postgresql-the-gsi-propagation-queue-serves-tables-in-turn)); it does not apply on the other backends.
 
 Configure `[backup.store]` before the release that stops creating in-catalog backups. The [Backup and Restore manual](14-backup-and-restore.md) covers choosing and securing a store, the recovery figures, the restore drill, catalog-loss recovery and what to do with in-catalog backups. This section says what the upgrade changes. In this release, CreateBackup and RestoreTableFromBackup work as follows:
 
@@ -74,7 +76,7 @@ Exit status 6 means the migration lock, or a running server, was still held when
 
 `verify` also checks the connection to the data database. When that check fails, `verify` exits 1 on a Behind catalog instead of 3, because `migrate --yes` cannot apply the pending migrations while the data database cannot be reached. It still exits 4 or 5 for the statuses that need a person.
 
-A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads; on PostgreSQL it is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra it does not apply (`migrate --list` prints it as not applicable, and `migrate` counts it as additive). Do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
+A migration is additive when the previous release serves the catalog correctly with it applied, and breaking otherwise. Migrations 1 to 7 and 9 to 12 are breaking. Migration 8 creates a table in the PostgreSQL data database that the previous release never reads, and migration 13 adds an index to that database; on PostgreSQL each is declared breaking only because the job that proves an additive declaration against the old binary does not yet exist (CONTRIBUTING, step 4 of adding a migration), and on SQLite, MongoDB and Cassandra neither applies (`migrate --list` prints each as not applicable, and `migrate` counts each as additive). Do not run a 0.1.x server against a migrated catalog. A 0.1.x binary that writes to a migrated catalog (its `migrate --yes`, or a SQLite dev server) leaves it WrittenByOlderRelease. `migrate --yes --reconverge` repairs it by running the convergent migrations again. Migration 2, which rewrites stored policies, is not convergent: the repair skips it and prints a line that says so (see the v0.1.14 notes below).
 
 ### Migration 6: the backup catalog index
 
@@ -379,6 +381,30 @@ The first release, so all 0.0.2 deployments were fresh installs.
 Catalog upgrades change the schema; behavior changes alter how the running server
 interprets existing data or configuration. Review these before upgrading a live
 deployment, even when no catalog migration is required.
+
+### PostgreSQL: the GSI propagation queue serves tables in turn
+
+**What changed.** A queue worker claimed the lowest `id` across its whole
+partition, and partitions are shared by every table, so a table's index rows
+waited behind every row another table had enqueued earlier: a bulk write to one
+table with an asynchronous GSI delayed a second table's propagation by the time
+the backlog took to drain. Each batch now lists the tables with a ready row in the
+partition and claims each table's oldest row in turn, so a table's latency depends
+on its own backlog. Within a table the order is unchanged. A table is listed once
+its oldest queued row is ready; a per-index `propagation_delay_ms` set above the
+default (the column is not written by any command today) widens the window in
+which a table's later row waits for its earlier one, by the difference between
+the two delays.
+
+**Operator step.** Migration 13, `gsi_pending_table_claim`, adds the index
+`idx_gsi_pending_table_claim` on `gsi_pending (worker_partition, table_id, id)`
+in the data database. Apply it with the usual sequence: stop the servers,
+`extenddb migrate --config extenddb.toml --yes`, start the servers.
+`migrate` builds the index with the servers stopped; at about 1.7 s per million
+queued rows on a development host the build is a pause of that length inside the
+maintenance window, and `CREATE INDEX IF NOT EXISTS` makes a repeated run harmless.
+
+---
 
 ### v0.1.15: a deleted principal or account leaves nothing behind
 
