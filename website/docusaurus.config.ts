@@ -194,8 +194,8 @@ const config: Config = {
       ],
       copyright:
         `Copyright ${new Date().getUTCFullYear()} ExtendDB contributors. Licensed under the Apache License, Version 2.0. ` +
-        'ExtendDB is an independent open source project managed by Amazon Web Services. It is not Amazon DynamoDB and contains no DynamoDB source code. ' +
-        '"DynamoDB" is a trademark of Amazon.com, Inc.',
+        'ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB or an AWS service. ' +
+        '"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.',
     },
     prism: {
       theme: lightTheme,
