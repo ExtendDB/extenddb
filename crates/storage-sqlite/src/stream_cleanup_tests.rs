@@ -33,7 +33,7 @@ async fn engine_at(location: &str) -> SqliteEngine {
     let engine = SqliteEngine::new(location, 4, "us-east-1", 409_600)
         .await
         .expect("engine");
-    crate::schema::apply(&engine.pool).await.expect("schema");
+    crate::migrations::apply_for_tests(&engine.pool).await;
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
         .bind(ACCOUNT)
         .execute(&engine.pool)
@@ -75,9 +75,10 @@ async fn stream_table(engine: &SqliteEngine) -> TableKeyInfo {
 }
 
 /// Insert the records with sequence numbers `first..first + count` across the
-/// table's four shards, in one statement. Record `i` is created at `base`
-/// moved by `age`, less `i % 3600` seconds, so created-at order differs from
-/// sequence order.
+/// table's four shards, in one statement. The shard ids are read from the
+/// table's `stream_shards` rows, since a shard id carries its stream's label.
+/// Record `i` is created at `base` moved by `age`, less `i % 3600` seconds, so
+/// created-at order differs from sequence order.
 async fn insert_records(
     engine: &SqliteEngine,
     table_id: &str,
@@ -87,13 +88,15 @@ async fn insert_records(
     record_data: &str,
 ) {
     sqlx::query(
-        "WITH RECURSIVE n(i) AS (SELECT ?1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+        "WITH RECURSIVE n(i) AS (SELECT ?1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2), \
+         s(shard_id, k) AS (SELECT shard_id, ROW_NUMBER() OVER (ORDER BY shard_id) - 1 \
+             FROM stream_shards WHERE table_id = ?3) \
          INSERT INTO stream_records \
              (shard_id, sequence_number, table_id, event_name, record_data, created_at) \
-         SELECT 'shardId-' || ?3 || '-' || printf('%016d', i % 4), printf('%021d', i), ?3, \
+         SELECT s.shard_id, printf('%021d', i), ?3, \
              'INSERT', ?4, \
              strftime('%Y-%m-%dT%H:%M:%fZ', ?5, ?6, '-' || (i % 3600) || ' seconds') \
-         FROM n",
+         FROM n JOIN s ON s.k = i % 4",
     )
     .bind(first)
     .bind(first + count - 1)
