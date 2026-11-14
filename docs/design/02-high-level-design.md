@@ -265,18 +265,18 @@ sequenceDiagram
 - sqlx provides native async PostgreSQL support
 - The storage trait being async allows backends that use network I/O (e.g., a future DynamoDB-backed backend for testing, or a distributed storage backend)
 
-### 4.7 Read Consistency via Optional Read Replica
+### 4.7 Read Consistency and the Proposed PostgreSQL Read Replica
 
-**Decision:** All reads are strongly consistent by default. Eventually consistent reads (`ConsistentRead=false`) are supported by routing to an optional PostgreSQL streaming replica.
+**Decision:** The PostgreSQL backend serves every item read from `data_pool`, the pool that takes the writes, so its reads are strongly consistent whatever `ConsistentRead` says. The flag is accepted and charged (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent). Routing `ConsistentRead=false` reads to a PostgreSQL streaming replica is a proposal (design document 04, section 5.3; REQ-PG-008; design document 11, Stage 2) and not code that exists.
 
 **Rationale:**
 - DynamoDB's eventual consistency is a consequence of reading from storage replicas that haven't received the latest write yet — it's not artificial delays or queues
 - Strongly consistent is strictly stronger than eventually consistent — any application that works against eventually consistent DynamoDB also works against a strongly consistent backend
-- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A real read replica provides genuine staleness without synthetic delays
-- The read replica is opt-in via `storage.postgres.read_replica_url`. When unset, all reads hit the primary — simple, correct, and matching what DynamoDB Local and other emulators do
-- Writes always go to the primary. `ConsistentRead=true` always reads from the primary. Only `ConsistentRead=false` reads route to the replica
-- Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) regardless of whether a replica is configured
-- This requires zero changes to the storage trait, engine, or server — it's entirely contained in the PostgreSQL backend's pool selection logic
+- For migration testing (relational → DynamoDB), teams need to surface bugs where application code assumes strong consistency on default reads. A read replica would return values that lag the primary without synthetic delays
+- In the proposal the replica is opt-in; when it is unset, all reads go to the primary, which is what the backend does today
+- Writes always go to the primary. `ConsistentRead=true` always reads from the primary. In the proposal only `ConsistentRead=false` reads route to the replica
+- Capacity calculations always reflect the consistency mode (0.5 RCU for eventually consistent, 1.0 RCU for strongly consistent) whether or not a replica exists
+- The proposal routes on the flag inside the PostgreSQL backend, so it needs the storage trait to carry the flag (design document 11, Stage 1); with that in place it needs no change to the engine or server and is contained in the backend's pool selection
 
 ## 5. Data Flow
 
