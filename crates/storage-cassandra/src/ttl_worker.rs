@@ -871,19 +871,20 @@ async fn process_ttl_work_row(
             .as_ref()
             .and_then(|specification| {
                 if specification.stream_enabled {
-                    specification
-                        .stream_view_type
-                        .map(|view_type| TtlStreamPlan {
+                    specification.stream_view_type.map(|view_type| {
+                        let (sequence_number, created_at_ms) = storage
+                            .hlc
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .generate_with_created_at();
+                        TtlStreamPlan {
                             event_id: uuid::Uuid::new_v4().to_string(),
-                            sequence_number: storage
-                                .hlc
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .generate(),
-                            created_at_ms: chrono::Utc::now().timestamp_millis(),
+                            sequence_number,
+                            created_at_ms,
                             region: storage.region.clone(),
                             view_type,
-                        })
+                        }
+                    })
                 } else {
                     None
                 }
@@ -1278,8 +1279,9 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                     match outcome {
                         Ok(true) => {
                             deleted += 1;
-                            metrics.record_ttl_deletion(table_name);
+                            metrics.record_ttl_deletion(account_id, table_name);
                             metrics.record_ttl_staleness(
+                                account_id,
                                 table_name,
                                 now_epoch.saturating_sub(expires_at) as f64,
                             );
@@ -1288,7 +1290,7 @@ pub async fn sweep_once(storage: &CassandraEngine, metrics: &MetricsCollector) {
                         // One row's failure must not abandon the wave or the
                         // table: its durable queue state drives its own retry.
                         Err(error) => {
-                            metrics.record_ttl_sweep_row_error(table_name);
+                            metrics.record_ttl_sweep_row_error(account_id, table_name);
                             tracing::warn!("TTL worker: row failed in {table_name}: {error}");
                         }
                     }
