@@ -27,7 +27,13 @@ import botocore.config
 import pytest
 import urllib3
 
-from helpers import make_dynamodb_client, unique_name, wait_for_active, wait_for_deleted  # noqa: F401
+from helpers import (  # noqa: F401
+    make_dynamodb_client,
+    make_raw_client,
+    unique_name,
+    wait_for_active,
+    wait_for_deleted,
+)
 
 # Suppress InsecureRequestWarning for self-signed TLS certs.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -90,6 +96,19 @@ def dynamodb_resource(endpoint_url: str | None):
             ca_cert = os.environ.get("EXTENDDB_CA_CERT", "")
             kwargs["verify"] = ca_cert if ca_cert else False
     return boto3.resource(**kwargs)
+
+
+@pytest.fixture(scope="session")
+def raw_client(endpoint_url: str | None):
+    """Session-scoped client with SDK parameter validation off; see
+    `helpers.make_raw_client`."""
+    return make_raw_client(endpoint_url)
+
+
+@pytest.fixture(scope="session")
+def raw_streams_client(endpoint_url: str | None):
+    """The streams API counterpart of `raw_client`."""
+    return make_raw_client(endpoint_url, "dynamodbstreams")
 
 
 @pytest.fixture()

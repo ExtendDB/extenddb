@@ -127,13 +127,13 @@ fn ambiguous_request_tag_fails_the_statement_closed() {
         values: vec!["prod".to_owned()],
     }];
     assert_eq!(
-        evaluate_statement_conditions(&deny_on_prod, &ctx),
+        evaluate_statement_conditions(&deny_on_prod, true, &ctx),
         ConditionMatch::Unresolvable
     );
     // The same statement against a request naming the tag once reads its value.
     let one = ctx_with(&[("env", "prod")], &["env"]);
     assert_eq!(
-        evaluate_statement_conditions(&deny_on_prod, &one),
+        evaluate_statement_conditions(&deny_on_prod, true, &one),
         ConditionMatch::Match
     );
 }
@@ -158,7 +158,7 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
     // One spelling expands to its value.
     for tags in [[("env", "prod")], [("Env", "prod")]] {
         assert_eq!(
-            evaluate_statement_conditions(&deny, &with_resource_tag(&tags)),
+            evaluate_statement_conditions(&deny, true, &with_resource_tag(&tags)),
             ConditionMatch::Match
         );
     }
@@ -168,7 +168,7 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
         [("env", "dev"), ("Env", "prod")],
     ] {
         assert_eq!(
-            evaluate_statement_conditions(&deny, &with_resource_tag(&tags)),
+            evaluate_statement_conditions(&deny, true, &with_resource_tag(&tags)),
             ConditionMatch::Unresolvable
         );
     }
@@ -181,13 +181,15 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
     assert_eq!(
         evaluate_statement_conditions(
             &embedded,
+            true,
             &with_resource_tag(&[("Env", "prod"), ("env", "dev")])
         ),
         ConditionMatch::Unresolvable
     );
-    // An absent request tag is not ambiguous: the variable stays literal, as before.
+    // An absent request tag is not ambiguous: with no default the variable has
+    // no value, so the value matches nothing.
     assert_eq!(
-        evaluate_statement_conditions(&deny, &with_resource_tag(&[("team", "x")])),
+        evaluate_statement_conditions(&deny, true, &with_resource_tag(&[("team", "x")])),
         ConditionMatch::NoMatch
     );
     // A brace that never closes names no variable.
@@ -199,6 +201,7 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
     assert_eq!(
         evaluate_statement_conditions(
             &unclosed,
+            true,
             &with_resource_tag(&[("Env", "prod"), ("env", "dev")])
         ),
         ConditionMatch::NoMatch
@@ -206,13 +209,59 @@ fn ambiguous_request_tag_as_a_policy_variable_fails_the_statement_closed() {
 }
 
 #[test]
-fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
+fn ambiguous_request_tag_as_a_defaulted_policy_variable_fails_the_statement_closed() {
+    use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
+    use crate::policy::document::{Condition, ConditionOperator};
+
+    let mut resource = HashMap::new();
+    resource.insert("env".to_owned(), "prod".to_owned());
+    let with_resource_tag = |tags: &[(&str, &str)]| {
+        let mut ctx = ctx_with(tags, &[]);
+        ctx.resource_tags = resource.clone();
+        ctx
+    };
+    let deny = [Condition {
+        operator: ConditionOperator::StringEquals,
+        key: "aws:ResourceTag/env".to_owned(),
+        values: vec!["${aws:RequestTag/env, 'prod'}".to_owned()],
+    }];
+    // Two spellings with differing values have no value to expand to, and the
+    // default is not used: the statement fails closed as it does for the plain
+    // form, so the default cannot route around the rule.
+    for tags in [
+        [("Env", "prod"), ("env", "dev")],
+        [("env", "dev"), ("Env", "prod")],
+    ] {
+        assert_eq!(
+            evaluate_statement_conditions(&deny, true, &with_resource_tag(&tags)),
+            ConditionMatch::Unresolvable
+        );
+    }
+    // One spelling expands to its value, and the default is not used.
+    assert_eq!(
+        evaluate_statement_conditions(&deny, true, &with_resource_tag(&[("Env", "prod")])),
+        ConditionMatch::Match
+    );
+    assert_eq!(
+        evaluate_statement_conditions(&deny, true, &with_resource_tag(&[("env", "dev")])),
+        ConditionMatch::NoMatch
+    );
+    // An absent request tag is not ambiguous: the default is used.
+    assert_eq!(
+        evaluate_statement_conditions(&deny, true, &with_resource_tag(&[("team", "x")])),
+        ConditionMatch::Match
+    );
+}
+
+#[test]
+fn policy_variable_naming_aws_tagkeys_has_no_value_for_every_tag_order() {
     use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
     use crate::policy::document::{Condition, ConditionOperator};
 
     // A Deny on aws:ResourceTag/team equal to ${aws:TagKeys} on a table tagged
-    // team=env. The variable names a multivalued key, so it stays literal and
-    // the statement applies to neither order of the request's tag keys.
+    // team=env. The variable names a multivalued key the request carries, so
+    // it has no value and the statement applies to neither order of the
+    // request's tag keys.
     let deny = [Condition {
         operator: ConditionOperator::StringEquals,
         key: "aws:ResourceTag/team".to_owned(),
@@ -223,7 +272,7 @@ fn policy_variable_naming_aws_tagkeys_is_left_literal_for_every_tag_order() {
         ctx.resource_tags
             .insert("team".to_owned(), "env".to_owned());
         assert_eq!(
-            evaluate_statement_conditions(&deny, &ctx),
+            evaluate_statement_conditions(&deny, true, &ctx),
             ConditionMatch::NoMatch,
             "tag keys {keys:?}"
         );
@@ -259,36 +308,51 @@ fn assume_role_ctx(principal: &[(&str, &str)], session: &[(&str, &str)]) -> Assu
 }
 
 #[test]
-fn trust_policy_variable_naming_aws_tagkeys_is_left_literal() {
+fn trust_policy_variable_naming_aws_tagkeys_has_no_value() {
     use crate::policy::condition::{ConditionMatch, evaluate_statement_conditions};
     use crate::policy::document::{Condition, ConditionOperator};
 
     // AssumeRoleContext reports aws:TagKeys as multivalued, so a trust policy
-    // condition value ${aws:TagKeys} stays literal text. Expanded, it would be
-    // the first session tag key in the map's iteration order, which a test
-    // cannot choose. One context holds both session tag keys in one map, and
-    // each of its two principal tags holds one key, so an expansion to either
-    // key matches the condition on the principal tag that holds it.
-    let compare_with_tag_keys = |principal_tag: &str| {
+    // condition value ${aws:TagKeys} has no value: a positive operator is
+    // false against it and a negated one true, even for a principal tag that
+    // holds the variable's text. The IAM policy simulator gives these answers
+    // for an identity policy (2026-10-31, rows in the description of PR
+    // #541); the trust policy case was not measured. Expanded, it would be the
+    // first session tag key in the map's iteration order, which a test cannot
+    // choose. One context holds both session tag keys in one map, and each of
+    // its two principal tags holds one key, so an expansion to either key
+    // matches the condition on the principal tag that holds it.
+    let compare_with_tag_keys = |operator: ConditionOperator, principal_tag: &str| {
         [Condition {
-            operator: ConditionOperator::StringEquals,
+            operator,
             key: format!("aws:PrincipalTag/{principal_tag}"),
             values: vec!["${aws:TagKeys}".to_owned()],
         }]
     };
+    let equals = |tag: &str| compare_with_tag_keys(ConditionOperator::StringEquals, tag);
+    let not_equals = |tag: &str| compare_with_tag_keys(ConditionOperator::StringNotEquals, tag);
     let session = [("env", "x"), ("owner", "x")];
     let ctx = assume_role_ctx(&[("key_env", "env"), ("key_owner", "owner")], &session);
     for tag in ["key_env", "key_owner"] {
         assert_eq!(
-            evaluate_statement_conditions(&compare_with_tag_keys(tag), &ctx),
+            evaluate_statement_conditions(&equals(tag), true, &ctx),
             ConditionMatch::NoMatch,
             "${{aws:TagKeys}} expanded to the session tag key in {tag}"
         );
+        assert_eq!(
+            evaluate_statement_conditions(&not_equals(tag), true, &ctx),
+            ConditionMatch::Match,
+            "${{aws:TagKeys}} expanded to the session tag key in {tag}"
+        );
     }
-    // The variable is text, so it equals the same text.
+    // The variable's text is not compared.
     let ctx = assume_role_ctx(&[("team", "${aws:TagKeys}")], &session);
     assert_eq!(
-        evaluate_statement_conditions(&compare_with_tag_keys("team"), &ctx),
+        evaluate_statement_conditions(&equals("team"), true, &ctx),
+        ConditionMatch::NoMatch
+    );
+    assert_eq!(
+        evaluate_statement_conditions(&not_equals("team"), true, &ctx),
         ConditionMatch::Match
     );
 }

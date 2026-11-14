@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
@@ -18,63 +18,88 @@ use super::ops::{OpError, op_err_to_response};
 pub async fn set_user_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
     axum::Json(document): axum::Json<Value>,
 ) -> Response {
-    set_boundary(&state, &headers, &account_id, "user", &user_name, &document).await
+    set_boundary(
+        &state,
+        &headers,
+        addr,
+        &account_id,
+        "user",
+        &user_name,
+        &document,
+    )
+    .await
 }
 
 pub async fn get_user_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
-    get_boundary(&state, &headers, &account_id, "user", &user_name).await
+    get_boundary(&state, &headers, addr, &account_id, "user", &user_name).await
 }
 
 pub async fn delete_user_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, user_name)): Path<(String, String)>,
 ) -> Response {
-    delete_boundary(&state, &headers, &account_id, "user", &user_name).await
+    delete_boundary(&state, &headers, addr, &account_id, "user", &user_name).await
 }
 
 pub async fn set_role_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
     axum::Json(document): axum::Json<Value>,
 ) -> Response {
-    set_boundary(&state, &headers, &account_id, "role", &role_name, &document).await
+    set_boundary(
+        &state,
+        &headers,
+        addr,
+        &account_id,
+        "role",
+        &role_name,
+        &document,
+    )
+    .await
 }
 
 pub async fn get_role_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
-    get_boundary(&state, &headers, &account_id, "role", &role_name).await
+    get_boundary(&state, &headers, addr, &account_id, "role", &role_name).await
 }
 
 pub async fn delete_role_boundary(
     State(state): State<Arc<ManagementState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path((account_id, role_name)): Path<(String, String)>,
 ) -> Response {
-    delete_boundary(&state, &headers, &account_id, "role", &role_name).await
+    delete_boundary(&state, &headers, addr, &account_id, "role", &role_name).await
 }
 
 async fn set_boundary(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
     document: &Value,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }
@@ -112,6 +137,17 @@ async fn set_boundary(
         }
     }
 
+    if let Err(e) = super::iam_policy::require_principal(
+        &*state.catalog_store,
+        account_id,
+        principal_type,
+        principal_name,
+    )
+    .await
+    {
+        return op_err_to_response(OpError::from_storage(e));
+    }
+
     let result = match principal_type {
         "user" => {
             state
@@ -140,12 +176,13 @@ async fn set_boundary(
 async fn get_boundary(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }
@@ -187,12 +224,13 @@ async fn get_boundary(
 async fn delete_boundary(
     state: &ManagementState,
     headers: &HeaderMap,
+    peer: std::net::SocketAddr,
     account_id: &str,
     principal_type: &str,
     principal_name: &str,
 ) -> Response {
     if let Err(e) =
-        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, None).await
+        authenticate_admin(headers, &*state.catalog_store, &*state.catalog_store, peer).await
     {
         return e;
     }

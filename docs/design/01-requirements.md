@@ -26,7 +26,6 @@ extenddb (ExtendDB) is a standalone, stateless Rust application that provides a 
 | Contributor Insights (DescribeContributorInsights, ListContributorInsights, UpdateContributorInsights) | Excluded — analytics feature, not core API |
 | Kinesis Streaming Destination (DescribeKinesisStreamingDestination, EnableKinesisStreamingDestination, DisableKinesisStreamingDestination, UpdateKinesisStreamingDestination) | Excluded — AWS-specific integration |
 | Resource Policies (GetResourcePolicy, PutResourcePolicy, DeleteResourcePolicy) | Deferred — resource-based policies are a future enhancement |
-| IAM Policy Variables (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) | Deferred — variable substitution in Resource ARNs and Condition values is a future enhancement (see REQ-ABAC-006) |
 | Federated Role Assumption (AssumeRoleWithSAML, AssumeRoleWithWebIdentity) | Deferred — v1 supports basic AssumeRole only (see REQ-IDENT-008) |
 | Role Chaining (role assumes role) | Deferred — v1 requires CallerArn to be a user; SourceIdentity and TransitiveTagKeys are deferred alongside (see REQ-IDENT-009) |
 | Role MaxSessionDuration | Deferred — v1 accepts any DurationSeconds with no per-role cap (see REQ-IDENT-010) |
@@ -326,7 +325,7 @@ extenddb implements a local IAM identity model that mirrors the structure of AWS
   - `dynamodb:FullTableScan` — restricts whether Scan operations are allowed (`Bool` condition).
   - `dynamodb:EnclosingOperation` — identifies the parent operation for batch/transact sub-operations.
 - REQ-ABAC-005: The policy engine must build a **request context** for each operation containing all applicable context keys. The request context is populated by the server middleware before policy evaluation.
-- REQ-ABAC-006 (Deferred): **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource ARNs and Condition values are not supported in v1. In AWS IAM, policy variables enable a single policy to grant access to resources that match the caller's own tags — e.g., `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Without policy variables, each team or department requires a separate policy with hardcoded resource ARNs, which reduces the ABAC testing value. This is a high-priority enhancement for a future version.
+- REQ-ABAC-006: **Policy variables** (`${aws:PrincipalTag/key}`, `${aws:username}`, etc.) in Resource and NotResource ARNs and in Condition values are expanded from the request context, as AWS IAM expands them, so that one policy can grant access to resources that match the caller's own tags, for example `"Resource": "arn:aws:dynamodb:*:*:table/${aws:PrincipalTag/Team}-*"`. Expansion in `Resource` and `NotResource` applies to `2012-10-17` documents only, as in IAM. Condition values follow the same `Version` rule, and only the string and ARN operators expand them (#534).
 
 ### 4.5 Authorization — Caching
 
@@ -669,6 +668,6 @@ DynamoDB SDKs support optional endpoint discovery via the `DescribeEndpoints` op
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

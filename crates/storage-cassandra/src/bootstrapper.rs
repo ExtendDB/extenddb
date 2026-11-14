@@ -553,7 +553,7 @@ impl Bootstrapper for CassandraBootstrapper {
     async fn bootstrap_encryption_key(&self) -> OpResult<()> {
         let keyspace = self.engine.catalog_keyspace();
         println!("--- Generating AES-256-GCM encryption key...");
-        let key_b64 = generate_encryption_key();
+        let key_b64 = generate_encryption_key().map_err(OpError::Internal)?;
         let insert_cql = format!(
             "INSERT INTO {keyspace}.settings (key, value) VALUES ('encryption_key', ?) IF NOT \
              EXISTS"
