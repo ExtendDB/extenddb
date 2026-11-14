@@ -238,7 +238,7 @@ impl Bootstrapper for PostgresBootstrapper {
         }
 
         println!("--- Generating AES-256-GCM encryption key...");
-        let key_b64 = generate_encryption_key();
+        let key_b64 = generate_encryption_key().map_err(OpError::Internal)?;
 
         sqlx::query(
             "INSERT INTO settings (key, value) VALUES ('encryption_key', $1) \

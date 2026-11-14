@@ -73,6 +73,7 @@ on:
           # ECR Public does not auto-create repositories on push.
           - extenddb-postgres
           - extenddb-mongodb
+          - extenddb-cassandra
         default: extenddb-postgres
 
 permissions:
@@ -117,13 +118,14 @@ jobs:
           RAW_TAG: ${{ inputs.candidate_tag }}
           RAW_DIGEST: ${{ inputs.expected_digest }}
           RAW_MOVE_LATEST: ${{ inputs.move_latest }}
+          RAW_IMAGE: ${{ inputs.image }}
         run: |
           set -euo pipefail
           # Local allowlist enforcement: API-side choice enforcement is
           # undocumented, so the security property is proven here.
-          case "${{ inputs.image }}" in
-            extenddb-postgres|extenddb-mongodb) ;;
-            *) echo "::error::image '${{ inputs.image }}' is not in the allowlist"; exit 1 ;;
+          case "$RAW_IMAGE" in
+            extenddb-postgres|extenddb-mongodb|extenddb-cassandra) ;;
+            *) echo "::error::image '$RAW_IMAGE' is not in the allowlist"; exit 1 ;;
           esac
           if [[ ! "$RAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version '$RAW_VERSION' is not strict semver (MAJOR.MINOR.PATCH)"
@@ -270,6 +272,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Export wave-1 results for the mirror wave
         id: results
@@ -322,6 +325,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Assume the ECR publisher role via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
@@ -351,6 +355,7 @@ jobs:
           version: ${{ env.VERSION }}
           digest: ${{ env.DIGEST }}
           move-latest: ${{ env.MOVE_LATEST }}
+          signer-workflows: release-image|sign-image
 
       - name: Log out of the mirror registries
         if: always()

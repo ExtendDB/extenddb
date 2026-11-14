@@ -66,6 +66,21 @@ impl PostgresEngine {
         // write is one the backfill sees. Vector indexes still have the window.
         let (indexes, vector_metas, stamp) =
             fetch_write_path_indexes(&key_info.table_id, &self.pool).await?;
+        // Literal operands assigned to a secondary-index key, checked on the
+        // statement ahead of the condition as the service checks them. The
+        // engine ran this check against its cached key info, which does not list
+        // a GSI until the UpdateTable that adds it returns; this read lists it
+        // from the moment its CREATING row commits, so a literal of the wrong
+        // type for an index still being built gets the same per-index wording.
+        if !indexes.is_empty() {
+            validation::validate_index_key_literal_operands(
+                actions,
+                &super::transactions::index_key_refs(&indexes),
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+                maps,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
         // Read whenever anything can propagate, secondary or vector. Gating this on
         // the secondary set alone made a vector-only table ignore the configured
         // delay and apply its vector index inline, while a TransactWriteItems on the
@@ -187,17 +202,20 @@ impl PostgresEngine {
             )
             .map_err(|e| StorageError::Validation(e.to_string()))?;
 
-            // Validate post-update item size (400 KB limit)
-            validation::validate_item_size(&item, self.max_item_size_bytes)
+            // Size the update the way the service does: what the statement
+            // writes plus a fixed cost per clause, against the item limit.
+            validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
                 .map_err(|e| StorageError::Validation(e.to_string()))?;
 
-            // Secondary-index key validation on the post-update item, as the
-            // TransactWriteItems update path and SQLite already do: a wrong-typed
-            // index key or an index key set to an empty value is a
-            // ValidationException, not an item the index then leaves out.
+            // Secondary-index keys on the written item, as the transacted Update
+            // path and the SQLite backend already do. Literal operands were
+            // checked ahead of the condition, above; a value computed from the
+            // existing item is only known now and carries the service's
+            // computed-value wording. An index key left empty is a
+            // ValidationException, not a malformed index row.
             if !indexes.is_empty() {
                 let idx_refs = super::transactions::index_key_refs(&indexes);
-                validation::validate_index_key_types(
+                validation::validate_index_key_types_after_update(
                     &item,
                     &idx_refs,
                     super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),

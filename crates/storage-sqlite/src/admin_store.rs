@@ -123,10 +123,7 @@ impl AdminStore for SqliteCatalogStore {
             let Some((hash,)) = row else {
                 return Ok(None);
             };
-            let verified = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash))
-                .await
-                .map_err(|e| OpError::Internal(format!("bcrypt task: {e}")))?
-                .unwrap_or(false);
+            let verified = extenddb_storage::password::verify_password(password, hash).await?;
             Ok(Some(verified))
         })
     }

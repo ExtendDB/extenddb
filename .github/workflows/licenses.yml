@@ -30,6 +30,7 @@ on:
       - 'Cargo.lock'
       - 'SOFTWARE-LICENSE-NOTICES.html'
       - 'SOFTWARE-LICENSE-NOTICES-MONGODB.html'
+      - 'SOFTWARE-LICENSE-NOTICES-CASSANDRA.html'
       - 'SOFTWARE-LICENSE-NOTICES-DEV.html'
       - 'about.toml'
       - 'about.hbs'

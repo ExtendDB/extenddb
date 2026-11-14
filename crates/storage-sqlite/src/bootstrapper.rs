@@ -203,7 +203,7 @@ impl Bootstrapper for SqliteBootstrapper {
         if exists {
             return Ok(());
         }
-        let key = helpers::generate_encryption_key();
+        let key = helpers::generate_encryption_key().map_err(OpError::Internal)?;
         sqlx::query("INSERT OR IGNORE INTO settings (key, value) VALUES ('encryption_key', ?)")
             .bind(&key)
             .execute(&pool)

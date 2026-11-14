@@ -178,6 +178,37 @@ pub(crate) async fn table_size_refresh_worker(
     }
 }
 
+/// How often the numbering worker looks for pending stream records.
+const STREAM_NUMBERING_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the numbering worker waits after a failed pass, on top of its
+/// interval, so an unreachable database is reported about once a second, as
+/// the GSI workers report it.
+const STREAM_NUMBERING_RETRY: Duration = Duration::from_secs(1);
+
+/// Numbers the stream records that writes leave in `stream_pending`
+/// (`number_pending_stream_records`). A read numbers its own shard before it
+/// reads, so this worker is what numbers the records of a shard that nobody
+/// reads, which the retention sweep then trims. It skips a shard that a
+/// reader or another server is numbering.
+pub(crate) async fn stream_record_numbering_worker(
+    storage: Arc<PostgresEngine>,
+    token: CancellationToken,
+) {
+    while tick(&token, STREAM_NUMBERING_INTERVAL).await {
+        match storage.number_pending_stream_records().await {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(records = n, "numbered pending stream records"),
+            Err(e) => {
+                tracing::warn!("Stream record numbering failed: {e}");
+                if !tick(&token, STREAM_NUMBERING_RETRY).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn stream_record_cleanup_worker(
     storage: Arc<PostgresEngine>,
     metrics: Arc<MetricsCollector>,
