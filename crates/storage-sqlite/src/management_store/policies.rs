@@ -9,6 +9,122 @@ use time::OffsetDateTime;
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::parse_timestamp;
 
+/// Begin the `BEGIN IMMEDIATE` transaction a principal's create or delete
+/// runs in. The caller holds the write lock (D1).
+pub(super) async fn begin_write<'a>(
+    pool: &'a sqlx::SqlitePool,
+    what: &str,
+) -> OpResult<sqlx::Transaction<'a, sqlx::Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
+        tracing::error!("{what} begin: {e}");
+        OpError::Internal("Database error".to_owned())
+    })
+}
+
+/// Commit `tx` when `result` is `Ok`, and roll it back otherwise, so the
+/// connection goes back to the pool with no transaction open.
+///
+/// Dropping a SQLite transaction only queues its rollback, and a
+/// `BEGIN IMMEDIATE` on that connection before the rollback ran fails with
+/// "attempted to call begin_with at non-zero transaction depth".
+pub(super) async fn finish<T>(
+    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    result: OpResult<T>,
+    what: &str,
+) -> OpResult<T> {
+    match result {
+        Ok(value) => {
+            tx.commit().await.map_err(|e| {
+                tracing::error!("{what} commit: {e}");
+                OpError::Internal("Database error".to_owned())
+            })?;
+            Ok(value)
+        }
+        Err(e) => {
+            if let Err(rollback) = tx.rollback().await {
+                tracing::error!("{what} rollback: {rollback}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Delete the inline policies and the permissions boundary stored under a
+/// principal's name, inside the caller's transaction.
+///
+/// `iam_policies` and `iam_permissions_boundaries` name their principal by
+/// `(principal_type, principal_name)` and have no foreign key to it, so the
+/// cascades that remove a principal's tags, access keys and memberships do not
+/// reach them. A principal's delete calls this so that a later principal with
+/// the same name does not get them, and a principal's create calls it so that
+/// rows a delete left behind before this existed are removed too.
+pub(super) async fn delete_principal_attachments(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+    principal_type: &str,
+    principal_name: &str,
+) -> OpResult<()> {
+    for table in ["iam_policies", "iam_permissions_boundaries"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} \
+             WHERE account_id = ? AND principal_type = ? AND principal_name = ?"
+        ))
+        .bind(account_id)
+        .bind(principal_type)
+        .bind(principal_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete {principal_type} {principal_name}'s rows in {table}: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    }
+    Ok(())
+}
+
+/// Delete the failed logins recorded under a user's sign-in name,
+/// `account_id/user_name`, inside the caller's transaction.
+///
+/// `login_attempts` is keyed by the name a login gave, not by the user, so a
+/// user created with the name of a deleted one would otherwise start with the
+/// deleted user's failures and could be refused with 429 on its first correct
+/// password. A user's delete and its create both call this: the create also
+/// clears failures recorded against the name while no user had it.
+pub(super) async fn delete_login_history(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+    user_name: &str,
+) -> OpResult<()> {
+    sqlx::query("DELETE FROM login_attempts WHERE principal = ?")
+        .bind(format!("{account_id}/{user_name}"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete user {user_name}'s login attempts: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    Ok(())
+}
+
+/// Delete the failed logins recorded under every sign-in name of an account,
+/// `account_id/<anything>`, inside the caller's transaction. A prefix
+/// comparison, not `LIKE`, so no character of the name is a wildcard.
+pub(super) async fn delete_account_login_history(
+    conn: &mut sqlx::SqliteConnection,
+    account_id: &str,
+) -> OpResult<()> {
+    let prefix = format!("{account_id}/");
+    sqlx::query("DELETE FROM login_attempts WHERE substr(principal, 1, length(?1)) = ?1")
+        .bind(&prefix)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("delete account {account_id}'s login attempts: {e}");
+            OpError::Internal("Database error".to_owned())
+        })?;
+    Ok(())
+}
+
 impl SqliteCatalogStore {
     pub(crate) async fn put_policy_impl(
         &self,
