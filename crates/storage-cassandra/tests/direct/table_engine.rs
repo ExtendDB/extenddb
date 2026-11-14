@@ -61,6 +61,7 @@ mod tests {
             tags: None,
             deletion_protection_enabled: None,
             table_class: None,
+            warm_throughput: None,
         };
 
         engine
