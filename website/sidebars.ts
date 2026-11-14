@@ -41,6 +41,7 @@ const sidebars: SidebarsConfig = {
           },
           items: [
             {type: 'doc', id: 'dev-image', label: 'Development image'},
+            {type: 'doc', id: 'verifying-images', label: 'Verifying the container images'},
             {type: 'doc', id: 'local-dev-docker-compose', label: 'Docker Compose with PostgreSQL'},
             {type: 'doc', id: 'manuals/install-linux', label: 'Linux'},
             {type: 'doc', id: 'manuals/install-macos', label: 'macOS'},
@@ -69,6 +70,7 @@ const sidebars: SidebarsConfig = {
         {type: 'doc', id: 'manuals/deployment-guide', label: 'Deployment'},
         {type: 'doc', id: 'manuals/security-model', label: 'Security model'},
         {type: 'doc', id: 'manuals/upgrade-manual', label: 'Upgrading'},
+        {type: 'doc', id: 'manuals/backup-and-restore', label: 'Backup and restore'},
         {type: 'doc', id: 'storage-backends', label: 'Storage backends'},
         {type: 'doc', id: 'cassandra-setup', label: 'Cassandra setup'},
         {type: 'doc', id: 'manuals/event-ticketing-demo', label: 'Event ticketing demo'},
@@ -90,6 +92,7 @@ const sidebars: SidebarsConfig = {
       items: [
         {type: 'doc', id: 'differences-from-dynamodb', label: 'Differences from DynamoDB'},
         {type: 'doc', id: 'dynamodb-limits', label: 'Limits'},
+        {type: 'doc', id: 'versioning', label: 'Versioning and support'},
         {
           type: 'link',
           label: 'Configuration',
