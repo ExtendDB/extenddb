@@ -226,8 +226,6 @@ enum RejectReason {
     InvalidHost(String),
     /// No readable `Host` header and no request-target authority.
     MissingHost,
-    /// More than one `Host` header.
-    RepeatedHost,
     /// A `Host` header and an absolute-form request target that name different
     /// hosts.
     HostMismatch,
@@ -245,9 +243,6 @@ impl RejectReason {
             }
             Self::MissingHost => {
                 format!("Developer mode refused a request with no usable Host header. {rule}")
-            }
-            Self::RepeatedHost => {
-                format!("Developer mode refused a request with more than one Host header. {rule}")
             }
             Self::HostMismatch => format!(
                 "Developer mode refused a request whose Host header and request target name \
@@ -274,14 +269,10 @@ fn evaluate(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -> Decision {
         return Decision::Allow;
     }
 
-    // More than one Host header is refused: a split header lets a page
-    // disagree with what verification reads.
-    let mut host_values = headers.get_all("host").iter();
-    let first = host_values.next();
-    if host_values.next().is_some() {
-        return Decision::Reject(RejectReason::RepeatedHost);
-    }
-    let host_header = match first {
+    // A request with more than one Host header does not get here:
+    // `repeated_headers::refuse_repeated_headers`, layered outside this guard
+    // in `start_server`, refuses it on every route.
+    let host_header = match headers.get("host") {
         Some(v) => match v.to_str() {
             Ok(s) => Some(s),
             Err(_) => return Decision::Reject(RejectReason::MissingHost),

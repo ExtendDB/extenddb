@@ -231,7 +231,7 @@ fn admin_path_is_checked_on_the_host_alone() {
 }
 
 #[test]
-fn missing_repeated_and_mismatched_host_are_refused() {
+fn missing_and_mismatched_host_are_refused() {
     // Missing Host on a browser request (no authority in a "/" uri).
     assert!(matches!(
         evaluate(&headers(&[("origin", "http://x")]), &uri("/"), &[]),
@@ -241,19 +241,6 @@ fn missing_repeated_and_mismatched_host_are_refused() {
     assert!(matches!(
         evaluate(&headers(&[]), &uri("/management/accounts"), &[]),
         Decision::Reject(RejectReason::MissingHost)
-    ));
-    // Repeated Host.
-    assert!(matches!(
-        evaluate(
-            &headers(&[
-                ("host", "localhost"),
-                ("host", "rebind.example"),
-                ("origin", "http://x")
-            ]),
-            &uri("/"),
-            &[]
-        ),
-        Decision::Reject(RejectReason::RepeatedHost)
     ));
     // Absolute-form target and Host header disagree.
     assert!(matches!(
