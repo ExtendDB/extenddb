@@ -44,12 +44,22 @@ fn create_input(table: &str) -> extenddb_core::types::CreateTableInput {
     .expect("input")
 }
 
+/// Write the control-plane delay. The row is written, not only updated: the
+/// migrations seed no setting.
+async fn set_delay(engine: &SqliteEngine, seconds: &str) {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(seconds)
+    .execute(&engine.pool)
+    .await
+    .expect("set the control-plane delay");
+}
+
 async fn seed(engine: &SqliteEngine) {
-    crate::schema::apply(&engine.pool).await.expect("schema");
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&engine.pool)
-        .await
-        .expect("delay");
+    crate::migrations::apply_for_tests(&engine.pool).await;
+    set_delay(engine, "0").await;
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
         .bind(ACCOUNT)
         .execute(&engine.pool)
@@ -228,11 +238,15 @@ async fn a_request_after_the_data_drop_is_table_not_found() {
 /// here to finish the deletion).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_delete_tables_have_one_winner() {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target")
-        });
+    // The cargo target directory, found from this test binary's own path
+    // (`<target>/<profile>/deps/<binary>`) as `snapshot_engine`'s file engine
+    // finds it, so a relative `CARGO_TARGET_DIR` or a `--target-dir` is
+    // honoured too.
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let target = exe
+        .ancestors()
+        .nth(3)
+        .unwrap_or_else(|| panic!("{} is not <target>/<profile>/deps/<binary>", exe.display()));
     assert!(target.is_dir(), "cargo target directory must exist");
     let path = target.join(format!("deleting-pair-{}.sqlite", uuid::Uuid::new_v4()));
     let engine = Arc::new(
@@ -244,18 +258,14 @@ async fn two_concurrent_delete_tables_have_one_winner() {
 
     for round in 0..10 {
         let table = format!("t_pair_{round}");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay 0 so the create completes inline");
+        // Delay 0 so the create completes inline, then 600 so the delete
+        // marks the row.
+        set_delay(&engine, "0").await;
         engine
             .create_table_impl(ACCOUNT, create_input(&table), false)
             .await
             .expect("create table");
-        sqlx::query("UPDATE settings SET value = '600' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay 600 so the delete marks the row");
+        set_delay(&engine, "600").await;
 
         let tasks: Vec<_> = (0..2)
             .map(|_| {

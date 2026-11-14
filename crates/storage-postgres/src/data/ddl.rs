@@ -11,6 +11,7 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::util::{sk_column, sk_column_n};
 
 use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_name};
+use crate::catalog_json::from_catalog_json;
 
 /// Column type for every text key column (`pk`, `sk_s`, `base_pk`,
 /// `base_sk_s`, and their numbered variants).
@@ -29,6 +30,16 @@ use super::{all_sort_key_info, data_table_name, index_table_name, vector_table_n
 /// on these columns. Their results are still ordered correctly, because the
 /// predicates carry the collation explicitly; only the index use differs.
 const TEXT_KEY: &str = "TEXT COLLATE \"C\"";
+
+/// The status the data plane classifies a `tables` row by. `abort_restore`
+/// claims a restore target under removal (the backup reconciler's, or a failed
+/// restore's own) by marking it `DELETING` with the epoch as its transition
+/// time, a time no `DeleteTable` mark carries. That row is read as the
+/// `CREATING` restore target it was, which the data plane answers as not
+/// found, as the service answers a table it is still restoring; a row
+/// `DeleteTable` marked is served until it is gone.
+const DATA_PLANE_STATUS: &str = "CASE WHEN table_status = 'DELETING' \
+     AND status_transition_at = 'epoch' THEN 'CREATING' ELSE table_status END";
 use crate::PostgresEngine;
 
 /// Row shape returned by the table-info query: (`key_schema`, `attr_defs`, status, `table_id`, `stream_spec`).
@@ -371,12 +382,12 @@ impl PostgresEngine {
         account_id: &str,
         table_name: &str,
     ) -> Result<TableKeyInfo, StorageError> {
-        let row: Option<TableInfoRow> = sqlx::query_as(
-            "SELECT key_schema, attribute_definitions, table_status, table_id, \
+        let row: Option<TableInfoRow> = sqlx::query_as(&format!(
+            "SELECT key_schema, attribute_definitions, {DATA_PLANE_STATUS}, table_id, \
              stream_specification \
              FROM tables \
-             WHERE account_id = $1 AND table_name = $2",
-        )
+             WHERE account_id = $1 AND table_name = $2"
+        ))
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&self.pool)
@@ -403,10 +414,8 @@ impl PostgresEngine {
             _ => return Err(StorageError::TableNotActive(table_name.to_owned())),
         }
 
-        let key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let attribute_definitions: Vec<AttributeDefinition> =
-            serde_json::from_value(ad_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let attribute_definitions: Vec<AttributeDefinition> = from_catalog_json(ad_json)?;
 
         let stream_specification: Option<StreamSpecification> = stream_spec_json
             .map(serde_json::from_value)
@@ -503,10 +512,8 @@ impl PostgresEngine {
                     )));
                 }
             };
-            let key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let projection: Projection = serde_json::from_value(proj_json)
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+            let projection: Projection = from_catalog_json(proj_json)?;
             let info = IndexInfo {
                 index_name,
                 index_id,
@@ -535,9 +542,10 @@ impl PostgresEngine {
         index_name: &str,
     ) -> Result<IndexInfo, StorageError> {
         // First get the table_id and verify the table is ACTIVE
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT table_id, table_status FROM tables WHERE account_id = $1 AND table_name = $2",
-        )
+        let row: Option<(String, String)> = sqlx::query_as(&format!(
+            "SELECT table_id, {DATA_PLANE_STATUS} FROM tables \
+             WHERE account_id = $1 AND table_name = $2"
+        ))
         .bind(account_id)
         .bind(table_name)
         .fetch_optional(&self.pool)
@@ -598,10 +606,8 @@ impl PostgresEngine {
             }
         };
 
-        let key_schema: Vec<KeySchemaElement> =
-            serde_json::from_value(ks_json).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let projection: Projection =
-            serde_json::from_value(proj_json).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json)?;
+        let projection: Projection = from_catalog_json(proj_json)?;
 
         Ok(IndexInfo {
             index_name: index_name.to_owned(),
@@ -747,7 +753,9 @@ async fn set_lock_timeout_until(
 }
 
 /// SQLSTATE `lock_not_available` (55P03), which `lock_timeout` raises.
-const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+/// The migration runner classifies a failed body by it too, from the code a
+/// `MigrationError` keeps (`migrations/failure.rs`).
+pub(crate) const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
 
 /// Whether `e` is a lock wait that ran out its `lock_timeout` (55P03): a
 /// session held a lock the statement needed, which a later attempt can get

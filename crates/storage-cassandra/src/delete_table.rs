@@ -41,8 +41,7 @@ pub(crate) enum DeleteTableCaller<'a> {
     /// DeleteTable: refuses a deletion-protected table and a restore target
     /// still being restored.
     Client,
-    /// The restore copy or the abandoned-restore sweep removing a restore
-    /// target. Deletes only the incarnation with this `table_id`, so a target
+    /// The restore copy or the reconciler removing a restore target. Deletes only the incarnation with this `table_id`, so a target
     /// that was already removed and whose name was reused is left alone.
     RestoreCleanup { table_id: &'a str },
 }
@@ -201,7 +200,7 @@ impl CassandraEngine {
         match caller {
             DeleteTableCaller::Client => {
                 // A DELETING row belongs to the deletion already under way
-                // (a concurrent DeleteTable, or the abandoned-restore sweep).
+                // (a concurrent DeleteTable, or the removal of a restore target).
                 // The service refuses a second DeleteTable in that window as a
                 // table still in use (measured 2026-10-24); checked before
                 // deletion protection, as the SQL backends order it.
@@ -224,7 +223,7 @@ impl CassandraEngine {
                 }
 
                 // A restore target is owned by its copy until the copy
-                // activates it (or the sweep removes it). Deleting it mid-copy
+                // activates it (or the reconciler removes it). Deleting it mid-copy
                 // would race the copy's writes into dropped tables.
                 let restoring_from: Option<String> = table_row
                     .get_by_name("restore_source_backup_arn")
@@ -298,14 +297,13 @@ impl CassandraEngine {
     /// twice: the base data table and the index data tables are dropped `IF
     /// EXISTS`, the TTL entries are cleared, and the index metadata goes after
     /// the index tables, so a removal that stops part way leaves the ids the
-    /// next attempt needs. The `continuous_backups` row is keyed on the table
-    /// name and the tags on the table ARN; neither carries a table id. They
-    /// are deleted last, after the renewal, while the catalog row still holds
-    /// the name, so a `CreateTable` of the name is refused until the row
-    /// delete releases it, and a tag or PITR write that landed during the
-    /// drops is removed with them. The renewal is the fence: an actor whose
-    /// lease was taken over, or whose row was removed or created again under
-    /// the name, stops before those deletes. It holds while the three
+    /// next attempt needs. The tags are keyed on the table ARN, which carries
+    /// no table id. They are deleted last, after the renewal, while the
+    /// catalog row still holds the name, so a `CreateTable` of the name is
+    /// refused until the row delete releases it, and a tag write that landed
+    /// during the drops is removed with them. The renewal is the fence: an
+    /// actor whose lease was taken over, or whose row was removed or created
+    /// again under the name, stops before that delete. It holds while the two
     /// statements after the renewal finish within the lease it wrote.
     pub(crate) async fn remove_claimed_table(
         &self,
@@ -343,19 +341,6 @@ impl CassandraEngine {
         {
             return Ok(false);
         }
-
-        // Delete table-scoped continuous-backup configuration so recreating the
-        // same table name does not inherit stale PITR state.
-        let delete_continuous_backup_query = format!(
-            "DELETE FROM {catalog_keyspace}.continuous_backups WHERE account_id = ? AND table_name = ?"
-        );
-        self.session
-            .query_with_values(
-                &delete_continuous_backup_query,
-                cdrs_tokio::query_values!(account_id, table_name),
-            )
-            .await
-            .map_err(|e| StorageError::Internal(format!("Delete continuous backup state: {e}")))?;
 
         // Delete tags for this table so they don't survive recreation under the same name.
         let delete_tags_query =

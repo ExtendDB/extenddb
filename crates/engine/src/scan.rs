@@ -21,11 +21,12 @@ use crate::create_table::storage_err_to_dynamo;
 use crate::expression_helpers::{build_expression_maps, parse_optional_filter};
 use crate::index_helpers::{
     VectorIndexReadRefusal, classify_unresolved_index_read, combined_lek_key_schema,
-    validate_scan_exclusive_start_key,
+    unresolved_index_error,
 };
 use crate::legacy_filter::desugar_filter;
 use crate::read_helpers::{PostRead, read_page};
 use crate::serialize_output;
+use crate::start_key::validate_scan_exclusive_start_key;
 use crate::{DispatchMetrics, DispatchResult};
 
 /// Handle a `Scan` request.
@@ -259,7 +260,9 @@ pub async fn handle_scan(
                 Err(err @ StorageError::IndexNotFound(_)) => {
                     return Err(
                         match classify_unresolved_index_read(ctx, &key_info, idx_name).await? {
-                            VectorIndexReadRefusal::NotFound => storage_err_to_dynamo(err),
+                            VectorIndexReadRefusal::NotFound => {
+                                unresolved_index_error(ctx, &key_info, err).await
+                            }
                             VectorIndexReadRefusal::Backfilling => {
                                 DynamoDbError::ValidationException(format!(
                                     "{VECTOR_INDEX_BACKFILLING_SCAN_PREFIX}{idx_name}"
@@ -377,7 +380,8 @@ pub async fn handle_scan(
         && index_info.is_none()
     {
         return Err(DynamoDbError::ValidationException(
-            "ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName".to_owned(),
+            "1 validation error detected: ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName"
+                .to_owned(),
         ));
     }
     if let Some(Select::Count) = input.select

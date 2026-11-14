@@ -158,9 +158,9 @@ impl CassandraEngine {
             match removal.await {
                 Ok(true) => transitions.push((table_name, "DELETING → deleted")),
                 Ok(false) => {}
-                // Logged and left, as the abandoned-restore sweep does, so one
-                // row that cannot be removed does not stop the rows after it. A
-                // later pass takes it again once this pass's lease has passed.
+                // Logged and left, so one row that cannot be removed does not
+                // stop the rows after it. A later pass takes it again once this
+                // pass's lease has passed.
                 Err(error) => tracing::warn!(
                     "Control-plane sweep: removing table {table_name} (account {account_id}): \
                      {error}; retrying on a later pass"

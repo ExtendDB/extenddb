@@ -1,19 +1,16 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Access-key management for `SqliteCatalogStore`, including key generation
-//! and AES-256-GCM secret encryption.
+//! Access-key management for `SqliteCatalogStore`, including key generation.
 //!
-//! Secrets are encrypted with the catalog encryption key before storage. The
-//! ciphertext layout is `nonce(12) || aes_gcm_ciphertext`, with the
-//! `access_key_id` bound as additional authenticated data (AAD) so a stored
-//! secret cannot be transplanted onto a different key id.
+//! Secrets are encrypted with the catalog encryption key before storage by
+//! `extenddb_storage::secret_cipher`. The ciphertext layout is
+//! `nonce(12) || ciphertext || tag(16)`, with the `access_key_id` bound as
+//! additional authenticated data (AAD) so a stored secret cannot be
+//! transplanted onto a different key id.
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use extenddb_storage::management_store::{AccessKeyCreated, OpError, OpResult};
+use extenddb_storage::secret_cipher::encrypt_secret;
 use time::OffsetDateTime;
 
 use crate::catalog_store::SqliteCatalogStore;
@@ -192,34 +189,4 @@ fn generate_secret_key() -> String {
         .map(|_| CHARSET[rand::Rng::random_range(&mut rng, 0..CHARSET.len())] as char)
         .collect();
     format!("extenddb{suffix}")
-}
-
-/// Encrypt a secret with AES-256-GCM. Output is `nonce(12) || ciphertext`,
-/// with `aad` (the access key id) bound as additional authenticated data.
-fn encrypt_secret(plaintext: &str, key_b64: &str, aad: &str) -> Result<Vec<u8>, String> {
-    let key_bytes = BASE64
-        .decode(key_b64)
-        .map_err(|e| format!("decode encryption key: {e}"))?;
-    if key_bytes.len() != 32 {
-        return Err("encryption key must be 32 bytes".to_owned());
-    }
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-
-    let nonce_bytes: [u8; 12] = rand::random();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext.as_bytes(),
-                aad: aad.as_bytes(),
-            },
-        )
-        .map_err(|e| format!("encrypt: {e}"))?;
-
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
 }

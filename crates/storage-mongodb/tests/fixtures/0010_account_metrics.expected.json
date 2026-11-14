@@ -1,0 +1,26 @@
+{
+  "account_metrics": {
+    "type": "collection",
+    "options": {},
+    "indexes": {
+      "_id_": {
+        "key": [
+          [
+            "_id",
+            1
+          ]
+        ],
+        "options": {}
+      },
+      "bucket_1": {
+        "key": [
+          [
+            "bucket",
+            1
+          ]
+        ],
+        "options": {}
+      }
+    }
+  }
+}

@@ -94,7 +94,7 @@ impl SqliteEngine {
         .await
         .map_err(|e| StorageError::Internal(e.to_string()))?
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25);
+        .unwrap_or(crate::DEFAULT_CONTROL_PLANE_DELAY_SECONDS);
 
         let index_ids: Vec<String> = index_rows.iter().map(|r| r.index_id.clone()).collect();
         let table_id = row.table_id.clone();
@@ -145,10 +145,10 @@ impl SqliteEngine {
             // reason: without it, a build committing between an earlier check
             // and this flip would have its table deleted underneath it.
             Self::refuse_if_index_build_in_flight(&mut tx, &row.table_id).await?;
-            // Fenced on the table id read above, so the mark can only land on
-            // the table this call described, never on a table created into the
-            // same name afterwards.
-            let marked = sqlx::query(
+            // The select above ran in this `BEGIN IMMEDIATE` transaction, so
+            // no other writer has changed the row since: the mark updates the
+            // row this call read, which the table id names.
+            sqlx::query(
                 "UPDATE tables SET table_status = 'DELETING', status_transition_at = ? \
                  WHERE account_id = ? AND table_name = ? AND table_id = ?",
             )
@@ -159,9 +159,6 @@ impl SqliteEngine {
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(e.to_string()))?;
-            if marked.rows_affected() == 0 {
-                return Err(StorageError::TableNotFound(input.table_name.clone()));
-            }
             tx.commit()
                 .await
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -222,11 +219,14 @@ mod deleting_window_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-            .execute(&engine.pool)
-            .await
-            .expect("delay");
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&engine.pool)
+        .await
+        .expect("delay");
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(ACCOUNT)
             .execute(&engine.pool)

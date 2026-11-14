@@ -18,30 +18,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from conftest import _is_real_dynamodb, wait_for_active, wait_for_deleted
-
-
-def _configured_backend():
-    """The backend under test: `EXTENDDB_TEST_BACKEND` (exported by
-    devtools/run-tests), else the `[storage] backend` of the server's config
-    file, else None (real DynamoDB, or a server started elsewhere)."""
-    explicit = os.environ.get("EXTENDDB_TEST_BACKEND", "").strip()
-    if explicit:
-        return explicit
-    path = os.environ.get("EXTENDDB_CONFIG", "extenddb.toml")
-    try:
-        with open(path) as f:
-            text = f.read()
-    except OSError:
-        return None
-    section = None
-    for line in text.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line.startswith("["):
-            section = line.strip("[]").strip()
-        elif section == "storage" and line.split("=", 1)[0].strip() == "backend":
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return None
+from conftest import configured_backend, _is_real_dynamodb, wait_for_active, wait_for_deleted
 
 
 @pytest.fixture()
@@ -136,7 +113,7 @@ class TestUpdateTimeToLive:
         The Cassandra refusal itself is pinned by the storage-level test
         test_ttl_on_a_table_with_an_async_gsi_is_refused_as_a_validation_error.
         """
-        backend = None if _is_real_dynamodb() else _configured_backend()
+        backend = None if _is_real_dynamodb() else configured_backend()
         may_refuse = backend == "cassandra" or (backend is None and not _is_real_dynamodb())
         print(f"backend under test: {backend or 'unknown'}; refusal allowed: {may_refuse}")
         dynamodb_client.create_table(

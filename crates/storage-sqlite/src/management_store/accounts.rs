@@ -9,6 +9,8 @@ use time::OffsetDateTime;
 use crate::catalog_store::SqliteCatalogStore;
 use crate::sqlite_util::{is_unique_violation, parse_timestamp};
 
+use super::policies::{begin_write, delete_account_login_history, finish};
+
 impl SqliteCatalogStore {
     pub(crate) async fn create_account_impl(
         &self,
@@ -67,15 +69,22 @@ impl SqliteCatalogStore {
         // D1: every writer holds the write lock. The existence and dependency
         // checks above are reads and run before it.
         let _writer = self.lock_writes().await;
-        sqlx::query("DELETE FROM accounts WHERE account_id = ?")
-            .bind(account_id)
-            .execute(self.pool())
-            .await
-            .map_err(|e| {
-                tracing::error!("delete_account: {e}");
-                OpError::Internal("Database error".to_owned())
-            })?;
-        Ok(())
+        let mut tx = begin_write(self.pool(), "delete_account").await?;
+        let result: OpResult<()> = async {
+            sqlx::query("DELETE FROM accounts WHERE account_id = ?")
+                .bind(account_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    tracing::error!("delete_account: {e}");
+                    OpError::Internal("Database error".to_owned())
+                })?;
+            // The foreign keys remove the account's IAM rows; its users'
+            // failed logins are keyed by sign-in name and have none.
+            delete_account_login_history(&mut tx, account_id).await
+        }
+        .await;
+        finish(tx, result, "delete_account").await
     }
 
     pub(crate) async fn list_all_accounts_impl(&self) -> OpResult<Vec<(String, String)>> {
