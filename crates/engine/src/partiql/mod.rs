@@ -57,7 +57,7 @@ mod returning;
 mod select;
 mod snapshot;
 #[cfg(test)]
-mod test_context;
+pub(crate) mod test_context;
 mod transaction;
 mod write;
 

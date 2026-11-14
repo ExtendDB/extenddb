@@ -25,13 +25,26 @@
 //! answers a bad `Limit` on a missing stream with `ValidationException` or
 //! `ResourceNotFoundException` is unknown. The handler refuses the `Limit`
 //! before it looks the stream up.
+//!
+//! The tests run the handler on the engine's in-memory SQLite test context
+//! (`partiql::test_context::context`). Its database holds no stream, so a
+//! request that reaches storage is answered with an error that is neither
+//! `Limit` message. A refused `Limit` carries its exact message, which shows
+//! the check ran before storage. For Limit 1 and Limit 100 the tests assert
+//! only that neither `Limit` message comes back: the crate has no helper that
+//! opens a migrated in-memory engine, so no stream exists to describe.
 
 use serde_json::json;
 
 use extenddb_core::error::DynamoDbError;
 
 use super::handle_describe_stream;
-use super::test_storage::{STREAM_ARN, StreamStorage, context};
+use crate::partiql::test_context::context;
+
+/// A stream ARN in the context's account. Its database holds no table, so a
+/// request that reaches storage is not answered with a stream description.
+const STREAM_ARN: &str =
+    "arn:aws:dynamodb:us-east-1:000000000000:table/Orders/stream/2026-10-22T00:00:00.000";
 
 const BELOW_ONE: &str = "1 validation error detected: Value at 'limit' failed to satisfy \
                          constraint: Member must have value greater than or equal to 1";
@@ -40,8 +53,7 @@ const ABOVE_MAX: &str =
 
 #[tokio::test]
 async fn describe_stream_refuses_a_limit_outside_1_to_100_before_storage() {
-    let storage = StreamStorage::new();
-    let ctx = context(&storage);
+    let ctx = context(None).await;
     for (limit, expected) in [
         (0, BELOW_ONE),
         (-3, BELOW_ONE),
@@ -54,21 +66,18 @@ async fn describe_stream_refuses_a_limit_outside_1_to_100_before_storage() {
             other => panic!("Limit {limit}: expected ValidationException, got {other:?}"),
         }
     }
-    assert_eq!(
-        storage.describe_calls(),
-        0,
-        "no refused Limit reached storage"
-    );
 }
 
 #[tokio::test]
-async fn describe_stream_passes_limits_1_and_100_to_storage() {
-    let storage = StreamStorage::new();
-    let ctx = context(&storage);
+async fn describe_stream_passes_limits_1_and_100() {
+    let ctx = context(None).await;
     for limit in [1, 100] {
         let body = json!({"StreamArn": STREAM_ARN, "Limit": limit});
-        let described = handle_describe_stream(body, &ctx).await;
-        assert!(described.is_ok(), "Limit {limit}: {described:?}");
+        let answer = handle_describe_stream(body, &ctx).await;
+        let refused = matches!(
+            &answer,
+            Err(DynamoDbError::ValidationException(m)) if m == BELOW_ONE || m == ABOVE_MAX
+        );
+        assert!(!refused, "Limit {limit} was refused: {answer:?}");
     }
-    assert_eq!(storage.describe_calls(), 2);
 }

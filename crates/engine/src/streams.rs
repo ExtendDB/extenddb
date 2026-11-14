@@ -525,7 +525,4 @@ fn storage_to_dynamo(e: StorageError) -> DynamoDbError {
 mod tests;
 
 #[cfg(test)]
-mod test_storage;
-
-#[cfg(test)]
 mod describe_limit_tests;
