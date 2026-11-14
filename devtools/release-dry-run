@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# Copyright 2026 ExtendDB contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Rehearse the container release workflows locally, with nothing published.
+#
+#     devtools/release-dry-run [--tag vX.Y.Z] [--images LIST|none] [--crates]
+#                              [--skip-scan] [--keep] [--reuse-images]
+#                              [--stop-on-fail]
+#
+# Runs, on the checked-out commit and for each image, what the `gate` and
+# `build` jobs of release-image.yml and release-dev-image.yml run before
+# anything is pushed: the licence-notice check, the migration-freeze check
+# (devtools/check-released-through), the image build with the release's
+# build-args (VERSION from Cargo.toml, VCS_REF the commit, BUILD_DATE the
+# commit's timestamp), the architecture check, the vulnerability scan and
+# SBOM through the release's pinned trivy image (the pin read from
+# release-image.yml) with the release's flags,
+# and the image's smoke test (ci/smoke-test-*-container.sh). Publishing,
+# signing, mirroring and attestation are not rehearsed here: the signing and
+# attestation paths have their own self-test workflows, and the push is the
+# release. The working tree must be clean: the release builds a commit, and
+# this rehearses the tree as that commit.
+#
+# `--tag vX.Y.Z` also runs the tag gates on that tag, as the workflows do:
+# strict shape, exists on origin, contained in origin's main, and the version
+# equals Cargo.toml's; the tag must name the checked-out commit. Without it
+# the tag gates are reported as not run.
+#
+# `--images` names which of postgres, mongodb, cassandra, dev to rehearse
+# (default: all four; `none` runs the shared gates alone). `--crates` adds
+# release-crates.yml's plan and `verify` steps: the publish plan
+# (`devtools/publish-crates --dry-run`), `cargo package --workspace
+# --locked`, `devtools/check-crate-packages` and the SHA-256 record of each
+# package, all on the toolchain release-crates.yml pins (RUST_TOOLCHAIN,
+# installed with rustup if absent); that workflow's other gates need the
+# promoted image and are not rehearsed.
+# `--skip-scan` skips the vulnerability scan and the SBOM (the trivy image
+# and its database need network access). The build runs with `--no-cache`,
+# as the release's does, so a rerun installs the base image's current
+# package updates where the Dockerfile upgrades them; `--reuse-images` is the
+# way to rerun a smoke test without that cost.
+#
+# Every gate and image is attempted and the summary lists each outcome with
+# its log; the exit code is 1 when anything failed. With `--stop-on-fail`
+# the run stops at the first failure, as the real gate does. `--keep` leaves
+# the built images and the work directory in place, and `--reuse-images`
+# skips a build whose image a previous `--keep` run left, so a smoke test
+# can be re-run without rebuilding. Images are tagged
+# `extenddb-dry-run/<image>:<commit>-<arch>`, a name no release uses; a
+# build moves that tag to the new image, and the run removes only the images
+# it built, giving a kept image its tag back. Logs, tarballs and SBOMs go
+# under target/release-dry-run/.
+#
+# Needs: docker (daemon running, with compose v2), aws, python3, cargo,
+# cargo-about 0.9.0 (the licence check), rustup for `--crates`, and
+# `timeout` (the Cassandra smoke test). PYTHON names the interpreter for the devtools scripts (default
+# python3; `--crates` needs 3.11 or later). One architecture only, the
+# host's: the release builds linux/amd64 and linux/arm64, each on its own
+# runner.
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+    # The header comment above, up to the first line of code.
+    awk 'NR >= 5 && !/^#/ {exit} NR >= 5 {sub(/^# ?/, ""); print}' "$0"
+}
+
+TAG=""
+IMAGES="postgres mongodb cassandra dev"
+CRATES=0
+SKIP_SCAN=0
+KEEP=0
+REUSE=0
+STOP_ON_FAIL=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tag) [[ $# -ge 2 ]] || { echo "error: --tag needs a value, e.g. v1.0.0" >&2; exit 2; }; TAG="$2"; shift 2 ;;
+        --images) [[ $# -ge 2 ]] || { echo "error: --images needs a list, e.g. postgres,dev, or none" >&2; exit 2; }; IMAGES="${2//,/ }"; shift 2 ;;
+        --crates) CRATES=1; shift ;;
+        --skip-scan) SKIP_SCAN=1; shift ;;
+        --keep) KEEP=1; shift ;;
+        --reuse-images) REUSE=1; shift ;;
+        --stop-on-fail) STOP_ON_FAIL=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown argument $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+[[ "$IMAGES" == none ]] && IMAGES=""
+for image in $IMAGES; do
+    case "$image" in
+        postgres|mongodb|cassandra|dev) ;;
+        *) echo "error: unknown image '$image' (postgres, mongodb, cassandra, dev, or none)" >&2; exit 2 ;;
+    esac
+done
+if [[ -z "$IMAGES" && $CRATES == 0 ]]; then
+    echo "note: no images and no --crates; only the shared gates run" >&2
+fi
+
+PYTHON="${PYTHON:-python3}"
+# The release's pins, read from the workflows so this script and the release
+# use one copy: the trivy image of the build jobs, and the toolchain of the
+# crates.io jobs.
+pin() { # file key
+    local value; value=$(sed -n "s/^ *$2: *[\"']\\{0,1\\}\\([^\"' ]*\\)[\"']\\{0,1\\} *$/\\1/p" "$1" | head -n 1)
+    [[ -n "$value" ]] || { echo "error: no $2 pin in $1" >&2; exit 1; }
+    printf '%s\n' "$value"
+}
+TRIVY_IMAGE=$(pin .github/workflows/release-image.yml TRIVY_IMAGE)
+RUST_TOOLCHAIN=$(pin .github/workflows/release-crates.yml RUST_TOOLCHAIN)
+
+# --- Prerequisites -------------------------------------------------------------
+missing=0
+for command in docker aws cargo git timeout "$PYTHON"; do
+    command -v "$command" >/dev/null 2>&1 || { echo "error: required command not found: $command" >&2; missing=1; }
+done
+[[ $missing == 0 ]] || exit 1
+docker info >/dev/null 2>&1 || { echo "error: the docker daemon is not reachable" >&2; exit 1; }
+if [[ -n "$IMAGES" ]]; then
+    docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required by the smoke tests" >&2; exit 1; }
+    cargo about --version >/dev/null 2>&1 || { echo "error: cargo-about is required by the licence check (cargo install --locked --version 0.9.0 --features cli cargo-about)" >&2; exit 1; }
+fi
+if [[ $CRATES == 1 ]]; then
+    command -v rustup >/dev/null 2>&1 || { echo "error: --crates needs rustup, for the release's toolchain $RUST_TOOLCHAIN" >&2; exit 1; }
+fi
+
+# --- Work directory and bookkeeping ------------------------------------------
+# Under the repository (gitignored, excluded from the Docker context), so the
+# trivy container's bind mount works where /tmp is not shared with the daemon.
+mkdir -p target/release-dry-run
+WORK="$(mktemp -d "$ROOT/target/release-dry-run/run.XXXXXX")"
+RESULTS=()
+FAILED=0
+BUILT_IMAGES=()
+NAME_WIDTH=24
+
+record() { # name outcome seconds detail
+    RESULTS+=("$(printf '%s\t%s\t%ss\t%s' "$1" "$2" "$3" "$4")")
+    (( ${#1} > NAME_WIDTH )) && NAME_WIDTH=${#1}
+    if [[ "$2" == FAIL ]]; then
+        FAILED=1
+        if [[ $STOP_ON_FAIL == 1 ]]; then
+            summary
+            exit 1
+        fi
+    fi
+}
+
+# run NAME LOG -- COMMAND...: runs the step in a subshell with errexit, so a
+# failing command inside a step function fails the step. The subshell is not
+# the condition of an `if` or an `||` list: in those contexts bash ignores
+# `set -e`, inside the subshell too, and a step whose first command failed
+# would run on and be recorded as PASS. Records PASS or FAIL with the
+# duration and the log's path; the log's tail is shown on failure.
+run() {
+    local name="$1" log="$WORK/$2"; shift 2; [[ "$1" == "--" ]] && shift
+    local start=$SECONDS status
+    set +e
+    ( set -e; "$@" ) >"$log" 2>&1
+    status=$?
+    set -e
+    if [[ $status == 0 ]]; then
+        record "$name" PASS $((SECONDS - start)) "$log"
+    else
+        echo "---- $name failed; last 40 lines of $log:" >&2
+        tail -n 40 "$log" >&2
+        echo "----" >&2
+        record "$name" FAIL $((SECONDS - start)) "$log"
+    fi
+}
+
+summary() {
+    echo
+    echo "release dry run of $SHA (version $VERSION, built $BUILD_DATE), linux/$ARCH, $(rustc --version 2>/dev/null || echo 'rustc unknown')"
+    printf "%-${NAME_WIDTH}s %-7s %8s  %s\n" step outcome time detail
+    local r n o t d
+    for r in "${RESULTS[@]}"; do
+        IFS=$'\t' read -r n o t d <<<"$r"
+        printf "%-${NAME_WIDTH}s %-7s %8s  %s\n" "$n" "$o" "$t" "$d"
+    done
+    if [[ $FAILED == 1 ]]; then echo "RESULT: FAIL"; else echo "RESULT: PASS"; fi
+    echo "logs: $WORK"
+}
+
+# BUILT_IMAGES holds `<image id>|<tag>|<id the tag had before, or ->` for each
+# image this run built.
+cleanup() {
+    if [[ $KEEP == 0 ]]; then
+        local entry id tag before
+        for entry in "${BUILT_IMAGES[@]+"${BUILT_IMAGES[@]}"}"; do
+            IFS='|' read -r id tag before <<<"$entry"
+            docker image rm -f "$id" >/dev/null 2>&1 || true
+            [[ "$before" == - ]] || docker tag "$before" "$tag" >/dev/null 2>&1 || true
+        done
+        rm -f "$WORK"/image-*.tar.gz
+    fi
+}
+trap cleanup EXIT
+
+# --- Release identity, as the gate derives it -------------------------------
+SHA=$(git rev-parse HEAD)
+VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+BUILD_DATE=$(TZ=UTC git show -s --date=format-local:'%Y-%m-%dT%H:%M:%SZ' --format=%cd "$SHA")
+ARCH=$(docker version --format '{{.Server.Arch}}')
+echo "commit $SHA, Cargo.toml version $VERSION, build date $BUILD_DATE, linux/$ARCH"
+echo "logs in $WORK"
+
+# --- Shared gates ---------------------------------------------------------------
+clean_tree() {
+    local dirty; dirty=$(git status --porcelain --untracked-files=no)
+    [[ -z "$dirty" ]] || { echo "the working tree differs from $SHA:"; echo "$dirty"; return 1; }
+    echo "the working tree is $SHA"
+}
+run "gate: working tree clean" gate-clean-tree.log -- clean_tree
+
+# The tag gates of release-image.yml's gate job, steps 1 to 4. The remote is
+# read directly (ls-remote and FETCH_HEAD), so a local tag or branch of the
+# same name cannot stand in for it.
+tag_gates() {
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+        || { echo "tag '$TAG' is not a strict vMAJOR.MINOR.PATCH"; return 1; }
+    local remote_tag tag_sha
+    remote_tag=$(git ls-remote --exit-code --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}") \
+        || { echo "tag $TAG does not exist on origin"; return 1; }
+    # An annotated tag lists its object and its peeled commit; take the commit.
+    tag_sha=$(awk '$2 ~ /\^\{\}$/ {peeled=$1} $2 !~ /\^\{\}$/ {plain=$1} END {print (peeled != "" ? peeled : plain)}' <<<"$remote_tag")
+    [[ "$tag_sha" == "$SHA" ]] \
+        || { echo "tag $TAG is $tag_sha on origin; the checked-out commit is $SHA"; return 1; }
+    git fetch --no-tags origin main
+    git merge-base --is-ancestor "$SHA" FETCH_HEAD \
+        || { echo "$TAG ($SHA) is not contained in origin's main"; return 1; }
+    [[ "${TAG#v}" == "$VERSION" ]] \
+        || { echo "tag $TAG implies ${TAG#v} but Cargo.toml says $VERSION"; return 1; }
+    echo "tag $TAG: strict shape, on origin at $SHA, on main, matches Cargo.toml"
+}
+if [[ -n "$TAG" ]]; then
+    run "gate: tag $TAG" gate-tag.log -- tag_gates
+else
+    on_main="whether $SHA is on origin's main was not checked"
+    if git fetch --no-tags origin main >/dev/null 2>&1; then
+        if git merge-base --is-ancestor "$SHA" FETCH_HEAD; then on_main="$SHA is on origin's main"; else on_main="$SHA is NOT on origin's main"; fi
+    fi
+    record "gate: tag" SKIP 0 "no --tag; the release needs v$VERSION at a commit on main ($on_main)"
+fi
+
+# The migration freeze, shared by every release workflow's gate.
+run "gate: migrations frozen" gate-released-through.log -- "$PYTHON" devtools/check-released-through
+
+# --- Per image -------------------------------------------------------------------
+files_exist() { [[ -f "$1" && -f "$2" ]] || { echo "missing $1 or $2"; return 1; }; }
+
+build_image() { # dockerfile image
+    docker build -f "$1" --platform "linux/$ARCH" --no-cache \
+        --build-arg "VERSION=$VERSION" --build-arg "VCS_REF=$SHA" --build-arg "BUILD_DATE=$BUILD_DATE" \
+        -t "$2" .
+}
+
+arch_check() { # image
+    local actual; actual=$(docker image inspect "$1" --format '{{.Architecture}}')
+    [[ "$actual" == "$ARCH" ]] || { echo "expected $ARCH, image reports $actual"; return 1; }
+    echo "image is $actual"
+}
+
+save_image() { # image tarball
+    [[ -f "$2" ]] || docker save "$1" | gzip > "$2"
+    ls -lh "$2"
+}
+
+scan_image() { # image tarball
+    save_image "$1" "$2"
+    docker run --rm -v "$2:/image.tar.gz:ro" "$TRIVY_IMAGE" image --input /image.tar.gz \
+        --scanners vuln --skip-files usr/local/bin/extenddb --ignore-unfixed --severity HIGH,CRITICAL \
+        --db-repository public.ecr.aws/aquasecurity/trivy-db:2 --exit-code 1 --no-progress
+}
+
+# The SBOM step of the build jobs, with the workflow's own validation.
+sbom_image() { # image tarball dockerfile sbom
+    save_image "$1" "$2"
+    docker run --rm -v "$2:/image.tar.gz:ro" "$TRIVY_IMAGE" image --input /image.tar.gz \
+        --format cyclonedx --no-progress --skip-version-check > "$4"
+    "$PYTHON" devtools/check-image-sbom "$4" "$3"
+}
+
+smoke_image() { # env-var script image
+    env "$1=$3" "$2"
+}
+
+for image in $IMAGES; do
+    case "$image" in
+        postgres)  dockerfile=Dockerfile;           smoke=ci/smoke-test-container.sh;           smoke_env=EXTENDDB_IMAGE;           licence=(devtools/generate-software-license-notices --check --backend postgres) ;;
+        mongodb)   dockerfile=Dockerfile.mongodb;   smoke=ci/smoke-test-mongodb-container.sh;   smoke_env=EXTENDDB_MONGODB_IMAGE;   licence=(devtools/generate-software-license-notices --check --backend mongodb) ;;
+        cassandra) dockerfile=Dockerfile.cassandra; smoke=ci/smoke-test-cassandra-container.sh; smoke_env=EXTENDDB_CASSANDRA_IMAGE; licence=(devtools/generate-software-license-notices --check --backend cassandra) ;;
+        dev)       dockerfile=Dockerfile.dev;       smoke=ci/smoke-test-dev-container.sh;       smoke_env=EXTENDDB_IMAGE;           licence=(devtools/generate-dev-license-notices --check) ;;
+    esac
+    # A name no release uses: the candidate is extenddb/extenddb-<image>:sha-<sha>-<arch>.
+    img="extenddb-dry-run/$image:${SHA:0:12}-$ARCH"
+    tarball="$WORK/image-$image-$ARCH.tar.gz"
+    sbom="$WORK/sbom-$image-$ARCH.cdx.json"
+
+    run "$image: gate: Dockerfile and smoke script" "$image-gate-files.log" -- files_exist "$dockerfile" "$smoke"
+    run "$image: gate: licence notices" "$image-gate-licence.log" -- "${licence[@]}"
+
+    if [[ $REUSE == 1 ]] && docker image inspect "$img" >/dev/null 2>&1; then
+        record "$image: build ($ARCH)" SKIP 0 "--reuse-images: $img exists and is kept"
+    else
+        before=$(docker image inspect --format '{{.Id}}' "$img" 2>/dev/null || echo -)
+        run "$image: build ($ARCH)" "$image-build.log" -- build_image "$dockerfile" "$img"
+        after=$(docker image inspect --format '{{.Id}}' "$img" 2>/dev/null || echo -)
+        [[ "$after" == - || "$after" == "$before" ]] || BUILT_IMAGES+=("$after|$img|$before")
+    fi
+    if ! docker image inspect "$img" >/dev/null 2>&1; then
+        for step in "arch check" "vulnerability scan" SBOM "smoke test"; do record "$image: $step" SKIP 0 "no image"; done
+        continue
+    fi
+
+    run "$image: arch check" "$image-arch.log" -- arch_check "$img"
+    if [[ $SKIP_SCAN == 1 ]]; then
+        record "$image: vulnerability scan" SKIP 0 "--skip-scan"
+        record "$image: SBOM" SKIP 0 "--skip-scan"
+    else
+        run "$image: vulnerability scan" "$image-scan.log" -- scan_image "$img" "$tarball"
+        run "$image: SBOM" "$image-sbom.log" -- sbom_image "$img" "$tarball" "$dockerfile" "$sbom"
+    fi
+    run "$image: smoke test" "$image-smoke.log" -- smoke_image "$smoke_env" "$smoke" "$img"
+done
+
+# --- crates.io: release-crates.yml's plan (a gate step) and verify job ----------
+if [[ $CRATES == 1 ]]; then
+    # release-crates.yml runs every cargo on RUST_TOOLCHAIN; a crate that builds
+    # on a newer toolchain and not on the pin would pass here and fail there.
+    export RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN"
+    toolchain_matches() {
+        rustup toolchain list | grep -q "^$RUST_TOOLCHAIN" || rustup toolchain install --profile minimal "$RUST_TOOLCHAIN"
+        local actual; actual=$(rustc --version)
+        [[ "$actual" == "rustc $RUST_TOOLCHAIN "* ]] || { echo "rustc is '$actual', not the release's $RUST_TOOLCHAIN"; return 1; }
+        echo "$actual (release-crates.yml pins $RUST_TOOLCHAIN)"
+    }
+    run "crates: toolchain $RUST_TOOLCHAIN" crates-toolchain.log -- toolchain_matches
+    run "crates: gate: publish plan" crates-plan.log -- "$PYTHON" devtools/publish-crates --dry-run --version "$VERSION"
+    run "crates: cargo package --workspace" crates-package.log -- cargo package --workspace --locked
+    run "crates: package rules" crates-rules.log -- "$PYTHON" devtools/check-crate-packages
+    crate_sha256() {
+        mkdir -p "$WORK/crate-sha256"
+        "$PYTHON" devtools/publish-crates --list-packages --version "$VERSION" > "$WORK/crate-sha256/packages.txt"
+        [[ -s "$WORK/crate-sha256/packages.txt" ]] || { echo "devtools/publish-crates lists no package"; return 1; }
+        printf '%s\n' "$SHA" > "$WORK/crate-sha256/COMMIT"
+        printf '%s\n' "$RUST_TOOLCHAIN" > "$WORK/crate-sha256/TOOLCHAIN"
+        local packages=()
+        while IFS= read -r line; do packages+=("$line"); done < "$WORK/crate-sha256/packages.txt"
+        (cd target/package && sha256sum -- "${packages[@]}") | tee "$WORK/crate-sha256/SHA256SUMS"
+    }
+    run "crates: SHA-256 record" crates-sha256.log -- crate_sha256
+fi
+
+summary
+[[ $FAILED == 0 ]]

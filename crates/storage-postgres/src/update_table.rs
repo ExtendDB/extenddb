@@ -7,9 +7,12 @@ use extenddb_core::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, TableDescription, UpdateTableInput,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
+use extenddb_storage::util::{
+    building_refuses, effective_attribute_definitions, warm_throughput_record_for_create,
+};
 
 use crate::PostgresEngine;
+use crate::catalog_json::{from_catalog_json, to_catalog_json};
 use crate::data::gsi_build::{
     GsiBuild, build_gsis, drop_gsi_tables, is_transient, remove_failed_build,
 };
@@ -381,75 +384,21 @@ impl PostgresEngine {
                 .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
-        // Apply stream specification change (enable/disable streams).
-        if let Some(spec) = &input.stream_specification {
-            let spec_json =
-                serde_json::to_value(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            sqlx::query(
-                "UPDATE tables SET stream_specification = $1 \
-                 WHERE account_id = $2 AND table_name = $3",
-            )
-            .bind(&spec_json)
-            .bind(account_id)
-            .bind(&input.table_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-            if spec.stream_enabled {
-                // Check if shards already exist (re-enabling streams on a table
-                // that previously had them). Query the data pool since
-                // stream_shards lives in the data database.
-                let existing: Option<(String,)> = sqlx::query_as(
-                    "SELECT shard_id FROM stream_shards \
-                     WHERE table_id = $1 \
-                     LIMIT 1",
+        // Apply stream specification change (enable/disable streams). The
+        // shard changes run once the catalog has committed.
+        let pending_stream = match &input.stream_specification {
+            Some(spec) => Some(
+                self.apply_stream_specification(
+                    &mut tx,
+                    account_id,
+                    &input.table_name,
+                    &table_id,
+                    spec,
                 )
-                .bind(&table_id)
-                .fetch_optional(&self.data_pool)
-                .await
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                if existing.is_none() {
-                    Self::init_stream_shards(
-                        &mut tx,
-                        &self.data_pool,
-                        account_id,
-                        &input.table_name,
-                        &table_id,
-                    )
-                    .await?;
-                } else {
-                    // Shards exist but stream_label may be NULL if streams were
-                    // previously disabled and the disable path cleared the label.
-                    // This is a defensive check — init_stream_shards sets the
-                    // label on first enable, but re-enable after disable needs
-                    // to restore it.
-                    let current_label: Option<String> = sqlx::query_scalar(
-                        "SELECT stream_label FROM tables \
-                         WHERE account_id = $1 AND table_name = $2",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-
-                    if current_label.is_none() {
-                        sqlx::query(
-                            "UPDATE tables SET stream_label = $3 \
-                             WHERE account_id = $1 AND table_name = $2",
-                        )
-                        .bind(account_id)
-                        .bind(&input.table_name)
-                        .bind(extenddb_storage::util::new_stream_label())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    }
-                }
-            }
-        }
+                .await?,
+            ),
+            None => None,
+        };
 
         // Apply table class change.
         if let Some(tc) = &input.table_class {
@@ -480,7 +429,14 @@ impl PostgresEngine {
             .map_err(|e| StorageError::Internal(e.to_string()))?;
         }
 
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
+
         // Apply GSI updates (create/delete).
+        // The WarmThroughput record each created GSI was inserted with, so the
+        // restart after the build leaves a later Update's record alone.
+        let mut created_warm: Vec<(String, serde_json::Value)> = Vec::new();
         let mut created_index_ids: Vec<String> = Vec::new();
         let mut deleted_index_ids: Vec<String> = Vec::new();
         // The merged and pruned attribute definitions persisted by this
@@ -504,10 +460,8 @@ impl PostgresEngine {
                     // `ensure_index_name_free`.
                     ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
 
-                    let gsi_ks = serde_json::to_value(&create.key_schema)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    let gsi_proj = serde_json::to_value(&create.projection)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let gsi_ks = to_catalog_json(&create.key_schema)?;
+                    let gsi_proj = to_catalog_json(&create.projection)?;
                     let gsi_pt = create
                         .provisioned_throughput
                         .as_ref()
@@ -515,12 +469,20 @@ impl PostgresEngine {
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
 
+                    let gsi_warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        Self::control_plane_delay_secs(&mut tx).await?,
+                    )
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|e| StorageError::Internal(e.to_string()))?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     sqlx::query(
                         r"INSERT INTO indexes
                            (table_id, index_name, index_id, index_type, key_schema, projection,
-                            index_status, provisioned_throughput)
-                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6)",
+                            index_status, provisioned_throughput, warm_throughput)
+                           VALUES ($1, $2, $3, 'GSI', $4, $5, 'CREATING', $6, $7)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -528,9 +490,13 @@ impl PostgresEngine {
                     .bind(&gsi_ks)
                     .bind(&gsi_proj)
                     .bind(&gsi_pt)
+                    .bind(&gsi_warm)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    if let Some(warm) = gsi_warm {
+                        created_warm.push((create.index_name.clone(), warm));
+                    }
                     created_index_ids.push(index_id);
                     // The data table is created before this transaction commits, and
                     // the index is published CREATING; see the block before the
@@ -578,12 +544,8 @@ impl PostgresEngine {
             // transaction, so `indexes` already holds exactly the surviving set;
             // the stored definitions were read under the FOR UPDATE lock, so the
             // read-modify-write is atomic against a concurrent UpdateTable.
-            let stored_attr_defs: Vec<AttributeDefinition> =
-                serde_json::from_value(ad_json.clone())
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let table_key_schema: Vec<KeySchemaElement> =
-                serde_json::from_value(ks_json.clone())
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let stored_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
+            let table_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
 
             let surviving_rows: Vec<(serde_json::Value,)> =
                 sqlx::query_as("SELECT key_schema FROM indexes WHERE table_id = $1")
@@ -594,10 +556,7 @@ impl PostgresEngine {
             let mut surviving_index_key_schemas: Vec<Vec<KeySchemaElement>> =
                 Vec::with_capacity(surviving_rows.len());
             for (ks_value,) in surviving_rows {
-                surviving_index_key_schemas.push(
-                    serde_json::from_value(ks_value)
-                        .map_err(|e| StorageError::Internal(e.to_string()))?,
-                );
+                surviving_index_key_schemas.push(from_catalog_json(ks_value)?);
             }
 
             let effective = effective_attribute_definitions(
@@ -608,8 +567,7 @@ impl PostgresEngine {
             );
 
             if effective != stored_attr_defs {
-                let effective_json = serde_json::to_value(&effective)
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
+                let effective_json = to_catalog_json(&effective)?;
                 sqlx::query(
                     "UPDATE tables SET attribute_definitions = $1 \
                      WHERE account_id = $2 AND table_name = $3",
@@ -695,11 +653,9 @@ impl PostgresEngine {
                         // naming both shapes, with the vector as type L and its
                         // dimension count.
                         let base_key_schema: Vec<KeySchemaElement> =
-                            serde_json::from_value(ks_json.clone())
-                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            from_catalog_json(ks_json.clone())?;
                         let stored_attr_defs: Vec<AttributeDefinition> =
-                            serde_json::from_value(ad_json.clone())
-                                .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            from_catalog_json(ad_json.clone())?;
                         let vec_attr_name = &create.vector_attribute.attribute_name;
                         if let Some(ks) = base_key_schema
                             .iter()
@@ -730,15 +686,12 @@ impl PostgresEngine {
                         ensure_index_name_free(&mut tx, &table_id, &create.index_name).await?;
 
                         let index_id = uuid::Uuid::new_v4().to_string();
-                        let vec_attr = serde_json::to_value(&create.vector_attribute)
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                        let vec_attr = to_catalog_json(&create.vector_attribute)?;
                         let search_schema = create
                             .search_schema_for_storage()
-                            .map(serde_json::to_value)
-                            .transpose()
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
-                        let projection = serde_json::to_value(&create.projection)
-                            .map_err(|e| StorageError::Internal(e.to_string()))?;
+                            .map(to_catalog_json)
+                            .transpose()?;
+                        let projection = to_catalog_json(&create.projection)?;
                         let distance = extenddb_storage::vector_catalog::distance_function_token(
                             create.distance_function,
                         )?;
@@ -842,10 +795,8 @@ impl PostgresEngine {
         // recovery sweep never sees a CREATING row with nobody holding it. It is an
         // efficiency measure only: a second, concurrent build is correct, because a
         // full backfill pass is enough on its own to publish the index.
-        let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
-        let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
-            .map_err(|e| StorageError::Internal(e.to_string()))?;
+        let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
+        let base_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
         // Built from the merged and pruned set rather than the request's subset: a
         // new index may key on an attribute the base table already defined, and on
         // a conflicting redeclaration the stored type is the one that counts.
@@ -951,6 +902,10 @@ impl PostgresEngine {
             return Err(e);
         }
 
+        if let Some(pending) = pending_stream {
+            pending.apply(self, account_id, &input.table_name).await?;
+        }
+
         // Drop the data tables of deleted GSIs, after the catalog commit.
         if let Some(updates) = &input.global_secondary_index_updates {
             let mut delete_idx = 0usize;
@@ -976,10 +931,8 @@ impl PostgresEngine {
         // leaves a CREATING row for the reconciler rather than an ACTIVE index over
         // a table that was never populated.
         for (index_id, create) in &created_vector_indexes {
-            let base_key_schema: Vec<KeySchemaElement> = serde_json::from_value(ks_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
-            let base_attr_defs: Vec<AttributeDefinition> = serde_json::from_value(ad_json.clone())
-                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            let base_key_schema: Vec<KeySchemaElement> = from_catalog_json(ks_json.clone())?;
+            let base_attr_defs: Vec<AttributeDefinition> = from_catalog_json(ad_json.clone())?;
 
             let started = self
                 .start_vector_index_build(
@@ -1136,6 +1089,11 @@ impl PostgresEngine {
                 ),
             }
         }
+
+        // The build outlasts a new GSI's WarmThroughput UPDATING window; start
+        // it again so the response reports it as the service does.
+        self.restart_created_gsi_warm_throughput(&table_id, &created_warm)
+            .await?;
 
         self.build_table_description(account_id, &input.table_name)
             .await

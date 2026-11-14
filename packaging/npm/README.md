@@ -49,12 +49,21 @@ calls in an async function (top-level `await` is ESM-only).
 | `memory` | `false` | Shorthand for `storage: "memory"`. |
 | `dbPath` | data dir | SQLite file location (file mode only). |
 | `port` | ephemeral | Fixed port instead of an OS-assigned one. |
-| `binary` | bundled | Path to an `extenddb` binary, overriding the bundled one. |
-| `startupTimeoutMs` | `15000` | How long to wait for the server to become healthy. |
+| `binary` | bundled | Path to an `extenddb` binary of this package's release, overriding the bundled one. |
+| `startupTimeoutMs` | `15000` | The time budget of `start()`, shared by the binary's version check and the wait for the server to become healthy. A health probe in flight at the deadline can add up to 1 s. |
 
 The returned object carries `endpoint`, `port`, `credentials`, `region`,
 `storage`, and `stop()`, which shuts the server down and resolves when the
 process has exited.
+
+`start()` runs only a binary of this package's release. It looks for the
+binary in the `binary` option, then `EXTENDDB_BINARY`, then the platform
+package, then `PATH`. Before it starts the server, it runs `extenddb version`
+on that binary and compares the release with the package version. A binary
+of another release stops `start()` with an error, and so does a binary whose
+`version` command fails or prints no release. The error names the package
+release, and the binary release when `start()` could read it. It also says
+where the binary came from and how to get a binary of this release.
 
 ## Use in a test suite
 
@@ -93,10 +102,10 @@ startup; whoever holds it can do anything. Do not expose it beyond localhost
 and do not keep real data in it. For a durable, TLS-terminated deployment,
 use [`extenddb/extenddb-postgres`](https://hub.docker.com/r/extenddb/extenddb-postgres).
 
-ExtendDB is an independent open source project managed by Amazon Web
-Services. It is not Amazon DynamoDB and does not contain any DynamoDB source
-code. "DynamoDB" is a trademark of Amazon.com, Inc. ExtendDB is a clean-room
-implementation that speaks the DynamoDB wire protocol.
+ExtendDB is an open source project maintained by AWS. It is not Amazon DynamoDB
+and does not contain any DynamoDB source code. It is not an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates. ExtendDB is a
+clean-room implementation that speaks the DynamoDB wire protocol.
 
 More at [extenddb.org](https://extenddb.org) and
 [github.com/ExtendDB/extenddb](https://github.com/ExtendDB/extenddb).

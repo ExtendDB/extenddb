@@ -8,25 +8,25 @@
 # enable "Require review from Code Owners".
 
 # Default — any file not matched below.
-*                              @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+*                              @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
 
 # Wire protocol & DynamoDB-compatible API surface.
-crates/server/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-crates/core/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+crates/server/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+crates/core/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
 
 # Storage abstraction — breaking changes ripple to every backend.
-crates/storage/                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-crates/storage-postgres/       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-crates/engine/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+crates/storage/                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+crates/storage-postgres/       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+crates/engine/                 @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
 
 # Auth & SigV4 — security-sensitive.
-crates/auth/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+crates/auth/                   @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
 
 # Public CLI surface.
-crates/bin/                    @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+crates/bin/                    @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
 
 # Process & governance documents.
-docs/adr/                      @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-docs/rfcs/                     @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-CONTRIBUTING.md                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
-.github/                       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @yesyayen @robinnsc
+docs/adr/                      @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+docs/rfcs/                     @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+CONTRIBUTING.md                @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol
+.github/                       @amrith @c33howard @jcshepherd @pdf-amzn @LeeroyHannigan @robinnsc @eliseong @hitesh96db @Navareamol

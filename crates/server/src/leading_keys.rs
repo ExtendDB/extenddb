@@ -12,12 +12,15 @@
 //! LeadingKeys, so a `ForAllValues` condition is satisfied vacuously (the read
 //! is allowed) and an operator fences them with `ForAnyValue` or a `Null`
 //! guard, which is how the service treats a `Scan`. Operations the engine
-//! rejects before any data flows (an unparseable or non-equality key condition,
-//! a missing key condition, an unresolved placeholder name, a table that does
-//! not exist) are left with the key absent on purpose: the engine returns
+//! rejects before any data flows (an unparseable key condition, a missing key
+//! condition, an unresolved placeholder name, a table that does not exist) are
+//! left with the key absent on purpose: the engine returns
 //! `ValidationException` or `ResourceNotFoundException`, which is what live
 //! `DynamoDB` returns for those shapes even under a LeadingKeys policy (measured
-//! 2026-10-20).
+//! 2026-10-20). A key condition that names the partition key with a single
+//! operand the engine then rejects as a shape, such as `pk > :v`, is the
+//! exception: the service binds that operand and evaluates the policy first, so
+//! the key is extracted here as well (measured 2026-10-21).
 //!
 //! Behaviour measured against live `DynamoDB`:
 //!
@@ -27,7 +30,18 @@
 //!   value from the key condition (an LSI shares the base partition key).
 //! - `Query` on a global secondary index: the index's partition key value from
 //!   the key condition. The service binds LeadingKeys to the queried index's
-//!   partition key, not the base table's.
+//!   partition key, not the base table's. On an index with several HASH
+//!   attributes it binds the first one's value only (measured 2026-10-20). The
+//!   clauses of a key condition on a multi-attribute key schema are assigned
+//!   to key attributes by name, through the same classification the engine
+//!   uses, so any clause order the engine serves binds the first HASH
+//!   attribute. When an equality names the first HASH attribute and the
+//!   classification refuses the condition (a missing HASH attribute, for one),
+//!   the key is left absent, as the service answers `ValidationException` to
+//!   every principal for `g1 = :a` on HASH `g1`, `g2` (measured 2026-10-21). A
+//!   single clause on the partition attribute under an operator the engine
+//!   rejects binds that clause's operand, the rule measured for `pk > :v` on a
+//!   base table.
 //! - `Scan` and `SearchVectors`: no LeadingKeys (neither targets a single
 //!   partition, so the service sets none).
 //! - `BatchGetItem`/`BatchWriteItem`: one authorization per (action, table)
@@ -48,22 +62,12 @@
 
 use std::collections::HashMap;
 
-use extenddb_core::expression::{Expr, PathElement, parse_key_condition, tokenize_with_limit};
-use extenddb_core::types::{KeyType, TableKeyInfo};
+use extenddb_core::expression::{
+    Expr, PathElement, Token, key_condition_clause_operands, parse_key_condition,
+    tokenize_with_limit,
+};
+use extenddb_core::types::{KeySchemaElement, KeyType, TableKeyInfo};
 use serde_json::Value;
-
-/// A single `(action, table)` authorization to perform for a batch or
-/// transaction operation, carrying the LeadingKeys the service would evaluate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct AuthzTarget {
-    /// The bare operation string the action maps to (no `dynamodb:` prefix).
-    pub action: String,
-    /// The table the action is authorized against.
-    pub table: String,
-    /// The partition key value(s) for this authorization, or `None` when the
-    /// key cannot be determined (the engine then rejects the request).
-    pub leading_keys: Option<Vec<String>>,
-}
 
 /// Find the HASH (partition) key attribute name of a key schema.
 fn hash_attr(schema: &[extenddb_core::types::KeySchemaElement]) -> Option<&str> {
@@ -100,7 +104,7 @@ pub(crate) enum NumberForm {
 /// spelling `10.0` matches on `GetItem` and does not match on
 /// `TransactGetItems`. An N value the engine would reject as malformed yields
 /// `None`, so the engine returns `ValidationException` before any data flows.
-fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
+pub(crate) fn extract_typed_value(type_val: &Value, form: NumberForm) -> Option<String> {
     let (type_tag, inner) = type_val.as_object()?.iter().next()?;
     let raw = inner.as_str().unwrap_or_default();
     if type_tag == "N" {
@@ -226,45 +230,74 @@ pub(crate) fn single_table_leading_keys(
 }
 
 /// The partition key value a `Query` touches, resolved against the queried key
-/// schema (base table, or the named index). `None` when it cannot be
-/// determined, which is every shape the engine rejects before returning data.
+/// schema (base table, or the named index). `None` when the key condition names
+/// no single value for that partition attribute.
 fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize) -> Option<String> {
-    // The partition attribute of whatever the query targets: the named index's
-    // partition key, or the base table's. A GSI has its own partition key; an
-    // LSI shares the base table's. An unknown index name is a request the engine
-    // rejects, so leave the key absent.
-    let pk_attr: String = match index_name(input) {
+    // The key schema the query reads: the named index's, or the base table's.
+    // A GSI has its own partition key; an LSI shares the base table's. An
+    // unknown index name is a request the engine rejects, so leave the key
+    // absent.
+    let key_schema: &[KeySchemaElement] = match index_name(input) {
         Some(index) => {
-            let info = key_info
+            &key_info
                 .global_secondary_indexes
                 .iter()
                 .chain(key_info.local_secondary_indexes.iter())
-                .find(|i| i.index_name == index)?;
-            hash_attr(&info.key_schema)?.to_owned()
+                .find(|i| i.index_name == index)?
+                .key_schema
         }
-        None => hash_attr(&key_info.key_schema)?.to_owned(),
+        None => &key_info.key_schema,
     };
+    let pk_attr = hash_attr(key_schema)?;
 
     let names = names_map(input);
     let values = values_map(input);
 
     if let Some(kce) = input.get("KeyConditionExpression").and_then(Value::as_str) {
         let tokens = tokenize_with_limit(kce, max_tokens).ok()?;
-        let mut kc = parse_key_condition(&tokens).ok()?;
-        // Assign PK vs SK using the partition attribute, mirroring the engine.
-        kc.resolve_pk_sk(&pk_attr, &names).ok()?;
-        // The condition must actually pin the partition key; if it does not, the
-        // engine rejects the query, so the key is not determinable here.
-        if resolve_attr_name(&kc.pk_path, &names).as_deref() != Some(pk_attr.as_str()) {
-            return None;
+        // The clauses that name the partition attribute, as written.
+        let pk_clauses: Vec<_> = key_condition_clause_operands(&tokens)
+            .ok()?
+            .into_iter()
+            .filter(|clause| resolve_attr_name(&clause.path, &names).as_deref() == Some(pk_attr))
+            .collect();
+        // An equality on the partition attribute decides the key, as the
+        // engine reads it. When the engine's classification refuses the
+        // condition (a missing HASH attribute on a multi-attribute key schema,
+        // for one) or the value cannot be read here (an `N` that is not a
+        // number, a placeholder with no value), the key stays absent and no
+        // other clause's operand is bound in its place: the equality, not the
+        // other clause, names the partition.
+        if pk_clauses.iter().any(|clause| clause.equality) {
+            return equality_pk_value(&tokens, key_schema, pk_attr, &names, &values);
         }
-        return value_of(&kc.pk_value, &values);
+        // Exactly one clause names the partition key, under an operator the
+        // engine rejects, such as `pk > :v`. The service binds LeadingKeys to
+        // that operand and evaluates the policy before it rejects the shape,
+        // so a principal fenced away from the value gets AccessDeniedException
+        // while one fenced to it gets the shape's ValidationException
+        // (measured 2026-10-21 for `pk > :v`). A condition that does not
+        // parse, one that names no partition clause, and one with two
+        // non-equality partition clauses (which value the service binds for
+        // that shape is not measured) leave the key absent.
+        let [clause] = pk_clauses.as_slice() else {
+            return None;
+        };
+        return value_of(&clause.value, &values);
     }
 
-    // Legacy KeyConditions: an EQ on the partition attribute.
+    // Legacy KeyConditions: the partition attribute's single operand. An EQ is
+    // the only operator the engine accepts, and the others (`LE` and
+    // `BEGINS_WITH` measured 2026-10-21) are authorized against that operand
+    // before the engine rejects the shape, as in the expression path above. An
+    // operator carrying no operand or more than one, such as BETWEEN or IN,
+    // names no single partition value, and a value that is not one of the
+    // service's comparison operators is not read as one; both leave the key
+    // absent.
     if let Some(conds) = input.get("KeyConditions").and_then(Value::as_object) {
-        let cond = conds.get(&pk_attr)?.as_object()?;
-        if cond.get("ComparisonOperator").and_then(Value::as_str) != Some("EQ") {
+        let cond = conds.get(pk_attr)?.as_object()?;
+        let operator = cond.get("ComparisonOperator").and_then(Value::as_str)?;
+        if !LEGACY_SINGLE_OPERAND_OPERATORS.contains(&operator) {
             return None;
         }
         let list = cond.get("AttributeValueList")?.as_array()?;
@@ -275,6 +308,46 @@ fn query_leading_keys(input: &Value, key_info: &TableKeyInfo, max_tokens: usize)
     }
 
     None
+}
+
+/// The legacy `ComparisonOperator` values that take exactly one operand.
+const LEGACY_SINGLE_OPERAND_OPERATORS: [&str; 9] = [
+    "EQ",
+    "NE",
+    "LE",
+    "LT",
+    "GE",
+    "GT",
+    "CONTAINS",
+    "NOT_CONTAINS",
+    "BEGINS_WITH",
+];
+
+/// The partition key value a `KeyConditionExpression` pins with an equality,
+/// resolved against the queried key schema the way the engine resolves it.
+/// `None` when the expression does not parse as a key condition, when the
+/// engine's classification refuses it, or when it does not pin `pk_attr` by
+/// equality.
+fn equality_pk_value(
+    tokens: &[Token],
+    key_schema: &[KeySchemaElement],
+    pk_attr: &str,
+    names: &HashMap<String, String>,
+    values: &HashMap<String, Value>,
+) -> Option<String> {
+    let mut kc = parse_key_condition(tokens).ok()?;
+    // Assign every clause to its key attribute with the engine's own
+    // classification: by name on a multi-attribute key schema, where the
+    // first HASH attribute is the one LeadingKeys names, and by
+    // `resolve_pk_sk` on any other. A condition the classifier refuses is
+    // refused by the engine too.
+    kc.resolve_key_schema(key_schema, names).ok()?;
+    // The condition must actually pin the partition key; if it does not, the
+    // engine rejects the query.
+    if resolve_attr_name(&kc.pk_path, names).as_deref() != Some(pk_attr) {
+        return None;
+    }
+    value_of(&kc.pk_value, values)
 }
 
 /// Resolve a key-condition value expression to its scalar string. Only a
@@ -326,190 +399,8 @@ fn values_map(input: &Value) -> HashMap<String, Value> {
     out
 }
 
-/// The per-(action, table) or per-item authorizations for a batch or
-/// transaction operation, each carrying the LeadingKeys the service evaluates.
-///
-/// Returns `None` for non-batch/transact operations. Batch operations
-/// authorize once per table with the set of all keys for that table;
-/// transaction operations authorize once per item with that item's key, which
-/// is how the service evaluates a `ForAnyValue` condition differently for the
-/// two (a batch of one own and one other key passes `ForAnyValue`; a
-/// transaction of the same two does not). Transaction items that give the same
-/// target are returned once, in the order of their first occurrence: the
-/// decision for a target depends only on its action, table and LeadingKeys, so
-/// a hundred `ConditionCheck`s on one partition need one evaluation.
-///
-/// `key_info_by_table` is the authorization snapshot; a `None` entry is a table
-/// that does not exist, whose targets carry no LeadingKeys (the engine returns
-/// `ResourceNotFoundException`).
-pub(crate) fn batch_transact_targets(
-    operation: &str,
-    input: &Value,
-    key_info_by_table: &HashMap<String, Option<TableKeyInfo>>,
-) -> Option<Vec<AuthzTarget>> {
-    let pk_attr_of = |table: &str| -> Option<String> {
-        key_info_by_table
-            .get(table)
-            .and_then(Option::as_ref)
-            .and_then(|ki| hash_attr(&ki.key_schema).map(ToOwned::to_owned))
-    };
-    let mut seen = std::collections::HashSet::new();
-    let mut push_unique = |out: &mut Vec<AuthzTarget>, target: AuthzTarget| {
-        if seen.insert(target.clone()) {
-            out.push(target);
-        }
-    };
-
-    match operation {
-        "BatchGetItem" | "BatchWriteItem" => {
-            let items = input.get("RequestItems")?.as_object()?;
-            let mut out = Vec::new();
-            for (table, body) in items {
-                let keys = batch_table_keys(operation, body, pk_attr_of(table).as_deref());
-                out.push(AuthzTarget {
-                    action: operation.to_owned(),
-                    table: table.clone(),
-                    leading_keys: keys,
-                });
-            }
-            Some(out)
-        }
-        "TransactGetItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            let mut out = Vec::new();
-            for entry in items {
-                if let Some(get) = entry.get("Get")
-                    && let Some(table) = get.get("TableName").and_then(Value::as_str)
-                {
-                    let lk = pk_attr_of(table)
-                        .and_then(|pk| {
-                            get.get("Key")
-                                .and_then(|k| pk_from_map(k, &pk, NumberForm::Decimal))
-                        })
-                        .map(|v| vec![v]);
-                    push_unique(
-                        &mut out,
-                        AuthzTarget {
-                            action: "GetItem".to_owned(),
-                            table: table.to_owned(),
-                            leading_keys: lk,
-                        },
-                    );
-                }
-            }
-            Some(out)
-        }
-        "TransactWriteItems" => {
-            let items = input.get("TransactItems")?.as_array()?;
-            let mut out = Vec::new();
-            for entry in items {
-                for (sub, action, key_field) in [
-                    ("Put", "PutItem", "Item"),
-                    ("Delete", "DeleteItem", "Key"),
-                    ("Update", "UpdateItem", "Key"),
-                    ("ConditionCheck", "ConditionCheckItem", "Key"),
-                ] {
-                    if let Some(op) = entry.get(sub)
-                        && let Some(table) = op.get("TableName").and_then(Value::as_str)
-                    {
-                        let lk = pk_attr_of(table)
-                            .and_then(|pk| {
-                                op.get(key_field)
-                                    .and_then(|m| pk_from_map(m, &pk, NumberForm::Decimal))
-                            })
-                            .map(|v| vec![v]);
-                        push_unique(
-                            &mut out,
-                            AuthzTarget {
-                                action: action.to_owned(),
-                                table: table.to_owned(),
-                                leading_keys: lk,
-                            },
-                        );
-                    }
-                }
-            }
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-/// The distinct table names a batch or transaction operation addresses, or
-/// `None` for any other operation (and for a batch or transaction request whose
-/// items container is absent). The `Some`/`None` result mirrors
-/// `batch_transact_targets`, so the caller gates the batch and transaction
-/// branch on this and then builds the per-target authorizations once. Walking
-/// the body for table names here avoids building a throwaway set of full
-/// targets only to discover which tables to fetch key info for.
-pub(crate) fn batch_transact_tables(
-    operation: &str,
-    input: &Value,
-) -> Option<std::collections::BTreeSet<String>> {
-    let mut tables = std::collections::BTreeSet::new();
-    match operation {
-        "BatchGetItem" | "BatchWriteItem" => {
-            for table in input.get("RequestItems")?.as_object()?.keys() {
-                tables.insert(table.clone());
-            }
-        }
-        "TransactGetItems" => {
-            for entry in input.get("TransactItems")?.as_array()? {
-                if let Some(table) = entry
-                    .get("Get")
-                    .and_then(|g| g.get("TableName"))
-                    .and_then(Value::as_str)
-                {
-                    tables.insert(table.to_owned());
-                }
-            }
-        }
-        "TransactWriteItems" => {
-            for entry in input.get("TransactItems")?.as_array()? {
-                for sub in ["Put", "Delete", "Update", "ConditionCheck"] {
-                    if let Some(table) = entry
-                        .get(sub)
-                        .and_then(|o| o.get("TableName"))
-                        .and_then(Value::as_str)
-                    {
-                        tables.insert(table.to_owned());
-                    }
-                }
-            }
-        }
-        _ => return None,
-    }
-    Some(tables)
-}
-
-/// Collect the partition key values a single table receives in a batch request.
-/// Returns `None` when the table's key schema is unknown (the engine then
-/// rejects), or when no key yields a value.
-fn batch_table_keys(operation: &str, body: &Value, pk_attr: Option<&str>) -> Option<Vec<String>> {
-    let pk_attr = pk_attr?;
-    let mut out = Vec::new();
-    if operation == "BatchGetItem" {
-        for key in body.get("Keys")?.as_array()? {
-            if let Some(v) = pk_from_map(key, pk_attr, NumberForm::Normalized) {
-                out.push(v);
-            }
-        }
-    } else {
-        // BatchWriteItem: a list of {PutRequest:{Item}} / {DeleteRequest:{Key}}.
-        for req in body.as_array()? {
-            let map = req
-                .get("PutRequest")
-                .and_then(|p| p.get("Item"))
-                .or_else(|| req.get("DeleteRequest").and_then(|d| d.get("Key")));
-            if let Some(m) = map
-                && let Some(v) = pk_from_map(m, pk_attr, NumberForm::Decimal)
-            {
-                out.push(v);
-            }
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
+mod batch;
+pub(crate) use batch::{batch_transact_tables, batch_transact_targets};
 
 #[cfg(test)]
 mod tests;
