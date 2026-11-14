@@ -1109,6 +1109,41 @@ Table backups (`CreateBackup`) hold one table's items and definition; they do no
 | MongoDB | `extenddb_catalog` and `extenddb_data`, fixed names |
 | Cassandra | The catalog keyspace `<keyspace_prefix>_catalog` and one keyspace per account, `<keyspace_prefix>_account_<account id>` (`keyspace_prefix` defaults to `extenddb`) |
 
+Where a step in this entry needs the server stopped, confirm the stop before the step touches a file or a database. `extenddb stop` finds the server through the PID file the daemon writes. It stops nothing and exits 1 for a server started with `serve --foreground`, which writes no PID file, and when its `--config` path does not name the server's config file. Stop the server through whatever runs it: `sudo systemctl stop extenddb` for the Deployment Guide's systemd unit, the container runtime for a container, otherwise `extenddb stop --config /path/to/extenddb.toml`. Start it again the same way when the procedure is done. The command below exits 0 only when `extenddb status` reports that nothing listens on the configured port; go on only then:
+
+```bash
+# Confirm the stop; exits 0 only when nothing listens on the configured port
+extenddb status --config /path/to/extenddb.toml | grep -q 'is not running'
+```
+
+Give the config file as an absolute path: a relative path names another file when the command runs from another directory. `extenddb status` connects to the port on 127.0.0.1, so for a server whose `bind_addr` is another address, also confirm the stop through whatever runs the server. On PostgreSQL, the query below counts the sessions of the application role on either database, which covers servers on other hosts and servers that `extenddb status` cannot see; go on only when it prints `0`:
+
+```bash
+psql -At -c "SELECT count(*) FROM pg_stat_activity WHERE datname IN ('extenddb_catalog', 'extenddb') AND usename = 'extenddb'" postgres
+```
+
+On SQLite, `VACUUM INTO` copies the database while the server runs. It reads the database in one read transaction and writes a new database file with no `-wal` or `-shm` file. The copy holds the writes committed before its read transaction began, a few milliseconds after the command starts, and the server keeps serving reads and writes while it runs: on a 284 MB database the copy took 2.0 s, with a client making about 100 writes a second. `.timeout 5000` sets the shell's busy timeout (its help reads `Try opening locked tables for MS milliseconds`), so the command waits for a lock instead of failing at once. On SQLite the catalog is the database file, so keep the copy readable by its owner alone: under umask 022 `VACUUM INTO` creates a file with mode 0644, which every local user can read, and under `umask 077` with mode 0600. The commands keep each copy in a directory of its own under `/path/to/backups`, in a file named `extenddb.sqlite` like the database:
+
+```bash
+# Copy while the server runs
+umask 077
+d=/path/to/backups/$(date +%Y%m%d%H%M%S)
+mkdir -p "$d"
+sqlite3 -cmd ".timeout 5000" /path/to/extenddb.sqlite "VACUUM INTO '$d/extenddb.sqlite'"
+```
+
+SQLite's release history dates `VACUUM INTO` to version 3.27.0; the commands here were run with sqlite3 3.46.0, and the sqlite3 3.7.17 shell rejects it (`Error: near "INTO": syntax error`). Do not use the sqlite3 `.backup` command while the server takes writes. The shell copies 100 pages at a time through SQLite's online backup API, which the SQLite documentation says starts again from the first page when another connection writes to the database between two steps: with the client making about 100 writes a second to the 284 MB database, `.backup` had not finished after 300 s.
+
+Before the copied files go in place (the SQLite row above), copy them into a work directory beside the database and check them there with `PRAGMA integrity_check`. The check writes a copied `-wal` file into the database file and removes it, so a copy taken with the server stopped goes into place as one file. A database file copied without its non-empty `-wal` file failed the check (`database disk image is malformed`); put the files in place only when the check prints `ok`:
+
+```bash
+# Check a copy before it goes in place
+mkdir /path/to/restore-new
+cp -p /path/to/backups/<copy>/extenddb.sqlite* /path/to/restore-new/
+sqlite3 /path/to/restore-new/extenddb.sqlite 'PRAGMA integrity_check'
+# ok
+```
+
 On PostgreSQL the catalog and data databases are one copy: dump both with every server of the catalog stopped, or, to back up without stopping the server, take a base backup (`pg_basebackup`) of the PostgreSQL server that holds both. Each `pg_dump` takes its own snapshot of one database, so two dumps taken while a server runs disagree when a table is created or deleted between them. The catalog dump holds the encryption key and the application role's password (in the `data_database_connection_string` setting), so create both files readable by their owner alone, with `umask 077`. With the default names:
 
 ```bash
@@ -1135,6 +1170,21 @@ psql -c 'DROP DATABASE extenddb_catalog_before_restore' -c 'DROP DATABASE extend
 ```
 
 On a new PostgreSQL server (the old one lost with its databases) create the application role first: a dump holds no roles, and without it `createdb -O extenddb` fails, `role "extenddb" does not exist`. Give it the password that the catalog dump's `data_database_connection_string` row carries (`postgresql://extenddb:<password>@<host>:<port>/extenddb`), the one the config file's `[storage.postgres] connection_string` names as well: `psql -c "CREATE USER extenddb WITH PASSWORD '<password>'" postgres`. That row also records the data database's host and port, and the server connects to the data database there. On a server at another address, point the config file's `connection_string` at it and, after the restore and before the server starts, set the row: `psql -c "UPDATE settings SET value = 'postgresql://extenddb:<password>@<new host>:<new port>/extenddb' WHERE key = 'data_database_connection_string'" extenddb_catalog`. Without that the server connects to the old address: it fails to start once nothing answers there, and while the old server still answers, the tables created then keep their items in the old server's data database while the new catalog lists them.
+
+To back up without stopping the server, take a base backup. `init` creates both databases on one PostgreSQL server, and `pg_basebackup` copies that server as of one instant, so the two databases in the copy agree. The archive holds the server's databases and the write-ahead log that makes them consistent; a 147 MB archive took 3.0 s while a client wrote. The archive holds the catalog, so create it readable by its owner alone:
+
+```bash
+# Base backup, while the server runs, as a role with the REPLICATION attribute
+umask 077
+pg_basebackup -D - -Ft -X fetch -c fast > base.tar
+```
+
+The PostgreSQL documentation for `pg_basebackup` sets these requirements:
+
+- The role that runs it is a superuser or has the `REPLICATION` attribute.
+- The server's `wal_level` is `replica` (the default) or `logical`.
+- `pg_hba.conf` allows a replication connection from your host. A line for database `all` does not match a replication connection; it needs `replication` in the database column. The `pgvector/pgvector:pg16` image allows replication connections from the loopback address only: a connection from the container's own non-loopback address failed with `no pg_hba.conf entry for replication connection from host`, and worked once a `host replication all <address>/32 scram-sha-256` line was added and the server reloaded its configuration.
+- With `-X fetch`, the server must still hold all the write-ahead log written during the backup when the backup ends, or the backup fails and is unusable. Set `wal_keep_size` high enough for the log the server writes while the backup runs.
 
 ---
 
