@@ -114,7 +114,6 @@ pub use delete_table::test_pause::{
     DataDropRetryBound, DeleteTablePause, DeleteTablePoint, arm_delete_table_pause,
     arm_delete_table_pause_at, shorten_data_drop_retry_bound_for_tests,
 };
-pub use gsi_queue::claim_index_present;
 /// Every migration, as `extenddb migrate --yes` applies them, for the test
 /// harnesses in `tests/` so they do not carry their own copy of the lists.
 #[cfg(feature = "test-hooks")]

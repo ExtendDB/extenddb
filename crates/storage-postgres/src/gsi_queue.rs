@@ -267,9 +267,6 @@ impl GsiQueue {
             notify: Arc::new(Notify::new()),
         });
 
-        let pool = q.data_pool.clone();
-        tokio::spawn(async move { warn_if_claim_index_missing(&pool).await });
-
         for worker_id in 0..NUM_WORKERS {
             let q = Arc::clone(&q);
             tokio::spawn(async move {
@@ -459,35 +456,6 @@ async fn next_ready_wait(
             std::time::Duration::from_secs_f64(s)
         }
     })
-}
-
-/// Whether the data database has `idx_gsi_pending_table_claim`, the index the
-/// per-table claim and the per-batch listing walk (migration 13,
-/// `gsi_pending_table_claim`).
-pub async fn claim_index_present(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
-         WHERE tablename = 'gsi_pending' AND indexname = 'idx_gsi_pending_table_claim')",
-    )
-    .fetch_one(pool)
-    .await
-}
-
-/// Log once at startup when the data database lacks the claim index: the
-/// `migrate` step of the upgrade was skipped. The queue serves correctly without
-/// it; each claim then reads and sorts the partition's ready rows, and each
-/// batch's table listing scans the queue table, which is slower under a backlog.
-async fn warn_if_claim_index_missing(pool: &PgPool) {
-    match claim_index_present(pool).await {
-        Ok(true) => {}
-        Ok(false) => tracing::warn!(
-            "gsi_pending has no idx_gsi_pending_table_claim index, so the upgrade's migrate step \
-             was skipped; index propagation runs, but each claim sorts the partition's ready rows \
-             and each batch's table listing scans gsi_pending. Stop the servers and run \
-             `extenddb migrate --yes` to apply migration 13, gsi_pending_table_claim"
-        ),
-        Err(e) => tracing::debug!("could not check for idx_gsi_pending_table_claim: {e}"),
-    }
 }
 
 /// Decode a claimed row's images and apply context.
