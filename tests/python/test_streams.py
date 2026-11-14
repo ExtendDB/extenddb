@@ -194,14 +194,13 @@ class TestDescribeStream:
             )
             wait_for_active(dynamodb_client, name)
             table = dynamodb_client.describe_table(TableName=name)["Table"]
-            # The service drops StreamSpecification from DescribeTable once the
-            # stream is disabled; ExtendDB answers {StreamEnabled: false} until
-            # every backend does the same.
-            assert "StreamSpecification" not in table or table["StreamSpecification"] == {
-                "StreamEnabled": False
-            }
+            # A disabled stream is dropped from DescribeTable's
+            # StreamSpecification, as on the service; LatestStreamArn keeps
+            # naming the closed stream.
+            assert "StreamSpecification" not in table
             assert table["LatestStreamArn"] == stream_arn
             desc = streams_client.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+            assert desc["StreamStatus"] == "DISABLED"
             self._assert_creation_matches_label(desc)
         finally:
             dynamodb_client.delete_table(TableName=name)

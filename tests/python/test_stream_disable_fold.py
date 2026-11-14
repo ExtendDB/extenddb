@@ -211,13 +211,10 @@ def test_a_stream_change_beside_an_index_create_is_refused(run):
 def test_the_index_definition_check_precedes_the_companion_rule(run):
     row = run["disable_plus_gsi_undefined_attribute"]
     assert (row["status"], row["code"]) == (400, "ValidationException"), row
-    # The index definition check comes first. The service's sentence is
-    # "AttributeDefinitions is not specified for index: gsi2"; ExtendDB's own
-    # sentence for an undefined index key ("Some index key attributes are not
-    # defined in AttributeDefinitions. Keys: [g], ...") pre-dates this change,
-    # so only the ordering is asserted here.
-    assert row["message"].startswith(INVALID), row
-    assert "AttributeDefinitions" in row["message"] and "stream" not in row["message"], row
+    # The index definition check comes first: the request carries no
+    # AttributeDefinitions, so the answer is the service's sentence for that
+    # shape (measured 2026-10-25), not the stream companion sentence.
+    assert row["message"] == INVALID + "AttributeDefinitions is not specified for index: gsi2", row
 
 
 def test_the_already_enabled_check_precedes_the_companion_rule(run):
