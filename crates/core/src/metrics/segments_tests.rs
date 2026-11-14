@@ -134,44 +134,38 @@ fn random_workload_matches_naive_reference() {
         let now_secs = now_ms / 1000;
         for (window, w, b) in windows {
             let first_slot = now_secs.saturating_sub(w) / b;
-            for account in filters {
-                let out = store.query(window, account.map(|a| ACCOUNTS[a]), now);
-                assert_matches_reference(
-                    &out,
-                    &points,
-                    account,
-                    (window, w, b),
-                    now_ms,
-                    first_slot,
-                );
+            for filter in filters {
+                let out = store.query(window, filter.map(|a| ACCOUNTS[a]), now);
+                assert_matches_reference(&out, &points, filter, (window, w, b), now_ms, first_slot);
             }
         }
     }
 }
 
 /// Checks `out`, the store's answer for the window `(window, w, b)` at
-/// `now_ms`, against the points of `account` (every account when `None`)
-/// summed by hand: the count is exact, the means agree to 1e-9, and the
-/// count lies between the exact `w` and `w + b` second windows.
+/// `now_ms`, against the points of the account at index `filter` in
+/// `ACCOUNTS` (every account when `None`) summed by hand: the count is exact,
+/// the means agree to 1e-9, and the count lies between the exact `w` and
+/// `w + b` second windows. The label names the index, not the account id.
 fn assert_matches_reference(
     out: &[OperationSegments],
     points: &[(usize, usize, u64, LatencySegments)],
-    account: Option<usize>,
+    filter: Option<usize>,
     (window, w, b): (TimeWindow, u64, u64),
     now_ms: u64,
     first_slot: u64,
 ) {
     for (i, op) in OPS.iter().enumerate() {
         let label = format!(
-            "{op} {window:?} at {now_ms} ms, account filter {}",
-            account.map_or("none", |a| ACCOUNTS[a])
+            "{op} {window:?} at {now_ms} ms, filter {}",
+            filter.map_or_else(|| "none".to_owned(), |a| format!("index {a}"))
         );
         let mut count = 0u64;
         let mut sum = LatencySegments::default();
         let mut exact_w = 0u64;
         let mut exact_w_plus_b = 0u64;
         for (p_account, p_op, p_ms, s) in points {
-            if *p_op != i || account.is_some_and(|a| *p_account != a) {
+            if *p_op != i || filter.is_some_and(|a| *p_account != a) {
                 continue;
             }
             if *p_ms + w * 1000 >= now_ms {
