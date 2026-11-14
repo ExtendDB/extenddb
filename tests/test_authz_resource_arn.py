@@ -36,8 +36,9 @@ import pytest
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
-from conftest import wait_for_active
+from conftest import ENABLE_REFUSED, RESTORE_REFUSED, wait_for_active
 from management_helpers import ManagementClient
+from test_backup_restore_fidelity import _delete_backup_when_available
 
 
 def _require_auth_env() -> tuple[str, str, str]:
@@ -53,14 +54,16 @@ def _require_auth_env() -> tuple[str, str, str]:
     return endpoint, admin_user, admin_pass
 
 
-def _client(endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb") -> Any:
+def _client(
+    endpoint: str, ak: str, sk: str, region: str, service: str = "dynamodb", validate: bool = True
+) -> Any:
     kwargs: dict = dict(
         service_name=service,
         endpoint_url=endpoint,
         aws_access_key_id=ak,
         aws_secret_access_key=sk,
         region_name=region,
-        config=BotoConfig(retries={"max_attempts": 0}),
+        config=BotoConfig(retries={"max_attempts": 0}, parameter_validation=validate),
     )
     if endpoint.startswith("https://"):
         kwargs["verify"] = False
@@ -122,7 +125,13 @@ def _user_with_policy(mgmt: ManagementClient, account_id: str, policy: dict) -> 
 @pytest.fixture(scope="module")
 def table(auth_env, mgmt, account_id, region):
     """A table with a GSI, a stream, one item, and a backup. Returns the
-    canonical table, index, stream, and backup ARNs."""
+    canonical table, index, stream, and backup ARNs. The cells deny
+    DeleteBackup and DeleteTable to other users, so the backup and the table
+    are deleted here once the module is done: on a server with a configured
+    `[backup.store]` the backup is a complete set of objects under the store,
+    and one that is left behind stays until someone deletes it (CI runners
+    die with theirs; a developer's server keeps them). The backup is deleted
+    once AVAILABLE, since a backup still CREATING refuses DeleteBackup."""
     endpoint = auth_env[0]
     ak, sk = _user_with_policy(mgmt, account_id, ALLOW_ALL)
     admin = _client(endpoint, ak, sk, region)
@@ -147,13 +156,18 @@ def table(auth_env, mgmt, account_id, region):
     desc = admin.describe_table(TableName=name)["Table"]
     table_arn = desc["TableArn"]
     backup_arn = admin.create_backup(TableName=name, BackupName="arnbk")["BackupDetails"]["BackupArn"]
-    return {
+    yield {
         "name": name,
         "table_arn": table_arn,
         "index_arn": table_arn + "/index/gsi1",
         "stream_arn": desc.get("LatestStreamArn"),
         "backup_arn": backup_arn,
     }
+    _delete_backup_when_available(admin, backup_arn)
+    try:
+        admin.delete_table(TableName=name)
+    except ClientError:
+        pass
 
 
 class TestExplicitDenyOnResourceArn:
@@ -534,6 +548,64 @@ class TestExplicitDenyOnResourceArn:
                 lambda a=arn, dd=d: dd.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]),
                 code, substr)
 
+    # -- the denial names the ARN as the caller supplied it (issue #447) --
+    # Measured on DynamoDB 2026-10-20 (TagResource, no-policy caller): the
+    # message carries the caller's partition, service and region unchanged, and
+    # an ARN in another account answers "Access is denied" for an admin and a
+    # no-policy caller alike.
+
+    def _denial_message(self, fn) -> str:
+        with pytest.raises(ClientError) as exc:
+            fn()
+        err = exc.value.response["Error"]
+        assert err["Code"] == "AccessDeniedException", err
+        return err["Message"]
+
+    def test_tag_denial_names_supplied_arn_noperm(self, table):
+        v = self._ordering_variants(table)
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        for label in ("wrong_partition", "wrong_service", "cross_region", "nonexistent"):
+            arn = v[label]
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert f"on resource: {arn} because no identity-based policy allows " in msg, (label, msg)
+
+    def test_tag_cross_account_is_access_denied_for_every_principal(self, table):
+        arn = self._ordering_variants(table)["cross_account"]
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        for policy in (noperm, ALLOW_ALL):
+            d = self._ddb(policy)
+            msg = self._denial_message(
+                lambda: d.tag_resource(ResourceArn=arn, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", msg
+
+    def test_tag_cross_account_index_and_backup_arns_are_access_denied(self, table):
+        # Measured on DynamoDB 2026-10-24 (admin): another account's index or
+        # backup ARN answers "Access is denied", not the shape ValidationException
+        # the same ARN in this account gets.
+        region = table["table_arn"].split(":")[3]
+        base = f"arn:aws:dynamodb:{region}:111122223333:table/{table['name']}"
+        d = self._ddb(ALLOW_ALL)
+        for arn in (f"{base}/index/gsi1", f"{base}/backup/01700000000000-aaaaaaaa"):
+            msg = self._denial_message(
+                lambda a=arn: d.tag_resource(ResourceArn=a, Tags=[{"Key": "k", "Value": "v"}]))
+            assert msg == "Access is denied", (arn, msg)
+
+    def test_get_item_table_arn_in_tablename_denial_names_table_arn(self, table):
+        # Measured on DynamoDB 2026-10-20 (resource-probe GetItem_tableArnInTableName).
+        noperm = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "dynamodb:ListTables", "Resource": "*"}]}
+        d = self._ddb(noperm)
+        msg = self._denial_message(
+            lambda: d.get_item(TableName=table["table_arn"], Key={"pk": {"S": "p1"}}))
+        assert (
+            f"dynamodb:GetItem on resource: {table['table_arn']} because no identity-based "
+            "policy allows the dynamodb:GetItem action"
+        ) in msg, msg
+
     # -- permission chains: a Deny anywhere in the chain blocks the operation --
 
     def test_restore_from_backup_deny_target_item_action_blocks(self, table):
@@ -545,11 +617,70 @@ class TestExplicitDenyOnResourceArn:
         self._assert_denied(lambda: d.restore_table_from_backup(
             TargetTableName=table["name"] + "-rfb", BackupArn=table["backup_arn"]))
 
-    def test_restore_to_point_in_time_deny_target_item_action_blocks(self, table):
-        target = table["table_arn"] + "-pitr"
-        d = self._ddb(_allow_all_deny("PutItem", target))
-        self._assert_denied(lambda: d.restore_table_to_point_in_time(
-            SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr"))
+    def test_restore_to_point_in_time_is_refused_before_authorization(self, table):
+        # On DynamoDB (measured 2026-10-22 and 2026-11-10), a caller with no
+        # policy is denied on dynamodb:Scan on the target table, and a caller
+        # allowed dynamodb:* gets "Table ARN is invalid." for an index source.
+        # Point-in-time recovery is not in this release, so ExtendDB refuses
+        # every restore before it authorizes it: each caller, including one
+        # with an explicit Deny on the target, gets the same refusal.
+        policies = [
+            {"Version": "2012-10-17", "Statement": []},
+            ALLOW_ALL,
+            _allow_all_deny("PutItem", table["table_arn"] + "-pitr"),
+        ]
+        for policy in policies:
+            d = self._ddb(policy)
+            for source in ({"SourceTableArn": table["index_arn"]},
+                           {"SourceTableName": table["name"]}):
+                with pytest.raises(ClientError) as exc:
+                    d.restore_table_to_point_in_time(
+                        TargetTableName=table["name"] + "-pitr", UseLatestRestorableTime=True,
+                        **source)
+                err = exc.value.response["Error"]
+                assert (err["Code"], err["Message"]) == RESTORE_REFUSED, (policy, source, err)
+
+    def test_an_enable_is_refused_before_authorization(self, table):
+        # An UpdateContinuousBackups that enables point-in-time recovery gets
+        # the same refusal from every caller: no policy, dynamodb:*, and an
+        # explicit Deny on the action for the table.
+        policies = [
+            {"Version": "2012-10-17", "Statement": []},
+            ALLOW_ALL,
+            _allow_all_deny("UpdateContinuousBackups", table["table_arn"]),
+        ]
+        for policy in policies:
+            ak, sk = _user_with_policy(self.mgmt, self.account_id, policy)
+            d = _client(self.endpoint, ak, sk, self.region, validate=False)
+            for flag in (True, "true"):
+                with pytest.raises(ClientError) as exc:
+                    d.update_continuous_backups(
+                        TableName=table["name"],
+                        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": flag})
+                err = exc.value.response["Error"]
+                assert (err["Code"], err["Message"]) == ENABLE_REFUSED, (policy, flag, err)
+
+    def test_the_refusal_comes_after_authentication(self, table):
+        # A request that does not authenticate gets the authentication error,
+        # not the point-in-time recovery refusal.
+        ak, _ = _user_with_policy(self.mgmt, self.account_id, ALLOW_ALL)
+        clients = {
+            "UnrecognizedClientException": _client(
+                self.endpoint, "AKIA" + "X" * 16, "x" * 40, self.region),
+            "InvalidSignatureException": _client(self.endpoint, ak, "x" * 40, self.region),
+        }
+        for code, d in clients.items():
+            for call in (
+                lambda: d.restore_table_to_point_in_time(
+                    SourceTableName=table["name"], TargetTableName=table["name"] + "-pitr",
+                    UseLatestRestorableTime=True),
+                lambda: d.update_continuous_backups(
+                    TableName=table["name"],
+                    PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True}),
+            ):
+                with pytest.raises(ClientError) as exc:
+                    call()
+                assert exc.value.response["Error"]["Code"] == code, exc.value.response["Error"]
 
     def test_export_deny_table_blocks(self, table):
         d = self._ddb(_allow_all_deny("ExportTableToPointInTime", table["table_arn"]))
@@ -570,13 +701,18 @@ class TestExplicitDenyOnResourceArn:
     # -- fail closed: a respelled ARN cannot evade a Deny on the canonical ARN --
 
     def test_respelled_stream_arn_cannot_bypass_deny(self, table):
-        """A Deny on the canonical stream ARN must also block a request that
-        respells the partition. ExtendDB resolves the stream in this account
-        regardless of the ARN's partition, so authorizing the respelled string
-        verbatim would bypass the Deny."""
+        """A principal with a Deny on the canonical stream ARN gets no stream
+        back for a request that respells the partition. The service refuses the
+        respelled ARN before the IAM decision with ValidationException "Invalid
+        StreamArn" (measured 2026-10-22), so ExtendDB does the same instead of
+        canonicalizing it; the fuller matrix is in test_stream_arn_scope.py."""
         respelled = table["stream_arn"].replace("arn:aws:", "arn:aws-cn:")
         s = self._ddb(_allow_all_deny("DescribeStream", table["stream_arn"]), "dynamodbstreams")
-        self._assert_denied(lambda: s.describe_stream(StreamArn=respelled))
+        with pytest.raises(ClientError) as exc:
+            s.describe_stream(StreamArn=respelled)
+        err = exc.value.response["Error"]
+        assert err["Code"] == "ValidationException", err
+        assert err.get("Message") == "Invalid StreamArn", err
 
     def test_table_arn_in_tablename_deny_blocks(self, table):
         """A Deny on the table ARN blocks GetItem whether TableName is the bare

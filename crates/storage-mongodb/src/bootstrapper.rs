@@ -190,9 +190,6 @@ impl Bootstrapper for MongoBootstrapper {
     }
 
     async fn bootstrap_encryption_key(&self) -> OpResult<()> {
-        use base64::Engine;
-        use rand::RngCore;
-
         let db = self.catalog_db();
         let settings = db.collection::<Document>("settings");
 
@@ -208,10 +205,8 @@ impl Bootstrapper for MongoBootstrapper {
             return Ok(());
         }
 
-        // Generate a 256-bit encryption key
-        let mut key_bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut key_bytes);
-        let key_b64 = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+        let key_b64 = extenddb_storage::bootstrapper::helpers::generate_encryption_key()
+            .map_err(OpError::Internal)?;
 
         // A duplicate `_id` (code 11000) means another process wrote the key
         // first, which keeps one key; every other error stops `init`.

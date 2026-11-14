@@ -41,11 +41,24 @@ use crate::catalog_store::CassandraCatalogStore;
 /// The handle code bodies receive: the session, the keyspace names and the
 /// catalog's management store (migration 2 rewrites policies through it),
 /// every call of which is bounded by the request timeout and, under the
-/// lock, checked against the lease.
+/// lock, checked against the lease. A body that sends requests on
+/// [`Self::session`] itself checks [`Self::check`] before each write and
+/// executes CQL files through [`Self::run_file`], as the runner does.
 pub struct CassandraStores {
     pub(crate) session: Arc<CassandraSession>,
     pub(crate) keyspace_prefix: String,
     management: LeasedManagementStore,
+    /// The lease of the lock the run holds, or works under.
+    lease: Option<LeaseHandle>,
+    /// The test hook's request budget: `None` outside the tests.
+    stop_after: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// The error a write meets once the test hook's budget is spent.
+fn stopped_by_hook() -> MigrationError {
+    MigrationError::Store(
+        "stopped by the test hook before a write, as a killed migrator stops".to_owned(),
+    )
 }
 
 impl CassandraStores {
@@ -57,15 +70,87 @@ impl CassandraStores {
         Self {
             management: LeasedManagementStore::new(
                 CassandraCatalogStore::catalog_only(session.clone(), keyspace_prefix.to_owned()),
-                lease,
+                lease.clone(),
             ),
             session,
             keyspace_prefix: keyspace_prefix.to_owned(),
+            lease,
+            stop_after: None,
         }
     }
 
     pub(crate) fn catalog_keyspace(&self) -> String {
         format!("{}_catalog", self.keyspace_prefix)
+    }
+
+    /// Stop before a write when the lease's deadline has passed, or when
+    /// the test hook's budget is spent.
+    ///
+    /// # Errors
+    ///
+    /// The lease may have lapsed, or the hook stopped the run.
+    pub(crate) fn check(&self) -> Result<(), MigrationError> {
+        if stopped(self.stop_after.as_deref()) {
+            return Err(stopped_by_hook());
+        }
+        self.lease.as_ref().map_or(Ok(()), LeaseHandle::check)
+    }
+
+    /// Record that a request completed, which keeps the lease's renewal
+    /// going.
+    pub(crate) fn progress(&self) {
+        if let Some(lease) = &self.lease {
+            lease.progress();
+        }
+    }
+
+    /// The bound on a schema statement: shorter than the lease's margin when
+    /// the run holds or works under a lease (see [`ddl_bound`]).
+    pub(crate) fn ddl_timeout(&self) -> std::time::Duration {
+        ddl_bound(self.lease.is_some())
+    }
+
+    /// Wait for schema agreement, as progress of a leased run.
+    pub(crate) async fn agree(&self) -> Result<(), MigrationError> {
+        wait_for_agreement_with(&self.session, AGREEMENT_TIMEOUT, || self.progress()).await?;
+        self.progress();
+        Ok(())
+    }
+
+    /// Execute file `name`'s statements in `keyspace`, each with its table
+    /// qualified by the keyspace, checking the lease before each one,
+    /// recording progress when each completes, and waiting for schema
+    /// agreement after each DDL statement: a file body's run, and a code
+    /// body's that executes a file.
+    ///
+    /// # Errors
+    ///
+    /// A statement the runner cannot qualify (before any runs), the lease
+    /// lapsed, or a statement or the agreement wait failed.
+    pub(crate) async fn run_file(
+        &self,
+        keyspace: &str,
+        name: &str,
+        text: &str,
+    ) -> Result<(), MigrationError> {
+        for statement in statements(keyspace, name, text)? {
+            self.check()?;
+            send_within(
+                &self.session,
+                &statement.text,
+                cdrs_tokio::query_values!(),
+                Consistency::Quorum,
+                None,
+                &format!("migration file {name} in {keyspace}"),
+                self.ddl_timeout(),
+            )
+            .await?;
+            self.progress();
+            if statement.ddl {
+                self.agree().await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -149,9 +234,7 @@ impl CassandraMigrations<'_> {
     /// test hook's budget is spent.
     fn check(&self) -> Result<(), MigrationError> {
         if stopped(self.stop_after.as_deref()) {
-            return Err(MigrationError::Store(
-                "stopped by the test hook before a write, as a killed migrator stops".to_owned(),
-            ));
+            return Err(stopped_by_hook());
         }
         match (self.lock, &self.lease) {
             (Some(lock), _) => lock.check(),
@@ -199,30 +282,6 @@ impl CassandraMigrations<'_> {
             Some(lock) => lock.guard(work).await,
             None => work.await,
         }
-    }
-
-    /// Execute a file body's statements in `keyspace`, checking the lock
-    /// before each one, recording progress when each completes, and waiting
-    /// for schema agreement after each DDL statement.
-    async fn run_file(&self, keyspace: &str, name: &str, text: &str) -> Result<(), MigrationError> {
-        for statement in statements(keyspace, name, text)? {
-            self.check()?;
-            send_within(
-                self.session(),
-                &statement.text,
-                cdrs_tokio::query_values!(),
-                Consistency::Quorum,
-                None,
-                &format!("migration file {name} in {keyspace}"),
-                self.ddl_timeout(),
-            )
-            .await?;
-            self.progress();
-            if statement.ddl {
-                self.agree().await?;
-            }
-        }
-        Ok(())
     }
 
     /// Create a missing account keyspace with the catalog keyspace's
@@ -461,7 +520,7 @@ impl MigrationBackend for CassandraMigrations<'_> {
         }
         let done = match step {
             Step::File { name, text } => {
-                self.run_file(&store.name, name, text).await?;
+                self.stores.run_file(&store.name, name, text).await?;
                 Done::default()
             }
             Step::Code(body) => {

@@ -9,6 +9,11 @@
 #
 #   npm dist-tag add @extenddb/dev@<version> latest   (and one per platform pkg)
 #
+# With the `dry_run` input the run ends after the build jobs: the gates and
+# the five native builds, smoke tests and launcher suites run as for a
+# release, and nothing is published; dry runs have a concurrency group of
+# their own (release-image.yml).
+#
 # Shape, and why (mirrors .github/workflows/release-image.yml):
 #
 #   gate      Runs once. Cheap checks that need no build: the dispatch input is
@@ -78,6 +83,10 @@ on:
       tag:
         description: 'Existing release tag to publish npm candidates for, e.g. v0.1.4'
         required: true
+      dry_run:
+        description: 'Rehearse only: run the gates and the five platform builds with their smoke tests and launcher suites; publish nothing'
+        type: boolean
+        default: false
 
 # Nothing is committed, so no write scope on the repo is needed. The publish
 # job adds id-token at job level, which is what both authenticates to npm
@@ -87,7 +96,7 @@ permissions:
 
 # Two launcher releases must never race.
 concurrency:
-  group: npm-publish-extenddb
+  group: npm-publish-extenddb${{ inputs.dry_run && '-dry' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -145,14 +154,22 @@ jobs:
             exit 1
           fi
 
-          # 5. The checked-in launcher manifest must not have drifted from it.
-          #    The publish step rewrites the version anyway, so a stale value
-          #    would not break the release; it would quietly mislead anyone
-          #    reading the manifest, which is worse.
-          # Read from origin/main, not the tag tree: packaging is release
-          # tooling and lives on main (same rule as the workflow definition
-          # itself). A tag cut before a manifest bump merged would otherwise
-          # fail here forever.
+          # 5. The launcher manifest must carry the same version, at the
+          #    tagged commit and on origin/main.
+          #    At the tag: every build leg runs the tagged commit's launcher
+          #    suite against the binary it built. The launcher runs only a
+          #    binary of its own release. A tagged manifest at another
+          #    version fails all five legs after this gate passes. The
+          #    release flow cannot fix a tag in place, so refuse the tag
+          #    here, before any build.
+          #    On origin/main: the publish step rewrites the version anyway,
+          #    so a stale value there would not break the release. It would
+          #    mislead anyone who reads the manifest.
+          TAG_PKG_VERSION=$(git show "${SHA}:packaging/npm/package.json" | jq -r .version)
+          if [[ "$VERSION" != "$TAG_PKG_VERSION" ]]; then
+            echo "::error::packaging/npm/package.json at ${RAW_TAG} (${SHA}) says ${TAG_PKG_VERSION}, expected ${VERSION}: the launcher suite on every build leg would refuse the ${VERSION} binary (bump the manifest in the same commit as the workspace version, before the tag)"
+            exit 1
+          fi
           PKG_VERSION=$(git show "origin/main:packaging/npm/package.json" | jq -r .version)
           if [[ "$VERSION" != "$PKG_VERSION" ]]; then
             echo "::error::packaging/npm/package.json on origin/main says ${PKG_VERSION}, expected ${VERSION} (bump it with the workspace version)"
@@ -192,9 +209,36 @@ jobs:
     uses: ./.github/workflows/npm-build-matrix.yml
     with:
       ref: ${{ needs.gate.outputs.sha }}
+      # A release stops at the first failing platform; a rehearsal lets all
+      # five report.
+      fail-fast: ${{ !inputs.dry_run }}
+
+  # A rehearsal's end: the gates and the builds ran as the release runs them,
+  # and nothing was published. The publish-side jobs are skipped by their
+  # `if`, so their environments ask no approval.
+  dry-run-summary:
+    needs: [gate, build]
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarise the rehearsal
+        run: |
+          {
+            echo "### Dry run: gates and builds passed, nothing published"
+            echo ""
+            echo "The five platform binaries built, passed their smoke tests and the launcher suite. Dispatch again without the dry run to publish the candidates."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| tag | \`v${{ needs.gate.outputs.version }}\` |"
+            echo "| commit | \`${{ needs.gate.outputs.sha }}\` |"
+            echo "| version (from tag) | \`${{ needs.gate.outputs.version }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     needs: [gate, build]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The protected environment requires reviewer approval, and its name is

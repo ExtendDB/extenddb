@@ -343,5 +343,17 @@ mod tests {
         );
         let unique = &data["idempotency_tokens"].indexes["account_id_1_token_1"];
         assert_eq!(unique.options.get("unique"), Some(&json!(true)));
+        // A table's stream shards in shard id order. No release before 1.0
+        // created this index, so migration 1 adds it to a released data
+        // database before the check.
+        let by_table = &data["stream_shards"].indexes["table_id_1_shard_id_1"];
+        assert_eq!(
+            by_table.key,
+            [
+                ("table_id".to_owned(), json!(1)),
+                ("shard_id".to_owned(), json!(1))
+            ]
+        );
+        assert!(by_table.options.is_empty());
     }
 }

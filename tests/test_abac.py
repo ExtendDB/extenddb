@@ -35,6 +35,7 @@ from botocore.exceptions import ClientError
 
 from conftest import wait_for_active, wait_for_deleted
 from management_helpers import ManagementClient
+from test_backup_restore_fidelity import _delete_backup_when_available
 def _require_auth_env() -> tuple[str, str, str]:
     endpoint = os.environ.get("EXTENDDB_TEST_ENDPOINT", "").strip()
     admin_user = os.environ.get("EXTENDDB_ADMIN_USER", "").strip()
@@ -1446,10 +1447,10 @@ class TestBackupResourceTags:
                 "BackupDescription"]["BackupDetails"]["BackupArn"] == backup_arn
         finally:
             if backup_arn is not None:
-                try:
-                    admin_client.delete_backup(BackupArn=backup_arn)
-                except Exception:
-                    pass
+                # On a server with a backup store the backup is CREATING for
+                # the job's duration and DeleteBackup answers BackupInUse;
+                # deleting at once leaked a backup on every store-backed run.
+                _delete_backup_when_available(admin_client, backup_arn)
             try:
                 admin_client.delete_table(TableName=table)
             except Exception:

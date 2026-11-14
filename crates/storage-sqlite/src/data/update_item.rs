@@ -43,6 +43,22 @@ impl SqliteEngine {
         // Read the index set after acquiring the write lock so a concurrently
         // added GSI (UpdateTable holds the same lock) is not missed.
         let indexes = fetch_indexes_for_table(&key_info.table_id, &self.pool).await?;
+        // Literal operands assigned to a secondary-index key, checked on the
+        // statement ahead of the condition as the service checks them. The
+        // engine ran this check against its cached key info, which does not list
+        // a GSI until the UpdateTable that adds it returns; a write that read the
+        // cache before then and takes the write lock after the build sees the GSI
+        // only in this read, and a literal of the wrong type for it gets the same
+        // per-index wording.
+        if !indexes.is_empty() {
+            validation::validate_index_key_literal_operands(
+                actions,
+                &index_key_refs(&indexes),
+                super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),
+                maps,
+            )
+            .map_err(|e| StorageError::Validation(e.to_string()))?;
+        }
 
         let mut tx = self
             .pool
@@ -73,7 +89,9 @@ impl SqliteEngine {
             &key_info.attribute_definitions,
         )
         .map_err(|e| StorageError::Validation(e.to_string()))?;
-        validation::validate_item_size(&item, self.max_item_size_bytes)
+        // Size the update the way the service does: what the statement writes
+        // plus a fixed cost per clause, against the item limit.
+        validation::validate_update_item_size(&item, actions, maps, self.max_item_size_bytes)
             .map_err(|e| StorageError::Validation(e.to_string()))?;
         // Secondary-index key validation on the post-update item, matching the
         // TransactWriteItems update path: a wrong-typed index key attribute or
@@ -81,7 +99,10 @@ impl SqliteEngine {
         // rather than silently producing a malformed / unmatchable index row.
         if !indexes.is_empty() {
             let idx_refs = index_key_refs(&indexes);
-            validation::validate_index_key_types(
+            // Literal operands were checked ahead of the condition, above; a
+            // value computed from the existing item is only known now and
+            // carries the service's computed-value wording.
+            validation::validate_index_key_types_after_update(
                 &item,
                 &idx_refs,
                 super::index::fresh_attr_defs(&indexes, &key_info.attribute_definitions),

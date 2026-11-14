@@ -196,14 +196,14 @@ still reports it as running, with the PID shown as unknown. Pass
 `serve --foreground --write-pid-file` to write one anyway, which restores both
 commands at the cost of needing a writable `run_dir`.
 8. Spawn background tasks (log level polling, throttling polling, GSI delay polling, stream cleanup, TTL expiry, metrics persistence)
-9. On SIGTERM/SIGINT: drain connections (5s timeout), exit
+9. On SIGTERM/SIGINT: drain connections (5s timeout), end the running backup jobs through their failure path (30s), stop the background tasks (5s, then abort) and give up the serving registration, exit
 
 ## Catalog Model
 
 extenddb uses a dual-database architecture:
 
 - **Catalog database** (e.g., `extenddb_catalog`): Stores table metadata, account/user/group/role/policy definitions, access keys, settings, stream metadata, and metrics. Shared across all accounts.
-- **Data database** (e.g., `extenddb_catalog_data`): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
+- **Data database** (`extenddb` for the default catalog `extenddb_catalog`: the catalog's name without its `_catalog` suffix): Stores user items, GSI/LSI data, and stream records. Each table gets its own PostgreSQL table.
 
 On PostgreSQL, SQLite, Cassandra and MongoDB the catalog is versioned by its migration ledger, the `extenddb_migrations` table (on MongoDB a collection, in the catalog database and in the data database): the catalog version is the highest migration recorded in every store, and `serve` reads the catalog's status at startup and refuses a catalog that is behind it or carries a breaking migration it does not know. On Cassandra every account keyspace has a ledger beside the catalog keyspace's.
 A server that refuses its catalog prints the status and the command that resolves it; for pending migrations that is `extenddb migrate --yes`.
@@ -247,7 +247,7 @@ TLS is supported via rustls. `extenddb init` generates a self-signed certificate
 - CSRF tokens on all state-changing POST handlers
 - HttpOnly session cookies
 - Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy
-- 8-hour session expiry
+- Sessions end 8 hours after login, however active they are, when the session cookie also expires
 
 ### Input Validation
 
@@ -260,28 +260,29 @@ The management web console is a server-rendered HTML interface mounted at `/cons
 ### Features
 
 - **Login**: Admin users and IAM users (`account_id/user_name`)
-- **Dashboard**: Account and admin user counts, version info, quick links
+- **Dashboard**: Account and admin user counts (admin sessions only; an IAM-user session gets a link to its own user page), version info, quick links
 - **Account management**: Create, view, delete accounts
 - **User management**: Create, delete users; view access keys, policies, tags, group memberships
 - **Access key management**: Create and delete access keys (secret shown once at creation)
 - **Group management**: Create, delete groups; add/remove members
 - **Role management**: Create, delete roles; view trust policies
 - **Policy management**: Add, delete inline policies for users, groups, and roles (JSON editor with template)
-- **Metrics dashboard**: Real-time and historical operation metrics with interactive charts
+- **Metrics dashboard**: Real-time and historical operation metrics for every account, with interactive charts (admin only)
 - **Settings viewer**: Read-only display of runtime settings and static configuration (admin only)
 - **Documentation browser**: All project manuals rendered as HTML, with PDF download (`/console/docs`)
 
 ### Architecture
 
-The console uses the `ManagementStore` trait for all data access — it never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
+The console reads all data through four of the traits that `CatalogStore` combines (`ManagementStore`, `PasswordHashStore`, `SettingsStore` and `RateLimitStore`) and never queries the database directly. Write operations route through shared functions in `management::ops`, ensuring validation and business logic are defined once. This means every action available in the console is also available through the management REST API.
 
 ### Authentication Model
 
-- Session-based authentication with 8-hour expiry
+- Session-based authentication; sessions end 8 hours after login, however active they are, when the session cookie also expires
 - Sessions stored in-memory with random tokens in HttpOnly cookies (`SameSite=Strict`, `Path=/console`)
+- Each request reads the principal's password hash from the catalog and ends the session if the principal was deleted or its password changed
 - CSRF tokens on all state-changing POST handlers
 - Security headers: X-Content-Type-Options (nosniff), X-Frame-Options (DENY), Referrer-Policy (strict-origin-when-cross-origin)
-- Login rate limiting with account lockout on excessive failures
+- Login rate limiting per user and source address, shared with the management API (see the security model manual)
 
 ### Unauthenticated Routes
 
@@ -326,6 +327,6 @@ The storage backend provides durability, replication, and backup. Use that backe
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.
