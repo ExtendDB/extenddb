@@ -108,10 +108,13 @@ pub async fn scratch() -> Scratch {
             .await
             .expect("apply a shipped migration");
     }
-    sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
-        .execute(&db)
-        .await
-        .expect("pin the control-plane delay to zero");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .execute(&db)
+    .await
+    .expect("pin the control-plane delay to zero");
     sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES ($1, $2)")
         .bind(ACCOUNT)
         .bind(format!("acct-{db_name}"))
@@ -138,11 +141,14 @@ pub async fn scratch() -> Scratch {
 }
 
 pub async fn set_delay_ms(db: &PgPool, ms: u64) {
-    sqlx::query("UPDATE settings SET value = $1 WHERE key = 'index_propagation_delay_ms'")
-        .bind(ms.to_string())
-        .execute(db)
-        .await
-        .expect("set the propagation delay");
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES ('index_propagation_delay_ms', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(ms.to_string())
+    .execute(db)
+    .await
+    .expect("set the propagation delay");
 }
 
 fn s_attr(name: &str) -> AttributeDefinition {
