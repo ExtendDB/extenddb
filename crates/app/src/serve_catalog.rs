@@ -120,6 +120,13 @@ fn check(
         }
     };
     let result = runtime.block_on(prepare_to_serve(migrations, &target, &startup, &progress));
+    // A refusal's backup clause names the data store the catalog records, as
+    // the server's own refusal does. It is read before the runtime stops.
+    let data_store = if result.is_err() {
+        runtime.block_on(migrations.data_store_name(&target))
+    } else {
+        None
+    };
     let capped = shut_down(runtime, shutdown_cap);
     match result {
         Ok(prepared) => {
@@ -140,11 +147,15 @@ fn check(
             Ok(exit::OK)
         }
         Err(error) => {
+            let named = Target {
+                data_store,
+                ..target
+            };
             let advice = AdviceFor::new(
                 start.release,
                 config::redact_password(start.location),
                 Some(migrations),
-                &target,
+                &named,
                 start.config_file,
             )
             .for_server();
