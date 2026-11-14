@@ -66,8 +66,9 @@ libc = { workspace = true }
 [dev-dependencies]
 extenddb-cache = { path = "../cache", features = ["test-util"] }
 # The login tests count bcrypt checks with `count_verifications` against an
-# in-memory SQLite catalog, and the dev-credential seeding tests run against a
-# SQLite catalog file.
+# in-memory SQLite catalog, the dev-credential seeding tests run against a
+# SQLite catalog file, and the handler tests drive a table through its own
+# throttle path on an in-memory SQLite engine.
 extenddb-storage = { path = "../storage", features = ["test-util"] }
 extenddb-storage-sqlite = { path = "../storage-sqlite" }
 sqlx = { workspace = true, features = ["sqlite"] }
