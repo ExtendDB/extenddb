@@ -40,6 +40,8 @@ mod partiql;
 pub mod private_fs;
 mod put_item;
 mod query;
+#[cfg(test)]
+mod query_key_size_tests;
 mod read_helpers;
 mod request_limits;
 mod scan;

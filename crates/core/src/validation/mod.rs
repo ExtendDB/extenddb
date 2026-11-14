@@ -1,10 +1,12 @@
 // Copyright 2026 ExtendDB contributors
 // SPDX-License-Identifier: Apache-2.0
+mod key_size;
 pub mod number;
 pub mod restorable_item;
 pub mod vector_item;
 pub mod warm_throughput;
 
+pub use key_size::validate_query_key_sizes;
 pub use restorable_item::{
     RestorableItemError, RestorableItemReason, RestorableKeySchema, RestorableLimits,
     SHOWN_VALUE_BYTES, validate_restorable_item,
@@ -2150,39 +2152,18 @@ fn check_key_size(
     value: &AttributeValue,
     limits: &LimitsConfig,
 ) -> Result<(), DynamoDbError> {
-    let size = key_value_byte_size(value);
+    let size = key_size::key_value_byte_size(value);
     let max_size = match ks.key_type {
         KeyType::Hash => limits.max_partition_key_size_bytes,
         KeyType::Range => limits.max_sort_key_size_bytes,
     };
     if size > max_size {
-        let msg = match ks.key_type {
-            KeyType::Hash => format!(
-                "One or more parameter values were invalid: \
-                 Size of hashkey has exceeded the maximum size limit of{max_size} bytes"
-            ),
-            KeyType::Range => format!(
-                "One or more parameter values were invalid: \
-                 Aggregated size of all range keys has exceeded the size limit of {max_size} bytes"
-            ),
-        };
-        return Err(DynamoDbError::ValidationException(msg));
+        return Err(match ks.key_type {
+            KeyType::Hash => key_size::hash_key_too_large(max_size),
+            KeyType::Range => key_size::range_keys_too_large(max_size),
+        });
     }
     Ok(())
-}
-
-/// Get the byte size of a key attribute value.
-///
-/// For `N` keys this uses the digit-string length. Amazon DynamoDB caps a
-/// number at 38 significant digits, so the string length is always far below
-/// the key-size limit and the proxy is exact for the rejection decision.
-fn key_value_byte_size(value: &AttributeValue) -> usize {
-    match value {
-        AttributeValue::S(s) => s.len(),
-        AttributeValue::N(n) => n.len(),
-        AttributeValue::B(b) => b.len(),
-        _ => 0,
-    }
 }
 
 /// Validate that an item does not exceed the maximum allowed size.

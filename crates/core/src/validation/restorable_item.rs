@@ -440,7 +440,7 @@ pub fn validate_restorable_item(
             KeyType::Hash => (limits.max_partition_key_size_bytes, "hash"),
             KeyType::Range => (limits.max_sort_key_size_bytes, "range"),
         };
-        let size = super::key_value_byte_size(value);
+        let size = super::key_size::key_value_byte_size(value);
         if size > max {
             return Err(refuse(
                 path(),
