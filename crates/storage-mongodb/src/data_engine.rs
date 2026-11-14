@@ -656,7 +656,7 @@ impl MongoEngine {
                         Ok(old_doc) => old_doc,
                         Err(e) if is_duplicate_key(&e) => {
                             lost_create_race = true;
-                            return Err(TxErr::Transient);
+                            return Err(TxErr::Transient(e.to_string()));
                         }
                         Err(e) => return Err(TxErr::from(e)),
                     };
