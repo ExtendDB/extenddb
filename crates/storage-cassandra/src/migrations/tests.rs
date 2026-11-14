@@ -69,6 +69,7 @@ fn every_migration_records_a_row_in_the_catalog_and_names_its_stores() {
     for id in [
         MigrationId::SortKeyDefinitions,
         MigrationId::IndexTableBaseKey,
+        MigrationId::RestoreProgress,
     ] {
         assert!(matches!(migration(id), Migration::NotApplicable(_)), "{id}");
     }

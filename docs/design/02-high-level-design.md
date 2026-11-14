@@ -376,12 +376,15 @@ Total connection footprint on the PostgreSQL server:
   pool because its ownership lock is session-scoped
 - one connection while a schema migration runs, pinned outside the pools so its
   transaction-scoped lock cannot move between backends
+- one connection per running backup or restore job, at most `[backup]
+  max_concurrent_jobs` (default 4), opened outside every pool because the job's
+  claim is a session-level advisory lock
 
-So the total is `2 * pool_size + catalog_pool_size`, plus builds and migrations.
-There is no separate poller pool: the log-level poller borrows from the management
-pool like every other background poller. `max_connections` is per cluster rather
-than per database, so both `pool_size` pools draw on the same budget: the defaults
-need 60 of PostgreSQL's default 100.
+So the total is `2 * pool_size + catalog_pool_size + max_concurrent_jobs`, plus
+builds and migrations. There is no separate poller pool: the log-level poller
+borrows from the management pool like every other background poller.
+`max_connections` is per cluster rather than per database, so both `pool_size`
+pools draw on the same budget: the defaults need 64 of PostgreSQL's default 100.
 
 ### 6.3 Row-Level Locking
 
@@ -461,6 +464,6 @@ There is no in-memory locking (no `Mutex`, `RwLock`, or similar) on the data pat
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is a trademark
-of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

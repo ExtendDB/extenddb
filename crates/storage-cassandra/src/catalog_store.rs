@@ -240,6 +240,27 @@ impl CassandraCatalogStore {
         Ok(!rows.is_empty())
     }
 
+    /// [`Self::account_exists`] read at `LOCAL_QUORUM`, for the console's
+    /// quorum reads: an account delete, committed at quorum, is seen.
+    ///
+    /// Before account deletes removed them, a deleted account's users stayed
+    /// in the catalog; the console treats a user whose account is gone as
+    /// absent.
+    pub(crate) async fn account_exists_quorum(&self, account_id: &str) -> Result<bool, OpError> {
+        let query = format!(
+            "SELECT account_id FROM {}.accounts WHERE account_id = ?",
+            self.catalog_keyspace()
+        );
+        let rows = crate::cassandra_util::query_rows_quorum(
+            &self.session,
+            &query,
+            cdrs_tokio::query_values!(account_id),
+            "account_exists_quorum",
+        )
+        .await?;
+        Ok(!rows.is_empty())
+    }
+
     /// Check if a user exists. Used to emulate foreign key checks.
     pub(crate) async fn user_exists(
         &self,
@@ -604,6 +625,7 @@ impl RateLimitStore for CassandraCatalogStore {
 
 use extenddb_storage::management_store::MetricsRow;
 
+/// `account_metrics`: migration 10 replaced `metrics` with it.
 impl MetricsStore for CassandraCatalogStore {
     fn insert_metrics(&self, rows: &[MetricsRow]) -> BoxFuture<'_, OpResult<()>> {
         let rows = rows.to_vec();
@@ -612,9 +634,10 @@ impl MetricsStore for CassandraCatalogStore {
         let ttl = self.metrics_ttl_seconds;
         Box::pin(async move {
             let query = format!(
-                "INSERT INTO {catalog_keyspace}.metrics \
-                 (bucket, metric, table_name, index_name, operation, sum, count, min, max) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl}"
+                "INSERT INTO {catalog_keyspace}.account_metrics \
+                 (bucket, account_id, metric, table_name, index_name, operation, \
+                  sum, count, min, max) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {ttl}"
             );
             for row in &rows {
                 #[allow(clippy::cast_possible_truncation)]
@@ -624,6 +647,7 @@ impl MetricsStore for CassandraCatalogStore {
                         &query,
                         cdrs_tokio::query_values!(
                             bucket_ms,
+                            row.account_id.as_deref().unwrap_or(""),
                             row.metric.as_str(),
                             row.table_name.as_deref().unwrap_or(""),
                             row.index_name.as_deref().unwrap_or(""),
@@ -647,11 +671,11 @@ impl MetricsStore for CassandraCatalogStore {
         &self,
         start: time::OffsetDateTime,
         end: time::OffsetDateTime,
-        table_name: Option<&str>,
-        metric: Option<&str>,
+        filter: &extenddb_storage::management_store::MetricsFilter,
     ) -> BoxFuture<'_, OpResult<Vec<MetricsRow>>> {
-        let table_name = table_name.map(str::to_owned);
-        let metric = metric.map(str::to_owned);
+        let account_id = filter.account_id().map(str::to_owned);
+        let table_name = filter.table_name().map(str::to_owned);
+        let metric = filter.metric().map(str::to_owned);
         let session = self.session.clone();
         let catalog_keyspace = self.catalog_keyspace();
         Box::pin(async move {
@@ -663,9 +687,9 @@ impl MetricsStore for CassandraCatalogStore {
             // bucket is part of the composite partition key so a range scan
             // requires ALLOW FILTERING; the time window keeps the result bounded.
             let query = format!(
-                "SELECT bucket, metric, table_name, index_name, operation, \
+                "SELECT bucket, account_id, metric, table_name, index_name, operation, \
                  sum, count, min, max \
-                 FROM {catalog_keyspace}.metrics \
+                 FROM {catalog_keyspace}.account_metrics \
                  WHERE bucket >= ? AND bucket <= ? ALLOW FILTERING"
             );
             let result = session
@@ -682,17 +706,22 @@ impl MetricsStore for CassandraCatalogStore {
                 .into_rows()
                 .unwrap_or_default();
 
+            let present = |s: String| (!s.is_empty()).then_some(s);
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 use crate::cassandra_util::get_column;
                 let bucket_ms: i64 = get_column(&row, "bucket", "query_metrics")?;
                 let bucket = time::OffsetDateTime::from_unix_timestamp(bucket_ms / 1000)
                     .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                let account: String = get_column(&row, "account_id", "query_metrics")?;
                 let metric_val: String = get_column(&row, "metric", "query_metrics")?;
                 let tn: String = get_column(&row, "table_name", "query_metrics")?;
                 let idx: String = get_column(&row, "index_name", "query_metrics")?;
                 let op: String = get_column(&row, "operation", "query_metrics")?;
 
+                if account_id.as_deref().is_some_and(|f| f != account) {
+                    continue;
+                }
                 if table_name.as_deref().is_some_and(|f| f != tn) {
                     continue;
                 }
@@ -702,10 +731,11 @@ impl MetricsStore for CassandraCatalogStore {
 
                 out.push(MetricsRow {
                     bucket,
+                    account_id: present(account),
                     metric: metric_val,
-                    table_name: if tn.is_empty() { None } else { Some(tn) },
-                    index_name: if idx.is_empty() { None } else { Some(idx) },
-                    operation: if op.is_empty() { None } else { Some(op) },
+                    table_name: present(tn),
+                    index_name: present(idx),
+                    operation: present(op),
                     sum: get_column(&row, "sum", "query_metrics")?,
                     count: get_column(&row, "count", "query_metrics")?,
                     min: get_column(&row, "min", "query_metrics")?,

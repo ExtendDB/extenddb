@@ -10,8 +10,10 @@
 
 mod admin_store;
 mod authorization_store;
+mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
+mod catalog_json;
 mod catalog_store;
 pub mod config;
 mod create_table;
@@ -23,11 +25,16 @@ mod management_store;
 mod metadata_engine;
 pub mod migrations;
 mod operations;
+mod password_hash_store;
 mod pg_util;
+mod restore_engine;
 mod snapshot_engine;
 #[doc(hidden)]
-pub use snapshot_engine::map_fetch_error;
+pub use snapshot_engine::{
+    MIN_NEXT_PAGE_ROWS, MIN_PAGE_ROWS, SNAPSHOT_SLOT_BOUND, map_fetch_error, page_sql_for,
+};
 mod stream_engine;
+mod stream_lifecycle;
 #[doc(hidden)]
 pub mod stream_records_sql;
 mod table_engine;
@@ -36,9 +43,23 @@ mod ttl_worker;
 mod update_table;
 mod vector;
 mod vector_search;
+mod warm_throughput;
 mod worker_store;
 mod workers;
 
+#[doc(hidden)]
+pub use backup_catalog::{
+    REWRITE_ATTEMPTS, REWRITE_BATCH, REWRITE_LOCK_TIMEOUT, REWRITE_STATEMENT_TIMEOUT,
+};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use backup_engine::claim_session_settings;
+/// Pause the legacy reader's item stream after its AVAILABLE re-check.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use backup_engine::legacy_items_pause;
+#[doc(hidden)]
+pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;
 pub use catalog_store::PostgresCatalogStore;
 pub use config::PostgresStorageConfig;
@@ -83,8 +104,9 @@ pub use data::vector_index::reconcile_incomplete_vector_indexes;
 #[doc(hidden)]
 pub use data::{data_table_name, index_table_name, vector_table_name};
 /// Hold a `DeleteTable` between its in-use probe and its drops, or (separate
-/// data database) between its catalog commit and its data commit; and shorten
-/// the bound on the drop retried after a failed data commit.
+/// data database) between its catalog commit and its data commit, or after
+/// its data commit; and shorten the bound on the drop retried after a failed
+/// data commit.
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use delete_table::test_pause::{
@@ -96,6 +118,11 @@ pub use delete_table::test_pause::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use migrations::apply_all_migrations;
+/// Pause `sweep_restore_progress` between its two reads, so a test can
+/// commit a registration and a progress row in between.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use restore_engine::sweep_pause;
 
 /// The `PostgreSQL` storage backend.
 ///
@@ -261,15 +288,6 @@ pub struct PostgresEngine {
     /// the search path exists, so this backend still refuses vector operations
     /// over the wire; the flag is what that decision will read.
     pub(crate) vector_capable: bool,
-    /// Restores this engine (one per server process) may have in flight
-    /// across all accounts; see `backup_engine::restore_server_slot_count`.
-    pub(crate) restore_server_slots: Arc<tokio::sync::Semaphore>,
-    /// The number of permits `restore_server_slots` was created with, for
-    /// the refusal message.
-    pub(crate) restore_server_slot_count: usize,
-    /// Restores each account may run at once in this process; see
-    /// `backup_engine::RestoreAccountSlots`.
-    pub(crate) restore_account_slots: backup_engine::RestoreAccountSlots,
     /// The serving registration a server holds for its life, so `migrate
     /// --yes` refuses while it serves, and takes again after the database
     /// ended its session. `None` outside a server.
@@ -290,14 +308,18 @@ pub struct PostgresEngine {
     ///
     /// What the permits do not prevent: request load alone exhausting a pool
     /// (an open then waits for its connection up to the acquire timeout like
-    /// any request), and restores, which take their own slots (half the
-    /// pool, at most 16: `backup_engine::restore_server_slot_count`), so
-    /// snapshots and restores together can hold the whole pool. On the separate layout requests that block on
+    /// any request), and restores, which hold no snapshot slot (their bound
+    /// is the engine's `max_concurrent_jobs`, which the pool is raised to
+    /// twice plus ten), so snapshots and restores together can hold the
+    /// whole pool. On the separate layout requests that block on
     /// the `tables` row an open holds `FOR SHARE` (`UpdateTable`,
     /// `DeleteTable` of that table) hold catalog connections while they
     /// wait; the open needs only a data connection by then, so they delay it
     /// no further.
     pub(crate) snapshot_open_slots: Arc<tokio::sync::Semaphore>,
+    /// The permits `snapshot_open_slots` was built with, for the refusal
+    /// that names the bound.
+    pub(crate) snapshot_slot_limit: usize,
     /// Whether `data_pool` is the catalog pool (no separate data database).
     /// The snapshot open uses one transaction on that layout, and
     /// `DeleteTable` runs its in-use probe and its synchronous drop on the
@@ -413,7 +435,6 @@ impl PostgresEngine {
             ),
         }
 
-        let server_slots = backup_engine::restore_server_slot_count(pool_size);
         Ok(Self {
             pool,
             data_pool,
@@ -425,13 +446,11 @@ impl PostgresEngine {
                 initial_gsi_delay,
             )),
             vector_capable,
-            restore_server_slots: Arc::new(tokio::sync::Semaphore::new(server_slots)),
-            restore_server_slot_count: server_slots,
-            restore_account_slots: backup_engine::RestoreAccountSlots::default(),
             serving: None,
             snapshot_open_slots: Arc::new(tokio::sync::Semaphore::new(snapshot_slot_count(
                 pool_size,
             ))),
+            snapshot_slot_limit: snapshot_slot_count(pool_size),
             shared_data_pool,
             #[cfg(feature = "test-hooks")]
             drop_attempts: Arc::default(),
@@ -708,6 +727,13 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             workers::stream_record_cleanup_worker(storage_for_stream, metrics, token).await;
         });
 
+        // 3b. Stream record numbering worker
+        let storage_for_numbering = self.engine.clone();
+        let token = ctx.shutdown.clone();
+        let stream_numbering = tokio::spawn(async move {
+            workers::stream_record_numbering_worker(storage_for_numbering, token).await;
+        });
+
         // 4. Idempotency token cleanup worker
         let storage_for_token = self.engine.clone();
         let metrics = ctx.metrics.clone();
@@ -760,6 +786,7 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
             control_plane,
             table_size,
             stream_cleanup,
+            stream_numbering,
             idempotency_cleanup,
             ttl,
             vector_builds,
@@ -784,6 +811,24 @@ impl ServerRuntimeHooks for PostgresRuntimeHooks {
     }
 }
 
+/// A pool size raised to what `max_concurrent_jobs` jobs need, when it is
+/// smaller (`pool_size_for_jobs`: twice the jobs plus ten, so a snapshot
+/// bound of half the pool admits every job the permit allows; the job's
+/// claim connection is outside the pool). A raise is logged at warn,
+/// naming both numbers, as the clamp to [`MIN_POOL_SIZE`] is; a size at or
+/// above the floor is returned as configured, and the minimum clamp still
+/// applies to it.
+fn raise_pool_size_for_jobs(key: &str, configured: u32, floor: u32, jobs: usize) -> u32 {
+    if configured >= floor || floor <= MIN_POOL_SIZE {
+        return configured;
+    }
+    tracing::warn!(
+        "{key} = {configured} is below the {floor} connections backup.max_concurrent_jobs = \
+         {jobs} needs (2 * max_concurrent_jobs + 10); raising it to {floor}"
+    );
+    floor
+}
+
 /// Build server components for the Postgres backend (registered in [`register`]).
 fn server_components_factory(
     config: &(dyn extenddb_storage::config::StorageConfig + 'static),
@@ -796,13 +841,32 @@ fn server_components_factory(
     Box<dyn std::future::Future<Output = Result<ServerComponents, BackendError>> + Send>,
 > {
     let connection_string = config.connection_config().to_string();
-    let max_connections = config.max_connections();
-    let max_catalog_connections = config.max_catalog_connections();
+    // Both pools admit the jobs the instance may run at once (the rule is
+    // `pool_size_for_jobs`'s).
+    let job_floor =
+        extenddb_storage::backup_catalog::pool_size_for_jobs(options.max_concurrent_jobs);
+    let max_connections = raise_pool_size_for_jobs(
+        "storage.postgres.pool_size",
+        config.max_connections(),
+        job_floor,
+        options.max_concurrent_jobs,
+    );
+    let max_catalog_connections = raise_pool_size_for_jobs(
+        "storage.postgres.catalog_pool_size",
+        config.max_catalog_connections(),
+        job_floor,
+        options.max_concurrent_jobs,
+    );
     let region = region.to_string();
     Box::pin(async move {
-        let registration = migrations::ServerRegistration::register(&connection_string)
-            .await
-            .map_err(BackendError::Catalog)?;
+        // Every caller registers, a command too: a migration must not run
+        // under one. A command's session carries its own name.
+        let registration = migrations::ServerRegistration::register_as(
+            &connection_string,
+            options.command.unwrap_or(migrations::SERVE_APPLICATION),
+        )
+        .await
+        .map_err(BackendError::Catalog)?;
 
         // Build PostgresConfig from extracted values
         let pg_config = PostgresConfig {
@@ -820,23 +884,37 @@ fn server_components_factory(
             })?;
         engine.serving = Some(Arc::new(registration));
 
-        // Rebuild any vector index a crash left CREATING, before serving: an index
-        // in that state is not searchable, and nothing else will repair it.
-        match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
-            Ok(n) if n > 0 => {
-                tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+        // The startup recovery is a server's; a command reading beside one,
+        // or one that writes beside the live servers (`backup purge`,
+        // `options.startup_recovery` off), leaves it to the server.
+        let recover = !options.beside_server && options.startup_recovery;
+        if recover {
+            // Rebuild any vector index a crash left CREATING, before serving:
+            // an index in that state is not searchable, and nothing else will
+            // repair it.
+            match crate::data::vector_index::reconcile_incomplete_vector_indexes(&engine).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!("Reconciled {n} incomplete vector index(es) at startup");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::error!("Failed to reconcile incomplete vector indexes: {e}"),
+
+            // Recover control plane transitions (errors are logged, not fatal).
+            // A drop deferred by a session still holding the table wakes the
+            // poller, which `spawn_workers` starts later.
+            workers::recover_control_plane_at_startup(&engine).await;
         }
 
-        // Recover control plane transitions (errors are logged, not fatal).
-        // A drop deferred by a session still holding the table wakes the
-        // poller, which `spawn_workers` starts later.
-        workers::recover_control_plane_at_startup(&engine).await;
-
-        // Start GSI workers
-        let engine = engine.start_gsi_workers();
+        // Start GSI workers: a server's. A command (`backup list`, the
+        // purge's dry run, `purge --confirm`) leaves the queue to the
+        // server that owns the catalog, so the command applies no pending
+        // index write and exits with none half-applied.
+        let engine = if recover {
+            engine.start_gsi_workers()
+        } else {
+            engine
+        };
 
         // Get data database name for logging (before wrapping in Arc)
         let data_db_name = engine
@@ -914,4 +992,26 @@ fn server_components_factory(
             runtime_hooks: Some(runtime_hooks),
         })
     })
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::{MIN_POOL_SIZE, raise_pool_size_for_jobs};
+    use extenddb_storage::backup_catalog::pool_size_for_jobs;
+
+    #[test]
+    fn a_pool_under_the_job_floor_is_raised_and_one_at_it_is_kept() {
+        let floor = pool_size_for_jobs(4);
+        assert_eq!(floor, 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 12, floor, 4), 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 18, floor, 4), 18);
+        assert_eq!(raise_pool_size_for_jobs("pool_size", 20, floor, 4), 20);
+        // No jobs asked for: the floor is the minimum, which the minimum
+        // clamp applies on its own.
+        assert_eq!(
+            raise_pool_size_for_jobs("pool_size", 5, pool_size_for_jobs(0), 0),
+            5
+        );
+        assert!(pool_size_for_jobs(0) <= MIN_POOL_SIZE);
+    }
 }
