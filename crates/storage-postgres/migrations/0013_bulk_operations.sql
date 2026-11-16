@@ -1,8 +1,8 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 8, bulk_operations, PostgreSQL catalog database: the bulk put
--- items records. The data database half is data_migrations/0008. Every
+-- Migration 13, bulk_operations, PostgreSQL catalog database: the bulk put
+-- items records. The data database half is data_migrations/0013. Every
 -- statement is IF NOT EXISTS, so a second run changes nothing.
 
 -- One row per bulk operation, everything the wire surface and the runner

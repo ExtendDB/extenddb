@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The input files of a bulk operation, one row per file in
-//! `bulk_operation_input_files` (catalog migration 8). Start inserts
+//! `bulk_operation_input_files` (catalog migration 13). Start inserts
 //! them, a checkpoint updates the rows of the files its cursor passes, and
 //! every full read of the record attaches them. The operation row's own
 //! `input_files` column keeps an empty array; the per-file figures lived

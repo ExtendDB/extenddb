@@ -3,7 +3,7 @@
 
 //! Row-outcome ledger for bulk put operations (`bulk_row_outcomes`) and
 //! the operation's write owner (`bulk_write_owners`), both created in the
-//! data database by migration 8.
+//! data database by migration 13.
 //!
 //! The catalog checkpoint cannot be atomic with a data write because the
 //! catalog and the data tables are separate databases, so the fact "this row

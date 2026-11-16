@@ -1,8 +1,8 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 8, bulk_operations, PostgreSQL data database: exactly-once
--- application of bulk put rows. The catalog half is migrations/0008. Every
+-- Migration 13, bulk_operations, PostgreSQL data database: exactly-once
+-- application of bulk put rows. The catalog half is migrations/0013. Every
 -- statement is IF NOT EXISTS, so a second run changes nothing.
 --
 -- A condition row is not idempotent under replay: a condition that passed

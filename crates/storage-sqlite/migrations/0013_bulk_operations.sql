@@ -1,7 +1,7 @@
 -- Copyright 2026 ExtendDB contributors
 -- SPDX-License-Identifier: Apache-2.0
 --
--- Migration 8, bulk_operations, SQLite: the bulk put items tables. Column
+-- Migration 13, bulk_operations, SQLite: the bulk put items tables. Column
 -- names are kept identical to the PostgreSQL catalog and data databases,
 -- whose 0008 files hold the comments on each table. Every statement is
 -- IF NOT EXISTS, so a second run changes nothing.

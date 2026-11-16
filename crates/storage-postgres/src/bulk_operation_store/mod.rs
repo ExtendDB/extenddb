@@ -4,7 +4,7 @@
 //! `BulkOperationStore` for the `PostgreSQL` backend.
 //!
 //! Backs the shared bulk put lifecycle with the `bulk_operations` and
-//! `bulk_operation_report_records` catalog tables (migration 8). The
+//! `bulk_operation_report_records` catalog tables (migration 13). The
 //! lifecycle itself (claim policy, batching, resume, rendering, terminal
 //! transitions) lives in the engine, as ADR-0005 requires; this file holds
 //! only the primitives, and the two rules that are correct only inside one
