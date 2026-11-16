@@ -217,3 +217,8 @@ inherits = "release"
 strip = true
 lto = true
 codegen-units = 1
+
+# Debug and test builds optimize blowfish, where bcrypt's key expansion runs:
+# a test that bootstraps a SQLite catalog hashes a password at cost 12.
+[profile.dev.package.blowfish]
+opt-level = 3
