@@ -14,6 +14,16 @@ use serde_json::json;
 
 const MAX_TOKENS: usize = 4096;
 
+/// The batch and transaction targets under the default expression limits.
+fn batch_transact_targets(
+    operation: &str,
+    input: &Value,
+    key_info: &HashMap<String, Option<TableKeyInfo>>,
+) -> Option<Vec<batch::AuthzTarget>> {
+    let limits = extenddb_core::limits::LimitsConfig::default();
+    super::batch_transact_targets(operation, input, key_info, &limits)
+}
+
 fn ks(name: &str, kt: KeyType) -> KeySchemaElement {
     KeySchemaElement {
         attribute_name: name.to_owned(),

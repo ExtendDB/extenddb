@@ -309,6 +309,8 @@ def _as_released_catalog(sqlite_path: str) -> None:
     (warm_throughput) add are removed, since no release before 1.0 had them
     and the check after migration 1 refuses a `table_restores` carrying its
     twelve job columns and a `tables` or `indexes` carrying warm_throughput.
+    The `account_metrics` table migration 10 creates is removed too; migration
+    1 creates the `metrics` table it replaced again.
     The runner then applies every migration, the condition-key rewrite
     included, as it does on a released catalog."""
     conn = sqlite3.connect(sqlite_path)
@@ -322,6 +324,8 @@ def _as_released_catalog(sqlite_path: str) -> None:
         # Migration 9 adds warm_throughput to tables and indexes.
         for table in ("tables", "indexes"):
             conn.execute(f"ALTER TABLE {table} DROP COLUMN warm_throughput")
+        # Migration 10 replaces metrics with account_metrics.
+        conn.execute("DROP TABLE IF EXISTS account_metrics")
         conn.execute("DELETE FROM extenddb_migrations")
         conn.execute(
             "UPDATE settings SET value = '0.0.3' WHERE key = 'catalog_version'"

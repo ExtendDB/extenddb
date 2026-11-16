@@ -8,7 +8,9 @@
 //!
 //! An index row is a `backups_by_arn` row with `store_kind` set; a row without
 //! it is an in-catalog backup of the legacy reader (`backup_engine.rs`), and
-//! each path skips the other's rows. `backups_by_arn`, partitioned by
+//! each path skips the other's rows. `extenddb backup migrate-legacy` turns
+//! an in-catalog row into its index row in place
+//! (`CassandraEngine::replace_legacy_row`), so an ARN never has both. `backups_by_arn`, partitioned by
 //! `(account_id, backup_arn)`, is authoritative and is written first by every
 //! writer; the list rows and the `backup_index_by_status` row follow, and a
 //! reader of those re-reads the authoritative row and skips an entry it no
@@ -126,7 +128,7 @@ use extenddb_core::backup_format::BackupArn;
 use extenddb_core::types::CreateTableInput;
 use extenddb_storage::backup_catalog::{
     BackupCatalog, BackupKey, BackupRow, BackupStatus, DeleteStart, ForgetRow, Heartbeat, JobClaim,
-    JobRow, JobStatus, MaintenanceClaim, RestoreJobRow, RestoreKind, RestoreRegistered,
+    JobRow, JobStatus, MaintenanceClaim, Replaced, RestoreJobRow, RestoreKind, RestoreRegistered,
     RestoreRegistrationRow, RestoreTargetKey, StaleClock, StatusEntrySweep, StatusFields,
     StoreIdentity, StoreKind, StoreRootCount, TimeBounds, UNOWNED_GENERATION, WriteOutcome,
     billing_mode_name, new_generation,
@@ -1576,15 +1578,7 @@ impl BackupCatalog for CassandraEngine {
             // `claim_backup`'s insert, unowned and complete. The partition is
             // (`account_id`, `backup_arn`) and no table indexes the backup id,
             // so a row for the id under another ARN spelling does not stop it.
-            let insert = format!(
-                "INSERT INTO {catalog}.backups_by_arn (account_id, backup_arn, backup_id, \
-                 backup_name, table_id, table_name, table_arn, backup_status, backup_type, \
-                 backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, \
-                 table_created_at, created_at, completed_at, failure_reason, store_kind, \
-                 store_root, store_id, source_table_details_json, owner_generation, heartbeat_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USER', ?, ?, ?, ?, ?, ?, ?, toTimestamp(now()), \
-                 ?, ?, ?, ?, ?, ?, toTimestamp(now())) IF NOT EXISTS"
-            );
+            let insert = insert_statement(&catalog);
             let values = || {
                 cdrs_tokio::query_values!(
                     row.account_id.as_str(),
@@ -1865,6 +1859,17 @@ impl BackupCatalog for CassandraEngine {
                     && row.account_id == arn.account_id()
             }))
         })
+    }
+
+    /// No table of this backend indexes the backup id (`backups_by_arn` is
+    /// partitioned by the account and the ARN), so no row is found by it:
+    /// the trait's caller reads the manifest under the prefix instead.
+    fn row_holding_backup_id<'a>(
+        &'a self,
+        backup_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BackupRow>, StorageError>> {
+        let _ = backup_id;
+        Box::pin(async { Ok(None) })
     }
 
     fn start_backup_delete<'a>(
@@ -3141,8 +3146,289 @@ impl MaintenanceClaim for CassandraMaintenanceClaim {
     }
 }
 
+/// `insert_backup_row`'s statement.
+fn insert_statement(catalog: &str) -> String {
+    format!(
+        "INSERT INTO {catalog}.backups_by_arn (account_id, backup_arn, backup_id, \
+         backup_name, table_id, table_name, table_arn, backup_status, backup_type, \
+         backup_size_bytes, item_count, key_schema, attribute_definitions, billing_mode, \
+         table_created_at, created_at, completed_at, failure_reason, store_kind, \
+         store_root, store_id, source_table_details_json, owner_generation, heartbeat_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'USER', ?, ?, ?, ?, ?, ?, ?, toTimestamp(now()), \
+         ?, ?, ?, ?, ?, ?, toTimestamp(now())) IF NOT EXISTS"
+    )
+}
+
+/// The conversion `replace_with_index_row` makes: the in-catalog row turned
+/// into `row`'s index row in place, conditioned on the row being an
+/// AVAILABLE in-catalog row with no registered restore (the condition
+/// DeleteBackup's claim and a restore's registration are ordered against on
+/// the same partition).
+fn convert_statement(catalog: &str) -> String {
+    format!(
+        "UPDATE {catalog}.backups_by_arn SET store_kind = ?, store_root = ?, store_id = ?, \
+         backup_id = ?, backup_name = ?, table_id = ?, table_name = ?, table_arn = ?, \
+         backup_size_bytes = ?, item_count = ?, key_schema = ?, attribute_definitions = ?, \
+         billing_mode = ?, table_created_at = ?, created_at = ?, backup_type = 'USER', \
+         failure_reason = null, source_table_details_json = ?, owner_generation = ?, \
+         completed_at = toTimestamp(now()), heartbeat_at = toTimestamp(now()) \
+         WHERE account_id = ? AND backup_arn = ? \
+         IF backup_status = 'AVAILABLE' AND store_kind = null AND active_restores = null"
+    )
+}
+
+impl CassandraEngine {
+    /// `replace_with_index_row` on Cassandra, where the in-catalog row and
+    /// the index row of one ARN are the same `backups_by_arn` row: one
+    /// lightweight transaction sets the row's store columns, sizes, source
+    /// table and an unowned generation (the in-catalog reader skips a row
+    /// with `store_kind` set from then on, and the index reader reads it),
+    /// then the list and status entries are written and the item buckets
+    /// deleted. The transaction sets every column `insert_backup_row`
+    /// writes except the key and the status (AVAILABLE by its
+    /// condition), `created_at` and `backup_type` included (`convert_statement`'s test pins the two lists). The list
+    /// rows keep their keys: both kinds key them by the id's millisecond,
+    /// which is the row's `created_at`. The `definition` column stays,
+    /// unread.
+    ///
+    /// Before the transaction a registered restore whose target is still
+    /// CREATING answers `InUse`, and stale registrations are cleared so the
+    /// condition can apply. `NotMatched` reads the row again and decides
+    /// anew, up to three times; a condition that failed at every attempt,
+    /// with no answer lost, wrote nothing and answers `NotApplied` (the
+    /// in-catalog backup is still AVAILABLE, and the caller tries again
+    /// later). A lost answer (`Unknown`) is settled by a
+    /// serial read: the row converted with this store is a conversion, the
+    /// row still in-catalog means the proposal did not commit and the write
+    /// is sent again. A row already converted with this account and store
+    /// (an earlier call that stopped after the transaction) is
+    /// `AlreadyReplaced`, and its entries and buckets are written and
+    /// deleted again, when the serial read finds it AVAILABLE; one the
+    /// serial read finds in another status (deleted since) has its buckets
+    /// deleted and no entry written, and answers `NotAvailable`. An index
+    /// row under another store is `AlreadyExists`. Only the ARN's own
+    /// partition is read: a row of the backup id under another ARN
+    /// spelling is not seen here.
+    pub(crate) async fn replace_legacy_row(
+        &self,
+        row: &BackupRow,
+    ) -> Result<Replaced, StorageError> {
+        /// Reads and transactions before the call gives up on a row whose
+        /// condition keeps failing (a registration or a delete racing it).
+        const ATTEMPTS: usize = 3;
+
+        Self::validate_account_id(&row.account_id)?;
+        let source = row.source_table()?;
+        let key_schema = serde_json::to_string(&source.key_schema)
+            .map_err(|e| StorageError::Internal(format!("Serialize key schema: {e}")))?;
+        let attribute_definitions = serde_json::to_string(&source.attribute_definitions)
+            .map_err(|e| StorageError::Internal(format!("Serialize attributes: {e}")))?;
+        let source_table_details_json = row.source_table_details_json.to_string();
+        let convert = convert_statement(&self.catalog_keyspace());
+        let values = || {
+            cdrs_tokio::query_values!(
+                row.store.store_kind.as_str(),
+                row.store.store_root.as_str(),
+                row.store.store_id.as_str(),
+                row.backup_id.as_str(),
+                row.backup_name.as_str(),
+                source.table_id.as_str(),
+                row.table_name.as_str(),
+                source.table_arn.as_str(),
+                row.size_bytes,
+                row.item_count,
+                key_schema.as_str(),
+                attribute_definitions.as_str(),
+                billing_mode_name(source.billing_mode),
+                seconds_to_millis(source.table_creation_date_time),
+                seconds_to_millis(row.created_at),
+                source_table_details_json.as_str(),
+                generation_column(UNOWNED_GENERATION),
+                row.account_id.as_str(),
+                row.backup_arn.as_str()
+            )
+        };
+        let is_this_row = |read: &BackupRow| {
+            read.account_id == row.account_id
+                && read.backup_arn == row.backup_arn
+                && read.store == row.store
+        };
+        let mut sent = false;
+        for _ in 0..ATTEMPTS {
+            let Some(stored) = self
+                .load_stored_backup(&row.account_id, &row.backup_arn)
+                .await?
+            else {
+                return Ok(Replaced::NotAvailable(format!(
+                    "Backup not found: {}",
+                    row.backup_arn
+                )));
+            };
+            if !stored.is_in_catalog() {
+                let read = self
+                    .read_index_row_serial(&row.account_id, &row.backup_arn)
+                    .await?;
+                return match read {
+                    // A conversion that stopped after its row, finished:
+                    // the entries only for a row still AVAILABLE. One
+                    // deleted since (a DeleteBackup of the migrated backup)
+                    // gets no entry; its item buckets go all the same.
+                    Some(read) if is_this_row(&read) && read.status != BackupStatus::Available => {
+                        self.cleanup_backup_payload(
+                            &row.account_id,
+                            &row.backup_arn,
+                            stored.item_count,
+                        )
+                        .await?;
+                        Ok(Replaced::NotAvailable(format!(
+                            "the backup is {} in the store",
+                            read.status
+                        )))
+                    }
+                    Some(read) if is_this_row(&read) => {
+                        self.finish_conversion(row, &source, stored.item_count)
+                            .await?;
+                        Ok(if sent {
+                            Replaced::Replaced
+                        } else {
+                            Replaced::AlreadyReplaced
+                        })
+                    }
+                    _ => Err(StorageError::AlreadyExists(format!(
+                        "backup {} has an index row in the {} store at {:?} ({})",
+                        row.backup_arn,
+                        stored.store_kind.as_deref().unwrap_or("?"),
+                        stored.store_root.as_deref().unwrap_or("?"),
+                        stored.store_id.as_deref().unwrap_or("?"),
+                    ))),
+                };
+            }
+            if stored.backup_status != "AVAILABLE" {
+                return Ok(Replaced::NotAvailable(format!(
+                    "the in-catalog backup is {}",
+                    stored.backup_status
+                )));
+            }
+            if let Some(target) = self.creating_restore_target(&stored).await? {
+                return Ok(Replaced::InUse(target));
+            }
+            crate::test_hooks::before_convert(&row.backup_arn).await;
+            let fault = crate::test_hooks::convert_write_fault(&row.backup_arn);
+            let outcome = if crate::test_hooks::convert_refused(&row.backup_arn) {
+                WriteOutcome::NotMatched
+            } else if fault == Some(crate::test_hooks::ProgressWriteFault::Lost) {
+                WriteOutcome::Unknown
+            } else {
+                let outcome = conditional_write(&self.session, &convert, values()).await?;
+                if fault.is_some() {
+                    WriteOutcome::Unknown
+                } else {
+                    outcome
+                }
+            };
+            match outcome {
+                WriteOutcome::Matched => {
+                    crate::test_hooks::convert_stop(&row.backup_arn)?;
+                    self.finish_conversion(row, &source, stored.item_count)
+                        .await?;
+                    return Ok(Replaced::Replaced);
+                }
+                // Read again: the next pass decides from what is there.
+                WriteOutcome::NotMatched => {}
+                WriteOutcome::Unknown => {
+                    sent = true;
+                    if self
+                        .read_index_row_serial(&row.account_id, &row.backup_arn)
+                        .await?
+                        .is_some_and(|read| is_this_row(&read))
+                    {
+                        crate::test_hooks::convert_stop(&row.backup_arn)?;
+                        self.finish_conversion(row, &source, stored.item_count)
+                            .await?;
+                        return Ok(Replaced::Replaced);
+                    }
+                }
+            }
+        }
+        if !sent {
+            return Ok(Replaced::NotApplied(format!(
+                "the conversion of backup {} did not apply after {ATTEMPTS} attempts (a \
+                 DeleteBackup or a restore's registration changed the row before each)",
+                row.backup_arn
+            )));
+        }
+        Err(StorageError::Internal(format!(
+            "the conversion of backup {} did not apply after {ATTEMPTS} attempts",
+            row.backup_arn
+        )))
+    }
+
+    /// The writes after a conversion: the list and status entries (sent
+    /// once more on a failure, as the insert does), then the in-catalog item
+    /// buckets, of which `item_count` the row accounted for (and any after
+    /// them, as the frozen delete finds them).
+    async fn finish_conversion(
+        &self,
+        row: &BackupRow,
+        source: &extenddb_core::backup_format::SourceTableSchema,
+        item_count: i64,
+    ) -> Result<(), StorageError> {
+        if let Err(first) = self
+            .write_index_entries(row, &source.table_id, &source.table_arn, row.status)
+            .await
+        {
+            tracing::warn!(
+                "backup {}: index entries not written, sending them once more: {first}",
+                row.backup_arn
+            );
+            self.write_index_entries(row, &source.table_id, &source.table_arn, row.status)
+                .await?;
+        }
+        self.cleanup_backup_payload(&row.account_id, &row.backup_arn, item_count)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The columns the conversion sets are the insert's, but for the key
+    /// and the status (AVAILABLE, the conversion's condition): a column
+    /// added to the insert and not to the conversion fails here.
+    #[test]
+    fn the_conversion_sets_every_column_the_insert_writes() {
+        use std::collections::BTreeSet;
+        let insert = super::insert_statement("c");
+        let inserted: BTreeSet<&str> = insert
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .expect("a column list")
+            .0
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let convert = super::convert_statement("c");
+        let set: BTreeSet<&str> = convert
+            .split_once(" SET ")
+            .and_then(|(_, rest)| rest.split_once(" WHERE "))
+            .expect("a SET list")
+            .0
+            .split(", ")
+            .map(|assignment| {
+                assignment
+                    .split_once(" = ")
+                    .expect("an assignment")
+                    .0
+                    .trim()
+            })
+            .collect();
+        let expected: BTreeSet<&str> = inserted
+            .iter()
+            .copied()
+            .filter(|c| !["account_id", "backup_arn", "backup_status"].contains(c))
+            .collect();
+        assert_eq!(set, expected);
+    }
+
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use cdrs_tokio::frame::message_error::{ErrorBody, WriteTimeoutError, WriteType};

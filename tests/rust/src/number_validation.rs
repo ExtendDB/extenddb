@@ -131,7 +131,7 @@ async fn put_item_zero_with_exponent_outside_i32_is_rejected() {
 // does not.
 const OVERFLOW_MESSAGE: &str =
     "Number overflow. Attempting to store a number with magnitude larger than supported range";
-const UNDERFLOW_MESSAGE: &str =
+pub(crate) const UNDERFLOW_MESSAGE: &str =
     "Number underflow. Attempting to store a number with magnitude smaller than supported range";
 const TOO_MANY_DIGITS_MESSAGE: &str =
     "Attempting to store more than 38 significant digits in a Number";

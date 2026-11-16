@@ -12,8 +12,13 @@ changes, it also needs `--allow-dirty`. This script needs Python 3.11 or
 later. It reads the members from `cargo metadata`, so cargo resolves globs,
 `exclude`, inherited fields and renamed dependencies. It then fails, with
 one line per problem, unless all of the following hold for each member that
-crates.io receives (one without `publish = false`):
+crates.io receives (one without a `publish` field, or one whose `publish`
+list names crates-io):
 
+- The member's version is the `version` of the root manifest's
+  `[workspace.package]` table. A release publishes every crate at the
+  workspace version, and `devtools/publish-crates --version` refuses a
+  crate of another version.
 - Each dependency on another workspace crate, normal or build, requires
   that crate's version exactly (`=X.Y.Z`). A caret requirement would let a
   fresh install combine crates of two releases. A pin left at the previous
@@ -91,8 +96,19 @@ def cargo_metadata(root: Path) -> dict:
 
 
 def is_published(package: dict) -> bool:
-    """`publish = false` reaches cargo metadata as an empty registry list."""
-    return package.get("publish") != []
+    """A member that crates.io receives. `publish = false` reaches cargo
+    metadata as an empty registry list, and a member without the field as
+    null. devtools/publish-crates uses the same rule."""
+    registries = package.get("publish")
+    return registries is None or "crates-io" in registries
+
+
+def workspace_version(metadata: dict) -> str | None:
+    """The `version` of the root manifest's [workspace.package] table, or
+    None when the root manifest sets none."""
+    manifest = tomllib.loads((Path(metadata["workspace_root"]) / "Cargo.toml").read_text())
+    version = manifest.get("workspace", {}).get("package", {}).get("version")
+    return version if isinstance(version, str) else None
 
 
 def check(root: Path, packages: Path | None = None) -> list[str]:
@@ -103,11 +119,19 @@ def check(root: Path, packages: Path | None = None) -> list[str]:
     if packages is None:
         packages = Path(metadata["target_directory"]) / "package"
     problems: list[str] = []
+    release = workspace_version(metadata)
+    if release is None:
+        problems.append("the root Cargo.toml sets no [workspace.package] version, so the release version is unknown")
 
     for name, package in sorted(members.items()):
         if not is_published(package):
             continue
         manifest = os.path.relpath(package["manifest_path"], root)
+        if release is not None and package["version"] != release:
+            problems.append(
+                f"{manifest}: {name} is version {package['version']}, and the workspace version is {release}. "
+                f"A release publishes every crate at the workspace version (`version.workspace = true`)."
+            )
         for dependency in package["dependencies"]:
             target = dependency["name"]
             if target not in members:

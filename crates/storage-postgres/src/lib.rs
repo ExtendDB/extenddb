@@ -13,6 +13,7 @@ mod authorization_store;
 mod backup_catalog;
 mod backup_engine;
 mod bootstrapper;
+mod catalog_json;
 mod catalog_store;
 pub mod config;
 mod create_table;
@@ -53,6 +54,10 @@ pub use backup_catalog::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use backup_engine::claim_session_settings;
+/// Pause the legacy reader's item stream after its AVAILABLE re-check.
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use backup_engine::legacy_items_pause;
 #[doc(hidden)]
 pub use backup_engine::{CLAIM_KEEPALIVES, RESTORE_LOCK_SEED};
 pub use bootstrapper::PostgresBootstrapper;

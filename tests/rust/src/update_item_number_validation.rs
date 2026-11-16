@@ -39,11 +39,11 @@ async fn update_item_rejects_malformed_number_in_expression() {
         .await
         .expect_err("malformed number must be rejected");
     assert_eq!(err_code(&e), Some("ValidationException"), "{}", err_msg(&e));
-    assert!(
-        err_msg(&e).contains("ExpressionAttributeValues contains invalid value")
-            && err_msg(&e).contains("cannot be converted to a numeric value: 12e"),
-        "got: {}",
-        err_msg(&e)
+    // Measured 2026-11-11: the prefix and the number message, with no
+    // ExpressionAttributeValues wrapper.
+    assert_eq!(
+        err_msg(&e),
+        "1 validation error detected: The parameter cannot be converted to a numeric value: 12e"
     );
 }
 

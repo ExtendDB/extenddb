@@ -100,11 +100,12 @@ binary crate, and a Cargo feature selects its backend.
   `devtools/check-crate-packages`. The check fails on a pin that is not
   exact, or on an internal dev-dependency with a version. It also fails on a
   missing LICENSE, NOTICE or description, and on a package or manifest field
-  over crates.io's limits. A pin left at an older version also makes every
-  cargo command that resolves dependencies fail.
-- Compiling each package from its tarball takes minutes, so that build
-  belongs to the release workflow, before the upload, and not to each pull
-  request.
+  over crates.io's limits. A crate whose version is not the workspace
+  version fails too. A pin left at an older version also makes every cargo
+  command that resolves dependencies fail.
+- Compiling each package from its tarball takes minutes, so that build runs
+  in the `verify` job of `.github/workflows/release-crates.yml`, before the
+  upload, and not on each pull request.
 - A release bump changes the 13 pins together with the workspace version.
 - Every release publishes all 14 crates, including the crates that did not
   change.
@@ -117,10 +118,17 @@ binary crate, and a Cargo feature selects its backend.
   from other crates.
 - The license notices now list the workspace crates under the text of the
   repository's LICENSE file, with a link to the repository.
-- Publishing is follow-up work. It needs a release workflow, and a first
-  publish with an API token, because trusted publishing cannot create a crate.
-  Each crate then needs its owners and a trusted publisher entry. Each crate
-  added to the workspace later needs its own first publish.
+- `.github/workflows/release-crates.yml` publishes each release after
+  `promote-image`, through trusted publishing, with `devtools/publish-crates`.
+  Trusted publishing cannot create a crate. So a maintainer publishes the
+  first version of each crate with an API token and
+  `devtools/publish-crates --new-crates`. That mode publishes only the
+  crates that crates.io does not have. Each crate then needs its owners and
+  a trusted publisher entry.
+- A release that adds one crate takes three runs. The workflow publishes the
+  crates before the new crate, and it stops. A maintainer publishes the new
+  crate with an API token, and a second dispatch publishes the rest.
+  `packaging/README.md`, "Releasing to crates.io", describes the steps.
 - A version on crates.io can never be replaced. A yank only stops new lock
   files from choosing it.
 
@@ -131,6 +139,6 @@ binary crate, and a Cargo feature selects its backend.
 Copyright 2026 ExtendDB contributors. Licensed under the Apache License, Version 2.0.
 See [LICENSE](../../LICENSE) for the full text.
 
-This software is provided "as is" without warranty of any kind. ExtendDB is not
-affiliated with, endorsed by, or sponsored by Amazon Web Services. "DynamoDB" is
-a trademark of Amazon.com, Inc.
+This software is provided "as is" without warranty of any kind. ExtendDB is an open
+source project maintained by AWS. It is not Amazon DynamoDB or an AWS service.
+"DynamoDB" is a trademark of Amazon.com, Inc. or its affiliates.

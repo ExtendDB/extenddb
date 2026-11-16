@@ -87,9 +87,16 @@
 //! backends purge runs beside live servers; the maintenance claim is the
 //! exclusion.
 //!
+//! `backup migrate-legacy <arn>|--all` copies in-catalog backups into the
+//! configured store and replaces each by its catalog row, under the
+//! maintenance claim on every backend (on SQLite under the serve lock as
+//! well); its module (`cmd_backup/migrate_legacy.rs`) states its output and
+//! exit.
+//!
 //! Every command opens the catalog through the backend's factory, under its own
 //! name (`extenddb backup list`, `extenddb backup purge`, `extenddb backup
-//! remove-target`, `extenddb backup sync`), and none runs the startup recovery
+//! remove-target`, `extenddb backup sync`, `extenddb backup migrate-legacy`),
+//! and none runs the startup recovery
 //! a server runs (`ServerComponentsOptions::startup_recovery` off): that work
 //! belongs to the servers the command runs beside, and a command that ran it
 //! could exit with it half done. On PostgreSQL, MongoDB and Cassandra the
@@ -239,6 +246,8 @@ use extenddb_storage::error::StorageError;
 use extenddb_storage::hooks::ServingRegistrar;
 use futures::TryStreamExt;
 
+mod migrate_legacy;
+
 #[derive(Args)]
 #[allow(clippy::doc_markdown)] // Clap help text, not rustdoc
 pub struct BackupArgs {
@@ -340,6 +349,24 @@ enum BackupCommand {
         )]
         forget_backup: Vec<String>,
     },
+    /// Copy in-catalog backups into the configured backup store, each under its own ARN, and
+    /// replace each by its catalog row. Takes the maintenance claim first (every backup and
+    /// restore job answers LimitExceededException until it ends) and waits for running jobs; on
+    /// SQLite it needs the server stopped. Refuses a backup a 0.1.x release took (its backup id
+    /// has the 13-digit shape a 0.1.x release issued) and one with an item the item check refuses
+    /// or a definition the legacy restore refuses, keeping its in-catalog backup; restore such a
+    /// backup and take a new one.
+    /// With --all it then cleans up after deleted in-catalog backups: what a stopped run left
+    /// under each one's prefix is deleted, and its record removed.
+    #[command(group(clap::ArgGroup::new("backups").required(true).args(["arn", "all"])))]
+    MigrateLegacy {
+        /// The backup ARN of the in-catalog backup to migrate
+        #[arg(value_name = "ARN", value_parser = migrate_legacy::backup_arn_arg)]
+        arn: Option<String>,
+        /// Migrate every in-catalog backup of every account, going on past a backup it refuses
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// How often the waiting purge re-reads the rows.
@@ -353,6 +380,7 @@ const LIST: &str = "extenddb backup list";
 const PURGE: &str = "extenddb backup purge";
 const REMOVE_TARGET: &str = "extenddb backup remove-target";
 const SYNC: &str = "extenddb backup sync";
+const MIGRATE_LEGACY: &str = "extenddb backup migrate-legacy";
 
 pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> {
     if !std::path::Path::new(&args.config).exists() {
@@ -419,6 +447,7 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
         BackupCommand::Purge { confirm: true } => (PURGE, Mode::Write),
         BackupCommand::Sync { .. } if forgetting => (SYNC, Mode::Forget),
         BackupCommand::Sync { .. } => (SYNC, Mode::Sync),
+        BackupCommand::MigrateLegacy { .. } => (MIGRATE_LEGACY, Mode::Write),
         BackupCommand::RemoveTarget { .. } => unreachable!("handled above"),
     };
     let opening = open(
@@ -528,6 +557,24 @@ pub async fn run(args: BackupArgs, release: &'static str) -> anyhow::Result<()> 
             done
         }
         (BackupCommand::Sync { .. }, Opening::NoStore(reason)) => anyhow::bail!("{reason}"),
+        (BackupCommand::MigrateLegacy { arn, .. }, Opening::Store(opened)) => {
+            let done = migrate_legacy::migrate_legacy(
+                &opened,
+                &app_config,
+                release,
+                arn.as_deref(),
+                interrupt,
+            )
+            .await;
+            opened.close().await;
+            done
+        }
+        (BackupCommand::MigrateLegacy { .. }, Opening::NoStore(reason)) => {
+            anyhow::bail!(
+                "backup migrate-legacy needs a configured backup store to copy into, and this \
+                 server has none ({reason})"
+            )
+        }
         (_, Opening::CatalogOnly(catalog, reason)) => {
             catalog.close().await;
             anyhow::bail!("{reason}")
@@ -1007,27 +1054,10 @@ async fn purge(
     print_plan(opened).await?;
 
     let stale_after = Duration::from_secs(backup.stale_job_after_secs);
-    let holder = format!(
-        "extenddb backup purge on {} (pid {})",
-        extenddb_server::backup_store::hostname(),
-        std::process::id()
-    );
     // The signal listener has been up since before the open, so a signal
     // from here on ends the command with the claim released: at once during
     // the wait, before the next row during the deletion.
-    let claim = storage
-        .maintenance_claim(&holder, stale_after)
-        .await
-        .map_err(|e| match e {
-            StorageError::AlreadyExists(m) => anyhow::anyhow!(
-                "{m}; one maintenance command runs at a time, and a claim whose holder died \
-                 expires after stale_job_after_secs ({} s)",
-                backup.stale_job_after_secs
-            ),
-            other => anyhow::anyhow!("cannot take the maintenance claim: {other}"),
-        })?;
-    println!("Took the maintenance claim as {holder:?}.");
-    let claim = HeldClaim::start(claim, JOB_HEARTBEAT_INTERVAL);
+    let claim = take_claim(storage, app_config, "purge").await?;
 
     // On SQLite the command holds the file alone: every job owner is dead
     // and no reconciler runs, so their resolution is this command's, and the
@@ -1259,7 +1289,23 @@ async fn resolve_dead_owners_with(
                 );
             }
             for arn in &report.legacy_backups_removed {
-                println!("removed the in-catalog backup {arn}: its create did not finish");
+                // A removal of a backup, logged as every command's deletion
+                // of one is.
+                let account_id = extenddb_storage::util::check_backup_arn(arn)
+                    .map(|parts| parts.account_id.to_owned())
+                    .unwrap_or_default();
+                tracing::info!(
+                    target: "extenddb::audit",
+                    action = "backup dead-owner resolution",
+                    account_id = %account_id,
+                    backup_arn = %arn,
+                    "removed an in-catalog backup whose CreateBackup or DeleteBackup did not \
+                     finish (its owner is dead)"
+                );
+                println!(
+                    "removed the in-catalog backup {arn}: its CreateBackup or DeleteBackup did \
+                     not finish"
+                );
             }
             for arn in &report.deletions_finished {
                 println!("finished the deletion of {arn}");
@@ -1293,9 +1339,14 @@ async fn resolve_dead_owners_with(
 
 /// Release the claim; a failure is printed, since the claim then expires by
 /// the stale rule and the command's own outcome is what the operator needs.
-async fn release(claim: HeldClaim) {
-    if let Err(e) = claim.release().await {
-        println!("could not release the maintenance claim ({e}); it expires on its own");
+/// `true` when the claim was released.
+async fn release(claim: HeldClaim) -> bool {
+    match claim.release().await {
+        Ok(()) => true,
+        Err(e) => {
+            println!("could not release the maintenance claim ({e}); it expires on its own");
+            false
+        }
     }
 }
 
@@ -1472,7 +1523,7 @@ async fn sync(
     if !sqlite || waits {
         let backup = &app_config.backup;
         let stale_after = Duration::from_secs(backup.stale_job_after_secs);
-        let held = take_claim(storage, app_config).await?;
+        let held = take_claim(storage, app_config, "sync").await?;
         if waits {
             let mut identities = match &known {
                 Some(identity) => vec![identity.clone()],
@@ -1521,15 +1572,19 @@ async fn sync(
     done
 }
 
-/// Take the maintenance claim for `backup sync` and start its heartbeat.
-async fn take_claim(
+/// Take the maintenance claim for `extenddb backup <command>` (`purge`,
+/// `sync`, `migrate-legacy`) under `stale_job_after_secs`, print the
+/// holder it was taken as, and start its heartbeat. A claim another holder
+/// has is refused with that holder named.
+pub(super) async fn take_claim(
     storage: &dyn StorageEngine,
     app_config: &config::AppConfig,
+    command: &str,
 ) -> anyhow::Result<HeldClaim> {
     let backup = &app_config.backup;
     let stale_after = Duration::from_secs(backup.stale_job_after_secs);
     let holder = format!(
-        "extenddb backup sync on {} (pid {})",
+        "extenddb backup {command} on {} (pid {})",
         extenddb_server::backup_store::hostname(),
         std::process::id()
     );
@@ -2819,7 +2874,7 @@ async fn forget(
         _ => Vec::new(),
     };
     let stale_after = Duration::from_secs(app_config.backup.stale_job_after_secs);
-    let claim = take_claim(storage, app_config).await?;
+    let claim = take_claim(storage, app_config, "sync").await?;
     let claimed_at = tokio::time::Instant::now();
     let identities = forget_wait_identities(known.as_ref(), &configured_ids, located.as_ref());
     let deletions_finished = match wait_for_jobs(

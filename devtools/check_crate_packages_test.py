@@ -207,13 +207,35 @@ class CheckCratePackagesTest(unittest.TestCase):
         self.write("crates/x/src/lib.rs", "")
         self.assert_passes()
 
-    def test_a_member_with_its_own_version_is_packaged_and_pinned_at_it(self) -> None:
+    def test_a_member_with_its_own_version_fails_and_its_pins_are_checked_at_it(self) -> None:
         self.write("Cargo.toml", ROOT_MANIFEST.replace(f'"crates/a", version = "={VERSION}"', '"crates/a", version = "=2.0.0"'))
         self.member("a", MEMBER_A.replace("version.workspace = true", 'version = "2.0.0"'))
         (self.packages / f"example-a-{VERSION}.crate").unlink()
         self.package("example-a", {"Cargo.toml": packaged_manifest("example-a", version="2.0.0")}, version="2.0.0")
         self.package("example-b", {"Cargo.toml": packaged_manifest("example-b", '\n[dependencies.example-a]\nversion = "=2.0.0"\n')})
+        code, output = self.run_check()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"error: crates/a/Cargo.toml: example-a is version 2.0.0, and the workspace version is {VERSION}.",
+                      output)
+        self.assertIn("1 problem(s) found", output)
+
+    def test_a_root_manifest_without_a_workspace_version_fails(self) -> None:
+        self.write("Cargo.toml", ROOT_MANIFEST.replace(f'version = "{VERSION}"\nedition', "edition"))
+        for directory, manifest in (("a", MEMBER_A), ("b", MEMBER_B)):
+            self.member(directory, manifest.replace("version.workspace = true", f'version = "{VERSION}"'))
+        self.assert_fails_with("error: the root Cargo.toml sets no [workspace.package] version")
+
+    def test_a_member_published_only_to_another_registry_needs_no_package(self) -> None:
+        self.member("b", MEMBER_B.replace("edition.workspace = true", 'edition.workspace = true\npublish = ["my-registry"]')
+                    .replace("{ workspace = true }", '{ path = "../a" }'))
+        (self.packages / f"example-b-{VERSION}.crate").unlink()
         self.assert_passes()
+
+    def test_a_member_whose_publish_list_names_crates_io_is_checked(self) -> None:
+        self.member("b", MEMBER_B.replace("edition.workspace = true",
+                                          'edition.workspace = true\npublish = ["my-registry", "crates-io"]'))
+        (self.packages / f"example-b-{VERSION}.crate").unlink()
+        self.assert_fails_with(f"example-b-{VERSION}.crate: missing")
 
     def test_cargo_target_dir_moves_the_packages(self) -> None:
         moved = self.root / "elsewhere"

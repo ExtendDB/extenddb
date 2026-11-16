@@ -697,25 +697,44 @@ pub(crate) async fn handle_describe_backup(
 /// `SourceTableDetails.ProvisionedThroughput` and `SourceTableFeatureDetails`
 /// filled from the backup's recorded source when the backup is AVAILABLE.
 /// The backup is looked up under the ARN's spellings in [`resolve_backup`]'s
-/// order; the source is then read under the spelling that resolved.
+/// order; the source is then read under the spelling that resolved. A
+/// legacy not-found re-reads the catalog index once, so a `backup
+/// migrate-legacy` replacement that committed between the two reads is
+/// described from its row.
 async fn describe_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
     storage: &S,
     account_id: &str,
     region: &str,
     backup_arn: &BackupArnSpellings,
 ) -> Result<BackupDescription, DynamoDbError> {
-    if let Some((arn, row)) = read_catalog_row(storage, backup_arn)
-        .await
-        .map_err(storage_err_to_dynamo)?
-    {
+    let described = |(arn, row): (BackupArn, BackupRow)| {
         if !row.status.is_described() {
             return Err(backup_not_found(&arn.to_arn_string()));
         }
-        return row.description().map_err(storage_err_to_dynamo);
-    }
-    let (backup_arn, mut desc) = resolve_backup(backup_arn, by!(storage, account_id, describe))
+        row.description().map_err(storage_err_to_dynamo)
+    };
+    if let Some(held) = read_catalog_row(storage, backup_arn)
         .await
-        .map_err(storage_err_to_dynamo)?;
+        .map_err(storage_err_to_dynamo)?
+    {
+        return described(held);
+    }
+    let (backup_arn, mut desc) =
+        match resolve_backup(backup_arn, by!(storage, account_id, describe)).await {
+            Ok(found) => found,
+            // A `backup migrate-legacy` replacement that committed between
+            // the two reads: the row is there now.
+            Err(e) if is_backup_not_found(&e) => {
+                return match read_catalog_row(storage, backup_arn)
+                    .await
+                    .map_err(storage_err_to_dynamo)?
+                {
+                    Some(held) => described(held),
+                    None => Err(storage_err_to_dynamo(e)),
+                };
+            }
+            Err(e) => return Err(storage_err_to_dynamo(e)),
+        };
     let backup_arn = backup_arn.as_str();
 
     // A CREATING or DELETED backup has no restore source to read; it is
@@ -927,6 +946,13 @@ async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
         lower: filter.lower,
         upper: filter.upper,
     };
+    // The legacy reader first, then the catalog index: a `backup
+    // migrate-legacy` replacement that commits between the two reads is
+    // then in the second (an index row), never in neither.
+    let legacy = storage
+        .list(account_id, table_name)
+        .await
+        .map_err(storage_err_to_dynamo)?;
     // A row whose summary does not derive (a `source_table_details_json`
     // this build cannot read) is logged and left out, so one such row does
     // not turn every ListBackups of the account into an internal error; a
@@ -952,11 +978,17 @@ async fn list_backups<S: BackupCatalog + LegacyBackupReader + ?Sized>(
         .try_collect()
         .await
         .map_err(storage_err_to_dynamo)?;
+    // A backup both readers list is listed once, with the catalog row's
+    // summary: a replacement that committed between the two reads above,
+    // or an in-catalog backup whose copy a `backup sync` without the
+    // in-catalog skip (a #825 or #880 build during a rolling upgrade)
+    // adopted before `backup migrate-legacy` replaced it.
+    let indexed: std::collections::HashSet<String> =
+        summaries.iter().map(|s| s.backup_arn.clone()).collect();
     summaries.extend(
-        storage
-            .list(account_id, table_name)
-            .await
-            .map_err(storage_err_to_dynamo)?,
+        legacy
+            .into_iter()
+            .filter(|s| !indexed.contains(&s.backup_arn)),
     );
     let start = start.map(|cursor| cursor.resolve(&summaries)).transpose()?;
     let summaries = summaries.into_iter().filter(|s| filter.keeps(s)).collect();
@@ -1238,13 +1270,27 @@ async fn delete_backup<S: BackupCatalog + LegacyBackupReader + ?Sized>(
             }
             Err(e) => return Err(storage_err_to_dynamo(e)),
         };
-    let mut desc = match resolved {
+    let deleted = match resolved {
         Some(resolved) => storage.delete(account_id, &resolved).await,
         None => resolve_backup(backup_arn, by!(storage, account_id, delete))
             .await
             .map(|(_, desc)| desc),
-    }
-    .map_err(storage_err_to_dynamo)?;
+    };
+    let mut desc = match deleted {
+        Ok(desc) => desc,
+        // A `backup migrate-legacy` replacement that committed between the
+        // catalog read and the legacy delete: the row is there now.
+        Err(e) if is_backup_not_found(&e) => {
+            return match read_catalog_row(storage, backup_arn)
+                .await
+                .map_err(storage_err_to_dynamo)?
+            {
+                Some((arn, row)) => delete_catalog_backup(storage, runtime, &arn, &row).await,
+                None => Err(storage_err_to_dynamo(e)),
+            };
+        }
+        Err(e) => return Err(storage_err_to_dynamo(e)),
+    };
     desc.backup_details.backup_status = "DELETED".to_owned();
     apply_source_to_description(&mut desc, source.as_ref(), region, account_id);
     Ok(desc)
@@ -1752,37 +1798,50 @@ where
     // 4. The catalog index first: a row of the healthy configured store is
     // restored from the store. With no row, the legacy reader under the ARN
     // spelling that resolves; the restore is registered against that
-    // spelling, the one the backend stored.
-    if let Some((arn, row)) = read_catalog_row(&**storage, &backup_arn)
+    // spelling, the one the backend stored. A legacy not-found re-reads the
+    // catalog index once.
+    let mut held = read_catalog_row(&**storage, &backup_arn)
         .await
-        .map_err(storage_err_to_dynamo)?
-    {
-        check_catalog_row_status(&arn, &row)?;
-        // 5, for a row: the target name once the backup is known to exist,
-        // before the backup's in-use rule (measured on DynamoDB: an in-use
-        // backup into an existing table is TableAlreadyExistsException, a
-        // backup into its own CREATING target TableInUseException, not
-        // BackupInUseException) and before the manifest is read.
-        check_restore_target_name(&**storage, account_id, target_table_name).await?;
-        let store = check_catalog_row_for_restore(&**storage, runtime, &arn, &row).await?;
-        return restore::request(
+        .map_err(storage_err_to_dynamo)?;
+    let mut legacy = None;
+    if held.is_none() {
+        match resolve_backup(&backup_arn, by!(&**storage, account_id, restore_source)).await {
+            Ok(found) => legacy = Some(found),
+            // A `backup migrate-legacy` replacement that committed between
+            // the two reads: the row is there now.
+            Err(e) if is_backup_not_found(&e) => {
+                held = read_catalog_row(&**storage, &backup_arn)
+                    .await
+                    .map_err(storage_err_to_dynamo)?;
+                if held.is_none() {
+                    return Err(storage_err_to_dynamo(e));
+                }
+            }
+            Err(e) => return Err(storage_err_to_dynamo(e)),
+        }
+    }
+    if let Some((arn, row)) = held {
+        return restore_from_row(
             storage,
             runtime,
-            store,
             account_id,
             limits,
             target_table_name,
             &arn,
+            &row,
             &overrides,
             &index_overrides,
         )
         .await;
     }
+    let storage_arc = storage;
+    let requested = backup_arn;
     let storage = &**storage;
-    let (backup_arn, source) =
-        resolve_backup(&backup_arn, by!(storage, account_id, restore_source))
-            .await
-            .map_err(storage_err_to_dynamo)?;
+    let Some((backup_arn, source)) = legacy else {
+        return Err(storage_err_to_dynamo(StorageError::Internal(
+            "the restore found neither a catalog row nor an in-catalog backup".to_owned(),
+        )));
+    };
 
     // 5. The target name, after the backup resolved and before the overrides
     // are checked against it.
@@ -1813,14 +1872,85 @@ where
     };
     refuse_while_maintenance_held(storage, runtime).await?;
     let permit = runtime.take_permit().await?;
-    let desc = storage
-        .restore(account_id, request, permit)
-        .await
+    let desc = match storage.restore(account_id, request, permit).await {
+        Ok(desc) => desc,
+        // A `backup migrate-legacy` replacement that committed between the
+        // source read and the backend's registration (which re-checks the
+        // backup under its lock, and removes the target it created): the
+        // row is there now, and the restore takes the row's path.
+        Err(e) if is_backup_not_found(&e) => {
+            let Some((arn, row)) = read_catalog_row(storage, &requested)
+                .await
+                .map_err(storage_err_to_dynamo)?
+            else {
+                return Err(restore_storage_err_to_dynamo(e));
+            };
+            return restore_from_row(
+                storage_arc,
+                runtime,
+                account_id,
+                limits,
+                target_table_name,
+                &arn,
+                &row,
+                &overrides,
+                &index_overrides,
+            )
+            .await;
+        }
         // 10.
-        .map_err(restore_storage_err_to_dynamo)?;
+        Err(e) => return Err(restore_storage_err_to_dynamo(e)),
+    };
 
     let response = restore_response(desc, &RestoreSource::from(&source), on_demand)?;
     Ok((target_table_name.to_owned(), response))
+}
+
+/// Steps 4 and 5 of a restore for a backup the catalog index has a row
+/// for, then the store-backed restore job ([`restore::request`]).
+#[allow(clippy::too_many_arguments)]
+async fn restore_from_row<S>(
+    storage: &Arc<S>,
+    runtime: &BackupRuntime,
+    account_id: &str,
+    limits: &LimitsConfig,
+    target_table_name: &str,
+    arn: &BackupArn,
+    row: &BackupRow,
+    overrides: &RestoreTableOverrides,
+    index_overrides: &overrides::IndexOverrides,
+) -> Result<(String, Value), DynamoDbError>
+where
+    S: BackupCatalog
+        + LegacyBackupReader
+        + TableEngine
+        + DataEngine
+        + RestoreEngine
+        + ?Sized
+        + Send
+        + Sync
+        + 'static,
+{
+    check_catalog_row_status(arn, row)?;
+    // 5, for a row: the target name once the backup is known to exist,
+    // before the backup's in-use rule (measured on DynamoDB: an in-use
+    // backup into an existing table is TableAlreadyExistsException, a
+    // backup into its own CREATING target TableInUseException, not
+    // BackupInUseException) and before the manifest is read.
+    check_restore_target_name(&**storage, account_id, target_table_name).await?;
+    let store = check_catalog_row_for_restore(&**storage, runtime, arn, row).await?;
+    restore::request(
+        storage,
+        runtime,
+        store,
+        account_id,
+        limits,
+        target_table_name,
+        arn,
+        overrides,
+        index_overrides,
+    )
+    .await
 }
 
 /// Step 4 of a restore for a backup the catalog index has a row for, the
@@ -2042,6 +2172,7 @@ fn storage_err_to_dynamo(e: StorageError) -> DynamoDbError {
 
 mod job;
 pub mod maintenance;
+pub mod migrate_legacy;
 mod overrides;
 mod pitr;
 pub mod reconciler;
@@ -2053,6 +2184,7 @@ pub mod sync;
 #[cfg(test)]
 mod tests;
 
+pub use pitr::refuse_before_authorization as refuse_point_in_time_recovery;
 pub(crate) use pitr::{
     handle_describe_continuous_backups, handle_restore_table_to_point_in_time,
     handle_update_continuous_backups,
