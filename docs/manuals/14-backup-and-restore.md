@@ -183,9 +183,9 @@ size for the default-allocator figures, which these measurements do not bound. T
 ## Configuration
 
 The `[backup]` section's keys (the job bound, the heartbeat and reconciler intervals, `spool_path`) and the
-`[backup.store]` section are documented in the admin guide's [`[backup]`](05-admin-guide.md#backup) and
-[`[backup.store]`](05-admin-guide.md#backupstore) sections. The store's keys, defaults and refusals are the
-backup store crate's, `crates/backup-store/src/config.rs`.
+`[backup.store]` section are documented in the [`[backup]`](../configuration.md#backup) and
+[`[backup.store]`](../configuration.md#backupstore) sections of the Configuration page. The store's keys,
+defaults and refusals are the backup store crate's, `crates/backup-store/src/config.rs`.
 
 A filesystem store:
 
@@ -271,8 +271,9 @@ the same copy rules before `backup sync` (the backups that the other directory's
 catalog's copy are in neither the restored catalog nor the kept directory, and the sync adopts only what the
 kept directory holds), and point every instance at the kept directory before the next backup. With an
 `extenddb-store.json` copied from one directory to the other nothing detects the split, and a restart can
-delete the only copy of a backup (the admin guide's [`[backup.store]`](05-admin-guide.md#backupstore)
-section). Point every instance at the shared root before the first backup, and never copy
+delete the only copy of a backup (the admin guide's
+[backup store section](05-admin-guide.md#backup-store-and-the-extenddb-backup-commands)). Point every
+instance at the shared root before the first backup, and never copy
 `extenddb-store.json` between roots.
 
 `extenddb destroy` removes the databases and leaves the store: the store is the copy that survives it.
