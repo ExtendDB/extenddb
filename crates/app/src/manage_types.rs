@@ -13,7 +13,8 @@ pub struct ManageArgs {
     /// Credentials: admin username, or account_id/user_name for IAM users
     #[arg(long)]
     pub user: String,
-    /// Password (reads from EXTENDDB_PASSWORD env var if not provided)
+    /// Password (visible in process listings and shell history; when omitted,
+    /// read from the EXTENDDB_PASSWORD env var)
     #[arg(long)]
     pub password: Option<String>,
     /// Server endpoint (default: from config file)

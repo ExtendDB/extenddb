@@ -12,6 +12,13 @@
 /// and the console's default all read this one value.
 pub(crate) const DEFAULT_CONTROL_PLANE_DELAY_SECONDS: f64 = 0.25;
 
+/// Default secondary-index propagation delay (milliseconds) when the
+/// `index_propagation_delay_ms` setting is absent or unparseable, as it is on
+/// a catalog the migrations created. The same value as SQLite and PostgreSQL,
+/// and the single definition used by the live read on the write path, the
+/// background refresh worker, and the engine's starting value.
+pub(crate) const DEFAULT_INDEX_PROPAGATION_DELAY_MS: u64 = 10;
+
 mod admin_store;
 mod authorization_store;
 mod backup_catalog;
@@ -32,6 +39,7 @@ pub mod migrations;
 pub mod operations;
 mod password_hash_store;
 pub(crate) mod propagation_hold;
+mod restore_engine;
 #[cfg(test)]
 #[path = "../../config/src/sample_toml_support.rs"]
 mod sample_toml_support;
@@ -39,6 +47,7 @@ mod sample_toml_support;
 mod sample_toml_tests;
 mod snapshot_engine;
 mod stream_engine;
+mod stream_lifecycle;
 pub mod stream_util;
 pub mod table_engine;
 mod table_helpers;
@@ -46,6 +55,7 @@ mod table_helpers;
 pub mod test_hooks;
 pub mod ttl_worker;
 mod update_table;
+mod warm_throughput;
 mod worker_store;
 pub mod workers;
 
@@ -137,6 +147,7 @@ impl ServerRuntimeHooks for CassandraRuntimeHooks {
                 gsi_backfill_notify,
                 std::time::Duration::from_secs(120), // stale threshold
                 std::time::Duration::from_secs(60),  // scan interval backstop
+                None,                                // every account keyspace
                 token,
             )
             .await;
@@ -321,11 +332,14 @@ fn server_components_factory(
             .instance_id
             .clone()
             .unwrap_or_else(|| "unknown".to_owned());
-        let registration = migrations::register_server(
+        // Every caller registers, a command too, so a migration does not run
+        // under one; a command's registration carries its own name.
+        let registration = migrations::register_server_as(
             status_session,
             &cassandra_config.keyspace_prefix,
             &host,
             options.release,
+            options.command.unwrap_or(migrations::SERVE_COMMAND),
         )
         .await
         .map_err(BackendError::Catalog)?;
@@ -345,14 +359,19 @@ fn server_components_factory(
         let control_plane_notify = engine.control_plane_notify.clone();
         let engine = Arc::new(engine);
 
-        match engine.process_control_plane_transitions().await {
-            Ok(ref t) if t.is_empty() => {}
-            Ok(transitions) => {
-                for (name, transition) in &transitions {
-                    tracing::info!("Recovered table '{name}': {transition}");
+        // The startup recovery is a server's; a command reading beside one,
+        // or one that writes beside the live servers (`backup purge`,
+        // `options.startup_recovery` off), leaves it to the server.
+        if !options.beside_server && options.startup_recovery {
+            match engine.process_control_plane_transitions().await {
+                Ok(ref t) if t.is_empty() => {}
+                Ok(transitions) => {
+                    for (name, transition) in &transitions {
+                        tracing::info!("Recovered table '{name}': {transition}");
+                    }
                 }
+                Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
             }
-            Err(e) => tracing::error!("Failed to recover control plane transitions: {e}"),
         }
 
         // Load encryption key from catalog.

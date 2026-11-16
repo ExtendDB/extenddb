@@ -1,21 +1,25 @@
 # Copyright 2026 ExtendDB contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""A policy variable that names `aws:TagKeys` stays literal text.
+"""A policy variable that names `aws:TagKeys` has no value.
 
 `aws:TagKeys` is the set of tag keys a request names, so it has no single value
-to put where `${aws:TagKeys}` stands in a condition value. The value keeps its
-text, and no tag key equals that text.
+to put where `${aws:TagKeys}` stands in a condition value. A positive operator
+is false against the variable and a negated one true, and the variable's text
+is not compared.
 
-The expected answers come from two measurements on 2026-10-27:
+The expected answers come from three measurements:
 
-  - `iam simulate-custom-policy`, a Deny on `TagResource` whose condition
-    compares `aws:ResourceTag/team` (or `aws:RequestTag/env`) with
+  - `iam simulate-custom-policy` on 2026-10-27, a Deny on `TagResource` whose
+    condition compares `aws:ResourceTag/team` (or `aws:RequestTag/env`) with
     `${aws:TagKeys}`: not applied for any order of the request's tag keys. The
-    same policy with `StringNotEquals` is applied for every order, which is the
-    comparison against the literal text.
+    same policy with `StringNotEquals` is applied for every order.
   - a resource policy carrying the same Deny on a DynamoDB table, with
-    `TagResource` requests listing the tag keys in both orders: not refused.
+    `TagResource` requests listing the tag keys in both orders, on 2026-10-27:
+    not refused.
+  - the IAM policy simulator on 2026-10-31, `StringEquals` with the value
+    `${aws:TagKeys}` against `aws:PrincipalTag/env` set to that text: not
+    matched, so the text is not compared.
 
 Prerequisites:
   - extenddb running with `auth.provider = "builtin"` on EXTENDDB_TEST_ENDPOINT
@@ -96,7 +100,7 @@ def _tags(keys: list[str]) -> list[dict[str, str]]:
 
 
 class TestTagKeysPolicyVariable:
-    """A condition value `${aws:TagKeys}` is compared as text."""
+    """The variable `${aws:TagKeys}` in a condition value has no value."""
 
     @pytest.fixture(autouse=True)
     def setup(self, auth_env, mgmt, account_id, region):
@@ -156,8 +160,8 @@ class TestTagKeysPolicyVariable:
 
     @pytest.mark.parametrize("keys", [*TAG_ORDERS, pytest.param(["colour"], id="other-key")])
     def test_negated_comparison_with_the_variable_applies_for_every_tag_order(self, keys):
-        # `env` is not equal to the text `${aws:TagKeys}`, so the negated
-        # comparison is true whatever the request's tag keys are.
+        # The variable has no value, so the negated comparison is true
+        # whatever the request's tag keys are.
         client = self._restricted(
             _deny({"StringNotEquals": {"aws:ResourceTag/team": "${aws:TagKeys}"}})
         )

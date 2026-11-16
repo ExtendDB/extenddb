@@ -966,3 +966,26 @@ mod migration_tests {
         assert_eq!(names, ["b_tagged", "<permissions-boundary>"]);
     }
 }
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn deleted_principals_and_accounts_leave_nothing() {
+        // One connection keeps the in-memory database alive for the test.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::migrations::apply_for_tests(&pool).await;
+        let store = SqliteCatalogStore::new(pool);
+        extenddb_storage::iam_leftovers_conformance::run(&store, "111111111111").await;
+    }
+}
