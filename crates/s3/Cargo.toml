@@ -6,6 +6,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "S3 clients of the ExtendDB server's stores and the AWS credentials they sign with. Internal crate of the extenddb binary, with no API stability promise."
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # The hooks a store's tests build clients with: `S3Clients::new` over a
