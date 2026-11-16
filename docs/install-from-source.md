@@ -289,8 +289,8 @@ contact_points = ["127.0.0.1:9042"]
 username = <extenddb-user>      # From extenddb init args
 password = <extenddb-pass>      # From extenddb init args
 keyspace_prefix = "extenddb"
-replication_factor = 1           # init always writes 1; edit for production
-datacenter = "datacenter1"       # must be datacenter1 (hardcoded by init)
+replication_factor = 1           # From --replication-factor (default 1)
+datacenter = "datacenter1"       # From --datacenter (default datacenter1)
 max_connections = 10
 ```
 
@@ -300,8 +300,10 @@ To override a default, pass the matching flag at init time:
 - `--cassandra-user` and `--cassandra-pass`: the superuser credentials `init` uses to create the keyspaces and the application role. The password can come from `EXTENDDB_CASSANDRA_PASSWORD` instead of the flag, as in the example above; without `--cassandra-user`, `init` connects as `$USER`, or as `cassandra` when `USER` is not set.
 - `--extenddb-user` and `--extenddb-pass`: override the application role's name and password (default `extenddb` / `extenddb-local-dev`).
 - `--keyspace-prefix myapp`: a different keyspace prefix, so one cluster can host more than one deployment.
+- `--replication-factor 3`: the replication factor of the keyspaces (default `1`, for a single node). Use 3 or more for a multi-node cluster.
+- `--datacenter dc1`: the datacenter the keyspaces replicate in (default `datacenter1`); use the name `nodetool status` prints.
 
-For a higher replication factor, edit `replication_factor` in the config after `init` (there is no init flag for it today). The datacenter must be `datacenter1`. For replication strategy, datacenter topology, authentication, authorization, and the fact that connections are unencrypted, see [Cassandra setup](cassandra-setup.md).
+For replication strategy, datacenter topology, authentication, authorization, and the fact that connections are unencrypted, see [Cassandra setup](cassandra-setup.md).
 
 ### Initialize on SQLite
 
@@ -345,7 +347,7 @@ What `init` prints, abridged (the full output also names the certificate files i
 
 Save the admin password and the account ID. The password is shown once and cannot be retrieved; the account ID is the one you create IAM users in.
 
-`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one.
+`init` refuses to run when the catalog or data database already exists. To start over, run `extenddb destroy --config extenddb.toml --yes` first (see [Tear down](#tear-down)). It also refuses to overwrite an existing `extenddb.toml` unless `--overwrite` is given (`Error: Config file "extenddb.toml" already exists. Use --overwrite to delete and regenerate it.`, exit 255); with `--overwrite` it loads the PostgreSQL connection defaults from the existing file and writes a new one. On Cassandra, `init` aborts if the catalog is already initialized. If an earlier `init` stopped partway, `init` finishes it, when its `--replication-factor` and `--datacenter` match the ones the earlier `init` used. If `init` stops because its `--replication-factor` is larger than the number of nodes, an `init` with the same `--replication-factor` stops the same way. To go on, see [Keyspace replication](cassandra-setup.md#keyspace-replication).
 
 | Flag | What it does |
 |---|---|
