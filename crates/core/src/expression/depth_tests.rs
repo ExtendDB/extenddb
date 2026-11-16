@@ -128,6 +128,10 @@ fn update_far_past_the_limit_is_refused_without_overflowing_the_stack() {
         ("deep update groups", nested_groups(FAR)),
         ("deep update calls", nested_calls(FAR)),
         ("deep update calls and groups", nested_mixed(FAR)),
+        (
+            "deep update calls of any name",
+            format!("SET qty = {}:v{}", "foo(".repeat(FAR), ")".repeat(FAR)),
+        ),
     ] {
         assert_eq!(message(on_small_stack(what, expr, update)), UPDATE_TOO_DEEP);
     }
@@ -157,9 +161,16 @@ fn condition_size_calls_inside_a_function_count_toward_the_limit() {
 
 #[test]
 fn condition_far_past_the_limit_is_refused_without_overflowing_the_stack() {
-    let expr = nested_sizes(FAR);
-    assert_eq!(
-        message(on_small_stack("deep condition sizes", expr, condition)),
-        CONDITION_TOO_DEEP
-    );
+    for (what, expr) in [
+        ("deep condition sizes", nested_sizes(FAR)),
+        (
+            "deep condition calls of any name",
+            format!("{}x{}", "f(".repeat(FAR), ")".repeat(FAR)),
+        ),
+    ] {
+        assert_eq!(
+            message(on_small_stack(what, expr, condition)),
+            CONDITION_TOO_DEEP
+        );
+    }
 }
