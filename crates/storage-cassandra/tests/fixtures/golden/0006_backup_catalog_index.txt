@@ -1,0 +1,6 @@
+-- table_name, table_status, restore_status, restore_kind, restore_owner_generation, restore_heartbeat_at, restore_store_kind, restore_completed_at = created_at
+cu_orders	ACTIVE	DONE	legacy	0	0	null	true
+interrupted	CREATING	RUNNING	legacy	0	0	null	null
+-- notes
+backfilled 2 restore registration(s) as legacy restores, 1 of them RUNNING with a dead owner for the reconciler to remove
+wrote settings.catalog_id

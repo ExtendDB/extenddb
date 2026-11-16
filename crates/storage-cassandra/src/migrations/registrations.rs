@@ -1,0 +1,580 @@
+// Copyright 2026 ExtendDB contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The serving registration.
+//!
+//! A server registers in `extenddb_servers`: one row, written at `QUORUM`
+//! with a TTL of 45 s and again every 5 s at `LOCAL_QUORUM`. A renewal that
+//! fails is tried again every second. The registration counts as lost only
+//! when no write of the row has succeeded for 30 s, after a last attempt at
+//! that deadline. Each attempt is bounded by 5 s, and one sent before the
+//! deadline also by the time left to it, so the loss is reported at most
+//! 35 s after the last successful write was sent (the INSERT that
+//! registered, then each renewal), at least 10 s before its row expires and
+//! `migrate --yes`, which waits while a row exists, can see it gone. The server then stops admitting requests and stops its
+//! background workers, and registers again with a new row
+//! ([`super::registrar`]).
+//!
+//! A command that opens the catalog as a server does (`extenddb backup list`,
+//! `extenddb backup purge`) registers too, so a migration waits for it. The
+//! table has no column for the process's name, and a column would be a
+//! catalog migration, so a command's row carries its name in `release`,
+//! after the release and ` as ` (`1.0.0 as extenddb backup purge`;
+//! [`release_cell`] writes it and [`registered_servers`] reads it back), and
+//! the migration's wait prints the name. A row whose `release` has no
+//! ` as ` is a server's.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use cdrs_tokio::consistency::Consistency;
+use extenddb_storage::migrations::MigrationError;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use super::connect::{nullable, rows, send, table_exists};
+use super::locks::MigrationLock;
+use crate::cassandra_util::CassandraSession;
+
+/// The times of a serving registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationTimes {
+    /// The row's TTL, in seconds.
+    pub ttl_secs: i32,
+    /// How often the row is written again.
+    pub renew_every: Duration,
+    /// How soon a renewal that failed is tried again.
+    pub retry_every: Duration,
+    /// How long after the last successful write of the row was sent (the
+    /// INSERT that registered, then each renewal) the registration counts as
+    /// lost. A renewal sent before then is bounded by the time left, and the
+    /// last attempt, at that deadline, by `renew_every`, so the loss is
+    /// reported by `lost_after + renew_every`, which must stay under the
+    /// TTL.
+    pub lost_after: Duration,
+}
+
+impl RegistrationTimes {
+    /// A 45 s row renewed every 5 s, tried again every second after a
+    /// failure, and lost after 30 s without a renewal.
+    pub const DEFAULT: Self = Self {
+        ttl_secs: 45,
+        renew_every: Duration::from_secs(5),
+        retry_every: Duration::from_secs(1),
+        lost_after: Duration::from_secs(30),
+    };
+}
+
+/// The name a server's registration carries; a command's carries its own
+/// (`extenddb backup list`).
+pub const SERVE_COMMAND: &str = "extenddb serve";
+
+/// What a registration writes in `release`: the release for a server, the
+/// release, ` as ` and the command's name for a command.
+pub(crate) fn release_cell(release: &str, command: &str) -> String {
+    if command == SERVE_COMMAND {
+        release.to_owned()
+    } else {
+        format!("{release} as {command}")
+    }
+}
+
+/// The release and the process name a `release` cell carries.
+fn split_release_cell(cell: &str) -> (String, String) {
+    match cell.split_once(" as ") {
+        Some((release, command)) => (release.to_owned(), command.to_owned()),
+        None => (cell.to_owned(), SERVE_COMMAND.to_owned()),
+    }
+}
+
+/// One running server, or a command registered as one, as `migrate --yes`
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Server {
+    pub(crate) command: String,
+    pub(crate) host: String,
+    pub(crate) pid: i32,
+    pub(crate) release: String,
+    pub(crate) started_at: String,
+}
+
+impl std::fmt::Display for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} on {} (process {}, started {})",
+            self.command, self.release, self.host, self.pid, self.started_at
+        )
+    }
+}
+
+/// The servers registered in `keyspace`, read at `ALL`: every replica of
+/// the catalog must answer. A catalog without the table has none.
+///
+/// # Errors
+///
+/// A replica did not answer.
+pub(crate) async fn registered_servers(
+    session: &CassandraSession,
+    keyspace: &str,
+) -> Result<Vec<Server>, MigrationError> {
+    if !table_exists(session, keyspace, "extenddb_servers").await? {
+        return Ok(Vec::new());
+    }
+    let found = rows(
+        session,
+        &format!("SELECT host, pid, release, started_at FROM {keyspace}.extenddb_servers"),
+        cdrs_tokio::query_values!(),
+        Consistency::All,
+        "read the running servers at consistency ALL",
+    )
+    .await?;
+    found
+        .iter()
+        .map(|row| {
+            let (release, command) = split_release_cell(
+                &nullable::<String>(row, "release", "read a server")?.unwrap_or_default(),
+            );
+            Ok(Server {
+                command,
+                host: nullable::<String>(row, "host", "read a server")?.unwrap_or_default(),
+                pid: nullable::<i32>(row, "pid", "read a server")?.unwrap_or_default(),
+                release,
+                started_at: nullable::<String>(row, "started_at", "read a server")?
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Wait, while holding `lock`, for every registered server to go away,
+/// until `timeout` after `started`, the start of the run's wait for the
+/// lock: one timeout bounds both waits.
+///
+/// # Errors
+///
+/// [`MigrationError::Locked`] (exit 6) naming the servers, or the error of
+/// the read at `ALL`, when the deadline passes first.
+pub(crate) async fn wait_for_no_servers(
+    lock: &MigrationLock,
+    started: Instant,
+    timeout: Duration,
+) -> Result<(), MigrationError> {
+    loop {
+        lock.check()?;
+        let read = registered_servers(lock.session(), lock.keyspace()).await;
+        lock.progress();
+        let outcome = match read {
+            Ok(servers) if servers.is_empty() => return Ok(()),
+            Ok(servers) => format!(
+                "{} server(s) serve this catalog: {}. Stop them, then run the migration again",
+                servers.len(),
+                servers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Err(e) => format!(
+                "the running servers could not be read at consistency ALL ({e}); a migration \
+                 needs every replica of {} reachable. Nodes the driver reports down: {}",
+                lock.keyspace(),
+                down_nodes(lock.session())
+            ),
+        };
+        if started.elapsed() >= timeout {
+            return Err(MigrationError::Locked(format!(
+                "after waiting {} s for the lock and the servers, {outcome}",
+                started.elapsed().as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1).min(timeout.saturating_sub(started.elapsed())))
+            .await;
+    }
+}
+
+/// The nodes the driver reports down, or "none".
+fn down_nodes(session: &CassandraSession) -> String {
+    let metadata = session.cluster_metadata();
+    let mut down: Vec<String> = metadata
+        .nodes()
+        .values()
+        .filter(|n| n.state() == cdrs_tokio::cluster::topology::NodeState::Down)
+        .map(|n| n.broadcast_rpc_address().to_string())
+        .collect();
+    down.sort();
+    if down.is_empty() {
+        "none".to_owned()
+    } else {
+        down.join(", ")
+    }
+}
+
+/// A server's registration, renewed until it is released or lost.
+pub struct ServingRegistration {
+    session: Arc<CassandraSession>,
+    keyspace: String,
+    server_id: String,
+    lost: watch::Receiver<Option<String>>,
+    renewal: JoinHandle<()>,
+    ttl_secs: i32,
+    released: AtomicBool,
+}
+
+impl ServingRegistration {
+    /// Write this server's row at `QUORUM`, so starting needs a majority of
+    /// the catalog's replicas, as migrating does, and start renewing it.
+    ///
+    /// # Errors
+    ///
+    /// The write fails.
+    pub async fn register(
+        session: Arc<CassandraSession>,
+        keyspace: &str,
+        host: &str,
+        release: &str,
+    ) -> Result<Self, MigrationError> {
+        Self::register_timed(session, keyspace, host, release, RegistrationTimes::DEFAULT).await
+    }
+
+    /// [`ServingRegistration::register`] with other times, for tests.
+    ///
+    /// # Errors
+    ///
+    /// As [`ServingRegistration::register`].
+    pub async fn register_timed(
+        session: Arc<CassandraSession>,
+        keyspace: &str,
+        host: &str,
+        release: &str,
+        times: RegistrationTimes,
+    ) -> Result<Self, MigrationError> {
+        let server_id = uuid::Uuid::new_v4().to_string();
+        let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let pid = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
+        let cql = format!(
+            "INSERT INTO {keyspace}.extenddb_servers (server_id, host, pid, release, started_at) \
+             VALUES (?, ?, ?, ?, ?) USING TTL {}",
+            times.ttl_secs
+        );
+        let values = || {
+            cdrs_tokio::query_values!(server_id.as_str(), host, pid, release, started_at.as_str())
+        };
+        // The row's TTL can start when a replica applies the INSERT, which
+        // can be as early as its send, so the first deadline counts from
+        // here and not from the answer.
+        let sent = Instant::now();
+        send(
+            &session,
+            &cql,
+            values(),
+            Consistency::Quorum,
+            None,
+            "register this server in extenddb_servers",
+        )
+        .await?;
+        let (lost_tx, lost) = watch::channel(None);
+        let renewal = tokio::spawn(renew_registration(
+            session.clone(),
+            cql,
+            values(),
+            times,
+            sent,
+            lost_tx,
+        ));
+        Ok(Self {
+            session,
+            keyspace: keyspace.to_owned(),
+            server_id,
+            lost,
+            renewal,
+            ttl_secs: times.ttl_secs,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// Changes to `Some(reason)` once no renewal has succeeded for
+    /// [`RegistrationTimes::lost_after`].
+    #[must_use]
+    pub fn lost(&self) -> watch::Receiver<Option<String>> {
+        self.lost.clone()
+    }
+
+    /// Stop renewing and delete the row, so a migration need not wait for
+    /// its TTL.
+    pub async fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.renewal.abort();
+        if let Err(e) = delete_row(&self.session, &self.keyspace, &self.server_id).await {
+            tracing::warn!("{e}; the row expires within {} s", self.ttl_secs);
+        }
+    }
+}
+
+/// A registration dropped without [`ServingRegistration::release`], as an
+/// attempt to register again that the server drops at its bound after the
+/// INSERT returned, deletes its row from a task of its own. An attempt
+/// dropped while its INSERT is in flight has no registration yet: a row
+/// that INSERT writes stays until its TTL ends, and `migrate --yes` counts
+/// it as a running server until then.
+impl Drop for ServingRegistration {
+    fn drop(&mut self) {
+        self.renewal.abort();
+        if self.released.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (session, keyspace, server_id) = (
+            self.session.clone(),
+            self.keyspace.clone(),
+            self.server_id.clone(),
+        );
+        runtime.spawn(async move {
+            if let Err(e) = delete_row(&session, &keyspace, &server_id).await {
+                tracing::warn!("{e}; the row expires by its TTL");
+            }
+        });
+    }
+}
+
+/// Delete a server's row at `QUORUM`.
+async fn delete_row(
+    session: &CassandraSession,
+    keyspace: &str,
+    server_id: &str,
+) -> Result<(), MigrationError> {
+    send(
+        session,
+        &format!("DELETE FROM {keyspace}.extenddb_servers WHERE server_id = ?"),
+        cdrs_tokio::query_values!(server_id),
+        Consistency::Quorum,
+        None,
+        "remove this server from extenddb_servers",
+    )
+    .await
+    .map(drop)
+}
+
+/// Write the row again every `renew_every`; after a failure try again every
+/// `retry_every`. Report the registration lost once the attempt at the
+/// deadline, `lost_after` after the last successful write of the row was
+/// sent (`registered`, the send of the INSERT that registered, until a
+/// renewal succeeds), fails too.
+async fn renew_registration(
+    session: Arc<CassandraSession>,
+    cql: String,
+    values: cdrs_tokio::query::QueryValues,
+    times: RegistrationTimes,
+    registered: Instant,
+    lost: watch::Sender<Option<String>>,
+) {
+    renew_with(times, registered, lost, || {
+        // LOCAL_QUORUM, so a running server stays up while a remote
+        // datacenter is unreachable.
+        let renewal = send(
+            &session,
+            &cql,
+            values.clone(),
+            Consistency::LocalQuorum,
+            None,
+            "renew the serving registration",
+        );
+        async move { renewal.await.map(drop).map_err(|e| e.to_string()) }
+    })
+    .await;
+}
+
+/// [`renew_registration`]'s schedule, with the renewal given. An attempt
+/// sent before the deadline is bounded by `renew_every` and by the time left
+/// to the deadline, so the attempt at the deadline is never late; that last
+/// attempt is bounded by `renew_every`. The loss is therefore reported at
+/// most `lost_after + renew_every` after the last successful write of the
+/// row was sent, the first of them at `registered`.
+async fn renew_with<F, Fut>(
+    times: RegistrationTimes,
+    registered: Instant,
+    lost: watch::Sender<Option<String>>,
+    mut renew: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last_ok = registered;
+    let mut next = last_ok + times.renew_every;
+    loop {
+        let deadline = last_ok + times.lost_after;
+        tokio::time::sleep_until(next.min(deadline)).await;
+        let sent = Instant::now();
+        let bound = if sent < deadline {
+            times.renew_every.min(deadline - sent)
+        } else {
+            times.renew_every
+        };
+        let why = match tokio::time::timeout(bound, renew()).await {
+            Ok(Ok(())) => {
+                last_ok = sent;
+                next = sent + times.renew_every;
+                continue;
+            }
+            Ok(Err(e)) => e,
+            Err(_) => format!("no answer within {} ms", bound.as_millis()),
+        };
+        if sent >= deadline {
+            let _ = lost.send(Some(format!(
+                "the serving registration was not renewed for {} s (the last attempt: {why})",
+                sent.duration_since(last_ok).as_secs()
+            )));
+            return;
+        }
+        tracing::warn!("renewing the serving registration failed: {why}; retrying");
+        next = Instant::now() + times.retry_every;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::watch;
+    use tokio::time::Instant;
+
+    /// The loss is reported by `lost_after + renew_every`, the last
+    /// attempt's bound, before the row's TTL ends.
+    #[test]
+    fn a_server_stops_admitting_before_its_row_expires() {
+        let times = super::RegistrationTimes::DEFAULT;
+        let ttl = Duration::from_secs(u64::try_from(times.ttl_secs).expect("ttl"));
+        assert!(times.lost_after + times.renew_every < ttl);
+        assert!(times.retry_every < times.renew_every);
+        assert!(times.renew_every < times.lost_after);
+    }
+
+    /// With every renewal after the first unanswered, the loss is reported
+    /// no earlier than `lost_after` and no later than `lost_after +
+    /// renew_every` after the last successful renewal was sent: the attempt
+    /// sent just before the deadline ends at it, so the last attempt starts
+    /// on time.
+    #[tokio::test(start_paused = true)]
+    async fn the_loss_is_reported_one_renewal_bound_after_the_deadline() {
+        let times = super::RegistrationTimes::DEFAULT;
+        let calls = Arc::new(AtomicU32::new(0));
+        let (lost, mut reported) = watch::channel(None);
+        let started = Instant::now();
+        let renew = {
+            let calls = calls.clone();
+            move || {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        Ok(())
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            }
+        };
+        tokio::spawn(super::renew_with(times, started, lost, renew));
+        reported.changed().await.expect("reported");
+        let lost_at = started.elapsed();
+        // The first renewal, the one that succeeded, was sent one interval
+        // after the start.
+        let last_ok = times.renew_every;
+        assert!(
+            lost_at >= last_ok + times.lost_after,
+            "lost {lost_at:?} after the start"
+        );
+        assert!(
+            lost_at <= last_ok + times.lost_after + times.renew_every,
+            "lost {lost_at:?} after the start"
+        );
+        let reason = reported.borrow().clone().expect("a reason");
+        assert!(reason.contains("not renewed for 30 s"), "{reason}");
+    }
+
+    /// The first deadline counts from when the INSERT that registered was
+    /// sent: with that INSERT answered 10 s after its send and no renewal
+    /// answered, the loss is still reported by `lost_after + renew_every`
+    /// after the send, before a row whose TTL started at the send expires.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_deadline_counts_from_the_registrations_send() {
+        let times = super::RegistrationTimes::DEFAULT;
+        let registered = Instant::now();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let (lost, mut reported) = watch::channel(None);
+        tokio::spawn(super::renew_with(times, registered, lost, || {
+            std::future::pending::<Result<(), String>>()
+        }));
+        reported.changed().await.expect("reported");
+        let lost_at = registered.elapsed();
+        assert!(
+            lost_at >= times.lost_after,
+            "lost {lost_at:?} after the INSERT was sent"
+        );
+        assert!(
+            lost_at <= times.lost_after + times.renew_every,
+            "lost {lost_at:?} after the INSERT was sent"
+        );
+    }
+
+    /// The times ADR-0023 (decision 5) and the module documentation give the
+    /// lock and the registration: a 60 s lock row renewed every 15 s, acted
+    /// on until 25 s before it expires and no longer renewed after 30 s
+    /// without progress; a 45 s registration renewed every 5 s and every
+    /// second after a failure, lost after 30 s without a renewal.
+    #[test]
+    fn the_lease_and_registration_times_are_adr_0023s() {
+        use crate::migrations::LeaseTimes;
+
+        assert_eq!(
+            LeaseTimes::DEFAULT,
+            LeaseTimes {
+                ttl: Duration::from_secs(60),
+                renew_every: Duration::from_secs(15),
+                margin: Duration::from_secs(25),
+                stall: Duration::from_secs(30),
+            }
+        );
+        assert_eq!(
+            super::RegistrationTimes::DEFAULT,
+            super::RegistrationTimes {
+                ttl_secs: 45,
+                renew_every: Duration::from_secs(5),
+                retry_every: Duration::from_secs(1),
+                lost_after: Duration::from_secs(30),
+            }
+        );
+    }
+
+    /// A server's `release` cell is the release; a command's carries its
+    /// name after ` as `, and the read gives both back, so the wait names
+    /// the command where it names a server `extenddb serve`.
+    #[test]
+    fn a_commands_release_cell_carries_its_name() {
+        use super::{SERVE_COMMAND, Server, release_cell, split_release_cell};
+        assert_eq!(release_cell("1.0.0", SERVE_COMMAND), "1.0.0");
+        let cell = release_cell("1.0.0", "extenddb backup purge");
+        assert_eq!(cell, "1.0.0 as extenddb backup purge");
+        let (release, command) = split_release_cell(&cell);
+        let server = Server {
+            command,
+            host: "host-a".to_owned(),
+            pid: 7,
+            release,
+            started_at: "2026-11-03T00:00:00Z".to_owned(),
+        };
+        assert_eq!(
+            server.to_string(),
+            "extenddb backup purge 1.0.0 on host-a (process 7, started 2026-11-03T00:00:00Z)"
+        );
+        assert_eq!(
+            split_release_cell("1.0.0"),
+            ("1.0.0".to_owned(), SERVE_COMMAND.to_owned())
+        );
+    }
+}

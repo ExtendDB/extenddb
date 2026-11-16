@@ -18,7 +18,10 @@ use extenddb_core::types::{
     TableDescription, UpdateTableInput, VectorIndexSpecification,
 };
 use extenddb_storage::error::StorageError;
-use extenddb_storage::util::{building_refuses, effective_attribute_definitions};
+use extenddb_storage::util::{
+    building_refuses, effective_attribute_definitions, warm_throughput_record_for_create,
+    warm_throughput_record_json,
+};
 
 use crate::store::SqliteEngine;
 
@@ -311,51 +314,28 @@ impl SqliteEngine {
             )
             .await?;
         }
-        if let Some(spec) = &input.stream_specification {
-            let j =
-                serde_json::to_string(spec).map_err(|e| StorageError::Internal(e.to_string()))?;
-            update_col(
+        if let Some(spec) = &input.stream_specification
+            && let Some(refusal) = Self::apply_stream_specification(
                 &mut tx,
                 account_id,
                 &input.table_name,
-                "stream_specification",
-                &j,
+                &table_id,
+                spec,
             )
-            .await?;
-            if spec.stream_enabled {
-                let existing: Option<(String,)> =
-                    sqlx::query_as("SELECT shard_id FROM stream_shards WHERE table_id = ? LIMIT 1")
-                        .bind(&table_id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                if existing.is_none() {
-                    Self::init_stream_shards(&mut tx, account_id, &input.table_name, &table_id)
-                        .await?;
-                } else {
-                    let label: Option<String> = sqlx::query_scalar(
-                        "SELECT stream_label FROM tables WHERE account_id = ? AND table_name = ?",
-                    )
-                    .bind(account_id)
-                    .bind(&input.table_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    if label.is_none() {
-                        sqlx::query(
-                            "UPDATE tables SET stream_label = ? \
-                             WHERE account_id = ? AND table_name = ?",
-                        )
-                        .bind(extenddb_storage::util::new_stream_label())
-                        .bind(account_id)
-                        .bind(&input.table_name)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| StorageError::Internal(e.to_string()))?;
-                    }
-                }
-            }
+            .await?
+        {
+            // A disable of an already disabled stream: the request is refused,
+            // and the transaction holds only the close of the shards the first
+            // disable left open (a stream change travels alone in the request).
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            return Err(refusal);
         }
+
+        // WarmThroughput on the table and on updated indexes: stored as sent,
+        // nothing acts on it. Validated by the engine against the current values.
+        Self::store_warm_throughput_updates(&mut tx, account_id, &table_id, &input).await?;
 
         // GSI create/delete.
         let mut created: Vec<String> = Vec::new();
@@ -404,12 +384,19 @@ impl SqliteEngine {
                         })
                         .transpose()
                         .map_err(|e| StorageError::Internal(e.to_string()))?;
+                    let warm = warm_throughput_record_for_create(
+                        create.warm_throughput.as_ref(),
+                        Self::control_plane_delay_secs(&mut tx).await?,
+                    )
+                    .as_ref()
+                    .map(warm_throughput_record_json)
+                    .transpose()?;
                     let index_id = uuid::Uuid::new_v4().to_string();
                     sqlx::query(
                         "INSERT INTO indexes \
                          (table_id, index_name, index_id, index_type, key_schema, projection, \
-                          index_status, provisioned_throughput) \
-                         VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?)",
+                          index_status, provisioned_throughput, warm_throughput) \
+                         VALUES (?, ?, ?, 'GSI', ?, ?, 'CREATING', ?, ?)",
                     )
                     .bind(&table_id)
                     .bind(&create.index_name)
@@ -417,6 +404,7 @@ impl SqliteEngine {
                     .bind(&ks)
                     .bind(&proj)
                     .bind(&pt)
+                    .bind(&warm)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -1303,8 +1291,8 @@ mod gsi_throughput_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
-        sqlx::query("UPDATE settings SET value = '0' WHERE key = 'control_plane_delay_seconds'")
+        crate::migrations::apply_for_tests(&engine.pool).await;
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('control_plane_delay_seconds', '0') ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             .execute(&engine.pool)
             .await
             .expect("delay");
@@ -1427,7 +1415,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
@@ -1513,7 +1501,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -1613,7 +1601,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -1730,7 +1718,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
 
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
@@ -1848,7 +1836,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -1974,7 +1962,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -2061,7 +2049,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind("000000000000")
             .execute(&engine.pool)
@@ -2145,7 +2133,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -2246,7 +2234,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)
@@ -2397,7 +2385,7 @@ mod reconciler_tests {
         let engine = SqliteEngine::new(":memory:", 1, "us-east-1", 409_600)
             .await
             .expect("engine");
-        crate::schema::apply(&engine.pool).await.expect("schema");
+        crate::migrations::apply_for_tests(&engine.pool).await;
         let account = "000000000000";
         sqlx::query("INSERT INTO accounts (account_id, account_name) VALUES (?, 'default')")
             .bind(account)

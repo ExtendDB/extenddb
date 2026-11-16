@@ -1,15 +1,18 @@
 name: Scripts test
 # Unit tests for the JavaScript under .github/scripts (Node's built-in runner,
-# no dependencies to install).
+# no dependencies to install), and for the Python helpers under devtools that
+# the catalog check scripts report through (the standard library's unittest).
 on:
   pull_request:
     paths:
       - '.github/scripts/**'
+      - 'devtools/**'
       - '.github/workflows/scripts-test.yml'
   push:
     branches: [main]
     paths:
       - '.github/scripts/**'
+      - 'devtools/**'
       - '.github/workflows/scripts-test.yml'
 
 permissions:
@@ -33,3 +36,18 @@ jobs:
       - name: Run tests
         # The shell expands the glob, so this works on every Node version.
         run: node --test .github/scripts/*.test.js
+
+  devtools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out devtools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: devtools
+          persist-credentials: false
+
+      - name: Run tests
+        # A check that passed on its exit code alone, or on its output
+        # alone, would let the catalog check scripts pass a broken binary.
+        run: python3 -m unittest discover -s devtools -p '*_test.py' -v

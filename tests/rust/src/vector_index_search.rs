@@ -1700,7 +1700,7 @@ async fn describe_table_reports_the_vector_index() {
 
 /// `SearchVectorsOutput` carries no `Count` field.
 ///
-/// Measured against the live service in sandbox 964157134968 on 2026-08-10: the
+/// Measured against the live service in sandbox 444455556666 on 2026-08-10: the
 /// response contains only `SearchResults` and, when asked for,
 /// `ConsumedCapacity`. Five parameter variations were probed and none produced a
 /// `Count`: no projection, `ReturnConsumedCapacity=INDEXES`, a

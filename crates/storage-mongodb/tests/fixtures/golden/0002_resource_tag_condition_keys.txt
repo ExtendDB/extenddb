@@ -1,0 +1,83 @@
+{
+  "policies": [
+    {
+      "account": "123456789012",
+      "principal": "user cu-tester",
+      "policy": "SelfServicePolicy",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "iam:CreateAccessKey",
+              "iam:DeleteAccessKey",
+              "iam:ListAccessKeys",
+              "iam:ChangePassword"
+            ],
+            "Resource": "arn:aws:iam::123456789012:user/cu-tester"
+          }
+        ]
+      }
+    },
+    {
+      "account": "123456789012",
+      "principal": "user cu-tester",
+      "policy": "dynamodb-full",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "dynamodb:*",
+            "Resource": "*"
+          }
+        ]
+      }
+    },
+    {
+      "account": "123456789012",
+      "principal": "user cu-tester",
+      "policy": "deny-prod",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:DeleteTable",
+            "Resource": "*",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/env": "prod"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "account": "<default account>",
+      "principal": "user ops",
+      "policy": "deny-prod-default",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Deny",
+            "Action": "dynamodb:*",
+            "Resource": "*",
+            "Condition": {
+              "StringEquals": {
+                "aws:ResourceTag/env": "prod"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "notes": [
+    "rewrote account <default account> user/ops policy deny-prod-default (1 key(s))",
+    "rewrote account 123456789012 user/cu-tester policy deny-prod (1 key(s))"
+  ]
+}
